@@ -1,0 +1,67 @@
+name: KAOS Server Ops (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      action:
+        required: true
+        type: string
+      version:
+        required: false
+        type: string
+        default: ""
+      release_repo:
+        required: false
+        type: string
+        default: "adtstack/kaos"
+    secrets:
+      release_token:
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 20
+
+      - name: Configure git identity
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Apply KAOS server artifact
+        if: ${{ inputs.action == 'update' }}
+        env:
+          KAOS_RELEASE_REPO: ${{ inputs.release_repo }}
+          KAOS_RELEASE_VERSION: ${{ inputs.version }}
+          KAOS_RELEASE_TOKEN: ${{ secrets.release_token }}
+        run: node scripts/update-from-release.mjs
+
+      - name: Revert last KAOS update commit
+        if: ${{ inputs.action == 'revert' }}
+        run: node scripts/revert-last-update.mjs
+
+      - name: Commit and push update if changed
+        if: ${{ inputs.action == 'update' }}
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No KAOS server changes to commit."
+            exit 0
+          fi
+          VERSION="$(node -p "require('./package.json').version")"
+          git commit -m "kaos(server): update to ${VERSION}"
+          git push
+
+      - name: Push revert commit
+        if: ${{ inputs.action == 'revert' }}
+        run: git push

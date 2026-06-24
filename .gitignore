@@ -1,0 +1,49 @@
+# Editors and operating systems
+.vscode/
+.idea/
+*.iml
+.DS_Store
+
+# Dependencies and package-manager state
+node_modules/
+server/node_modules/
+bun.lock
+server/bun.lock
+
+# Build and release artifacts
+dist/
+server/dist/
+main.js
+telemetry.js
+lab.js
+*.map
+*.zip
+
+# Local runtime state and secrets
+data.json
+.env
+.env.*
+!.env.example
+server/.env
+.wrangler/
+server/.wrangler/
+server/.partykit/
+
+# Generated QA and test output
+qa-runs/
+qa/**/*.js
+qa/**/*.js.map
+src/debug/*.js
+src/runtime/*.js
+src/settings/*.js
+src/sync/*.js
+src/utils/*.js
+src/*.js
+tests/*.js
+coverage/
+
+# Local scratch files
+session-*.md
+*.session.md
+plan.md
+public/

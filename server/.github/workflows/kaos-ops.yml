@@ -1,0 +1,70 @@
+name: KAOS Server Ops
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Choose update or revert"
+        required: true
+        default: "update"
+        type: choice
+        options:
+          - update
+          - revert
+      version:
+        description: "Optional KAOS release tag to install (defaults to latest)"
+        required: false
+        type: string
+      release_repo:
+        description: "Optional owner/repo to pull releases from"
+        required: false
+        default: "adtstack/kaos"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 20
+
+      - name: Configure git identity
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      - name: Apply KAOS server artifact
+        if: ${{ github.event.inputs.action == 'update' }}
+        env:
+          KAOS_RELEASE_REPO: ${{ vars.KAOS_RELEASE_REPO != '' && vars.KAOS_RELEASE_REPO || github.event.inputs.release_repo }}
+          KAOS_RELEASE_VERSION: ${{ github.event.inputs.version }}
+          KAOS_RELEASE_TOKEN: ${{ secrets.KAOS_RELEASE_TOKEN }}
+        run: node scripts/update-from-release.mjs
+
+      - name: Revert last KAOS update commit
+        if: ${{ github.event.inputs.action == 'revert' }}
+        run: node scripts/revert-last-update.mjs
+
+      - name: Commit and push update if changed
+        if: ${{ github.event.inputs.action == 'update' }}
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No KAOS server changes to commit."
+            exit 0
+          fi
+          VERSION="$(node -p "require('./package.json').version")"
+          git commit -m "kaos(server): update to ${VERSION}"
+          git push
+
+      - name: Push revert commit
+        if: ${{ github.event.inputs.action == 'revert' }}
+        run: git push

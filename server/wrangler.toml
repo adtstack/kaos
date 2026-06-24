@@ -1,0 +1,42 @@
+name = "kaos"
+main = "src/index.ts"
+compatibility_date = "2026-03-02"
+
+[[durable_objects.bindings]]
+name = "KAOS_SYNC"
+class_name = "VaultSyncServer"
+
+[[durable_objects.bindings]]
+name = "KAOS_CONFIG"
+class_name = "ServerConfig"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["VaultSyncServer", "ServerConfig"]
+
+[observability.logs]
+enabled = true
+
+# ---------------------------------------------------------------------------
+# Optional hardening variables
+# ---------------------------------------------------------------------------
+#
+# Uncomment KAOS_DISABLE_LEGACY_WS_TOKEN once all plugin clients in your
+# deployment have upgraded to a version that supports short-lived WebSocket
+# tickets (plugin Release N or later, identified by the capabilities response
+# containing "socketTicketAuth": true).
+#
+# When set to any non-empty string, WebSocket connections that still use the
+# legacy ?token= query parameter are rejected with HTTP 401 before the vault
+# Durable Object is woken.  Connections using short-lived tickets are
+# unaffected.
+#
+# Upgrade path:
+#   1. Deploy this server version (Release N).
+#   2. Wait until Worker logs no longer show:
+#        "legacy ?token= WebSocket auth for vault <id>"
+#   3. Uncomment the line below and redeploy.
+#   4. Keep the emergency fallback: if clients break, comment it out again.
+#
+# [vars]
+# KAOS_DISABLE_LEGACY_WS_TOKEN = "true"

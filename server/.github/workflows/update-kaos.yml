@@ -1,0 +1,47 @@
+name: Update KAOS Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional KAOS release tag to install (defaults to latest)"
+        required: false
+        type: string
+      release_repo:
+        description: "Optional owner/repo to pull releases from"
+        required: false
+        default: "adtstack/kaos"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 20
+
+      - name: Apply KAOS server artifact
+        env:
+          KAOS_RELEASE_REPO: ${{ vars.KAOS_RELEASE_REPO != '' && vars.KAOS_RELEASE_REPO || inputs.release_repo }}
+          KAOS_RELEASE_VERSION: ${{ inputs.version }}
+          KAOS_RELEASE_TOKEN: ${{ secrets.KAOS_RELEASE_TOKEN }}
+        run: node scripts/update-from-release.mjs
+
+      - name: Commit and push if changed
+        run: |
+          if git diff --quiet; then
+            echo "No KAOS server changes to commit."
+            exit 0
+          fi
+          VERSION="$(node -p "require('./package.json').version")"
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add -A
+          git commit -m "kaos(server): update to ${VERSION}"
+          git push

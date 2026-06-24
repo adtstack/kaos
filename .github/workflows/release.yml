@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm ci --prefix server
+      - run: npm run build
+      - run: npm run build:server-release
+      - run: npm run test:ci
+      - run: npm --prefix server run typecheck
+
+      # Sanity check: the tag must match manifest.json version
+      - name: Verify tag matches manifest version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          MANIFEST_VERSION=$(node -p "require('./manifest.json').version")
+          if [ "$TAG" != "$MANIFEST_VERSION" ]; then
+            echo "::error::Tag ($TAG) does not match manifest.json version ($MANIFEST_VERSION)"
+            exit 1
+          fi
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zip kaos.zip main.js telemetry.js manifest.json styles.css
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              kaos.zip \
+              dist/release-assets/kaos-server.zip \
+              dist/release-assets/update-manifest.json \
+              main.js \
+              telemetry.js \
+              manifest.json \
+              styles.css \
+              --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              kaos.zip \
+              dist/release-assets/kaos-server.zip \
+              dist/release-assets/update-manifest.json \
+              main.js \
+              telemetry.js \
+              manifest.json \
+              styles.css
+          fi
