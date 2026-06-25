@@ -20,5 +20,5 @@ jobs:
       - run: npm ci
       - run: npm ci --prefix server
       - run: npm run build
-      - run: npm run test:ci
+      - run: npm run test:ci:release
       - run: npm --prefix server run typecheck

@@ -13,9 +13,12 @@
 //                        Repeatable. May also be passed as --only=<substring>.
 //                        With no --only flags, all suites run.
 //                        If no suite matches, the runner exits non-zero.
+//   --skip <substring>   Exclude suites whose path contains <substring>.
+//                        Repeatable. May also be passed as --skip=<substring>.
+//                        If no suite matches, the runner exits non-zero.
 //   --list               Print every suite path the runner knows about (one
 //                        per line) and exit 0 without running anything.
-//                        Honors --only filters when listing.
+//                        Honors --only and --skip filters when listing.
 //   --help, -h           Print this usage block and exit 0.
 //
 // Unknown flags or positional args cause the runner to exit non-zero with
@@ -125,6 +128,7 @@ const suites = [
 	[JITI, "tests/witness-identity-command.ts"],
 	[JITI, "tests/witness-persistence-isolation.ts"],
 	[JITI, "tests/witness-scenario-step.ts"],
+	[NODE, "tests/run-regressions-cli.mjs"],
 	// Snapshot safety tests (Phase 0 tourniquet)
 	[JITI, "tests/snapshot-retention.ts"],
 	[JITI, "tests/snapshot-compat.ts"],
@@ -160,21 +164,24 @@ let totalPassed = 0;
 let totalFailed = 0;
 
 // -----------------------------------------------------------------------
-// CLI argument parsing — fail fast on unknown args, support --only filter.
+// CLI argument parsing — fail fast on unknown args, support --only/--skip filters.
 // -----------------------------------------------------------------------
 
 function printUsage() {
-	console.log("Usage: node tests/run-regressions.mjs [--only <substring>]... [--list] [--help]");
+	console.log("Usage: node tests/run-regressions.mjs [--only <substring>]... [--skip <substring>]... [--list] [--help]");
 	console.log("");
 	console.log("  --only <substring>   Run only suites whose path contains <substring>.");
 	console.log("                       Repeatable. May also be passed as --only=<substring>.");
-	console.log("  --list               Print every suite path (filtered by --only if given)");
+	console.log("  --skip <substring>   Exclude suites whose path contains <substring>.");
+	console.log("                       Repeatable. May also be passed as --skip=<substring>.");
+	console.log("  --list               Print every suite path (filtered by --only/--skip)");
 	console.log("                       and exit without running anything.");
 	console.log("  --help, -h           Print this usage block and exit.");
 }
 
 const argv = process.argv.slice(2);
 const onlyFilters = [];
+const skipFilters = [];
 let listOnly = false;
 
 for (let i = 0; i < argv.length; i++) {
@@ -206,19 +213,57 @@ for (let i = 0; i < argv.length; i++) {
 		onlyFilters.push(value);
 		continue;
 	}
+	if (arg === "--skip") {
+		const next = argv[i + 1];
+		if (next === undefined || next.startsWith("--")) {
+			console.error(`Error: --skip requires a value (e.g. --skip witness-scenario-step)`);
+			process.exit(2);
+		}
+		skipFilters.push(next);
+		i += 1;
+		continue;
+	}
+	if (arg.startsWith("--skip=")) {
+		const value = arg.slice("--skip=".length);
+		if (value.length === 0) {
+			console.error(`Error: --skip requires a non-empty value`);
+			process.exit(2);
+		}
+		skipFilters.push(value);
+		continue;
+	}
 	console.error(`Error: unknown argument "${arg}"`);
 	console.error("");
 	printUsage();
 	process.exit(2);
 }
 
-const selectedSuites = onlyFilters.length === 0
+const onlySelectedSuites = onlyFilters.length === 0
 	? suites
 	: suites.filter(([, path]) => onlyFilters.some((needle) => path.includes(needle)));
 
-if (onlyFilters.length > 0 && selectedSuites.length === 0) {
+if (onlyFilters.length > 0 && onlySelectedSuites.length === 0) {
 	console.error(`Error: no suite path matched --only filter(s): ${onlyFilters.map((f) => `"${f}"`).join(", ")}`);
 	console.error(`Hint: run with --list to see every known suite path.`);
+	process.exit(2);
+}
+
+const skippedSuites = skipFilters.length === 0
+	? []
+	: onlySelectedSuites.filter(([, path]) => skipFilters.some((needle) => path.includes(needle)));
+
+if (skipFilters.length > 0 && skippedSuites.length === 0) {
+	console.error(`Error: no suite path matched --skip filter(s): ${skipFilters.map((f) => `"${f}"`).join(", ")}`);
+	console.error(`Hint: run with --list to see every known suite path.`);
+	process.exit(2);
+}
+
+const selectedSuites = skipFilters.length === 0
+	? onlySelectedSuites
+	: onlySelectedSuites.filter((suite) => !skippedSuites.includes(suite));
+
+if (selectedSuites.length === 0) {
+	console.error(`Error: all selected suites were skipped.`);
 	process.exit(2);
 }
 
@@ -231,6 +276,9 @@ if (listOnly) {
 
 if (onlyFilters.length > 0) {
 	console.log(`Running ${selectedSuites.length} of ${suites.length} suite(s) matching --only filter(s): ${onlyFilters.map((f) => `"${f}"`).join(", ")}`);
+}
+if (skipFilters.length > 0) {
+	console.log(`Skipping ${skippedSuites.length} suite(s) matching --skip filter(s): ${skipFilters.map((f) => `"${f}"`).join(", ")}`);
 }
 
 for (const [runner, suitePath] of selectedSuites) {
