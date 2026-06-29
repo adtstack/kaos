@@ -23,7 +23,7 @@ jobs:
       - run: npm ci --prefix server
       - run: npm run build
       - run: npm run build:server-release
-      - run: npm run test:ci
+      - run: npm run test:ci:release
       - run: npm --prefix server run typecheck
 
       # Sanity check: the tag must match manifest.json version
