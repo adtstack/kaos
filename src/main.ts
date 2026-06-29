@@ -39,6 +39,13 @@ import {
 	type BlobHashCache,
 	moveCachedHashes,
 } from "./sync/blobHashCache";
+import {
+	pruneBaselineTextStore,
+	readBaselineTextStore,
+	readConflictMergeBaseStore,
+	type BaselineTextStore,
+	type ConflictMergeBaseStore,
+} from "./sync/baselineTextStore";
 import type { PreservedUnresolvedEntry } from "./sync/preservedUnresolved";
 import {
 	SnapshotService,
@@ -102,9 +109,12 @@ declare const __KAOS_QA_HARNESS_ENABLED__: boolean;
 
 const RECOVERY_SNAPSHOT_INTERVAL_MS = 60 * 60 * 1000;
 const CRDT_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const DISK_INDEX_SAVE_DEBOUNCE_MS = 500;
 
 type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_diskIndex?: DiskIndex;
+	_baselineTexts?: BaselineTextStore;
+	_conflictMergeBases?: ConflictMergeBaseStore;
 	_blobHashCache?: BlobHashCache;
 	/**
 	 * Unix ms timestamp of the last successful saveDiskIndex() call.
@@ -197,6 +207,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private preservedUnresolvedEntries: PreservedUnresolvedEntry[] = [];
 	private persistedState: PersistedPluginState = {};
 	private persistWriteChain: Promise<void> = Promise.resolve();
+	private diskIndexSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
 	/** Pending stability checks for newly created/dropped files. */
 	private pendingStabilityChecks = new Set<string>();
@@ -209,6 +220,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private idbDegradedHandled = false;
 	private frontmatterGuardCoordinator!: FrontmatterGuardCoordinator;
 	private frontmatterQuarantineEntries: FrontmatterQuarantineEntry[] = [];
+	private baselineTexts: BaselineTextStore = {};
+	private conflictMergeBases: ConflictMergeBaseStore = {};
 
 	/**
 	 * True when startup timed out waiting for provider sync.
@@ -228,6 +241,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getDiskIndex: () => this.diskIndex,
 			setDiskIndex: (index) => {
 				this.diskIndex = index;
+			},
+			getBaselineText: (contentHash) => this.baselineTexts[contentHash] ?? null,
+			recordBaselineText: (contentHash, text) => {
+				this.baselineTexts[contentHash] = text;
+			},
+			recordConflictMergeBase: (artifactPath, baseHash) => {
+				this.conflictMergeBases[artifactPath] = baseHash;
 			},
 			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
 			shouldBlockFrontmatterIngest: (path, previousContent, nextContent, reason) =>
@@ -369,6 +389,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerView(KAOS_DASHBOARD_VIEW_TYPE, (leaf) => new KaosDashboardView(leaf, {
 			collectData: () => this.collectDashboardData(),
+			getBaselineText: (contentHash) => this.baselineTexts[contentHash] ?? null,
+			getConflictMergeBaseHash: (artifactPath) => this.conflictMergeBases[artifactPath] ?? null,
+			clearConflictMergeBase: (artifactPath) => {
+				delete this.conflictMergeBases[artifactPath];
+				void this.persistPluginState();
+			},
 			actions: {
 				reconnect: () => {
 					if (!this.vaultSync) {
@@ -803,13 +829,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// Track SHA-256 baseline hash after every successful flushWrite.
 			// Used by decideClosedFileConflict on startup/re-enable to determine
 			// which side actually changed from the last known stable state.
-			this.diskMirror.setDiskWriteCallback((path, contentHash) => {
+			this.diskMirror.setDiskWriteCallback((path, contentHash, content) => {
 				const existing = this.diskIndex[path];
 				if (existing) {
 					existing.contentHash = contentHash;
 				} else {
 					this.diskIndex[path] = { mtime: 0, size: 0, contentHash };
 				}
+				this.baselineTexts[contentHash] = content;
+				this.scheduleDiskIndexSave("disk-write-baseline");
 				// Req 17.2: mark dirty after post-readback verification succeeds.
 				// contentHash is baselineHash-domain — NOT published as diskHash.
 				this.lab?.markWitnessDirty(path, "disk-write");
@@ -2043,7 +2071,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	onunload() {
 		this.log("Unloading plugin");
 		this.lab?.dispose();   // dispose stops flight trace, witness, and QA API
-		void this.traceRuntime?.shutdown();
+		const teardown = this.teardownSync().catch((err) => {
+			console.error("[kaos] Failed to teardown sync runtime during unload:", err);
+			this.log(`teardownSync failed during unload: ${formatUnknown(err)}`);
+		});
+		const traceShutdown = this.traceRuntime?.shutdown();
+		if (traceShutdown) {
+			void traceShutdown.catch((err) => {
+				console.error("[kaos] Failed to shutdown trace runtime during unload:", err);
+				this.log(`trace runtime shutdown failed during unload: ${formatUnknown(err)}`);
+			});
+		}
 		document.body.removeClass("vault-crdt-show-cursors");
 		// Remove plugin-owned debug global to prevent stale API references
 		// from confusing test harnesses after plugin reload.
@@ -2051,7 +2089,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (win.__KAOS_DEBUG__) {
 			delete win.__KAOS_DEBUG__;
 		}
-		void this.teardownSync();
+		void teardown;
 	}
 
 	async loadSettings() {
@@ -2063,6 +2101,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (data && typeof data._diskIndex === "object" && data._diskIndex !== null) {
 			this.diskIndex = data._diskIndex;
 		}
+		this.baselineTexts = readBaselineTextStore(data?._baselineTexts);
+		this.conflictMergeBases = readConflictMergeBaseStore(data?._conflictMergeBases);
 		// Load lastDiskIndexPersistedAt for missing-baseline conflict tie-breaking
 		if (data && typeof data._lastDiskIndexPersistedAt === "number" && data._lastDiskIndexPersistedAt > 0) {
 			this.lastDiskIndexPersistedAt = data._lastDiskIndexPersistedAt;
@@ -2269,11 +2309,29 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 
 	private async saveDiskIndex(): Promise<void> {
+		this.clearScheduledDiskIndexSave();
 		const persistedAt = Date.now();
 		await this.persistPluginState((state) => {
 			state._lastDiskIndexPersistedAt = persistedAt;
 		});
 		this.lastDiskIndexPersistedAt = persistedAt;
+	}
+
+	private scheduleDiskIndexSave(reason: string): void {
+		if (this.diskIndexSaveTimer !== null) return;
+		this.diskIndexSaveTimer = setTimeout(() => {
+			this.diskIndexSaveTimer = null;
+			void this.saveDiskIndex().catch((err) => {
+				console.error("[kaos] Failed to persist disk index:", err);
+				this.log(`saveDiskIndex failed after ${reason}: ${formatUnknown(err)}`);
+			});
+		}, DISK_INDEX_SAVE_DEBOUNCE_MS);
+	}
+
+	private clearScheduledDiskIndexSave(): void {
+		if (this.diskIndexSaveTimer === null) return;
+		clearTimeout(this.diskIndexSaveTimer);
+		this.diskIndexSaveTimer = null;
 	}
 
 	private async persistBlobQueueSnapshot(snapshot: BlobQueueSnapshot): Promise<void> {
@@ -2296,9 +2354,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private refreshPersistedState(): void {
+		for (const artifactPath of Object.keys(this.conflictMergeBases)) {
+			if (!(this.app.vault.getAbstractFileByPath(artifactPath) instanceof TFile)) {
+				delete this.conflictMergeBases[artifactPath];
+			}
+		}
+		this.baselineTexts = pruneBaselineTextStore(
+			this.baselineTexts,
+			this.diskIndex,
+			this.conflictMergeBases,
+		);
 		const nextState: PersistedPluginState = {
 			...this.settingsStore.withSettings(this.persistedState, this.settings),
 			_diskIndex: this.diskIndex,
+			...(Object.keys(this.baselineTexts).length > 0 && { _baselineTexts: this.baselineTexts }),
+			...(Object.keys(this.conflictMergeBases).length > 0 && { _conflictMergeBases: this.conflictMergeBases }),
 			_blobHashCache: this.blobHashCache,
 			...(this.lastDiskIndexPersistedAt > 0 && { _lastDiskIndexPersistedAt: this.lastDiskIndexPersistedAt }),
 		};

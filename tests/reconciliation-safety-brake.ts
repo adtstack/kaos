@@ -56,6 +56,216 @@ console.log("\n--- Test 2: same-stat excluded paths are still unindexed ---");
 	assert(!("blocked.md" in next), "same-stat blocked path is removed from index");
 }
 
+console.log("\n--- Test 2b: clean equal disk/CRDT paths get a settled baseline ---");
+{
+	const path = "clean-equal.md";
+	const content = "same content";
+	const file = makeTFile(path);
+	let diskIndex: DiskIndex = {};
+	const stats = new Map<string, { mtime: number; size: number }>([
+		[path, { mtime: 5, size: content.length }],
+	]);
+	const flushed: string[] = [];
+	let saveDiskIndexCalls = 0;
+	let resolveSave: (() => void) | null = null;
+	let resolveSaveStarted: (() => void) | null = null;
+	const saveRelease = new Promise<void>((resolve) => { resolveSave = resolve; });
+	const saveStarted = new Promise<void>((resolve) => { resolveSaveStarted = resolve; });
+	let saveCompleted = false;
+	let reconcileCompleted = false;
+
+	const app = {
+		vault: {
+			getMarkdownFiles: () => [file],
+			read: async (readFile: TFile & { path: string }) => {
+				assert(readFile.path === path, "clean baseline test reads the expected file");
+				return content;
+			},
+			adapter: {
+				stat: async (candidate: string) => stats.get(candidate) ?? null,
+			},
+			getAbstractFileByPath: () => null,
+		},
+		workspace: {
+			iterateAllLeaves: () => {},
+		},
+	};
+
+	const vaultSync = {
+		connected: true,
+		providerSynced: true,
+		getTextForPath: (candidate: string) => candidate === path ? { toJSON: () => content } : null,
+		getActiveMarkdownPaths: () => [path],
+		reconcileVault: () => ({
+			mode: "authoritative",
+			createdOnDisk: [],
+			updatedOnDisk: [],
+			seededToCrdt: [],
+			untracked: [],
+			skipped: 0,
+		}),
+		runIntegrityChecks: () => ({ duplicateIds: 0, orphansCleaned: 0 }),
+	};
+
+	const controller = new ReconciliationController({
+		app: app as any,
+		getSettings: () => ({ deviceName: "device" }) as any,
+		getRuntimeConfig: () => ({
+			maxFileSizeBytes: 0,
+			maxFileSizeKB: 0,
+			excludePatterns: [],
+		}) as any,
+		getVaultSync: () => vaultSync as any,
+		getDiskMirror: () => ({ flushWrite: async (flushPath: string) => { flushed.push(flushPath); } }) as any,
+		getBlobSync: () => null,
+		getEditorBindings: () => null,
+		getDiskIndex: () => diskIndex,
+		setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
+		isMarkdownPathSyncable: () => true,
+		shouldBlockFrontmatterIngest: () => false,
+		refreshServerCapabilities: async () => {},
+		validateOpenEditorBindings: () => {},
+		onReconciled: () => {},
+		getAwaitingFirstProviderSyncAfterStartup: () => false,
+		setAwaitingFirstProviderSyncAfterStartup: () => {},
+		saveDiskIndex: async () => {
+			saveDiskIndexCalls++;
+			resolveSaveStarted?.();
+			await saveRelease;
+			saveCompleted = true;
+		},
+		refreshStatusBar: () => {},
+		trace: () => {},
+		scheduleTraceStateSnapshot: () => {},
+		log: () => {},
+	});
+
+	const reconcileRun = controller.runReconciliation("authoritative").then(() => {
+		reconcileCompleted = true;
+	});
+	await saveStarted;
+	await Promise.resolve();
+	assert(reconcileCompleted === false, "reconciliation waits for disk index save");
+	if (!resolveSave) throw new Error("save release was not initialised");
+	resolveSave();
+	await reconcileRun;
+
+	const baselineHash = diskIndex[path]?.contentHash;
+	assert(saveCompleted, "disk index save completes before reconciliation returns");
+	assert(typeof baselineHash === "string" && baselineHash.length === 64, "equal path records a content baseline");
+	assert(diskIndex[path]?.mtime === 5, "equal path keeps fresh disk stats");
+	assert(flushed.length === 0, "equal path does not need a disk flush");
+	assert(saveDiskIndexCalls === 1, "disk index save is attempted after clean baseline recording");
+}
+
+console.log("\n--- Test 2c: conflict winner baseline waits for observed equality ---");
+{
+	const path = "conflict-then-equal.md";
+	const diskContent = "offline disk edit";
+	const crdtContent = "remote crdt edit";
+	const file = makeTFile(path);
+	const doc = new Y.Doc();
+	const ytext = doc.getText("content");
+	ytext.insert(0, crdtContent);
+	let diskIndex: DiskIndex = {
+		[path]: { mtime: 1, size: crdtContent.length },
+	};
+	const stats = new Map<string, { mtime: number; size: number }>([
+		[path, { mtime: 2_000, size: diskContent.length }],
+	]);
+	const createdFiles = new Map<string, string>();
+	const flushed: string[] = [];
+	let reconcileCallCount = 0;
+
+	const app = {
+		vault: {
+			getMarkdownFiles: () => [file],
+			read: async (readFile: TFile & { path: string }) => {
+				if (readFile.path === path) return diskContent;
+				return createdFiles.get(readFile.path) ?? "";
+			},
+			create: async (createdPath: string, content: string) => {
+				if (createdFiles.has(createdPath)) throw new Error("exists");
+				createdFiles.set(createdPath, content);
+			},
+			adapter: {
+				stat: async (candidate: string) => stats.get(candidate) ?? null,
+			},
+			getAbstractFileByPath: (candidate: string) =>
+				createdFiles.has(candidate) ? ({ path: candidate }) : null,
+		},
+		workspace: {
+			iterateAllLeaves: () => {},
+		},
+	};
+
+	const vaultSync = {
+		connected: true,
+		providerSynced: true,
+		getTextForPath: (candidate: string) => candidate === path ? ytext : null,
+		getActiveMarkdownPaths: () => [path],
+		reconcileVault: () => {
+			reconcileCallCount++;
+			return {
+				mode: "authoritative",
+				createdOnDisk: [],
+				updatedOnDisk: reconcileCallCount === 1 ? [path] : [],
+				seededToCrdt: [],
+				untracked: [],
+				skipped: 0,
+			};
+		},
+		runIntegrityChecks: () => ({ duplicateIds: 0, orphansCleaned: 0 }),
+	};
+
+	const controller = new ReconciliationController({
+		app: app as any,
+		getSettings: () => ({ deviceName: "device" }) as any,
+		getRuntimeConfig: () => ({
+			maxFileSizeBytes: 0,
+			maxFileSizeKB: 0,
+			excludePatterns: [],
+		}) as any,
+		getVaultSync: () => vaultSync as any,
+		getDiskMirror: () => ({
+			flushWrite: async (flushPath: string) => { flushed.push(flushPath); },
+			suppressLocalCreate: async () => {},
+		}) as any,
+		getBlobSync: () => null,
+		getEditorBindings: () => null,
+		getDiskIndex: () => diskIndex,
+		setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
+		isMarkdownPathSyncable: () => true,
+		shouldBlockFrontmatterIngest: () => false,
+		refreshServerCapabilities: async () => {},
+		validateOpenEditorBindings: () => {},
+		onReconciled: () => {},
+		getAwaitingFirstProviderSyncAfterStartup: () => false,
+		setAwaitingFirstProviderSyncAfterStartup: () => {},
+		getLastSaveDiskIndexAt: () => 1_000,
+		saveDiskIndex: async () => {},
+		refreshStatusBar: () => {},
+		trace: () => {},
+		scheduleTraceStateSnapshot: () => {},
+		log: () => {},
+	});
+
+	await controller.runReconciliation("authoritative");
+
+	assert(ytext.toString() === diskContent, "first pass applies disk winner to CRDT");
+	assert(createdFiles.size === 1, "first pass preserves the losing CRDT side");
+	assert(Array.from(createdFiles.values())[0] === crdtContent, "conflict artifact contains the losing CRDT content");
+	assert(diskIndex[path]?.contentHash === undefined, "conflict winner does not immediately advance baseline");
+
+	(controller as any).lastReconcileTime = 0;
+	await controller.runReconciliation("authoritative");
+
+	const baselineHash = diskIndex[path]?.contentHash;
+	assert(typeof baselineHash === "string" && baselineHash.length === 64, "second pass records baseline after disk/CRDT equality");
+	assert(flushed.length === 0, "disk-wins conflict path does not require CRDT-to-disk flush");
+	doc.destroy();
+}
+
 console.log("\n--- Test 3: reconciliation safety brake leaves blocked overwrites unindexed ---");
 {
 	const paths = Array.from({ length: 30 }, (_, i) => `note-${i}.md`);
@@ -377,7 +587,14 @@ console.log("\n--- Test 6: bound ambiguous divergence creates a conflict artifac
 
 	const app = {
 		vault: {
-			read: async () => diskContent,
+			getMarkdownFiles: () => [
+				file,
+				...Array.from(createdFiles.keys()).map(makeTFile),
+			],
+			read: async (readFile: TFile & { path: string }) => {
+				if (readFile.path === path) return diskContent;
+				return createdFiles.get(readFile.path) ?? "";
+			},
 			create: async (createdPath: string, content: string) => {
 				if (createdFiles.has(createdPath)) throw new Error("exists");
 				createdFiles.set(createdPath, content);
@@ -699,7 +916,14 @@ console.log("\n--- Test 9: convergence failure does not create infinite conflict
 	let getTextForPathCallCount = 0;
 	const app = {
 		vault: {
-			read: async () => diskContent,
+			getMarkdownFiles: () => [
+				file,
+				...Array.from(createdFiles.keys()).map(makeTFile),
+			],
+			read: async (readFile: TFile & { path: string }) => {
+				if (readFile.path === path) return diskContent;
+				return createdFiles.get(readFile.path) ?? "";
+			},
 			create: async (createdPath: string, content: string) => {
 				if (createdFiles.has(createdPath)) throw new Error("exists");
 				createdFiles.set(createdPath, content);
@@ -785,6 +1009,53 @@ console.log("\n--- Test 9: convergence failure does not create infinite conflict
 	const secondTraces = traces.filter((t) => t.msg === "conflict-artifact-needed");
 	assert(secondTraces.length === 2, "second pass still traces conflict-artifact-needed");
 	assert(secondTraces[1]?.details?.conflictSkippedDedupe === true, "second pass reports dedupe skip");
+
+	let restartGetTextForPathCallCount = 0;
+	const restartVaultSync = {
+		getTextForPath: () => {
+			restartGetTextForPathCallCount++;
+			if (restartGetTextForPathCallCount % 2 === 1) return ytext;
+			return null;
+		},
+	};
+	const restartedController = new ReconciliationController({
+		app: app as any,
+		getSettings: () => ({ deviceName: "Test Device" }) as any,
+		getRuntimeConfig: () => ({
+			maxFileSizeBytes: 0,
+			maxFileSizeKB: 0,
+			excludePatterns: [],
+			externalEditPolicy: "always",
+		}) as any,
+		getVaultSync: () => restartVaultSync as any,
+		getDiskMirror: () => null,
+		getBlobSync: () => null,
+		getEditorBindings: () => editorBindings as any,
+		getDiskIndex: () => diskIndex,
+		setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
+		isMarkdownPathSyncable: () => true,
+		shouldBlockFrontmatterIngest: () => false,
+		refreshServerCapabilities: async () => {},
+		validateOpenEditorBindings: () => {},
+		onReconciled: () => {},
+		getAwaitingFirstProviderSyncAfterStartup: () => false,
+		setAwaitingFirstProviderSyncAfterStartup: () => {},
+		saveDiskIndex: async () => {},
+		refreshStatusBar: () => {},
+		trace: (source: string, msg: string, details?: Record<string, unknown>) => {
+			traces.push({ source, msg, details });
+		},
+		scheduleTraceStateSnapshot: () => {},
+		log: () => {},
+	});
+
+	await (restartedController as any).syncFileFromDisk(file, "modify");
+	assert(createdFiles.size === 2, "restart pass reuses existing conflict artifacts");
+
+	const restartTrace = traces.filter((t) => t.msg === "conflict-artifact-needed").at(-1);
+	assert(restartTrace?.details?.conflictSkippedDedupe === true, "restart pass reports durable artifact dedupe");
+	assert(restartTrace?.details?.conflictDedupeScope === "artifact", "restart dedupe scope is artifact");
+	assert(restartTrace?.details?.conflictArtifactCreated === false, "restart pass does not report a fresh artifact");
 
 	doc.destroy();
 }

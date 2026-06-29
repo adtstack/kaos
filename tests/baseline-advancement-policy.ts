@@ -87,7 +87,7 @@ console.log("\n--- Test 3: import-disk-to-crdt advances with diskHash ---");
 	assert(result.kind === "advance" && result.reason === "disk-wins-clean", "reason is disk-wins-clean");
 }
 
-console.log("\n--- Test 4: conflict-disk-wins advances with diskHash ---");
+console.log("\n--- Test 4: conflict-disk-wins defers until equality is observed ---");
 {
 	const result = planBaselineAdvancement({
 		actionKind: "conflict-disk-wins",
@@ -95,12 +95,11 @@ console.log("\n--- Test 4: conflict-disk-wins advances with diskHash ---");
 		crdtHash: CRDT_HASH,
 		previousBaselineHash: BASELINE_HASH,
 	});
-	assert(result.kind === "advance", "kind is advance");
-	assert(result.kind === "advance" && result.hash === DISK_HASH, "hash is diskHash");
-	assert(result.kind === "advance" && result.reason.includes("conflict"), "reason mentions conflict");
+	assert(result.kind === "defer", "kind is defer");
+	assert(result.reason === "conflict-winner-provisional", "reason marks provisional conflict winner");
 }
 
-console.log("\n--- Test 5: conflict-crdt-wins advances with crdtHash ---");
+console.log("\n--- Test 5: conflict-crdt-wins defers until equality is observed ---");
 {
 	const result = planBaselineAdvancement({
 		actionKind: "conflict-crdt-wins",
@@ -108,9 +107,8 @@ console.log("\n--- Test 5: conflict-crdt-wins advances with crdtHash ---");
 		crdtHash: CRDT_HASH,
 		previousBaselineHash: BASELINE_HASH,
 	});
-	assert(result.kind === "advance", "kind is advance");
-	assert(result.kind === "advance" && result.hash === CRDT_HASH, "hash is crdtHash");
-	assert(result.kind === "advance" && result.reason.includes("crdt-wins"), "reason mentions crdt-wins");
+	assert(result.kind === "defer", "kind is defer");
+	assert(result.reason === "conflict-winner-provisional", "reason marks provisional conflict winner");
 }
 
 console.log("\n--- Test 6: apply-remote-to-disk advances with crdtHash ---");
@@ -262,16 +260,13 @@ console.log("\n--- Test 14: null diskHash throws for disk-authority actions ---"
 		"import-disk-to-crdt throws on null diskHash",
 	);
 
-	assertThrows(
-		() => planBaselineAdvancement({
-			actionKind: "conflict-disk-wins",
-			diskHash: null,
-			crdtHash: CRDT_HASH,
-			previousBaselineHash: BASELINE_HASH,
-		}),
-		"requires diskHash",
-		"conflict-disk-wins throws on null diskHash",
-	);
+	const conflictResult = planBaselineAdvancement({
+		actionKind: "conflict-disk-wins",
+		diskHash: null,
+		crdtHash: CRDT_HASH,
+		previousBaselineHash: BASELINE_HASH,
+	});
+	assert(conflictResult.kind === "defer", "conflict-disk-wins can defer without diskHash");
 }
 
 console.log("\n--- Test 15: previousBaselineHash is not required ---");

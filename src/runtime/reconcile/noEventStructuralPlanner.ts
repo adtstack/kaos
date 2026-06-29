@@ -94,6 +94,9 @@ export function planNoEventStructuralRenames(input: {
 		if (oldPaths.length === 1 && newPaths.length === 1) {
 			const oldPath = oldPaths[0]!;
 			const newPath = newPaths[0]!;
+			if (basename(oldPath) !== basename(newPath)) {
+				continue;
+			}
 			renames.push({
 				oldPath,
 				newPath,

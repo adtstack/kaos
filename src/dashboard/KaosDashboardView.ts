@@ -1,4 +1,4 @@
-import { App, ItemView, Modal, Notice, TFile, type WorkspaceLeaf } from "obsidian";
+import { App, ItemView, Modal, Notice, Platform, TFile, type WorkspaceLeaf } from "obsidian";
 import type {
 	DashboardAttentionItem,
 	DashboardConflictArtifact,
@@ -6,11 +6,21 @@ import type {
 	DashboardRecentChange,
 	KaosDashboardData,
 } from "./dashboardTypes";
+import {
+	resolveKaosDashboardMode,
+	selectMobileOverviewMetrics,
+	type KaosDashboardMode,
+} from "./dashboardLayout";
 import { formatDashboardDeviceName } from "./deviceDisplay";
 import {
 	renderDiffLines as buildTextDiffLines,
 	type RenderedDiffLine,
 } from "../utils/textDiff";
+import {
+	mergeTexts3,
+	type ThreeWayMergeConflictHunk,
+	type ThreeWayMergeSegment,
+} from "../utils/threeWayMerge";
 import { ConfirmModal } from "../ui/ConfirmModal";
 
 export const KAOS_DASHBOARD_VIEW_TYPE = "kaos-dashboard";
@@ -28,6 +38,9 @@ export interface KaosDashboardActions {
 
 export interface KaosDashboardViewDeps {
 	collectData(): Promise<KaosDashboardData>;
+	getBaselineText?(contentHash: string): string | null;
+	getConflictMergeBaseHash?(artifactPath: string): string | null;
+	clearConflictMergeBase?(artifactPath: string): void;
 	actions: KaosDashboardActions;
 }
 
@@ -74,6 +87,7 @@ export class KaosDashboardView extends ItemView {
 			this.refreshTimer = null;
 		}
 		this.contentEl.removeClass("kaos-dashboard");
+		this.contentEl.classList.remove("is-phone-dashboard");
 		this.contentEl.empty();
 	}
 
@@ -96,8 +110,10 @@ export class KaosDashboardView extends ItemView {
 
 	private render(): void {
 		const root = this.contentEl;
+		const mode = this.getDashboardMode();
 		root.empty();
-		this.renderHeader(root);
+		root.classList.toggle("is-phone-dashboard", mode === "phone");
+		this.renderHeader(root, mode);
 		if (!this.data && this.loading) {
 			root.createDiv({ text: "Loading...", cls: "kaos-dashboard-muted" });
 			return;
@@ -108,6 +124,11 @@ export class KaosDashboardView extends ItemView {
 		}
 		if (!this.data) return;
 
+		if (mode === "phone") {
+			this.renderPhoneDashboard(root, this.data);
+			return;
+		}
+
 		this.renderActions(root, this.data);
 		this.renderOverview(root, this.data.overview);
 		this.renderSnapshots(root, this.data);
@@ -115,9 +136,13 @@ export class KaosDashboardView extends ItemView {
 		this.renderAttention(root, this.data.attention);
 	}
 
-	private renderHeader(root: HTMLElement): void {
+	private getDashboardMode(): KaosDashboardMode {
+		return resolveKaosDashboardMode(Platform);
+	}
+
+	private renderHeader(root: HTMLElement, mode: KaosDashboardMode): void {
 		const header = root.createDiv({ cls: "kaos-dashboard-header" });
-		header.createEl("h2", { text: "Dashboard" });
+		header.createEl("h2", { text: mode === "phone" ? "Mobile dashboard" : "Dashboard" });
 		const meta = header.createDiv({ cls: "kaos-dashboard-muted" });
 		if (this.data) {
 			const deviceName = formatDashboardDeviceName(
@@ -132,6 +157,42 @@ export class KaosDashboardView extends ItemView {
 		if (this.error) {
 			header.createDiv({ text: this.error, cls: "kaos-dashboard-error" });
 		}
+	}
+
+	private renderPhoneDashboard(root: HTMLElement, data: KaosDashboardData): void {
+		this.renderMobileSummary(root, data);
+		this.renderMobileActions(root, data);
+		if (data.attention.length > 0) {
+			this.renderAttention(root, data.attention);
+		}
+		if (data.conflicts.length > 0) {
+			this.renderConflicts(root, data.conflicts, data.settings.deviceName);
+		}
+		this.renderSnapshots(root, data, 10);
+		this.renderMobileOverview(root, selectMobileOverviewMetrics(data.overview));
+	}
+
+	private renderMobileSummary(root: HTMLElement, data: KaosDashboardData): void {
+		const status = data.overview.find((metric) => metric.label === "Status");
+		const connection = data.overview.find((metric) => metric.label === "Connection");
+		const recentValue = data.recentChanges.status === "ready"
+			? String(data.recentChanges.changes.length)
+			: data.recentChanges.status;
+		const metrics: DashboardMetric[] = [
+			{ label: "Status", value: status?.value ?? "unknown", tone: status?.tone },
+			{ label: "Connection", value: connection?.value ?? "unknown", tone: connection?.tone },
+			{ label: "Attention", value: String(data.attention.length), tone: data.attention.length > 0 ? "warn" : "ok" },
+			{ label: "Conflicts", value: String(data.conflicts.length), tone: data.conflicts.length > 0 ? "error" : "ok" },
+			{ label: "Recent changes", value: recentValue, tone: data.recentChanges.status === "error" ? "error" : undefined },
+			{
+				label: "Snapshots",
+				value: data.snapshotStatus.status === "ready"
+					? String(data.snapshotStatus.summary.snapshotCountLowerBound)
+					: data.snapshotStatus.status,
+				tone: data.snapshotStatus.status === "error" ? "error" : undefined,
+			},
+		];
+		this.renderMetricGrid(root, metrics, "kaos-dashboard-mobile-summary");
 	}
 
 	private renderActions(root: HTMLElement, data: KaosDashboardData): void {
@@ -152,9 +213,42 @@ export class KaosDashboardView extends ItemView {
 		this.button(section, "Export with filenames", async () => this.deps.actions.exportDiagnosticsWithFilenames());
 	}
 
+	private renderMobileActions(root: HTMLElement, data: KaosDashboardData): void {
+		const section = root.createDiv({ cls: "kaos-dashboard-actionbar kaos-dashboard-mobile-actionbar" });
+		this.button(section, "Refresh", () => this.refresh());
+		this.button(section, "Reconnect", async () => this.deps.actions.reconnect(), !data.actions.syncInitialized);
+		this.button(section, "Reconcile", async () => this.deps.actions.forceReconcile(), !data.actions.syncInitialized);
+		this.button(
+			section,
+			`Import${data.actions.untrackedFileCount > 0 ? ` (${data.actions.untrackedFileCount})` : ""}`,
+			() => this.deps.actions.importUntracked(),
+			!data.actions.syncInitialized || data.actions.untrackedFileCount === 0,
+		);
+		this.button(section, "Snapshot", () => this.deps.actions.takeSnapshotNow(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
+
+		const details = root.createEl("details", { cls: "kaos-dashboard-mobile-more-actions" });
+		details.createEl("summary", { text: "More actions" });
+		const more = details.createDiv({ cls: "kaos-dashboard-row-actions" });
+		this.button(more, "Browse snapshots", () => this.deps.actions.showSnapshotList(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
+		this.button(more, "File history", () => this.deps.actions.showRecoveryHistory(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
+		this.button(more, "Export diagnostics", async () => this.deps.actions.exportDiagnostics());
+		this.button(more, "Export with filenames", async () => this.deps.actions.exportDiagnosticsWithFilenames());
+	}
+
 	private renderOverview(root: HTMLElement, metrics: DashboardMetric[]): void {
 		const section = this.section(root, "Overview");
-		const grid = section.createDiv({ cls: "kaos-dashboard-metric-grid" });
+		this.renderMetricGrid(section, metrics);
+	}
+
+	private renderMobileOverview(root: HTMLElement, metrics: DashboardMetric[]): void {
+		const section = this.section(root, "Sync Detail");
+		this.renderMetricGrid(section, metrics);
+	}
+
+	private renderMetricGrid(root: HTMLElement, metrics: DashboardMetric[], extraClass = ""): void {
+		const grid = root.createDiv({
+			cls: ["kaos-dashboard-metric-grid", extraClass].filter(Boolean).join(" "),
+		});
 		for (const metric of metrics) {
 			const card = grid.createDiv({ cls: `kaos-dashboard-metric ${toneClass(metric.tone)}` });
 			card.createDiv({ text: metric.label, cls: "kaos-dashboard-metric-label" });
@@ -162,7 +256,7 @@ export class KaosDashboardView extends ItemView {
 		}
 	}
 
-	private renderSnapshots(root: HTMLElement, data: KaosDashboardData): void {
+	private renderSnapshots(root: HTMLElement, data: KaosDashboardData, changeLimit = 40): void {
 		const section = this.section(root, "Recent Changes");
 		const snapshotRow = section.createDiv({ cls: "kaos-dashboard-snapshot-summary" });
 		if (data.snapshotStatus.status === "ready") {
@@ -188,7 +282,7 @@ export class KaosDashboardView extends ItemView {
 			return;
 		}
 		const list = section.createDiv({ cls: "kaos-dashboard-list" });
-		for (const change of data.recentChanges.changes.slice(0, 40)) {
+		for (const change of data.recentChanges.changes.slice(0, changeLimit)) {
 			this.renderRecentChange(list, change, data.settings.deviceName);
 		}
 	}
@@ -330,11 +424,15 @@ export class KaosDashboardView extends ItemView {
 			this.app.vault.cachedRead(originalFile),
 			this.app.vault.cachedRead(artifactFile),
 		]);
+		const baseHash = this.deps.getConflictMergeBaseHash?.(artifact.artifactPath) ?? null;
+		const baseText = baseHash ? this.deps.getBaselineText?.(baseHash) ?? null : null;
 		new ConflictDiffModal(this.app, {
 			artifactPath: artifact.artifactPath,
 			originalPath: artifact.inferredOriginalPath,
 			originalText,
 			artifactText,
+			baseHash,
+			baseText,
 			onResolve: (choice) => this.resolveConflictArtifact(artifact, choice),
 		}).open();
 	}
@@ -348,11 +446,14 @@ export class KaosDashboardView extends ItemView {
 		if (!(artifactFile instanceof TFile) || !(originalFile instanceof TFile)) {
 			throw new Error("Both the conflict note and original note are required.");
 		}
-		if (choice === "artifact") {
+		if (choice.kind === "artifact") {
 			const artifactText = await this.app.vault.cachedRead(artifactFile);
 			await this.app.vault.modify(originalFile, artifactText);
+		} else if (choice.kind === "merged") {
+			await this.app.vault.modify(originalFile, choice.mergedText);
 		}
 		await this.app.vault.delete(artifactFile);
+		this.deps.clearConflictMergeBase?.(artifact.artifactPath);
 		await this.refresh(true);
 	}
 
@@ -362,17 +463,33 @@ export class KaosDashboardView extends ItemView {
 	}
 }
 
-type ConflictResolutionChoice = "original" | "artifact";
+type ConflictResolutionChoice =
+	| { kind: "original" }
+	| { kind: "artifact" }
+	| { kind: "merged"; mergedText: string };
 
 interface ConflictDiffModalData {
 	artifactPath: string;
 	originalPath: string;
 	originalText: string;
 	artifactText: string;
+	baseHash: string | null;
+	baseText: string | null;
 	onResolve(choice: ConflictResolutionChoice): Promise<void>;
 }
 
+interface ManualMergeModel {
+	mode: "clean" | "three-way" | "two-way";
+	hunks: ThreeWayMergeConflictHunk[];
+	segments: ThreeWayMergeSegment[];
+	cleanText?: string;
+}
+
 class ConflictDiffModal extends Modal {
+	private mergeModel: ManualMergeModel | null = null;
+	private hunkEdits = new Map<number, string>();
+	private previewEl: HTMLTextAreaElement | null = null;
+
 	constructor(
 		app: App,
 		private readonly data: ConflictDiffModalData,
@@ -390,19 +507,26 @@ class ConflictDiffModal extends Modal {
 		const pathGrid = contentEl.createDiv({ cls: "kaos-conflict-diff-paths" });
 		this.renderPath(pathGrid, "Original", this.data.originalPath);
 		this.renderPath(pathGrid, "Conflict artifact", this.data.artifactPath);
-
-		const legend = contentEl.createDiv({ cls: "kaos-conflict-diff-legend" });
-		legend.createEl("span", { text: "- original", cls: "kaos-conflict-diff-delete" });
-		legend.createEl("span", { text: "+ artifact", cls: "kaos-conflict-diff-insert" });
+		this.renderPath(pathGrid, "Base", this.data.baseHash ? `available (${this.data.baseHash.slice(0, 12)})` : "not available");
 
 		const actions = contentEl.createDiv({ cls: "modal-button-container kaos-conflict-diff-actions" });
 		actions.createEl("button", { text: "Keep original" }).addEventListener("click", () => {
-			this.confirmResolution("original");
+			this.confirmResolution({ kind: "original" });
 		});
 		actions.createEl("button", { text: "Use artifact", cls: "mod-cta" }).addEventListener("click", () => {
-			this.confirmResolution("artifact");
+			this.confirmResolution({ kind: "artifact" });
+		});
+		actions.createEl("button", { text: "Apply merged", cls: "mod-cta" }).addEventListener("click", () => {
+			this.confirmResolution({ kind: "merged", mergedText: this.currentMergedText() });
 		});
 		actions.createEl("button", { text: "Close" }).addEventListener("click", () => this.close());
+
+		this.renderManualMerge(contentEl);
+
+		contentEl.createEl("h4", { text: "Original vs artifact diff", cls: "kaos-conflict-diff-heading" });
+		const legend = contentEl.createDiv({ cls: "kaos-conflict-diff-legend" });
+		legend.createEl("span", { text: "- original", cls: "kaos-conflict-diff-delete" });
+		legend.createEl("span", { text: "+ artifact", cls: "kaos-conflict-diff-insert" });
 
 		const diffBody = contentEl.createDiv({ cls: "kaos-conflict-diff-body" });
 		this.renderDiffLines(
@@ -426,6 +550,198 @@ class ConflictDiffModal extends Modal {
 		item.createDiv({ text: path, cls: "kaos-conflict-diff-path-value" });
 	}
 
+	private renderManualMerge(parent: HTMLElement): void {
+		this.mergeModel = this.buildMergeModel();
+		this.hunkEdits.clear();
+		const root = parent.createDiv({ cls: "kaos-conflict-merge" });
+		root.createEl("h4", { text: this.mergeModel.mode === "two-way" ? "Manual merge" : "3-way merge" });
+
+		if (this.mergeModel.hunks.length > 0) {
+			for (const hunk of this.mergeModel.hunks) {
+				this.hunkEdits.set(hunk.index, hunk.leftText);
+				this.renderMergeHunk(root, hunk, this.mergeModel.mode);
+			}
+		}
+
+		const previewWrap = root.createDiv({ cls: "kaos-conflict-merge-preview" });
+		previewWrap.createDiv({ text: "Merged", cls: "kaos-conflict-diff-path-label" });
+		this.previewEl = previewWrap.createEl("textarea", {
+			cls: "kaos-conflict-merge-preview-text",
+		});
+		this.previewEl.readOnly = true;
+		this.updateMergePreview();
+	}
+
+	private buildMergeModel(): ManualMergeModel {
+		if (this.data.baseText !== null) {
+			const result = mergeTexts3(this.data.baseText, this.data.originalText, this.data.artifactText);
+			if (result.kind === "clean-merge") {
+				return {
+					mode: "clean",
+					hunks: [],
+					segments: [{ kind: "text", text: result.mergedText }],
+					cleanText: result.mergedText,
+				};
+			}
+			if (result.kind === "conflict") {
+				return {
+					mode: "three-way",
+					hunks: result.hunks,
+					segments: result.segments,
+				};
+			}
+		}
+
+		const fallbackHunk: ThreeWayMergeConflictHunk = {
+			index: 0,
+			baseStart: 0,
+			baseEnd: 0,
+			baseText: "",
+			leftText: this.data.originalText,
+			rightText: this.data.artifactText,
+		};
+		return {
+			mode: "two-way",
+			hunks: [fallbackHunk],
+			segments: [{ kind: "conflict", hunkIndex: 0 }],
+		};
+	}
+
+	private renderMergeHunk(parent: HTMLElement, hunk: ThreeWayMergeConflictHunk, mode: ManualMergeModel["mode"]): void {
+		const item = parent.createDiv({ cls: "kaos-conflict-merge-hunk" });
+		item.createDiv({
+			text: `Hunk ${hunk.index + 1}`,
+			cls: "kaos-conflict-merge-hunk-title",
+		});
+
+		const paneGrid = item.createDiv({ cls: "kaos-conflict-merge-pane-grid" });
+		this.renderMergeSourcePane(paneGrid, "Base", hunk.baseText, {
+			kind: "base",
+			baseText: hunk.baseText,
+			diffAgainstBase: false,
+			unavailable: mode === "two-way",
+		});
+		this.renderMergeSourcePane(paneGrid, "Original", hunk.leftText, {
+			kind: "original",
+			baseText: hunk.baseText,
+			diffAgainstBase: mode !== "two-way",
+			unavailable: false,
+		});
+		this.renderMergeSourcePane(paneGrid, "Artifact", hunk.rightText, {
+			kind: "artifact",
+			baseText: hunk.baseText,
+			diffAgainstBase: mode !== "two-way",
+			unavailable: false,
+		});
+
+		const buttons = item.createDiv({ cls: "kaos-conflict-merge-hunk-actions" });
+		const editor = item.createDiv({ cls: "kaos-conflict-merge-editor" });
+		editor.createDiv({ text: "Merged", cls: "kaos-conflict-diff-path-label" });
+		const textarea = editor.createEl("textarea", { cls: "kaos-conflict-merge-hunk-text" });
+		textarea.value = hunk.leftText;
+		textarea.addEventListener("input", () => {
+			this.hunkEdits.set(hunk.index, textarea.value);
+			this.updateMergePreview();
+		});
+		const setText = (text: string) => {
+			textarea.value = text;
+			this.hunkEdits.set(hunk.index, text);
+			this.updateMergePreview();
+		};
+		buttons.createEl("button", { text: "Use original" }).addEventListener("click", () => setText(hunk.leftText));
+		buttons.createEl("button", { text: "Use artifact" }).addEventListener("click", () => setText(hunk.rightText));
+		buttons.createEl("button", { text: "Use both" }).addEventListener("click", () => setText(combineBoth(hunk.leftText, hunk.rightText)));
+		buttons.createEl("button", { text: "Edit merged" }).addEventListener("click", () => textarea.focus());
+	}
+
+	private renderMergeSourcePane(
+		parent: HTMLElement,
+		label: string,
+		text: string,
+		options: {
+			kind: "base" | "original" | "artifact";
+			baseText: string;
+			diffAgainstBase: boolean;
+			unavailable: boolean;
+		},
+	): void {
+		const pane = parent.createDiv({ cls: `kaos-conflict-merge-pane is-${options.kind}` });
+		pane.createDiv({ text: label, cls: "kaos-conflict-merge-pane-label" });
+		const body = pane.createDiv({ cls: "kaos-conflict-merge-pane-body" });
+		if (options.unavailable) {
+			this.renderMergeEmptyText(body, "Base not available");
+			return;
+		}
+		if (options.kind === "base") {
+			this.renderMergePlainText(body, text, "Empty base");
+			return;
+		}
+		if (!options.diffAgainstBase) {
+			this.renderMergePlainText(body, text, `Empty ${label.toLowerCase()}`);
+			return;
+		}
+		this.renderMergeVariantDiff(body, options.baseText, text, options.kind);
+	}
+
+	private renderMergeVariantDiff(
+		parent: HTMLElement,
+		baseText: string,
+		variantText: string,
+		kind: "original" | "artifact",
+	): void {
+		const lines = buildTextDiffLines(baseText, variantText, {
+			maxSegments: 200,
+			maxLinesPerSegment: 200,
+		});
+		if (lines.length === 0) {
+			this.renderMergeEmptyText(parent, "No changes");
+			return;
+		}
+		for (const line of lines) {
+			const changed = line.kind !== "equal" && line.kind !== "context";
+			const prefix = line.kind === "delete" ? "- " : line.kind === "insert" ? "+ " : "  ";
+			const text = line.text.length === 0 ? prefix : `${prefix}${line.text}`;
+			const cls = [
+				"kaos-conflict-merge-pane-line",
+				changed ? `is-${kind}-change` : "",
+				line.kind === "context" ? "is-context" : "",
+			].filter(Boolean).join(" ");
+			parent.createDiv({ text, cls });
+		}
+	}
+
+	private renderMergePlainText(parent: HTMLElement, text: string, emptyText: string): void {
+		const lines = splitDisplayLines(text);
+		if (lines.length === 0) {
+			this.renderMergeEmptyText(parent, emptyText);
+			return;
+		}
+		for (const line of lines) {
+			parent.createDiv({
+				text: line.length === 0 ? "  " : `  ${line}`,
+				cls: "kaos-conflict-merge-pane-line",
+			});
+		}
+	}
+
+	private renderMergeEmptyText(parent: HTMLElement, text: string): void {
+		parent.createDiv({ text, cls: "kaos-conflict-merge-pane-empty" });
+	}
+
+	private currentMergedText(): string {
+		const model = this.mergeModel ?? this.buildMergeModel();
+		if (model.cleanText !== undefined) return model.cleanText;
+		return model.segments.map((segment) => {
+			if (segment.kind === "text") return segment.text;
+			return this.hunkEdits.get(segment.hunkIndex) ?? "";
+		}).join("");
+	}
+
+	private updateMergePreview(): void {
+		if (!this.previewEl) return;
+		this.previewEl.value = this.currentMergedText();
+	}
+
 	private renderDiffLines(parent: HTMLElement, lines: RenderedDiffLine[]): void {
 		for (const line of lines) {
 			const prefix = line.kind === "delete" ? "- " : line.kind === "insert" ? "+ " : "  ";
@@ -441,15 +757,18 @@ class ConflictDiffModal extends Modal {
 	}
 
 	private confirmResolution(choice: ConflictResolutionChoice): void {
-		const useArtifact = choice === "artifact";
+		const useArtifact = choice.kind === "artifact";
+		const useMerged = choice.kind === "merged";
 		new ConfirmModal(
 			this.app,
-			useArtifact ? "Use conflict artifact?" : "Keep original note?",
-			useArtifact
+			useMerged ? "Apply merged result?" : useArtifact ? "Use conflict artifact?" : "Keep original note?",
+			useMerged
+				? `Replace "${this.data.originalPath}" with the merged result, then delete "${this.data.artifactPath}"?`
+				: useArtifact
 				? `Replace "${this.data.originalPath}" with the conflict artifact content, then delete "${this.data.artifactPath}"?`
 				: `Keep "${this.data.originalPath}" as-is and delete "${this.data.artifactPath}"?`,
 			() => this.applyResolution(choice),
-			useArtifact ? "Use artifact" : "Keep original",
+			useMerged ? "Apply merged" : useArtifact ? "Use artifact" : "Keep original",
 			"Cancel",
 		).open();
 	}
@@ -457,7 +776,13 @@ class ConflictDiffModal extends Modal {
 	private async applyResolution(choice: ConflictResolutionChoice): Promise<void> {
 		try {
 			await this.data.onResolve(choice);
-			new Notice(choice === "artifact" ? "Conflict resolved using artifact." : "Conflict artifact deleted.");
+			new Notice(
+				choice.kind === "merged"
+					? "Conflict resolved using merged result."
+					: choice.kind === "artifact"
+						? "Conflict resolved using artifact."
+						: "Conflict artifact deleted.",
+			);
 			this.close();
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
@@ -465,6 +790,20 @@ class ConflictDiffModal extends Modal {
 			console.warn("[kaos] conflict resolution failed:", err);
 		}
 	}
+}
+
+function combineBoth(left: string, right: string): string {
+	if (left.length === 0) return right;
+	if (right.length === 0) return left;
+	if (left.endsWith("\n") || right.startsWith("\n")) return left + right;
+	return `${left}\n${right}`;
+}
+
+function splitDisplayLines(text: string): string[] {
+	if (text.length === 0) return [];
+	const lines = text.split(/\r?\n/);
+	if (lines[lines.length - 1] === "") lines.pop();
+	return lines;
 }
 
 function toneClass(tone: string | undefined): string {

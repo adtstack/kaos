@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import yaml from "js-yaml";
 
-const vaultRoot = process.argv[2] ?? "/home/user/vault";
+const vaultRoot = process.argv[2] ?? "/tmp/kaos-test-vault";
 const rounds = Math.max(40, Number.parseInt(process.argv[3] ?? "120", 10));
 const maxFileBytes = Math.max(256 * 1024, Number.parseInt(process.argv[4] ?? `${2 * 1024 * 1024}`, 10));
 const profile = (process.argv[5] ?? "all").trim();

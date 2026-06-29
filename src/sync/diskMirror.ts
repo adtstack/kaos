@@ -138,7 +138,7 @@ export class DiskMirror {
 	 * The hash is pre-computed here (where the content is in scope) to keep
 	 * the caller free of crypto concerns. Use to update disk index baselines.
 	 */
-	private _onDiskWriteCallback: ((path: string, contentHash: string) => void) | null = null;
+	private _onDiskWriteCallback: ((path: string, contentHash: string, content: string) => void) | null = null;
 
 	/**
 	 * Per-path timestamp of the most recent successful `flushWrite`. Updated
@@ -187,7 +187,7 @@ export class DiskMirror {
 	 * content written (pre-computed in diskMirror to avoid redundant re-reads).
 	 * Use this to update content-hash baselines in the disk index.
 	 */
-	setDiskWriteCallback(callback: (path: string, contentHash: string) => void): void {
+	setDiskWriteCallback(callback: (path: string, contentHash: string, content: string) => void): void {
 		this._onDiskWriteCallback = callback;
 	}
 
@@ -550,7 +550,7 @@ export class DiskMirror {
 				await this.app.vault.modify(existing, content);
 				this.log(`flushWrite: updated "${path}" (${content.length} chars)`);
 				this.lastDiskWriteOkAt.set(normalized, Date.now());
-				this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content));
+				this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content), content);
 				this._flightEventHandler?.({
 					priority: "important",
 					kind: "disk.write.ok",
@@ -579,7 +579,7 @@ export class DiskMirror {
 					`flushWrite: created "${path}" on disk (${content.length} chars)`,
 				);
 				this.lastDiskWriteOkAt.set(normalized, Date.now());
-				this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content));
+				this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content), content);
 				this._flightEventHandler?.({
 					priority: "important",
 					kind: "disk.write.ok",

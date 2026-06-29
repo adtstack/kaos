@@ -20,8 +20,8 @@ export type BaselineActionKind =
 	| "crdt-created-on-disk"       // CRDT file written to new disk location
 	| "disk-seeded-to-crdt"        // Disk file seeded into CRDT for first time
 	| "import-disk-to-crdt"        // Disk wins clean (crdt was at baseline)
-	| "conflict-disk-wins"         // Conflict artifact created, disk winner
-	| "conflict-crdt-wins"         // Conflict artifact created, crdt winner
+	| "conflict-disk-wins"         // Conflict artifact created, disk winner; baseline remains provisional
+	| "conflict-crdt-wins"         // Conflict artifact created, crdt winner; baseline remains provisional
 	| "apply-remote-to-disk"       // CRDT changed, disk unchanged, flushed
 	| "no-op"                      // Disk == CRDT, settle the common content
 	| "defer-to-crdt-flush"        // Open/bound/non-authoritative, flushed
@@ -83,10 +83,7 @@ export function planBaselineAdvancement(
 			return { kind: "advance", hash: crdtHash, reason: "remote-applied-to-disk" };
 
 		case "conflict-crdt-wins":
-			if (crdtHash === null) {
-				throw new Error("planBaselineAdvancement: conflict-crdt-wins requires crdtHash");
-			}
-			return { kind: "advance", hash: crdtHash, reason: "conflict-resolved-crdt-wins" };
+			return { kind: "defer", reason: "conflict-winner-provisional" };
 
 		case "no-op":
 			// Disk and CRDT are identical. Use crdtHash (same as diskHash).
@@ -116,10 +113,7 @@ export function planBaselineAdvancement(
 			return { kind: "advance", hash: diskHash, reason: "disk-wins-clean" };
 
 		case "conflict-disk-wins":
-			if (diskHash === null) {
-				throw new Error("planBaselineAdvancement: conflict-disk-wins requires diskHash");
-			}
-			return { kind: "advance", hash: diskHash, reason: "conflict-resolved-disk-wins" };
+			return { kind: "defer", reason: "conflict-winner-provisional" };
 
 		// --- Live-sync ---
 		case "live-disk-to-crdt":

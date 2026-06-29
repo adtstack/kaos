@@ -64,6 +64,7 @@ const suites = [
 	[JITI, "tests/frontmatter-guard-orchestration.ts"],
 	[NODE, "tests/disk-mirror-regressions.mjs"],
 	[JITI, "tests/disk-mirror-origin-classification.ts"],
+	[JITI, "tests/disk-index-persistence-wiring.ts"],
 	[NODE, "tests/server-pre-auth-trace.mjs"],
 	[NODE, "tests/server-do-amplification.mjs"],
 	[JITI, "tests/diagnostics-redaction.mjs"],
@@ -144,6 +145,7 @@ const suites = [
 	[JITI, "tests/conflict-artifact-path.ts"],
 	[JITI, "tests/dashboard-data.ts"],
 	[JITI, "tests/text-diff.ts"],
+	[JITI, "tests/three-way-merge.ts"],
 	// Autophagy: TraceSink dependency inversion
 	[JITI, "tests/trace-sink.ts"],
 	// Autophagy: QA port fencing

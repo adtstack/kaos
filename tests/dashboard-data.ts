@@ -4,6 +4,10 @@ import {
 	collectDashboardAttention,
 	collectDashboardConflictArtifacts,
 } from "../src/dashboard/dashboardData";
+import {
+	resolveKaosDashboardMode,
+	selectMobileOverviewMetrics,
+} from "../src/dashboard/dashboardLayout";
 import { formatDashboardDeviceName } from "../src/dashboard/deviceDisplay";
 import type { KaosDashboardCollectorInput } from "../src/dashboard/dashboardTypes";
 
@@ -216,6 +220,34 @@ console.log("\n--- Test 5: dashboard device display marks this device ---");
 		formatDashboardDeviceName("device-a", "device-local") === "device-a",
 		"remote device display is unchanged",
 	);
+}
+
+console.log("\n--- Test 6: dashboard layout switches only for phones ---");
+{
+	assert(
+		resolveKaosDashboardMode({ isMobile: true, isPhone: true, isTablet: false }) === "phone",
+		"phone mobile app uses phone dashboard mode",
+	);
+	assert(
+		resolveKaosDashboardMode({ isMobile: true, isPhone: false, isTablet: true }) === "desktop",
+		"tablet mobile app keeps full dashboard mode",
+	);
+	assert(
+		resolveKaosDashboardMode({ isMobile: false, isPhone: false, isTablet: false }) === "desktop",
+		"desktop app keeps full dashboard mode",
+	);
+}
+
+console.log("\n--- Test 7: mobile overview keeps actionable metrics ---");
+{
+	const data = buildKaosDashboardData(baseInput);
+	const mobileMetrics = selectMobileOverviewMetrics(data.overview);
+	const labels = mobileMetrics.map((metric) => metric.label);
+	assert(labels.includes("Status"), "mobile overview keeps status");
+	assert(labels.includes("Connection"), "mobile overview keeps connection");
+	assert(labels.includes("Server receipt"), "mobile overview keeps server receipt");
+	assert(labels.includes("Untracked"), "mobile overview keeps untracked count");
+	assert(!labels.includes("Open files"), "mobile overview drops passive open-file metric");
 }
 
 console.log(`\nResults: ${passed} passed, ${failed} failed\n`);

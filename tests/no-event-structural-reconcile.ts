@@ -212,6 +212,53 @@ console.log("\n--- No-event structural reconcile: moved markdown is CRDT rename 
 	assertEq(fx.controller.getState().unresolvedStructuralChangeCount, 0, "no unresolved structural changes");
 }
 
+console.log("\n--- No-event structural reconcile: same template daily notes are independent files ---");
+{
+	const fx = buildFixture({
+		oldPath: "Journal/2026-06-25.md",
+		oldContent: "# Daily\n\n",
+		newPath: "Journal/2026-06-26.md",
+		newContent: "# Daily\n\n",
+	});
+
+	await fx.controller.runReconciliation("authoritative");
+	const events = fx.events.slice(fx.eventBoundary);
+
+	assert(fx.vaultSync.getTextForPath("Journal/2026-06-25.md") !== null, "old daily note remains in CRDT");
+	assert(fx.vaultSync.getTextForPath("Journal/2026-06-26.md") !== null, "new daily note is admitted separately");
+	assertEq(fx.vaultSync.getFileId("Journal/2026-06-25.md"), fx.oldFileId, "old daily note keeps its file ID");
+	assert(
+		fx.vaultSync.getFileId("Journal/2026-06-26.md") !== fx.oldFileId,
+		"new daily note gets a distinct file ID",
+	);
+	assert(
+		fx.flushWrites.includes("Journal/2026-06-25.md"),
+		"old daily note may be restored to disk, not renamed into the new date",
+	);
+	assertEq(
+		events.filter((event) =>
+			event.kind === "reconcile.file.decision" &&
+			event.data.decision === "rename-crdt-path-to-disk"
+		).length,
+		0,
+		"no inferred rename decision emitted",
+	);
+	assertEq(
+		events.filter((event) =>
+			event.kind === "reconcile.file.decision" &&
+			event.data.decision === "unresolved-ambiguous-structural-change"
+		).length,
+		0,
+		"no structural conflict decision emitted",
+	);
+	assertEq(
+		events.filter((event) => event.kind === "crdt.file.created" && event.path === "Journal/2026-06-26.md").length,
+		1,
+		"new daily note is admitted as a create",
+	);
+	assertEq(fx.controller.getState().unresolvedStructuralChangeCount, 0, "no unresolved structural changes");
+}
+
 console.log("\n--- No-event structural reconcile: moved and edited markdown is unresolved ---");
 {
 	const fx = buildFixture({

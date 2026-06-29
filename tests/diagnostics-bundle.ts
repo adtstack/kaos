@@ -62,7 +62,7 @@ async function sha256Hex(text: string): Promise<string> {
 
 const SENSITIVE_HOST      = "https://my-secret-worker.workers.dev";
 const SENSITIVE_VAULT     = "vault-id-abc123";
-const SENSITIVE_DEVICE    = "example-laptop";
+const SENSITIVE_DEVICE    = "private-device-fixture";
 const KNOWN_PATH_1        = "Projects/secret-plan.md";
 const KNOWN_PATH_2        = "Inbox/private-note.md";
 // Path that only appears in serverTrace — NOT in diskHashes or crdtHashes.

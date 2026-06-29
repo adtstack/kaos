@@ -336,7 +336,7 @@ console.log("\n--- Test 12: safe-mode bundle shape — no tokenPrefix, vaultId, 
 	const withLeaks = {
 		settings: {
 			token: "tok_abcdef01...",
-			deviceName: "Example Laptop",
+			deviceName: "Personal Laptop Fixture",
 		},
 	};
 	const outLeaks = redactor.redactDeep(withLeaks);
@@ -345,7 +345,7 @@ console.log("\n--- Test 12: safe-mode bundle shape — no tokenPrefix, vaultId, 
 		"non-path token string is NOT altered by path redactor (service must scrub it explicitly)",
 	);
 	assert(
-		outLeaks.settings.deviceName === "Example Laptop",
+		outLeaks.settings.deviceName === "Personal Laptop Fixture",
 		"non-path deviceName is NOT altered by path redactor (service must set it to '(redacted)')",
 	);
 }

@@ -8,7 +8,7 @@ import * as Y from "yjs";
 import YSyncProvider from "y-partyserver/provider";
 import WebSocket from "ws";
 
-const HOST = process.env.KAOS_TEST_HOST || "https://kaos-staging.example.workers.dev";
+const HOST = process.env.KAOS_TEST_HOST || "https://kaos-test.example.invalid";
 const TOKEN = process.env.SYNC_TOKEN;
 const VAULT_ID = process.env.KAOS_TEST_VAULT_ID || `persistence-evict-${Date.now().toString(36)}`;
 const PREFIX = `/vault/sync/${encodeURIComponent(VAULT_ID)}`;

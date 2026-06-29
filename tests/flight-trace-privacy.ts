@@ -70,9 +70,9 @@ function containsSensitive(
 
 const RAW_PATH = "Projects/secret/finance.md";
 const HOST_URL = "https://my-sync-server.example.com";
-const DEVICE_NAME = "MacBook-Example-Private";
+const DEVICE_NAME = "Private-Laptop-Fixture";
 const VAULT_ID = "vault-id-very-unique-12345";
-const SYNC_TOKEN = "Bearer test-sync-token-redaction-sentinel";
+const SYNC_TOKEN = "Bearer sk_live_abcdef1234567890";
 
 const SENSITIVE_VALUES = [RAW_PATH, HOST_URL, DEVICE_NAME, VAULT_ID, SYNC_TOKEN];
 

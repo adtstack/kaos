@@ -36,6 +36,16 @@ console.log("\n--- No-event structural planner: unique file move ---");
 	assertEq(plan.unresolved.length, 0, "no unresolved changes");
 }
 
+console.log("\n--- No-event structural planner: same content with different basename is not inferred as rename ---");
+{
+	const plan = planNoEventStructuralRenames({
+		missingCrdtPaths: [{ path: "Journal/2026-06-25.md", contentHash: "same-template" }],
+		extraDiskPaths: [{ path: "Journal/2026-06-26.md", contentHash: "same-template" }],
+	});
+	assertEq(plan.renames.length, 0, "different basenames are not auto-renamed");
+	assertEq(plan.unresolved.length, 0, "different basenames are not surfaced as structural conflicts");
+}
+
 console.log("\n--- No-event structural planner: folder move with unique hashes ---");
 {
 	const plan = planNoEventStructuralRenames({

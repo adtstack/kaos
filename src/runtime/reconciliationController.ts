@@ -31,6 +31,7 @@ import {
 } from "../sync/diff";
 import { decideExternalEditImport } from "../sync/externalEditPolicy";
 import { yTextToString } from "../utils/format";
+import { mergeTexts3 } from "../utils/threeWayMerge";
 import {
 	ORIGIN_DISK_SYNC,
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
@@ -121,6 +122,9 @@ interface ReconciliationControllerDeps {
 	getEditorBindings(): EditorBindingManager | null;
 	getDiskIndex(): DiskIndex;
 	setDiskIndex(index: DiskIndex): void;
+	getBaselineText?(contentHash: string): string | null;
+	recordBaselineText?(contentHash: string, text: string): void;
+	recordConflictMergeBase?(artifactPath: string, baseHash: string): void;
 	isMarkdownPathSyncable(path: string): boolean;
 	shouldBlockFrontmatterIngest(
 		path: string,
@@ -893,11 +897,21 @@ export class ReconciliationController {
 				// Stored in the disk index as the three-way baseline for the
 				// next startup reconcile (after plugin disable/re-enable).
 				const settledHashes = new Map<string, string>();
+				const settledBaselineTexts = new Map<string, string>();
+				const recordSettledBaseline = (path: string, hash: string, text: string) => {
+					settledHashes.set(path, hash);
+					settledBaselineTexts.set(hash, text);
+				};
 
 				// Track paths that need CRDT→disk flush, along with the semantic reason.
 				// This preserves the action kind so planBaselineAdvancement gets the
 				// correct input, not a flattened "defer-to-crdt-flush" for everything.
 				const updatesToFlush: Array<{ path: string; baselineActionKind: BaselineActionKind }> = [];
+				const actionPaths = new Set<string>([
+					...result.createdOnDisk,
+					...result.seededToCrdt,
+					...result.updatedOnDisk,
+				]);
 				for (const path of result.createdOnDisk) {
 					this.deps.recordFlightPathEvent?.({
 						priority: "important",
@@ -927,7 +941,7 @@ export class ReconciliationController {
 							previousBaselineHash: null,
 						});
 						if (baselineAction.kind === "advance") {
-							settledHashes.set(path, baselineAction.hash);
+							recordSettledBaseline(path, baselineAction.hash, crdtContent);
 						}
 					}
 				}
@@ -950,8 +964,31 @@ export class ReconciliationController {
 							previousBaselineHash: null,
 						});
 						if (baselineAction.kind === "advance") {
-							settledHashes.set(path, baselineAction.hash);
+							recordSettledBaseline(path, baselineAction.hash, diskContent);
 						}
+					}
+				}
+				for (const [path, diskContent] of diskFiles) {
+					if (actionPaths.has(path)) {
+						continue;
+					}
+					const ytext = vaultSync.getTextForPath(path);
+					if (!ytext) {
+						continue;
+					}
+					const crdtContent = yTextToString(ytext) ?? "";
+					if (crdtContent !== diskContent) {
+						continue;
+					}
+					const contentHash = await contentBaselineHash(diskContent);
+					const baselineAction = planBaselineAdvancement({
+						actionKind: "no-op",
+						diskHash: contentHash,
+						crdtHash: contentHash,
+						previousBaselineHash: this.deps.getDiskIndex()[path]?.contentHash ?? null,
+					});
+					if (baselineAction.kind === "advance") {
+						recordSettledBaseline(path, baselineAction.hash, diskContent);
 					}
 				}
 				for (const path of result.updatedOnDisk) {
@@ -1030,6 +1067,34 @@ export class ReconciliationController {
 
 						// Execute the planned action.
 						if (action.kind === "create-conflict-artifact") {
+							if (action.reason === "both-changed" && baselineHash !== null) {
+								const baseText = this.deps.getBaselineText?.(baselineHash) ?? null;
+								const mergeResult = mergeTexts3(baseText, diskContent, crdtContent);
+								if (mergeResult.kind === "clean-merge") {
+									forceReplaceYText(ytext, mergeResult.mergedText, ORIGIN_DISK_SYNC_RECOVER_BOUND);
+									await diskMirror.flushWrite(path, true);
+									flushedUpdates++;
+									const mergedHash = await contentBaselineHash(mergeResult.mergedText);
+									recordSettledBaseline(path, mergedHash, mergeResult.mergedText);
+									this.deps.trace("reconcile", "closed-file-3way-auto-merged", {
+										path,
+										baselineHash,
+										diskLength: diskContent.length,
+										crdtLength: crdtContent.length,
+										mergedLength: mergeResult.mergedText.length,
+									});
+									continue;
+								}
+								if (mergeResult.kind === "conflict") {
+									this.deps.trace("conflict", "closed-file-manual-merge-required", {
+										path,
+										baselineHash,
+										hunkCount: mergeResult.hunks.length,
+										diskLength: diskContent.length,
+										crdtLength: crdtContent.length,
+									});
+								}
+							}
 							try {
 								const preservedContent = action.preserveSide === "disk" ? diskContent : crdtContent;
 								const conflictPath = await this.createMarkdownConflictArtifact(
@@ -1038,6 +1103,9 @@ export class ReconciliationController {
 									`closed-file-${action.reason}`,
 									action.preserveSide,
 								);
+								if (baselineHash !== null) {
+									this.deps.recordConflictMergeBase?.(conflictPath, baselineHash);
+								}
 								if (action.winner === "disk") {
 									forceReplaceYText(ytext, diskContent, ORIGIN_DISK_SYNC_RECOVER_BOUND);
 									const baselineAction = planBaselineAdvancement({
@@ -1047,7 +1115,7 @@ export class ReconciliationController {
 										previousBaselineHash: baselineHash,
 									});
 									if (baselineAction.kind === "advance") {
-										settledHashes.set(path, baselineAction.hash);
+										recordSettledBaseline(path, baselineAction.hash, diskContent);
 									}
 								} else {
 									updatesToFlush.push({ path, baselineActionKind: "conflict-crdt-wins" });
@@ -1090,7 +1158,7 @@ export class ReconciliationController {
 								previousBaselineHash: baselineHash,
 							});
 							if (baselineAction.kind === "advance") {
-								settledHashes.set(path, baselineAction.hash);
+								recordSettledBaseline(path, baselineAction.hash, diskContent);
 							}
 							this.deps.trace("reconcile", "closed-file-disk-wins-clean", {
 								path,
@@ -1113,7 +1181,8 @@ export class ReconciliationController {
 					// Record settled baseline hash: CRDT content was written to disk
 					const ytext = vaultSync.getTextForPath(path);
 					if (ytext) {
-						const crdtHash = await contentBaselineHash(yTextToString(ytext) ?? "");
+						const crdtContent = yTextToString(ytext) ?? "";
+						const crdtHash = await contentBaselineHash(crdtContent);
 						// Use the preserved action kind for accurate baseline advancement.
 						const baselineAction = planBaselineAdvancement({
 							actionKind: baselineActionKind,
@@ -1122,7 +1191,7 @@ export class ReconciliationController {
 							previousBaselineHash: null,
 						});
 						if (baselineAction.kind === "advance") {
-							settledHashes.set(path, baselineAction.hash);
+							recordSettledBaseline(path, baselineAction.hash, crdtContent);
 						}
 					}
 				}
@@ -1138,6 +1207,9 @@ export class ReconciliationController {
 					excludePaths: blockedIndexPathsInner,
 					settledHashes,
 				}));
+				for (const [hash, text] of settledBaselineTexts) {
+					this.deps.recordBaselineText?.(hash, text);
+				}
 			} else {
 				// Safety brake triggered: exclude all planned updates from index.
 				const blockedIndexPaths = result.updatedOnDisk;
@@ -1184,8 +1256,8 @@ export class ReconciliationController {
 			});
 
 			this.untrackedFiles = result.untracked;
+			await this.deps.saveDiskIndex();
 			this.reconciled = true;
-			void this.deps.saveDiskIndex();
 
 			const integrity = vaultSync.runIntegrityChecks();
 			if (integrity.duplicateIds > 0 || integrity.orphansCleaned > 0) {
@@ -2465,6 +2537,8 @@ export class ReconciliationController {
 		let diskConflictPath: string | null = null;
 		let conflictError: string | null = null;
 		let conflictSkippedDedupe = false;
+		let conflictDedupeScope: "session" | "artifact" | null = null;
+		let conflictArtifactCreated = false;
 		if (crdtContent != null) {
 			// Dedupe: if the same ambiguous fingerprint was already turned into
 			// a conflict artifact, do not create another one. This prevents
@@ -2484,34 +2558,66 @@ export class ReconciliationController {
 			const previousConflictFingerprint = this.lastConflictFingerprints.get(file.path);
 			if (previousConflictFingerprint === conflictFingerprint) {
 				conflictSkippedDedupe = true;
+				conflictDedupeScope = "session";
 			} else {
 				try {
-					conflictPath = await this.createMarkdownConflictArtifact(
-						file.path,
-						crdtContent,
-						"bound-file-ambiguous-divergence",
-						"crdt",
-					);
-					if (
+					const needsDiskConflictArtifact =
 						editorAuthority !== null &&
 						content !== editorAuthority &&
-						content !== crdtContent
+						content !== crdtContent;
+					const existingCrdtConflictPath = await this.findExistingMarkdownConflictArtifact(
+						file.path,
+						crdtContent,
+						"crdt",
+					);
+					const existingDiskConflictPath = needsDiskConflictArtifact
+						? await this.findExistingMarkdownConflictArtifact(file.path, content, "disk")
+						: null;
+					if (
+						existingCrdtConflictPath !== null &&
+						(!needsDiskConflictArtifact || existingDiskConflictPath !== null)
 					) {
-						diskConflictPath = await this.createMarkdownConflictArtifact(
-							file.path,
-							content,
-							"bound-file-ambiguous-divergence",
-							"disk",
+						conflictPath = existingCrdtConflictPath;
+						diskConflictPath = existingDiskConflictPath;
+						conflictSkippedDedupe = true;
+						conflictDedupeScope = "artifact";
+					} else {
+						if (existingCrdtConflictPath !== null) {
+							conflictPath = existingCrdtConflictPath;
+						} else {
+							conflictPath = await this.createMarkdownConflictArtifact(
+								file.path,
+								crdtContent,
+								"bound-file-ambiguous-divergence",
+								"crdt",
+							);
+							conflictArtifactCreated = true;
+						}
+						if (needsDiskConflictArtifact) {
+							if (existingDiskConflictPath !== null) {
+								diskConflictPath = existingDiskConflictPath;
+							} else {
+								diskConflictPath = await this.createMarkdownConflictArtifact(
+									file.path,
+									content,
+									"bound-file-ambiguous-divergence",
+									"disk",
+								);
+								conflictArtifactCreated = true;
+							}
+						}
+					}
+					if (conflictArtifactCreated) {
+						// Notify the user only when this pass creates a new
+						// preserved artifact. Existing artifacts are durable
+						// duplicate markers across restart and should not
+						// re-notify as a fresh conflict.
+						this.showConflictNotice(
+							`Conflict detected for "${file.path.split("/").pop()}" — ` +
+							`competing version preserved as conflict note.`,
 						);
 					}
 					this.lastConflictFingerprints.set(file.path, conflictFingerprint);
-					// Notify the user — conflict artifacts can be surprising.
-					// Throttled: only one Notice per 30s window; suppressed
-					// conflicts are counted and reported in the next notice.
-					this.showConflictNotice(
-						`Conflict detected for "${file.path.split("/").pop()}" — ` +
-						`competing version preserved as conflict note.`,
-					);
 				} catch (err) {
 					conflictError = err instanceof Error ? err.message : String(err);
 				}
@@ -2528,10 +2634,10 @@ export class ReconciliationController {
 		// convergence so the path can become stable.
 		let convergenceApplied = false;
 		if ((conflictPath !== null || conflictSkippedDedupe) && editorAuthority !== null) {
-				const existingText = vaultSync?.getTextForPath(file.path);
-				if (existingText) {
-					forceReplaceYText(existingText, editorAuthority, ORIGIN_DISK_SYNC_RECOVER_BOUND);
-					convergenceApplied = yTextToString(existingText) === editorAuthority;
+			const existingText = vaultSync?.getTextForPath(file.path);
+			if (existingText) {
+				forceReplaceYText(existingText, editorAuthority, ORIGIN_DISK_SYNC_RECOVER_BOUND);
+				convergenceApplied = yTextToString(existingText) === editorAuthority;
 				if (convergenceApplied) {
 					// Convergence succeeded — the original path now matches disk.
 					// Clear the conflict fingerprint so a genuinely new divergence
@@ -2551,8 +2657,9 @@ export class ReconciliationController {
 			editorViewCount: viewStates.length,
 			distinctEditorContentCount: distinctEditorContents.length,
 			chosenSource: editorAuthority === null ? "none-multiple-editor-contents" : "editor",
-			conflictArtifactCreated: conflictPath !== null,
+			conflictArtifactCreated,
 			conflictSkippedDedupe,
+			conflictDedupeScope,
 			convergenceApplied,
 			error: conflictError,
 		});
@@ -2915,17 +3022,21 @@ export class ReconciliationController {
 			const stat = stableStat ?? await this.deps.app.vault.adapter.stat(path);
 			if (stat) {
 				const existing = this.deps.getDiskIndex()[path];
+				const settledHash = settledContent !== undefined
+					? await contentBaselineHash(settledContent)
+					: undefined;
 				const nextEntry: import("../sync/diskIndex").DiskIndexEntry = {
 					mtime: stat.mtime,
 					size: stat.size,
 					// Advance the baseline hash if settled content is provided.
 					// This covers disk→CRDT imports (external edits while KAOS is running).
-					contentHash: settledContent !== undefined
-						? await contentBaselineHash(settledContent)
-						: existing?.contentHash,
+					contentHash: settledHash ?? existing?.contentHash,
 				};
 				if (nextEntry.contentHash === undefined) {
 					delete nextEntry.contentHash;
+				}
+				if (settledHash !== undefined && settledContent !== undefined) {
+					this.deps.recordBaselineText?.(settledHash, settledContent);
 				}
 				this.deps.setDiskIndex({
 					...this.deps.getDiskIndex(),
