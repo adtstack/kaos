@@ -1,6 +1,6 @@
 {
 	"name": "kaos",
-	"version": "1.8.1",
+	"version": "1.8.2",
 	"description": "A zero-terminal, real-time sync engine powered by your own Cloudflare Worker.",
 	"main": "main.js",
 	"type": "module",

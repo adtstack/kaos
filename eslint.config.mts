@@ -30,6 +30,13 @@ export default tseslint.config(
 		files: ["**/*.ts"],
 		rules: {
 			"no-undef": "off",
+			"obsidianmd/ui/sentence-case": [
+				"error",
+				{
+					enforceCamelCaseLower: true,
+					ignoreWords: ["Cloudflare", "KAOS"],
+				},
+			],
 		},
 	},
 	{
@@ -89,5 +96,6 @@ export default tseslint.config(
 		"version-bump.mjs",
 		"versions.json",
 		"main.js",
+		"telemetry.js",
 	]),
 );

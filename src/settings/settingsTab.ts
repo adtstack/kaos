@@ -94,6 +94,36 @@ function addCardRow(containerEl: HTMLElement, label: string, value: string): voi
 	row.createSpan({ text: value, cls: "kaos-settings-card-value" });
 }
 
+function addServerUpdateGuide(containerEl: HTMLElement): void {
+	const guide = createDetailsSection(containerEl, "How to update this server", true);
+	guide.addClass("kaos-settings-update-guide");
+	const guideBody = guide.createDiv({ cls: "kaos-settings-details-body" });
+	guideBody.createEl("p", {
+		text: "Existing Cloudflare servers update through the generated deployment repo. This preserves the same worker, durable object bindings, and sync history.",
+		cls: "kaos-settings-status-subtitle",
+	});
+	const steps = guideBody.createEl("ol", { cls: "kaos-settings-update-steps" });
+	steps.createEl("li", {
+		text: "Paste the generated deployment repo URL below; this is the repo Cloudflare created when you first deployed KAOS.",
+	});
+	steps.createEl("li", {
+		text: "If workflows are missing, click initialize updater and commit the generated workflow in GitHub once.",
+	});
+	steps.createEl("li", {
+		text: "When a server update is available, click update server, then run the opened GitHub workflow with action set to update.",
+	});
+	steps.createEl("li", {
+		text: "Leave this settings tab open while Cloudflare redeploys; this plugin watches the capabilities endpoint until the new server version appears.",
+	});
+	steps.createEl("li", {
+		text: "To roll back, open the same workflow and run it with action set to revert.",
+	});
+	guideBody.createEl("p", {
+		text: "Do not re-click deploy to Cloudflare for an existing stateful server; that is only the first-install path.",
+		cls: "kaos-settings-security-warning kaos-settings-update-warning",
+	});
+}
+
 function statusClass(state: string): string {
 	switch (state) {
 		case "connected":
@@ -286,6 +316,36 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						: "kaos-settings-status-subtitle",
 				});
 			}
+
+			addServerUpdateGuide(updateCard);
+			new Setting(updateCard)
+				.setName("Deployment repo URL")
+				.setDesc("Required for guided server updates. Paste the generated repo Cloudflare created during the first deploy.")
+				.addText((text) =>
+					text
+						.setPlaceholder("https://github.com/you/kaos-server")
+						.setValue(this.host.settings.updateRepoUrl)
+						.onChange(async (value) => {
+							await this.host.updateSettings((settings) => {
+								settings.updateRepoUrl = value.trim();
+							}, "settings:update-repo-url");
+							this.display();
+						}),
+				);
+
+			new Setting(updateCard)
+				.setName("Deployment default branch")
+				.setDesc("Usually main; used when KAOS opens repo-local update workflow links.")
+				.addText((text) =>
+					text
+						.setPlaceholder("Default branch (for example, main)")
+						.setValue(this.host.settings.updateRepoBranch)
+						.onChange(async (value) => {
+							await this.host.updateSettings((settings) => {
+								settings.updateRepoBranch = value.trim() || "main";
+							}, "settings:update-repo-branch");
+						}),
+				);
 
 			const updateActions = updateCard.createDiv({ cls: "modal-button-container kaos-settings-status-actions" });
 			updateActions.createEl("button", { text: "Refresh update info" }).addEventListener("click", () => {
@@ -561,35 +621,6 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						this.display();
 					}),
 			);
-
-			new Setting(advancedBody)
-				.setName("Deployment repo URL")
-				.setDesc("Optional. Example: https://github.com/you/kaos-server. Provider is inferred from this URL.")
-				.addText((text) =>
-					text
-						.setPlaceholder("Paste the generated GitHub or GitLab repo URL")
-						.setValue(this.host.settings.updateRepoUrl)
-						.onChange(async (value) => {
-							await this.host.updateSettings((settings) => {
-								settings.updateRepoUrl = value.trim();
-							}, "settings:update-repo-url");
-							this.display();
-						}),
-				);
-
-			new Setting(advancedBody)
-				.setName("Deployment default branch")
-				.setDesc("Used for GitLab pipeline links and future provider-native update helpers.")
-				.addText((text) =>
-						text
-							.setPlaceholder("Default branch (for example, main)")
-							.setValue(this.host.settings.updateRepoBranch)
-						.onChange(async (value) => {
-							await this.host.updateSettings((settings) => {
-								settings.updateRepoBranch = value.trim() || "main";
-							}, "settings:update-repo-branch");
-						}),
-				);
 
 			new Setting(advancedBody)
 				.setName("Edits from other apps")
