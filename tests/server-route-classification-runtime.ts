@@ -249,6 +249,9 @@ console.log("\n--- Test 5: valid resource + invalid shape returns 404 without KA
 		["PUT", "/vault/foo/recovery-snapshots/maybe"],
 		["GET", "/vault/foo/recovery-snapshots/abc123"],
 		["POST", "/vault/foo/recovery-snapshots/abc123/manifest"],
+		["PUT", "/vault/foo/recovery-snapshots/status"],
+		["GET", "/vault/foo/recovery-snapshots/status/extra"],
+		["GET", "/vault/foo/recovery-snapshots/repair"],
 		["POST", "/vault/foo/recovery-content/abc123"],
 		["GET", "/vault/foo/recovery-content"],
 		["GET",  "/api/not-real"],                  // API-shaped but unknown endpoint
@@ -270,6 +273,54 @@ console.log("\n--- Test 5: valid resource + invalid shape returns 404 without KA
 		assert(!threw, `${method} ${path}: did not throw (DO namespace not touched)`);
 		assert(status === 404, `${method} ${path}: status is 404`);
 	}
+}
+
+// ── Test 5b: new recovery storage status/repair shapes reach the handler ─────
+console.log("\n--- Test 5b: recovery storage status and repair are valid route shapes ---");
+{
+	const bucket = {
+		list: async () => ({ objects: [], truncated: false }),
+		get: async () => null,
+		head: async () => null,
+		put: async () => { throw new Error("GET status must not write"); },
+		delete: async () => {},
+	};
+	const validRecoveryEnv: Env = {
+		SYNC_TOKEN: "shape-token",
+		KAOS_SYNC: makeTrapNamespace() as unknown as Env["KAOS_SYNC"],
+		KAOS_CONFIG: makeTrapNamespace() as unknown as Env["KAOS_CONFIG"],
+		KAOS_BUCKET: bucket as unknown as R2Bucket,
+	};
+	const auth = { Authorization: "Bearer shape-token" };
+
+	const statusResp = await worker.fetch(
+		new Request("https://example.com/vault/foo/recovery-snapshots/status", { headers: auth }),
+		validRecoveryEnv,
+	);
+	assert(statusResp.status === 200, "GET /recovery-snapshots/status reaches handler");
+	const statusJson = await statusResp.json() as { status?: string };
+	assert(statusJson.status === "empty", "GET /recovery-snapshots/status returns audit status");
+
+	let putCalls = 0;
+	const repairBucket = {
+		...bucket,
+		put: async () => {
+			putCalls++;
+		},
+	};
+	const repairEnv: Env = {
+		...validRecoveryEnv,
+		KAOS_BUCKET: repairBucket as unknown as R2Bucket,
+	};
+	const repairResp = await worker.fetch(
+		new Request("https://example.com/vault/foo/recovery-snapshots/repair", {
+			method: "POST",
+			headers: auth,
+		}),
+		repairEnv,
+	);
+	assert(repairResp.status === 200, "POST /recovery-snapshots/repair reaches handler");
+	assert(putCalls === 0, "POST repair does not write when storage is empty");
 }
 
 // ── Test 6: parseSyncPath ordering — /vault/sync/:id is not misread ───────────

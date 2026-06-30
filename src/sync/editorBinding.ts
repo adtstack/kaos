@@ -1227,6 +1227,34 @@ export class EditorBindingManager {
 
 		const existingText = this.vaultSync.getTextForPath(file.path);
 		if (existingText) {
+			let currentContent: string;
+			try {
+				currentContent = view.editor.getValue();
+			} catch {
+				this.trace?.("editor", "binding-target-editor-read-failed", {
+					path: file.path,
+					reason,
+					leafId:
+						(view.leaf as unknown as { id: string }).id ?? file.path,
+				});
+				return null;
+			}
+			const crdtContent = existingText.toJSON();
+			if (currentContent !== crdtContent) {
+				this.trace?.("editor", "binding-target-editor-diverged", {
+					path: file.path,
+					reason,
+					leafId:
+						(view.leaf as unknown as { id: string }).id ?? file.path,
+					editorLength: currentContent.length,
+					crdtLength: crdtContent.length,
+				});
+				this.log(
+					`resolveBindingTarget: skipped binding for "${file.path}" ` +
+					`because open editor differs from CRDT (reason=${reason})`,
+				);
+				return null;
+			}
 			return {
 				ytext: existingText,
 				fileId:

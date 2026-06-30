@@ -678,6 +678,7 @@ export class ReconciliationController {
 				eligibleFiles.push(file);
 				diskPresentPaths.add(file.path);
 			}
+			const eligibleFileByPath = new Map(eligibleFiles.map((file) => [file.path, file]));
 
 			let changed: TFile[] = [];
 			let unchanged: TFile[] = [];
@@ -994,9 +995,28 @@ export class ReconciliationController {
 				for (const path of result.updatedOnDisk) {
 					const diskContent = diskFiles.get(path);
 					const ytext = vaultSync.getTextForPath(path);
+					const openViews = this.getOpenMarkdownViewsForPath(path);
 					const isOpenOrBound =
 						(this.deps.getEditorBindings()?.isBound(path) ?? false) ||
-						this.getOpenMarkdownViewsForPath(path).length > 0;
+						openViews.length > 0;
+					if (
+						mode === "authoritative" &&
+						isOpenOrBound &&
+						diskContent !== undefined &&
+						ytext &&
+						openViews.length > 0
+					) {
+						const handledOpenDivergence = await this.handleOpenFileReconcileDivergence(
+							path,
+							diskContent,
+							ytext,
+							openViews,
+							eligibleFileByPath.get(path) ?? null,
+						);
+						if (handledOpenDivergence) {
+							continue;
+						}
+					}
 					if (
 						mode === "authoritative" &&
 						!isOpenOrBound &&
@@ -1906,6 +1926,101 @@ export class ReconciliationController {
 			}
 		});
 		return views;
+	}
+
+	private async handleOpenFileReconcileDivergence(
+		path: string,
+		diskContent: string,
+		ytext: ReturnType<VaultSync["getTextForPath"]>,
+		openViews: MarkdownView[],
+		file: TFile | null,
+	): Promise<boolean> {
+		if (!ytext) return false;
+		const crdtContent = yTextToString(ytext) ?? "";
+		const viewStates = openViews.map((view) => ({
+			view,
+			editorContent: view.editor.getValue(),
+		}));
+		const distinctEditorContents = [...new Set(viewStates.map((state) => state.editorContent))];
+		if (distinctEditorContents.length !== 1) {
+			this.deps.trace("conflict", "open-file-reconcile-multiple-editor-authorities", {
+				path,
+				editorViewCount: openViews.length,
+				distinctEditorContentCount: distinctEditorContents.length,
+				diskLength: diskContent.length,
+				crdtLength: crdtContent.length,
+			});
+			return false;
+		}
+
+		const editorAuthority = distinctEditorContents[0]!;
+		if (editorAuthority === crdtContent) {
+			return false;
+		}
+
+		this.deps.recordFlightPathEvent?.({
+			priority: "critical",
+			kind: PRODUCT_EVENT_KIND.reconcileFileDecision,
+			severity: "warn",
+			scope: "file",
+			source: "reconciliationController",
+			layer: "reconcile",
+			path,
+			data: {
+				decision: "open-editor-wins",
+				reason: "open-file-editor-diverged-from-crdt",
+				conflictRisk: "ambiguous",
+				editorLength: editorAuthority.length,
+				diskLength: diskContent.length,
+				crdtLength: crdtContent.length,
+				editorMatchesDisk: editorAuthority === diskContent,
+				editorMatchesCrdt: false,
+			},
+		});
+
+		let crdtConflictPath: string | null = null;
+		let diskConflictPath: string | null = null;
+		try {
+			crdtConflictPath = await this.createMarkdownConflictArtifact(
+				path,
+				crdtContent,
+				"open-file-reconcile-editor-wins",
+				"crdt",
+			);
+			if (diskContent !== editorAuthority && diskContent !== crdtContent) {
+				diskConflictPath = await this.createMarkdownConflictArtifact(
+					path,
+					diskContent,
+					"open-file-reconcile-editor-wins",
+					"disk",
+				);
+			}
+		} catch (err) {
+			this.deps.trace("conflict", "open-file-reconcile-preserve-failed", {
+				path,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return true;
+		}
+
+		forceReplaceYText(ytext, editorAuthority, ORIGIN_DISK_SYNC_RECOVER_BOUND);
+		const convergenceApplied = yTextToString(ytext) === editorAuthority;
+		this.deps.trace("conflict", "open-file-reconcile-editor-wins", {
+			path,
+			filePath: file?.path ?? null,
+			crdtConflictPath,
+			diskConflictPath,
+			editorViewCount: openViews.length,
+			editorLength: editorAuthority.length,
+			diskLength: diskContent.length,
+			crdtLength: crdtContent.length,
+			convergenceApplied,
+		});
+		this.showConflictNotice(
+			`Conflict detected for "${path.split("/").pop()}" — ` +
+			`competing version preserved as conflict note.`,
+		);
+		return true;
 	}
 
 	private async handleBoundFileSyncGap(

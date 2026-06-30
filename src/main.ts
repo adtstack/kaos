@@ -50,6 +50,10 @@ import type { PreservedUnresolvedEntry } from "./sync/preservedUnresolved";
 import {
 	SnapshotService,
 } from "./snapshots/snapshotService";
+import {
+	getFileHistoryStorageStatus,
+	type RecoveryStorageAuditReport,
+} from "./sync/recoverySnapshotClient";
 import type {
 	TraceEventDetails,
 	TraceHttpContext,
@@ -148,6 +152,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private attachmentOrchestrator: AttachmentOrchestrator | null = null;
 	private editorWorkspace: EditorWorkspaceOrchestrator | null = null;
 	private snapshotService: SnapshotService | null = null;
+	private lastRecoveryStorageStatus: RecoveryStorageAuditReport | null = null;
+	private lastRecoveryStorageStatusError: string | null = null;
 	private reconciliationController!: ReconciliationController;
 	private setupLinkController: SetupLinkController | null = null;
 	private traceRuntime: TraceRuntimeController | null = null;
@@ -430,6 +436,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				},
 				showSnapshotList: async () => {
 					await this.snapshotService?.showSnapshotList();
+				},
+				createFileHistoryPoint: async () => {
+					await this.snapshotService?.createFileHistoryPoint();
 				},
 				showRecoveryHistory: async () => {
 					await this.snapshotService?.showRecoveryHistory();
@@ -1774,6 +1783,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const recentChanges = this.snapshotService
 			? await this.snapshotService.getDashboardRecentChanges()
 			: { status: "unavailable" as const, message: "File history service not initialized." };
+		const recoveryStorageStatus = this.snapshotService
+			? await this.snapshotService.getDashboardRecoveryStorageStatus()
+			: { status: "unavailable" as const, message: "File history storage service not initialized." };
 		return buildKaosDashboardData({
 			app: this.app,
 			generatedAt: new Date().toISOString(),
@@ -1794,6 +1806,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			frontmatterQuarantineEntries: this.frontmatterQuarantineEntries,
 			diskIndex: this.diskIndex,
 			snapshotStatus,
+			recoveryStorageStatus,
 			recentChanges,
 			openFileCount: this.editorWorkspace?.openFileCount ?? 0,
 			snapshotsAvailable: this.serverSupportsSnapshots,
@@ -2244,6 +2257,79 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	async refreshUpdateManifest(reason = "manual", force = false): Promise<void> {
 		await this.capabilityUpdateService?.refreshUpdateManifest(reason, force);
+	}
+
+	async refreshRecoveryStorageStatus(reason = "manual"): Promise<void> {
+		void reason;
+		if (!this.settings.host || !this.settings.token || !this.settings.vaultId) {
+			this.lastRecoveryStorageStatus = null;
+			this.lastRecoveryStorageStatusError = "Sync is not configured.";
+			return;
+		}
+		if (!this.serverSupportsSnapshots) {
+			this.lastRecoveryStorageStatus = null;
+			this.lastRecoveryStorageStatusError = "File history storage is unavailable on this server.";
+			return;
+		}
+		try {
+			this.lastRecoveryStorageStatus = await getFileHistoryStorageStatus(
+				this.settings,
+				this.getTraceHttpContext(),
+			);
+			this.lastRecoveryStorageStatusError = null;
+		} catch (err) {
+			this.lastRecoveryStorageStatus = null;
+			this.lastRecoveryStorageStatusError = formatUnknown(err);
+		}
+	}
+
+	getRecoveryStorageStatusState(): {
+		status: RecoveryStorageAuditReport["status"] | "unknown";
+		label: "Healthy" | "Repaired" | "Needs attention" | "Unknown";
+		detail: string | null;
+		checkedAt: string | null;
+	} {
+		const report = this.lastRecoveryStorageStatus;
+		if (!report) {
+			return {
+				status: "unknown",
+				label: "Unknown",
+				detail: this.lastRecoveryStorageStatusError,
+				checkedAt: null,
+			};
+		}
+		if (report.status === "healthy" || report.status === "empty") {
+			return {
+				status: report.status,
+				label: "Healthy",
+				detail: `${report.manifestCountLowerBound} file history point(s) checked.`,
+				checkedAt: report.checkedAt,
+			};
+		}
+		if (report.status === "repaired") {
+			const repairCount = report.repairs.filter((repair) => repair.success).length;
+			return {
+				status: "repaired",
+				label: "Repaired",
+				detail: `${repairCount} file history storage repair(s) applied.`,
+				checkedAt: report.checkedAt,
+			};
+		}
+		if (report.status === "degraded") {
+			const remaining = report.issues.filter((issue) => !issue.repaired).length;
+			return {
+				status: "degraded",
+				label: "Needs attention",
+				detail: `${remaining} file history storage issue(s) need attention.`,
+				checkedAt: report.checkedAt,
+			};
+		}
+		return {
+			status: "unavailable",
+			label: "Unknown",
+			detail: report.issues[0]?.message ?? "File history storage is unavailable.",
+			checkedAt: report.checkedAt,
+		};
 	}
 
 	getUpdateState(): UpdateState {

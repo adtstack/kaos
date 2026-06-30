@@ -20,6 +20,12 @@ interface SnapshotRouteOptions {
 	fetchVaultDocument(env: Env, vaultId: string): Promise<Uint8Array>;
 }
 
+export function snapshotMaybeTraceEventName(status: SnapshotResult["status"]): string {
+	if (status === "created") return "snapshot-created";
+	if (status === "noop") return "snapshot-skipped";
+	return "snapshot-unavailable";
+}
+
 export async function handleSnapshotRoute(
 	env: Env,
 	vaultId: string,
@@ -69,10 +75,11 @@ export async function handleSnapshotRoute(
 			body: JSON.stringify(body),
 		});
 		const result: SnapshotResult = await res.json();
-		await options.recordVaultTrace(env, vaultId, "snapshot-created", {
+		await options.recordVaultTrace(env, vaultId, snapshotMaybeTraceEventName(result.status), {
 			status: result.status,
 			snapshotId: result.snapshotId,
 			triggeredBy: body.device,
+			reason: result.reason,
 		});
 		return json(result);
 	}

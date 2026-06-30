@@ -2,7 +2,7 @@ import { App, Modal, Notice } from "obsidian";
 import type { SnapshotDiff, SnapshotIndex } from "../sync/snapshotClient";
 
 /**
- * Modal that lists available snapshots and lets the user pick one.
+ * Modal that lists available vault snapshots and lets the user pick one.
  */
 export class SnapshotListModal extends Modal {
 	constructor(
@@ -18,9 +18,9 @@ export class SnapshotListModal extends Modal {
 		contentEl.empty();
 		contentEl.addClass("snapshot-list-modal");
 
-		contentEl.createEl("h3", { text: "Available snapshots" });
+		contentEl.createEl("h3", { text: "Available vault snapshots" });
 		contentEl.createEl("p", {
-			text: `${this.snapshots.length} snapshot(s) found. Select one to see a diff and restore files.`,
+			text: `${this.snapshots.length} vault snapshot(s) found. Select one to see a diff and restore files.`,
 			cls: "setting-item-description",
 		});
 
@@ -32,8 +32,8 @@ export class SnapshotListModal extends Modal {
 		if (this.snapshots.length > 30 || totalMB > 50) {
 			const warning = contentEl.createDiv({ cls: "snapshot-storage-warning" });
 			warning.createEl("p", {
-				text: `Storage: at least ${this.snapshots.length} snapshots using ~${totalMB.toFixed(1)} MB (may be more). ` +
-					`Consider pruning old snapshots to reduce storage usage.`,
+				text: `Storage: at least ${this.snapshots.length} vault snapshots using ~${totalMB.toFixed(1)} MB (may be more). ` +
+					`Consider pruning old vault snapshots to reduce storage usage.`,
 			});
 			warning.style.color = "var(--text-error)";
 			warning.style.marginBottom = "8px";
@@ -82,7 +82,7 @@ export class SnapshotListModal extends Modal {
 }
 
 /**
- * Modal that shows a diff between a snapshot and the current CRDT state.
+ * Modal that shows a diff between a vault snapshot and the current CRDT state.
  * Lets the user select files to restore.
  */
 export class SnapshotDiffModal extends Modal {
@@ -114,7 +114,7 @@ export class SnapshotDiffModal extends Modal {
 			hour: "2-digit",
 			minute: "2-digit",
 		});
-		contentEl.createEl("h3", { text: `Snapshot: ${dateStr}` });
+		contentEl.createEl("h3", { text: `Vault snapshot: ${dateStr}` });
 
 		const { diff } = this;
 		const totalChanges = diff.deletedSinceSnapshot.length +
@@ -123,40 +123,40 @@ export class SnapshotDiffModal extends Modal {
 			diff.blobsChanged.length;
 
 		if (totalChanges === 0 && diff.createdSinceSnapshot.length === 0) {
-			contentEl.createEl("p", { text: "No differences found between the snapshot and current state." });
+			contentEl.createEl("p", { text: "No differences found between the vault snapshot and current state." });
 			return;
 		}
 
 		contentEl.createEl("p", {
-			text: "Select files to restore from the snapshot. " +
-				"Created-since-snapshot files are shown for reference but cannot be \"restored\" (they didn't exist yet).",
+			text: "Select files to restore from the vault snapshot. " +
+				"Created-since-vault-snapshot files are shown for reference but cannot be \"restored\" (they didn't exist yet).",
 			cls: "setting-item-description",
 		});
 
-		// --- Deleted since snapshot (can restore = undelete) ---
+		// --- Deleted since vault snapshot (can restore = undelete) ---
 		if (diff.deletedSinceSnapshot.length > 0) {
 			this.renderSection(
 				contentEl,
-				"Deleted since snapshot (can undelete)",
+				"Deleted since vault snapshot (can undelete)",
 				diff.deletedSinceSnapshot.map((d) => d.path),
 				this.selectedMd,
 			);
 		}
 
-		// --- Content changed (can restore to snapshot version) ---
+		// --- Content changed (can restore to vault snapshot version) ---
 		if (diff.contentChanged.length > 0) {
 			this.renderSection(
 				contentEl,
-				"Content changed since snapshot",
+				"Content changed since vault snapshot",
 				diff.contentChanged.map((d) => d.path),
 				this.selectedMd,
 			);
 		}
 
-		// --- Created since snapshot (informational only) ---
+		// --- Created since vault snapshot (informational only) ---
 		if (diff.createdSinceSnapshot.length > 0) {
 			const section = contentEl.createDiv();
-			section.createEl("h4", { text: `Created since snapshot (${diff.createdSinceSnapshot.length})` });
+			section.createEl("h4", { text: `Created since vault snapshot (${diff.createdSinceSnapshot.length})` });
 			const listEl = section.createEl("ul");
 			for (const path of diff.createdSinceSnapshot) {
 				listEl.createEl("li", { text: path, cls: "setting-item-description" });
@@ -167,7 +167,7 @@ export class SnapshotDiffModal extends Modal {
 		if (diff.blobsDeletedSinceSnapshot.length > 0) {
 			this.renderSection(
 				contentEl,
-				"Attachments deleted since snapshot",
+				"Attachments deleted since vault snapshot",
 				diff.blobsDeletedSinceSnapshot.map((d) => d.path),
 				this.selectedBlobs,
 			);
@@ -176,7 +176,7 @@ export class SnapshotDiffModal extends Modal {
 		if (diff.blobsChanged.length > 0) {
 			this.renderSection(
 				contentEl,
-				"Attachments changed since snapshot",
+				"Attachments changed since vault snapshot",
 				diff.blobsChanged.map((d) => d.path),
 				this.selectedBlobs,
 			);

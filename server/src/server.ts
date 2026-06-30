@@ -14,6 +14,7 @@ import {
 } from "./snapshot";
 import {
 	applyRecoveryRetention,
+	auditRecoveryStorage,
 	createRecoverySnapshot,
 	decodeRecoveryFileMeta,
 	type RecoverySnapshotResult,
@@ -759,9 +760,44 @@ export class VaultSyncServer extends YServer {
 					} satisfies RecoverySnapshotResult;
 				}
 
+				const vaultId = this.getRoomId();
+				try {
+					const audit = await auditRecoveryStorage(vaultId, bucket, {
+						repair: true,
+						contentCheckLimit: 0,
+					});
+					const successfulRepairs = audit.repairs.filter((repair) => repair.success);
+					if (successfulRepairs.length > 0) {
+						await this.recordTrace("recovery-storage-repaired", {
+							status: audit.status,
+							latestManifestId: audit.latestManifestId,
+							latestIndexManifestId: audit.latestIndexManifestId,
+							latestStateManifestId: audit.latestStateManifestId,
+							issueCount: audit.issues.length,
+							repairCount: successfulRepairs.length,
+							repairKinds: successfulRepairs.map((repair) => repair.kind).slice(0, 20),
+						});
+					}
+					if (audit.status === "degraded") {
+						await this.recordTrace("recovery-storage-degraded", {
+							status: audit.status,
+							latestManifestId: audit.latestManifestId,
+							issueCount: audit.issues.length,
+							unrepairedIssueKinds: audit.issues
+								.filter((issue) => !issue.repaired)
+								.map((issue) => issue.kind)
+								.slice(0, 20),
+						});
+					}
+				} catch (err) {
+					await this.recordTrace("recovery-storage-degraded", {
+						error: err instanceof Error ? err.message : String(err),
+					});
+				}
+
 				const result = await createRecoverySnapshot(
 					this.document,
-					this.getRoomId(),
+					vaultId,
 					bucket,
 					{
 						triggeredBy,
@@ -770,7 +806,7 @@ export class VaultSyncServer extends YServer {
 						pinned: false,
 					},
 				);
-				if (result.status === "created" && result.index?.kind === "full") {
+				if (result.status === "created" && result.index?.kind === "file-history") {
 					try {
 						await applyRecoveryRetention(this.getRoomId(), bucket);
 					} catch (err) {

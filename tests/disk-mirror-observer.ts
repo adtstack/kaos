@@ -33,6 +33,7 @@
  */
 
 import * as Y from "yjs";
+import { MarkdownView, TFile } from "obsidian";
 import { DiskMirror } from "../src/sync/diskMirror";
 import {
 	ORIGIN_DISK_SYNC,
@@ -61,11 +62,18 @@ function assert(condition: boolean, msg: string) {
 const FILE_PATH = "notes/test.md";
 const FILE_ID = "file-001";
 
-function makeHarness() {
+function makeHarness(options: {
+	openEditorContent?: string;
+	initialDiskContent?: string;
+} = {}) {
 	const doc = new Y.Doc();
 	const meta = doc.getMap<{ path: string; deleted?: boolean }>("meta");
 	const ytext = doc.getText("content");
 	const fakeProvider = { __kind: "fake-provider" };
+	const diskFiles = new Map<string, string>();
+	if (options.initialDiskContent !== undefined) {
+		diskFiles.set(FILE_PATH, options.initialDiskContent);
+	}
 
 	// Seed meta so afterTxnHandler can resolve fileId → path
 	doc.transact(() => {
@@ -88,14 +96,40 @@ function makeHarness() {
 		getLastEditorActivityForPath: () => null,
 	};
 
+	const openView = options.openEditorContent === undefined
+		? null
+		: Object.assign(new MarkdownView(), {
+			file: { path: FILE_PATH },
+			editor: { getValue: () => options.openEditorContent },
+		});
+	const existingFile = Object.assign(new TFile(), {
+		path: FILE_PATH,
+		stat: { size: options.initialDiskContent?.length ?? 0 },
+	});
 	const fakeApp = {
-		workspace: { getActiveViewOfType: () => null },
+		workspace: {
+			getActiveViewOfType: () => openView,
+			iterateAllLeaves: (callback: (leaf: { view: unknown }) => void) => {
+				if (openView) callback({ view: openView });
+			},
+		},
+		vault: {
+			getAbstractFileByPath: (path: string) => diskFiles.has(path) ? existingFile : null,
+			read: async (file: { path: string }) => diskFiles.get(file.path) ?? "",
+			modify: async (file: { path: string }, content: string) => {
+				diskFiles.set(file.path, content);
+			},
+			create: async (path: string, content: string) => {
+				diskFiles.set(path, content);
+			},
+			createFolder: async () => {},
+		},
 	};
 
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const mirror = new DiskMirror(fakeApp as any, fakeVaultSync as any, fakeEditorBindings as any, false);
 
-	return { doc, ytext, fakeProvider, meta, mirror };
+	return { doc, ytext, fakeProvider, meta, mirror, diskFiles };
 }
 
 // Private-field accessors — DiskMirror internals are not exposed publicly
@@ -236,6 +270,48 @@ console.log("\n--- Test 5: mixed cycle — recovery then provider — only provi
 	assert(debounceTimerCount(mirror) === 1, "after provider update: debounce timer set");
 
 	clearTimers(mirror);
+	doc.destroy();
+}
+
+// ── Test 6: startup-open workspace gap schedules open write, not closed write ─
+
+console.log("\n--- Test 6: provider update to workspace-open file schedules open write before notifyFileOpened ---");
+{
+	const { doc, ytext, fakeProvider, mirror } = makeHarness({ openEditorContent: "local editor" });
+	mirror.startMapObservers();
+
+	doc.transact(() => { ytext.insert(0, "remote content"); }, fakeProvider);
+
+	assert(
+		pendingOpenWriteCount(mirror) === 1,
+		"workspace-open provider update is treated as an open-file write",
+	);
+	assert(
+		debounceTimerCount(mirror) === 0,
+		"workspace-open provider update does not use closed-file debounce",
+	);
+
+	clearTimers(mirror);
+	doc.destroy();
+}
+
+// ── Test 7: forced flush does not overwrite an open editor mismatch ──────────
+
+console.log("\n--- Test 7: forced open flush does not overwrite disk when editor differs from CRDT ---");
+{
+	const { ytext, mirror, diskFiles, doc } = makeHarness({
+		openEditorContent: "LOCAL_ON_EDITOR\n",
+		initialDiskContent: "LOCAL_ON_EDITOR\n",
+	});
+	ytext.insert(0, "REMOTE_FROM_CRDT\n");
+
+	await mirror.flushWrite(FILE_PATH, true);
+
+	assert(
+		diskFiles.get(FILE_PATH) === "LOCAL_ON_EDITOR\n",
+		"force flush preserves disk when an open editor carries different content",
+	);
+
 	doc.destroy();
 }
 

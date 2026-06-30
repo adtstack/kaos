@@ -3,6 +3,8 @@ import { MAX_BLOB_UPLOAD_BYTES } from "../server/src/contracts";
 import worker from "../server/src/index";
 import { getCapabilities } from "../server/src/routes/auth";
 import { handleBlobRoute } from "../server/src/routes/blobs";
+import { recoverySnapshotMaybeTraceEventName } from "../server/src/routes/recoverySnapshots";
+import { snapshotMaybeTraceEventName } from "../server/src/routes/snapshots";
 
 let passed = 0;
 let failed = 0;
@@ -136,6 +138,16 @@ console.log("\n--- Test 3: runSerialized keeps snapshot maybe logic single-filed
 	assert(maxActiveRuns === 1, "serialized queue never runs snapshot maybe work concurrently");
 	assert(createdResults.length === 1, "serialized snapshot maybe logic produces exactly one created result");
 	assert(noopResults.length === results.length - 1, "remaining serialized snapshot maybe calls become noops");
+}
+
+console.log("\n--- Test 3b: snapshot trace event names reflect actual maybe status ---");
+{
+	assert(snapshotMaybeTraceEventName("created") === "snapshot-created", "daily created status records a created event");
+	assert(snapshotMaybeTraceEventName("noop") === "snapshot-skipped", "daily noop status records a skipped event");
+	assert(snapshotMaybeTraceEventName("unavailable") === "snapshot-unavailable", "daily unavailable status records an unavailable event");
+	assert(recoverySnapshotMaybeTraceEventName("created") === "recovery-snapshot-created", "recovery created status records a created event");
+	assert(recoverySnapshotMaybeTraceEventName("noop") === "recovery-snapshot-skipped", "recovery noop status records a skipped event");
+	assert(recoverySnapshotMaybeTraceEventName("unavailable") === "recovery-snapshot-unavailable", "recovery unavailable status records an unavailable event");
 }
 
 console.log("\n--- Test 4: blob uploads reject poisoned content-addressed keys ---");

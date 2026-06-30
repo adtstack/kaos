@@ -266,6 +266,142 @@ console.log("\n--- Test 2c: conflict winner baseline waits for observed equality
 	doc.destroy();
 }
 
+console.log("\n--- Test 2d: startup open editor content wins before binding can overwrite it ---");
+{
+	const path = "open-reenable.md";
+	const diskContent = "LOCAL_ON_EDITOR\n";
+	const editorContent = "LOCAL_ON_EDITOR\n";
+	const crdtContent = "REMOTE_FROM_CRDT\n";
+	const file = makeTFile(path);
+	const doc = new Y.Doc();
+	const ytext = doc.getText("content");
+	ytext.insert(0, crdtContent);
+	const transactionOrigins: unknown[] = [];
+	doc.on("afterTransaction", (txn) => transactionOrigins.push(txn.origin));
+
+	let diskIndex: DiskIndex = {};
+	const stats = new Map<string, { mtime: number; size: number }>([
+		[path, { mtime: 12, size: diskContent.length }],
+	]);
+	const createdFiles = new Map<string, string>();
+	const flushed: string[] = [];
+	const decisions: Array<Record<string, unknown>> = [];
+	const traces: Array<{ source: string; msg: string; details?: Record<string, unknown> }> = [];
+
+	const view = new MarkdownView() as MarkdownView & {
+		file: TFile;
+		editor: { getValue(): string };
+	};
+	view.file = file;
+	view.editor = { getValue: () => editorContent };
+
+	const app = {
+		vault: {
+			getMarkdownFiles: () => [
+				file,
+				...Array.from(createdFiles.keys()).map(makeTFile),
+			],
+			read: async (readFile: TFile & { path: string }) => {
+				if (readFile.path === path) return diskContent;
+				return createdFiles.get(readFile.path) ?? "";
+			},
+			create: async (createdPath: string, content: string) => {
+				if (createdFiles.has(createdPath)) throw new Error("exists");
+				createdFiles.set(createdPath, content);
+			},
+			adapter: {
+				stat: async (candidate: string) => stats.get(candidate) ?? null,
+			},
+			getAbstractFileByPath: (candidate: string) =>
+				createdFiles.has(candidate) ? ({ path: candidate }) : null,
+		},
+		workspace: {
+			iterateAllLeaves: (cb: (leaf: { view: MarkdownView }) => void) => {
+				cb({ view });
+			},
+		},
+	};
+
+	const vaultSync = {
+		connected: true,
+		providerSynced: true,
+		getTextForPath: (candidate: string) => candidate === path ? ytext : null,
+		getActiveMarkdownPaths: () => [path],
+		reconcileVault: () => ({
+			mode: "authoritative",
+			createdOnDisk: [],
+			updatedOnDisk: [path],
+			seededToCrdt: [],
+			untracked: [],
+			tombstonedDiskConflicts: [],
+			skipped: 0,
+		}),
+		runIntegrityChecks: () => ({ duplicateIds: 0, orphansCleaned: 0 }),
+	};
+
+	const controller = new ReconciliationController({
+		app: app as any,
+		getSettings: () => ({ deviceName: "Device" }) as any,
+		getRuntimeConfig: () => ({
+			maxFileSizeBytes: 0,
+			maxFileSizeKB: 0,
+			excludePatterns: [],
+		}) as any,
+		getVaultSync: () => vaultSync as any,
+		getDiskMirror: () => ({
+			flushWrite: async (flushPath: string) => { flushed.push(flushPath); },
+			suppressLocalCreate: async () => {},
+		}) as any,
+		getBlobSync: () => null,
+		getEditorBindings: () => ({
+			isBound: () => false,
+		}) as any,
+		getDiskIndex: () => diskIndex,
+		setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
+		isMarkdownPathSyncable: () => true,
+		shouldBlockFrontmatterIngest: () => false,
+		refreshServerCapabilities: async () => {},
+		validateOpenEditorBindings: () => {},
+		onReconciled: () => {},
+		getAwaitingFirstProviderSyncAfterStartup: () => false,
+		setAwaitingFirstProviderSyncAfterStartup: () => {},
+		saveDiskIndex: async () => {},
+		refreshStatusBar: () => {},
+		recordFlightPathEvent: (event) => {
+			if (event.kind === "reconcile.file.decision") decisions.push(event.data ?? {});
+		},
+		trace: (source: string, msg: string, details?: Record<string, unknown>) => {
+			traces.push({ source, msg, details });
+		},
+		scheduleTraceStateSnapshot: () => {},
+		log: () => {},
+	});
+
+	await controller.runReconciliation("authoritative");
+
+	const artifactPath = Array.from(createdFiles.keys()).find((candidate) =>
+		candidate.startsWith("open-reenable (KAOS conflict - crdt from Device ") &&
+		candidate.endsWith(".md")
+	);
+	assert(ytext.toString() === editorContent, "open editor content is applied to CRDT before binding");
+	assert(!!artifactPath, "remote CRDT content is preserved as a conflict artifact");
+	assert(artifactPath ? createdFiles.get(artifactPath) === crdtContent : false, "conflict artifact contains remote CRDT content");
+	assert(flushed.length === 0, "open editor reconcile does not write remote CRDT over disk");
+	assert(
+		transactionOrigins.includes(ORIGIN_DISK_SYNC_RECOVER_BOUND),
+		"open editor reconcile uses a known local repair origin",
+	);
+	assert(
+		decisions.some((decision) => decision.decision === "open-editor-wins"),
+		"open editor reconcile emits an explicit decision",
+	);
+	assert(
+		traces.some((event) => event.msg === "open-file-reconcile-editor-wins"),
+		"open editor reconcile traces editor-wins convergence",
+	);
+	doc.destroy();
+}
+
 console.log("\n--- Test 3: reconciliation safety brake leaves blocked overwrites unindexed ---");
 {
 	const paths = Array.from({ length: 30 }, (_, i) => `note-${i}.md`);

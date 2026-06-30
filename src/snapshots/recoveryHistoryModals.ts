@@ -1,13 +1,13 @@
 import { App, Modal, Notice } from "obsidian";
 import type {
-	RecoveryManifest,
-	RecoveryManifestEntry,
+	FileHistoryEntry,
+	FileHistoryManifestIndex,
 } from "../sync/recoverySnapshotClient";
 import { renderDiffText } from "../utils/textDiff";
 
 interface FileHistoryItem {
-	manifest: RecoveryManifest;
-	entry: RecoveryManifestEntry;
+	manifest: FileHistoryManifestIndex;
+	entry: FileHistoryEntry;
 }
 
 interface FileHistory {
@@ -17,7 +17,7 @@ interface FileHistory {
 }
 
 interface SnapshotHistory {
-	manifest: RecoveryManifest;
+	manifest: FileHistoryManifestIndex;
 	changedItems: FileHistoryItem[];
 }
 
@@ -26,15 +26,13 @@ interface RecoveryHistoryModalDeps {
 	restoreVersion(item: FileHistoryItem): Promise<void>;
 }
 
-function displayKind(kind: RecoveryManifestEntry["kind"]): string {
+function displayKind(kind: FileHistoryEntry["kind"]): string {
 	switch (kind) {
 		case "created": return "Created";
 		case "modified": return "Modified";
 		case "renamed": return "Renamed";
 		case "deleted": return "Deleted";
 		case "restored": return "Restored";
-		case "attachment-changed": return "Attachment changed";
-		case "unchanged": return "Unchanged";
 	}
 }
 
@@ -48,12 +46,11 @@ function formatDate(iso: string): string {
 	});
 }
 
-function buildHistories(manifests: RecoveryManifest[]): FileHistory[] {
+function buildHistories(manifests: FileHistoryManifestIndex[]): FileHistory[] {
 	const byFileId = new Map<string, FileHistory>();
 	const sorted = manifests.slice().sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 	for (const manifest of sorted) {
-		for (const entry of manifest.entries) {
-			if (entry.kind === "unchanged") continue;
+		for (const entry of manifest.changedEntries) {
 			const path = entry.newPath ?? entry.path;
 			const existing = byFileId.get(entry.fileId);
 			if (existing) {
@@ -85,7 +82,7 @@ export class RecoveryHistoryModal extends Modal {
 
 	constructor(
 		app: App,
-		private readonly manifests: RecoveryManifest[],
+		private readonly manifests: FileHistoryManifestIndex[],
 		private readonly deps: RecoveryHistoryModalDeps,
 	) {
 		super(app);
@@ -119,12 +116,12 @@ export class RecoveryHistoryModal extends Modal {
 	private renderTimeline(contentEl: HTMLElement): void {
 		contentEl.createEl("h3", { text: "File history" });
 		contentEl.createEl("p", {
-			text: `${this.snapshots.length} snapshot(s), ${this.histories.length} changed file(s).`,
+			text: `${this.snapshots.length} point(s), ${this.histories.length} changed file(s).`,
 			cls: "setting-item-description",
 		});
 
 		if (this.snapshots.length === 0) {
-			contentEl.createEl("p", { text: "No file history snapshots found yet." });
+			contentEl.createEl("p", { text: "No file history points found yet." });
 			return;
 		}
 
@@ -142,7 +139,7 @@ export class RecoveryHistoryModal extends Modal {
 				cls: "recovery-history-snapshot-date",
 			});
 			row.createEl("div", {
-				text: `${snapshot.changedItems.length} changed · ${snapshot.manifest.kind}`,
+				text: `${snapshot.changedItems.length} changed`,
 				cls: "setting-item-description",
 			});
 			row.addEventListener("click", () => {
@@ -164,13 +161,13 @@ export class RecoveryHistoryModal extends Modal {
 			cls: "recovery-history-snapshot-heading",
 		});
 		contentEl.createEl("div", {
-			text: `${snapshot.manifest.changedCount} changed file(s), ${snapshot.manifest.fullFileCount} file(s) tracked.`,
+			text: `${snapshot.manifest.changedCount} changed file(s).`,
 			cls: "setting-item-description",
 		});
 
 		if (snapshot.changedItems.length === 0) {
 			contentEl.createEl("p", {
-				text: "This snapshot has no file-level changes.",
+				text: "This file history point has no file-level changes.",
 				cls: "setting-item-description",
 			});
 			return;
@@ -203,7 +200,7 @@ export class RecoveryHistoryModal extends Modal {
 
 	private renderDetail(contentEl: HTMLElement, history: FileHistory): void {
 		const titleRow = contentEl.createDiv({ cls: "recovery-history-title-row" });
-		titleRow.createEl("button", { text: "Back to snapshots" }).addEventListener("click", () => {
+		titleRow.createEl("button", { text: "Back to file history" }).addEventListener("click", () => {
 			this.selected = null;
 			this.expandedDiffKey = null;
 			this.diffText = null;
@@ -271,14 +268,12 @@ export class RecoveryHistoryModal extends Modal {
 
 export type RecoveryHistoryFileItem = FileHistoryItem;
 
-function buildSnapshotHistories(manifests: RecoveryManifest[]): SnapshotHistory[] {
+function buildSnapshotHistories(manifests: FileHistoryManifestIndex[]): SnapshotHistory[] {
 	return manifests
 		.slice()
 		.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
 		.map((manifest) => ({
 			manifest,
-			changedItems: manifest.entries
-				.filter((entry) => entry.kind !== "unchanged")
-				.map((entry) => ({ manifest, entry })),
+			changedItems: manifest.changedEntries.map((entry) => ({ manifest, entry })),
 		}));
 }

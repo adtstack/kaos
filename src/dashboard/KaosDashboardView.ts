@@ -4,6 +4,8 @@ import type {
 	DashboardConflictArtifact,
 	DashboardMetric,
 	DashboardRecentChange,
+	DashboardRecoveryStorageStatus,
+	DashboardTone,
 	KaosDashboardData,
 } from "./dashboardTypes";
 import {
@@ -31,6 +33,7 @@ export interface KaosDashboardActions {
 	importUntracked(): Promise<void>;
 	takeSnapshotNow(): Promise<void>;
 	showSnapshotList(): Promise<void>;
+	createFileHistoryPoint(): Promise<void>;
 	showRecoveryHistory(): Promise<void>;
 	exportDiagnostics(): void;
 	exportDiagnosticsWithFilenames(): void;
@@ -185,7 +188,7 @@ export class KaosDashboardView extends ItemView {
 			{ label: "Conflicts", value: String(data.conflicts.length), tone: data.conflicts.length > 0 ? "error" : "ok" },
 			{ label: "Recent changes", value: recentValue, tone: data.recentChanges.status === "error" ? "error" : undefined },
 			{
-				label: "Snapshots",
+				label: "Vault snapshots",
 				value: data.snapshotStatus.status === "ready"
 					? String(data.snapshotStatus.summary.snapshotCountLowerBound)
 					: data.snapshotStatus.status,
@@ -206,9 +209,10 @@ export class KaosDashboardView extends ItemView {
 			() => this.deps.actions.importUntracked(),
 			!data.actions.syncInitialized || data.actions.untrackedFileCount === 0,
 		);
-		this.button(section, "Take snapshot", () => this.deps.actions.takeSnapshotNow(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
-		this.button(section, "Browse snapshots", () => this.deps.actions.showSnapshotList(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
-		this.button(section, "File history", () => this.deps.actions.showRecoveryHistory(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
+		this.button(section, "Take vault snapshot", () => this.deps.actions.takeSnapshotNow(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
+		this.button(section, "Browse vault snapshots", () => this.deps.actions.showSnapshotList(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
+		this.button(section, "Create file history point", () => this.deps.actions.createFileHistoryPoint(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
+		this.button(section, "Review file history", () => this.deps.actions.showRecoveryHistory(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
 		this.button(section, "Export diagnostics", async () => this.deps.actions.exportDiagnostics());
 		this.button(section, "Export with filenames", async () => this.deps.actions.exportDiagnosticsWithFilenames());
 	}
@@ -224,13 +228,14 @@ export class KaosDashboardView extends ItemView {
 			() => this.deps.actions.importUntracked(),
 			!data.actions.syncInitialized || data.actions.untrackedFileCount === 0,
 		);
-		this.button(section, "Snapshot", () => this.deps.actions.takeSnapshotNow(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
+		this.button(section, "Vault snapshot", () => this.deps.actions.takeSnapshotNow(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
 
 		const details = root.createEl("details", { cls: "kaos-dashboard-mobile-more-actions" });
 		details.createEl("summary", { text: "More actions" });
 		const more = details.createDiv({ cls: "kaos-dashboard-row-actions" });
-		this.button(more, "Browse snapshots", () => this.deps.actions.showSnapshotList(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
-		this.button(more, "File history", () => this.deps.actions.showRecoveryHistory(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
+		this.button(more, "Browse vault snapshots", () => this.deps.actions.showSnapshotList(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
+		this.button(more, "Create file history point", () => this.deps.actions.createFileHistoryPoint(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
+		this.button(more, "Review file history", () => this.deps.actions.showRecoveryHistory(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
 		this.button(more, "Export diagnostics", async () => this.deps.actions.exportDiagnostics());
 		this.button(more, "Export with filenames", async () => this.deps.actions.exportDiagnosticsWithFilenames());
 	}
@@ -262,15 +267,27 @@ export class KaosDashboardView extends ItemView {
 		if (data.snapshotStatus.status === "ready") {
 			const summary = data.snapshotStatus.summary;
 			snapshotRow.createDiv({
-				text: `${summary.snapshotCountLowerBound} snapshot(s), ${formatBytes(summary.estimatedStorageBytesLowerBound)} stored`,
+				text: `${summary.snapshotCountLowerBound} vault snapshot(s), ${formatBytes(summary.estimatedStorageBytesLowerBound)} stored`,
 				cls: "kaos-dashboard-strong",
 			});
 			snapshotRow.createDiv({
-				text: summary.latestCreatedAt ? `latest ${formatDateTime(summary.latestCreatedAt)}` : "no snapshot timestamp",
+				text: summary.latestCreatedAt ? `latest ${formatDateTime(summary.latestCreatedAt)}` : "no vault snapshot timestamp",
 				cls: "kaos-dashboard-muted",
 			});
 		} else {
 			snapshotRow.createDiv({ text: data.snapshotStatus.message, cls: `kaos-dashboard-${data.snapshotStatus.status === "error" ? "error" : "muted"}` });
+		}
+		const storage = recoveryStorageDisplay(data.recoveryStorageStatus);
+		const storageRow = section.createDiv({ cls: "kaos-dashboard-snapshot-summary" });
+		storageRow.createDiv({
+			text: `File history storage: ${storage.label}`,
+			cls: `kaos-dashboard-strong ${toneClass(storage.tone)}`,
+		});
+		if (storage.detail) {
+			storageRow.createDiv({
+				text: storage.detail,
+				cls: storage.tone === "error" ? "kaos-dashboard-error" : "kaos-dashboard-muted",
+			});
 		}
 
 		if (data.recentChanges.status !== "ready") {
@@ -303,7 +320,7 @@ export class KaosDashboardView extends ItemView {
 		row.createDiv({ text: change.path, cls: "kaos-dashboard-path kaos-dashboard-recent-path" });
 		const details = [
 			change.oldPath && change.newPath ? `${change.oldPath} -> ${change.newPath}` : "",
-			change.snapshotKind,
+			"file history",
 			change.size !== null ? formatBytes(change.size) : "",
 		].filter(Boolean).join(" · ");
 		if (details) {
@@ -817,13 +834,50 @@ function displayChangeKind(kind: string): string {
 		case "renamed": return "Renamed";
 		case "deleted": return "Deleted";
 		case "restored": return "Restored";
-		case "attachment-changed": return "Attachment changed";
 		default: return kind;
 	}
 }
 
 function changeKindClass(kind: string): string {
 	return `is-change-${kind.replace(/[^a-z0-9-]/gi, "-").toLowerCase()}`;
+}
+
+function recoveryStorageDisplay(status: DashboardRecoveryStorageStatus): { label: string; tone: DashboardTone; detail: string } {
+	if (status.status !== "ready") {
+		return {
+			label: "Unknown",
+			tone: status.status === "error" ? "error" : "muted",
+			detail: status.message,
+		};
+	}
+	const report = status.report;
+	switch (report.status) {
+		case "healthy":
+		case "empty":
+			return {
+				label: "Healthy",
+				tone: "ok",
+				detail: `${report.manifestCountLowerBound} manifest(s) checked`,
+			};
+		case "repaired":
+			return {
+				label: "Repaired",
+				tone: "warn",
+				detail: `${report.repairs.filter((repair) => repair.success).length} repair(s) applied`,
+			};
+		case "degraded":
+			return {
+				label: "Needs attention",
+				tone: "error",
+				detail: `${report.issues.filter((issue) => !issue.repaired).length} issue(s) remaining`,
+			};
+		case "unavailable":
+			return {
+				label: "Unknown",
+				tone: "muted",
+				detail: report.issues[0]?.message ?? "File history storage is unavailable.",
+			};
+	}
 }
 
 function formatDateTime(iso: string): string {

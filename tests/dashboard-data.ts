@@ -9,6 +9,7 @@ import {
 	selectMobileOverviewMetrics,
 } from "../src/dashboard/dashboardLayout";
 import { formatDashboardDeviceName } from "../src/dashboard/deviceDisplay";
+import { normalizeRecoveryStorageAuditReport } from "../src/sync/recoverySnapshotClient";
 import type { KaosDashboardCollectorInput } from "../src/dashboard/dashboardTypes";
 
 let passed = 0;
@@ -151,13 +152,29 @@ const baseInput: KaosDashboardCollectorInput = {
 		},
 	},
 	snapshotStatus: { status: "unavailable", message: "Snapshot storage is unavailable." },
+	recoveryStorageStatus: {
+		status: "ready",
+		report: {
+			status: "healthy",
+			checkedAt: "2026-06-24T00:00:00Z",
+			latestManifestId: "m1",
+			latestIndexManifestId: "m1",
+			latestStateManifestId: "m1",
+			manifestCount: 1,
+			manifestCountLowerBound: 1,
+			checkedManifestCount: 1,
+			issues: [],
+			repairs: [],
+			contentCheckLimited: false,
+		},
+	},
 	recentChanges: {
 		status: "ready",
 		manifestCount: 1,
 		limited: false,
 		changes: [{
 			manifestId: "m1",
-			snapshotKind: "delta",
+			snapshotKind: "file-history",
 			createdAt: "2026-06-24T01:00:00Z",
 			fileId: "f1",
 			changeKind: "modified",
@@ -205,6 +222,7 @@ console.log("\n--- Test 4: dashboard data preserves snapshot unavailable and rec
 {
 	const data = buildKaosDashboardData(baseInput);
 	assert(data.snapshotStatus.status === "unavailable", "snapshot unavailable preserved");
+	assert(data.recoveryStorageStatus.status === "ready" && data.recoveryStorageStatus.report.status === "healthy", "recovery storage status preserved");
 	assert(data.recentChanges.status === "ready" && data.recentChanges.changes.length === 1, "recent changes preserved");
 	assert(data.actions.snapshotsAvailable === false, "snapshot action disabled state represented");
 	assert(data.overview.some((metric) => metric.label === "Server receipt" && metric.value === "confirmed"), "server receipt metric built");
@@ -248,6 +266,30 @@ console.log("\n--- Test 7: mobile overview keeps actionable metrics ---");
 	assert(labels.includes("Server receipt"), "mobile overview keeps server receipt");
 	assert(labels.includes("Untracked"), "mobile overview keeps untracked count");
 	assert(!labels.includes("Open files"), "mobile overview drops passive open-file metric");
+}
+
+console.log("\n--- Test 8: recovery storage audit response normalization is tolerant ---");
+{
+	const normalized = normalizeRecoveryStorageAuditReport({
+		status: "repaired",
+		checkedAt: "2026-06-24T02:00:00Z",
+		latestManifestId: "m2",
+		latestIndexManifestId: "m2",
+		latestStateManifestId: "m2",
+		manifestCountLowerBound: 2,
+		checkedManifestCount: 1,
+		contentCheckLimited: true,
+		issues: [{ kind: "latest-state-missing", severity: "error", repairable: true, repaired: true }],
+		repairs: [{ kind: "latest-state-missing", success: true }],
+	});
+	assert(normalized.status === "repaired", "known recovery storage status preserved");
+	assert(normalized.manifestCount === 2, "manifestCount falls back to manifestCountLowerBound");
+	assert(normalized.issues[0]?.message === "", "missing issue message normalizes to empty string");
+	assert(normalized.repairs[0]?.success === true, "repair success normalizes");
+
+	const unknown = normalizeRecoveryStorageAuditReport({ status: "surprise", issues: "bad" });
+	assert(unknown.status === "unavailable", "unknown recovery storage status normalizes to unavailable");
+	assert(unknown.issues.length === 0, "invalid issue list normalizes to empty");
 }
 
 console.log(`\nResults: ${passed} passed, ${failed} failed\n`);

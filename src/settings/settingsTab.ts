@@ -6,6 +6,7 @@ import {
 	type ExternalEditPolicy,
 	type VaultSyncSettings,
 } from "./settingsStore";
+import type { RecoveryStorageAuditReport } from "../sync/recoverySnapshotClient";
 import { randomBase64Url } from "../utils/base64url";
 
 type SettingsAuthMode = "env" | "claim" | "unclaimed" | "unknown";
@@ -26,6 +27,13 @@ interface SettingsUpdateState {
 	pluginCompatibilityWarning: string | null;
 }
 
+interface SettingsRecoveryStorageState {
+	status: RecoveryStorageAuditReport["status"] | "unknown";
+	label: "Healthy" | "Repaired" | "Needs attention" | "Unknown";
+	detail: string | null;
+	checkedAt: string | null;
+}
+
 export interface VaultSyncSettingsHost {
 	settings: VaultSyncSettings;
 	serverAuthMode: SettingsAuthMode;
@@ -34,9 +42,11 @@ export interface VaultSyncSettingsHost {
 	updateSettings(mutator: (settings: VaultSyncSettings) => void, reason?: string): Promise<void>;
 	refreshServerCapabilities(reason?: string): Promise<void>;
 	refreshUpdateManifest(reason?: string, force?: boolean): Promise<void>;
+	refreshRecoveryStorageStatus(reason?: string): Promise<void>;
 	refreshAttachmentSyncRuntime(reason?: string): Promise<void>;
 	getSettingsStatusSummary(): { state: SettingsStatusState; label: string };
 	getUpdateState(): SettingsUpdateState;
+	getRecoveryStorageStatusState(): SettingsRecoveryStorageState;
 	buildSetupDeepLink(): string | null;
 	buildMobileSetupUrl(): string | null;
 	buildRecoveryKitText(): string | null;
@@ -216,6 +226,8 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				"Update path",
 				updateState.updateRepoUrl ?? "Not configured",
 			);
+			const recoveryStorageState = this.host.getRecoveryStorageStatusState();
+			addCardRow(updateCard, "File history storage", recoveryStorageState.label);
 
 			const summaryText = updateState.serverUpdateAvailable
 				? updateState.migrationRequired
@@ -241,11 +253,22 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					cls: "kaos-settings-security-warning",
 				});
 			}
+			if (recoveryStorageState.detail) {
+				updateCard.createEl("p", {
+					text: recoveryStorageState.detail,
+					cls: recoveryStorageState.label === "Needs attention"
+						? "kaos-settings-security-warning"
+						: "kaos-settings-status-subtitle",
+				});
+			}
 
 			const updateActions = updateCard.createDiv({ cls: "modal-button-container kaos-settings-status-actions" });
 			updateActions.createEl("button", { text: "Refresh update info" }).addEventListener("click", () => {
 				void this.host.refreshServerCapabilities("settings-refresh");
 				void this.host.refreshUpdateManifest("settings-refresh", true).then(() => this.display());
+			});
+			updateActions.createEl("button", { text: "Check file history storage" }).addEventListener("click", () => {
+				void this.host.refreshRecoveryStorageStatus("settings-refresh").then(() => this.display());
 			});
 			const updateActionUrl = updateState.updateActionUrl;
 			if (updateActionUrl) {
@@ -317,7 +340,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					.setName("Attachment storage")
 					.setDesc(
 						attachmentsAvailable
-							? "Available on this server. The plugin can sync attachments and snapshots."
+							? "Available on this server. The plugin can sync attachments, vault snapshots, and file history."
 							: "Not available on this server. Add object storage in Cloudflare, then redeploy.",
 					)
 					.addButton((button) =>

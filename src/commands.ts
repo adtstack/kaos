@@ -181,7 +181,7 @@ export function registerCommands(
 
 	registrar.addCommand({
 		id: "snapshot-now",
-		name: "Take snapshot now",
+		name: "Take vault snapshot now",
 		callback: async () => {
 			await host.getSnapshotService()?.takeSnapshotNow();
 		},
@@ -189,9 +189,17 @@ export function registerCommands(
 
 	registrar.addCommand({
 		id: "snapshot-list",
-		name: "Browse and restore snapshots",
+		name: "Browse and restore vault snapshots",
 		callback: async () => {
 			await host.getSnapshotService()?.showSnapshotList();
+		},
+	});
+
+	registrar.addCommand({
+		id: "create-file-history-point",
+		name: "Create file history point",
+		callback: async () => {
+			await host.getSnapshotService()?.createFileHistoryPoint();
 		},
 	});
 
@@ -205,9 +213,25 @@ export function registerCommands(
 
 	registrar.addCommand({
 		id: "snapshot-prune",
-		name: "Cleanup old snapshots (apply retention policy)",
+		name: "Cleanup old vault snapshots",
 		callback: async () => {
 			await host.getSnapshotService()?.pruneSnapshots();
+		},
+	});
+
+	registrar.addCommand({
+		id: "check-file-history-storage",
+		name: "Check file history storage",
+		callback: async () => {
+			await host.getSnapshotService()?.repairFileHistoryStorage();
+		},
+	});
+
+	registrar.addCommand({
+		id: "cleanup-file-history",
+		name: "Cleanup file history",
+		callback: async () => {
+			await host.getSnapshotService()?.cleanupFileHistory();
 		},
 	});
 

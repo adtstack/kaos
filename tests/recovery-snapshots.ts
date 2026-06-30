@@ -1,5 +1,5 @@
 /**
- * File-level recovery snapshot safety tests.
+ * File history safety tests.
  *
  * Usage:
  *   node --import jiti/register tests/recovery-snapshots.ts
@@ -9,6 +9,7 @@ import * as Y from "yjs";
 import { gzipSync } from "fflate";
 import {
 	applyRecoveryRetention,
+	auditRecoveryStorage,
 	createRecoverySnapshot,
 	getRecoveryContent,
 	getRecoveryManifest,
@@ -64,6 +65,8 @@ class MemoryR2Object {
 class MemoryR2Bucket {
 	readonly objects = new Map<string, Uint8Array>();
 	readonly putOrder: string[] = [];
+	readonly getOrder: string[] = [];
+	readonly headOrder: string[] = [];
 
 	async put(key: string, value: string | ArrayBuffer | Uint8Array, _options?: unknown): Promise<MemoryR2Object> {
 		const bytes = typeof value === "string"
@@ -78,11 +81,13 @@ class MemoryR2Bucket {
 	}
 
 	async get(key: string): Promise<MemoryR2Object | null> {
+		this.getOrder.push(key);
 		const bytes = this.objects.get(key);
 		return bytes ? new MemoryR2Object(key, bytes) : null;
 	}
 
 	async head(key: string): Promise<{ key: string } | null> {
+		this.headOrder.push(key);
 		return this.objects.has(key) ? { key } : null;
 	}
 
@@ -107,6 +112,14 @@ class MemoryR2Bucket {
 			truncated: next < keys.length,
 			cursor: next < keys.length ? String(next) : undefined,
 		};
+	}
+
+	clearGetOrder(): void {
+		this.getOrder.length = 0;
+	}
+
+	clearHeadOrder(): void {
+		this.headOrder.length = 0;
 	}
 }
 
@@ -161,8 +174,7 @@ function applyEntry(state: Map<string, RecoveryManifestEntry>, entry: RecoveryMa
 function reconstructFrom(manifests: RecoveryManifest[]): Map<string, RecoveryManifestEntry> {
 	const state = new Map<string, RecoveryManifestEntry>();
 	for (const manifest of manifests.slice().sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
-		for (const entry of manifest.entries) {
-			if (entry.kind === "unchanged" && state.has(entry.fileId)) continue;
+		for (const entry of manifest.changedEntries) {
 			applyEntry(state, entry);
 		}
 	}
@@ -173,11 +185,11 @@ async function hashText(text: string): Promise<string> {
 	return sha256Hex(new TextEncoder().encode(text));
 }
 
-async function testStandaloneFullManifestWithChangedCount(): Promise<void> {
-	console.log("\n--- Test 1: v2 standalone full manifest records whole state and changedCount ---");
+async function testStandaloneChangedOnlyManifestWithChangedCount(): Promise<void> {
+	console.log("\n--- Test 1: file history manifest stores changed entries only ---");
 	const bucket = new MemoryR2Bucket();
 	const doc = new Y.Doc();
-	const vaultId = "recovery-v2-full";
+	const vaultId = "file-history-changed-only";
 
 	setText(doc, "file-a", "a.md", "alpha");
 	setText(doc, "file-b", "b.md", "bravo");
@@ -185,15 +197,19 @@ async function testStandaloneFullManifestWithChangedCount(): Promise<void> {
 	const first = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
 		now: new Date("2026-06-20T00:00:00Z"),
 	});
-	assertEqual(first.status, "created", "initial recovery snapshot is created");
-	assertEqual(first.index?.kind, "full", "initial recovery snapshot is full");
-	assertEqual(first.index?.storageVersion, "v2", "initial recovery snapshot uses v2 storage");
-	assertEqual(first.index?.changedCount, 2, "initial full marks both files changed");
+	assertEqual(first.status, "created", "initial file history point is created");
+	assertEqual(first.index?.kind, "file-history", "initial point is file-history");
+	assertEqual(first.index?.storageVersion, "v2", "initial point uses v2 storage");
+	assertEqual(first.index?.changedCount, 2, "initial point marks both files changed");
+	assertEqual(first.index?.changedEntries.length, 2, "initial index includes changed entry preview");
 
 	const firstManifest = await getRecoveryManifest(vaultId, first.manifestId!, bucket as unknown as R2Bucket);
-	assertEqual(firstManifest?.schemaVersion, 2, "v2 manifest has schemaVersion 2");
+	assert(firstManifest !== null, "initial file history manifest can be fetched");
+	assertEqual(firstManifest?.schemaVersion, 3, "file history manifest has schemaVersion 3");
 	assertEqual(firstManifest?.storageVersion, "v2", "v2 manifest has storageVersion");
-	assertEqual(firstManifest?.entries.length, 2, "initial v2 manifest contains full file state");
+	assertEqual(firstManifest?.kind, "file-history", "manifest kind is file-history");
+	assertEqual(firstManifest?.changedEntries.length, 2, "initial manifest contains changed entries");
+	if (firstManifest) assert(!("entries" in firstManifest), "file history manifest does not contain full entries");
 	assert(bucket.putOrder.some((key) => key.startsWith(`v2/${vaultId}/recovery/manifests/`)), "manifest is written under v2 recovery prefix");
 	assert(!bucket.putOrder.some((key) => key.startsWith(`v1/${vaultId}/recovery/`)), "v1 recovery prefix is not written");
 
@@ -203,20 +219,207 @@ async function testStandaloneFullManifestWithChangedCount(): Promise<void> {
 	assertEqual(noop.status, "noop", "unchanged state is not stored again");
 
 	setText(doc, "file-b", "b.md", "bravo v2");
+	bucket.clearHeadOrder();
+	const putOrderBeforeSecond = bucket.putOrder.length;
 	const second = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
 		now: new Date("2026-06-20T01:00:00Z"),
 	});
-	assertEqual(second.status, "created", "changed state creates a new v2 full manifest");
-	assertEqual(second.index?.kind, "full", "second manifest remains full");
+	assertEqual(second.status, "created", "changed state creates a new file history point");
+	assertEqual(second.index?.kind, "file-history", "second manifest remains file-history");
 	assertEqual(second.index?.changedCount, 1, "changedCount is one");
+	assertEqual(second.index?.changedEntries.length, 1, "index includes one changed entry");
+	assertEqual(second.index?.changedEntries[0]?.fileId, "file-b", "only changed file is indexed");
+	const secondContentHeads = bucket.headOrder.filter((key) => key.startsWith(`v2/${vaultId}/recovery/content/`));
+	const secondContentPuts = bucket.putOrder
+		.slice(putOrderBeforeSecond)
+		.filter((key) => key.startsWith(`v2/${vaultId}/recovery/content/`));
+	assertEqual(secondContentHeads.length, 1, "only changed content hash is checked with head");
+	assertEqual(secondContentPuts.length, 1, "only changed content object is uploaded");
 
 	const manifest = await getRecoveryManifest(vaultId, second.manifestId!, bucket as unknown as R2Bucket);
-	assert(manifest !== null, "v2 full manifest can be fetched");
-	assertEqual(manifest!.entries.length, 2, "v2 full manifest contains all current files");
-	assert(manifest!.entries.some((entry) => entry.fileId === "file-a" && entry.kind === "unchanged"), "unchanged file remains in full manifest");
-	assert(manifest!.entries.some((entry) => entry.fileId === "file-b" && entry.kind === "modified"), "changed file is marked modified");
+	assert(manifest !== null, "file history manifest can be fetched");
+	assertEqual(manifest!.changedEntries.length, 1, "follow-up manifest contains only changed file");
+	assert(!manifest!.changedEntries.some((entry) => entry.fileId === "file-a"), "unchanged file is not stored in manifest");
+	assert(manifest!.changedEntries.some((entry) => entry.fileId === "file-b" && entry.kind === "modified"), "changed file is marked modified");
 
 	doc.destroy();
+}
+
+async function testMissingLatestStateStartsNewBaseline(): Promise<void> {
+	console.log("\n--- Test 1b: missing latest-state starts a new changed-only baseline ---");
+	const bucket = new MemoryR2Bucket();
+	const doc = new Y.Doc();
+	const vaultId = "file-history-missing-latest-state";
+	const latestStateKey = `v2/${vaultId}/recovery/latest-state.json.gz`;
+
+	setText(doc, "file-a", "a.md", "alpha");
+	setText(doc, "file-b", "b.md", "bravo");
+	const first = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:00:00Z"),
+	});
+	assertEqual(first.status, "created", "initial point is created");
+
+	await bucket.delete(latestStateKey);
+	const second = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:30:00Z"),
+	});
+	assertEqual(second.status, "created", "missing latest-state does not synthesize old baseline from manifest");
+	assertEqual(second.index?.changedCount, 2, "all active files become the new baseline");
+	assert(await bucket.head(latestStateKey) !== null, "new point rewrites latest-state");
+	const manifest = await getRecoveryManifest(vaultId, second.manifestId!, bucket as unknown as R2Bucket);
+	assert(manifest !== null, "new baseline manifest can be fetched");
+	assertEqual(manifest?.changedEntries.length, 2, "new baseline manifest stores active files as changed entries");
+	assert(manifest!.changedEntries.every((entry) => entry.kind === "created"), "new baseline marks active files created");
+
+	doc.destroy();
+}
+
+async function testRecoveryStorageStatusAndRepairDerivedObjects(): Promise<void> {
+	console.log("\n--- Test 1c: light status is read-only and does not open gzip manifests ---");
+	const bucket = new MemoryR2Bucket();
+	const doc = new Y.Doc();
+	const vaultId = "file-history-light-status";
+
+	setText(doc, "file-a", "a.md", "alpha");
+	setText(doc, "file-b", "b.md", "bravo");
+	const first = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:00:00Z"),
+	});
+	assertEqual(first.status, "created", "initial file history point is created");
+
+	bucket.clearGetOrder();
+	const putCountBeforeStatus = bucket.putOrder.length;
+	const status = await auditRecoveryStorage(vaultId, bucket as unknown as R2Bucket, {
+		repair: false,
+		manifestCheckLimit: 0,
+		contentCheckLimit: 0,
+	});
+	assertEqual(status.status, "healthy", "light status reports healthy pointers");
+	assertEqual(status.checkedManifestCount, 0, "light status does not check full manifests");
+	assertEqual(bucket.putOrder.length, putCountBeforeStatus, "light status does not write to R2");
+	assert(!bucket.getOrder.some((key) => key.includes("/recovery/manifests/") && key.endsWith(".json.gz")), "light status does not read gzip manifests");
+
+	doc.destroy();
+}
+
+async function testRecoveryStorageMissingLatestStateIsDegraded(): Promise<void> {
+	console.log("\n--- Test 1d: latest-state is not repaired from changed-only manifests ---");
+	const bucket = new MemoryR2Bucket();
+	const doc = new Y.Doc();
+	const vaultId = "file-history-latest-state-degraded";
+	const latestStateKey = `v2/${vaultId}/recovery/latest-state.json.gz`;
+
+	setText(doc, "file-a", "a.md", "alpha");
+	const first = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:00:00Z"),
+	});
+	assertEqual(first.status, "created", "initial point is created");
+
+	await bucket.delete(latestStateKey);
+	const putCountBeforeRepair = bucket.putOrder.length;
+	const repaired = await auditRecoveryStorage(vaultId, bucket as unknown as R2Bucket, { repair: true });
+	assertEqual(repaired.status, "degraded", "repair reports missing latest-state as degraded");
+	assert(repaired.issues.some((issue) => issue.kind === "latest-state-missing" && !issue.repaired && !issue.repairable), "latest-state issue is not repaired");
+	assertEqual(bucket.putOrder.length, putCountBeforeRepair, "repair does not synthesize latest-state from changed-only manifests");
+
+	doc.destroy();
+}
+
+async function testRecoveryStorageRepairCorruptLatestStateAndPointers(): Promise<void> {
+	console.log("\n--- Test 1e: recovery storage repair fixes latest-index and manifest-index metadata ---");
+	const bucket = new MemoryR2Bucket();
+	const doc = new Y.Doc();
+	const vaultId = "file-history-pointer-repair";
+	const latestIndexKey = `v2/${vaultId}/recovery/latest-index.json`;
+
+	setText(doc, "file-a", "a.md", "alpha");
+	const first = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:00:00Z"),
+	});
+	setText(doc, "file-a", "a.md", "alpha v2");
+	const second = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T01:00:00Z"),
+	});
+
+	await bucket.delete(latestIndexKey);
+	const missingLatestIndexRepair = await auditRecoveryStorage(vaultId, bucket as unknown as R2Bucket, { repair: true });
+	assertEqual(missingLatestIndexRepair.status, "repaired", "missing latest-index is repaired");
+	assert(missingLatestIndexRepair.issues.some((issue) => issue.kind === "latest-index-missing" && issue.repaired), "missing latest-index issue is marked repaired");
+
+	await bucket.put(latestIndexKey, JSON.stringify(first.index));
+	const indexRepair = await auditRecoveryStorage(vaultId, bucket as unknown as R2Bucket, { repair: true });
+	assertEqual(indexRepair.status, "repaired", "stale latest-index is repaired");
+	assertEqual(indexRepair.latestIndexManifestId, second.manifestId ?? null, "repair report points latest-index to newest manifest");
+
+	const manifestIndexKey = `v2/${vaultId}/recovery/manifest-indexes/${second.manifestId}.json`;
+	await bucket.delete(manifestIndexKey);
+	const missingIndexRepair = await auditRecoveryStorage(vaultId, bucket as unknown as R2Bucket, { repair: true });
+	assertEqual(missingIndexRepair.status, "repaired", "missing manifest-index is repaired");
+	assert(missingIndexRepair.issues.some((issue) => issue.kind === "manifest-index-missing" && issue.repaired), "missing manifest-index issue is marked repaired");
+
+	await bucket.put(manifestIndexKey, JSON.stringify({ ...second.index, changedCount: 999 }));
+	const staleIndexRepair = await auditRecoveryStorage(vaultId, bucket as unknown as R2Bucket, { repair: true });
+	assertEqual(staleIndexRepair.status, "repaired", "stale manifest-index is repaired");
+	assert(staleIndexRepair.issues.some((issue) => issue.kind === "manifest-index-stale" && issue.repaired), "stale manifest-index issue is marked repaired");
+
+	doc.destroy();
+}
+
+async function testRecoveryStorageCorruptLatestStateIsDegraded(): Promise<void> {
+	console.log("\n--- Test 1f: corrupt latest-state is degraded and not repaired ---");
+	const bucket = new MemoryR2Bucket();
+	const doc = new Y.Doc();
+	const vaultId = "file-history-corrupt-latest-state";
+	const latestStateKey = `v2/${vaultId}/recovery/latest-state.json.gz`;
+
+	setText(doc, "file-a", "a.md", "alpha");
+	const first = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:00:00Z"),
+	});
+	assertEqual(first.status, "created", "initial point is created");
+
+	await bucket.put(latestStateKey, new TextEncoder().encode("not gzip"));
+	const stateRepair = await auditRecoveryStorage(vaultId, bucket as unknown as R2Bucket, { repair: true });
+	assertEqual(stateRepair.status, "degraded", "corrupt latest-state is reported degraded");
+	assert(stateRepair.issues.some((issue) => issue.kind === "latest-state-corrupt" && !issue.repaired && !issue.repairable), "corrupt latest-state issue is not repaired");
+
+	doc.destroy();
+}
+
+async function testRecoveryStorageDegradedDoesNotRepairManifestOrContent(): Promise<void> {
+	console.log("\n--- Test 1g: recovery storage audit reports corrupt manifest and missing content without repairing them ---");
+	const corruptBucket = new MemoryR2Bucket();
+	const corruptDoc = new Y.Doc();
+	const corruptVaultId = "recovery-storage-corrupt-manifest";
+	setText(corruptDoc, "file-a", "a.md", "alpha");
+	const corruptSnapshot = await createRecoverySnapshot(corruptDoc, corruptVaultId, corruptBucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:00:00Z"),
+	});
+	const corruptManifestKey = `v2/${corruptVaultId}/recovery/manifests/${corruptSnapshot.manifestId}.json.gz`;
+	await corruptBucket.put(corruptManifestKey, gzipSync(new TextEncoder().encode("not json")));
+	const corruptPutCount = corruptBucket.putOrder.length;
+	const corruptReport = await auditRecoveryStorage(corruptVaultId, corruptBucket as unknown as R2Bucket, { repair: true });
+	assertEqual(corruptReport.status, "degraded", "corrupt manifest is reported degraded");
+	assert(corruptReport.issues.some((issue) => issue.kind === "manifest-corrupt" && !issue.repairable), "corrupt manifest is not repairable");
+	assertEqual(corruptBucket.putOrder.length, corruptPutCount, "corrupt manifest repair does not rewrite objects");
+	corruptDoc.destroy();
+
+	const missingContentBucket = new MemoryR2Bucket();
+	const contentDoc = new Y.Doc();
+	const contentVaultId = "recovery-storage-missing-content";
+	setText(contentDoc, "file-a", "a.md", "alpha");
+	const contentSnapshot = await createRecoverySnapshot(contentDoc, contentVaultId, missingContentBucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:00:00Z"),
+	});
+	const hash = contentSnapshot.index?.contentHashes[0];
+	assert(typeof hash === "string", "test snapshot has a content object");
+	await missingContentBucket.delete(recoveryContentKey(contentVaultId, hash!));
+	const missingContentPutCount = missingContentBucket.putOrder.length;
+	const missingContentReport = await auditRecoveryStorage(contentVaultId, missingContentBucket as unknown as R2Bucket, { repair: true });
+	assertEqual(missingContentReport.status, "degraded", "missing content object is reported degraded");
+	assert(missingContentReport.issues.some((issue) => issue.kind === "content-missing" && !issue.repairable), "missing content object is not repairable");
+	assertEqual(missingContentBucket.putOrder.length, missingContentPutCount, "missing content repair does not rewrite content");
+	contentDoc.destroy();
 }
 
 async function testRenameDeleteAndChainReconstruction(): Promise<void> {
@@ -258,10 +461,10 @@ async function testRenameDeleteAndChainReconstruction(): Promise<void> {
 }
 
 async function testNestedV3MetaIsSnapshotted(): Promise<void> {
-	console.log("\n--- Test 2b: v3 nested meta is snapshotted without pathToId ---");
+	console.log("\n--- Test 2b: v3 nested meta is recorded as file history without pathToId ---");
 	const bucket = new MemoryR2Bucket();
 	const doc = new Y.Doc();
-	const vaultId = "recovery-v3-meta";
+	const vaultId = "file-history-v3-meta";
 
 	setNestedMetaText(doc, "file-a", "a.md", "alpha");
 	setNestedMetaText(doc, "file-b", "folder/b.md", "bravo");
@@ -269,36 +472,36 @@ async function testNestedV3MetaIsSnapshotted(): Promise<void> {
 	const first = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
 		now: new Date("2026-06-20T00:00:00Z"),
 	});
-	assertEqual(first.status, "created", "initial v3 recovery snapshot is created");
-	assertEqual(first.index?.kind, "full", "initial v3 recovery snapshot is full");
-	assertEqual(first.index?.changedCount, 2, "initial v3 full marks both files changed");
-	assertEqual(first.index?.fullFileCount, 2, "initial v3 full records both files");
+	assertEqual(first.status, "created", "initial v3 file history point is created");
+	assertEqual(first.index?.kind, "file-history", "initial v3 point is file-history");
+	assertEqual(first.index?.changedCount, 2, "initial v3 point marks both files changed");
+	assertEqual(first.index?.changedEntries.length, 2, "initial v3 index records both changed entries");
 
 	const firstManifest = await getRecoveryManifest(vaultId, first.manifestId!, bucket as unknown as R2Bucket);
-	assertEqual(firstManifest?.entries.length, 2, "initial v3 manifest contains both entries");
-	assert(firstManifest!.entries.every((entry) => entry.kind === "created"), "initial v3 entries are marked created");
+	assertEqual(firstManifest?.changedEntries.length, 2, "initial v3 manifest contains both changed entries");
+	assert(firstManifest!.changedEntries.every((entry) => entry.kind === "created"), "initial v3 entries are marked created");
 
 	setNestedMetaText(doc, "file-b", "folder/b.md", "bravo v2");
 	const second = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
 		now: new Date("2026-06-20T01:00:00Z"),
 	});
-	assertEqual(second.status, "created", "v3 content change creates a v2 full snapshot");
-	assertEqual(second.index?.kind, "full", "v3 follow-up snapshot remains full");
-	assertEqual(second.index?.changedCount, 1, "v3 delta changedCount is one");
+	assertEqual(second.status, "created", "v3 content change creates a file history point");
+	assertEqual(second.index?.kind, "file-history", "v3 follow-up point remains file-history");
+	assertEqual(second.index?.changedCount, 1, "v3 follow-up changedCount is one");
 
 	const secondManifest = await getRecoveryManifest(vaultId, second.manifestId!, bucket as unknown as R2Bucket);
-	assertEqual(secondManifest?.entries.length, 2, "v3 full manifest contains whole state");
-	assert(secondManifest!.entries.some((entry) => entry.fileId === "file-a" && entry.kind === "unchanged"), "v3 full manifest includes unchanged file");
-	assert(secondManifest!.entries.some((entry) => entry.fileId === "file-b" && entry.kind === "modified"), "v3 touched file is marked modified");
+	assertEqual(secondManifest?.changedEntries.length, 1, "v3 follow-up manifest contains only changed file");
+	assert(!secondManifest!.changedEntries.some((entry) => entry.fileId === "file-a"), "v3 follow-up manifest omits unchanged file");
+	assert(secondManifest!.changedEntries.some((entry) => entry.fileId === "file-b" && entry.kind === "modified"), "v3 touched file is marked modified");
 
 	doc.destroy();
 }
 
-async function testLargeVaultFullManifestUsesContentDedupe(): Promise<void> {
-	console.log("\n--- Test 3: 5k-file vault writes full manifest and deduped content ---");
+async function testLargeVaultFollowUpStoresChangedOnly(): Promise<void> {
+	console.log("\n--- Test 3: 5k-file vault follow-up stores changed file only ---");
 	const bucket = new MemoryR2Bucket();
 	const doc = new Y.Doc();
-	const vaultId = "recovery-large";
+	const vaultId = "file-history-large";
 
 	for (let i = 0; i < 5000; i++) {
 		setText(doc, `file-${i}`, `folder/${i}.md`, `content ${i}`);
@@ -306,29 +509,42 @@ async function testLargeVaultFullManifestUsesContentDedupe(): Promise<void> {
 	const full = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
 		now: new Date("2026-06-20T00:00:00Z"),
 	});
-	assertEqual(full.index?.kind, "full", "large initial snapshot is full");
-	assertEqual(full.index?.fullFileCount, 5000, "large full records 5000 live files");
+	assertEqual(full.index?.kind, "file-history", "large initial point is file-history");
+	assertEqual(full.index?.changedEntries.length, 5000, "large initial point records all files as initial changes");
 
 	setText(doc, "file-1234", "folder/1234.md", "content 1234 changed");
+	bucket.clearHeadOrder();
+	const putOrderBeforeNext = bucket.putOrder.length;
 	const next = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
 		now: new Date("2026-06-20T01:00:00Z"),
 	});
-	assertEqual(next.index?.kind, "full", "large follow-up snapshot remains full");
+	assertEqual(next.index?.kind, "file-history", "large follow-up remains file-history");
 	assertEqual(next.index?.changedCount, 1, "large follow-up changedCount is one");
+	assertEqual(next.index?.contentHashes.length, 1, "large follow-up stores one content hash");
+	assertEqual(
+		bucket.headOrder.filter((key) => key.startsWith(`v2/${vaultId}/recovery/content/`)).length,
+		1,
+		"large follow-up checks only changed content hash",
+	);
+	assertEqual(
+		bucket.putOrder.slice(putOrderBeforeNext).filter((key) => key.startsWith(`v2/${vaultId}/recovery/content/`)).length,
+		1,
+		"large follow-up uploads only changed content object",
+	);
 
 	const manifest = await getRecoveryManifest(vaultId, next.manifestId!, bucket as unknown as R2Bucket);
-	assertEqual(manifest?.entries.length, 5000, "large follow-up full manifest contains all files");
-	assert(manifest!.entries.some((entry) => entry.fileId === "file-1234" && entry.kind === "modified"), "large follow-up marks touched file modified");
-	assert(manifest!.entries.some((entry) => entry.fileId === "file-1235" && entry.kind === "unchanged"), "large follow-up marks untouched file unchanged");
+	assertEqual(manifest?.changedEntries.length, 1, "large follow-up manifest contains one changed entry");
+	assert(manifest!.changedEntries.some((entry) => entry.fileId === "file-1234" && entry.kind === "modified"), "large follow-up marks touched file modified");
+	assert(!manifest!.changedEntries.some((entry) => entry.fileId === "file-1235"), "large follow-up omits untouched file");
 
 	doc.destroy();
 }
 
-async function testFullManifestCadenceAndPointerOrder(): Promise<void> {
-	console.log("\n--- Test 4: forced full manifest and latest pointer order ---");
+async function testFileHistoryPointerOrder(): Promise<void> {
+	console.log("\n--- Test 4: file history content and pointer write order ---");
 	const bucket = new MemoryR2Bucket();
 	const doc = new Y.Doc();
-	const vaultId = "recovery-full";
+	const vaultId = "file-history-pointer-order";
 
 	setText(doc, "file-a", "a.md", "alpha");
 	setText(doc, "file-b", "b.md", "bravo");
@@ -340,11 +556,11 @@ async function testFullManifestCadenceAndPointerOrder(): Promise<void> {
 		now: new Date("2026-06-20T01:00:00Z"),
 		forceFull: true,
 	});
-	assertEqual(forced.index?.kind, "full", "forceFull creates a full manifest");
+	assertEqual(forced.index?.kind, "file-history", "forceFull is accepted but file history remains changed-only");
 
 	const manifest = await getRecoveryManifest(vaultId, forced.manifestId!, bucket as unknown as R2Bucket);
-	assertEqual(manifest?.entries.length, 2, "forced full stores whole file-state manifest");
-	assert(manifest!.entries.some((entry) => entry.kind === "unchanged" && entry.fileId === "file-b"), "forced full includes unchanged file state");
+	assertEqual(manifest?.changedEntries.length, 1, "forced point stores only changed file entries");
+	assert(!manifest!.changedEntries.some((entry) => entry.fileId === "file-b"), "forced point omits unchanged file state");
 
 	const latestIndexKey = `v2/${vaultId}/recovery/latest-index.json`;
 	const latestStateKey = `v2/${vaultId}/recovery/latest-state.json.gz`;
@@ -352,11 +568,11 @@ async function testFullManifestCadenceAndPointerOrder(): Promise<void> {
 	const latestStatePutIndex = bucket.putOrder.lastIndexOf(latestStateKey);
 	const latestIndexPutIndex = bucket.putOrder.lastIndexOf(latestIndexKey);
 	const contentPutIndex = bucket.putOrder.findIndex((key) => key.startsWith(`v2/${vaultId}/recovery/content/`) && key.endsWith(".md.gz"));
-	assert(manifestPutIndex >= 0, "forced manifest object was written");
+	assert(manifestPutIndex >= 0, "manifest object was written");
 	assert(contentPutIndex >= 0 && contentPutIndex < manifestPutIndex, "content is written before manifest");
 	assert(latestStatePutIndex > manifestPutIndex, "latest state is written after manifest");
 	assert(latestIndexPutIndex > latestStatePutIndex, "latest pointer is written after manifest and state");
-	assert(first.manifestId !== forced.manifestId, "new full manifest has a new id");
+	assert(first.manifestId !== forced.manifestId, "new file history point has a new id");
 
 	doc.destroy();
 }
@@ -378,10 +594,10 @@ async function testContentHashVerification(): Promise<void> {
 }
 
 async function testListIsNewestFirst(): Promise<void> {
-	console.log("\n--- Test 6: v2 manifest listing is newest-first, bounded, and ignores v1 ---");
+	console.log("\n--- Test 6: file history listing is newest-first, bounded, lightweight, and ignores v1 ---");
 	const bucket = new MemoryR2Bucket();
 	const doc = new Y.Doc();
-	const vaultId = "recovery-list";
+	const vaultId = "file-history-list";
 
 	setText(doc, "file-a", "a.md", "alpha");
 	const first = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
@@ -397,13 +613,39 @@ async function testListIsNewestFirst(): Promise<void> {
 	assertEqual(listed.totalManifestKeys, 2, "list reports total manifest key count");
 	assertEqual(listed.limited, true, "list marks bounded result as limited");
 	assertEqual(listed.manifests[0]?.manifestId, second.manifestId, "newest manifest is listed first");
+	assertEqual(listed.manifests[0]?.changedCount, 1, "list reads changedCount from lightweight index");
+	assertEqual(listed.manifests[0]?.kind, "file-history", "list reads file-history kind from lightweight index");
+	assertEqual(listed.manifests[0]?.changedEntries.length, 1, "list reads changed entry preview from lightweight index");
+	assertEqual(listed.manifests[0]?.changedEntries[0]?.fileId, "file-a", "list preview includes changed file id");
 	assert(first.manifestId !== second.manifestId, "test created two distinct manifests");
+	assert(bucket.putOrder.some((key) => key === `v2/${vaultId}/recovery/manifest-indexes/${second.manifestId}.json`), "lightweight manifest index is written");
+	assert(!bucket.getOrder.some((key) => key.includes("/recovery/manifests/") && key.endsWith(".json.gz")), "listing does not read full gzip manifests");
 
 	await bucket.put(`v1/${vaultId}/recovery/manifests/2026-06-20/legacy.json.gz`, "legacy");
 	const listedAfterLegacy = await listRecoveryManifestIndexes(vaultId, bucket as unknown as R2Bucket, 20);
-	assertEqual(listedAfterLegacy.totalManifestKeys, 2, "v1 recovery manifest is ignored by v2 listing");
+	assertEqual(listedAfterLegacy.totalManifestKeys, 2, "v1 recovery manifest is ignored by file history listing");
 
 	doc.destroy();
+}
+
+async function testListSynthesizesLegacyIndexWithoutReadingManifest(): Promise<void> {
+	console.log("\n--- Test 6b: listing missing-index v2 manifests does not open large gzip manifest ---");
+	const bucket = new MemoryR2Bucket();
+	const vaultId = "file-history-list-missing-index";
+	const createdAt = "2026-05-27T00:00:00.000Z";
+	const manifestId = `${new Date(createdAt).getTime().toString(36)}-abcd1234`;
+	await bucket.put(
+		`v2/${vaultId}/recovery/manifests/${manifestId}.json.gz`,
+		gzipSync(new TextEncoder().encode("not json and intentionally never read")),
+	);
+
+	bucket.clearGetOrder();
+	const listed = await listRecoveryManifestIndexes(vaultId, bucket as unknown as R2Bucket, 9);
+	assertEqual(listed.manifests.length, 1, "missing-index v2 manifest key is listed");
+	assertEqual(listed.manifests[0]?.manifestId, manifestId, "synthesized index keeps manifest id");
+	assertEqual(listed.manifests[0]?.createdAt, createdAt, "synthesized index derives createdAt from manifest id");
+	assertEqual(listed.manifests[0]?.changedEntries.length, 0, "synthesized index has no preview without opening manifest");
+	assert(!bucket.getOrder.some((key) => key.endsWith(".json.gz")), "listing does not read full gzip manifest");
 }
 
 async function testRetentionPrunesOnlyV2AndGcContent(): Promise<void> {
@@ -469,11 +711,11 @@ async function testRetentionPrunesOnlyV2AndGcContent(): Promise<void> {
 	doc.destroy();
 }
 
-async function testLargeFullSnapshotDoesNotCreateBundle(): Promise<void> {
-	console.log("\n--- Test 8: large v2 full snapshot stores individual content objects, not bundles ---");
+async function testLargeFileHistoryPointDoesNotCreateBundle(): Promise<void> {
+	console.log("\n--- Test 8: large file history point stores individual changed content objects, not bundles ---");
 	const bucket = new MemoryR2Bucket();
 	const doc = new Y.Doc();
-	const vaultId = "recovery-v2-large-full";
+	const vaultId = "file-history-large-no-bundle";
 
 	for (let i = 0; i < 600; i++) {
 		setText(doc, `file-${i}`, `notes/${i}.md`, `content ${i}`);
@@ -482,12 +724,13 @@ async function testLargeFullSnapshotDoesNotCreateBundle(): Promise<void> {
 	const first = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
 		now: new Date("2026-06-20T00:00:00Z"),
 	});
-	assertEqual(first.status, "created", "large initial full snapshot is created");
-	assertEqual(first.index?.kind, "full", "large initial snapshot is full");
+	assertEqual(first.status, "created", "large initial file history point is created");
+	assertEqual(first.index?.kind, "file-history", "large initial point is file-history");
+	assertEqual(first.index?.changedEntries.length, 600, "large initial point stores initial changed entries");
 
 	const hash = await hashText("content 542");
-	assert(await bucket.head(recoveryContentKey(vaultId, hash)) !== null, "large v2 full writes individual content object");
-	assert(!bucket.putOrder.some((key) => key.includes("/recovery/content-bundles/")), "large v2 full does not create content bundle");
+	assert(await bucket.head(recoveryContentKey(vaultId, hash)) !== null, "large file history point writes individual content object");
+	assert(!bucket.putOrder.some((key) => key.includes("/recovery/content-bundles/")), "large file history point does not create content bundle");
 	const content = await getRecoveryContent(vaultId, hash, bucket as unknown as R2Bucket);
 	assertEqual(content?.text, "content 542", "individual v2 content is fetched by hash");
 
@@ -506,7 +749,7 @@ async function testTamperedManifestIsRejected(): Promise<void> {
 	});
 	const manifest = await getRecoveryManifest(vaultId, created.manifestId!, bucket as unknown as R2Bucket);
 	assert(manifest !== null, "manifest can be loaded before tamper");
-	manifest!.entries[0]!.path = "tampered.md";
+	manifest!.changedEntries[0]!.path = "tampered.md";
 	await bucket.put(
 		`v2/${vaultId}/recovery/manifests/${created.manifestId}.json.gz`,
 		gzipSync(new TextEncoder().encode(JSON.stringify(manifest))),
@@ -516,15 +759,22 @@ async function testTamperedManifestIsRejected(): Promise<void> {
 	doc.destroy();
 }
 
-await testStandaloneFullManifestWithChangedCount();
+await testStandaloneChangedOnlyManifestWithChangedCount();
+await testMissingLatestStateStartsNewBaseline();
+await testRecoveryStorageStatusAndRepairDerivedObjects();
+await testRecoveryStorageMissingLatestStateIsDegraded();
+await testRecoveryStorageRepairCorruptLatestStateAndPointers();
+await testRecoveryStorageCorruptLatestStateIsDegraded();
+await testRecoveryStorageDegradedDoesNotRepairManifestOrContent();
 await testRenameDeleteAndChainReconstruction();
 await testNestedV3MetaIsSnapshotted();
-await testLargeVaultFullManifestUsesContentDedupe();
-await testFullManifestCadenceAndPointerOrder();
+await testLargeVaultFollowUpStoresChangedOnly();
+await testFileHistoryPointerOrder();
 await testContentHashVerification();
 await testListIsNewestFirst();
+await testListSynthesizesLegacyIndexWithoutReadingManifest();
 await testRetentionPrunesOnlyV2AndGcContent();
-await testLargeFullSnapshotDoesNotCreateBundle();
+await testLargeFileHistoryPointDoesNotCreateBundle();
 await testTamperedManifestIsRejected();
 
 console.log(`\nResults: ${passed} passed, ${failed} failed`);

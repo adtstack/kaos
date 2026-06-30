@@ -14,13 +14,16 @@ import {
 	type SnapshotIndex,
 } from "../sync/snapshotClient";
 import {
-	downloadRecoveryContent,
-	downloadRecoveryManifest,
+	cleanupFileHistoryStorage,
+	downloadFileHistoryContent,
+	getFileHistoryStorageStatus,
 	getLiveHashForFileVersion,
-	listRecoverySnapshots,
-	requestRecoverySnapshotMaybe,
+	listFileHistoryManifests,
+	repairFileHistoryStorage,
+	requestFileHistoryPointMaybe,
 	restoreRecoveryVersionToLiveDoc,
-	type RecoveryManifest,
+	type FileHistoryManifestIndex,
+	type FileHistoryPointResult,
 } from "../sync/recoverySnapshotClient";
 import { VaultSync } from "../sync/vaultSync";
 import type { VaultSyncSettings } from "../settings";
@@ -31,6 +34,7 @@ import { RecoveryHistoryModal, type RecoveryHistoryFileItem } from "./recoveryHi
 import type {
 	DashboardRecentChange,
 	DashboardRecentChanges,
+	DashboardRecoveryStorageStatus,
 	DashboardSnapshotStatus,
 } from "../dashboard/dashboardTypes";
 
@@ -90,24 +94,18 @@ export class SnapshotService {
 
 		try {
 			const settings = this.deps.getSettings();
-			const listed = await listRecoverySnapshots(
+			const listed = await listFileHistoryManifests(
 				settings,
 				this.deps.getTraceHttpContext(),
 				manifestLimit,
 			);
 			const changes: DashboardRecentChange[] = [];
 			for (const index of listed.manifests.slice(0, manifestLimit)) {
-				const manifest = await downloadRecoveryManifest(
-					settings,
-					index.manifestId,
-					this.deps.getTraceHttpContext(),
-				);
-				for (const entry of manifest.entries) {
-					if (entry.kind === "unchanged") continue;
+				for (const entry of index.changedEntries) {
 					changes.push({
-						manifestId: manifest.manifestId,
-						snapshotKind: manifest.kind,
-						createdAt: manifest.createdAt,
+						manifestId: index.manifestId,
+						snapshotKind: index.kind,
+						createdAt: index.createdAt,
 						fileId: entry.fileId,
 						changeKind: entry.kind,
 						path: entry.newPath ?? entry.path,
@@ -125,6 +123,30 @@ export class SnapshotService {
 				manifestCount: listed.manifests.length,
 				limited: listed.limited,
 				changes: changes.slice(0, changeLimit),
+			};
+		} catch (err) {
+			return { status: "error", message: formatUnknown(err) };
+		}
+	}
+
+	async getDashboardRecoveryStorageStatus(): Promise<DashboardRecoveryStorageStatus> {
+		const vaultSync = this.deps.getVaultSync();
+		if (!vaultSync) {
+			return { status: "unavailable", message: "Sync not initialized." };
+		}
+		if (!this.deps.getServerSupportsSnapshots()) {
+			return { status: "unavailable", message: "File history storage is unavailable." };
+		}
+		if (!vaultSync.connected) {
+			return { status: "offline", message: "Not connected to server." };
+		}
+		try {
+			return {
+				status: "ready",
+				report: await getFileHistoryStorageStatus(
+					this.deps.getSettings(),
+					this.deps.getTraceHttpContext(),
+				),
 			};
 		} catch (err) {
 			return { status: "error", message: formatUnknown(err) };
@@ -150,7 +172,7 @@ export class SnapshotService {
 			if (result.status === "created") {
 				this.deps.log(`Daily snapshot created: ${result.snapshotId}`);
 			} else if (result.status === "noop") {
-				this.deps.log("Daily snapshot: already taken today");
+				this.deps.log(`Daily snapshot: ${result.reason ?? "no changes"}`);
 			} else {
 				this.deps.log(`Daily snapshot: ${result.reason ?? "unavailable"}`);
 			}
@@ -163,7 +185,7 @@ export class SnapshotService {
 	}
 
 	/**
-	 * Request a file-level recovery snapshot. Silent noop when unavailable or unchanged.
+	 * Request a file history point. Silent noop when unavailable or unchanged.
 	 */
 	async triggerRecoverySnapshot(forceFull = false): Promise<void> {
 		if (!this.deps.getServerSupportsSnapshots()) {
@@ -174,26 +196,66 @@ export class SnapshotService {
 			return;
 		}
 
-		const settings = this.deps.getSettings();
 		try {
-			const result = await requestRecoverySnapshotMaybe(
-				settings,
-				settings.deviceName,
-				this.deps.getTraceHttpContext(),
-				forceFull,
-			);
+			const result = await this.requestFileHistoryPoint(forceFull);
 			if (result.status === "created") {
-				this.deps.log(`Recovery snapshot created: ${result.manifestId}`);
+				const changed = typeof result.index?.changedCount === "number"
+					? ` (${result.index.changedCount} changed)`
+					: "";
+				this.deps.log(`File history point created: ${result.manifestId}${changed}`);
 			} else if (result.status === "noop") {
-				this.deps.log(`Recovery snapshot: ${result.reason ?? "no changes"}`);
+				this.deps.log(`File history point: ${result.reason ?? "no changes"}`);
 			} else {
-				this.deps.log(`Recovery snapshot: ${result.reason ?? "unavailable"}`);
+				this.deps.log(`File history point: ${result.reason ?? "unavailable"}`);
 			}
 		} catch (err) {
-			if (this.logTransientSnapshotNetworkError(err, "Recovery snapshot")) return;
+			if (this.logTransientSnapshotNetworkError(err, "File history point")) return;
 			if (this.logSnapshotBackendAction(err, "File history")) return;
-			console.warn("[kaos] Recovery snapshot failed:", err);
+			console.warn("[kaos] File history point failed:", err);
 		}
+	}
+
+	async createFileHistoryPoint(): Promise<void> {
+		const vaultSync = this.deps.getVaultSync();
+		if (!vaultSync) {
+			new Notice("Sync not initialized");
+			return;
+		}
+		if (!this.deps.getServerSupportsSnapshots()) {
+			this.notifySnapshotStorageUnavailable("File history");
+			return;
+		}
+		if (!vaultSync.connected) {
+			new Notice("Not connected to server — cannot create file history point.");
+			return;
+		}
+
+		new Notice("Creating file history point...");
+		try {
+			const result = await this.requestFileHistoryPoint(false);
+			if (result.status === "created") {
+				const changed = typeof result.index?.changedCount === "number"
+					? `${result.index.changedCount} changed file(s)`
+					: "changes recorded";
+				new Notice(`File history point created: ${changed}.`);
+			} else if (result.status === "noop") {
+				new Notice(result.reason ?? "No file changes since the latest file history point.");
+			} else {
+				new Notice(`File history unavailable: ${result.reason ?? "server storage unavailable"}`);
+			}
+		} catch (err) {
+			this.showSnapshotFailure("File history point failed", "File history", err);
+		}
+	}
+
+	private async requestFileHistoryPoint(forceFull: boolean): Promise<FileHistoryPointResult> {
+		const settings = this.deps.getSettings();
+		return await requestFileHistoryPointMaybe(
+			settings,
+			settings.deviceName,
+			this.deps.getTraceHttpContext(),
+			forceFull,
+		);
 	}
 
 	async takeSnapshotNow(): Promise<void> {
@@ -203,16 +265,16 @@ export class SnapshotService {
 			return;
 		}
 		if (!this.deps.getServerSupportsSnapshots()) {
-			this.notifySnapshotStorageUnavailable("Snapshots");
+			this.notifySnapshotStorageUnavailable("Vault snapshots");
 			return;
 		}
 		if (!vaultSync.connected) {
-			new Notice("Not connected to server — cannot create snapshot.");
+			new Notice("Not connected to server — cannot create vault snapshot.");
 			return;
 		}
 
 		const settings = this.deps.getSettings();
-		new Notice("Creating snapshot...");
+		new Notice("Creating vault snapshot...");
 		try {
 			const result = await requestSnapshotNow(
 				settings,
@@ -226,23 +288,23 @@ export class SnapshotService {
 					? " (note: identical to latest snapshot)"
 					: "";
 				new Notice(
-					`Snapshot created: ${result.index.markdownFileCount} notes, ` +
+					`Vault snapshot created: ${result.index.markdownFileCount} notes, ` +
 					`${result.index.blobFileCount} attachments ` +
 					`(${Math.round(result.index.crdtSizeBytes / 1024)} KB)${unchangedNote}`,
 				);
 			} else if (result.status === "unavailable") {
-				const deploymentMessage = snapshotBackendActionMessage(result.reason ?? "", "Snapshots");
-				new Notice(deploymentMessage ?? `Snapshot unavailable: ${result.reason ?? "R2 not configured"}`);
+				const deploymentMessage = snapshotBackendActionMessage(result.reason ?? "", "Vault snapshots");
+				new Notice(deploymentMessage ?? `Vault snapshot unavailable: ${result.reason ?? "R2 not configured"}`);
 			} else {
-				new Notice("Snapshot created.");
+				new Notice("Vault snapshot created.");
 			}
 		} catch (err) {
-			this.showSnapshotFailure("Snapshot failed", "Snapshots", err);
+			this.showSnapshotFailure("Vault snapshot failed", "Vault snapshots", err);
 		}
 	}
 
 	/**
-	 * Show a list of available snapshots and let the user pick one to diff/restore.
+	 * Show a list of available vault snapshots and let the user pick one to diff/restore.
 	 */
 	async showSnapshotList(): Promise<void> {
 		const vaultSync = this.deps.getVaultSync();
@@ -251,15 +313,15 @@ export class SnapshotService {
 			return;
 		}
 		if (!this.deps.getServerSupportsSnapshots()) {
-			this.notifySnapshotStorageUnavailable("Snapshots");
+			this.notifySnapshotStorageUnavailable("Vault snapshots");
 			return;
 		}
 		if (!vaultSync.connected) {
-			new Notice("Not connected to server — cannot browse snapshots.");
+			new Notice("Not connected to server — cannot browse vault snapshots.");
 			return;
 		}
 
-		new Notice("Loading snapshots...");
+		new Notice("Loading vault snapshots...");
 
 		try {
 			const snapshots = await fetchSnapshotList(
@@ -268,7 +330,7 @@ export class SnapshotService {
 			);
 
 			if (snapshots.length === 0) {
-				new Notice("No snapshots found. Take a snapshot first.");
+				new Notice("No vault snapshots found. Take a vault snapshot first.");
 				return;
 			}
 
@@ -276,7 +338,7 @@ export class SnapshotService {
 				await this.showSnapshotDiff(selected);
 			}).open();
 		} catch (err) {
-			this.showSnapshotFailure("Failed to list snapshots", "Snapshots", err);
+			this.showSnapshotFailure("Failed to list vault snapshots", "Vault snapshots", err);
 		}
 	}
 
@@ -299,19 +361,16 @@ export class SnapshotService {
 
 		try {
 			const settings = this.deps.getSettings();
-			const listed = await listRecoverySnapshots(settings, this.deps.getTraceHttpContext(), 50);
+			const listed = await listFileHistoryManifests(settings, this.deps.getTraceHttpContext(), 50);
 			if (listed.manifests.length === 0) {
-				new Notice("No file history found yet. A recovery snapshot will be created after the next file change.");
+				new Notice("No file history found yet. Create a file history point after the next file change.");
 				return;
 			}
 
-			const manifests: RecoveryManifest[] = [];
-			for (const index of listed.manifests) {
-				manifests.push(await downloadRecoveryManifest(settings, index.manifestId, this.deps.getTraceHttpContext()));
-			}
+			const manifests: FileHistoryManifestIndex[] = listed.manifests;
 
 			new RecoveryHistoryModal(this.deps.app, manifests, {
-				downloadContent: async (hash) => await downloadRecoveryContent(
+				downloadContent: async (hash) => await downloadFileHistoryContent(
 					settings,
 					hash,
 					this.deps.getTraceHttpContext(),
@@ -331,7 +390,7 @@ export class SnapshotService {
 	 */
 	async pruneSnapshots(): Promise<void> {
 		if (!this.deps.getServerSupportsSnapshots()) {
-			this.notifySnapshotStorageUnavailable("Snapshots");
+			this.notifySnapshotStorageUnavailable("Vault snapshots");
 			return;
 		}
 		const vaultSync = this.deps.getVaultSync();
@@ -340,23 +399,84 @@ export class SnapshotService {
 			return;
 		}
 
-		new Notice("Running snapshot cleanup...");
+		new Notice("Running vault snapshot cleanup...");
 		try {
 			const result = await requestPrune(
 				this.deps.getSettings(),
 				this.deps.getTraceHttpContext(),
 			);
 			if (result.pruned === 0) {
-				new Notice("No snapshots to prune — retention policy already satisfied.");
+				new Notice("No vault snapshots to prune — retention policy already satisfied.");
 			} else {
 				new Notice(
-					`Cleanup complete: ${result.pruned} old snapshot(s) removed, ${result.kept} retained.` +
+					`Vault snapshot cleanup complete: ${result.pruned} old snapshot(s) removed, ${result.kept} retained.` +
 					(result.failed > 0 ? ` (${result.failed} failed)` : ""),
 				);
 			}
-			this.deps.log(`Snapshot prune: kept=${result.kept} pruned=${result.pruned} failed=${result.failed}`);
+			this.deps.log(`Vault snapshot prune: kept=${result.kept} pruned=${result.pruned} failed=${result.failed}`);
 		} catch (err) {
-			this.showSnapshotFailure("Snapshot cleanup failed", "Snapshots", err);
+			this.showSnapshotFailure("Vault snapshot cleanup failed", "Vault snapshots", err);
+		}
+	}
+
+	async cleanupFileHistory(): Promise<void> {
+		if (!this.deps.getServerSupportsSnapshots()) {
+			this.notifySnapshotStorageUnavailable("File history");
+			return;
+		}
+		const vaultSync = this.deps.getVaultSync();
+		if (!vaultSync?.connected) {
+			new Notice("Not connected to server.");
+			return;
+		}
+
+		new Notice("Running file history cleanup...");
+		try {
+			const result = await cleanupFileHistoryStorage(
+				this.deps.getSettings(),
+				this.deps.getTraceHttpContext(),
+			);
+			new Notice(
+				`File history cleanup complete: ${result.prunedManifests} point(s), ` +
+				`${result.contentDeleted} orphan content object(s) removed.` +
+				(result.failed > 0 ? ` (${result.failed} failed)` : ""),
+			);
+			this.deps.log(
+				`File history cleanup: kept=${result.kept} pruned=${result.prunedManifests} ` +
+				`contentDeleted=${result.contentDeleted} failed=${result.failed}`,
+			);
+		} catch (err) {
+			this.showSnapshotFailure("File history cleanup failed", "File history", err);
+		}
+	}
+
+	async repairFileHistoryStorage(): Promise<void> {
+		if (!this.deps.getServerSupportsSnapshots()) {
+			this.notifySnapshotStorageUnavailable("File history");
+			return;
+		}
+		const vaultSync = this.deps.getVaultSync();
+		if (!vaultSync?.connected) {
+			new Notice("Not connected to server.");
+			return;
+		}
+
+		new Notice("Checking file history storage...");
+		try {
+			const report = await repairFileHistoryStorage(
+				this.deps.getSettings(),
+				this.deps.getTraceHttpContext(),
+			);
+			const repaired = report.repairs.filter((repair) => repair.success).length;
+			const remaining = report.issues.filter((issue) => !issue.repaired).length;
+			new Notice(
+				report.status === "degraded"
+					? `File history storage needs attention: ${remaining} issue(s) remaining.`
+					: `File history storage ${report.status}. ${repaired} repair(s) applied.`,
+				8000,
+			);
+		} catch (err) {
+			this.showSnapshotFailure("File history storage check failed", "File history", err);
 		}
 	}
 
@@ -508,7 +628,7 @@ export class SnapshotService {
 
 		const path = item.entry.path;
 		const expectedCurrentHash = await getLiveHashForFileVersion(vaultSync.ydoc, item.entry.fileId, path);
-		const content = await downloadRecoveryContent(
+		const content = await downloadFileHistoryContent(
 			this.deps.getSettings(),
 			hash,
 			this.deps.getTraceHttpContext(),

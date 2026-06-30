@@ -88,6 +88,28 @@ console.log("\n--- Test 4: editor-health-heal origin remains manual-only ---");
 	);
 }
 
+console.log("\n--- Test 5: binding skips when open editor differs from CRDT ---");
+{
+	const section = sliceBetween(
+		bindingSource,
+		"private resolveBindingTarget(",
+		"private isHardTombstonedPath(path: string): boolean {",
+	);
+	assert(section !== null, "resolveBindingTarget section found");
+	assert(
+		section?.includes('"binding-target-editor-diverged"'),
+		"resolveBindingTarget traces divergent open editor",
+	);
+	assert(
+		section?.includes("currentContent !== crdtContent"),
+		"resolveBindingTarget compares editor content to CRDT before binding",
+	);
+	assert(
+		section?.includes("return null;"),
+		"resolveBindingTarget skips binding instead of overwriting divergent editor content",
+	);
+}
+
 console.log(`\n${"-".repeat(50)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log(`${"-".repeat(50)}\n`);

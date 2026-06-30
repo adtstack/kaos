@@ -1,9 +1,11 @@
 import { getServerByName } from "partyserver";
 import {
 	applyRecoveryRetention,
+	auditRecoveryStorage,
 	getRecoveryContent,
 	getRecoveryManifest,
 	listRecoveryManifestIndexes,
+	type RecoveryStorageAuditReport,
 	type RecoverySnapshotResult,
 } from "../recoverySnapshot";
 import type { Env, JsonResponse } from "./types";
@@ -15,6 +17,34 @@ interface RecoverySnapshotRouteOptions {
 		event: string,
 		data?: Record<string, unknown>,
 	): Promise<void>;
+}
+
+export function recoverySnapshotMaybeTraceEventName(status: RecoverySnapshotResult["status"]): string {
+	if (status === "created") return "recovery-snapshot-created";
+	if (status === "noop") return "recovery-snapshot-skipped";
+	return "recovery-snapshot-unavailable";
+}
+
+function unavailableRecoveryStorageReport(): RecoveryStorageAuditReport {
+	return {
+		status: "unavailable",
+		checkedAt: new Date().toISOString(),
+		latestManifestId: null,
+		latestIndexManifestId: null,
+		latestStateManifestId: null,
+		manifestCount: 0,
+		manifestCountLowerBound: 0,
+		checkedManifestCount: 0,
+		issues: [{
+			kind: "storage-unavailable",
+			severity: "error",
+			message: "File history storage is unavailable.",
+			repairable: false,
+			repaired: false,
+		}],
+		repairs: [],
+		contentCheckLimited: false,
+	};
 }
 
 export async function handleRecoverySnapshotRoute(
@@ -52,13 +82,57 @@ export async function handleRecoverySnapshotRoute(
 			});
 		}
 		const result: RecoverySnapshotResult = JSON.parse(text) as RecoverySnapshotResult;
-		await options.recordVaultTrace(env, vaultId, "recovery-snapshot-created", {
+		await options.recordVaultTrace(env, vaultId, recoverySnapshotMaybeTraceEventName(result.status), {
 			status: result.status,
 			manifestId: result.manifestId,
 			triggeredBy: body.device,
 			forceFull: body.forceFull === true,
+			reason: result.reason,
+			changedCount: result.index?.changedCount,
+			fileHistoryKind: result.index?.kind,
 		});
 		return json(result);
+	}
+
+	if (req.method === "GET" && rest.length === 1 && rest[0] === "status") {
+		const bucket = env.KAOS_BUCKET;
+		if (!bucket) {
+			return json(unavailableRecoveryStorageReport(), 503);
+		}
+		const result = await auditRecoveryStorage(vaultId, bucket, {
+			repair: false,
+			manifestCheckLimit: 0,
+			contentCheckLimit: 0,
+		});
+		return json(result, result.status === "unavailable" ? 503 : 200);
+	}
+
+	if (req.method === "POST" && rest.length === 1 && rest[0] === "repair") {
+		const bucket = env.KAOS_BUCKET;
+		if (!bucket) {
+			return json(unavailableRecoveryStorageReport(), 503);
+		}
+		const result = await auditRecoveryStorage(vaultId, bucket, { repair: true });
+		if (result.repairs.some((repair) => repair.success)) {
+			await options.recordVaultTrace(env, vaultId, "recovery-storage-repaired", {
+				status: result.status,
+				latestManifestId: result.latestManifestId,
+				repairCount: result.repairs.filter((repair) => repair.success).length,
+				issueCount: result.issues.length,
+			});
+		}
+		if (result.status === "degraded") {
+			await options.recordVaultTrace(env, vaultId, "recovery-storage-degraded", {
+				status: result.status,
+				latestManifestId: result.latestManifestId,
+				issueCount: result.issues.length,
+				unrepairedIssueKinds: result.issues
+					.filter((issue) => !issue.repaired)
+					.map((issue) => issue.kind)
+					.slice(0, 20),
+			});
+		}
+		return json(result, result.status === "unavailable" ? 503 : 200);
 	}
 
 	if (req.method === "POST" && rest.length === 1 && rest[0] === "prune") {

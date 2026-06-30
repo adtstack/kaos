@@ -7,20 +7,18 @@ import { obsidianRequest } from "../utils/http";
 import { createNestedActiveMeta, decodeFileMeta, isFileMetaDeletedValue } from "./fileMeta";
 import { ORIGIN_RESTORE } from "./origins";
 
-export type RecoveryManifestKind = "full" | "delta";
-export type RecoveryStorageVersion = "v2";
-export type RecoveryEntryKind =
+export type FileHistoryManifestKind = "file-history";
+export type FileHistoryStorageVersion = "v2";
+export type FileHistoryEntryKind =
 	| "created"
 	| "modified"
 	| "renamed"
 	| "deleted"
-	| "restored"
-	| "unchanged"
-	| "attachment-changed";
+	| "restored";
 
-export interface RecoveryManifestEntry {
+export interface FileHistoryEntry {
 	fileId: string;
-	kind: RecoveryEntryKind;
+	kind: FileHistoryEntryKind;
 	path: string;
 	oldPath?: string;
 	newPath?: string;
@@ -30,44 +28,93 @@ export interface RecoveryManifestEntry {
 	size?: number;
 	mtime?: number;
 	device?: string;
-	baseManifestId?: string;
 }
 
-export interface RecoveryManifestIndex {
-	storageVersion?: RecoveryStorageVersion;
+export interface FileHistoryManifestIndex {
+	storageVersion: FileHistoryStorageVersion;
 	manifestId: string;
 	vaultId: string;
-	kind: RecoveryManifestKind;
+	kind: FileHistoryManifestKind;
 	createdAt: string;
 	day: string;
 	reason: string;
 	pinned: boolean;
-	baseManifestId?: string;
-	baseFullManifestId?: string;
 	changedCount: number;
-	fullFileCount: number;
 	contentHashes: string[];
+	changedEntries: FileHistoryEntry[];
 	stateHash: string;
 	manifestHash: string;
 	crdtSchemaVersion?: number;
 }
 
-export interface RecoveryManifest extends RecoveryManifestIndex {
-	schemaVersion: 1 | 2;
-	entries: RecoveryManifestEntry[];
+export interface FileHistoryManifest extends FileHistoryManifestIndex {
+	schemaVersion: 3;
 }
 
-export interface RecoverySnapshotResult {
+export interface FileHistoryPointResult {
 	status: "created" | "noop" | "unavailable";
 	manifestId?: string;
 	reason?: string;
-	index?: RecoveryManifestIndex;
+	index?: FileHistoryManifestIndex;
 }
 
-export interface RecoveryManifestList {
-	manifests: RecoveryManifestIndex[];
+export interface FileHistoryManifestList {
+	manifests: FileHistoryManifestIndex[];
 	totalManifestKeys: number;
 	limited: boolean;
+}
+
+export interface FileHistoryRetentionResult {
+	kept: number;
+	prunedManifests: number;
+	contentDeleted: number;
+	failed: number;
+	errors: string[];
+}
+
+export type RecoveryManifestKind = FileHistoryManifestKind;
+export type RecoveryStorageVersion = FileHistoryStorageVersion;
+export type RecoveryEntryKind = FileHistoryEntryKind;
+export type RecoveryManifestEntry = FileHistoryEntry;
+export type RecoveryManifestIndex = FileHistoryManifestIndex;
+export type RecoveryManifest = FileHistoryManifest;
+export type RecoverySnapshotResult = FileHistoryPointResult;
+export type RecoveryManifestList = FileHistoryManifestList;
+export type RecoveryRetentionResult = FileHistoryRetentionResult;
+
+export type RecoveryStorageAuditStatus = "healthy" | "repaired" | "degraded" | "empty" | "unavailable";
+export type RecoveryStorageIssueSeverity = "warn" | "error";
+
+export interface RecoveryStorageIssue {
+	kind: string;
+	severity: RecoveryStorageIssueSeverity;
+	message: string;
+	manifestId?: string;
+	objectKey?: string;
+	repairable: boolean;
+	repaired: boolean;
+}
+
+export interface RecoveryStorageRepair {
+	kind: string;
+	message: string;
+	manifestId?: string;
+	objectKey?: string;
+	success: boolean;
+}
+
+export interface RecoveryStorageAuditReport {
+	status: RecoveryStorageAuditStatus;
+	checkedAt: string;
+	latestManifestId: string | null;
+	latestIndexManifestId: string | null;
+	latestStateManifestId: string | null;
+	manifestCount: number;
+	manifestCountLowerBound: number;
+	checkedManifestCount: number;
+	issues: RecoveryStorageIssue[];
+	repairs: RecoveryStorageRepair[];
+	contentCheckLimited: boolean;
 }
 
 export interface RestoreRecoveryVersionOptions {
@@ -132,32 +179,90 @@ async function serverGet(
 	return res.json;
 }
 
-export async function requestRecoverySnapshotMaybe(
+export async function requestFileHistoryPointMaybe(
 	settings: VaultSyncSettings,
 	device?: string,
 	trace?: TraceHttpContext,
 	forceFull = false,
-): Promise<RecoverySnapshotResult> {
-	return await serverPost(settings, "recovery-snapshots/maybe", { device, forceFull }, trace) as RecoverySnapshotResult;
+): Promise<FileHistoryPointResult> {
+	return await serverPost(settings, "recovery-snapshots/maybe", { device, forceFull }, trace) as FileHistoryPointResult;
 }
 
-export async function listRecoverySnapshots(
+export const requestRecoverySnapshotMaybe = requestFileHistoryPointMaybe;
+
+export async function listFileHistoryManifests(
 	settings: VaultSyncSettings,
 	trace?: TraceHttpContext,
 	limit = 50,
-): Promise<RecoveryManifestList> {
-	return await serverGet(settings, `recovery-snapshots?limit=${encodeURIComponent(String(limit))}`, trace) as RecoveryManifestList;
+): Promise<FileHistoryManifestList> {
+	return await serverGet(settings, `recovery-snapshots?limit=${encodeURIComponent(String(limit))}`, trace) as FileHistoryManifestList;
 }
 
-export async function downloadRecoveryManifest(
+export const listRecoverySnapshots = listFileHistoryManifests;
+
+export function normalizeRecoveryStorageAuditReport(value: unknown): RecoveryStorageAuditReport {
+	const raw = typeof value === "object" && value !== null
+		? value as Record<string, unknown>
+		: {};
+	const status = normalizeRecoveryStorageAuditStatus(raw.status);
+	const issues = Array.isArray(raw.issues)
+		? raw.issues.map(normalizeRecoveryStorageIssue)
+		: [];
+	const repairs = Array.isArray(raw.repairs)
+		? raw.repairs.map(normalizeRecoveryStorageRepair)
+		: [];
+	const manifestCount = numberOr(raw.manifestCount, numberOr(raw.manifestCountLowerBound, 0));
+	return {
+		status,
+		checkedAt: typeof raw.checkedAt === "string" ? raw.checkedAt : new Date(0).toISOString(),
+		latestManifestId: stringOrNull(raw.latestManifestId),
+		latestIndexManifestId: stringOrNull(raw.latestIndexManifestId),
+		latestStateManifestId: stringOrNull(raw.latestStateManifestId),
+		manifestCount,
+		manifestCountLowerBound: numberOr(raw.manifestCountLowerBound, manifestCount),
+		checkedManifestCount: numberOr(raw.checkedManifestCount, 0),
+		issues,
+		repairs,
+		contentCheckLimited: raw.contentCheckLimited === true,
+	};
+}
+
+export async function getFileHistoryStorageStatus(
+	settings: VaultSyncSettings,
+	trace?: TraceHttpContext,
+): Promise<RecoveryStorageAuditReport> {
+	return normalizeRecoveryStorageAuditReport(await serverGet(settings, "recovery-snapshots/status", trace));
+}
+
+export const getRecoveryStorageStatus = getFileHistoryStorageStatus;
+
+export async function repairFileHistoryStorage(
+	settings: VaultSyncSettings,
+	trace?: TraceHttpContext,
+): Promise<RecoveryStorageAuditReport> {
+	return normalizeRecoveryStorageAuditReport(await serverPost(settings, "recovery-snapshots/repair", {}, trace));
+}
+
+export const repairRecoveryStorage = repairFileHistoryStorage;
+
+export async function cleanupFileHistoryStorage(
+	settings: VaultSyncSettings,
+	trace?: TraceHttpContext,
+): Promise<FileHistoryRetentionResult> {
+	return await serverPost(settings, "recovery-snapshots/prune", {}, trace) as FileHistoryRetentionResult;
+}
+
+export async function downloadFileHistoryManifest(
 	settings: VaultSyncSettings,
 	manifestId: string,
 	trace?: TraceHttpContext,
-): Promise<RecoveryManifest> {
-	return await serverGet(settings, `recovery-snapshots/${encodeURIComponent(manifestId)}/manifest`, trace) as RecoveryManifest;
+): Promise<FileHistoryManifest> {
+	return await serverGet(settings, `recovery-snapshots/${encodeURIComponent(manifestId)}/manifest`, trace) as FileHistoryManifest;
 }
 
-export async function downloadRecoveryContent(
+export const downloadRecoveryManifest = downloadFileHistoryManifest;
+
+export async function downloadFileHistoryContent(
 	settings: VaultSyncSettings,
 	hash: string,
 	trace?: TraceHttpContext,
@@ -171,21 +276,72 @@ export async function downloadRecoveryContent(
 		},
 	});
 	if (res.status !== 200) {
-		throw new Error(`Recovery content download failed (${res.status}): ${res.text}`);
+		throw new Error(`File history content download failed (${res.status}): ${res.text}`);
 	}
 	const raw = gunzipSync(new Uint8Array(res.arrayBuffer));
 	const text = new TextDecoder().decode(raw);
 	const actualHash = await sha256Hex(text);
 	if (actualHash !== hash) {
-		throw new Error(`Recovery content hash mismatch: expected ${hash}, got ${actualHash}`);
+		throw new Error(`File history content hash mismatch: expected ${hash}, got ${actualHash}`);
 	}
 	return text;
 }
+
+export const downloadRecoveryContent = downloadFileHistoryContent;
 
 export async function sha256Hex(text: string): Promise<string> {
 	const data = new TextEncoder().encode(text);
 	const digest = await crypto.subtle.digest("SHA-256", data);
 	return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function normalizeRecoveryStorageAuditStatus(value: unknown): RecoveryStorageAuditStatus {
+	switch (value) {
+		case "healthy":
+		case "repaired":
+		case "degraded":
+		case "empty":
+		case "unavailable":
+			return value;
+		default:
+			return "unavailable";
+	}
+}
+
+function normalizeRecoveryStorageIssue(value: unknown): RecoveryStorageIssue {
+	const raw = typeof value === "object" && value !== null
+		? value as Record<string, unknown>
+		: {};
+	return {
+		kind: typeof raw.kind === "string" ? raw.kind : "unknown",
+		severity: raw.severity === "warn" ? "warn" : "error",
+		message: typeof raw.message === "string" ? raw.message : "",
+		manifestId: typeof raw.manifestId === "string" ? raw.manifestId : undefined,
+		objectKey: typeof raw.objectKey === "string" ? raw.objectKey : undefined,
+		repairable: raw.repairable === true,
+		repaired: raw.repaired === true,
+	};
+}
+
+function normalizeRecoveryStorageRepair(value: unknown): RecoveryStorageRepair {
+	const raw = typeof value === "object" && value !== null
+		? value as Record<string, unknown>
+		: {};
+	return {
+		kind: typeof raw.kind === "string" ? raw.kind : "unknown",
+		message: typeof raw.message === "string" ? raw.message : "",
+		manifestId: typeof raw.manifestId === "string" ? raw.manifestId : undefined,
+		objectKey: typeof raw.objectKey === "string" ? raw.objectKey : undefined,
+		success: raw.success === true,
+	};
+}
+
+function numberOr(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function stringOrNull(value: unknown): string | null {
+	return typeof value === "string" ? value : null;
 }
 
 function normalizeVaultPath(path: string): string {

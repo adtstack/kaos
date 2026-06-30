@@ -114,7 +114,9 @@ function isKnownRecoverySnapshotRouteShape(method: string, rest: string[]): bool
 		return method === "GET";
 	}
 	if (rest.length === 1) {
-		return method === "POST" && rest[0] === "maybe";
+		const sub = rest[0];
+		if (method === "GET") return sub === "status";
+		if (method === "POST") return sub === "maybe" || sub === "prune" || sub === "repair";
 	}
 	if (rest.length === 2) {
 		return method === "GET" && rest[0].length > 0 && rest[1] === "manifest";

@@ -390,7 +390,7 @@ export class DiskMirror {
 
 	scheduleWrite(path: string): void {
 		path = normalizePath(path);
-		if (this.openPaths.has(path)) {
+		if (this.openPaths.has(path) || this.isOpenInWorkspace(path)) {
 			this.scheduleOpenWrite(path);
 			return;
 		}
@@ -516,7 +516,18 @@ export class DiskMirror {
 		}
 		const content = ytext.toJSON();
 
-		if (!force && this.openPaths.has(path)) {
+		const isOpenOrViewed = this.openPaths.has(path) || this.isOpenInWorkspace(path);
+		if (isOpenOrViewed) {
+			if (this.hasOpenEditorContentMismatch(path, content)) {
+				this.log(`flushWrite: deferring open "${path}" (open editor differs from CRDT)`);
+				if (!force) {
+					this.scheduleOpenWrite(path);
+				}
+				return;
+			}
+		}
+
+		if (!force && isOpenOrViewed) {
 			if (
 				this.isActivelyViewedPath(path)
 				&& this.hasFocusedEditorUnflushedChanges(path, content)
@@ -1243,6 +1254,41 @@ export class DiskMirror {
 			// If the editor instance is in flux, conservatively defer one cycle.
 			return true;
 		}
+	}
+
+	private getOpenMarkdownViewsForPath(path: string): MarkdownView[] {
+		const views: MarkdownView[] = [];
+		const workspace = this.app.workspace as {
+			iterateAllLeaves?: (callback: (leaf: { view?: unknown }) => void) => void;
+		};
+		workspace.iterateAllLeaves?.((leaf) => {
+			if (
+				leaf.view instanceof MarkdownView
+				&& leaf.view.file?.path === path
+			) {
+				views.push(leaf.view);
+			}
+		});
+		return views;
+	}
+
+	private isOpenInWorkspace(path: string): boolean {
+		return this.getOpenMarkdownViewsForPath(path).length > 0;
+	}
+
+	private hasOpenEditorContentMismatch(path: string, expectedCrdtContent: string | null): boolean {
+		if (expectedCrdtContent == null) return false;
+		for (const view of this.getOpenMarkdownViewsForPath(path)) {
+			try {
+				if (view.editor.getValue() !== expectedCrdtContent) {
+					return true;
+				}
+			} catch {
+				// If an open editor is in flux, do not overwrite the disk under it.
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private isActivelyViewedPath(path: string): boolean {

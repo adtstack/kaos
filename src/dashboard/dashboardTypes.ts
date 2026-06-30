@@ -1,4 +1,5 @@
 import type { ReconciliationState } from "../runtime/reconciliationController";
+import type { RecoveryStorageAuditReport } from "../sync/recoverySnapshotClient";
 import type { DiskIndex } from "../sync/diskIndex";
 import type { FrontmatterQuarantineEntry } from "../sync/frontmatterQuarantine";
 import type { PreservedUnresolvedEntry } from "../sync/preservedUnresolved";
@@ -55,9 +56,13 @@ export type DashboardRecentChanges =
 	| { status: "ready"; manifestCount: number; limited: boolean; changes: DashboardRecentChange[] }
 	| { status: "unavailable" | "offline" | "error"; message: string };
 
+export type DashboardRecoveryStorageStatus =
+	| { status: "ready"; report: RecoveryStorageAuditReport }
+	| { status: "unavailable" | "offline" | "error"; message: string };
+
 export interface DashboardRecentChange {
 	manifestId: string;
-	snapshotKind: "full" | "delta";
+	snapshotKind: "file-history";
 	createdAt: string;
 	fileId: string;
 	changeKind: string;
@@ -86,6 +91,7 @@ export interface KaosDashboardData {
 	};
 	overview: DashboardMetric[];
 	snapshotStatus: DashboardSnapshotStatus;
+	recoveryStorageStatus: DashboardRecoveryStorageStatus;
 	recentChanges: DashboardRecentChanges;
 	conflicts: DashboardConflictArtifact[];
 	attention: DashboardAttentionItem[];
@@ -143,6 +149,7 @@ export interface KaosDashboardCollectorInput {
 	frontmatterQuarantineEntries: FrontmatterQuarantineEntry[];
 	diskIndex: DiskIndex;
 	snapshotStatus: DashboardSnapshotStatus;
+	recoveryStorageStatus: DashboardRecoveryStorageStatus;
 	recentChanges: DashboardRecentChanges;
 	openFileCount: number;
 	snapshotsAvailable: boolean;
