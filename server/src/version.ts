@@ -1,10 +1,10 @@
-export const SERVER_VERSION = "0.4.1";
+export const SERVER_VERSION = "0.5.0";
 
 // Compatibility metadata is intentionally explicit so the plugin can reason
 // about safe upgrade paths before we add richer release-manifest logic.
 export const SERVER_MIN_PLUGIN_VERSION: string | null = null;
-export const SERVER_RECOMMENDED_PLUGIN_VERSION = "1.5.0";
-export const SERVER_MIN_COMPATIBLE_SERVER_VERSION_FOR_PLUGIN = "0.2.0";
+export const SERVER_RECOMMENDED_PLUGIN_VERSION = "1.8.0";
+export const SERVER_MIN_COMPATIBLE_SERVER_VERSION_FOR_PLUGIN = "0.5.0";
 export const SERVER_MIN_COMPATIBLE_PLUGIN_VERSION_FOR_SERVER = "1.3.3";
 // Keep v2 in the supported range during the v2 -> v3 rolling-upgrade window.
 // The room-level schema guard still rejects older clients after a v3-aware
