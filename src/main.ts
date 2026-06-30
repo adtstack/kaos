@@ -67,6 +67,10 @@ import {
 	type UpdateState,
 } from "./runtime/capabilityUpdateService";
 import {
+	readPersistedGuidedServerUpdateState,
+	type PersistedGuidedServerUpdateState,
+} from "./runtime/guidedServerUpdate";
+import {
 	ConnectionController,
 	type ConnectionState,
 } from "./runtime/connectionController";
@@ -133,6 +137,7 @@ type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_blobQueue?: BlobQueueSnapshot;
 	_serverCapabilitiesCache?: PersistedServerCapabilitiesCache;
 	_updateManifestCache?: PersistedUpdateManifestCache;
+	_guidedServerUpdate?: PersistedGuidedServerUpdateState;
 	_frontmatterQuarantine?: FrontmatterQuarantineEntry[];
 	_preservedUnresolved?: PreservedUnresolvedEntry[];
 };
@@ -474,6 +479,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			setStatusError: () => this.updateStatusBar("error"),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
 			updateSettings: (mutator, reason) => this.updateSettings(mutator, reason),
+			openExternalUrl: (url) => window.open(url, "_blank", "noopener"),
 		});
 		await this.loadSettings();
 		this.applyRuntimeSettings("load-settings");
@@ -940,7 +946,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				const waitingForR2 =
 					!!this.settings.host &&
 					(!capabilityState || !capabilityState.attachments || !capabilityState.snapshots);
-				if (waitingForR2 && (this.capabilityUpdateService?.shouldRefreshCapabilities() ?? false)) {
+				const waitingForGuidedUpdate = this.capabilityUpdateService?.hasActiveGuidedServerUpdate() ?? false;
+				if ((waitingForR2 || waitingForGuidedUpdate) &&
+					(this.capabilityUpdateService?.shouldRefreshCapabilities() ?? false)) {
 					void this.refreshServerCapabilities("background-poll");
 				}
 			}, 3000);
@@ -2143,7 +2151,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 		const cachedCapabilities = readPersistedServerCapabilitiesCache(data?._serverCapabilitiesCache);
 		const cachedUpdateManifest = readPersistedUpdateManifestCache(data?._updateManifestCache);
-		this.capabilityUpdateService?.hydratePersistedCaches(cachedCapabilities, cachedUpdateManifest);
+		const guidedServerUpdate = readPersistedGuidedServerUpdateState(data?._guidedServerUpdate);
+		this.capabilityUpdateService?.hydratePersistedCaches(
+			cachedCapabilities,
+			cachedUpdateManifest,
+			guidedServerUpdate,
+		);
 		this.frontmatterQuarantineEntries = readPersistedFrontmatterQuarantine(data?._frontmatterQuarantine);
 		this.refreshPersistedState();
 		if (migrated) {
@@ -2348,7 +2361,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			updateActionLabel: "KAOS settings",
 			legacyServerDetected: false,
 			pluginCompatibilityWarning: null,
+			autoUpdateEligible: false,
+			releaseNotesUrl: null,
+			upgradeGuideUrl: null,
+			guidedServerUpdateAvailable: false,
+			guidedServerUpdateStatus: "idle",
+			guidedServerUpdateTargetVersion: null,
+			guidedServerUpdateStartedAt: null,
 		};
+	}
+
+	async beginGuidedServerUpdate(): Promise<boolean> {
+		return await this.capabilityUpdateService?.beginGuidedServerUpdate() ?? false;
 	}
 
 	buildServerUpdateUrl(): string | null {
@@ -2469,6 +2493,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			nextState._updateManifestCache = cachedUpdateManifest;
 		} else {
 			delete nextState._updateManifestCache;
+		}
+		const guidedServerUpdate = this.capabilityUpdateService?.getPersistedGuidedServerUpdateState();
+		if (guidedServerUpdate) {
+			nextState._guidedServerUpdate = guidedServerUpdate;
+		} else {
+			delete nextState._guidedServerUpdate;
 		}
 		if (this.frontmatterQuarantineEntries.length > 0) {
 			nextState._frontmatterQuarantine = this.frontmatterQuarantineEntries;

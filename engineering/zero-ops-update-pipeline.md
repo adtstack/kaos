@@ -99,6 +99,6 @@ Deploy is an install primitive, not an in-place update primitive. Re-deploy can 
 ## User-facing behavior summary
 
 - One-time: initialize updater from plugin settings.
-- Normal update: click **Open update action**, run workflow with `update`.
+- Normal update: click **Update server** in KAOS settings, run the opened workflow with `update`, then let KAOS watch the Worker version.
 - Rollback: run workflow with `revert`.
 - Migration-required release: workflow fails safely with explicit guidance.

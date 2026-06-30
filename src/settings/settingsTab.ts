@@ -25,6 +25,13 @@ interface SettingsUpdateState {
 	updateBootstrapUrl: string | null;
 	legacyServerDetected: boolean;
 	pluginCompatibilityWarning: string | null;
+	autoUpdateEligible: boolean;
+	releaseNotesUrl: string | null;
+	upgradeGuideUrl: string | null;
+	guidedServerUpdateAvailable: boolean;
+	guidedServerUpdateStatus: "idle" | "waiting-for-user" | "waiting-for-deploy" | "updated" | "timed-out";
+	guidedServerUpdateTargetVersion: string | null;
+	guidedServerUpdateStartedAt: number | null;
 }
 
 interface SettingsRecoveryStorageState {
@@ -44,6 +51,7 @@ export interface VaultSyncSettingsHost {
 	refreshUpdateManifest(reason?: string, force?: boolean): Promise<void>;
 	refreshRecoveryStorageStatus(reason?: string): Promise<void>;
 	refreshAttachmentSyncRuntime(reason?: string): Promise<void>;
+	beginGuidedServerUpdate(): Promise<boolean>;
 	getSettingsStatusSummary(): { state: SettingsStatusState; label: string };
 	getUpdateState(): SettingsUpdateState;
 	getRecoveryStorageStatusState(): SettingsRecoveryStorageState;
@@ -229,17 +237,34 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			const recoveryStorageState = this.host.getRecoveryStorageStatusState();
 			addCardRow(updateCard, "File history storage", recoveryStorageState.label);
 
-			const summaryText = updateState.serverUpdateAvailable
-				? updateState.migrationRequired
-					? "A migration-sensitive server update is available. Use the guided update path."
-					: "A server update is available."
-				: updateState.pluginUpdateRecommended
-					? "This device should update the KAOS plugin soon."
-					: "Server and plugin are up to date with the latest cached manifest.";
+			const guidedStatus = updateState.guidedServerUpdateStatus;
+			const waitingForGuidedUpdate =
+				guidedStatus === "waiting-for-user" || guidedStatus === "waiting-for-deploy";
+			const summaryText = guidedStatus === "updated"
+				? `Server update to ${updateState.guidedServerUpdateTargetVersion ?? "the target version"} completed.`
+				: guidedStatus === "timed-out"
+					? "KAOS is still waiting for the server update. Reopen the update action if needed."
+					: waitingForGuidedUpdate
+						? "Waiting for the GitHub update workflow and Cloudflare redeploy to finish."
+						: updateState.serverUpdateAvailable
+							? updateState.migrationRequired
+								? "A migration-sensitive server update is available. Use the guided update path."
+								: updateState.updateRepoUrl
+									? "A guided server update is available."
+									: "A server update is available. Add your deployment repo URL to enable guided updates."
+							: updateState.pluginUpdateRecommended
+								? "This device should update the KAOS plugin soon."
+								: "Server and plugin are up to date with the latest cached manifest.";
 			updateCard.createEl("p", {
 				text: summaryText,
 				cls: "kaos-settings-status-subtitle",
 			});
+			if (waitingForGuidedUpdate && updateState.guidedServerUpdateTargetVersion) {
+				updateCard.createEl("p", {
+					text: `Target server version: ${updateState.guidedServerUpdateTargetVersion}`,
+					cls: "kaos-settings-status-subtitle",
+				});
+			}
 
 			if (updateState.pluginCompatibilityWarning) {
 				updateCard.createEl("p", {
@@ -249,7 +274,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			}
 			if (updateState.legacyServerDetected) {
 				updateCard.createEl("p", {
-					text: "Legacy server detected. Sync will continue, but update metadata and 1-click updater features need a newer server.",
+					text: "Legacy server detected. Sync will continue, but update metadata and guided server update features need a newer server.",
 					cls: "kaos-settings-security-warning",
 				});
 			}
@@ -271,9 +296,38 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				void this.host.refreshRecoveryStorageStatus("settings-refresh").then(() => this.display());
 			});
 			const updateActionUrl = updateState.updateActionUrl;
-			if (updateActionUrl) {
+			if (updateState.serverUpdateAvailable && updateState.migrationRequired) {
+				if (updateState.releaseNotesUrl) {
+					updateActions.createEl("button", { text: "Open release notes" }).addEventListener("click", () => {
+						window.open(updateState.releaseNotesUrl ?? "", "_blank", "noopener");
+					});
+				}
+				if (updateState.upgradeGuideUrl) {
+					updateActions.createEl("button", { text: "Open upgrade guide" }).addEventListener("click", () => {
+						window.open(updateState.upgradeGuideUrl ?? "", "_blank", "noopener");
+					});
+				}
+				if (updateActionUrl) {
+					updateActions.createEl("button", { text: "Open guided update" }).addEventListener("click", () => {
+						window.open(updateActionUrl, "_blank", "noopener");
+					});
+				}
+			} else if (updateActionUrl && updateState.guidedServerUpdateAvailable) {
+				const updateButton = updateActions.createEl("button", {
+					text: `Update server to ${updateState.latestServerVersion ?? "latest"}`,
+				});
+				updateButton.disabled = waitingForGuidedUpdate;
+				updateButton.addEventListener("click", () => {
+					void this.host.beginGuidedServerUpdate().then(() => this.display());
+				});
+				if (waitingForGuidedUpdate || guidedStatus === "timed-out") {
+					updateActions.createEl("button", { text: "Open update action again" }).addEventListener("click", () => {
+						window.open(updateActionUrl, "_blank", "noopener");
+					});
+				}
+			} else if (updateActionUrl) {
 				updateActions.createEl("button", {
-					text: "Open update action",
+					text: updateState.serverUpdateAvailable ? "Open update action" : "Open update workflow",
 				}).addEventListener("click", () => {
 					window.open(updateActionUrl, "_blank", "noopener");
 				});

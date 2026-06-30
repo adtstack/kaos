@@ -105,7 +105,7 @@ const updateManifest = {
 	latestPluginVersion: pluginManifest.version,
 	releaseType: migrationRequired ? "migration-required" : "compatible",
 	migrationRequired,
-	autoUpdateEligible: false,
+	autoUpdateEligible: !migrationRequired,
 	minCompatibleServerVersionForPlugin,
 	minCompatiblePluginVersionForServer,
 	latestPluginSchemaVersion: pluginSchemaVersion,

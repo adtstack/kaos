@@ -13,6 +13,11 @@ import { attachmentSizeCapKB } from "../settings/settingsStore";
 import { obsidianRequest } from "../utils/http";
 import { formatUnknown } from "../utils/format";
 import { compareSemver } from "../utils/semver";
+import {
+	evaluateGuidedServerUpdateState,
+	type GuidedServerUpdateStatus,
+	type PersistedGuidedServerUpdateState,
+} from "./guidedServerUpdate";
 
 export type PersistedServerCapabilitiesCache = {
 	host: string;
@@ -39,6 +44,13 @@ export type UpdateState = {
 	updateActionLabel: string;
 	legacyServerDetected: boolean;
 	pluginCompatibilityWarning: string | null;
+	autoUpdateEligible: boolean;
+	releaseNotesUrl: string | null;
+	upgradeGuideUrl: string | null;
+	guidedServerUpdateAvailable: boolean;
+	guidedServerUpdateStatus: GuidedServerUpdateStatus;
+	guidedServerUpdateTargetVersion: string | null;
+	guidedServerUpdateStartedAt: number | null;
 };
 
 const UPDATE_MANIFEST_URLS = [
@@ -173,6 +185,7 @@ interface CapabilityUpdateServiceDeps {
 	setStatusError(): void;
 	scheduleTraceStateSnapshot(reason: string): void;
 	updateSettings(mutator: (settings: VaultSyncSettings) => void, reason: string): Promise<void>;
+	openExternalUrl(url: string): void;
 }
 
 export class CapabilityUpdateService {
@@ -188,6 +201,7 @@ export class CapabilityUpdateService {
 	private lastPushedUpdateMetadataFingerprint: string | null = null;
 	private legacyServerDetected = false;
 	private legacyServerNoticeShown = false;
+	private guidedServerUpdate: PersistedGuidedServerUpdateState | null = null;
 
 	constructor(private readonly deps: CapabilityUpdateServiceDeps) {}
 
@@ -217,9 +231,15 @@ export class CapabilityUpdateService {
 		return now - this.lastCapabilityRefreshAt >= CAPABILITY_REFRESH_INTERVAL_MS;
 	}
 
+	hasActiveGuidedServerUpdate(now = Date.now()): boolean {
+		const status = this.evaluateGuidedServerUpdate(now);
+		return status === "waiting-for-user" || status === "waiting-for-deploy";
+	}
+
 	hydratePersistedCaches(
 		cachedCapabilities: PersistedServerCapabilitiesCache | null,
 		cachedUpdateManifest: PersistedUpdateManifestCache | null,
+		guidedServerUpdate: PersistedGuidedServerUpdateState | null = null,
 	): void {
 		const settings = this.deps.getSettings();
 		if (settings.host && cachedCapabilities?.host === settings.host) {
@@ -235,6 +255,9 @@ export class CapabilityUpdateService {
 			this.updateManifest = null;
 			this.updateManifestFetchedAt = 0;
 		}
+
+		this.guidedServerUpdate = guidedServerUpdate;
+		this.evaluateGuidedServerUpdate();
 	}
 
 	getPersistedServerCapabilitiesCache(): PersistedServerCapabilitiesCache | undefined {
@@ -252,6 +275,11 @@ export class CapabilityUpdateService {
 			fetchedAt: this.updateManifestFetchedAt,
 			manifest: this.updateManifest,
 		};
+	}
+
+	getPersistedGuidedServerUpdateState(): PersistedGuidedServerUpdateState | undefined {
+		this.evaluateGuidedServerUpdate();
+		return this.guidedServerUpdate ?? undefined;
 	}
 
 	enforceCompatibilityGuard(reason: string): boolean {
@@ -301,7 +329,33 @@ export class CapabilityUpdateService {
 		return await this.updateManifestRefreshPromise;
 	}
 
-	getUpdateState(): UpdateState {
+	async beginGuidedServerUpdate(now = Date.now()): Promise<boolean> {
+		const updateState = this.getUpdateState(now);
+		if (!updateState.guidedServerUpdateAvailable || !updateState.latestServerVersion || !updateState.updateActionUrl) {
+			new Notice("KAOS: guided server update is not available for the current settings or release.", 8000);
+			return false;
+		}
+
+		this.guidedServerUpdate = {
+			status: "waiting-for-user",
+			targetVersion: updateState.latestServerVersion,
+			startedAt: now,
+			updateActionUrl: updateState.updateActionUrl,
+		};
+		this.deps.openExternalUrl(updateState.updateActionUrl);
+		await this.deps.persistPluginState();
+		this.deps.log(
+			`Guided server update started: target=${updateState.latestServerVersion} action=${updateState.updateActionUrl}`,
+		);
+		new Notice(
+			`KAOS: opened the server update workflow. Run it in GitHub; KAOS will watch for server ${updateState.latestServerVersion}.`,
+			10000,
+		);
+		void this.refreshServerCapabilities("guided-server-update-start");
+		return true;
+	}
+
+	getUpdateState(now = Date.now()): UpdateState {
 		const settings = this.deps.getSettings();
 		const serverVersion = this.serverCapabilities?.serverVersion ?? null;
 		const latestServerVersion = this.updateManifest?.latestServerVersion ?? null;
@@ -321,6 +375,18 @@ export class CapabilityUpdateService {
 		const effectiveProvider = this.inferUpdateProvider(effectiveRepoUrl) ||
 			this.serverCapabilities?.updateProvider ||
 			"unknown";
+		const updateActionUrl = this.buildServerUpdateUrl();
+		const updateBootstrapUrl = this.buildGithubUpdaterBootstrapUrl();
+		const migrationRequired = this.updateManifest?.migrationRequired ?? this.serverCapabilities?.migrationRequired ?? false;
+		const autoUpdateEligible = this.updateManifest?.autoUpdateEligible ?? false;
+		this.clearStaleGuidedServerUpdate(latestServerVersion, updateActionUrl);
+		const guidedServerUpdateStatus = this.evaluateGuidedServerUpdate(now);
+		const guidedServerUpdateAvailable =
+			serverUpdateAvailable &&
+			autoUpdateEligible &&
+			!migrationRequired &&
+			effectiveProvider === "github" &&
+			updateActionUrl !== null;
 
 		let pluginCompatibilityWarning: string | null = null;
 		const minPluginVersion = this.serverCapabilities?.minPluginVersion ?? null;
@@ -346,11 +412,11 @@ export class CapabilityUpdateService {
 			pluginVersion: this.deps.pluginVersion,
 			latestPluginVersion,
 			pluginUpdateRecommended,
-			migrationRequired: this.updateManifest?.migrationRequired ?? this.serverCapabilities?.migrationRequired ?? false,
+			migrationRequired,
 			updateProvider: effectiveProvider,
 			updateRepoUrl: effectiveRepoUrl,
-			updateActionUrl: this.buildServerUpdateUrl(),
-			updateBootstrapUrl: this.buildGithubUpdaterBootstrapUrl(),
+			updateActionUrl,
+			updateBootstrapUrl,
 			updateActionLabel: effectiveRepoUrl
 				? effectiveProvider === "gitlab"
 					? "your GitLab pipeline"
@@ -358,6 +424,13 @@ export class CapabilityUpdateService {
 				: "KAOS settings",
 			legacyServerDetected: this.legacyServerDetected,
 			pluginCompatibilityWarning,
+			autoUpdateEligible,
+			releaseNotesUrl: this.updateManifest?.releaseNotesUrl ?? null,
+			upgradeGuideUrl: this.updateManifest?.upgradeGuideUrl ?? null,
+			guidedServerUpdateAvailable,
+			guidedServerUpdateStatus,
+			guidedServerUpdateTargetVersion: this.guidedServerUpdate?.targetVersion ?? null,
+			guidedServerUpdateStartedAt: this.guidedServerUpdate?.startedAt ?? null,
 		};
 	}
 
@@ -704,6 +777,40 @@ export class CapabilityUpdateService {
 		this.enforceCompatibilityGuard(`manifest-refresh:${reason}`);
 	}
 
+	private evaluateGuidedServerUpdate(now = Date.now()): GuidedServerUpdateStatus {
+		const previous = this.guidedServerUpdate;
+		const result = evaluateGuidedServerUpdateState(
+			previous,
+			this.serverCapabilities?.serverVersion ?? null,
+			now,
+		);
+		if (result.changed) {
+			this.guidedServerUpdate = result.state;
+			void this.deps.persistPluginState();
+			if (result.status === "updated") {
+				this.deps.log(`Guided server update completed: target=${previous?.targetVersion ?? "unknown"}`);
+				new Notice(`KAOS: server updated to ${previous?.targetVersion ?? "the target version"}.`, 8000);
+			} else if (result.status === "timed-out") {
+				this.deps.log(`Guided server update timed out: target=${previous?.targetVersion ?? "unknown"}`);
+				new Notice("KAOS: still waiting for the server update. Open the update action again if needed.", 10000);
+			}
+		}
+		return result.status;
+	}
+
+	private clearStaleGuidedServerUpdate(
+		latestServerVersion: string | null,
+		updateActionUrl: string | null,
+	): void {
+		const state = this.guidedServerUpdate;
+		if (!state) return;
+		const targetChanged = latestServerVersion !== null && state.targetVersion !== latestServerVersion;
+		const actionChanged = updateActionUrl !== null && state.updateActionUrl !== updateActionUrl;
+		if (!targetChanged && !actionChanged) return;
+		this.guidedServerUpdate = null;
+		void this.deps.persistPluginState();
+	}
+
 	private maybeShowUpdateNotices(reason: string): void {
 		const updateState = this.getUpdateState();
 		if (updateState.serverUpdateAvailable && updateState.latestServerVersion) {
@@ -713,7 +820,7 @@ export class CapabilityUpdateService {
 				if (!updateState.updateActionUrl) {
 					new Notice(
 						`KAOS: server update ${updateState.latestServerVersion} is available. ` +
-						"Set your deployment repo URL in KAOS settings to enable 1-click updates.",
+						"Set your deployment repo URL in KAOS settings to enable guided server updates.",
 						12000,
 					);
 				} else {
@@ -764,7 +871,7 @@ export class CapabilityUpdateService {
 
 	private maybeShowLegacyServerNotice(): void {
 		if (this.legacyServerNoticeShown) return;
-		const message = "KAOS: legacy server detected. Sync continues, but update metadata and 1-click updater features need a newer server. Deploy/update the Worker when ready.";
+		const message = "KAOS: legacy server detected. Sync continues, but update metadata and guided server update features need a newer server. Deploy/update the Worker when ready.";
 		console.warn(`[kaos] ${message}`);
 		this.deps.log(message);
 		new Notice(message, 12000);

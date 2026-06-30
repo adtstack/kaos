@@ -34,7 +34,7 @@ The default deploy is text-only:
 
 That claim page generates a token in the browser and returns an `obsidian://kaos?...` setup link you can use to configure the plugin.
 
-## Updating an existing deploy
+## Guided server update for an existing deploy
 
 The Deploy to Cloudflare button creates a new repository in your own Git account and connects this Worker to that new repo.
 
@@ -44,8 +44,13 @@ To pick up new KAOS changes later:
 
 1. Add your generated repo URL in the plugin settings (`Deployment repo URL`).
 2. Use **Initialize updater** once (GitHub) if workflows are missing.
-3. Use **Open update action** from plugin settings and run the update workflow.
-4. Cloudflare redeploys automatically after the workflow push.
+3. Use **Update server** from plugin settings. KAOS opens the GitHub workflow.
+4. Run the workflow with `update`; KAOS watches `/api/capabilities` until the
+   Worker reports the new server version.
+5. Cloudflare redeploys automatically after the workflow push.
+
+The Deploy to Cloudflare button is still the first-install path. Do not use it
+as the update path for an existing stateful Worker.
 
 Server updates are published through the main KAOS GitHub release stream. See
 [`engineering/version-release-management.md`](../engineering/version-release-management.md)

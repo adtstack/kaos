@@ -83,7 +83,7 @@ Snapshots can be browsed, compared with the current vault, and selectively
 restored. Without R2, text sync still works, but attachment sync and snapshots
 are disabled.
 
-## Updating the Server
+## Guided Server Update
 
 KAOS is designed to avoid terminal work, but the server still lives in your
 Cloudflare account. Updates are handled through a GitHub Actions workflow in
@@ -92,9 +92,15 @@ and state history are preserved.
 
 1. One-time setup: initialize the updater from KAOS settings and commit the
    generated workflow.
-2. Update: when KAOS reports a new version, open the update action and run it
-   with `update`.
+2. Update: when KAOS reports a new server version, click **Update server** in
+   KAOS settings. KAOS opens the GitHub workflow; run it with `update`, then
+   KAOS watches the Worker until `/api/capabilities` reports the new version.
 3. Roll back: run the same workflow with `revert`.
+
+Publishing a new KAOS release does not automatically mutate the generated
+deployment repo that Cloudflare created in your account. The guided update
+workflow is the handoff that commits the new server artifact into that repo and
+lets Cloudflare redeploy it.
 
 Re-clicking Deploy to Cloudflare is not the safe update path for an existing
 stateful server.
