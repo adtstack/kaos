@@ -34,7 +34,6 @@ export class EditorWorkspaceOrchestrator {
 	}
 
 	onLayoutChange(): void {
-		this.deps.getEditorBindings()?.clearLocalCursor("layout-change");
 		this.reconcileTrackedOpenFiles("layout-change");
 		this.updateActiveMarkdownPath(
 			this.getActiveMarkdownPath(),
@@ -90,6 +89,7 @@ export class EditorWorkspaceOrchestrator {
 
 	validateOpenBindings(reason: string): void {
 		let touched = 0;
+		let auditNeeded = false;
 		const editorBindings = this.deps.getEditorBindings();
 		if (!editorBindings) return;
 
@@ -105,25 +105,18 @@ export class EditorWorkspaceOrchestrator {
 				return;
 			}
 
-			touched += 1;
 			if (!binding || !health?.bound) {
+				touched += 1;
 				editorBindings.bind(leaf.view, this.deps.getSettings().deviceName);
 				return;
 			}
 
-			const repaired = editorBindings.repair(
-				leaf.view,
-				this.deps.getSettings().deviceName,
-				`validate:${reason}`,
-			);
-			if (!repaired) {
-				editorBindings.rebind(
-					leaf.view,
-					this.deps.getSettings().deviceName,
-					`validate:${reason}`,
-				);
-			}
+			auditNeeded = true;
 		});
+
+		if (auditNeeded) {
+			touched += editorBindings.auditBindings(`validate:${reason}`);
+		}
 
 		if (touched > 0) {
 			this.deps.log(`Validated open bindings (${reason}) — touched ${touched}`);

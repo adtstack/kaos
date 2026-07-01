@@ -915,6 +915,7 @@ export class ReconciliationController {
 				// This preserves the action kind so planBaselineAdvancement gets the
 				// correct input, not a flattened "defer-to-crdt-flush" for everything.
 				const updatesToFlush: Array<{ path: string; baselineActionKind: BaselineActionKind }> = [];
+				const deferredOpenEditorIndexPaths = new Set<string>();
 				const actionPaths = new Set<string>([
 					...result.createdOnDisk,
 					...result.seededToCrdt,
@@ -1013,6 +1014,26 @@ export class ReconciliationController {
 						ytext &&
 						openViews.length > 0
 					) {
+						const crdtContent = yTextToString(ytext) ?? "";
+						const editorSettleDefer =
+							this.getOpenEditorReconcileSettleDefer({
+								path,
+								diskContent,
+								crdtContent,
+								openViews,
+							});
+						if (editorSettleDefer !== null) {
+							this.deferOpenFileReconcileForEditorSettle({
+								path,
+								diskContent,
+								crdtContent,
+								openViews,
+								...editorSettleDefer,
+							});
+							deferredOpenEditorIndexPaths.add(path);
+							continue;
+						}
+
 						const handledOpenDivergence = await this.handleOpenFileReconcileDivergence(
 							path,
 							diskContent,
@@ -1225,11 +1246,18 @@ export class ReconciliationController {
 
 				// Pass settled hashes to disk index so they survive plugin reload
 				// and serve as the three-way baseline next startup reconcile.
-				const blockedIndexPathsInner: string[] = [];
+				const blockedIndexPathsInner = Array.from(deferredOpenEditorIndexPaths);
 				this.blockedDivergenceCount = 0;
 				// Do NOT clear lastBlockedDivergenceAt — it serves as "last seen"
 				// historical marker. Do NOT clear sample — remains available as
 				// "last blocked sample" even when count resets.
+				if (blockedIndexPathsInner.length > 0) {
+					this.deps.trace("reconcile", "reconcile-disk-index-advance-deferred-open-editor", {
+						mode,
+						blockedCount: blockedIndexPathsInner.length,
+						...tracePathList("blocked", blockedIndexPathsInner),
+					});
+				}
 				this.deps.setDiskIndex(updateIndex(this.deps.getDiskIndex(), allStats, {
 					excludePaths: blockedIndexPathsInner,
 					settledHashes,
@@ -2068,6 +2096,102 @@ export class ReconciliationController {
 		if (authority.content === input.diskContent) return null;
 		if (input.crdtContent !== null && authority.content === input.crdtContent) return null;
 		return now + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS;
+	}
+
+	private getOpenEditorReconcileSettleDefer(
+		input: {
+			path: string;
+			diskContent: string;
+			crdtContent: string;
+			openViews: MarkdownView[];
+		},
+		now = Date.now(),
+	): {
+		reason: "recent-editor-activity" | "editor-ahead-without-activity-timestamp";
+		lastEditorActivity: number | null;
+		idleMs: number | null;
+		deferUntil: number;
+	} | null {
+		const editorBindings = this.deps.getEditorBindings() as
+			| { getLastEditorActivityForPath?: (path: string) => number | null }
+			| null;
+		const lastEditorActivity =
+			editorBindings?.getLastEditorActivityForPath?.(input.path) ?? null;
+		if (lastEditorActivity !== null) {
+			const deferUntil = lastEditorActivity + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS;
+			if (deferUntil <= now) return null;
+
+			return {
+				reason: "recent-editor-activity",
+				lastEditorActivity,
+				idleMs: Math.max(0, now - lastEditorActivity),
+				deferUntil,
+			};
+		}
+
+		const authority = this.getOpenEditorAuthority(input.openViews);
+		if (authority.kind !== "single") return null;
+		if (authority.content === input.diskContent) return null;
+		if (authority.content === input.crdtContent) return null;
+
+		// Startup can receive provider state before the CM6 binding has begun
+		// tracking user edits. If the live editor is already ahead of both disk
+		// and CRDT, treat it as an unsettled typing/autosave boundary once
+		// before preserving artifacts.
+		return {
+			reason: "editor-ahead-without-activity-timestamp",
+			lastEditorActivity: null,
+			idleMs: null,
+			deferUntil: now + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS,
+		};
+	}
+
+	private deferOpenFileReconcileForEditorSettle(input: {
+		path: string;
+		diskContent: string;
+		crdtContent: string;
+		openViews: MarkdownView[];
+		reason: "recent-editor-activity" | "editor-ahead-without-activity-timestamp";
+		lastEditorActivity: number | null;
+		idleMs: number | null;
+		deferUntil: number;
+	}): void {
+		const editorStates = input.openViews.map((view) => {
+			let editorContent: string | null = null;
+			try {
+				editorContent = view.editor.getValue();
+			} catch {
+				editorContent = null;
+			}
+			return {
+				editorLength: editorContent?.length ?? null,
+				editorMatchesDisk: editorContent === input.diskContent,
+				editorMatchesCrdt: editorContent === input.crdtContent,
+			};
+		});
+
+		this.deps.log(
+			`reconcile: deferring "${input.path}" ` +
+			`(open editor is still settling; reason=${input.reason})`,
+		);
+		this.deps.trace("reconcile", "open-file-reconcile-deferred-editor-settle", {
+			path: input.path,
+			reason: input.reason,
+			idleMs: input.idleMs,
+			lastEditorActivity: input.lastEditorActivity,
+			notBeforeMs: input.deferUntil,
+			openViewCount: input.openViews.length,
+			diskLength: input.diskContent.length,
+			crdtLength: input.crdtContent.length,
+			editorStates,
+		});
+		this.mergeDirtyEntryIntoPath(input.path, {
+			reason: "modify",
+			primaryOpId: undefined,
+			coalescedOpIds: [],
+			retryCount: 0,
+			notBeforeMs: input.deferUntil,
+		});
 	}
 
 	private async handleOpenFileReconcileDivergence(

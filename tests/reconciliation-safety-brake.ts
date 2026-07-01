@@ -402,6 +402,269 @@ console.log("\n--- Test 2d: startup open editor content wins before binding can 
 	doc.destroy();
 }
 
+console.log("\n--- Test 2e: recent startup typing defers open editor conflict creation ---");
+{
+	const path = "open-typing-during-connect.md";
+	const diskContent = "LOCAL_STILL_TYPING\n";
+	const editorContent = "LOCAL_STILL_TYPING plus more\n";
+	const crdtContent = "REMOTE_FROM_INITIAL_SYNC\n";
+	const file = makeTFile(path);
+	const doc = new Y.Doc();
+	const ytext = doc.getText("content");
+	ytext.insert(0, crdtContent);
+
+	let diskIndex: DiskIndex = {};
+	const stats = new Map<string, { mtime: number; size: number }>([
+		[path, { mtime: 12, size: diskContent.length }],
+	]);
+	const createdFiles = new Map<string, string>();
+	const traces: Array<{ source: string; msg: string; details?: Record<string, unknown> }> = [];
+
+	const view = new MarkdownView() as MarkdownView & {
+		file: TFile;
+		editor: { getValue(): string };
+	};
+	view.file = file;
+	view.editor = { getValue: () => editorContent };
+
+	const app = {
+		vault: {
+			getMarkdownFiles: () => [
+				file,
+				...Array.from(createdFiles.keys()).map(makeTFile),
+			],
+			read: async (readFile: TFile & { path: string }) => {
+				if (readFile.path === path) return diskContent;
+				return createdFiles.get(readFile.path) ?? "";
+			},
+			create: async (createdPath: string, content: string) => {
+				if (createdFiles.has(createdPath)) throw new Error("exists");
+				createdFiles.set(createdPath, content);
+			},
+			adapter: {
+				stat: async (candidate: string) => stats.get(candidate) ?? null,
+			},
+			getAbstractFileByPath: (candidate: string) =>
+				candidate === path ? file : (createdFiles.has(candidate) ? ({ path: candidate }) : null),
+		},
+		workspace: {
+			iterateAllLeaves: (cb: (leaf: { view: MarkdownView }) => void) => {
+				cb({ view });
+			},
+		},
+	};
+
+	const vaultSync = {
+		connected: true,
+		providerSynced: true,
+		getTextForPath: (candidate: string) => candidate === path ? ytext : null,
+		getActiveMarkdownPaths: () => [path],
+		reconcileVault: () => ({
+			mode: "authoritative",
+			createdOnDisk: [],
+			updatedOnDisk: [path],
+			seededToCrdt: [],
+			untracked: [],
+			tombstonedDiskConflicts: [],
+			skipped: 0,
+		}),
+		runIntegrityChecks: () => ({ duplicateIds: 0, orphansCleaned: 0 }),
+	};
+
+	const controller = new ReconciliationController({
+		app: app as any,
+		getSettings: () => ({ deviceName: "Device" }) as any,
+		getRuntimeConfig: () => ({
+			maxFileSizeBytes: 0,
+			maxFileSizeKB: 0,
+			excludePatterns: [],
+		}) as any,
+		getVaultSync: () => vaultSync as any,
+		getDiskMirror: () => ({
+			flushWrite: async () => {},
+			suppressLocalCreate: async () => {},
+		}) as any,
+		getBlobSync: () => null,
+		getEditorBindings: () => ({
+			isBound: () => false,
+			getLastEditorActivityForPath: (candidate: string) =>
+				candidate === path ? Date.now() - 100 : null,
+		}) as any,
+		getDiskIndex: () => diskIndex,
+		setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
+		isMarkdownPathSyncable: () => true,
+		shouldBlockFrontmatterIngest: () => false,
+		refreshServerCapabilities: async () => {},
+		validateOpenEditorBindings: () => {},
+		onReconciled: () => {},
+		getAwaitingFirstProviderSyncAfterStartup: () => false,
+		setAwaitingFirstProviderSyncAfterStartup: () => {},
+		saveDiskIndex: async () => {},
+		refreshStatusBar: () => {},
+		trace: (source: string, msg: string, details?: Record<string, unknown>) => {
+			traces.push({ source, msg, details });
+		},
+		scheduleTraceStateSnapshot: () => {},
+		log: () => {},
+	});
+
+	await controller.runReconciliation("authoritative");
+
+	const dirtyEntry = (controller as any).dirtyMarkdownPaths.get(path);
+	const timer = (controller as any).markdownDrainTimer as ReturnType<typeof setTimeout> | null;
+	if (timer) clearTimeout(timer);
+
+	assert(createdFiles.size === 0, "recent typing does not create a conflict artifact");
+	assert(ytext.toString() === crdtContent, "recent typing does not force a premature CRDT winner");
+	assert(!!dirtyEntry, "recent typing queues a deferred disk ingest");
+	assert(
+		typeof dirtyEntry?.notBeforeMs === "number" && dirtyEntry.notBeforeMs > Date.now(),
+		"deferred disk ingest waits for the editor idle window",
+	);
+	assert(!diskIndex[path], "deferred open editor path is not advanced in the disk index");
+	assert(
+		traces.some((event) =>
+			event.msg === "open-file-reconcile-deferred-editor-settle" &&
+			event.details?.reason === "recent-editor-activity"
+		),
+		"defer path emits an explicit trace",
+	);
+	assert(
+		!traces.some((event) => event.msg === "open-file-reconcile-editor-wins"),
+		"defer path avoids the conflict-preserving editor-wins branch",
+	);
+	doc.destroy();
+}
+
+console.log("\n--- Test 2f: startup editor ahead of disk and CRDT defers without activity timestamp ---");
+{
+	const path = "open-editor-ahead-without-timestamp.md";
+	const diskContent = "LOCAL_AUTOSAVED\n";
+	const editorContent = "LOCAL_AUTOSAVED plus unsaved editor text\n";
+	const crdtContent = "REMOTE_FROM_INITIAL_SYNC\n";
+	const file = makeTFile(path);
+	const doc = new Y.Doc();
+	const ytext = doc.getText("content");
+	ytext.insert(0, crdtContent);
+
+	let diskIndex: DiskIndex = {};
+	const stats = new Map<string, { mtime: number; size: number }>([
+		[path, { mtime: 12, size: diskContent.length }],
+	]);
+	const createdFiles = new Map<string, string>();
+	const traces: Array<{ source: string; msg: string; details?: Record<string, unknown> }> = [];
+
+	const view = new MarkdownView() as MarkdownView & {
+		file: TFile;
+		editor: { getValue(): string };
+	};
+	view.file = file;
+	view.editor = { getValue: () => editorContent };
+
+	const app = {
+		vault: {
+			getMarkdownFiles: () => [
+				file,
+				...Array.from(createdFiles.keys()).map(makeTFile),
+			],
+			read: async (readFile: TFile & { path: string }) => {
+				if (readFile.path === path) return diskContent;
+				return createdFiles.get(readFile.path) ?? "";
+			},
+			create: async (createdPath: string, content: string) => {
+				if (createdFiles.has(createdPath)) throw new Error("exists");
+				createdFiles.set(createdPath, content);
+			},
+			adapter: {
+				stat: async (candidate: string) => stats.get(candidate) ?? null,
+			},
+			getAbstractFileByPath: (candidate: string) =>
+				candidate === path ? file : (createdFiles.has(candidate) ? ({ path: candidate }) : null),
+		},
+		workspace: {
+			iterateAllLeaves: (cb: (leaf: { view: MarkdownView }) => void) => {
+				cb({ view });
+			},
+		},
+	};
+
+	const vaultSync = {
+		connected: true,
+		providerSynced: true,
+		getTextForPath: (candidate: string) => candidate === path ? ytext : null,
+		getActiveMarkdownPaths: () => [path],
+		reconcileVault: () => ({
+			mode: "authoritative",
+			createdOnDisk: [],
+			updatedOnDisk: [path],
+			seededToCrdt: [],
+			untracked: [],
+			tombstonedDiskConflicts: [],
+			skipped: 0,
+		}),
+		runIntegrityChecks: () => ({ duplicateIds: 0, orphansCleaned: 0 }),
+	};
+
+	const controller = new ReconciliationController({
+		app: app as any,
+		getSettings: () => ({ deviceName: "Device" }) as any,
+		getRuntimeConfig: () => ({
+			maxFileSizeBytes: 0,
+			maxFileSizeKB: 0,
+			excludePatterns: [],
+		}) as any,
+		getVaultSync: () => vaultSync as any,
+		getDiskMirror: () => ({
+			flushWrite: async () => {},
+			suppressLocalCreate: async () => {},
+		}) as any,
+		getBlobSync: () => null,
+		getEditorBindings: () => ({
+			isBound: () => false,
+			getLastEditorActivityForPath: () => null,
+		}) as any,
+		getDiskIndex: () => diskIndex,
+		setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
+		isMarkdownPathSyncable: () => true,
+		shouldBlockFrontmatterIngest: () => false,
+		refreshServerCapabilities: async () => {},
+		validateOpenEditorBindings: () => {},
+		onReconciled: () => {},
+		getAwaitingFirstProviderSyncAfterStartup: () => false,
+		setAwaitingFirstProviderSyncAfterStartup: () => {},
+		saveDiskIndex: async () => {},
+		refreshStatusBar: () => {},
+		trace: (source: string, msg: string, details?: Record<string, unknown>) => {
+			traces.push({ source, msg, details });
+		},
+		scheduleTraceStateSnapshot: () => {},
+		log: () => {},
+	});
+
+	await controller.runReconciliation("authoritative");
+
+	const dirtyEntry = (controller as any).dirtyMarkdownPaths.get(path);
+	const timer = (controller as any).markdownDrainTimer as ReturnType<typeof setTimeout> | null;
+	if (timer) clearTimeout(timer);
+
+	assert(createdFiles.size === 0, "editor-ahead startup does not create conflict artifacts");
+	assert(ytext.toString() === crdtContent, "editor-ahead startup does not pick a premature winner");
+	assert(!!dirtyEntry, "editor-ahead startup queues a deferred disk ingest");
+	assert(!diskIndex[path], "editor-ahead deferred path is not advanced in the disk index");
+	assert(
+		traces.some((event) =>
+			event.msg === "open-file-reconcile-deferred-editor-settle" &&
+			event.details?.reason === "editor-ahead-without-activity-timestamp"
+		),
+		"editor-ahead defer path records the no-timestamp reason",
+	);
+	assert(
+		!traces.some((event) => event.msg === "open-file-reconcile-editor-wins"),
+		"editor-ahead defer path avoids conflict-preserving editor-wins branch",
+	);
+	doc.destroy();
+}
+
 console.log("\n--- Test 3: reconciliation safety brake leaves blocked overwrites unindexed ---");
 {
 	const paths = Array.from({ length: 30 }, (_, i) => `note-${i}.md`);

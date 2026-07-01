@@ -148,6 +148,8 @@ export class EditorBindingManager {
 	private pendingCmResolveRetries = new Map<string, ReturnType<typeof setTimeout>>();
 	private pendingYTextPatches = new WeakMap<Y.Text, PendingYTextPatch>();
 	private editorAuthorityShieldLeafIds = new Set<string>();
+	private lastEditorDocChangeAtByPath = new Map<string, number>();
+	private pendingReplacementCmToLeafId = new WeakMap<EditorView, string>();
 
 	private readonly debug: boolean;
 
@@ -258,6 +260,14 @@ export class EditorBindingManager {
 				`bind: repairing unhealthy binding "${file.path}" ` +
 				`(leaf=${leafId}, cm=${cmId}, issues=${reason})`,
 			);
+			if (this.deferRepairForRecentEditorActivity(
+				leafId,
+				existing,
+				`bind-health:${reason}`,
+				health.issues,
+			)) {
+				return;
+			}
 			if (this.repair(view, deviceName, `bind-health:${reason}`)) {
 				return;
 			}
@@ -273,6 +283,15 @@ export class EditorBindingManager {
 				`bind: editor view changed for "${file.path}" ` +
 				`(leaf=${leafId}, stored=${existing.cmId}, live=${cmId})`,
 			);
+			if (this.deferRepairForRecentEditorActivity(
+				leafId,
+				existing,
+				"bind-target-changed:cm-changed",
+				["cm-changed"],
+			)) {
+				this.pendingReplacementCmToLeafId.set(cm, leafId);
+				return;
+			}
 		}
 
 		// Unbind previous if switching files in the same leaf
@@ -330,10 +349,23 @@ export class EditorBindingManager {
 		}
 
 		if (existing.path !== file.path || existing.cm !== cm) {
+			const targetChangedIssues = [
+				...(existing.path !== file.path ? ["path-changed"] : []),
+				...(existing.cm !== cm ? ["cm-changed"] : []),
+			];
 			this.log(
 				`repair: binding target changed for "${file.path}" ` +
 				`(leaf=${leafId}, reason=${reason}) — forcing rebind`,
 			);
+			if (existing.path === file.path && this.deferRepairForRecentEditorActivity(
+				leafId,
+				existing,
+				`repair-target-changed:${reason}`,
+				targetChangedIssues,
+			)) {
+				this.pendingReplacementCmToLeafId.set(cm, leafId);
+				return true;
+			}
 			this.rebind(view, deviceName, reason);
 			return true;
 		}
@@ -424,6 +456,15 @@ export class EditorBindingManager {
 
 		const leafId =
 			(view.leaf as unknown as { id: string }).id ?? file.path;
+		const existing = this.bindings.get(leafId);
+		if (existing && this.deferRepairForRecentEditorActivity(
+			leafId,
+			existing,
+			`rebind:${reason}`,
+			["rebind-requested"],
+		)) {
+			return;
+		}
 		this.log(`rebind: forcing "${file.path}" (leaf=${leafId}, reason=${reason})`);
 		this.unbind(view);
 		this.bind(view, deviceName);
@@ -495,6 +536,7 @@ export class EditorBindingManager {
 				}
 				this.cmToLeafId.delete(binding.cm);
 				this.bindings.delete(leafId);
+				this.lastEditorDocChangeAtByPath.delete(path);
 				this.log(`unbindByPath: unbound "${path}" (leaf=${leafId})`);
 				// Don't break — a path could theoretically be open in multiple leaves
 			}
@@ -521,6 +563,11 @@ export class EditorBindingManager {
 			const newPath = renames.get(binding.path);
 			if (newPath) {
 				this.log(`updatePaths: "${binding.path}" -> "${newPath}" (leaf=${leafId})`);
+				const lastDocChange = this.lastEditorDocChangeAtByPath.get(binding.path);
+				if (lastDocChange != null) {
+					this.lastEditorDocChangeAtByPath.set(newPath, lastDocChange);
+					this.lastEditorDocChangeAtByPath.delete(binding.path);
+				}
 				binding.path = newPath;
 			}
 		}
@@ -603,7 +650,7 @@ export class EditorBindingManager {
 	}
 
 	getLastEditorActivityForPath(path: string): number | null {
-		let latest: number | null = null;
+		let latest: number | null = this.lastEditorDocChangeAtByPath.get(path) ?? null;
 		for (const binding of this.bindings.values()) {
 			if (binding.path !== path) continue;
 			const lastDocChange = binding.lastEditorDocChangeAtMs;
@@ -804,6 +851,7 @@ export class EditorBindingManager {
 	private unregisterKnownCmView(cm: EditorView): void {
 		this.knownCmViews.delete(cm);
 		this.cmToLeafId.delete(cm);
+		this.pendingReplacementCmToLeafId.delete(cm);
 	}
 
 	private inspectBindingHealth(
@@ -875,11 +923,17 @@ export class EditorBindingManager {
 		const pendingPatch = this.pendingYTextPatches.get(binding.ytext);
 		if (!pendingPatch || pendingPatch.leafId !== leafId) return transaction;
 		if (Date.now() - pendingPatch.at > 1000) return transaction;
-		if (!this.shouldShieldYTextPatchOrigin(pendingPatch.origin)) return transaction;
 		if (!this.hasRecentUserDocumentEdit(binding, RECENT_EDITOR_PATCH_SHIELD_MS)) return transaction;
 
 		const editorContent = transaction.startState.doc.toString();
 		const incomingContent = transaction.newDoc.toString();
+		if (!this.shouldShieldYTextPatch({
+			origin: pendingPatch.origin,
+			editorContent,
+			incomingContent,
+		})) {
+			return transaction;
+		}
 		this.activateEditorAuthorityShield(leafId, binding, editorContent, incomingContent, pendingPatch);
 		return { effects: this.compartment.reconfigure([]) };
 	}
@@ -921,6 +975,40 @@ export class EditorBindingManager {
 			origin !== ORIGIN_EDITOR_AUTHORITY_SHIELD &&
 			isLocalStringOrigin(origin)
 		);
+	}
+
+	private shouldShieldYTextPatch(input: {
+		origin: unknown;
+		editorContent: string;
+		incomingContent: string;
+	}): boolean {
+		if (this.shouldShieldYTextPatchOrigin(input.origin)) return true;
+		if (
+			input.origin === ORIGIN_EDITOR_HEALTH_HEAL ||
+			input.origin === ORIGIN_EDITOR_AUTHORITY_SHIELD
+		) {
+			return false;
+		}
+
+		return !this.incomingContentPreservesEditorContent(
+			input.editorContent,
+			input.incomingContent,
+		);
+	}
+
+	private incomingContentPreservesEditorContent(
+		editorContent: string,
+		incomingContent: string,
+	): boolean {
+		if (editorContent.length > incomingContent.length) return false;
+		let editorIndex = 0;
+		for (let incomingIndex = 0; incomingIndex < incomingContent.length; incomingIndex++) {
+			if (incomingContent[incomingIndex] === editorContent[editorIndex]) {
+				editorIndex++;
+				if (editorIndex === editorContent.length) return true;
+			}
+		}
+		return editorIndex === editorContent.length;
 	}
 
 	private hasRecentUserDocumentEdit(binding: EditorBinding, windowMs: number): boolean {
@@ -1022,6 +1110,10 @@ export class EditorBindingManager {
 		if (this.isUserDocumentEdit(update)) {
 			match.binding.lastEditorChangeAtMs = Date.now();
 			match.binding.lastEditorDocChangeAtMs = match.binding.lastEditorChangeAtMs;
+			this.lastEditorDocChangeAtByPath.set(
+				match.binding.path,
+				match.binding.lastEditorDocChangeAtMs,
+			);
 		}
 		this.maybeHealBinding(match.leafId, match.binding, "live-update");
 	}
@@ -1048,19 +1140,7 @@ export class EditorBindingManager {
 			this.scheduleHealthCheck(leafId, LIVE_UPDATE_HEALTH_RETRY_DELAY_MS, "live-update-deferred");
 			return;
 		}
-		const recentEditorRepairDelayMs = this.recentEditorRepairDelayMs(binding);
-		if (recentEditorRepairDelayMs > 0) {
-			const traceDetails = this.buildHealthTraceDetails(leafId, binding, source, health.issues);
-			this.trace?.("editor", "binding-health-repair-deferred-recent-editor-activity", {
-				...traceDetails,
-				action: "deferred",
-				delayMs: recentEditorRepairDelayMs,
-			});
-			this.scheduleHealthCheck(
-				leafId,
-				recentEditorRepairDelayMs,
-				"recent-editor-activity-deferred",
-			);
+		if (this.deferRepairForRecentEditorActivity(leafId, binding, source, health.issues)) {
 			return;
 		}
 		const onlyMissingSyncFacet =
@@ -1210,6 +1290,29 @@ export class EditorBindingManager {
 		return RECENT_EDITOR_REPAIR_DEFER_MS - elapsedMs + LIVE_UPDATE_HEALTH_RETRY_DELAY_MS;
 	}
 
+	private deferRepairForRecentEditorActivity(
+		leafId: string,
+		binding: EditorBinding,
+		source: string,
+		issues: string[],
+	): boolean {
+		const recentEditorRepairDelayMs = this.recentEditorRepairDelayMs(binding);
+		if (recentEditorRepairDelayMs <= 0) return false;
+
+		const traceDetails = this.buildHealthTraceDetails(leafId, binding, source, issues);
+		this.trace?.("editor", "binding-health-repair-deferred-recent-editor-activity", {
+			...traceDetails,
+			action: "deferred",
+			delayMs: recentEditorRepairDelayMs,
+		});
+		this.scheduleHealthCheck(
+			leafId,
+			recentEditorRepairDelayMs,
+			"recent-editor-activity-deferred",
+		);
+		return true;
+	}
+
 	private clearCmResolveRetry(leafId: string): void {
 		const timer = this.pendingCmResolveRetries.get(leafId);
 		if (timer) {
@@ -1296,7 +1399,6 @@ export class EditorBindingManager {
 		];
 
 		try {
-			this.clearLocalCursor(`${action}-pre-reconfigure`);
 			cm.dispatch({
 				effects: this.compartment.reconfigure(guardedCollabExtension),
 			});
@@ -1313,6 +1415,7 @@ export class EditorBindingManager {
 		if (existing) {
 			this.cmToLeafId.delete(existing.cm);
 		}
+		this.pendingReplacementCmToLeafId.delete(cm);
 		const boundAtMs = Date.now();
 		const rapidSwitch =
 			!!existing
@@ -1321,6 +1424,27 @@ export class EditorBindingManager {
 		const settleWindowMs = rapidSwitch
 			? FAST_SWITCH_BINDING_SETTLE_WINDOW_MS
 			: BASE_BINDING_SETTLE_WINDOW_MS;
+		const carryExistingActivity = existing?.path === filePath;
+		const existingLastDocChangeAtMs = carryExistingActivity
+			? (existing.lastEditorDocChangeAtMs ?? null)
+			: null;
+		const cachedLastDocChangeAtMs =
+			this.lastEditorDocChangeAtByPath.get(filePath) ?? null;
+		const lastEditorDocChangeAtMs =
+			existingLastDocChangeAtMs == null
+				? cachedLastDocChangeAtMs
+				: (cachedLastDocChangeAtMs == null
+					? existingLastDocChangeAtMs
+					: Math.max(existingLastDocChangeAtMs, cachedLastDocChangeAtMs));
+		const lastEditorChangeAtMs = Math.max(
+			boundAtMs,
+			carryExistingActivity ? existing.lastEditorChangeAtMs : 0,
+			lastEditorDocChangeAtMs ?? 0,
+		);
+		if (lastEditorDocChangeAtMs != null) {
+			this.lastEditorDocChangeAtByPath.set(filePath, lastEditorDocChangeAtMs);
+		}
+
 		this.bindings.set(leafId, {
 			view,
 			path: filePath,
@@ -1331,8 +1455,8 @@ export class EditorBindingManager {
 			fileId,
 			lastBoundAt: new Date(boundAtMs).toISOString(),
 			lastBoundAtMs: boundAtMs,
-			lastEditorChangeAtMs: boundAtMs,
-			lastEditorDocChangeAtMs: null,
+			lastEditorChangeAtMs,
+			lastEditorDocChangeAtMs,
 			settleWindowMs,
 		});
 		this.cmToLeafId.set(cm, leafId);
@@ -1396,6 +1520,15 @@ export class EditorBindingManager {
 			}
 		}
 
+		const pendingLeafId = this.pendingReplacementCmToLeafId.get(cm);
+		if (pendingLeafId) {
+			const binding = this.bindings.get(pendingLeafId);
+			if (binding && this.isPendingReplacementCmForBinding(cm, binding)) {
+				return { leafId: pendingLeafId, binding };
+			}
+			this.pendingReplacementCmToLeafId.delete(cm);
+		}
+
 		for (const [fallbackLeafId, binding] of this.bindings) {
 			if (binding.cm === cm) {
 				this.cmToLeafId.set(cm, fallbackLeafId);
@@ -1404,6 +1537,13 @@ export class EditorBindingManager {
 		}
 
 		return null;
+	}
+
+	private isPendingReplacementCmForBinding(cm: EditorView, binding: EditorBinding): boolean {
+		const file = binding.view.file;
+		if (!file || file.path !== binding.path) return false;
+		if (!cm.dom.isConnected) return false;
+		return binding.view.containerEl.contains(cm.dom);
 	}
 
 	private findBindingForState(state: EditorState): { leafId: string; binding: EditorBinding } | null {
