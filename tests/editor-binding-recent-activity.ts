@@ -448,6 +448,7 @@ console.log("\n--- Test 13: local repair patches are blocked during recent user 
 		path: binding.path,
 		leafId,
 		at: Date.now(),
+		baseContent: "typing now",
 	});
 
 	const transaction = {
@@ -498,6 +499,7 @@ console.log("\n--- Test 14: provider-origin patches that preserve editor content
 		path: binding.path,
 		leafId: "leaf-1",
 		at: Date.now(),
+		baseContent: "typing now",
 	});
 
 	const transaction = {
@@ -536,6 +538,7 @@ console.log("\n--- Test 15: provider-origin patches that erase recent typing are
 		path: binding.path,
 		leafId,
 		at: Date.now(),
+		baseContent: "typing now plus stale remote content",
 	});
 
 	const transaction = {
@@ -567,7 +570,7 @@ console.log("\n--- Test 15: provider-origin patches that erase recent typing are
 	clearPendingHealthChecks(manager);
 }
 
-console.log("\n--- Test 16: provider-origin patches that erase idle open editor content are blocked ---");
+console.log("\n--- Test 16: provider-origin patches that erase idle open editor content are allowed ---");
 {
 	const { manager, binding, flightEvents } = buildManagerFixture({
 		lastEditorChangeAgeMs: 10_000,
@@ -582,6 +585,7 @@ console.log("\n--- Test 16: provider-origin patches that erase idle open editor 
 		path: binding.path,
 		leafId,
 		at: Date.now(),
+		baseContent: "typing now plus stale remote content",
 	});
 
 	const transaction = {
@@ -596,19 +600,96 @@ console.log("\n--- Test 16: provider-origin patches that erase idle open editor 
 		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
 	}).filterRiskyNonUserPatch(transaction);
 
-	assertEq(result !== transaction, true, "idle destructive provider patch is replaced with a shield transaction");
+	assertEq(result, transaction, "idle destructive provider patch is allowed through");
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has(leafId),
+		true,
+		"idle binding remains attached for provider-origin updates",
+	);
+	assertEq(
+		flightEvents.some((event) => event.kind === PRODUCT_EVENT_KIND.editorAuthorityShieldApplied),
+		false,
+		"idle provider patch does not emit editor.authority_shield.applied",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 17: non-overlapping provider patches auto-merge during recent typing ---");
+{
+	const baseContent = "one\ntwo\nthree\n";
+	const editorContent = "one local\ntwo\nthree\n";
+	const incomingContent = "one\ntwo\nthree remote\n";
+	const mergedContent = "one local\ntwo\nthree remote\n";
+	const { manager, binding, flightEvents } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	const leafId = "leaf-1";
+	const providerOrigin = { provider: true };
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, incomingContent);
+	binding.cm.state = {
+		...binding.cm.state,
+		doc: {
+			length: editorContent.length,
+			toString: () => editorContent,
+		},
+	};
+	let editorValue = editorContent;
+	binding.view.editor = { getValue: () => editorValue };
+	let dispatched: unknown = null;
+	binding.cm.dispatch = (spec: unknown) => {
+		dispatched = spec;
+		editorValue = mergedContent;
+		binding.cm.state = {
+			...binding.cm.state,
+			doc: {
+				length: mergedContent.length,
+				toString: () => mergedContent,
+			},
+		};
+	};
+	(manager as unknown as {
+		pendingYTextPatches: WeakMap<Y.Text, unknown>;
+	}).pendingYTextPatches.set(binding.ytext, {
+		origin: providerOrigin,
+		path: binding.path,
+		leafId,
+		at: Date.now(),
+		baseContent,
+	});
+
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => incomingContent },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+
+	const result = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+
+	assertEq(result !== transaction, true, "non-overlapping destructive provider patch is intercepted for auto-merge");
 	assertEq(
 		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has(leafId),
 		false,
-		"idle binding is detached before the provider patch can erase open editor content",
+		"binding is detached before the incoming-only patch can reach the editor",
 	);
 
 	await Promise.resolve();
-	assertEq(binding.ytext.toString(), "typing now", "idle open editor content is written back to CRDT after provider shield");
+	assertEq(binding.ytext.toString(), mergedContent, "auto-merge writes the merged content to CRDT");
+	assertEq(dispatched !== null, true, "auto-merge dispatches merged content into CodeMirror");
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has(leafId),
+		true,
+		"auto-merge rebinds after the editor and CRDT match",
+	);
 	assertEq(
 		flightEvents.some((event) => event.kind === PRODUCT_EVENT_KIND.editorAuthorityShieldApplied),
-		true,
-		"idle provider shield emits editor.authority_shield.applied",
+		false,
+		"auto-merge does not emit editor.authority_shield.applied",
 	);
 	clearPendingHealthChecks(manager);
 }

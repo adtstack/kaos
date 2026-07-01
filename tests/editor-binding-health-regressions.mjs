@@ -143,7 +143,7 @@ console.log("\n--- Test 8: applyBinding refuses divergent editor content ---");
 	);
 }
 
-console.log("\n--- Test 9: destructive non-user patches do not depend on recent activity ---");
+console.log("\n--- Test 9: destructive provider patches merge before recent-activity shielding ---");
 {
 	const section = sliceBetween(
 		bindingSource,
@@ -156,8 +156,39 @@ console.log("\n--- Test 9: destructive non-user patches do not depend on recent 
 		"filterRiskyNonUserPatch checks whether incoming content preserves editor content",
 	);
 	assert(
-		!section?.includes("RECENT_EDITOR_PATCH_SHIELD_MS"),
-		"filterRiskyNonUserPatch does not require recent activity before shielding destructive patches",
+		section?.includes("this.planEditorYTextMerge({"),
+		"filterRiskyNonUserPatch attempts a 3-way merge before shielding destructive patches",
+	);
+	assert(
+		section?.includes("this.hasRecentUserDocumentEdit(binding, RECENT_EDITOR_PATCH_SHIELD_MS)"),
+		"filterRiskyNonUserPatch only shields unmerged destructive patches during recent editor activity",
+	);
+	assert(
+		(section?.indexOf("this.planEditorYTextMerge({") ?? Infinity) <
+			(section?.indexOf("this.hasRecentUserDocumentEdit(binding, RECENT_EDITOR_PATCH_SHIELD_MS)") ?? -1),
+		"3-way merge runs before recent-activity shielding",
+	);
+}
+
+console.log("\n--- Test 9b: Y.Text patch capture records the pre-patch base content ---");
+{
+	const section = sliceBetween(
+		bindingSource,
+		"private createYTextOriginCaptureExtension(",
+		"private shouldShieldYTextPatch(input: {",
+	);
+	assert(section !== null, "createYTextOriginCaptureExtension section found");
+	assert(
+		section?.includes("beforeContentByTransaction"),
+		"Y.Text patch capture stores content by transaction",
+	);
+	assert(
+		section?.includes('"beforeTransaction"'),
+		"Y.Text patch capture listens before the transaction mutates content",
+	);
+	assert(
+		section?.includes("baseContent"),
+		"pending Y.Text patch includes baseContent for 3-way merge",
 	);
 }
 

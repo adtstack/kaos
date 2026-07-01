@@ -5,6 +5,7 @@ import * as Y from "yjs";
 import { Notice, type MarkdownView } from "obsidian";
 import type { VaultSync } from "./vaultSync";
 import { applyDiffToYText } from "./diff";
+import { mergeTexts3 } from "../utils/threeWayMerge";
 import type { TraceRecord } from "../observability/traceContext";
 import type { ProductFlightPathEventInput } from "../observability/traceSink";
 import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
@@ -33,6 +34,7 @@ const FAST_SWITCH_WINDOW_MS = 2000;
 const POST_BIND_HEALTH_GRACE_MS = 100;
 const LIVE_UPDATE_HEALTH_RETRY_DELAY_MS = 120;
 const RECENT_EDITOR_REPAIR_DEFER_MS = 1200;
+const RECENT_EDITOR_PATCH_SHIELD_MS = 5000;
 const CM_RESOLVE_RETRY_DELAYS_MS = [80, 160, 320, 640, 1000, 1500, 2000] as const;
 const CM_RESOLVE_DELAYED_ATTEMPT = 5;
 const CM_RESOLVE_IDLE_RETRY_DELAY_MS = 5000;
@@ -101,6 +103,7 @@ interface PendingYTextPatch {
 	path: string;
 	leafId: string;
 	at: number;
+	baseContent: string | null;
 }
 
 /**
@@ -931,8 +934,67 @@ export class EditorBindingManager {
 		})) {
 			return transaction;
 		}
+
+		const mergeResult = this.planEditorYTextMerge({
+			patch: pendingPatch,
+			editorContent,
+			incomingContent,
+		});
+		if (mergeResult.kind === "allow-incoming") {
+			return transaction;
+		}
+		if (mergeResult.kind === "apply-merged") {
+			this.activateEditorAutoMerge(
+				leafId,
+				binding,
+				editorContent,
+				incomingContent,
+				mergeResult.mergedContent,
+				pendingPatch,
+			);
+			return { effects: this.compartment.reconfigure([]) };
+		}
+
+		if (!this.hasRecentUserDocumentEdit(binding, RECENT_EDITOR_PATCH_SHIELD_MS)) {
+			return transaction;
+		}
 		this.activateEditorAuthorityShield(leafId, binding, editorContent, incomingContent, pendingPatch);
 		return { effects: this.compartment.reconfigure([]) };
+	}
+
+	private planEditorYTextMerge(input: {
+		patch: PendingYTextPatch;
+		editorContent: string;
+		incomingContent: string;
+	}): { kind: "allow-incoming" } | { kind: "apply-merged"; mergedContent: string } | { kind: "no-merge" } {
+		if (input.patch.origin == null || typeof input.patch.origin === "string") {
+			return { kind: "no-merge" };
+		}
+
+		const mergeResult = mergeTexts3(
+			input.patch.baseContent,
+			input.editorContent,
+			input.incomingContent,
+		);
+		if (mergeResult.kind !== "clean-merge") {
+			this.trace?.("editor", "editor-ytext-3way-merge-skipped", {
+				path: input.patch.path,
+				reason: mergeResult.kind,
+				hunkCount: mergeResult.kind === "conflict" ? mergeResult.hunks.length : null,
+			});
+			return { kind: "no-merge" };
+		}
+
+		if (mergeResult.mergedText === input.incomingContent) {
+			return { kind: "allow-incoming" };
+		}
+
+		return { kind: "apply-merged", mergedContent: mergeResult.mergedText };
+	}
+
+	private hasRecentUserDocumentEdit(binding: EditorBinding, windowMs: number): boolean {
+		const lastDocChangeAt = binding.lastEditorDocChangeAtMs;
+		return lastDocChangeAt != null && Date.now() - lastDocChangeAt < windowMs;
 	}
 
 	private createYTextOriginCaptureExtension(
@@ -940,26 +1002,36 @@ export class EditorBindingManager {
 		path: string,
 		leafId: string,
 	): Extension {
-		const recordPatch = (origin: unknown) => {
+		const beforeContentByTransaction = new WeakMap<Y.Transaction, string>();
+		const recordPatch = (origin: unknown, baseContent: string | null) => {
 			this.pendingYTextPatches.set(ytext, {
 				origin,
 				path,
 				leafId,
 				at: Date.now(),
+				baseContent,
 			});
 		};
 		return ViewPlugin.fromClass(
 			class {
 				private readonly handler = (_event: Y.YTextEvent, transaction: Y.Transaction) => {
-					recordPatch(transaction.origin);
+					const baseContent = beforeContentByTransaction.get(transaction) ?? null;
+					beforeContentByTransaction.delete(transaction);
+					recordPatch(transaction.origin, baseContent);
+				};
+
+				private readonly beforeTransactionHandler = (transaction: Y.Transaction) => {
+					beforeContentByTransaction.set(transaction, ytext.toJSON());
 				};
 
 				constructor() {
+					ytext.doc?.on("beforeTransaction", this.beforeTransactionHandler);
 					ytext.observe(this.handler);
 				}
 
 				destroy(): void {
 					ytext.unobserve(this.handler);
+					ytext.doc?.off("beforeTransaction", this.beforeTransactionHandler);
 				}
 			},
 		);
@@ -1084,6 +1156,96 @@ export class EditorBindingManager {
 		}
 
 		this.bind(binding.view, this.lastDeviceName);
+	}
+
+	private activateEditorAutoMerge(
+		leafId: string,
+		binding: EditorBinding,
+		editorContent: string,
+		incomingContent: string,
+		mergedContent: string,
+		patch: PendingYTextPatch,
+	): void {
+		if (this.bindings.get(leafId) !== binding) return;
+		this.editorAuthorityShieldLeafIds.add(leafId);
+		this.clearScheduledHealthCheck(leafId);
+		this.clearCmResolveRetry(leafId);
+		this.healthWorkInFlight.delete(leafId);
+		this.bindings.delete(leafId);
+		this.cmToLeafId.delete(binding.cm);
+		this.trace?.("editor", "editor-ytext-3way-auto-merge-activated", {
+			leafId,
+			path: binding.path,
+			cmId: binding.cmId,
+			origin: typeof patch.origin === "string" ? patch.origin : null,
+			baseLength: patch.baseContent?.length ?? null,
+			editorLength: editorContent.length,
+			incomingLength: incomingContent.length,
+			mergedLength: mergedContent.length,
+		});
+
+		queueMicrotask(() => {
+			this.editorAuthorityShieldLeafIds.delete(leafId);
+			binding.undoManager.destroy();
+			this.applyEditorAutoMergeAfterShield(leafId, binding, mergedContent, patch);
+		});
+	}
+
+	private applyEditorAutoMergeAfterShield(
+		leafId: string,
+		binding: EditorBinding,
+		mergedContent: string,
+		patch: PendingYTextPatch,
+	): void {
+		const file = binding.view.file;
+		if (!file || file.path !== binding.path) return;
+
+		const ytext = this.vaultSync.getTextForPath(binding.path) ?? binding.ytext;
+		const crdtContent = ytext.toJSON();
+		if (crdtContent !== mergedContent) {
+			applyDiffToYText(ytext, crdtContent, mergedContent, ORIGIN_EDITOR_AUTHORITY_SHIELD);
+		}
+
+		try {
+			const currentEditorContent = binding.cm.state.doc.toString();
+			if (currentEditorContent !== mergedContent) {
+				binding.cm.dispatch({
+					changes: {
+						from: 0,
+						to: binding.cm.state.doc.length,
+						insert: mergedContent,
+					},
+				});
+			}
+		} catch (err) {
+			this.trace?.("editor", "editor-ytext-3way-auto-merge-dispatch-failed", {
+				leafId,
+				path: binding.path,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			return;
+		}
+
+		this.trace?.("editor", "editor-ytext-3way-auto-merged", {
+			leafId,
+			path: binding.path,
+			origin: typeof patch.origin === "string" ? patch.origin : null,
+			baseLength: patch.baseContent?.length ?? null,
+			mergedLength: mergedContent.length,
+		});
+
+		this.applyBinding({
+			action: "repair",
+			deviceName: this.lastDeviceName,
+			view: binding.view,
+			cm: binding.cm,
+			cmId: binding.cmId,
+			leafId,
+			filePath: binding.path,
+			ytext,
+			fileId: this.vaultSync.getFileIdForText(ytext) ?? binding.fileId,
+			reason: "editor-3way-auto-merge",
+		});
 	}
 
 	private handleLiveEditorUpdate(update: ViewUpdate): void {
