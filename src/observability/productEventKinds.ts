@@ -41,6 +41,7 @@ export const PRODUCT_EVENT_KIND = {
 	// Editor
 	editorHealApplied: "editor.heal.applied",
 	editorRepairApplied: "editor.repair.applied",
+	editorAuthorityShieldApplied: "editor.authority_shield.applied",
 } as const;
 
 export type ProductEventKind =

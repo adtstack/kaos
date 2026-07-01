@@ -1,5 +1,5 @@
 export const FLIGHT_EVENT_SCHEMA_VERSION = 1;
-export const FLIGHT_TAXONOMY_VERSION = 10; // bumped: editor-bound localOnly amplifier guard — recovery.amplification.quarantined
+export const FLIGHT_TAXONOMY_VERSION = 11; // bumped: editor authority shield event
 
 export type FlightSeverity = "debug" | "info" | "warn" | "error";
 export type FlightScope =
@@ -149,6 +149,7 @@ export const FLIGHT_KIND = {
 	// Editor binding orchestration (controller recovery orchestration spec)
 	editorRepairApplied: "editor.repair.applied",
 	editorHealApplied: "editor.heal.applied",
+	editorAuthorityShieldApplied: "editor.authority_shield.applied",
 } as const;
 
 export type FlightKind = typeof FLIGHT_KIND[keyof typeof FLIGHT_KIND];

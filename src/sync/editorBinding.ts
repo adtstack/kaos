@@ -1,4 +1,4 @@
-import { Compartment, type Extension } from "@codemirror/state";
+import { Compartment, EditorState, Transaction, type Extension, type TransactionSpec } from "@codemirror/state";
 import { EditorView, ViewPlugin, type ViewUpdate } from "@codemirror/view";
 import { yCollab, ySyncFacet } from "y-codemirror.next";
 import * as Y from "yjs";
@@ -8,7 +8,11 @@ import { applyDiffToYText } from "./diff";
 import type { TraceRecord } from "../observability/traceContext";
 import type { ProductFlightPathEventInput } from "../observability/traceSink";
 import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
-import { ORIGIN_EDITOR_HEALTH_HEAL } from "./origins";
+import {
+	ORIGIN_EDITOR_AUTHORITY_SHIELD,
+	ORIGIN_EDITOR_HEALTH_HEAL,
+	isLocalStringOrigin,
+} from "./origins";
 
 /**
  * Manages per-editor CM6 bindings via yCollab.
@@ -30,6 +34,7 @@ const FAST_SWITCH_WINDOW_MS = 2000;
 const POST_BIND_HEALTH_GRACE_MS = 100;
 const LIVE_UPDATE_HEALTH_RETRY_DELAY_MS = 120;
 const RECENT_EDITOR_REPAIR_DEFER_MS = 1200;
+const RECENT_EDITOR_PATCH_SHIELD_MS = 1200;
 const CM_RESOLVE_RETRY_DELAYS_MS = [80, 160, 320, 640, 1000, 1500, 2000] as const;
 const CM_RESOLVE_DELAYED_ATTEMPT = 5;
 const CM_RESOLVE_IDLE_RETRY_DELAY_MS = 5000;
@@ -39,6 +44,7 @@ interface EditorBinding {
 	view: MarkdownView;
 	path: string;
 	undoManager: Y.UndoManager;
+	ytext: Y.Text;
 	cm: EditorView;
 	cmId: string;
 	fileId?: string;
@@ -92,6 +98,13 @@ interface BindingTarget {
 	fileId?: string;
 }
 
+interface PendingYTextPatch {
+	origin: unknown;
+	path: string;
+	leafId: string;
+	at: number;
+}
+
 /**
  * Harness-only gate for pausing editor<->CRDT propagation on specific paths.
  * Supplied by the QA harness via the EditorBindingManager constructor.
@@ -133,6 +146,8 @@ export class EditorBindingManager {
 	private cmResolveAttempts = new Map<string, number>();
 	private cmResolveDelayedLogged = new Set<string>();
 	private pendingCmResolveRetries = new Map<string, ReturnType<typeof setTimeout>>();
+	private pendingYTextPatches = new WeakMap<Y.Text, PendingYTextPatch>();
+	private editorAuthorityShieldLeafIds = new Set<string>();
 
 	private readonly debug: boolean;
 
@@ -172,8 +187,14 @@ export class EditorBindingManager {
 		const registerKnownCmView = this.registerKnownCmView.bind(this);
 		const handleLiveEditorUpdate = this.handleLiveEditorUpdate.bind(this);
 		const unregisterKnownCmView = this.unregisterKnownCmView.bind(this);
+		const filterRiskyNonUserPatch = this.filterRiskyNonUserPatch.bind(this);
 		return [
 			this.compartment.of([]),
+			// Guard y-codemirror document patches that would replay a local repair
+			// over an actively edited note. The actual local-edit tracking lives
+			// in the ViewPlugin below; this filter runs before the patch reaches
+			// the editor document.
+			EditorState.transactionFilter.of(filterRiskyNonUserPatch),
 			ViewPlugin.fromClass(
 				class {
 					constructor(readonly view: EditorView) {
@@ -839,14 +860,177 @@ export class EditorBindingManager {
 		};
 	}
 
+	private filterRiskyNonUserPatch(transaction: Transaction): Transaction | TransactionSpec {
+		if (!transaction.docChanged || this.isUserTransaction(transaction)) {
+			return transaction;
+		}
+
+		const match = this.findBindingForState(transaction.startState);
+		if (!match) return transaction;
+		const { leafId, binding } = match;
+		if (this.editorAuthorityShieldLeafIds.has(leafId)) {
+			return { effects: this.compartment.reconfigure([]) };
+		}
+
+		const pendingPatch = this.pendingYTextPatches.get(binding.ytext);
+		if (!pendingPatch || pendingPatch.leafId !== leafId) return transaction;
+		if (Date.now() - pendingPatch.at > 1000) return transaction;
+		if (!this.shouldShieldYTextPatchOrigin(pendingPatch.origin)) return transaction;
+		if (!this.hasRecentUserDocumentEdit(binding, RECENT_EDITOR_PATCH_SHIELD_MS)) return transaction;
+
+		const editorContent = transaction.startState.doc.toString();
+		const incomingContent = transaction.newDoc.toString();
+		this.activateEditorAuthorityShield(leafId, binding, editorContent, incomingContent, pendingPatch);
+		return { effects: this.compartment.reconfigure([]) };
+	}
+
+	private createYTextOriginCaptureExtension(
+		ytext: Y.Text,
+		path: string,
+		leafId: string,
+	): Extension {
+		const recordPatch = (origin: unknown) => {
+			this.pendingYTextPatches.set(ytext, {
+				origin,
+				path,
+				leafId,
+				at: Date.now(),
+			});
+		};
+		return ViewPlugin.fromClass(
+			class {
+				private readonly handler = (_event: Y.YTextEvent, transaction: Y.Transaction) => {
+					recordPatch(transaction.origin);
+				};
+
+				constructor() {
+					ytext.observe(this.handler);
+				}
+
+				destroy(): void {
+					ytext.unobserve(this.handler);
+				}
+			},
+		);
+	}
+
+	private shouldShieldYTextPatchOrigin(origin: unknown): boolean {
+		return (
+			typeof origin === "string" &&
+			origin !== ORIGIN_EDITOR_HEALTH_HEAL &&
+			origin !== ORIGIN_EDITOR_AUTHORITY_SHIELD &&
+			isLocalStringOrigin(origin)
+		);
+	}
+
+	private hasRecentUserDocumentEdit(binding: EditorBinding, windowMs: number): boolean {
+		if (binding.lastEditorDocChangeAtMs == null) return false;
+		return Date.now() - binding.lastEditorDocChangeAtMs < windowMs;
+	}
+
+	private isUserTransaction(transaction: Transaction): boolean {
+		return (
+			transaction.annotation(Transaction.userEvent) !== undefined &&
+			(
+				transaction.isUserEvent("input") ||
+				transaction.isUserEvent("delete") ||
+				transaction.isUserEvent("move") ||
+				transaction.isUserEvent("undo") ||
+				transaction.isUserEvent("redo")
+			)
+		);
+	}
+
+	private activateEditorAuthorityShield(
+		leafId: string,
+		binding: EditorBinding,
+		editorContent: string,
+		incomingContent: string,
+		patch: PendingYTextPatch,
+	): void {
+		if (this.bindings.get(leafId) !== binding) return;
+		this.editorAuthorityShieldLeafIds.add(leafId);
+		this.clearScheduledHealthCheck(leafId);
+		this.clearCmResolveRetry(leafId);
+		this.healthWorkInFlight.delete(leafId);
+		this.bindings.delete(leafId);
+		this.cmToLeafId.delete(binding.cm);
+		this.trace?.("editor", "editor-authority-shield-activated", {
+			leafId,
+			path: binding.path,
+			cmId: binding.cmId,
+			origin: typeof patch.origin === "string" ? patch.origin : null,
+			editorLength: editorContent.length,
+			incomingLength: incomingContent.length,
+			idleMs: binding.lastEditorDocChangeAtMs == null
+				? null
+				: Date.now() - binding.lastEditorDocChangeAtMs,
+		});
+
+		queueMicrotask(() => {
+			this.editorAuthorityShieldLeafIds.delete(leafId);
+			binding.undoManager.destroy();
+			this.applyEditorAuthorityAfterShield(binding, editorContent, patch);
+		});
+	}
+
+	private applyEditorAuthorityAfterShield(
+		binding: EditorBinding,
+		fallbackEditorContent: string,
+		patch: PendingYTextPatch,
+	): void {
+		const file = binding.view.file;
+		if (!file || file.path !== binding.path) return;
+
+		let editorContent = fallbackEditorContent;
+		try {
+			editorContent = binding.view.editor.getValue();
+		} catch {
+			// Fall back to the transaction start document captured before the
+			// blocked patch. That is still the last known editor authority.
+		}
+
+		const ytext = this.vaultSync.getTextForPath(binding.path) ?? binding.ytext;
+		const crdtContent = ytext.toJSON();
+		if (crdtContent !== editorContent) {
+			applyDiffToYText(ytext, crdtContent, editorContent, ORIGIN_EDITOR_AUTHORITY_SHIELD);
+			this.recordFlightPathEvent?.({
+				priority: "important",
+				kind: PRODUCT_EVENT_KIND.editorAuthorityShieldApplied,
+				severity: "info",
+				scope: "file",
+				source: "editorBinding",
+				layer: "editor",
+				path: binding.path,
+				data: {
+					reason: "editor-authority-shield",
+					crdtLength: crdtContent.length,
+					editorLength: editorContent.length,
+					crdtMatchesEditorBefore: false,
+					diffApplied: true,
+					blockedOrigin: typeof patch.origin === "string" ? patch.origin : null,
+				},
+			});
+		}
+
+		this.bind(binding.view, this.lastDeviceName);
+	}
+
 	private handleLiveEditorUpdate(update: ViewUpdate): void {
 		const match = this.findBindingForCm(update.view);
 		if (!match) return;
-		if (update.docChanged) {
+		if (this.isUserDocumentEdit(update)) {
 			match.binding.lastEditorChangeAtMs = Date.now();
 			match.binding.lastEditorDocChangeAtMs = match.binding.lastEditorChangeAtMs;
 		}
 		this.maybeHealBinding(match.leafId, match.binding, "live-update");
+	}
+
+	private isUserDocumentEdit(update: ViewUpdate): boolean {
+		if (!update.docChanged) return false;
+		return update.transactions.some((transaction) =>
+			transaction.docChanged && this.isUserTransaction(transaction),
+		);
 	}
 
 	private maybeHealBinding(
@@ -1106,11 +1290,15 @@ export class EditorBindingManager {
 		const collabExtension = yCollab(ytext, this.vaultSync.provider.awareness, {
 			undoManager,
 		});
+		const guardedCollabExtension = [
+			this.createYTextOriginCaptureExtension(ytext, filePath, leafId),
+			collabExtension,
+		];
 
 		try {
 			this.clearLocalCursor(`${action}-pre-reconfigure`);
 			cm.dispatch({
-				effects: this.compartment.reconfigure(collabExtension),
+				effects: this.compartment.reconfigure(guardedCollabExtension),
 			});
 		} catch (err) {
 			undoManager.destroy();
@@ -1137,6 +1325,7 @@ export class EditorBindingManager {
 			view,
 			path: filePath,
 			undoManager,
+			ytext,
 			cm,
 			cmId,
 			fileId,
@@ -1214,6 +1403,15 @@ export class EditorBindingManager {
 			}
 		}
 
+		return null;
+	}
+
+	private findBindingForState(state: EditorState): { leafId: string; binding: EditorBinding } | null {
+		for (const [leafId, binding] of this.bindings) {
+			if (binding.cm.state === state) {
+				return { leafId, binding };
+			}
+		}
 		return null;
 	}
 

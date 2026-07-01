@@ -1,5 +1,5 @@
 import * as Y from "yjs";
-import { TFile } from "obsidian";
+import { MarkdownView, TFile } from "obsidian";
 import { DiskMirror } from "../src/sync/diskMirror";
 import { ServerAckTracker } from "../src/sync/serverAckTracker";
 import { InMemoryCandidateStore, type ScopeKey, type ScopeMetadata } from "../src/sync/candidateStore";
@@ -554,6 +554,87 @@ console.log("\n--- Test 12: known-dirty remote delete revives tombstone (no loop
 	assert(ensureFileCalled, "ensureFile was called to revive");
 	assert(ensureFileArgs?.reviveTombstone === true, "reviveTombstone: true passed");
 	assert(ensureFileArgs?.content === diskContent, "disk content used for revive");
+}
+
+console.log("\n--- Test 12b: remote delete preserves unsaved open editor content ---");
+{
+	const events: CapturedTrace[] = [];
+	let ensureFileCalled = false;
+	let ensureFileArgs: { path: string; content: string; reviveTombstone: boolean } | null = null;
+	const trashedPaths: string[] = [];
+	const deletedPaths: string[] = [];
+
+	const path = "Notes/unsaved-open-editor.md";
+	const file = new TFile() as TFile & { path: string; stat: { mtime: number; size: number } };
+	file.path = path;
+	file.stat = { mtime: 1, size: 12 };
+
+	const crdtContent = "old baseline";
+	const diskContent = crdtContent;
+	const editorContent = "typed but not autosaved yet";
+	const openView = Object.assign(new MarkdownView(), {
+		file,
+		editor: { getValue: () => editorContent },
+	});
+
+	const app = {
+		vault: {
+			read: async () => diskContent,
+			getAbstractFileByPath: (p: string) => (p === path ? file : null),
+			delete: async (f: TFile & { path: string }) => { deletedPaths.push(f.path); },
+			adapter: {},
+		},
+		workspace: {
+			getActiveViewOfType: () => openView,
+			iterateAllLeaves: (cb: (leaf: { view: MarkdownView }) => void) => {
+				cb({ view: openView });
+			},
+		},
+		fileManager: {
+			trashFile: async (f: TFile & { path: string }) => { trashedPaths.push(f.path); },
+		},
+	} as any;
+	const vaultSync = {
+		provider: {},
+		meta: { observe() {}, unobserve() {} },
+		ydoc: { on() {}, off() {} },
+		getFileIdForText: () => null,
+		idToText: new Map(),
+		getTextForPath: () => ({ toString: () => crdtContent }),
+		isFileMetaDeleted: () => false,
+		ensureFile: (p: string, content: string, _device: string, opts: any) => {
+			ensureFileCalled = true;
+			ensureFileArgs = { path: p, content, reviveTombstone: opts?.reviveTombstone ?? false };
+			return {};
+		},
+	} as any;
+	const editorBindings = {
+		getLastEditorActivityForPath: () => Date.now(),
+		isBound: () => true,
+		unbindByPath: () => {},
+	} as any;
+	const mirror = new DiskMirror(
+		app, vaultSync, editorBindings, false, captureTrace(events),
+		() => true, undefined, () => "TestDevice",
+	);
+
+	await (mirror as any).handleRemoteDelete(path);
+
+	const preserved = findEvent(events, "disk", "remote-delete-conflict-preserved");
+	const revived = findEvent(events, "disk", "remote-delete-preserved-revived");
+	const deleted = findEvent(events, "disk", "remote-delete-applied");
+	assert(!!preserved, "open editor content is preserved");
+	assert(
+		preserved?.details?.reason === "local-open-editor-modified-since-last-sync",
+		"reason is open-editor-known-dirty",
+	);
+	assert(!!revived, "tombstone is revived for open editor dirty content");
+	assert(!deleted, "remote delete is not applied while open editor has unsaved content");
+	assert(trashedPaths.length === 0, "trashFile is not called for unsaved open editor");
+	assert(deletedPaths.length === 0, "vault.delete is not called for unsaved open editor");
+	assert(ensureFileCalled, "ensureFile is called to revive open editor content");
+	assert(ensureFileArgs?.reviveTombstone === true, "open editor preserve uses reviveTombstone: true");
+	assert(ensureFileArgs?.content === editorContent, "editor content is used for revive");
 }
 
 console.log("\n--- Test 13: unknown-baseline remote delete does NOT revive tombstone ---");

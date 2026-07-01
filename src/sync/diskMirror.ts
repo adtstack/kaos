@@ -22,8 +22,14 @@ export { isLocalOrigin };
  */
 export type RemoteDeleteDecision =
 	| { kind: "apply-delete" }
-	| { kind: "preserve-revive"; diskContent: string }
+	| { kind: "preserve-revive"; diskContent: string; contentSource?: "disk" | "editor" }
 	| { kind: "preserve-unresolved" };
+
+type OpenEditorAuthority =
+	| { kind: "none" }
+	| { kind: "single"; content: string }
+	| { kind: "multiple" }
+	| { kind: "read-failed" };
 
 /**
  * Handles writeback from Y.Text -> disk with:
@@ -509,112 +515,185 @@ export class DiskMirror {
 	}
 
 	private async flushWriteUnlocked(path: string, force: boolean): Promise<void> {
-		const ytext = this.vaultSync.getTextForPath(path);
-		if (!ytext) {
-			this.log(`flushWrite: no Y.Text for "${path}", skipping`);
-			return;
-		}
-		const content = ytext.toJSON();
-
-		const isOpenOrViewed = this.openPaths.has(path) || this.isOpenInWorkspace(path);
-		if (isOpenOrViewed) {
-			if (this.hasOpenEditorContentMismatch(path, content)) {
-				this.log(`flushWrite: deferring open "${path}" (open editor differs from CRDT)`);
-				if (!force) {
-					this.scheduleOpenWrite(path);
-				}
-				return;
-			}
-		}
-
-		if (!force && isOpenOrViewed) {
-			if (
-				this.isActivelyViewedPath(path)
-				&& this.hasFocusedEditorUnflushedChanges(path, content)
-			) {
-				this.log(`flushWrite: deferring open "${path}" (active editor has unflushed changes)`);
-				this.scheduleOpenWrite(path);
-				return;
-			}
-			if (this.hasRecentEditorActivity(path)) {
-				this.log(`flushWrite: deferring open "${path}" (recent editor activity)`);
-				this.scheduleOpenWrite(path);
-				return;
-			}
-		}
-
 		const normalized = normalizePath(path);
 
-		try {
-			const existing = this.app.vault.getAbstractFileByPath(normalized);
-			if (existing instanceof TFile) {
-				const currentContent = await this.app.vault.read(existing);
-				if (currentContent === content) {
-					this.log(`flushWrite: "${path}" unchanged, skipping`);
-					return;
-				}
-				if (this.shouldBlockFrontmatterWrite(path, currentContent, content)) {
-					return;
-				}
-
-				await this.suppressWrite(path, content);
-				await this.app.vault.modify(existing, content);
-				this.log(`flushWrite: updated "${path}" (${content.length} chars)`);
-				this.lastDiskWriteOkAt.set(normalized, Date.now());
-				this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content), content);
-				this._flightEventHandler?.({
-					priority: "important",
-					kind: "disk.write.ok",
-					severity: "info",
-					scope: "file",
-					source: "diskMirror",
-					layer: "disk",
-					path: normalized,
-					data: { contentLength: content.length, isCreate: false },
-				});
-			} else {
-				if (this.shouldBlockFrontmatterWrite(path, null, content)) {
-					return;
-				}
-				await this.suppressWrite(path, content);
-				const dir = normalized.substring(0, normalized.lastIndexOf("/"));
-				if (dir) {
-					const dirExists =
-						this.app.vault.getAbstractFileByPath(normalizePath(dir));
-					if (!dirExists) {
-						await this.app.vault.createFolder(dir);
-					}
-				}
-				await this.app.vault.create(normalized, content);
-				this.log(
-					`flushWrite: created "${path}" on disk (${content.length} chars)`,
-				);
-				this.lastDiskWriteOkAt.set(normalized, Date.now());
-				this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content), content);
-				this._flightEventHandler?.({
-					priority: "important",
-					kind: "disk.write.ok",
-					severity: "info",
-					scope: "file",
-					source: "diskMirror",
-					layer: "disk",
-					path: normalized,
-					data: { contentLength: content.length, isCreate: true },
-				});
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const ytext = this.vaultSync.getTextForPath(path);
+			if (!ytext) {
+				this.log(`flushWrite: no Y.Text for "${path}", skipping`);
+				return;
 			}
-		} catch (err) {
-			console.error(`[kaos] flushWrite failed for "${path}":`, err);
-			this._flightEventHandler?.({
-				priority: "critical",
-				kind: "disk.write.failed",
-				severity: "error",
-				scope: "file",
-				source: "diskMirror",
-				layer: "disk",
-				path: normalized,
-				data: { error: err instanceof Error ? err.message : String(err) },
-			});
+			const content = ytext.toJSON();
+			if (this.shouldDeferOpenWrite(path, content, force, "preflight")) {
+				return;
+			}
+
+			try {
+				const existing = this.app.vault.getAbstractFileByPath(normalized);
+				if (existing instanceof TFile) {
+					const currentContent = await this.app.vault.read(existing);
+					if (this.didCrdtChangeDuringWrite(path, content, "read")) continue;
+					if (this.shouldDeferOpenWrite(path, content, force, "post-read")) {
+						return;
+					}
+					if (currentContent === content) {
+						this.log(`flushWrite: "${path}" unchanged, skipping`);
+						return;
+					}
+					if (this.shouldBlockFrontmatterWrite(path, currentContent, content)) {
+						return;
+					}
+
+					await this.suppressWrite(path, content);
+					if (this.didCrdtChangeDuringWrite(path, content, "suppress")) {
+						this.suppressedPaths.delete(normalized);
+						continue;
+					}
+					if (this.shouldDeferOpenWrite(path, content, force, "pre-modify")) {
+						this.suppressedPaths.delete(normalized);
+						return;
+					}
+					await this.app.vault.modify(existing, content);
+					this.log(`flushWrite: updated "${path}" (${content.length} chars)`);
+					this.lastDiskWriteOkAt.set(normalized, Date.now());
+					this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content), content);
+					this._flightEventHandler?.({
+						priority: "important",
+						kind: "disk.write.ok",
+						severity: "info",
+						scope: "file",
+						source: "diskMirror",
+						layer: "disk",
+						path: normalized,
+						data: { contentLength: content.length, isCreate: false },
+					});
+				} else {
+					if (this.shouldBlockFrontmatterWrite(path, null, content)) {
+						return;
+					}
+					const dir = normalized.substring(0, normalized.lastIndexOf("/"));
+					if (dir) {
+						const dirExists =
+							this.app.vault.getAbstractFileByPath(normalizePath(dir));
+						if (!dirExists) {
+							await this.app.vault.createFolder(dir);
+						}
+					}
+					if (this.app.vault.getAbstractFileByPath(normalized) instanceof TFile) {
+						this.log(`flushWrite: "${path}" appeared during create preparation, retrying as update`);
+						continue;
+					}
+					if (this.didCrdtChangeDuringWrite(path, content, "create-folder")) continue;
+					if (this.shouldDeferOpenWrite(path, content, force, "pre-create")) {
+						return;
+					}
+					await this.suppressWrite(path, content);
+					if (this.didCrdtChangeDuringWrite(path, content, "suppress")) {
+						this.suppressedPaths.delete(normalized);
+						continue;
+					}
+					if (this.shouldDeferOpenWrite(path, content, force, "pre-create-write")) {
+						this.suppressedPaths.delete(normalized);
+						return;
+					}
+					await this.app.vault.create(normalized, content);
+					this.log(
+						`flushWrite: created "${path}" on disk (${content.length} chars)`,
+					);
+					this.lastDiskWriteOkAt.set(normalized, Date.now());
+					this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content), content);
+					this._flightEventHandler?.({
+						priority: "important",
+						kind: "disk.write.ok",
+						severity: "info",
+						scope: "file",
+						source: "diskMirror",
+						layer: "disk",
+						path: normalized,
+						data: { contentLength: content.length, isCreate: true },
+					});
+				}
+				return;
+			} catch (err) {
+				console.error(`[kaos] flushWrite failed for "${path}":`, err);
+				this._flightEventHandler?.({
+					priority: "critical",
+					kind: "disk.write.failed",
+					severity: "error",
+					scope: "file",
+					source: "diskMirror",
+					layer: "disk",
+					path: normalized,
+					data: { error: err instanceof Error ? err.message : String(err) },
+				});
+				return;
+			}
 		}
+
+		this.log(`flushWrite: deferred "${path}" (CRDT changed repeatedly during write preparation)`);
+		if (!force) {
+			this.scheduleWrite(path);
+		}
+	}
+
+	private didCrdtChangeDuringWrite(
+		path: string,
+		plannedContent: string,
+		phase: string,
+	): boolean {
+		const latest = this.vaultSync.getTextForPath(path)?.toJSON();
+		if (latest === plannedContent) return false;
+		if (latest == null) {
+			this.log(`flushWrite: no Y.Text for "${path}" after ${phase}, skipping`);
+			return true;
+		}
+		this.log(
+			`flushWrite: retrying "${path}" because CRDT changed during ${phase} ` +
+			`(${plannedContent.length} -> ${latest.length} chars)`,
+		);
+		return true;
+	}
+
+	private shouldDeferOpenWrite(
+		path: string,
+		content: string,
+		force: boolean,
+		phase: string,
+	): boolean {
+		const isOpenOrViewed = this.openPaths.has(path) || this.isOpenInWorkspace(path);
+		if (!isOpenOrViewed) return false;
+
+		if (this.hasOpenEditorContentMismatch(path, content)) {
+			this.log(
+				`flushWrite: deferring open "${path}" ` +
+				`(open editor differs from CRDT, phase=${phase})`,
+			);
+			if (!force) {
+				this.scheduleOpenWrite(path);
+			}
+			return true;
+		}
+
+		if (force) return false;
+
+		if (
+			this.isActivelyViewedPath(path)
+			&& this.hasFocusedEditorUnflushedChanges(path, content)
+		) {
+			this.log(
+				`flushWrite: deferring open "${path}" ` +
+				`(active editor has unflushed changes, phase=${phase})`,
+			);
+			this.scheduleOpenWrite(path);
+			return true;
+		}
+		if (this.hasRecentEditorActivity(path)) {
+			this.log(`flushWrite: deferring open "${path}" (recent editor activity, phase=${phase})`);
+			this.scheduleOpenWrite(path);
+			return true;
+		}
+
+		return false;
 	}
 
 	private shouldBlockFrontmatterWrite(
@@ -687,39 +766,85 @@ export class DiskMirror {
 					let unresolvedReason: PreservedUnresolvedReason | null = null;
 
 					if (lastKnownContent !== null) {
-						try {
-							const diskContent = await this.app.vault.read(file);
-							if (diskContent !== lastKnownContent) {
-								// Known baseline exists, local file differs → known dirty.
-								// Preserve and revive: local dirty work wins over remote delete.
-								decision = { kind: "preserve-revive", diskContent };
-								this.trace?.("disk", "remote-delete-conflict-preserved", {
-									path,
-									normalizedPath: normalized,
-									reason: "local-file-modified-since-last-sync",
-									diskLength: diskContent.length,
-									crdtLength: lastKnownContent.length,
-								});
-								this.log(
-									`handleRemoteDelete: preserved locally modified "${path}" ` +
-									`(disk ${diskContent.length} chars !== CRDT ${lastKnownContent.length} chars)`,
-								);
-							}
-							// else: disk matches CRDT → clean → apply-delete stays
-						} catch {
-							// Read failed — file might be locked, busy, or inaccessible.
-							// We have a baseline but cannot verify local state. Treat as
-							// unresolved to avoid deleting potentially modified data.
-							decision = { kind: "preserve-unresolved" };
-							unresolvedReason = "remote-delete-read-failed";
+						const openEditorAuthority = this.getOpenEditorAuthority(normalized);
+						if (openEditorAuthority.kind === "single" && openEditorAuthority.content !== lastKnownContent) {
+							// Known baseline exists, open editor differs → known dirty,
+							// even if Obsidian has not autosaved it to disk yet.
+							decision = {
+								kind: "preserve-revive",
+								diskContent: openEditorAuthority.content,
+								contentSource: "editor",
+							};
 							this.trace?.("disk", "remote-delete-conflict-preserved", {
 								path,
 								normalizedPath: normalized,
-								reason: "read-failed-cannot-verify",
+								reason: "local-open-editor-modified-since-last-sync",
+								editorLength: openEditorAuthority.content.length,
+								crdtLength: lastKnownContent.length,
 							});
 							this.log(
-								`handleRemoteDelete: preserved "${path}" (read failed — cannot verify local state)`,
+								`handleRemoteDelete: preserved open editor content for "${path}" ` +
+								`(editor ${openEditorAuthority.content.length} chars !== CRDT ${lastKnownContent.length} chars)`,
 							);
+						} else if (openEditorAuthority.kind === "multiple") {
+							decision = { kind: "preserve-unresolved" };
+							unresolvedReason = "remote-delete-multiple-open-editor-authorities";
+							this.trace?.("disk", "remote-delete-conflict-preserved", {
+								path,
+								normalizedPath: normalized,
+								reason: "multiple-open-editor-authorities",
+							});
+							this.log(
+								`handleRemoteDelete: preserved "${path}" ` +
+								`(multiple open editor authorities — cannot choose safely)`,
+							);
+						} else if (openEditorAuthority.kind === "read-failed") {
+							decision = { kind: "preserve-unresolved" };
+							unresolvedReason = "remote-delete-open-editor-read-failed";
+							this.trace?.("disk", "remote-delete-conflict-preserved", {
+								path,
+								normalizedPath: normalized,
+								reason: "open-editor-read-failed-cannot-verify",
+							});
+							this.log(
+								`handleRemoteDelete: preserved "${path}" ` +
+								`(open editor read failed — cannot verify local state)`,
+							);
+						} else {
+							try {
+								const diskContent = await this.app.vault.read(file);
+								if (diskContent !== lastKnownContent) {
+									// Known baseline exists, local file differs → known dirty.
+									// Preserve and revive: local dirty work wins over remote delete.
+									decision = { kind: "preserve-revive", diskContent, contentSource: "disk" };
+									this.trace?.("disk", "remote-delete-conflict-preserved", {
+										path,
+										normalizedPath: normalized,
+										reason: "local-file-modified-since-last-sync",
+										diskLength: diskContent.length,
+										crdtLength: lastKnownContent.length,
+									});
+									this.log(
+										`handleRemoteDelete: preserved locally modified "${path}" ` +
+										`(disk ${diskContent.length} chars !== CRDT ${lastKnownContent.length} chars)`,
+									);
+								}
+								// else: disk matches CRDT → clean → apply-delete stays
+							} catch {
+								// Read failed — file might be locked, busy, or inaccessible.
+								// We have a baseline but cannot verify local state. Treat as
+								// unresolved to avoid deleting potentially modified data.
+								decision = { kind: "preserve-unresolved" };
+								unresolvedReason = "remote-delete-read-failed";
+								this.trace?.("disk", "remote-delete-conflict-preserved", {
+									path,
+									normalizedPath: normalized,
+									reason: "read-failed-cannot-verify",
+								});
+								this.log(
+									`handleRemoteDelete: preserved "${path}" (read failed — cannot verify local state)`,
+								);
+							}
 						}
 					} else {
 						// No CRDT baseline available — cannot verify local file is
@@ -1258,6 +1383,12 @@ export class DiskMirror {
 
 	private getOpenMarkdownViewsForPath(path: string): MarkdownView[] {
 		const views: MarkdownView[] = [];
+		const activeView = (this.app.workspace as {
+			getActiveViewOfType?: <T>(type: abstract new (...args: never[]) => T) => T | null;
+		}).getActiveViewOfType?.(MarkdownView) ?? null;
+		if (activeView?.file?.path === path) {
+			views.push(activeView);
+		}
 		const workspace = this.app.workspace as {
 			iterateAllLeaves?: (callback: (leaf: { view?: unknown }) => void) => void;
 		};
@@ -1265,6 +1396,7 @@ export class DiskMirror {
 			if (
 				leaf.view instanceof MarkdownView
 				&& leaf.view.file?.path === path
+				&& !views.includes(leaf.view)
 			) {
 				views.push(leaf.view);
 			}
@@ -1289,6 +1421,25 @@ export class DiskMirror {
 			}
 		}
 		return false;
+	}
+
+	private getOpenEditorAuthority(path: string): OpenEditorAuthority {
+		const views = this.getOpenMarkdownViewsForPath(path);
+		if (views.length === 0) return { kind: "none" };
+
+		const contents: string[] = [];
+		for (const view of views) {
+			try {
+				contents.push(view.editor.getValue());
+			} catch {
+				return { kind: "read-failed" };
+			}
+		}
+
+		const distinct = [...new Set(contents)];
+		if (distinct.length === 0) return { kind: "none" };
+		if (distinct.length > 1) return { kind: "multiple" };
+		return { kind: "single", content: distinct[0]! };
 	}
 
 	private isActivelyViewedPath(path: string): boolean {

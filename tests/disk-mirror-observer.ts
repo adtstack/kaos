@@ -39,6 +39,7 @@ import {
 	ORIGIN_DISK_SYNC,
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
 	ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
+	ORIGIN_EDITOR_AUTHORITY_SHIELD,
 	ORIGIN_EDITOR_HEALTH_HEAL,
 	ORIGIN_RESTORE,
 	ORIGIN_SEED,
@@ -63,8 +64,9 @@ const FILE_PATH = "notes/test.md";
 const FILE_ID = "file-001";
 
 function makeHarness(options: {
-	openEditorContent?: string;
+	openEditorContent?: string | (() => string);
 	initialDiskContent?: string;
+	onRead?: () => void | Promise<void>;
 } = {}) {
 	const doc = new Y.Doc();
 	const meta = doc.getMap<{ path: string; deleted?: boolean }>("meta");
@@ -100,7 +102,12 @@ function makeHarness(options: {
 		? null
 		: Object.assign(new MarkdownView(), {
 			file: { path: FILE_PATH },
-			editor: { getValue: () => options.openEditorContent },
+			editor: {
+				getValue: () => {
+					const value = options.openEditorContent;
+					return typeof value === "function" ? value() : value ?? "";
+				},
+			},
 		});
 	const existingFile = Object.assign(new TFile(), {
 		path: FILE_PATH,
@@ -115,7 +122,11 @@ function makeHarness(options: {
 		},
 		vault: {
 			getAbstractFileByPath: (path: string) => diskFiles.has(path) ? existingFile : null,
-			read: async (file: { path: string }) => diskFiles.get(file.path) ?? "",
+			read: async (file: { path: string }) => {
+				const content = diskFiles.get(file.path) ?? "";
+				await options.onRead?.();
+				return content;
+			},
 			modify: async (file: { path: string }, content: string) => {
 				diskFiles.set(file.path, content);
 			},
@@ -167,6 +178,7 @@ console.log("\n--- Test 1: afterTransaction — recovery origins do not schedule
 		ORIGIN_DISK_SYNC_RECOVER_BOUND,
 		ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
 		ORIGIN_EDITOR_HEALTH_HEAL,
+		ORIGIN_EDITOR_AUTHORITY_SHIELD,
 		ORIGIN_RESTORE,
 		ORIGIN_SEED,
 	];
@@ -310,6 +322,62 @@ console.log("\n--- Test 7: forced open flush does not overwrite disk when editor
 	assert(
 		diskFiles.get(FILE_PATH) === "LOCAL_ON_EDITOR\n",
 		"force flush preserves disk when an open editor carries different content",
+	);
+
+	doc.destroy();
+}
+
+// ── Test 8: async read race — open editor changes after preflight ────────────
+
+console.log("\n--- Test 8: forced open flush rechecks editor after async read ---");
+{
+	let editorContent = "REMOTE_FROM_CRDT\n";
+	let readCount = 0;
+	const { ytext, mirror, diskFiles, doc } = makeHarness({
+		openEditorContent: () => editorContent,
+		initialDiskContent: "DISK_BEFORE\n",
+		onRead: () => {
+			readCount++;
+			if (readCount === 1) {
+				editorContent = "USER_TYPED_DURING_READ\n";
+			}
+		},
+	});
+	ytext.insert(0, "REMOTE_FROM_CRDT\n");
+
+	await mirror.flushWrite(FILE_PATH, true);
+
+	assert(
+		diskFiles.get(FILE_PATH) === "DISK_BEFORE\n",
+		"force flush does not write stale CRDT content when the editor changes during read",
+	);
+
+	doc.destroy();
+}
+
+// ── Test 9: async read race — CRDT changes after the write snapshot ──────────
+
+console.log("\n--- Test 9: flush retries when CRDT changes during async read ---");
+{
+	let readCount = 0;
+	const { ytext, mirror, diskFiles, doc } = makeHarness({
+		initialDiskContent: "DISK_BEFORE\n",
+		onRead: () => {
+			readCount++;
+			if (readCount === 1) {
+				ytext.delete(0, ytext.length);
+				ytext.insert(0, "NEW_CRDT\n");
+			}
+		},
+	});
+	ytext.insert(0, "OLD_CRDT\n");
+
+	await mirror.flushWrite(FILE_PATH, true);
+
+	assert(readCount >= 2, "flush retries after detecting a stale CRDT snapshot");
+	assert(
+		diskFiles.get(FILE_PATH) === "NEW_CRDT\n",
+		"flush writes the latest CRDT content instead of the stale snapshot",
 	);
 
 	doc.destroy();

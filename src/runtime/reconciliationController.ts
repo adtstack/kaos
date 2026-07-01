@@ -99,6 +99,7 @@ interface MarkdownDirtyEntry {
 	primaryOpId?: string;
 	coalescedOpIds: string[];
 	retryCount: number;
+	notBeforeMs?: number;
 }
 
 export type StableMarkdownReadResult =
@@ -111,6 +112,12 @@ interface ActiveMarkdownIngest {
 	entry: MarkdownDirtyEntry;
 	redirectedTo: string | null;
 }
+
+type OpenEditorAuthority =
+	| { kind: "none" }
+	| { kind: "single"; content: string }
+	| { kind: "multiple" }
+	| { kind: "read-failed" };
 
 interface ReconciliationControllerDeps {
 	app: App;
@@ -1431,7 +1438,28 @@ export class ReconciliationController {
 			primaryOpId: previous.primaryOpId ?? incoming.primaryOpId,
 			coalescedOpIds,
 			retryCount: Math.min(previous.retryCount, incoming.retryCount),
+			notBeforeMs: mergedReason === "create"
+				? undefined
+				: Math.max(previous.notBeforeMs ?? 0, incoming.notBeforeMs ?? 0) || undefined,
 		});
+	}
+
+	private getRecentEditorDirtyDeferUntil(
+		path: string,
+		reason: MarkdownDirtyReason,
+		now = Date.now(),
+	): number | null {
+		if (reason !== "modify") return null;
+		const editorBindings = this.deps.getEditorBindings();
+		const lastEditorActivity = editorBindings?.getLastEditorActivityForPath(path) ?? null;
+		if (lastEditorActivity === null) return null;
+
+		const isOpenOrBound =
+			(editorBindings?.isBound(path) ?? false) || this.getOpenMarkdownViewsForPath(path).length > 0;
+		if (!isOpenOrBound) return null;
+
+		const deferUntil = lastEditorActivity + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS;
+		return deferUntil > now ? deferUntil : null;
 	}
 
 	private queueDirtyMarkdownPath(
@@ -1441,13 +1469,16 @@ export class ReconciliationController {
 		coalescedOpIds: string[] = opId ? [opId] : [],
 		retryCount = 0,
 	): void {
+		const now = Date.now();
+		const notBeforeMs = this.getRecentEditorDirtyDeferUntil(path, reason, now) ?? undefined;
 		this.mergeDirtyMarkdownPath(path, {
 			reason,
 			primaryOpId: opId,
 			coalescedOpIds: Array.from(new Set(coalescedOpIds)),
 			retryCount,
+			notBeforeMs,
 		});
-		this.lastMarkdownDirtyAt = Date.now();
+		this.lastMarkdownDirtyAt = now;
 		this.scheduleMarkdownDrain();
 	}
 
@@ -1655,17 +1686,34 @@ export class ReconciliationController {
 		if (this.markdownDrainTimer) {
 			clearTimeout(this.markdownDrainTimer);
 		}
-		const elapsed = Date.now() - this.lastMarkdownDirtyAt;
-		const delay = Math.max(0, MARKDOWN_DIRTY_SETTLE_MS - elapsed);
+		const delay = this.getNextMarkdownDrainDelayMs();
 		this.markdownDrainTimer = setTimeout(() => {
 			this.markdownDrainTimer = null;
-			const sinceLastDirty = Date.now() - this.lastMarkdownDirtyAt;
-			if (sinceLastDirty < MARKDOWN_DIRTY_SETTLE_MS) {
+			const nextDelay = this.getNextMarkdownDrainDelayMs();
+			if (nextDelay > 0) {
 				this.scheduleMarkdownDrain();
 				return;
 			}
 			this.kickMarkdownDrain();
 		}, delay);
+	}
+
+	private getNextMarkdownDrainDelayMs(now = Date.now()): number {
+		const elapsed = now - this.lastMarkdownDirtyAt;
+		const settleDelay = Math.max(0, MARKDOWN_DIRTY_SETTLE_MS - elapsed);
+		if (settleDelay > 0) return settleDelay;
+
+		let earliestDeferred: number | null = null;
+		let hasReadyEntry = false;
+		for (const entry of this.dirtyMarkdownPaths.values()) {
+			if (entry.notBeforeMs !== undefined && entry.notBeforeMs > now) {
+				earliestDeferred = Math.min(earliestDeferred ?? entry.notBeforeMs, entry.notBeforeMs);
+			} else {
+				hasReadyEntry = true;
+			}
+		}
+		if (hasReadyEntry || earliestDeferred === null) return 0;
+		return Math.max(0, earliestDeferred - now);
 	}
 
 	private kickMarkdownDrain(): void {
@@ -1684,8 +1732,20 @@ export class ReconciliationController {
 
 	private async drainDirtyMarkdownPaths(): Promise<void> {
 		if (this.dirtyMarkdownPaths.size === 0) return;
-		const batch = Array.from(this.dirtyMarkdownPaths.entries());
-		this.dirtyMarkdownPaths.clear();
+		const now = Date.now();
+		const batch: Array<[string, MarkdownDirtyEntry]> = [];
+		for (const [path, entry] of this.dirtyMarkdownPaths.entries()) {
+			const latestDeferUntil = this.getRecentEditorDirtyDeferUntil(path, entry.reason, now);
+			if (latestDeferUntil !== null) {
+				entry.notBeforeMs = Math.max(entry.notBeforeMs ?? 0, latestDeferUntil);
+			}
+			if (entry.notBeforeMs !== undefined && entry.notBeforeMs > now) continue;
+			batch.push([path, entry]);
+		}
+		if (batch.length === 0) return;
+		for (const [path] of batch) {
+			this.dirtyMarkdownPaths.delete(path);
+		}
 
 		for (const [path, entry] of batch) {
 			await this.processDirtyMarkdownPath(path, entry);
@@ -1815,6 +1875,34 @@ export class ReconciliationController {
 				return;
 			}
 			const existingText = vaultSync.getTextForPath(path);
+			const existingCrdtContent = existingText ? existingText.toJSON() : null;
+
+			const openEditorMismatchDeferUntil = this.getOpenEditorDiskMismatchDeferUntil({
+				sourceReason,
+				cameFromDirtyQueue: typeof entryOrReason !== "string",
+				diskContent: content,
+				crdtContent: existingCrdtContent,
+				openViews,
+			});
+			if (openEditorMismatchDeferUntil !== null) {
+				this.deps.log(
+					`syncFileFromDisk: deferring "${path}" ` +
+					"(open editor is ahead of disk and CRDT; waiting for autosave/binding to settle)",
+				);
+				this.deps.trace("reconcile", "open-editor-disk-mismatch-deferred", {
+					path,
+					reason: sourceReason,
+					notBeforeMs: openEditorMismatchDeferUntil,
+					diskLength: content.length,
+					crdtLength: existingCrdtContent?.length ?? null,
+					openViewCount: openViews.length,
+				});
+				this.mergeDirtyEntryIntoPath(path, {
+					...entry,
+					notBeforeMs: Math.max(entry.notBeforeMs ?? 0, openEditorMismatchDeferUntil),
+				});
+				return;
+			}
 
 			if (wasBound && isOpenInEditor) {
 				const handledBound = await this.handleBoundFileSyncGap(
@@ -1917,15 +2005,69 @@ export class ReconciliationController {
 
 	private getOpenMarkdownViewsForPath(path: string): MarkdownView[] {
 		const views: MarkdownView[] = [];
-		this.deps.app.workspace.iterateAllLeaves((leaf) => {
+		const activeView = (this.deps.app.workspace as {
+			getActiveViewOfType?: <T>(type: abstract new (...args: never[]) => T) => T | null;
+		}).getActiveViewOfType?.(MarkdownView) ?? null;
+		if (activeView?.file?.path === path) {
+			views.push(activeView);
+		}
+
+		const workspace = this.deps.app.workspace as {
+			iterateAllLeaves?: (callback: (leaf: { view?: unknown }) => void) => void;
+		};
+		workspace.iterateAllLeaves?.((leaf) => {
 			if (
 				leaf.view instanceof MarkdownView
 				&& leaf.view.file?.path === path
+				&& !views.includes(leaf.view)
 			) {
 				views.push(leaf.view);
 			}
 		});
 		return views;
+	}
+
+	private getOpenEditorAuthority(openViews: MarkdownView[]): OpenEditorAuthority {
+		if (openViews.length === 0) return { kind: "none" };
+
+		const contents: string[] = [];
+		for (const view of openViews) {
+			try {
+				contents.push(view.editor.getValue());
+			} catch {
+				return { kind: "read-failed" };
+			}
+		}
+
+		const distinct = [...new Set(contents)];
+		if (distinct.length === 0) return { kind: "none" };
+		if (distinct.length > 1) return { kind: "multiple" };
+		return { kind: "single", content: distinct[0]! };
+	}
+
+	private getOpenEditorDiskMismatchDeferUntil(input: {
+		sourceReason: MarkdownDirtyReason;
+		cameFromDirtyQueue: boolean;
+		diskContent: string;
+		crdtContent: string | null;
+		openViews: MarkdownView[];
+		now?: number;
+	}): number | null {
+		if (input.sourceReason !== "modify") return null;
+		if (!input.cameFromDirtyQueue) return null;
+		if (input.openViews.length === 0) return null;
+
+		const authority = this.getOpenEditorAuthority(input.openViews);
+		if (authority.kind === "none") return null;
+
+		const now = input.now ?? Date.now();
+		if (authority.kind === "multiple" || authority.kind === "read-failed") {
+			return now + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS;
+		}
+
+		if (authority.content === input.diskContent) return null;
+		if (input.crdtContent !== null && authority.content === input.crdtContent) return null;
+		return now + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS;
 	}
 
 	private async handleOpenFileReconcileDivergence(

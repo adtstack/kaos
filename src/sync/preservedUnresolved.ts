@@ -5,6 +5,8 @@ export type PreservedUnresolvedKind = "markdown" | "blob";
 export type PreservedUnresolvedReason =
 	| "remote-delete-missing-baseline"
 	| "remote-delete-read-failed"
+	| "remote-delete-open-editor-read-failed"
+	| "remote-delete-multiple-open-editor-authorities"
 	| "remote-delete-hash-read-failed"
 	| "remote-delete-stat-failed"
 	| "conflict-artifact-write-failed"

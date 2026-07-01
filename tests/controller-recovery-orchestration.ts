@@ -258,6 +258,8 @@ function buildFixture(initial: {
 		}) as never,
 		getVaultSync: () => vaultSync as never,
 		getDiskMirror: () => ({
+			shouldSuppressCreate: async () => false,
+			shouldSuppressModify: async () => false,
 			isPreservedUnresolved: () => false,
 			clearPreservedUnresolved: () => {},
 			flushWrite: async () => {},
@@ -488,10 +490,15 @@ async function drainQueuedMarkdown(controller: ReconciliationController): Promis
 
 console.log("\n--- Test 0: flight taxonomy bumped and new kinds present ---");
 {
-	assertEq(FLIGHT_TAXONOMY_VERSION, 10, "FLIGHT_TAXONOMY_VERSION === 10");
+	assertEq(FLIGHT_TAXONOMY_VERSION, 11, "FLIGHT_TAXONOMY_VERSION === 11");
 	assertEq(FLIGHT_KIND.recoverySkipped, "recovery.skipped", "FLIGHT_KIND.recoverySkipped");
 	assertEq(FLIGHT_KIND.editorRepairApplied, "editor.repair.applied", "FLIGHT_KIND.editorRepairApplied");
 	assertEq(FLIGHT_KIND.editorHealApplied, "editor.heal.applied", "FLIGHT_KIND.editorHealApplied");
+	assertEq(
+		FLIGHT_KIND.editorAuthorityShieldApplied,
+		"editor.authority_shield.applied",
+		"FLIGHT_KIND.editorAuthorityShieldApplied",
+	);
 }
 
 // -------------------------------------------------------------------
@@ -713,6 +720,168 @@ console.log("\n--- Test 5: crdtOnly idle-grace bail emits recovery.skipped ---")
 
 	const healOnIdleBail = fix.captured.filter((e) => typeof e.kind === "string" && e.kind.startsWith("editor.heal."));
 	assertEq(healOnIdleBail.length, 0, "no editor.heal.* events on idle-grace bail");
+}
+
+// -------------------------------------------------------------------
+// Test 5a — autosave modify ingest waits while the user is typing
+// -------------------------------------------------------------------
+
+console.log("\n--- Test 5a: autosave modify ingest waits while user is typing ---");
+{
+	const fix = buildFixture({
+		path: "Notes/typing-autosave.md",
+		// editor==disk≠CRDT (the Obsidian autosave typing shape)
+		disk: "typed text",
+		editor: "typed text",
+		crdt: "base",
+	});
+	const internals = fix.controller as never as {
+		deps: { getEditorBindings(): { getLastEditorActivityForPath: (p: string) => number | null } };
+		dirtyMarkdownPaths: Map<string, { reason: MarkdownDirtyReason; notBeforeMs?: number }>;
+		getNextMarkdownDrainDelayMs(now?: number): number;
+	};
+	const eb = internals.deps.getEditorBindings();
+	const original = eb.getLastEditorActivityForPath.bind(eb);
+	let lastEditorActivity = Date.now() - 100;
+	eb.getLastEditorActivityForPath = () => lastEditorActivity;
+
+	try {
+		fix.controller.markMarkdownDirty(fix.file, "modify", "op-typing-autosave");
+		clearMarkdownDrainTimer(fix.controller);
+
+		const queued = internals.dirtyMarkdownPaths.get(fix.path);
+		assert(queued !== undefined, "modify dirty entry is queued");
+		assert(
+			queued?.notBeforeMs !== undefined && queued.notBeforeMs > Date.now(),
+			"recent typing assigns a future notBeforeMs",
+		);
+		assert(
+			internals.getNextMarkdownDrainDelayMs(Date.now() + 500) > 1000,
+			"only-deferred dirty queue sleeps until the editor idle window",
+		);
+
+		await drainQueuedMarkdown(fix.controller);
+		assert(internals.dirtyMarkdownPaths.has(fix.path), "deferred modify remains queued before idle");
+		assertEq(fix.ytext.toString(), "base", "deferred autosave modify does not touch CRDT while typing");
+
+		lastEditorActivity = Date.now();
+		const staleQueued = internals.dirtyMarkdownPaths.get(fix.path);
+		if (staleQueued) staleQueued.notBeforeMs = Date.now() - 1;
+		await drainQueuedMarkdown(fix.controller);
+		const refreshed = internals.dirtyMarkdownPaths.get(fix.path);
+		assert(
+			refreshed?.notBeforeMs !== undefined && refreshed.notBeforeMs > Date.now(),
+			"drain refreshes deferral when the user typed again after queueing",
+		);
+		assertEq(fix.ytext.toString(), "base", "refreshed deferral still does not touch CRDT");
+	} finally {
+		eb.getLastEditorActivityForPath = original;
+		clearMarkdownDrainTimer(fix.controller);
+	}
+}
+
+// -------------------------------------------------------------------
+// Test 5b — stale autosave lag does not create an ambiguous conflict
+// -------------------------------------------------------------------
+
+console.log("\n--- Test 5b: stale autosave lag waits instead of creating conflict ---");
+{
+	const fix = buildFixture({
+		path: "Notes/stale-autosave-lag.md",
+		// editor differs from both disk and CRDT: a transient autosave-lag
+		// shape while the user has continued typing after an earlier save.
+		disk: "typed partial",
+		editor: "typed partial plus more",
+		crdt: "base",
+	});
+	const internals = fix.controller as never as {
+		dirtyMarkdownPaths: Map<string, { reason: MarkdownDirtyReason; notBeforeMs?: number }>;
+	};
+
+	fix.controller.markMarkdownDirty(fix.file, "modify", "op-stale-autosave");
+	clearMarkdownDrainTimer(fix.controller);
+	await drainQueuedMarkdown(fix.controller);
+
+	const queued = internals.dirtyMarkdownPaths.get(fix.path);
+	assert(queued !== undefined, "stale autosave modify remains queued");
+	assert(
+		queued?.notBeforeMs !== undefined && queued.notBeforeMs > Date.now(),
+		"stale autosave modify is deferred into the future",
+	);
+	assertEq(fix.ytext.toString(), "base", "stale autosave lag does not mutate CRDT");
+	assertEq(
+		fix.captured.filter((e) => e.kind === FLIGHT_KIND.recoveryDecision).length,
+		0,
+		"stale autosave lag emits no recovery.decision",
+	);
+	assertEq(
+		fix.captured.filter((e) => e.kind === FLIGHT_KIND.recoveryApplyStart).length,
+		0,
+		"stale autosave lag emits no recovery.apply.start",
+	);
+	clearMarkdownDrainTimer(fix.controller);
+}
+
+// -------------------------------------------------------------------
+// Test 5c — queued external disk edits still import when editor matches CRDT
+// -------------------------------------------------------------------
+
+console.log("\n--- Test 5c: queued crdtOnly external edit still imports ---");
+{
+	const fix = buildFixture({
+		path: "Notes/queued-external-edit.md",
+		// editor==CRDT!=disk: this is still the external-disk-edit candidate
+		// and must not be blocked by the stale-autosave ambiguity guard.
+		disk: "external disk edit",
+		editor: "base",
+		crdt: "base",
+	});
+
+	fix.controller.markMarkdownDirty(fix.file, "modify", "op-external-edit");
+	clearMarkdownDrainTimer(fix.controller);
+	await drainQueuedMarkdown(fix.controller);
+
+	assertEq(fix.ytext.toString(), "external disk edit", "queued crdtOnly edit imports disk into CRDT");
+	const decision = fix.captured.find((e) => e.kind === FLIGHT_KIND.recoveryDecision);
+	assertEq(
+		decision?.data.reason,
+		"bound-file-open-idle-disk-recovery",
+		"queued crdtOnly edit keeps the open-idle recovery path",
+	);
+}
+
+// -------------------------------------------------------------------
+// Test 5d — create entries do not inherit autosave modify deferral
+// -------------------------------------------------------------------
+
+console.log("\n--- Test 5d: create dirty entries bypass typing deferral ---");
+{
+	const fix = buildFixture({
+		path: "Notes/create-after-autosave.md",
+		disk: "created",
+		editor: "created",
+		crdt: "base",
+	});
+	const internals = fix.controller as never as {
+		deps: { getEditorBindings(): { getLastEditorActivityForPath: (p: string) => number | null } };
+		dirtyMarkdownPaths: Map<string, { reason: MarkdownDirtyReason; notBeforeMs?: number }>;
+	};
+	const eb = internals.deps.getEditorBindings();
+	const original = eb.getLastEditorActivityForPath.bind(eb);
+	eb.getLastEditorActivityForPath = () => Date.now() - 100;
+
+	try {
+		fix.controller.markMarkdownDirty(fix.file, "modify", "op-typing-before-create");
+		fix.controller.markMarkdownDirty(fix.file, "create", "op-create");
+		clearMarkdownDrainTimer(fix.controller);
+
+		const queued = internals.dirtyMarkdownPaths.get(fix.path);
+		assertEq(queued?.reason, "create", "create priority wins over pending modify");
+		assertEq(queued?.notBeforeMs, undefined, "create entry is not delayed by recent typing");
+	} finally {
+		eb.getLastEditorActivityForPath = original;
+		clearMarkdownDrainTimer(fix.controller);
+	}
 }
 
 // -------------------------------------------------------------------

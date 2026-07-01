@@ -96,7 +96,8 @@
  *   trace covers the preserved-unresolved skip (Scenario D). The existing
  *   eight `reconcile.file.decision` discriminators plus the legacy trace
  *   plus `recovery.skipped` cover every branch this spec asserts on. No new
- *   `FlightKind` is required; `FLIGHT_TAXONOMY_VERSION` stays at 9.
+ *   `FlightKind` was required for this spec; later specs may bump
+ *   `FLIGHT_TAXONOMY_VERSION`.
  *
  * ============================================================================
  * Scenario F — callback failure semantics (reviewer follow-up)
@@ -413,14 +414,13 @@ function buildFixture(opts: {
 
 console.log("\n--- Taxonomy: FLIGHT_TAXONOMY_VERSION ---");
 {
-	// Bumped to 10 by the editor-bound localOnly amplifier guard spec
-	// (recovery.amplification.quarantined). This spec does not bump.
-	assertEq(
-		FLIGHT_TAXONOMY_VERSION,
-		10,
-		"FLIGHT_TAXONOMY_VERSION === 10 (no bump for this spec)",
-	);
-}
+		// Bumped to 11 by later editor safety specs. This spec does not bump.
+		assertEq(
+			FLIGHT_TAXONOMY_VERSION,
+			11,
+			"FLIGHT_TAXONOMY_VERSION === 11 (no bump for this spec)",
+		);
+	}
 
 // -------------------------------------------------------------------
 // Scenario A — fresh admission via the authoritative-mode lane

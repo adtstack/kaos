@@ -533,6 +533,7 @@ console.log("\n--- Test 14: FLIGHT_KIND taxonomy constants ---");
 	assert(FLIGHT_KIND.reconcileComplete === "reconcile.complete", "reconcile complete");
 	assert(FLIGHT_KIND.reconcileFileDecision === "reconcile.file.decision", "reconcile file decision (new)");
 	assert(FLIGHT_KIND.reconcileSafetyBrakeTriggered === "reconcile.safety_brake.triggered", "safety brake");
+	assert(FLIGHT_KIND.editorAuthorityShieldApplied === "editor.authority_shield.applied", "editor authority shield");
 	assert(FLIGHT_KIND.serverReceiptConfirmed === "server.receipt.confirmed", "receipt confirmed");
 	assert(FLIGHT_KIND.serverReceiptCandidateCaptured === "server.receipt.candidate_captured", "receipt candidate");
 	assert(FLIGHT_KIND.qaCheckpoint === "qa.checkpoint", "qa checkpoint");

@@ -26,6 +26,33 @@ export function recoverySnapshotMaybeTraceEventName(status: RecoverySnapshotResu
 	return "recovery-snapshot-unavailable";
 }
 
+function formatFailure(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
+function unavailableRecoverySnapshot(reason: string): RecoverySnapshotResult {
+	return {
+		status: "unavailable",
+		reason,
+	};
+}
+
+export function recoverySnapshotFailureReason(status: number, text: string): string {
+	const trimmed = text.trim();
+	if (!trimmed) return `File history point failed on the sync room (${status}).`;
+	try {
+		const parsed = JSON.parse(trimmed) as { message?: unknown; error?: unknown };
+		const message = typeof parsed.message === "string" ? parsed.message : undefined;
+		const error = typeof parsed.error === "string" ? parsed.error : undefined;
+		if (message && error) return `File history point failed on the sync room (${status}): ${message}`;
+		if (message) return `File history point failed on the sync room (${status}): ${message}`;
+		if (error) return `File history point failed on the sync room (${status}): ${error}`;
+	} catch {
+		// Fall through to the raw text below.
+	}
+	return `File history point failed on the sync room (${status}): ${trimmed}`;
+}
+
 function unavailableRecoveryStorageReport(): RecoveryStorageAuditReport {
 	return {
 		status: "unavailable",
@@ -64,25 +91,47 @@ export async function handleRecoverySnapshotRoute(
 			body = {};
 		}
 
-		const stub = await getServerByName(env.KAOS_SYNC, vaultId);
-		const res = await stub.fetch("https://internal/__kaos/recovery-snapshot-maybe", {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-			},
-			body: JSON.stringify(body),
-		});
+		let res: Response;
+		try {
+			const stub = await getServerByName(env.KAOS_SYNC, vaultId);
+			res = await stub.fetch("https://internal/__kaos/recovery-snapshot-maybe", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify(body),
+			});
+		} catch (err) {
+			const reason = `File history point could not reach the sync room: ${formatFailure(err)}`;
+			const result = unavailableRecoverySnapshot(reason);
+			await options.recordVaultTrace(env, vaultId, recoverySnapshotMaybeTraceEventName(result.status), {
+				status: result.status,
+				triggeredBy: body.device,
+				forceFull: body.forceFull === true,
+				reason,
+			});
+			return json(result);
+		}
+
 		const text = await res.text();
 		if (!res.ok) {
-			return new Response(text || JSON.stringify({ error: "recovery_snapshot_failed" }), {
-				status: res.status,
-				headers: {
-					"Content-Type": res.headers.get("Content-Type") ?? "application/json; charset=utf-8",
-					"Cache-Control": "no-store",
-				},
+			const reason = recoverySnapshotFailureReason(res.status, text);
+			const result = unavailableRecoverySnapshot(reason);
+			await options.recordVaultTrace(env, vaultId, recoverySnapshotMaybeTraceEventName(result.status), {
+				status: result.status,
+				triggeredBy: body.device,
+				forceFull: body.forceFull === true,
+				reason,
 			});
+			return json(result);
 		}
-		const result: RecoverySnapshotResult = JSON.parse(text) as RecoverySnapshotResult;
+		let result: RecoverySnapshotResult;
+		try {
+			result = JSON.parse(text) as RecoverySnapshotResult;
+		} catch (err) {
+			const reason = `File history point returned an invalid response: ${formatFailure(err)}`;
+			result = unavailableRecoverySnapshot(reason);
+		}
 		await options.recordVaultTrace(env, vaultId, recoverySnapshotMaybeTraceEventName(result.status), {
 			status: result.status,
 			manifestId: result.manifestId,

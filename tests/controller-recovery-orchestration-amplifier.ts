@@ -286,16 +286,21 @@ function buildFixture(initial: {
 }
 
 // -------------------------------------------------------------------
-// Test 0 — taxonomy bumped, new flight kind present
+// Test 0 — taxonomy bumped, new flight kinds present
 // -------------------------------------------------------------------
 
-console.log("\n--- Test 0: taxonomy bumped to 10, recovery.amplification.quarantined defined ---");
+console.log("\n--- Test 0: taxonomy bumped to 11, recovery/editor guard kinds defined ---");
 {
-	assertEq(FLIGHT_TAXONOMY_VERSION, 10, "FLIGHT_TAXONOMY_VERSION === 10");
+	assertEq(FLIGHT_TAXONOMY_VERSION, 11, "FLIGHT_TAXONOMY_VERSION === 11");
 	assertEq(
 		FLIGHT_KIND.recoveryAmplificationQuarantined,
 		"recovery.amplification.quarantined",
 		"FLIGHT_KIND.recoveryAmplificationQuarantined",
+	);
+	assertEq(
+		FLIGHT_KIND.editorAuthorityShieldApplied,
+		"editor.authority_shield.applied",
+		"FLIGHT_KIND.editorAuthorityShieldApplied",
 	);
 }
 
@@ -334,7 +339,8 @@ console.log("\n--- Scenario 1: localOnly idle guard defers when editor typed rec
 		e.kind === FLIGHT_KIND.recoveryAmplificationQuarantined ||
 		e.kind === FLIGHT_KIND.recoveryQuarantined ||
 		e.kind === FLIGHT_KIND.editorRepairApplied ||
-		e.kind === FLIGHT_KIND.editorHealApplied
+		e.kind === FLIGHT_KIND.editorHealApplied ||
+		e.kind === FLIGHT_KIND.editorAuthorityShieldApplied
 	);
 	assertEq(forbidden.length, 0, "no recovery.* / editor.* events fire on idle-guarded skip");
 

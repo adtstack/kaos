@@ -621,7 +621,7 @@ export class SnapshotService {
 	private logTransientSnapshotNetworkError(err: unknown, actionLabel: string): boolean {
 		if (!isTransientSnapshotNetworkError(err)) return false;
 		const message = `${actionLabel} skipped: network unavailable or connection closed.`;
-			console.debug(`[kaos] ${message}`);
+		console.debug(`[kaos] ${message}`);
 		this.deps.log(`${message} ${formatUnknown(err)}`);
 		return true;
 	}
@@ -743,6 +743,12 @@ function isTransientSnapshotNetworkError(err: unknown): boolean {
 		lower.includes("err_connection_closed") ||
 		lower.includes("err_network_changed") ||
 		lower.includes("err_connection_reset") ||
+		lower.includes("(502)") ||
+		lower.includes("(504)") ||
+		lower.includes("error code: 502") ||
+		lower.includes("error code: 504") ||
+		lower.includes("bad gateway") ||
+		lower.includes("gateway timeout") ||
 		lower.includes("networkerror") ||
 		lower.includes("failed to fetch");
 }

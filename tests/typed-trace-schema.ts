@@ -158,13 +158,12 @@ console.log("\n--- Test 3: source-grep static guard for recovery.skipped frontma
 		`recordFrontmatterIngestBlocked invoked exactly six times in controller (got ${helperInvocations.length})`,
 	);
 
-	// FLIGHT_TAXONOMY_VERSION is at 10 (bumped by editor-bound localOnly
-	// amplifier guard for recovery.amplification.quarantined).
-	assert(
-		flight.includes("export const FLIGHT_TAXONOMY_VERSION = 10"),
-		"FLIGHT_TAXONOMY_VERSION at 10",
-	);
-}
+		// FLIGHT_TAXONOMY_VERSION is at 11 (bumped by editor authority shield).
+		assert(
+			flight.includes("export const FLIGHT_TAXONOMY_VERSION = 11"),
+			"FLIGHT_TAXONOMY_VERSION at 11",
+		);
+	}
 
 console.log("\n──────────────────────────────────────────────────");
 console.log(`Results: ${passed} passed, ${failed} failed`);

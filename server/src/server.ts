@@ -255,7 +255,6 @@ export class VaultSyncServer extends YServer {
 		}
 
 		if (request.method === "POST" && url.pathname === "/__kaos/recovery-snapshot-maybe") {
-			await this.ensureDocumentLoaded();
 			let body: { device?: string; forceFull?: boolean } = {};
 			try {
 				body = await request.json();
@@ -263,18 +262,23 @@ export class VaultSyncServer extends YServer {
 				body = {};
 			}
 			try {
+				await this.ensureDocumentLoaded();
 				return json(await this.createRecoverySnapshotMaybe(body.device, body.forceFull === true));
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
-				await this.recordTrace("recovery-snapshot-failed", {
-					error: message,
-					forceFull: body.forceFull === true,
-					triggeredBy: body.device,
-				});
+				try {
+					await this.recordTrace("recovery-snapshot-failed", {
+						error: message,
+						forceFull: body.forceFull === true,
+						triggeredBy: body.device,
+					});
+				} catch (traceErr) {
+					console.warn(`${LOG_PREFIX} recovery snapshot failure trace failed:`, traceErr);
+				}
 				return json({
-					error: "recovery_snapshot_failed",
-					message,
-				}, 500);
+					status: "unavailable",
+					reason: `File history point failed on the sync room: ${message}`,
+				} satisfies RecoverySnapshotResult);
 			}
 		}
 

@@ -1,9 +1,13 @@
+import { readFileSync } from "node:fs";
 import { runSerialized, runSingleFlight } from "../server/src/asyncConcurrency";
 import { MAX_BLOB_UPLOAD_BYTES } from "../server/src/contracts";
 import worker from "../server/src/index";
 import { getCapabilities } from "../server/src/routes/auth";
 import { handleBlobRoute } from "../server/src/routes/blobs";
-import { recoverySnapshotMaybeTraceEventName } from "../server/src/routes/recoverySnapshots";
+import {
+	recoverySnapshotFailureReason,
+	recoverySnapshotMaybeTraceEventName,
+} from "../server/src/routes/recoverySnapshots";
 import { snapshotMaybeTraceEventName } from "../server/src/routes/snapshots";
 
 let passed = 0;
@@ -149,6 +153,27 @@ console.log("\n--- Test 3b: snapshot trace event names reflect actual maybe stat
 	assert(recoverySnapshotMaybeTraceEventName("noop") === "recovery-snapshot-skipped", "recovery noop status records a skipped event");
 	assert(recoverySnapshotMaybeTraceEventName("pending") === "recovery-snapshot-pending", "recovery pending status records a pending event");
 	assert(recoverySnapshotMaybeTraceEventName("unavailable") === "recovery-snapshot-unavailable", "recovery unavailable status records an unavailable event");
+}
+
+console.log("\n--- Test 3c: recovery snapshot 5xx failures normalize to unavailable reasons ---");
+{
+	assert(
+		recoverySnapshotFailureReason(502, "error code: 502")
+			.includes("File history point failed on the sync room (502): error code: 502"),
+		"recovery snapshot 502 text becomes a user-facing unavailable reason",
+	);
+	assert(
+		recoverySnapshotFailureReason(500, JSON.stringify({ error: "recovery_snapshot_failed", message: "boom" }))
+			.includes("boom"),
+		"recovery snapshot JSON failure preserves the server message",
+	);
+}
+
+console.log("\n--- Test 3d: automatic snapshot triggers treat Bad Gateway as transient ---");
+{
+	const source = readFileSync("src/snapshots/snapshotService.ts", "utf8");
+	assert(source.includes('lower.includes("(502)")'), "snapshot transient classifier includes HTTP 502");
+	assert(source.includes('lower.includes("bad gateway")'), "snapshot transient classifier includes Bad Gateway text");
 }
 
 console.log("\n--- Test 4: blob uploads reject poisoned content-addressed keys ---");
