@@ -369,6 +369,8 @@ console.log("\n--- Test 11: binding replacement preserves same-path editor activ
 	});
 	const before = binding.lastEditorDocChangeAtMs;
 	const liveCm = installLiveCmReplacement(manager, binding);
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "typing now");
 
 	const applied = (manager as unknown as {
 		applyBinding: (options: unknown) => boolean;
@@ -394,7 +396,45 @@ console.log("\n--- Test 11: binding replacement preserves same-path editor activ
 	clearPendingHealthChecks(manager);
 }
 
-console.log("\n--- Test 12: local repair patches are blocked during recent user typing ---");
+console.log("\n--- Test 12: direct binding refuses divergent editor content ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const liveCm = installLiveCmReplacement(manager, binding);
+	let dispatchCalls = 0;
+	(liveCm as { dispatch: () => void }).dispatch = () => {
+		dispatchCalls++;
+	};
+
+	const applied = (manager as unknown as {
+		applyBinding: (options: unknown) => boolean;
+	}).applyBinding({
+		action: "repair",
+		deviceName: "TestDevice",
+		view: binding.view,
+		cm: liveCm,
+		cmId: "cm-2",
+		leafId: "leaf-1",
+		filePath: binding.path,
+		ytext: binding.ytext,
+		fileId: binding.fileId,
+		existing: binding,
+		reason: "divergent-editor-test",
+	});
+
+	assertEq(applied, false, "divergent editor content blocks direct binding");
+	assertEq(dispatchCalls, 0, "blocked binding does not reconfigure CodeMirror");
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.get("leaf-1"),
+		binding,
+		"blocked binding leaves the existing binding untouched",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 13: local repair patches are blocked during recent user typing ---");
 {
 	const { manager, binding, flightEvents } = buildManagerFixture({
 		lastEditorChangeAgeMs: 100,
@@ -444,7 +484,7 @@ console.log("\n--- Test 12: local repair patches are blocked during recent user 
 	clearPendingHealthChecks(manager);
 }
 
-console.log("\n--- Test 13: provider-origin patches that preserve editor content are allowed ---");
+console.log("\n--- Test 14: provider-origin patches that preserve editor content are allowed ---");
 {
 	const { manager, binding } = buildManagerFixture({
 		lastEditorChangeAgeMs: 100,
@@ -481,7 +521,7 @@ console.log("\n--- Test 13: provider-origin patches that preserve editor content
 	clearPendingHealthChecks(manager);
 }
 
-console.log("\n--- Test 14: provider-origin patches that erase recent typing are blocked ---");
+console.log("\n--- Test 15: provider-origin patches that erase recent typing are blocked ---");
 {
 	const { manager, binding, flightEvents } = buildManagerFixture({
 		lastEditorChangeAgeMs: 100,
@@ -523,6 +563,52 @@ console.log("\n--- Test 14: provider-origin patches that erase recent typing are
 		flightEvents.some((event) => event.kind === PRODUCT_EVENT_KIND.editorAuthorityShieldApplied),
 		true,
 		"provider shield emits editor.authority_shield.applied",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 16: provider-origin patches that erase idle open editor content are blocked ---");
+{
+	const { manager, binding, flightEvents } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const leafId = "leaf-1";
+	const providerOrigin = { provider: true };
+	(manager as unknown as {
+		pendingYTextPatches: WeakMap<Y.Text, unknown>;
+	}).pendingYTextPatches.set(binding.ytext, {
+		origin: providerOrigin,
+		path: binding.path,
+		leafId,
+		at: Date.now(),
+	});
+
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "typing" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+
+	const result = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+
+	assertEq(result !== transaction, true, "idle destructive provider patch is replaced with a shield transaction");
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has(leafId),
+		false,
+		"idle binding is detached before the provider patch can erase open editor content",
+	);
+
+	await Promise.resolve();
+	assertEq(binding.ytext.toString(), "typing now", "idle open editor content is written back to CRDT after provider shield");
+	assertEq(
+		flightEvents.some((event) => event.kind === PRODUCT_EVENT_KIND.editorAuthorityShieldApplied),
+		true,
+		"idle provider shield emits editor.authority_shield.applied",
 	);
 	clearPendingHealthChecks(manager);
 }

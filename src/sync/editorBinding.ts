@@ -11,7 +11,6 @@ import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
 import {
 	ORIGIN_EDITOR_AUTHORITY_SHIELD,
 	ORIGIN_EDITOR_HEALTH_HEAL,
-	isLocalStringOrigin,
 } from "./origins";
 
 /**
@@ -34,7 +33,6 @@ const FAST_SWITCH_WINDOW_MS = 2000;
 const POST_BIND_HEALTH_GRACE_MS = 100;
 const LIVE_UPDATE_HEALTH_RETRY_DELAY_MS = 120;
 const RECENT_EDITOR_REPAIR_DEFER_MS = 1200;
-const RECENT_EDITOR_PATCH_SHIELD_MS = 1200;
 const CM_RESOLVE_RETRY_DELAYS_MS = [80, 160, 320, 640, 1000, 1500, 2000] as const;
 const CM_RESOLVE_DELAYED_ATTEMPT = 5;
 const CM_RESOLVE_IDLE_RETRY_DELAY_MS = 5000;
@@ -923,7 +921,6 @@ export class EditorBindingManager {
 		const pendingPatch = this.pendingYTextPatches.get(binding.ytext);
 		if (!pendingPatch || pendingPatch.leafId !== leafId) return transaction;
 		if (Date.now() - pendingPatch.at > 1000) return transaction;
-		if (!this.hasRecentUserDocumentEdit(binding, RECENT_EDITOR_PATCH_SHIELD_MS)) return transaction;
 
 		const editorContent = transaction.startState.doc.toString();
 		const incomingContent = transaction.newDoc.toString();
@@ -968,21 +965,11 @@ export class EditorBindingManager {
 		);
 	}
 
-	private shouldShieldYTextPatchOrigin(origin: unknown): boolean {
-		return (
-			typeof origin === "string" &&
-			origin !== ORIGIN_EDITOR_HEALTH_HEAL &&
-			origin !== ORIGIN_EDITOR_AUTHORITY_SHIELD &&
-			isLocalStringOrigin(origin)
-		);
-	}
-
 	private shouldShieldYTextPatch(input: {
 		origin: unknown;
 		editorContent: string;
 		incomingContent: string;
 	}): boolean {
-		if (this.shouldShieldYTextPatchOrigin(input.origin)) return true;
 		if (
 			input.origin === ORIGIN_EDITOR_HEALTH_HEAL ||
 			input.origin === ORIGIN_EDITOR_AUTHORITY_SHIELD
@@ -1009,11 +996,6 @@ export class EditorBindingManager {
 			}
 		}
 		return editorIndex === editorContent.length;
-	}
-
-	private hasRecentUserDocumentEdit(binding: EditorBinding, windowMs: number): boolean {
-		if (binding.lastEditorDocChangeAtMs == null) return false;
-		return Date.now() - binding.lastEditorDocChangeAtMs < windowMs;
 	}
 
 	private isUserTransaction(transaction: Transaction): boolean {
@@ -1381,6 +1363,17 @@ export class EditorBindingManager {
 			reason,
 		} = options;
 
+		if (!this.canApplyBindingToEditor({
+			action,
+			view,
+			leafId,
+			filePath,
+			ytext,
+			reason,
+		})) {
+			return false;
+		}
+
 		const undoManager = new Y.UndoManager(ytext);
 
 		this.vaultSync.provider.awareness.setLocalStateField("user", {
@@ -1502,6 +1495,47 @@ export class EditorBindingManager {
 			`(leaf=${leafId}, cm=${cmId}${fileId ? `, fileId=${fileId}` : ""}${reasonSuffix}${settleSuffix})`,
 		);
 		return true;
+	}
+
+	private canApplyBindingToEditor(input: {
+		action: "bind" | "repair";
+		view: MarkdownView;
+		leafId: string;
+		filePath: string;
+		ytext: Y.Text;
+		reason?: string;
+	}): boolean {
+		let editorContent: string;
+		try {
+			editorContent = input.view.editor.getValue();
+		} catch {
+			this.trace?.("editor", "binding-apply-editor-read-failed", {
+				action: input.action,
+				path: input.filePath,
+				reason: input.reason ?? null,
+				leafId: input.leafId,
+			});
+			return false;
+		}
+
+		const crdtContent = input.ytext.toJSON();
+		if (editorContent === crdtContent) {
+			return true;
+		}
+
+		this.trace?.("editor", "binding-apply-editor-diverged", {
+			action: input.action,
+			path: input.filePath,
+			reason: input.reason ?? null,
+			leafId: input.leafId,
+			editorLength: editorContent.length,
+			crdtLength: crdtContent.length,
+		});
+		this.log(
+			`${input.action}: skipped binding for "${input.filePath}" ` +
+			`because open editor differs from CRDT (reason=${input.reason ?? "n/a"})`,
+		);
+		return false;
 	}
 
 	private log(msg: string): void {

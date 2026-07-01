@@ -114,7 +114,54 @@ console.log("\n--- Test 7: same-path binding replacement preserves editor activi
 	assert(section?.includes("lastEditorDocChangeAtMs,"), "applyBinding stores the carried document activity timestamp");
 }
 
-console.log("\n--- Test 8: editor-health-heal origin remains manual-only ---");
+console.log("\n--- Test 8: applyBinding refuses divergent editor content ---");
+{
+	const section = sliceBetween(
+		bindingSource,
+		"private applyBinding(options: {",
+		"private canApplyBindingToEditor(input: {",
+	);
+	const guardSection = sliceBetween(
+		bindingSource,
+		"private canApplyBindingToEditor(input: {",
+		"private log(msg: string): void {",
+	);
+	assert(section !== null, "applyBinding section found");
+	assert(guardSection !== null, "canApplyBindingToEditor section found");
+	assert(section?.includes("this.canApplyBindingToEditor({"), "applyBinding checks editor/CRDT content before reconfigure");
+	assert(
+		(section?.indexOf("this.canApplyBindingToEditor({") ?? Infinity) < (section?.indexOf("new Y.UndoManager") ?? -1),
+		"applyBinding guard runs before creating yCollab state",
+	);
+	assert(
+		guardSection?.includes("editorContent === crdtContent"),
+		"canApplyBindingToEditor only allows matching editor and CRDT content",
+	);
+	assert(
+		guardSection?.includes('"binding-apply-editor-diverged"'),
+		"canApplyBindingToEditor traces divergent apply attempts",
+	);
+}
+
+console.log("\n--- Test 9: destructive non-user patches do not depend on recent activity ---");
+{
+	const section = sliceBetween(
+		bindingSource,
+		"private filterRiskyNonUserPatch(transaction: Transaction): Transaction | TransactionSpec {",
+		"private createYTextOriginCaptureExtension(",
+	);
+	assert(section !== null, "filterRiskyNonUserPatch section found");
+	assert(
+		section?.includes("this.shouldShieldYTextPatch({"),
+		"filterRiskyNonUserPatch checks whether incoming content preserves editor content",
+	);
+	assert(
+		!section?.includes("RECENT_EDITOR_PATCH_SHIELD_MS"),
+		"filterRiskyNonUserPatch does not require recent activity before shielding destructive patches",
+	);
+}
+
+console.log("\n--- Test 10: editor-health-heal origin remains manual-only ---");
 {
 	const healSection = sliceBetween(
 		bindingSource,
@@ -140,7 +187,7 @@ console.log("\n--- Test 8: editor-health-heal origin remains manual-only ---");
 	);
 }
 
-console.log("\n--- Test 9: binding skips when open editor differs from CRDT ---");
+console.log("\n--- Test 11: binding skips when open editor differs from CRDT ---");
 {
 	const section = sliceBetween(
 		bindingSource,
