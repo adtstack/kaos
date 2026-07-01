@@ -5,6 +5,13 @@
 KAOS has four conflict classes, each with a defined policy. This document
 is the single source of truth for conflict resolution behavior.
 
+Live editor overwrite protection is intentionally narrower than general
+conflict resolution. See
+[`live-editor-authority-policy.md`](live-editor-authority-policy.md) for the
+active rule: shield destructive non-user editor patches only during recent
+local typing, never merely because a file is open, and never by performing
+live string-level auto-merge.
+
 ## 1. Markdown ambiguous divergence
 
 **Trigger:** Open file in editor where disk, CRDT, and editor all disagree

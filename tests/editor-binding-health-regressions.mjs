@@ -143,7 +143,7 @@ console.log("\n--- Test 8: applyBinding refuses divergent editor content ---");
 	);
 }
 
-console.log("\n--- Test 9: destructive provider patches merge before recent-activity shielding ---");
+console.log("\n--- Test 9: destructive provider patches only shield during recent editor activity ---");
 {
 	const section = sliceBetween(
 		bindingSource,
@@ -156,21 +156,21 @@ console.log("\n--- Test 9: destructive provider patches merge before recent-acti
 		"filterRiskyNonUserPatch checks whether incoming content preserves editor content",
 	);
 	assert(
-		section?.includes("this.planEditorYTextMerge({"),
-		"filterRiskyNonUserPatch attempts a 3-way merge before shielding destructive patches",
+		!section?.includes("this.planEditorYTextMerge({"),
+		"filterRiskyNonUserPatch does not attempt live 3-way auto-merge",
 	);
 	assert(
 		section?.includes("this.hasRecentUserDocumentEdit(binding, RECENT_EDITOR_PATCH_SHIELD_MS)"),
-		"filterRiskyNonUserPatch only shields unmerged destructive patches during recent editor activity",
+		"filterRiskyNonUserPatch only shields destructive patches during recent editor activity",
 	);
 	assert(
-		(section?.indexOf("this.planEditorYTextMerge({") ?? Infinity) <
+		(section?.indexOf("this.shouldShieldYTextPatch({") ?? Infinity) <
 			(section?.indexOf("this.hasRecentUserDocumentEdit(binding, RECENT_EDITOR_PATCH_SHIELD_MS)") ?? -1),
-		"3-way merge runs before recent-activity shielding",
+		"preservation check runs before recent-activity shielding",
 	);
 }
 
-console.log("\n--- Test 9b: Y.Text patch capture records the pre-patch base content ---");
+console.log("\n--- Test 9b: live editor patch filtering has no 3-way merge state ---");
 {
 	const section = sliceBetween(
 		bindingSource,
@@ -179,16 +179,16 @@ console.log("\n--- Test 9b: Y.Text patch capture records the pre-patch base cont
 	);
 	assert(section !== null, "createYTextOriginCaptureExtension section found");
 	assert(
-		section?.includes("beforeContentByTransaction"),
-		"Y.Text patch capture stores content by transaction",
+		!bindingSource.includes("mergeTexts3"),
+		"EditorBindingManager does not import or call mergeTexts3",
 	);
 	assert(
-		section?.includes('"beforeTransaction"'),
-		"Y.Text patch capture listens before the transaction mutates content",
+		!section?.includes("beforeContentByTransaction"),
+		"Y.Text patch capture does not store pre-patch base content for live merge",
 	);
 	assert(
-		section?.includes("baseContent"),
-		"pending Y.Text patch includes baseContent for 3-way merge",
+		!section?.includes("baseContent"),
+		"pending Y.Text patch does not include live merge baseContent",
 	);
 }
 
