@@ -51,11 +51,18 @@ export interface FileHistoryManifest extends FileHistoryManifestIndex {
 	schemaVersion: 3;
 }
 
+export interface FileHistoryPointProgress {
+	uploadedContentCount: number;
+	totalContentCount: number;
+	remainingContentCount: number;
+}
+
 export interface FileHistoryPointResult {
-	status: "created" | "noop" | "unavailable";
+	status: "created" | "noop" | "unavailable" | "pending";
 	manifestId?: string;
 	reason?: string;
 	index?: FileHistoryManifestIndex;
+	pending?: FileHistoryPointProgress;
 }
 
 export interface FileHistoryManifestList {

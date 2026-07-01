@@ -21,6 +21,7 @@ interface RecoverySnapshotRouteOptions {
 
 export function recoverySnapshotMaybeTraceEventName(status: RecoverySnapshotResult["status"]): string {
 	if (status === "created") return "recovery-snapshot-created";
+	if (status === "pending") return "recovery-snapshot-pending";
 	if (status === "noop") return "recovery-snapshot-skipped";
 	return "recovery-snapshot-unavailable";
 }
@@ -90,8 +91,11 @@ export async function handleRecoverySnapshotRoute(
 			reason: result.reason,
 			changedCount: result.index?.changedCount,
 			fileHistoryKind: result.index?.kind,
+			uploadedContentCount: result.pending?.uploadedContentCount,
+			totalContentCount: result.pending?.totalContentCount,
+			remainingContentCount: result.pending?.remainingContentCount,
 		});
-		return json(result);
+		return json({ ...result, pendingUpload: undefined });
 	}
 
 	if (req.method === "GET" && rest.length === 1 && rest[0] === "status") {

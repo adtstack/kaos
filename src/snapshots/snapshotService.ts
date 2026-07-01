@@ -38,6 +38,8 @@ import type {
 	DashboardSnapshotStatus,
 } from "../dashboard/dashboardTypes";
 
+const RECOVERY_SNAPSHOT_PENDING_RETRY_MS = 2_000;
+
 interface SnapshotServiceDeps {
 	app: App;
 	getSettings(): VaultSyncSettings;
@@ -51,6 +53,8 @@ interface SnapshotServiceDeps {
 }
 
 export class SnapshotService {
+	private recoverySnapshotRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
 	constructor(private readonly deps: SnapshotServiceDeps) {}
 
 	async getDashboardSnapshotStatus(): Promise<DashboardSnapshotStatus> {
@@ -205,6 +209,9 @@ export class SnapshotService {
 				this.deps.log(`File history point created: ${result.manifestId}${changed}`);
 			} else if (result.status === "noop") {
 				this.deps.log(`File history point: ${result.reason ?? "no changes"}`);
+			} else if (result.status === "pending") {
+				this.deps.log(this.formatPendingFileHistoryPoint(result));
+				this.scheduleRecoverySnapshotRetry(forceFull);
 			} else {
 				this.deps.log(`File history point: ${result.reason ?? "unavailable"}`);
 			}
@@ -240,6 +247,9 @@ export class SnapshotService {
 				new Notice(`File history point created: ${changed}.`);
 			} else if (result.status === "noop") {
 				new Notice(result.reason ?? "No file changes since the latest file history point.");
+			} else if (result.status === "pending") {
+				new Notice(this.formatPendingFileHistoryPoint(result));
+				this.scheduleRecoverySnapshotRetry(false);
 			} else {
 				new Notice(`File history unavailable: ${result.reason ?? "server storage unavailable"}`);
 			}
@@ -256,6 +266,20 @@ export class SnapshotService {
 			this.deps.getTraceHttpContext(),
 			forceFull,
 		);
+	}
+
+	private formatPendingFileHistoryPoint(result: FileHistoryPointResult): string {
+		const pending = result.pending;
+		if (!pending) return result.reason ?? "File history content upload is still in progress";
+		return `File history upload in progress: ${pending.uploadedContentCount}/${pending.totalContentCount} content object(s) uploaded.`;
+	}
+
+	private scheduleRecoverySnapshotRetry(forceFull: boolean): void {
+		if (this.recoverySnapshotRetryTimer) return;
+		this.recoverySnapshotRetryTimer = setTimeout(() => {
+			this.recoverySnapshotRetryTimer = null;
+			void this.triggerRecoverySnapshot(forceFull);
+		}, RECOVERY_SNAPSHOT_PENDING_RETRY_MS);
 	}
 
 	async takeSnapshotNow(): Promise<void> {

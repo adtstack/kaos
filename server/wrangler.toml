@@ -2,6 +2,10 @@ name = "kaos"
 main = "src/index.ts"
 compatibility_date = "2026-03-02"
 
+[limits]
+cpu_ms = 300000
+subrequests = 25000
+
 [[durable_objects.bindings]]
 name = "KAOS_SYNC"
 class_name = "VaultSyncServer"

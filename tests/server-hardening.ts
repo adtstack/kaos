@@ -147,6 +147,7 @@ console.log("\n--- Test 3b: snapshot trace event names reflect actual maybe stat
 	assert(snapshotMaybeTraceEventName("unavailable") === "snapshot-unavailable", "daily unavailable status records an unavailable event");
 	assert(recoverySnapshotMaybeTraceEventName("created") === "recovery-snapshot-created", "recovery created status records a created event");
 	assert(recoverySnapshotMaybeTraceEventName("noop") === "recovery-snapshot-skipped", "recovery noop status records a skipped event");
+	assert(recoverySnapshotMaybeTraceEventName("pending") === "recovery-snapshot-pending", "recovery pending status records a pending event");
 	assert(recoverySnapshotMaybeTraceEventName("unavailable") === "recovery-snapshot-unavailable", "recovery unavailable status records an unavailable event");
 }
 

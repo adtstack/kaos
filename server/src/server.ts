@@ -17,6 +17,7 @@ import {
 	auditRecoveryStorage,
 	createRecoverySnapshot,
 	decodeRecoveryFileMeta,
+	type FileHistoryPendingUpload,
 	type RecoverySnapshotResult,
 } from "./recoverySnapshot";
 import {
@@ -41,6 +42,8 @@ const JOURNAL_COMPACT_MAX_ENTRIES = 50;
 const JOURNAL_COMPACT_MAX_BYTES = 1 * 1024 * 1024;
 const TRACE_DEBUG_LIMIT = 100;
 const LOG_PREFIX = "[kaos-sync:server]";
+const RECOVERY_SNAPSHOT_CONTENT_UPLOAD_LIMIT = 5000;
+const RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY = "recoverySnapshotPendingUpload";
 
 /**
  * If a journal append fails, fall back to full checkpoint rewrite after this
@@ -75,6 +78,19 @@ type ServerPersistenceHealth = PersistenceHealth & {
 	legacyDocumentMigrated: boolean;
 };
 
+function isFileHistoryPendingUpload(value: unknown): value is FileHistoryPendingUpload {
+	if (typeof value !== "object" || value === null) return false;
+	const candidate = value as Partial<FileHistoryPendingUpload>;
+	return typeof candidate.manifestId === "string" &&
+		typeof candidate.createdAt === "string" &&
+		typeof candidate.day === "string" &&
+		typeof candidate.stateHash === "string" &&
+		(candidate.previousStateHash === undefined || typeof candidate.previousStateHash === "string") &&
+		typeof candidate.uploadedContentCount === "number" &&
+		Number.isInteger(candidate.uploadedContentCount) &&
+		candidate.uploadedContentCount >= 0;
+}
+
 function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
 	if (a.byteLength !== b.byteLength) return false;
 	for (let i = 0; i < a.byteLength; i++) {
@@ -104,8 +120,7 @@ export class VaultSyncServer extends YServer {
 	private chunkedDocStore: ChunkedDocStore | null = null;
 	private persistence: PersistenceCoordinator | null = null;
 	private documentUpdateListenerAttached = false;
-	private snapshotMaybeChain: Promise<void> = Promise.resolve();
-	private recoverySnapshotMaybeChain: Promise<void> = Promise.resolve();
+	private snapshotMaintenanceChain: Promise<void> = Promise.resolve();
 	private roomMeta: RoomMeta | null = null;
 	private readonly traceRateLimiter = new TraceRateLimiter();
 	private readonly svEchoCounters: SvEchoCounters = {
@@ -627,7 +642,7 @@ export class VaultSyncServer extends YServer {
 	private async createDailySnapshotMaybe(
 		triggeredBy?: string,
 	): Promise<SnapshotResult> {
-		const serialized = { chain: this.snapshotMaybeChain };
+		const serialized = { chain: this.snapshotMaintenanceChain };
 		const run = runSerialized(
 			serialized,
 			async () => {
@@ -740,7 +755,7 @@ export class VaultSyncServer extends YServer {
 				} satisfies SnapshotResult;
 			},
 		);
-		this.snapshotMaybeChain = serialized.chain;
+		this.snapshotMaintenanceChain = serialized.chain;
 		return await run;
 	}
 
@@ -748,7 +763,7 @@ export class VaultSyncServer extends YServer {
 		triggeredBy?: string,
 		forceFull = false,
 	): Promise<RecoverySnapshotResult> {
-		const serialized = { chain: this.recoverySnapshotMaybeChain };
+		const serialized = { chain: this.snapshotMaintenanceChain };
 		const run = runSerialized(
 			serialized,
 			async () => {
@@ -761,38 +776,42 @@ export class VaultSyncServer extends YServer {
 				}
 
 				const vaultId = this.getRoomId();
-				try {
-					const audit = await auditRecoveryStorage(vaultId, bucket, {
-						repair: true,
-						contentCheckLimit: 0,
-					});
-					const successfulRepairs = audit.repairs.filter((repair) => repair.success);
-					if (successfulRepairs.length > 0) {
-						await this.recordTrace("recovery-storage-repaired", {
-							status: audit.status,
-							latestManifestId: audit.latestManifestId,
-							latestIndexManifestId: audit.latestIndexManifestId,
-							latestStateManifestId: audit.latestStateManifestId,
-							issueCount: audit.issues.length,
-							repairCount: successfulRepairs.length,
-							repairKinds: successfulRepairs.map((repair) => repair.kind).slice(0, 20),
+				const pendingRaw = await this.ctx.storage.get<unknown>(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY);
+				const pendingUpload = isFileHistoryPendingUpload(pendingRaw) ? pendingRaw : null;
+				if (!pendingUpload) {
+					try {
+						const audit = await auditRecoveryStorage(vaultId, bucket, {
+							repair: true,
+							contentCheckLimit: 0,
 						});
-					}
-					if (audit.status === "degraded") {
+						const successfulRepairs = audit.repairs.filter((repair) => repair.success);
+						if (successfulRepairs.length > 0) {
+							await this.recordTrace("recovery-storage-repaired", {
+								status: audit.status,
+								latestManifestId: audit.latestManifestId,
+								latestIndexManifestId: audit.latestIndexManifestId,
+								latestStateManifestId: audit.latestStateManifestId,
+								issueCount: audit.issues.length,
+								repairCount: successfulRepairs.length,
+								repairKinds: successfulRepairs.map((repair) => repair.kind).slice(0, 20),
+							});
+						}
+						if (audit.status === "degraded") {
+							await this.recordTrace("recovery-storage-degraded", {
+								status: audit.status,
+								latestManifestId: audit.latestManifestId,
+								issueCount: audit.issues.length,
+								unrepairedIssueKinds: audit.issues
+									.filter((issue) => !issue.repaired)
+									.map((issue) => issue.kind)
+									.slice(0, 20),
+							});
+						}
+					} catch (err) {
 						await this.recordTrace("recovery-storage-degraded", {
-							status: audit.status,
-							latestManifestId: audit.latestManifestId,
-							issueCount: audit.issues.length,
-							unrepairedIssueKinds: audit.issues
-								.filter((issue) => !issue.repaired)
-								.map((issue) => issue.kind)
-								.slice(0, 20),
+							error: err instanceof Error ? err.message : String(err),
 						});
 					}
-				} catch (err) {
-					await this.recordTrace("recovery-storage-degraded", {
-						error: err instanceof Error ? err.message : String(err),
-					});
 				}
 
 				const result = await createRecoverySnapshot(
@@ -804,8 +823,21 @@ export class VaultSyncServer extends YServer {
 						forceFull,
 						reason: "automatic",
 						pinned: false,
+						contentUploadLimit: RECOVERY_SNAPSHOT_CONTENT_UPLOAD_LIMIT,
+						pendingUpload,
 					},
 				);
+				if (result.status === "pending" && result.pending && result.pendingUpload) {
+					await this.ctx.storage.put(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY, result.pendingUpload);
+					await this.recordTrace("recovery-snapshot-upload-pending", {
+						manifestId: result.manifestId,
+						uploadedContentCount: result.pending.uploadedContentCount,
+						totalContentCount: result.pending.totalContentCount,
+						remainingContentCount: result.pending.remainingContentCount,
+					});
+					return result;
+				}
+				await this.ctx.storage.delete(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY);
 				if (result.status === "created" && result.index?.kind === "file-history") {
 					try {
 						await applyRecoveryRetention(this.getRoomId(), bucket);
@@ -818,7 +850,7 @@ export class VaultSyncServer extends YServer {
 				return result;
 			},
 		);
-		this.recoverySnapshotMaybeChain = serialized.chain;
+		this.snapshotMaintenanceChain = serialized.chain;
 		return await run;
 	}
 

@@ -50,11 +50,28 @@ export interface FileHistoryManifest extends FileHistoryManifestIndex {
 	kind: "file-history";
 }
 
+export interface FileHistoryPointProgress {
+	uploadedContentCount: number;
+	totalContentCount: number;
+	remainingContentCount: number;
+}
+
+export interface FileHistoryPendingUpload {
+	manifestId: string;
+	createdAt: string;
+	day: string;
+	stateHash: string;
+	previousStateHash?: string;
+	uploadedContentCount: number;
+}
+
 export interface FileHistoryPointResult {
-	status: "created" | "noop" | "unavailable";
+	status: "created" | "noop" | "unavailable" | "pending";
 	manifestId?: string;
 	reason?: string;
 	index?: FileHistoryManifestIndex;
+	pending?: FileHistoryPointProgress;
+	pendingUpload?: FileHistoryPendingUpload;
 }
 
 export interface CreateFileHistoryPointOptions {
@@ -63,6 +80,8 @@ export interface CreateFileHistoryPointOptions {
 	forceFull?: boolean;
 	pinned?: boolean;
 	now?: Date;
+	contentUploadLimit?: number;
+	pendingUpload?: FileHistoryPendingUpload | null;
 }
 
 export interface RecoveryRetentionPolicy {
@@ -567,11 +586,22 @@ async function readLatestRecoveryManifestIndexRaw(
 	}
 }
 
+interface PutContentObjectsResult {
+	contentHashes: string[];
+	uploadedContentCount: number;
+	nextUploadedContentCount: number;
+	complete: boolean;
+}
+
 async function putContentObjects(
 	vaultId: string,
 	bucket: R2Bucket,
 	entries: InternalStateEntry[],
-): Promise<string[]> {
+	options: {
+		uploadedContentCount?: number;
+		limit?: number;
+	} = {},
+): Promise<PutContentObjectsResult> {
 	const unique = new Map<string, string>();
 	for (const entry of entries) {
 		if (!entry.contentHash || typeof entry.content !== "string") continue;
@@ -579,21 +609,36 @@ async function putContentObjects(
 	}
 
 	const hashes = Array.from(unique.keys()).sort();
-	await mapWithConcurrency(hashes, RECOVERY_FETCH_CONCURRENCY, async (hash) => {
+	const uploadedContentCount = Math.max(
+		0,
+		Math.min(Math.floor(options.uploadedContentCount ?? 0), hashes.length),
+	);
+	const uploadLimit = options.limit === undefined
+		? hashes.length - uploadedContentCount
+		: Math.max(1, Math.floor(options.limit));
+	const nextUploadedContentCount = Math.min(hashes.length, uploadedContentCount + uploadLimit);
+	const hashesToUpload = hashes.slice(uploadedContentCount, nextUploadedContentCount);
+
+	await mapWithConcurrency(hashesToUpload, RECOVERY_FETCH_CONCURRENCY, async (hash) => {
 		const key = recoveryContentKey(vaultId, hash);
-		const existing = await bucket.head(key);
-		if (existing) return;
 		const content = unique.get(hash) ?? "";
 		const bytes = encoder.encode(content);
 		const actualHash = await sha256Hex(bytes);
 		if (actualHash !== hash) {
 			throw new Error(`recovery content hash mismatch for ${hash}`);
 		}
+		// Content keys are content-addressed, so rewriting an existing hash is
+		// idempotent and cheaper than spending one R2 request per file on head().
 		await bucket.put(key, gzipSync(bytes), {
 			httpMetadata: { contentType: "application/gzip" },
 		});
 	});
-	return hashes;
+	return {
+		contentHashes: hashes,
+		uploadedContentCount,
+		nextUploadedContentCount,
+		complete: nextUploadedContentCount >= hashes.length,
+	};
 }
 
 async function listAllKeys(bucket: R2Bucket, prefix: string): Promise<string[]> {
@@ -1144,7 +1189,6 @@ export async function createRecoverySnapshot(
 	options: CreateRecoverySnapshotOptions = {},
 ): Promise<RecoverySnapshotResult> {
 	const now = options.now ?? new Date();
-	const createdAt = now.toISOString();
 	const latestState = await readLatestRecoveryStateWithFallback(vaultId, bucket);
 	const previousByFileId = new Map<string, RecoveryStateEntry>();
 	for (const entry of latestState?.entries ?? []) previousByFileId.set(entry.fileId, entry);
@@ -1173,9 +1217,17 @@ export async function createRecoverySnapshot(
 		};
 	}
 
-	const manifestId = generateRecoveryManifestId(now);
 	const persistedState = currentState.map(toPersistedStateEntry);
 	const nextStateHash = await stateHash(persistedState);
+	const previousStateHash = latestState?.stateHash ?? null;
+	const pendingUpload = options.pendingUpload;
+	const canContinuePending = pendingUpload !== null &&
+		pendingUpload !== undefined &&
+		pendingUpload.stateHash === nextStateHash &&
+		(pendingUpload.previousStateHash ?? null) === previousStateHash;
+	const manifestId = canContinuePending ? pendingUpload.manifestId : generateRecoveryManifestId(now);
+	const createdAt = canContinuePending ? pendingUpload.createdAt : now.toISOString();
+	const day = canContinuePending ? pendingUpload.day : today(now);
 	const defaultDevice = options.triggeredBy;
 	const changedEntries = changes.map((change) => ({
 		...change,
@@ -1185,11 +1237,35 @@ export async function createRecoverySnapshot(
 		.filter((entry) => entry.kind !== "deleted" && entry.contentHash)
 		.map((entry) => currentByFileId.get(entry.fileId))
 		.filter((entry): entry is InternalStateEntry => !!entry && typeof entry.content === "string");
-	const contentHashes = await putContentObjects(vaultId, bucket, changedCurrentEntries);
+	const contentResult = await putContentObjects(vaultId, bucket, changedCurrentEntries, {
+		uploadedContentCount: canContinuePending ? pendingUpload.uploadedContentCount : 0,
+		limit: options.contentUploadLimit,
+	});
+	const contentHashes = contentResult.contentHashes;
+
+	if (!contentResult.complete) {
+		return {
+			status: "pending",
+			manifestId,
+			reason: "File history content upload is still in progress",
+			pending: {
+				uploadedContentCount: contentResult.nextUploadedContentCount,
+				totalContentCount: contentHashes.length,
+				remainingContentCount: contentHashes.length - contentResult.nextUploadedContentCount,
+			},
+			pendingUpload: {
+				manifestId,
+				createdAt,
+				day,
+				stateHash: nextStateHash,
+				previousStateHash: previousStateHash ?? undefined,
+				uploadedContentCount: contentResult.nextUploadedContentCount,
+			},
+		};
+	}
 
 	const reason = options.reason ?? "automatic";
 	const pinned = options.pinned ?? (reason !== "automatic");
-	const day = today(now);
 
 	const indexBase = {
 		storageVersion: "v2" as const,

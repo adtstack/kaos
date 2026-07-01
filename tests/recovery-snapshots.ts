@@ -233,7 +233,7 @@ async function testStandaloneChangedOnlyManifestWithChangedCount(): Promise<void
 	const secondContentPuts = bucket.putOrder
 		.slice(putOrderBeforeSecond)
 		.filter((key) => key.startsWith(`v2/${vaultId}/recovery/content/`));
-	assertEqual(secondContentHeads.length, 1, "only changed content hash is checked with head");
+	assertEqual(secondContentHeads.length, 0, "changed content upload does not spend a head request");
 	assertEqual(secondContentPuts.length, 1, "only changed content object is uploaded");
 
 	const manifest = await getRecoveryManifest(vaultId, second.manifestId!, bucket as unknown as R2Bucket);
@@ -511,6 +511,11 @@ async function testLargeVaultFollowUpStoresChangedOnly(): Promise<void> {
 	});
 	assertEqual(full.index?.kind, "file-history", "large initial point is file-history");
 	assertEqual(full.index?.changedEntries.length, 5000, "large initial point records all files as initial changes");
+	assertEqual(
+		bucket.headOrder.filter((key) => key.startsWith(`v2/${vaultId}/recovery/content/`)).length,
+		0,
+		"large initial point does not spend content head requests",
+	);
 
 	setText(doc, "file-1234", "folder/1234.md", "content 1234 changed");
 	bucket.clearHeadOrder();
@@ -523,8 +528,8 @@ async function testLargeVaultFollowUpStoresChangedOnly(): Promise<void> {
 	assertEqual(next.index?.contentHashes.length, 1, "large follow-up stores one content hash");
 	assertEqual(
 		bucket.headOrder.filter((key) => key.startsWith(`v2/${vaultId}/recovery/content/`)).length,
-		1,
-		"large follow-up checks only changed content hash",
+		0,
+		"large follow-up does not spend content head requests",
 	);
 	assertEqual(
 		bucket.putOrder.slice(putOrderBeforeNext).filter((key) => key.startsWith(`v2/${vaultId}/recovery/content/`)).length,
@@ -536,6 +541,60 @@ async function testLargeVaultFollowUpStoresChangedOnly(): Promise<void> {
 	assertEqual(manifest?.changedEntries.length, 1, "large follow-up manifest contains one changed entry");
 	assert(manifest!.changedEntries.some((entry) => entry.fileId === "file-1234" && entry.kind === "modified"), "large follow-up marks touched file modified");
 	assert(!manifest!.changedEntries.some((entry) => entry.fileId === "file-1235"), "large follow-up omits untouched file");
+
+	doc.destroy();
+}
+
+async function testChunkedInitialUploadCompletesAcrossCalls(): Promise<void> {
+	console.log("\n--- Test 3b: initial file history content upload can resume across calls ---");
+	const bucket = new MemoryR2Bucket();
+	const doc = new Y.Doc();
+	const vaultId = "file-history-chunked-initial";
+
+	for (let i = 0; i < 5; i++) {
+		setText(doc, `file-${i}`, `notes/${i}.md`, `content ${i}`);
+	}
+
+	const first = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:00:00Z"),
+		contentUploadLimit: 2,
+	});
+	assertEqual(first.status, "pending", "first chunk returns pending");
+	assertEqual(first.pending?.uploadedContentCount, 2, "first chunk uploads two content objects");
+	assertEqual(first.pending?.totalContentCount, 5, "first chunk reports total content objects");
+	assert(await getRecoveryManifest(vaultId, first.manifestId!, bucket as unknown as R2Bucket) === null, "pending chunk does not write manifest");
+	assert(await bucket.head(`v2/${vaultId}/recovery/latest-state.json.gz`) === null, "pending chunk does not advance latest-state");
+
+	const second = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:00:10Z"),
+		contentUploadLimit: 2,
+		pendingUpload: first.pendingUpload,
+	});
+	assertEqual(second.status, "pending", "second chunk still returns pending");
+	assertEqual(second.manifestId, first.manifestId, "second chunk continues same manifest id");
+	assertEqual(second.pending?.uploadedContentCount, 4, "second chunk uploads two more content objects");
+	assert(await getRecoveryManifest(vaultId, second.manifestId!, bucket as unknown as R2Bucket) === null, "second pending chunk still does not write manifest");
+
+	const third = await createRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:00:20Z"),
+		contentUploadLimit: 2,
+		pendingUpload: second.pendingUpload,
+	});
+	assertEqual(third.status, "created", "final chunk creates file history point");
+	assertEqual(third.manifestId, first.manifestId, "final chunk keeps same manifest id");
+	assertEqual(third.index?.changedCount, 5, "final chunk records all initial files");
+	assertEqual(
+		bucket.putOrder.filter((key) => key.startsWith(`v2/${vaultId}/recovery/content/`)).length,
+		5,
+		"chunked upload writes each content object once",
+	);
+	assertEqual(
+		bucket.headOrder.filter((key) => key.startsWith(`v2/${vaultId}/recovery/content/`)).length,
+		0,
+		"chunked upload does not spend content head requests",
+	);
+	assert(await getRecoveryManifest(vaultId, third.manifestId!, bucket as unknown as R2Bucket) !== null, "final chunk writes manifest");
+	assert(await bucket.head(`v2/${vaultId}/recovery/latest-state.json.gz`) !== null, "final chunk advances latest-state");
 
 	doc.destroy();
 }
@@ -769,6 +828,7 @@ await testRecoveryStorageDegradedDoesNotRepairManifestOrContent();
 await testRenameDeleteAndChainReconstruction();
 await testNestedV3MetaIsSnapshotted();
 await testLargeVaultFollowUpStoresChangedOnly();
+await testChunkedInitialUploadCompletesAcrossCalls();
 await testFileHistoryPointerOrder();
 await testContentHashVerification();
 await testListIsNewestFirst();
