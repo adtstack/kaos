@@ -23,6 +23,7 @@
  *   - Scenario 4: pause from the idle guard resets the amplification detector
  */
 
+import { createHash } from "node:crypto";
 import { MarkdownView, TFile } from "obsidian";
 import * as Y from "yjs";
 import { ReconciliationController } from "../src/runtime/reconciliationController";
@@ -61,6 +62,10 @@ function makeTFile(path: string): TFile {
 	const file = new TFile() as TFile & { path: string };
 	file.path = path;
 	return file;
+}
+
+function baselineHashSync(content: string): string {
+	return createHash("sha256").update(content, "utf8").digest("hex");
 }
 
 interface CapturedEvent {
@@ -111,6 +116,7 @@ interface Fixture {
 	setEditorContent(content: string): void;
 	setLastEditorActivity(value: number | null): void;
 	setBindingHealthy(healthy: boolean): void;
+	setBaselineContent(content: string): void;
 	clearBoundRecoveryLocks(): void;
 	ingestDiskFileNow(reason?: "create" | "modify"): Promise<void>;
 }
@@ -129,6 +135,13 @@ function buildFixture(initial: {
 	let diskIngestPort: DiskIngestPort | null = null;
 	let lastEditorActivity: number | null = initial.lastEditorActivity ?? null;
 	let bindingHealthy = initial.bindingHealthy ?? true;
+	let diskIndex: Record<string, { mtime: number; size: number; contentHash?: string }> = {
+		[path]: {
+			mtime: 0,
+			size: initial.crdt.length,
+			contentHash: baselineHashSync(initial.crdt),
+		},
+	};
 
 	const doc = new Y.Doc();
 	const ytext = doc.getText("content");
@@ -235,14 +248,18 @@ function buildFixture(initial: {
 		}) as never,
 		getVaultSync: () => vaultSync as never,
 		getDiskMirror: () => ({
+			shouldSuppressCreate: async () => false,
+			shouldSuppressModify: async () => false,
 			isPreservedUnresolved: () => false,
 			clearPreservedUnresolved: () => {},
 			flushWrite: async () => {},
 		}) as never,
 		getBlobSync: () => null,
 		getEditorBindings: () => editorBindings as never,
-		getDiskIndex: () => ({}),
-		setDiskIndex: () => {},
+		getDiskIndex: () => diskIndex,
+		setDiskIndex: (next: Record<string, { mtime: number; size: number; contentHash?: string }>) => {
+			diskIndex = next;
+		},
 		isMarkdownPathSyncable: () => true,
 		shouldBlockFrontmatterIngest: () => false,
 		refreshServerCapabilities: async () => {},
@@ -274,6 +291,15 @@ function buildFixture(initial: {
 		setEditorContent: (c) => { editorContent = c; },
 		setLastEditorActivity: (v) => { lastEditorActivity = v; },
 		setBindingHealthy: (h) => { bindingHealthy = h; },
+		setBaselineContent: (c) => {
+			diskIndex = {
+				[path]: {
+					mtime: 0,
+					size: c.length,
+					contentHash: baselineHashSync(c),
+				},
+			};
+		},
 		clearBoundRecoveryLocks: () => {
 			(controller as unknown as { boundRecoveryLocks: Map<string, number> })
 				.boundRecoveryLocks.clear();
@@ -459,6 +485,7 @@ console.log("\n--- Scenario 3: fingerprint quarantine still trips on its shape -
 			fix.ytext.delete(0, fix.ytext.length);
 			fix.ytext.insert(0, "BBB");
 		}
+		fix.setBaselineContent("BBB");
 		fix.clearBoundRecoveryLocks();
 		await fix.ingestDiskFileNow("modify");
 	}
@@ -577,6 +604,7 @@ console.log("\n--- Scenario 5: unhealthy binding triggers editor.repair.applied 
 	fix.clearBoundRecoveryLocks();
 	fix.ytext.delete(0, fix.ytext.length);
 	fix.ytext.insert(0, "EEE"); // re-establish localOnly divergence
+	fix.setBaselineContent("EEE");
 	const beforeCount = fix.captured.length;
 	await fix.ingestDiskFileNow("modify");
 	const newEvents = fix.captured.slice(beforeCount);

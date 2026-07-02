@@ -21,6 +21,7 @@
  * heal() after applyDiffToYText.
  */
 
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { MarkdownView, TFile } from "obsidian";
@@ -73,6 +74,10 @@ function makeTFile(path: string): TFile {
 	return file;
 }
 
+function baselineHashSync(content: string): string {
+	return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
 interface CapturedEvent {
 	kind: string;
 	path: string;
@@ -123,6 +128,7 @@ interface Fixture {
 	controller: ReconciliationController;
 	setDiskContent(content: string): void;
 	setEditorContent(content: string): void;
+	setBaselineContent(content: string): void;
 	getCurrentDiskContent(): string;
 	ingestDiskFileNow(reason?: "create" | "modify"): Promise<void>;
 }
@@ -137,6 +143,13 @@ function buildFixture(initial: {
 	let diskContent = initial.disk;
 	let editorContent = initial.editor;
 	let diskIngestPort: DiskIngestPort | null = null;
+	let diskIndex: Record<string, { mtime: number; size: number; contentHash?: string }> = {
+		[path]: {
+			mtime: 0,
+			size: initial.crdt.length,
+			contentHash: baselineHashSync(initial.crdt),
+		},
+	};
 
 	const doc = new Y.Doc();
 	const ytext = doc.getText("content");
@@ -266,8 +279,10 @@ function buildFixture(initial: {
 		}) as never,
 		getBlobSync: () => null,
 		getEditorBindings: () => editorBindings as never,
-		getDiskIndex: () => ({}),
-		setDiskIndex: () => {},
+		getDiskIndex: () => diskIndex,
+		setDiskIndex: (next: Record<string, { mtime: number; size: number; contentHash?: string }>) => {
+			diskIndex = next;
+		},
 		isMarkdownPathSyncable: () => true,
 		shouldBlockFrontmatterIngest: () => false,
 		refreshServerCapabilities: async () => {},
@@ -297,6 +312,15 @@ function buildFixture(initial: {
 		controller,
 		setDiskContent: (c) => { diskContent = c; },
 		setEditorContent: (c) => { editorContent = c; },
+		setBaselineContent: (c) => {
+			diskIndex = {
+				[path]: {
+					mtime: 0,
+					size: c.length,
+					contentHash: baselineHashSync(c),
+				},
+			};
+		},
 		getCurrentDiskContent: () => diskContent,
 		ingestDiskFileNow: (reason: "create" | "modify" = "modify") => {
 			if (!diskIngestPort) throw new Error("diskIngestPort not registered");
@@ -904,6 +928,7 @@ console.log("\n--- Test 6: third identical recovery is quarantined ---");
 			fix.ytext.delete(0, fix.ytext.length);
 			fix.ytext.insert(0, "BBB");
 		}
+		fix.setBaselineContent("BBB");
 		// Clear the lock so each attempt re-enters the recovery branch.
 		(fix.controller as unknown as { boundRecoveryLocks: Map<string, number> })
 			.boundRecoveryLocks.clear();

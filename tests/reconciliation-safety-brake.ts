@@ -1,6 +1,6 @@
 import { MarkdownView, TFile } from "obsidian";
 import * as Y from "yjs";
-import { updateIndex, type DiskIndex } from "../src/sync/diskIndex";
+import { contentBaselineHash, updateIndex, type DiskIndex } from "../src/sync/diskIndex";
 import { ReconciliationController } from "../src/runtime/reconciliationController";
 import {
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
@@ -879,7 +879,14 @@ console.log("\n--- Test 5: bound recovery force-replaces when CRDT changes after
 	});
 
 	let mutatedDuringGuard = false;
-	let diskIndex: DiskIndex = {};
+	const crdtBaseline = "abcX";
+	let diskIndex: DiskIndex = {
+		[path]: {
+			mtime: 1,
+			size: crdtBaseline.length,
+			contentHash: await contentBaselineHash(crdtBaseline),
+		},
+	};
 
 	const app = {
 		vault: {
@@ -1098,7 +1105,13 @@ console.log("\n--- Test 7: repeated identical recovery fingerprint is quarantine
 	view.editor = { getValue: () => diskContent };
 
 	const traces: Array<{ source: string; msg: string; details?: Record<string, unknown> }> = [];
-	let diskIndex: DiskIndex = {};
+	let diskIndex: DiskIndex = {
+		[path]: {
+			mtime: 1,
+			size: crdtContent.length,
+			contentHash: await contentBaselineHash(crdtContent),
+		},
+	};
 
 	const app = {
 		vault: {
@@ -1162,6 +1175,11 @@ console.log("\n--- Test 7: repeated identical recovery fingerprint is quarantine
 	for (let i = 0; i < 3; i++) {
 		ytext.delete(0, ytext.length);
 		ytext.insert(0, crdtContent);
+		diskIndex[path] = {
+			mtime: i + 1,
+			size: crdtContent.length,
+			contentHash: await contentBaselineHash(crdtContent),
+		};
 		(controller as any).boundRecoveryLocks.clear();
 		await (controller as any).syncFileFromDisk(file, "modify");
 	}
@@ -1203,7 +1221,13 @@ console.log("\n--- Test 8: successful recovery clears quarantine fingerprint ---
 	view.editor = { getValue: () => "disk version A" };
 
 	const traces: Array<{ source: string; msg: string; details?: Record<string, unknown> }> = [];
-	let diskIndex: DiskIndex = {};
+	let diskIndex: DiskIndex = {
+		[path]: {
+			mtime: 1,
+			size: "stale".length,
+			contentHash: await contentBaselineHash("stale"),
+		},
+	};
 
 	const app = {
 		vault: {
@@ -1278,6 +1302,11 @@ console.log("\n--- Test 8: successful recovery clears quarantine fingerprint ---
 	// Now change CRDT to something new and recover again — different fingerprint
 	ytext.delete(0, ytext.length);
 	ytext.insert(0, "new-stale");
+	diskIndex[path] = {
+		mtime: 2,
+		size: "new-stale".length,
+		contentHash: await contentBaselineHash("new-stale"),
+	};
 	(controller as any).boundRecoveryLocks.clear();
 	await (controller as any).syncFileFromDisk(file, "modify");
 	assert(ytext.toString() === "disk version A", "different-fingerprint recovery still succeeds");

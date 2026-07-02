@@ -919,14 +919,17 @@ export class EditorBindingManager {
 			return { effects: this.compartment.reconfigure([]) };
 		}
 
-		const pendingPatch = this.pendingYTextPatches.get(binding.ytext);
-		if (!pendingPatch || pendingPatch.leafId !== leafId) return transaction;
-		if (Date.now() - pendingPatch.at > 1000) return transaction;
-
 		const editorContent = transaction.startState.doc.toString();
 		const incomingContent = transaction.newDoc.toString();
+		const pendingPatch = this.pendingYTextPatches.get(binding.ytext);
+		const validPendingPatch =
+			pendingPatch &&
+			pendingPatch.leafId === leafId &&
+			Date.now() - pendingPatch.at <= 1000
+				? pendingPatch
+				: null;
 		if (!this.shouldShieldYTextPatch({
-			origin: pendingPatch.origin,
+			origin: validPendingPatch?.origin ?? null,
 			editorContent,
 			incomingContent,
 		})) {
@@ -935,7 +938,13 @@ export class EditorBindingManager {
 		if (!this.hasRecentUserDocumentEdit(binding, RECENT_EDITOR_PATCH_SHIELD_MS)) {
 			return transaction;
 		}
-		this.activateEditorAuthorityShield(leafId, binding, editorContent, incomingContent, pendingPatch);
+		this.activateEditorAuthorityShield(
+			leafId,
+			binding,
+			editorContent,
+			incomingContent,
+			validPendingPatch?.origin ?? null,
+		);
 		return { effects: this.compartment.reconfigure([]) };
 	}
 
@@ -1025,7 +1034,7 @@ export class EditorBindingManager {
 		binding: EditorBinding,
 		editorContent: string,
 		incomingContent: string,
-		patch: PendingYTextPatch,
+		blockedOrigin: unknown | null,
 	): void {
 		if (this.bindings.get(leafId) !== binding) return;
 		this.editorAuthorityShieldLeafIds.add(leafId);
@@ -1038,7 +1047,7 @@ export class EditorBindingManager {
 			leafId,
 			path: binding.path,
 			cmId: binding.cmId,
-			origin: typeof patch.origin === "string" ? patch.origin : null,
+			origin: typeof blockedOrigin === "string" ? blockedOrigin : null,
 			editorLength: editorContent.length,
 			incomingLength: incomingContent.length,
 			idleMs: binding.lastEditorDocChangeAtMs == null
@@ -1049,14 +1058,14 @@ export class EditorBindingManager {
 		queueMicrotask(() => {
 			this.editorAuthorityShieldLeafIds.delete(leafId);
 			binding.undoManager.destroy();
-			this.applyEditorAuthorityAfterShield(binding, editorContent, patch);
+			this.applyEditorAuthorityAfterShield(binding, editorContent, blockedOrigin);
 		});
 	}
 
 	private applyEditorAuthorityAfterShield(
 		binding: EditorBinding,
 		fallbackEditorContent: string,
-		patch: PendingYTextPatch,
+		blockedOrigin: unknown | null,
 	): void {
 		const file = binding.view.file;
 		if (!file || file.path !== binding.path) return;
@@ -1087,7 +1096,7 @@ export class EditorBindingManager {
 					editorLength: editorContent.length,
 					crdtMatchesEditorBefore: false,
 					diffApplied: true,
-					blockedOrigin: typeof patch.origin === "string" ? patch.origin : null,
+					blockedOrigin: typeof blockedOrigin === "string" ? blockedOrigin : null,
 				},
 			});
 		}

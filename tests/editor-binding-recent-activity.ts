@@ -610,6 +610,113 @@ console.log("\n--- Test 16: provider-origin patches that erase idle open editor 
 	clearPendingHealthChecks(manager);
 }
 
+console.log("\n--- Test 17: destructive patch without origin capture is blocked during recent typing ---");
+{
+	const { manager, binding, flightEvents } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	const leafId = "leaf-1";
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "typing" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+
+	const result = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+
+	assertEq(result !== transaction, true, "missing-origin destructive patch is shielded during recent typing");
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has(leafId),
+		false,
+		"binding is detached before a missing-origin patch can erase recent typing",
+	);
+
+	await Promise.resolve();
+	assertEq(binding.ytext.toString(), "typing now", "editor authority is restored after missing-origin shield");
+	assertEq(
+		flightEvents.some((event) =>
+			event.kind === PRODUCT_EVENT_KIND.editorAuthorityShieldApplied &&
+			event.data?.blockedOrigin === null
+		),
+		true,
+		"missing-origin shield records blockedOrigin=null",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 18: stale origin capture still falls back to recent-typing shield ---");
+{
+	const { manager, binding, flightEvents } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	const leafId = "leaf-1";
+	(manager as unknown as {
+		pendingYTextPatches: WeakMap<Y.Text, unknown>;
+	}).pendingYTextPatches.set(binding.ytext, {
+		origin: ORIGIN_DISK_SYNC_RECOVER_BOUND,
+		path: binding.path,
+		leafId,
+		at: Date.now() - 5000,
+	});
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "typing" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+
+	const result = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+
+	assertEq(result !== transaction, true, "stale-origin destructive patch is shielded during recent typing");
+	await Promise.resolve();
+	assertEq(binding.ytext.toString(), "typing now", "editor authority is restored after stale-origin fallback shield");
+	assertEq(
+		flightEvents.some((event) =>
+			event.kind === PRODUCT_EVENT_KIND.editorAuthorityShieldApplied &&
+			event.data?.blockedOrigin === null
+		),
+		true,
+		"stale-origin fallback records blockedOrigin=null",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19: missing-origin preserving patch is allowed during recent typing ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "typing now plus remote text" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+
+	const result = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+
+	assertEq(result, transaction, "missing-origin preserving patch is allowed");
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has("leaf-1"),
+		true,
+		"binding remains attached for missing-origin preserving patch",
+	);
+	clearPendingHealthChecks(manager);
+}
+
 console.log("\n──────────────────────────────────────────────────");
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log("──────────────────────────────────────────────────");

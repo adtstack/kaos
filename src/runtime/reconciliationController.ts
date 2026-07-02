@@ -38,6 +38,11 @@ import {
 	ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
 } from "../sync/origins";
 import { planClosedFileReconcile } from "./reconcile/closedFilePlanner";
+import {
+	planOpenBoundFileReconcile,
+	type OpenBoundEditorAuthority,
+	type OpenBoundFileReconcileAction,
+} from "./reconcile/openBoundFilePlanner";
 import { planBaselineAdvancement, type BaselineActionKind } from "./reconcile/baselineAdvancementPolicy";
 import { evaluateSafetyBrake } from "./reconcile/safetyBrakePolicy";
 import {
@@ -118,6 +123,12 @@ type OpenEditorAuthority =
 	| { kind: "single"; content: string }
 	| { kind: "multiple" }
 	| { kind: "read-failed" };
+
+type BoundFileSyncGapOutcome =
+	| { kind: "not-handled" }
+	| { kind: "handled"; settledContent?: string }
+	| { kind: "deferred"; deferUntil: number; reason: string }
+	| { kind: "flush-crdt-to-disk" };
 
 interface ReconciliationControllerDeps {
 	app: App;
@@ -1933,15 +1944,29 @@ export class ReconciliationController {
 			}
 
 			if (wasBound && isOpenInEditor) {
-				const handledBound = await this.handleBoundFileSyncGap(
+				const boundOutcome = await this.handleBoundFileSyncGap(
 					file,
 					content,
 					existingText,
 					openViews,
 					sourceReason,
+					stableRead.stat,
 				);
-				if (handledBound) {
-					await this.updateDiskIndexForPath(path, undefined, stableRead.stat);
+				if (boundOutcome.kind === "handled") {
+					if (boundOutcome.settledContent !== undefined) {
+						await this.updateDiskIndexForPath(path, boundOutcome.settledContent, stableRead.stat);
+					}
+					return;
+				}
+				if (boundOutcome.kind === "deferred") {
+					this.mergeDirtyEntryIntoPath(path, {
+						...entry,
+						notBeforeMs: Math.max(entry.notBeforeMs ?? 0, boundOutcome.deferUntil),
+					});
+					return;
+				}
+				if (boundOutcome.kind === "flush-crdt-to-disk") {
+					await diskMirror?.flushWrite(path, true);
 					return;
 				}
 			}
@@ -2289,13 +2314,121 @@ export class ReconciliationController {
 		return true;
 	}
 
+	private async preserveOpenBoundPlannerConflict(input: {
+		file: TFile;
+		diskContent: string;
+		crdtContent: string;
+		targetContent?: string;
+		reason: string;
+		preserveDisk: boolean;
+		preserveCrdt: boolean;
+		editorViewCount: number;
+		distinctEditorContentCount: number;
+		chosenSource: "disk" | "crdt" | "editor";
+	}): Promise<boolean> {
+		const {
+			file,
+			diskContent,
+			crdtContent,
+			targetContent,
+			reason,
+			preserveDisk,
+			preserveCrdt,
+			editorViewCount,
+			distinctEditorContentCount,
+			chosenSource,
+		} = input;
+		let crdtConflictPath: string | null = null;
+		let diskConflictPath: string | null = null;
+		let conflictError: string | null = null;
+		let convergenceApplied = false;
+		let conflictArtifactCreated = false;
+
+		try {
+			if (preserveCrdt && crdtContent !== targetContent) {
+				crdtConflictPath = await this.createMarkdownConflictArtifact(
+					file.path,
+					crdtContent,
+					reason,
+					"crdt",
+				);
+				conflictArtifactCreated = true;
+			}
+			if (
+				preserveDisk &&
+				diskContent !== targetContent &&
+				diskContent !== crdtContent
+			) {
+				diskConflictPath = await this.createMarkdownConflictArtifact(
+					file.path,
+					diskContent,
+					reason,
+					"disk",
+				);
+				conflictArtifactCreated = true;
+			}
+		} catch (err) {
+			conflictError = err instanceof Error ? err.message : String(err);
+			this.deps.getDiskMirror()?.recordPreservedUnresolved?.(
+				file.path,
+				"conflict-artifact-write-failed",
+			);
+			this.deps.trace("conflict", "conflict-artifact-needed", {
+				path: file.path,
+				conflictPath: crdtConflictPath,
+				diskConflictPath,
+				reason,
+				diskLength: diskContent.length,
+				crdtLength: crdtContent.length,
+				editorViewCount,
+				distinctEditorContentCount,
+				chosenSource,
+				conflictArtifactCreated,
+				convergenceApplied: false,
+				error: conflictError,
+			});
+			return false;
+		}
+
+		if (targetContent !== undefined) {
+			const existingText = this.deps.getVaultSync()?.getTextForPath(file.path);
+			if (existingText) {
+				forceReplaceYText(existingText, targetContent, ORIGIN_DISK_SYNC_RECOVER_BOUND);
+				convergenceApplied = yTextToString(existingText) === targetContent;
+			}
+		}
+
+		this.deps.trace("conflict", "conflict-artifact-needed", {
+			path: file.path,
+			conflictPath: crdtConflictPath,
+			diskConflictPath,
+			reason,
+			diskLength: diskContent.length,
+			crdtLength: crdtContent.length,
+			editorViewCount,
+			distinctEditorContentCount,
+			chosenSource,
+			conflictArtifactCreated,
+			convergenceApplied,
+			error: conflictError,
+		});
+		if (conflictArtifactCreated) {
+			this.showConflictNotice(
+				`Conflict detected for "${file.path.split("/").pop()}" — ` +
+				`competing version preserved as conflict note.`,
+			);
+		}
+		return true;
+	}
+
 	private async handleBoundFileSyncGap(
 		file: TFile,
 		content: string,
 		existingText: ReturnType<VaultSync["getTextForPath"]>,
 		openViews: MarkdownView[] = this.getOpenMarkdownViewsForPath(file.path),
 		sourceReason: "create" | "modify" = "modify",
-	): Promise<boolean> {
+		stableStat?: { mtime: number; size: number } | null,
+	): Promise<BoundFileSyncGapOutcome> {
 		const editorBindings = this.deps.getEditorBindings();
 		const vaultSync = this.deps.getVaultSync();
 		const now = Date.now();
@@ -2325,7 +2458,7 @@ export class ReconciliationController {
 			// Pauses (or quenched cycles) reset the amplification detector.
 			// See spec: .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.8.
 			this.amplificationHistory.delete(file.path);
-			return true;
+			return { kind: "handled" };
 		}
 		if (lockUntil > 0) {
 			this.boundRecoveryLocks.delete(file.path);
@@ -2337,7 +2470,7 @@ export class ReconciliationController {
 			});
 			editorBindings?.unbindByPath(file.path);
 			this.deps.log(`syncFileFromDisk: cleared stale bound state for "${file.path}" (no live view)`);
-			return false;
+			return { kind: "not-handled" };
 		}
 
 		const crdtContent = yTextToString(existingText);
@@ -2362,7 +2495,7 @@ export class ReconciliationController {
 			// Convergence reached: amplification detector is reset.
 			// See spec: .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.8.
 			this.amplificationHistory.delete(file.path);
-			return true;
+			return { kind: "handled", settledContent: content };
 		}
 
 		const viewStates = openViews.map((view) => {
@@ -2378,10 +2511,106 @@ export class ReconciliationController {
 				collab,
 			};
 		});
-
+		const distinctEditorContentsForPlanner = [...new Set(viewStates.map((state) => state.editorContent))];
+		let plannerEditorAuthority: OpenBoundEditorAuthority;
+		if (distinctEditorContentsForPlanner.length === 0) {
+			plannerEditorAuthority = { kind: "none" };
+		} else if (distinctEditorContentsForPlanner.length > 1) {
+			plannerEditorAuthority = { kind: "multiple" };
+		} else {
+			const editorContent = distinctEditorContentsForPlanner[0]!;
+			const editorMatchesDisk = editorContent === content;
+			const editorMatchesCrdt = crdtContent != null && editorContent === crdtContent;
+			plannerEditorAuthority = {
+				kind: "single",
+				relation: editorMatchesDisk && editorMatchesCrdt
+					? "both"
+					: (editorMatchesDisk
+						? "disk"
+						: (editorMatchesCrdt ? "crdt" : "distinct")),
+			};
+		}
+		const lastEditorActivityForPlanner =
+			editorBindings?.getLastEditorActivityForPath(file.path) ?? null;
+		const hasRecentEditorActivityForPlanner =
+			lastEditorActivityForPlanner != null &&
+			(now - lastEditorActivityForPlanner) < OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS;
+		let openBoundAction: OpenBoundFileReconcileAction | null = null;
+		if (existingText && crdtContent != null) {
+			const diskHash = await contentBaselineHash(content);
+			const crdtHash = await contentBaselineHash(crdtContent);
+			const baselineHash = this.deps.getDiskIndex()[file.path]?.contentHash ?? null;
+			const rawLastSave = this.deps.getLastSaveDiskIndexAt?.();
+			const lastDiskIndexPersistedAt =
+				typeof rawLastSave === "number" &&
+				Number.isFinite(rawLastSave) &&
+				rawLastSave > 0 &&
+				rawLastSave <= now
+					? rawLastSave
+					: undefined;
+			openBoundAction = planOpenBoundFileReconcile({
+				diskHash,
+				crdtHash,
+				baselineHash,
+				editorAuthority: plannerEditorAuthority,
+				hasRecentEditorActivity: hasRecentEditorActivityForPlanner,
+				diskMtime: stableStat?.mtime,
+				lastDiskIndexPersistedAt,
+			});
+			this.deps.trace("reconcile", "bound-file-open-planner-decision", {
+				path: file.path,
+				action: openBoundAction.kind,
+				reason: openBoundAction.reason,
+				diskLength: content.length,
+				crdtLength: crdtContent.length,
+				baselineHash,
+				editorAuthority: plannerEditorAuthority,
+				hasRecentEditorActivity: hasRecentEditorActivityForPlanner,
+				diskMtime: stableStat?.mtime ?? null,
+				lastDiskIndexPersistedAt: lastDiskIndexPersistedAt ?? null,
+			});
+		}
 		const localOnlyViews = viewStates.filter(
 			(state) => state.editorMatchesDisk && !state.editorMatchesCrdt,
 		);
+		const crdtOnlyViews = viewStates.filter(
+			(state) => state.editorMatchesCrdt && !state.editorMatchesDisk,
+		);
+		if (
+			openBoundAction?.kind === "defer-recent-editor" &&
+			localOnlyViews.length === 0 &&
+			crdtOnlyViews.length === 0
+		) {
+			const deferUntil =
+				(lastEditorActivityForPlanner ?? Date.now()) + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS;
+			const idleMs = lastEditorActivityForPlanner == null
+				? null
+				: Math.max(0, Date.now() - lastEditorActivityForPlanner);
+			this.deps.log(
+				`syncFileFromDisk: deferring "${file.path}" ` +
+				`(editor-bound recent typing${idleMs == null ? "" : ` ${idleMs}ms ago`})`,
+			);
+			this.deps.recordFlightPathEvent?.({
+				priority: "verbose",
+				kind: PRODUCT_EVENT_KIND.recoverySkipped,
+				severity: "info",
+				scope: "file",
+				source: "reconciliationController",
+				layer: "recovery",
+				path: file.path,
+				data: {
+					reason: "recent-editor-activity-local-only",
+					idleMs,
+				},
+			});
+			this.amplificationHistory.delete(file.path);
+			return {
+				kind: "deferred",
+				deferUntil,
+				reason: "recent-editor-activity-local-only",
+			};
+		}
+
 		if (localOnlyViews.length > 0) {
 			this.deps.trace("trace", "bound-file-local-only-divergence", {
 				path: file.path,
@@ -2401,6 +2630,70 @@ export class ReconciliationController {
 					expectedFileId: state.collab?.expectedFileId ?? null,
 				})),
 			});
+
+			if (existingText && openBoundAction?.kind === "apply-crdt-to-disk") {
+				if (openBoundAction.preserveDisk) {
+					const preserved = await this.preserveOpenBoundPlannerConflict({
+						file,
+						diskContent: content,
+						crdtContent: crdtContent ?? "",
+						targetContent: undefined,
+						reason: `bound-file-${openBoundAction.reason}`,
+						preserveDisk: true,
+						preserveCrdt: false,
+						editorViewCount: viewStates.length,
+						distinctEditorContentCount: distinctEditorContentsForPlanner.length,
+						chosenSource: "crdt",
+					});
+					if (!preserved) {
+						return { kind: "handled" };
+					}
+				}
+				this.deps.scheduleTraceStateSnapshot("bound-file-open-planner-crdt-wins");
+				return { kind: "flush-crdt-to-disk" };
+			}
+
+			if (existingText && openBoundAction?.kind === "editor-wins-preserve") {
+				const editorAuthority =
+					distinctEditorContentsForPlanner.length === 1
+						? distinctEditorContentsForPlanner[0]!
+						: null;
+				if (editorAuthority === null) {
+					return { kind: "handled" };
+				}
+				const preserved = await this.preserveOpenBoundPlannerConflict({
+					file,
+					diskContent: content,
+					crdtContent: crdtContent ?? "",
+					targetContent: editorAuthority,
+					reason: `bound-file-${openBoundAction.reason}`,
+					preserveDisk: !!openBoundAction.preserveDisk,
+					preserveCrdt: !!openBoundAction.preserveCrdt,
+					editorViewCount: viewStates.length,
+					distinctEditorContentCount: distinctEditorContentsForPlanner.length,
+					chosenSource: "editor",
+				});
+				this.deps.scheduleTraceStateSnapshot("bound-file-open-planner-editor-wins");
+				return { kind: "handled", settledContent: preserved && editorAuthority === content ? editorAuthority : undefined };
+			}
+
+			if (existingText && openBoundAction?.kind === "import-disk-to-crdt" && openBoundAction.preserveCrdt) {
+				const preserved = await this.preserveOpenBoundPlannerConflict({
+					file,
+					diskContent: content,
+					crdtContent: crdtContent ?? "",
+					targetContent: undefined,
+					reason: `bound-file-${openBoundAction.reason}`,
+					preserveDisk: false,
+					preserveCrdt: true,
+					editorViewCount: viewStates.length,
+					distinctEditorContentCount: distinctEditorContentsForPlanner.length,
+					chosenSource: "disk",
+				});
+				if (!preserved) {
+					return { kind: "handled" };
+				}
+			}
 
 			if (existingText) {
 				// Localized idle guard: defer recovery if the user just typed.
@@ -2436,22 +2729,26 @@ export class ReconciliationController {
 							reason: "recent-editor-activity-local-only",
 							idleMs,
 						},
-					});
-					// Pauses reset the amplification detector. See spec R3.8.
-					this.amplificationHistory.delete(file.path);
-					return true;
-				}
+						});
+						// Pauses reset the amplification detector. See spec R3.8.
+						this.amplificationHistory.delete(file.path);
+						return {
+							kind: "deferred",
+							deferUntil: lastEditorActivityLocalOnly + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS,
+							reason: "recent-editor-activity-local-only",
+						};
+					}
 
 				if (this.deps.shouldBlockFrontmatterIngest(
 					file.path,
 					crdtContent ?? "",
 					content,
 					"bound-file-local-only-divergence",
-				)) {
-					this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-local-only-divergence");
-					this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
-					return true;
-				}
+					)) {
+						this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-local-only-divergence");
+						this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
+						return { kind: "handled" };
+					}
 				this.deps.log(
 					`syncFileFromDisk: recovering "${file.path}" ` +
 					`(editor-bound local-only divergence: ${crdtContent?.length ?? 0} -> ${content.length} chars)`,
@@ -2512,17 +2809,17 @@ export class ReconciliationController {
 					"bound-file-local-only-divergence",
 					crdtContent?.length ?? 0,
 					content.length,
-				)) {
-					return true;
-				}
-				if (this.shouldQuarantineRepeatedRecovery(
+					)) {
+						return { kind: "handled" };
+					}
+					if (this.shouldQuarantineRepeatedRecovery(
 					file.path,
 					"bound-file-local-only-divergence",
 					crdtContent ?? "",
 					content,
-				)) {
-					return true;
-				}
+					)) {
+						return { kind: "handled" };
+					}
 				// recovery.apply.start: before the actual diff application
 				this.deps.recordFlightPathEvent?.({
 					priority: "important",
@@ -2577,11 +2874,11 @@ export class ReconciliationController {
 					null,
 					content,
 					"bound-file-local-only-seed",
-				)) {
-					this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-local-only-seed");
-					this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
-					return true;
-				}
+					)) {
+						this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-local-only-seed");
+						this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
+						return { kind: "handled" };
+					}
 				this.deps.log(
 					`syncFileFromDisk: recovering "${file.path}" ` +
 					`(editor-bound, missing CRDT text: seeding ${content.length} chars)`,
@@ -2608,9 +2905,9 @@ export class ReconciliationController {
 					"bound-file-local-only-seed",
 					"",
 					content,
-				)) {
-					return true;
-				}
+					)) {
+						return { kind: "handled" };
+					}
 				this.deps.recordFlightPathEvent?.({
 					priority: "important",
 					kind: PRODUCT_EVENT_KIND.recoveryApplyStart,
@@ -2695,13 +2992,75 @@ export class ReconciliationController {
 			}
 
 			this.deps.scheduleTraceStateSnapshot("bound-file-desync-recovery");
-			return true;
+			return {
+				kind: "handled",
+				settledContent: yTextToString(vaultSync?.getTextForPath(file.path)) === content
+					? content
+					: undefined,
+			};
 		}
 
-		const crdtOnlyViews = viewStates.filter(
-			(state) => state.editorMatchesCrdt && !state.editorMatchesDisk,
-		);
 		if (crdtOnlyViews.length > 0) {
+			if (existingText && openBoundAction?.kind === "apply-crdt-to-disk") {
+				if (openBoundAction.preserveDisk) {
+					const preserved = await this.preserveOpenBoundPlannerConflict({
+						file,
+						diskContent: content,
+						crdtContent: crdtContent ?? "",
+						targetContent: undefined,
+						reason: `bound-file-${openBoundAction.reason}`,
+						preserveDisk: true,
+						preserveCrdt: false,
+						editorViewCount: viewStates.length,
+						distinctEditorContentCount: distinctEditorContentsForPlanner.length,
+						chosenSource: "crdt",
+					});
+					if (!preserved) {
+						return { kind: "handled" };
+					}
+				}
+				this.deps.scheduleTraceStateSnapshot("bound-file-open-planner-crdt-wins");
+				return { kind: "flush-crdt-to-disk" };
+			}
+
+			if (existingText && openBoundAction?.kind === "editor-wins-preserve") {
+				const preserved = await this.preserveOpenBoundPlannerConflict({
+					file,
+					diskContent: content,
+					crdtContent: crdtContent ?? "",
+					targetContent: undefined,
+					reason: `bound-file-${openBoundAction.reason}`,
+					preserveDisk: !!openBoundAction.preserveDisk,
+					preserveCrdt: !!openBoundAction.preserveCrdt,
+					editorViewCount: viewStates.length,
+					distinctEditorContentCount: distinctEditorContentsForPlanner.length,
+					chosenSource: "crdt",
+				});
+				if (!preserved) {
+					return { kind: "handled" };
+				}
+				this.deps.scheduleTraceStateSnapshot("bound-file-open-planner-editor-crdt-wins");
+				return { kind: "flush-crdt-to-disk" };
+			}
+
+			if (existingText && openBoundAction?.kind === "import-disk-to-crdt" && openBoundAction.preserveCrdt) {
+				const preserved = await this.preserveOpenBoundPlannerConflict({
+					file,
+					diskContent: content,
+					crdtContent: crdtContent ?? "",
+					targetContent: undefined,
+					reason: `bound-file-${openBoundAction.reason}`,
+					preserveDisk: false,
+					preserveCrdt: true,
+					editorViewCount: viewStates.length,
+					distinctEditorContentCount: distinctEditorContentsForPlanner.length,
+					chosenSource: "disk",
+				});
+				if (!preserved) {
+					return { kind: "handled" };
+				}
+			}
+
 			const lastEditorActivity = editorBindings?.getLastEditorActivityForPath(file.path) ?? null;
 			const hasRecentEditorActivity = lastEditorActivity != null
 				&& (Date.now() - lastEditorActivity) < OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS;
@@ -2721,9 +3080,13 @@ export class ReconciliationController {
 							reason: "recent-editor-activity",
 							idleMs: Date.now() - lastEditorActivity,
 						},
-					});
-				return true;
-			}
+						});
+					return {
+						kind: "deferred",
+						deferUntil: lastEditorActivity + OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS,
+						reason: "recent-editor-activity",
+					};
+				}
 
 			if (existingText) {
 				if (this.deps.shouldBlockFrontmatterIngest(
@@ -2731,11 +3094,11 @@ export class ReconciliationController {
 					crdtContent ?? "",
 					content,
 					"bound-file-open-idle-disk-recovery",
-				)) {
-					this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-open-idle-disk-recovery");
-					this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
-					return true;
-				}
+					)) {
+						this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-open-idle-disk-recovery");
+						this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
+						return { kind: "handled" };
+					}
 				this.deps.log(
 					`syncFileFromDisk: recovering "${file.path}" ` +
 					`(editor-bound external disk edit while idle: ${crdtContent?.length ?? 0} -> ${content.length} chars)`,
@@ -2768,9 +3131,9 @@ export class ReconciliationController {
 					"bound-file-open-idle-disk-recovery",
 					crdtContent ?? "",
 					content,
-				)) {
-					return true;
-				}
+					)) {
+						return { kind: "handled" };
+					}
 				this.deps.recordFlightPathEvent?.({
 					priority: "important",
 					kind: PRODUCT_EVENT_KIND.recoveryApplyStart,
@@ -2824,11 +3187,11 @@ export class ReconciliationController {
 					null,
 					content,
 					"bound-file-open-idle-seed",
-				)) {
-					this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-open-idle-seed");
-					this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
-					return true;
-				}
+					)) {
+						this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-open-idle-seed");
+						this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
+						return { kind: "handled" };
+					}
 				this.deps.log(
 					`syncFileFromDisk: recovering "${file.path}" ` +
 					`(editor-bound idle disk edit, missing CRDT text: seeding ${content.length} chars)`,
@@ -2855,9 +3218,9 @@ export class ReconciliationController {
 					"bound-file-open-idle-seed",
 					"",
 					content,
-				)) {
-					return true;
-				}
+					)) {
+						return { kind: "handled" };
+					}
 				vaultSync?.ensureFile(
 					file.path,
 					content,
@@ -2882,7 +3245,12 @@ export class ReconciliationController {
 			}
 			this.boundRecoveryLocks.set(file.path, Date.now() + BOUND_RECOVERY_LOCK_MS);
 			this.deps.scheduleTraceStateSnapshot("bound-file-open-idle-disk-recovery");
-			return true;
+			return {
+				kind: "handled",
+				settledContent: yTextToString(vaultSync?.getTextForPath(file.path)) === content
+					? content
+					: undefined,
+			};
 		}
 
 		this.deps.trace("trace", "bound-file-ambiguous-divergence", {
@@ -3046,7 +3414,7 @@ export class ReconciliationController {
 		});
 		this.deps.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, ambiguous divergence)`);
 		this.deps.scheduleTraceStateSnapshot("bound-file-ambiguous");
-		return true;
+		return { kind: "handled" };
 	}
 
 	/**

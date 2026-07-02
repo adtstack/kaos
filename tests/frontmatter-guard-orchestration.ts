@@ -49,6 +49,7 @@
  *     fixed string.
  */
 
+import { createHash } from "node:crypto";
 import { MarkdownView, TFile } from "obsidian";
 import * as Y from "yjs";
 import { ReconciliationController } from "../src/runtime/reconciliationController";
@@ -92,6 +93,10 @@ function makeTFile(path: string): TFile {
 	const file = new TFile() as TFile & { path: string };
 	file.path = path;
 	return file;
+}
+
+function baselineHashSync(content: string): string {
+	return createHash("sha256").update(content, "utf8").digest("hex");
 }
 
 interface CapturedEvent {
@@ -186,6 +191,16 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 	let editorContent = options.editor;
 	let blockPredicate: BlockPredicate = options.shouldBlock;
 	let diskIngestPort: DiskIngestPort | null = null;
+	let diskIndex: Record<string, { mtime: number; size: number; contentHash?: string }> =
+		options.crdt === null
+			? {}
+			: {
+				[path]: {
+					mtime: 0,
+					size: options.crdt.length,
+					contentHash: baselineHashSync(options.crdt),
+				},
+			};
 
 	const doc = new Y.Doc();
 	let ytext: Y.Text | null = null;
@@ -324,14 +339,18 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 		}) as never,
 		getVaultSync: () => vaultSync as never,
 		getDiskMirror: () => ({
+			shouldSuppressCreate: async () => false,
+			shouldSuppressModify: async () => false,
 			isPreservedUnresolved: () => false,
 			clearPreservedUnresolved: () => {},
 			flushWrite: async () => {},
 		}) as never,
 		getBlobSync: () => null,
 		getEditorBindings: () => editorBindings as never,
-		getDiskIndex: () => ({}),
-		setDiskIndex: () => {},
+		getDiskIndex: () => diskIndex,
+		setDiskIndex: (next: Record<string, { mtime: number; size: number; contentHash?: string }>) => {
+			diskIndex = next;
+		},
 		isMarkdownPathSyncable: () => true,
 		shouldBlockFrontmatterIngest: (
 			p: string,
