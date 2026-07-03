@@ -1,6 +1,6 @@
 import { App, MarkdownView, Notice, TFile } from "obsidian";
 import type { BlobSyncManager } from "../sync/blobSync";
-import type { DiskMirror } from "../sync/diskMirror";
+import type { DiskMirror, DiskWriteResult } from "../sync/diskMirror";
 import {
 	type DiskIndex,
 	collectFileStats,
@@ -128,7 +128,12 @@ type BoundFileSyncGapOutcome =
 	| { kind: "not-handled" }
 	| { kind: "handled"; settledContent?: string }
 	| { kind: "deferred"; deferUntil: number; reason: string }
-	| { kind: "flush-crdt-to-disk" };
+	| { kind: "flush-crdt-to-disk"; provisionalBaseline?: boolean; reason: string };
+
+interface MarkdownConflictArtifactResult {
+	path: string;
+	created: boolean;
+}
 
 interface ReconciliationControllerDeps {
 	app: App;
@@ -509,6 +514,24 @@ export class ReconciliationController {
 				void this.runReconnectReconciliation(nextVaultSync.connectionGeneration);
 			}
 		}
+	}
+
+	private isDiskWriteSettled(result: DiskWriteResult | undefined): boolean {
+		return result?.kind === "written" || result?.kind === "unchanged";
+	}
+
+	private traceDiskWriteNotSettled(
+		path: string,
+		result: DiskWriteResult | undefined,
+		reason: string,
+	): void {
+		this.deps.trace("reconcile", "disk-write-not-settled", {
+			path,
+			reason,
+			resultKind: result?.kind ?? "missing-disk-mirror",
+			resultReason: result && "reason" in result ? result.reason : null,
+			error: result?.kind === "failed" ? result.error : null,
+		});
 	}
 
 	private async applyNoEventStructuralPrepass(input: {
@@ -947,8 +970,14 @@ export class ReconciliationController {
 							conflictRisk: "none",
 						},
 					});
-					await diskMirror.flushWrite(path);
-					flushedCreates++;
+					const writeResult = await diskMirror.flushWrite(path);
+					if (!this.isDiskWriteSettled(writeResult)) {
+						this.traceDiskWriteNotSettled(path, writeResult, "crdt-file-missing-on-disk");
+						continue;
+					}
+					if (writeResult.kind === "written") {
+						flushedCreates++;
+					}
 					// Record settled baseline hash: CRDT content was written to disk
 					const ytext = vaultSync.getTextForPath(path);
 					if (ytext) {
@@ -1131,8 +1160,14 @@ export class ReconciliationController {
 								const mergeResult = mergeTexts3(baseText, diskContent, crdtContent);
 								if (mergeResult.kind === "clean-merge") {
 									forceReplaceYText(ytext, mergeResult.mergedText, ORIGIN_DISK_SYNC_RECOVER_BOUND);
-									await diskMirror.flushWrite(path, true);
-									flushedUpdates++;
+									const writeResult = await diskMirror.flushWrite(path, true);
+									if (!this.isDiskWriteSettled(writeResult)) {
+										this.traceDiskWriteNotSettled(path, writeResult, "closed-file-3way-auto-merged");
+										continue;
+									}
+									if (writeResult.kind === "written") {
+										flushedUpdates++;
+									}
 									const mergedHash = await contentBaselineHash(mergeResult.mergedText);
 									recordSettledBaseline(path, mergedHash, mergeResult.mergedText);
 									this.deps.trace("reconcile", "closed-file-3way-auto-merged", {
@@ -1156,12 +1191,13 @@ export class ReconciliationController {
 							}
 							try {
 								const preservedContent = action.preserveSide === "disk" ? diskContent : crdtContent;
-								const conflictPath = await this.createMarkdownConflictArtifact(
+								const conflictArtifact = await this.createMarkdownConflictArtifact(
 									path,
 									preservedContent,
 									`closed-file-${action.reason}`,
 									action.preserveSide,
 								);
+								const conflictPath = conflictArtifact.path;
 								if (baselineHash !== null) {
 									this.deps.recordConflictMergeBase?.(conflictPath, baselineHash);
 								}
@@ -1235,8 +1271,25 @@ export class ReconciliationController {
 					}
 				}
 				for (const { path, baselineActionKind } of updatesToFlush) {
-					await diskMirror.flushWrite(path);
-					flushedUpdates++;
+					const provisionalConflictWinner =
+						baselineActionKind === "conflict-crdt-wins" ||
+						baselineActionKind === "conflict-disk-wins";
+					const writeResult = await diskMirror.flushWrite(path, false, {
+						recordBaseline: !provisionalConflictWinner,
+					});
+					if (!this.isDiskWriteSettled(writeResult)) {
+						this.traceDiskWriteNotSettled(path, writeResult, baselineActionKind);
+						if (provisionalConflictWinner) {
+							diskMirror.recordPreservedUnresolved(
+								path,
+								"conflict-winner-flush-deferred",
+							);
+						}
+						continue;
+					}
+					if (writeResult.kind === "written") {
+						flushedUpdates++;
+					}
 					// Record settled baseline hash: CRDT content was written to disk
 					const ytext = vaultSync.getTextForPath(path);
 					if (ytext) {
@@ -1966,7 +2019,18 @@ export class ReconciliationController {
 					return;
 				}
 				if (boundOutcome.kind === "flush-crdt-to-disk") {
-					await diskMirror?.flushWrite(path, true);
+					const writeResult = await diskMirror?.flushWrite(path, true, {
+						recordBaseline: !boundOutcome.provisionalBaseline,
+					});
+					if (!this.isDiskWriteSettled(writeResult)) {
+						this.traceDiskWriteNotSettled(path, writeResult, boundOutcome.reason);
+						if (boundOutcome.provisionalBaseline) {
+							diskMirror?.recordPreservedUnresolved(
+								path,
+								"conflict-winner-flush-deferred",
+							);
+						}
+					}
 					return;
 				}
 			}
@@ -2271,20 +2335,25 @@ export class ReconciliationController {
 
 		let crdtConflictPath: string | null = null;
 		let diskConflictPath: string | null = null;
+		let conflictArtifactCreated = false;
 		try {
-			crdtConflictPath = await this.createMarkdownConflictArtifact(
+			const crdtConflict = await this.createMarkdownConflictArtifact(
 				path,
 				crdtContent,
 				"open-file-reconcile-editor-wins",
 				"crdt",
 			);
+			crdtConflictPath = crdtConflict.path;
+			conflictArtifactCreated ||= crdtConflict.created;
 			if (diskContent !== editorAuthority && diskContent !== crdtContent) {
-				diskConflictPath = await this.createMarkdownConflictArtifact(
+				const diskConflict = await this.createMarkdownConflictArtifact(
 					path,
 					diskContent,
 					"open-file-reconcile-editor-wins",
 					"disk",
 				);
+				diskConflictPath = diskConflict.path;
+				conflictArtifactCreated ||= diskConflict.created;
 			}
 		} catch (err) {
 			this.deps.trace("conflict", "open-file-reconcile-preserve-failed", {
@@ -2306,11 +2375,14 @@ export class ReconciliationController {
 			diskLength: diskContent.length,
 			crdtLength: crdtContent.length,
 			convergenceApplied,
+			conflictArtifactCreated,
 		});
-		this.showConflictNotice(
-			`Conflict detected for "${path.split("/").pop()}" — ` +
-			`competing version preserved as conflict note.`,
-		);
+		if (conflictArtifactCreated) {
+			this.showConflictNotice(
+				`Conflict detected for "${path.split("/").pop()}" — ` +
+				`competing version preserved as conflict note.`,
+			);
+		}
 		return true;
 	}
 
@@ -2346,26 +2418,28 @@ export class ReconciliationController {
 
 		try {
 			if (preserveCrdt && crdtContent !== targetContent) {
-				crdtConflictPath = await this.createMarkdownConflictArtifact(
+				const crdtConflict = await this.createMarkdownConflictArtifact(
 					file.path,
 					crdtContent,
 					reason,
 					"crdt",
 				);
-				conflictArtifactCreated = true;
+				crdtConflictPath = crdtConflict.path;
+				conflictArtifactCreated ||= crdtConflict.created;
 			}
 			if (
 				preserveDisk &&
 				diskContent !== targetContent &&
 				diskContent !== crdtContent
 			) {
-				diskConflictPath = await this.createMarkdownConflictArtifact(
+				const diskConflict = await this.createMarkdownConflictArtifact(
 					file.path,
 					diskContent,
 					reason,
 					"disk",
 				);
-				conflictArtifactCreated = true;
+				diskConflictPath = diskConflict.path;
+				conflictArtifactCreated ||= diskConflict.created;
 			}
 		} catch (err) {
 			conflictError = err instanceof Error ? err.message : String(err);
@@ -2576,6 +2650,7 @@ export class ReconciliationController {
 		const crdtOnlyViews = viewStates.filter(
 			(state) => state.editorMatchesCrdt && !state.editorMatchesDisk,
 		);
+		let plannerConflictPreserved = false;
 		if (
 			openBoundAction?.kind === "defer-recent-editor" &&
 			localOnlyViews.length === 0 &&
@@ -2648,9 +2723,14 @@ export class ReconciliationController {
 					if (!preserved) {
 						return { kind: "handled" };
 					}
+					plannerConflictPreserved = true;
 				}
 				this.deps.scheduleTraceStateSnapshot("bound-file-open-planner-crdt-wins");
-				return { kind: "flush-crdt-to-disk" };
+				return {
+					kind: "flush-crdt-to-disk",
+					provisionalBaseline: plannerConflictPreserved,
+					reason: `bound-file-${openBoundAction.reason}`,
+				};
 			}
 
 			if (existingText && openBoundAction?.kind === "editor-wins-preserve") {
@@ -2673,8 +2753,11 @@ export class ReconciliationController {
 					distinctEditorContentCount: distinctEditorContentsForPlanner.length,
 					chosenSource: "editor",
 				});
+				if (!preserved) {
+					return { kind: "handled" };
+				}
 				this.deps.scheduleTraceStateSnapshot("bound-file-open-planner-editor-wins");
-				return { kind: "handled", settledContent: preserved && editorAuthority === content ? editorAuthority : undefined };
+				return { kind: "handled" };
 			}
 
 			if (existingText && openBoundAction?.kind === "import-disk-to-crdt" && openBoundAction.preserveCrdt) {
@@ -2693,6 +2776,7 @@ export class ReconciliationController {
 				if (!preserved) {
 					return { kind: "handled" };
 				}
+				plannerConflictPreserved = true;
 			}
 
 			if (existingText) {
@@ -2989,12 +3073,13 @@ export class ReconciliationController {
 						"bound-file-local-only-divergence",
 					);
 				}
-			}
+				}
 
 			this.deps.scheduleTraceStateSnapshot("bound-file-desync-recovery");
 			return {
 				kind: "handled",
-				settledContent: yTextToString(vaultSync?.getTextForPath(file.path)) === content
+				settledContent: !plannerConflictPreserved &&
+					yTextToString(vaultSync?.getTextForPath(file.path)) === content
 					? content
 					: undefined,
 			};
@@ -3018,9 +3103,14 @@ export class ReconciliationController {
 					if (!preserved) {
 						return { kind: "handled" };
 					}
+					plannerConflictPreserved = true;
 				}
 				this.deps.scheduleTraceStateSnapshot("bound-file-open-planner-crdt-wins");
-				return { kind: "flush-crdt-to-disk" };
+				return {
+					kind: "flush-crdt-to-disk",
+					provisionalBaseline: plannerConflictPreserved,
+					reason: `bound-file-${openBoundAction.reason}`,
+				};
 			}
 
 			if (existingText && openBoundAction?.kind === "editor-wins-preserve") {
@@ -3039,8 +3129,13 @@ export class ReconciliationController {
 				if (!preserved) {
 					return { kind: "handled" };
 				}
+				plannerConflictPreserved = true;
 				this.deps.scheduleTraceStateSnapshot("bound-file-open-planner-editor-crdt-wins");
-				return { kind: "flush-crdt-to-disk" };
+				return {
+					kind: "flush-crdt-to-disk",
+					provisionalBaseline: true,
+					reason: `bound-file-${openBoundAction.reason}`,
+				};
 			}
 
 			if (existingText && openBoundAction?.kind === "import-disk-to-crdt" && openBoundAction.preserveCrdt) {
@@ -3059,6 +3154,7 @@ export class ReconciliationController {
 				if (!preserved) {
 					return { kind: "handled" };
 				}
+				plannerConflictPreserved = true;
 			}
 
 			const lastEditorActivity = editorBindings?.getLastEditorActivityForPath(file.path) ?? null;
@@ -3247,7 +3343,8 @@ export class ReconciliationController {
 			this.deps.scheduleTraceStateSnapshot("bound-file-open-idle-disk-recovery");
 			return {
 				kind: "handled",
-				settledContent: yTextToString(vaultSync?.getTextForPath(file.path)) === content
+				settledContent: !plannerConflictPreserved &&
+					yTextToString(vaultSync?.getTextForPath(file.path)) === content
 					? content
 					: undefined,
 			};
@@ -3334,25 +3431,27 @@ export class ReconciliationController {
 						if (existingCrdtConflictPath !== null) {
 							conflictPath = existingCrdtConflictPath;
 						} else {
-							conflictPath = await this.createMarkdownConflictArtifact(
+							const crdtConflict = await this.createMarkdownConflictArtifact(
 								file.path,
 								crdtContent,
 								"bound-file-ambiguous-divergence",
 								"crdt",
 							);
-							conflictArtifactCreated = true;
+							conflictPath = crdtConflict.path;
+							conflictArtifactCreated ||= crdtConflict.created;
 						}
 						if (needsDiskConflictArtifact) {
 							if (existingDiskConflictPath !== null) {
 								diskConflictPath = existingDiskConflictPath;
 							} else {
-								diskConflictPath = await this.createMarkdownConflictArtifact(
+								const diskConflict = await this.createMarkdownConflictArtifact(
 									file.path,
 									content,
 									"bound-file-ambiguous-divergence",
 									"disk",
 								);
-								conflictArtifactCreated = true;
+								diskConflictPath = diskConflict.path;
+								conflictArtifactCreated ||= diskConflict.created;
 							}
 						}
 					}
@@ -3652,7 +3751,7 @@ export class ReconciliationController {
 		content: string,
 		reason: string,
 		source?: "crdt" | "disk" | "editor",
-	): Promise<string> {
+	): Promise<MarkdownConflictArtifactResult> {
 		const existing = await this.findExistingMarkdownConflictArtifact(path, content, source);
 		if (existing !== null) {
 			this.deps.trace("conflict", "conflict-artifact-deduped", {
@@ -3662,7 +3761,7 @@ export class ReconciliationController {
 				source: source ?? null,
 				contentFingerprint: contentFingerprint(content),
 			});
-			return existing;
+			return { path: existing, created: false };
 		}
 
 		const basePath = this.conflictArtifactPath(path, source);
@@ -3680,7 +3779,7 @@ export class ReconciliationController {
 				source: source ?? null,
 				contentLength: content.length,
 			});
-			return candidate;
+			return { path: candidate, created: true };
 		}
 		throw new Error(`could not create conflict artifact for ${path}`);
 	}

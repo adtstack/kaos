@@ -10,14 +10,17 @@ import { gzipSync } from "fflate";
 import {
 	applyRecoveryRetention,
 	auditRecoveryStorage,
+	createIndexedRecoverySnapshot,
 	createRecoverySnapshot,
 	getRecoveryContent,
 	getRecoveryManifest,
 	listRecoveryManifestIndexes,
 	recoveryContentKey,
 	selectRecoveryRetention,
+	type PreparedFileHistoryPendingUpload,
 	type RecoveryManifest,
 	type RecoveryManifestEntry,
+	type RecoveryIndexSnapshot,
 } from "../server/src/recoverySnapshot";
 import { sha256Hex } from "../server/src/hex";
 
@@ -599,6 +602,170 @@ async function testChunkedInitialUploadCompletesAcrossCalls(): Promise<void> {
 	doc.destroy();
 }
 
+async function testIndexedFileHistoryUsesDirtySet(): Promise<void> {
+	console.log("\n--- Test 3c: indexed file history hashes only dirty files ---");
+	const bucket = new MemoryR2Bucket();
+	const doc = new Y.Doc();
+	const vaultId = "file-history-indexed-dirty";
+
+	setText(doc, "file-a", "a.md", "alpha");
+	setText(doc, "file-b", "b.md", "bravo");
+	setText(doc, "file-c", "c.md", "charlie");
+
+	const bootstrap = await createIndexedRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:00:00Z"),
+		indexSnapshot: null,
+		dirtyFileIds: [],
+		trustCleanIndex: false,
+	});
+	assertEqual(bootstrap.result.status, "created", "missing index bootstraps with a file history point");
+	assertEqual(bootstrap.fullScanReason, "index_missing", "missing index records a bootstrap full scan reason");
+	assertEqual(bootstrap.metrics.hashedFileCount, 3, "bootstrap hashes every live file once");
+	assertEqual(bootstrap.nextIndexSnapshot?.entries.length, 3, "bootstrap returns a healthy index snapshot");
+
+	const indexSnapshot = bootstrap.nextIndexSnapshot!;
+	const putCountAfterBootstrap = bucket.putOrder.length;
+	bucket.clearGetOrder();
+	bucket.clearHeadOrder();
+	const clean = await createIndexedRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:01:00Z"),
+		indexSnapshot,
+		dirtyFileIds: [],
+		trustCleanIndex: true,
+	});
+	assertEqual(clean.result.status, "noop", "clean healthy index returns noop");
+	assertEqual(clean.metrics.hashedFileCount, 0, "clean healthy index does not hash file content");
+	assertEqual(clean.metrics.buildMs, 0, "clean healthy index skips state building");
+	assertEqual(bucket.getOrder.length, 0, "clean healthy index does not read recovery storage");
+	assertEqual(bucket.putOrder.length, putCountAfterBootstrap, "clean healthy index does not write recovery storage");
+
+	setText(doc, "file-b", "b.md", "bravo v2");
+	const incremental = await createIndexedRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:02:00Z"),
+		indexSnapshot,
+		dirtyFileIds: ["file-b"],
+		trustCleanIndex: true,
+	});
+	assertEqual(incremental.result.status, "created", "dirty file creates an incremental file history point");
+	assertEqual(incremental.metrics.hashedFileCount, 1, "incremental point hashes only the dirty file");
+	assertEqual(incremental.metrics.changedCount, 1, "incremental point records one changed entry");
+	assertEqual(incremental.result.index?.changedCount, 1, "incremental manifest index records one changed entry");
+	const manifest = await getRecoveryManifest(vaultId, incremental.result.manifestId!, bucket as unknown as R2Bucket);
+	assertEqual(manifest?.changedEntries[0]?.fileId, "file-b", "incremental manifest contains only the dirty file");
+	assertEqual(incremental.nextIndexSnapshot?.entries.length, 3, "incremental index keeps unchanged file state");
+
+	doc.destroy();
+}
+
+async function testIndexedPendingUploadReusesPreparedQueue(): Promise<void> {
+	console.log("\n--- Test 3d: indexed pending upload resumes without rebuilding manifest ---");
+	const bucket = new MemoryR2Bucket();
+	const doc = new Y.Doc();
+	const vaultId = "file-history-indexed-pending";
+	const fileIds: string[] = [];
+
+	for (let i = 0; i < 5; i++) {
+		const fileId = `file-${i}`;
+		fileIds.push(fileId);
+		setText(doc, fileId, `${i}.md`, `content ${i}`);
+	}
+
+	const first = await createIndexedRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:00:00Z"),
+		contentUploadLimit: 2,
+		indexSnapshot: null,
+		dirtyFileIds: fileIds,
+		trustCleanIndex: false,
+	});
+	assertEqual(first.result.status, "pending", "first indexed chunk returns pending");
+	assertEqual(first.metrics.hashedFileCount, 5, "first pending preparation hashes the current files once");
+	assertEqual(first.preparedPendingUpload?.contentQueue.length, 5, "pending state stores the prepared content queue");
+	const firstPending = first.preparedPendingUpload as PreparedFileHistoryPendingUpload;
+
+	setText(doc, "file-0", "0.md", "changed after prepare");
+	const second = await createIndexedRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:01:00Z"),
+		contentUploadLimit: 2,
+		indexSnapshot: null,
+		dirtyFileIds: ["file-0"],
+		trustCleanIndex: false,
+		pendingUpload: firstPending,
+	});
+	assertEqual(second.result.status, "pending", "second indexed chunk still returns pending");
+	assertEqual(second.result.manifestId, first.result.manifestId, "second chunk keeps the prepared manifest id");
+	assertEqual(second.metrics.hashedFileCount, 0, "second chunk does not rehash document content");
+	assertEqual(second.metrics.buildMs, 0, "second chunk does not rebuild manifest state");
+	const secondPending = second.preparedPendingUpload as PreparedFileHistoryPendingUpload;
+
+	const third = await createIndexedRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:02:00Z"),
+		contentUploadLimit: 2,
+		indexSnapshot: null,
+		dirtyFileIds: ["file-0"],
+		trustCleanIndex: false,
+		pendingUpload: secondPending,
+	});
+	assertEqual(third.result.status, "created", "final indexed chunk creates the prepared file history point");
+	assertEqual(third.result.manifestId, first.result.manifestId, "final indexed chunk keeps the prepared manifest id");
+	assertEqual(third.metrics.hashedFileCount, 0, "final indexed chunk does not rehash document content");
+	assertEqual(third.nextIndexSnapshot?.entries.length, 5, "final indexed chunk writes the prepared index state");
+	const originalHash = await hashText("content 0");
+	const changedHash = await hashText("changed after prepare");
+	const manifest = await getRecoveryManifest(vaultId, third.result.manifestId!, bucket as unknown as R2Bucket);
+	assert(manifest?.contentHashes.includes(originalHash) === true, "prepared manifest keeps original content hash");
+	assert(manifest?.contentHashes.includes(changedHash) === false, "prepared manifest ignores later document edits during pending retry");
+
+	doc.destroy();
+}
+
+async function testIndexedDirtyRenameDeleteAndRevive(): Promise<void> {
+	console.log("\n--- Test 3e: indexed file history handles dirty rename, delete, and revive ---");
+	const bucket = new MemoryR2Bucket();
+	const doc = new Y.Doc();
+	const vaultId = "file-history-indexed-operations";
+
+	setNestedMetaText(doc, "file-a", "a.md", "alpha");
+	const bootstrap = await createIndexedRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:00:00Z"),
+		indexSnapshot: null,
+		dirtyFileIds: ["file-a"],
+		trustCleanIndex: false,
+	});
+	const bootstrapIndex = bootstrap.nextIndexSnapshot as RecoveryIndexSnapshot;
+	doc.getMap<Y.Map<unknown>>("meta").get("file-a")?.set("path", "renamed.md");
+
+	const renamed = await createIndexedRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:01:00Z"),
+		indexSnapshot: bootstrapIndex,
+		dirtyFileIds: ["file-a"],
+		trustCleanIndex: true,
+	});
+	assertEqual(renamed.result.index?.changedEntries[0]?.kind, "renamed", "dirty meta path change records rename");
+	const renamedIndex = renamed.nextIndexSnapshot as RecoveryIndexSnapshot;
+	doc.getMap<Y.Map<unknown>>("meta").get("file-a")?.set("deleted", true);
+
+	const deleted = await createIndexedRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:02:00Z"),
+		indexSnapshot: renamedIndex,
+		dirtyFileIds: ["file-a"],
+		trustCleanIndex: true,
+	});
+	assertEqual(deleted.result.index?.changedEntries[0]?.kind, "deleted", "dirty meta deleted flag records deletion");
+	const deletedIndex = deleted.nextIndexSnapshot as RecoveryIndexSnapshot;
+	doc.getMap<Y.Map<unknown>>("meta").get("file-a")?.set("deleted", false);
+
+	const revived = await createIndexedRecoverySnapshot(doc, vaultId, bucket as unknown as R2Bucket, {
+		now: new Date("2026-06-20T00:03:00Z"),
+		indexSnapshot: deletedIndex,
+		dirtyFileIds: ["file-a"],
+		trustCleanIndex: true,
+	});
+	assertEqual(revived.result.index?.changedEntries[0]?.kind, "restored", "dirty meta revive records restoration");
+	assertEqual(revived.metrics.hashedFileCount, 1, "dirty meta operations only hash the affected file");
+
+	doc.destroy();
+}
+
 async function testFileHistoryPointerOrder(): Promise<void> {
 	console.log("\n--- Test 4: file history content and pointer write order ---");
 	const bucket = new MemoryR2Bucket();
@@ -829,6 +996,9 @@ await testRenameDeleteAndChainReconstruction();
 await testNestedV3MetaIsSnapshotted();
 await testLargeVaultFollowUpStoresChangedOnly();
 await testChunkedInitialUploadCompletesAcrossCalls();
+await testIndexedFileHistoryUsesDirtySet();
+await testIndexedPendingUploadReusesPreparedQueue();
+await testIndexedDirtyRenameDeleteAndRevive();
 await testFileHistoryPointerOrder();
 await testContentHashVerification();
 await testListIsNewestFirst();

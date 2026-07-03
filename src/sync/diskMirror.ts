@@ -25,6 +25,29 @@ export type RemoteDeleteDecision =
 	| { kind: "preserve-revive"; diskContent: string; contentSource?: "disk" | "editor" }
 	| { kind: "preserve-unresolved" };
 
+export type DiskWriteDeferReason =
+	| "missing-ytext"
+	| "open-editor-mismatch"
+	| "active-editor-unflushed"
+	| "recent-editor-activity"
+	| "crdt-changed-during-write";
+
+export type DiskWriteResult =
+	| { kind: "written"; path: string; isCreate: boolean; contentHash: string; baselineRecorded: boolean }
+	| { kind: "unchanged"; path: string }
+	| { kind: "deferred"; path: string; reason: DiskWriteDeferReason }
+	| { kind: "blocked"; path: string; reason: "frontmatter" }
+	| { kind: "failed"; path: string; error: string };
+
+export interface DiskWriteOptions {
+	/**
+	 * Whether a successful write should immediately advance the persisted
+	 * baseline. Conflict winners pass false so the next reconcile must first
+	 * observe disk == CRDT before teaching the disk index that the state is clean.
+	 */
+	recordBaseline?: boolean;
+}
+
 type OpenEditorAuthority =
 	| { kind: "none" }
 	| { kind: "single"; content: string }
@@ -125,7 +148,7 @@ export class DiskMirror {
 	/** True while the drain loop is running. */
 	private draining = false;
 	private drainPromise: Promise<void> | null = null;
-	private pathWriteLocks = new Map<string, Promise<void>>();
+	private pathWriteLocks = new Map<string, Promise<unknown>>();
 
 	/** Per-file Y.Text observers. Only attached for open/active files. */
 	private textObservers = new Map<
@@ -509,23 +532,32 @@ export class DiskMirror {
 	// Disk write
 	// -------------------------------------------------------------------
 
-	async flushWrite(path: string, force = false): Promise<void> {
+	async flushWrite(
+		path: string,
+		force = false,
+		options: DiskWriteOptions = {},
+	): Promise<DiskWriteResult> {
 		path = normalizePath(path);
-		return this.runPathWriteLocked(path, () => this.flushWriteUnlocked(path, force));
+		return this.runPathWriteLocked(path, () => this.flushWriteUnlocked(path, force, options));
 	}
 
-	private async flushWriteUnlocked(path: string, force: boolean): Promise<void> {
+	private async flushWriteUnlocked(
+		path: string,
+		force: boolean,
+		options: DiskWriteOptions,
+	): Promise<DiskWriteResult> {
 		const normalized = normalizePath(path);
 
 		for (let attempt = 0; attempt < 3; attempt++) {
 			const ytext = this.vaultSync.getTextForPath(path);
 			if (!ytext) {
 				this.log(`flushWrite: no Y.Text for "${path}", skipping`);
-				return;
+				return { kind: "deferred", path: normalized, reason: "missing-ytext" };
 			}
 			const content = ytext.toJSON();
-			if (this.shouldDeferOpenWrite(path, content, force, "preflight")) {
-				return;
+			const preflightDefer = this.getOpenWriteDeferral(path, content, force, "preflight");
+			if (preflightDefer) {
+				return preflightDefer;
 			}
 
 			try {
@@ -533,15 +565,16 @@ export class DiskMirror {
 				if (existing instanceof TFile) {
 					const currentContent = await this.app.vault.read(existing);
 					if (this.didCrdtChangeDuringWrite(path, content, "read")) continue;
-					if (this.shouldDeferOpenWrite(path, content, force, "post-read")) {
-						return;
+					const postReadDefer = this.getOpenWriteDeferral(path, content, force, "post-read");
+					if (postReadDefer) {
+						return postReadDefer;
 					}
 					if (currentContent === content) {
 						this.log(`flushWrite: "${path}" unchanged, skipping`);
-						return;
+						return { kind: "unchanged", path: normalized };
 					}
 					if (this.shouldBlockFrontmatterWrite(path, currentContent, content)) {
-						return;
+						return { kind: "blocked", path: normalized, reason: "frontmatter" };
 					}
 
 					await this.suppressWrite(path, content);
@@ -549,14 +582,19 @@ export class DiskMirror {
 						this.suppressedPaths.delete(normalized);
 						continue;
 					}
-					if (this.shouldDeferOpenWrite(path, content, force, "pre-modify")) {
+					const preModifyDefer = this.getOpenWriteDeferral(path, content, force, "pre-modify");
+					if (preModifyDefer) {
 						this.suppressedPaths.delete(normalized);
-						return;
+						return preModifyDefer;
 					}
 					await this.app.vault.modify(existing, content);
 					this.log(`flushWrite: updated "${path}" (${content.length} chars)`);
 					this.lastDiskWriteOkAt.set(normalized, Date.now());
-					this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content), content);
+					const contentHash = await contentBaselineHash(content);
+					const baselineRecorded = options.recordBaseline !== false;
+					if (baselineRecorded) {
+						this._onDiskWriteCallback?.(normalized, contentHash, content);
+					}
 					this._flightEventHandler?.({
 						priority: "important",
 						kind: "disk.write.ok",
@@ -565,11 +603,12 @@ export class DiskMirror {
 						source: "diskMirror",
 						layer: "disk",
 						path: normalized,
-						data: { contentLength: content.length, isCreate: false },
+						data: { contentLength: content.length, isCreate: false, baselineRecorded },
 					});
+					return { kind: "written", path: normalized, isCreate: false, contentHash, baselineRecorded };
 				} else {
 					if (this.shouldBlockFrontmatterWrite(path, null, content)) {
-						return;
+						return { kind: "blocked", path: normalized, reason: "frontmatter" };
 					}
 					const dir = normalized.substring(0, normalized.lastIndexOf("/"));
 					if (dir) {
@@ -584,24 +623,30 @@ export class DiskMirror {
 						continue;
 					}
 					if (this.didCrdtChangeDuringWrite(path, content, "create-folder")) continue;
-					if (this.shouldDeferOpenWrite(path, content, force, "pre-create")) {
-						return;
+					const preCreateDefer = this.getOpenWriteDeferral(path, content, force, "pre-create");
+					if (preCreateDefer) {
+						return preCreateDefer;
 					}
 					await this.suppressWrite(path, content);
 					if (this.didCrdtChangeDuringWrite(path, content, "suppress")) {
 						this.suppressedPaths.delete(normalized);
 						continue;
 					}
-					if (this.shouldDeferOpenWrite(path, content, force, "pre-create-write")) {
+					const preCreateWriteDefer = this.getOpenWriteDeferral(path, content, force, "pre-create-write");
+					if (preCreateWriteDefer) {
 						this.suppressedPaths.delete(normalized);
-						return;
+						return preCreateWriteDefer;
 					}
 					await this.app.vault.create(normalized, content);
 					this.log(
 						`flushWrite: created "${path}" on disk (${content.length} chars)`,
 					);
 					this.lastDiskWriteOkAt.set(normalized, Date.now());
-					this._onDiskWriteCallback?.(normalized, await contentBaselineHash(content), content);
+					const contentHash = await contentBaselineHash(content);
+					const baselineRecorded = options.recordBaseline !== false;
+					if (baselineRecorded) {
+						this._onDiskWriteCallback?.(normalized, contentHash, content);
+					}
 					this._flightEventHandler?.({
 						priority: "important",
 						kind: "disk.write.ok",
@@ -610,12 +655,13 @@ export class DiskMirror {
 						source: "diskMirror",
 						layer: "disk",
 						path: normalized,
-						data: { contentLength: content.length, isCreate: true },
+						data: { contentLength: content.length, isCreate: true, baselineRecorded },
 					});
+					return { kind: "written", path: normalized, isCreate: true, contentHash, baselineRecorded };
 				}
-				return;
 			} catch (err) {
 				console.error(`[kaos] flushWrite failed for "${path}":`, err);
+				const error = err instanceof Error ? err.message : String(err);
 				this._flightEventHandler?.({
 					priority: "critical",
 					kind: "disk.write.failed",
@@ -624,9 +670,9 @@ export class DiskMirror {
 					source: "diskMirror",
 					layer: "disk",
 					path: normalized,
-					data: { error: err instanceof Error ? err.message : String(err) },
+					data: { error },
 				});
-				return;
+				return { kind: "failed", path: normalized, error };
 			}
 		}
 
@@ -634,6 +680,7 @@ export class DiskMirror {
 		if (!force) {
 			this.scheduleWrite(path);
 		}
+		return { kind: "deferred", path: normalized, reason: "crdt-changed-during-write" };
 	}
 
 	private didCrdtChangeDuringWrite(
@@ -654,14 +701,15 @@ export class DiskMirror {
 		return true;
 	}
 
-	private shouldDeferOpenWrite(
+	private getOpenWriteDeferral(
 		path: string,
 		content: string,
 		force: boolean,
 		phase: string,
-	): boolean {
+	): DiskWriteResult | null {
+		const normalized = normalizePath(path);
 		const isOpenOrViewed = this.openPaths.has(path) || this.isOpenInWorkspace(path);
-		if (!isOpenOrViewed) return false;
+		if (!isOpenOrViewed) return null;
 
 		if (this.hasOpenEditorContentMismatch(path, content)) {
 			this.log(
@@ -671,10 +719,10 @@ export class DiskMirror {
 			if (!force) {
 				this.scheduleOpenWrite(path);
 			}
-			return true;
+			return { kind: "deferred", path: normalized, reason: "open-editor-mismatch" };
 		}
 
-		if (force) return false;
+		if (force) return null;
 
 		if (
 			this.isActivelyViewedPath(path)
@@ -685,15 +733,15 @@ export class DiskMirror {
 				`(active editor has unflushed changes, phase=${phase})`,
 			);
 			this.scheduleOpenWrite(path);
-			return true;
+			return { kind: "deferred", path: normalized, reason: "active-editor-unflushed" };
 		}
 		if (this.hasRecentEditorActivity(path)) {
 			this.log(`flushWrite: deferring open "${path}" (recent editor activity, phase=${phase})`);
 			this.scheduleOpenWrite(path);
-			return true;
+			return { kind: "deferred", path: normalized, reason: "recent-editor-activity" };
 		}
 
-		return false;
+		return null;
 	}
 
 	private shouldBlockFrontmatterWrite(
@@ -1625,12 +1673,12 @@ export class DiskMirror {
 		};
 	}
 
-	private runPathWriteLocked(path: string, work: () => Promise<void>): Promise<void> {
+	private runPathWriteLocked<T>(path: string, work: () => Promise<T>): Promise<T> {
 		// All flush paths funnel through one per-path promise chain so direct
 		// flushes cannot overlap with queued writes for the same file.
 		const previous = this.pathWriteLocks.get(path) ?? Promise.resolve();
 		const next = previous.catch(() => undefined).then(work);
-		let tracked: Promise<void>;
+		let tracked: Promise<T>;
 		tracked = next.finally(() => {
 			if (this.pathWriteLocks.get(path) === tracked) {
 				this.pathWriteLocks.delete(path);

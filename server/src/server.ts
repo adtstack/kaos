@@ -15,9 +15,12 @@ import {
 import {
 	applyRecoveryRetention,
 	auditRecoveryStorage,
-	createRecoverySnapshot,
+	createIndexedRecoverySnapshot,
 	decodeRecoveryFileMeta,
-	type FileHistoryPendingUpload,
+	type PreparedFileHistoryPendingUpload,
+	type RecoveryIndexSnapshot,
+	type RecoveryStateEntry,
+	type RecoveryStorageAuditStatus,
 	type RecoverySnapshotResult,
 } from "./recoverySnapshot";
 import {
@@ -43,6 +46,9 @@ const JOURNAL_COMPACT_MAX_BYTES = 1 * 1024 * 1024;
 const TRACE_DEBUG_LIMIT = 100;
 const LOG_PREFIX = "[kaos-sync:server]";
 const RECOVERY_SNAPSHOT_CONTENT_UPLOAD_LIMIT = 5000;
+const RECOVERY_AUTOMATIC_BOOTSTRAP_FILE_LIMIT = 1000;
+const RECOVERY_INDEX_KEY = "recovery:index:v1";
+const RECOVERY_DIRTY_KEY = "recovery:dirty:v1";
 const RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY = "recoverySnapshotPendingUpload";
 
 /**
@@ -78,14 +84,96 @@ type ServerPersistenceHealth = PersistenceHealth & {
 	legacyDocumentMigrated: boolean;
 };
 
-function isFileHistoryPendingUpload(value: unknown): value is FileHistoryPendingUpload {
+type RecoveryIndexRecord = {
+	storageVersion: "index-v1";
+	manifestId: string | null;
+	stateHash: string | null;
+	entries: RecoveryStateEntry[];
+	updatedAt: string;
+};
+
+type RecoveryDirtyRecord = {
+	storageVersion: "dirty-v1";
+	nextSeq: number;
+	entries: Array<{ fileId: string; seq: number }>;
+	updatedAt: string;
+};
+
+type RecoveryIndexHealth = "unknown" | "healthy" | "rebuilding";
+
+function isRecoveryStateEntry(value: unknown): value is RecoveryStateEntry {
 	if (typeof value !== "object" || value === null) return false;
-	const candidate = value as Partial<FileHistoryPendingUpload>;
-	return typeof candidate.manifestId === "string" &&
+	const candidate = value as Partial<RecoveryStateEntry>;
+	return typeof candidate.fileId === "string" &&
+		typeof candidate.path === "string" &&
+		(candidate.contentHash === undefined || typeof candidate.contentHash === "string") &&
+		(candidate.deleted === undefined || typeof candidate.deleted === "boolean") &&
+		(candidate.size === undefined || typeof candidate.size === "number") &&
+		(candidate.mtime === undefined || typeof candidate.mtime === "number") &&
+		(candidate.device === undefined || typeof candidate.device === "string");
+}
+
+function isRecoveryIndexRecord(value: unknown): value is RecoveryIndexRecord {
+	if (typeof value !== "object" || value === null) return false;
+	const candidate = value as Partial<RecoveryIndexRecord>;
+	return candidate.storageVersion === "index-v1" &&
+		(candidate.manifestId === null || typeof candidate.manifestId === "string") &&
+		(candidate.stateHash === null || typeof candidate.stateHash === "string") &&
+		Array.isArray(candidate.entries) &&
+		candidate.entries.every(isRecoveryStateEntry) &&
+		typeof candidate.updatedAt === "string";
+}
+
+function isRecoveryDirtyRecord(value: unknown): value is RecoveryDirtyRecord {
+	if (typeof value !== "object" || value === null) return false;
+	const candidate = value as Partial<RecoveryDirtyRecord>;
+	return candidate.storageVersion === "dirty-v1" &&
+		Number.isInteger(candidate.nextSeq) &&
+		(candidate.nextSeq ?? 0) >= 0 &&
+		Array.isArray(candidate.entries) &&
+		candidate.entries.every((entry) => (
+			typeof entry === "object" &&
+			entry !== null &&
+			typeof (entry as { fileId?: unknown }).fileId === "string" &&
+			Number.isInteger((entry as { seq?: unknown }).seq) &&
+			((entry as { seq: number }).seq) >= 0
+		)) &&
+		typeof candidate.updatedAt === "string";
+}
+
+function isPreparedFileHistoryPendingUpload(value: unknown): value is PreparedFileHistoryPendingUpload {
+	if (typeof value !== "object" || value === null) return false;
+	const candidate = value as Partial<PreparedFileHistoryPendingUpload>;
+	return candidate.storageVersion === "prepared-v1" &&
+		typeof candidate.manifestId === "string" &&
 		typeof candidate.createdAt === "string" &&
 		typeof candidate.day === "string" &&
 		typeof candidate.stateHash === "string" &&
 		(candidate.previousStateHash === undefined || typeof candidate.previousStateHash === "string") &&
+		(candidate.reason === "automatic" ||
+			candidate.reason === "manual" ||
+			candidate.reason === "pre-upgrade" ||
+			candidate.reason === "pre-migration" ||
+			candidate.reason === "pre-bulk-operation") &&
+		typeof candidate.pinned === "boolean" &&
+		(candidate.triggeredBy === undefined || typeof candidate.triggeredBy === "string") &&
+		(candidate.crdtSchemaVersion === undefined || typeof candidate.crdtSchemaVersion === "number") &&
+		Array.isArray(candidate.changedEntries) &&
+		Array.isArray(candidate.contentHashes) &&
+		candidate.contentHashes.every((hash) => typeof hash === "string") &&
+		Array.isArray(candidate.contentQueue) &&
+		candidate.contentQueue.every((entry) => (
+			typeof entry === "object" &&
+			entry !== null &&
+			typeof (entry as { hash?: unknown }).hash === "string" &&
+			typeof (entry as { content?: unknown }).content === "string"
+		)) &&
+		Array.isArray(candidate.persistedState) &&
+		candidate.persistedState.every(isRecoveryStateEntry) &&
+		Array.isArray(candidate.processedDirtyFileIds) &&
+		candidate.processedDirtyFileIds.every((fileId) => typeof fileId === "string") &&
+		(candidate.dirtyWatermark === undefined ||
+			(Number.isInteger(candidate.dirtyWatermark) && candidate.dirtyWatermark >= 0)) &&
 		typeof candidate.uploadedContentCount === "number" &&
 		Number.isInteger(candidate.uploadedContentCount) &&
 		candidate.uploadedContentCount >= 0;
@@ -122,6 +210,29 @@ export class VaultSyncServer extends YServer {
 	private documentUpdateListenerAttached = false;
 	private snapshotMaintenanceChain: Promise<void> = Promise.resolve();
 	private roomMeta: RoomMeta | null = null;
+	private recoveryIndexLoaded = false;
+	private recoveryIndexSnapshot: RecoveryIndexSnapshot | null = null;
+	private recoveryIndexHealth: RecoveryIndexHealth = "unknown";
+	private recoveryDirtyLoaded = false;
+	private recoveryDirtyMarks = new Map<string, number>();
+	private recoveryDirtySeq = 0;
+	private recoveryDirtyFlushTimer: ReturnType<typeof setTimeout> | null = null;
+	private recoveryDirtyFlushPromise: Promise<void> | null = null;
+	private recoveryIndexObserversAttached = false;
+	private recoveryTextObservers = new Map<string, {
+		ytext: Y.Text;
+		handler: (event: unknown, transaction: Y.Transaction) => void;
+	}>();
+	private recoveryLastFullScanReason: string | null = null;
+	private recoveryLastIncrementalChangedCount: number | null = null;
+	private recoveryLastBuildMs: number | null = null;
+	private recoveryLastHashCount: number | null = null;
+	private recoveryLastUploadMs: number | null = null;
+	private recoveryLastPendingProgress: {
+		uploadedContentCount: number;
+		totalContentCount: number;
+		remainingContentCount: number;
+	} | null = null;
 	private readonly traceRateLimiter = new TraceRateLimiter();
 	private readonly svEchoCounters: SvEchoCounters = {
 		baselineSent: 0,
@@ -160,6 +271,7 @@ export class VaultSyncServer extends YServer {
 		if (!result.success) {
 			console.error(`${LOG_PREFIX} save failed (health: degraded, pendingPersistence: true):`, result.error);
 		}
+		await this.flushRecoveryDirtyMarks();
 		await this.syncRoomMetaFromDocument();
 	}
 
@@ -223,6 +335,7 @@ export class VaultSyncServer extends YServer {
 				recent,
 				svEcho: { ...this.svEchoCounters },
 				persistence: serverHealth,
+				recovery: this.recoveryDebugSummary(),
 				documentSummary: this.documentLoaded ? this.getDocumentSummary() : null,
 			});
 		}
@@ -298,6 +411,199 @@ export class VaultSyncServer extends YServer {
 		return super.fetch(request);
 	}
 
+	private async ensureRecoveryIndexLoaded(): Promise<void> {
+		if (this.recoveryIndexLoaded) return;
+		const raw = await this.ctx.storage.get<unknown>(RECOVERY_INDEX_KEY);
+		if (isRecoveryIndexRecord(raw)) {
+			this.recoveryIndexSnapshot = {
+				manifestId: raw.manifestId,
+				stateHash: raw.stateHash,
+				entries: raw.entries,
+			};
+			this.recoveryIndexHealth = "healthy";
+		} else {
+			this.recoveryIndexSnapshot = null;
+			this.recoveryIndexHealth = "unknown";
+		}
+		this.recoveryIndexLoaded = true;
+	}
+
+	private async writeRecoveryIndexSnapshot(snapshot: RecoveryIndexSnapshot): Promise<void> {
+		const record: RecoveryIndexRecord = {
+			storageVersion: "index-v1",
+			manifestId: snapshot.manifestId,
+			stateHash: snapshot.stateHash,
+			entries: snapshot.entries,
+			updatedAt: new Date().toISOString(),
+		};
+		await this.ctx.storage.put(RECOVERY_INDEX_KEY, record);
+		this.recoveryIndexSnapshot = snapshot;
+		this.recoveryIndexHealth = "healthy";
+		this.recoveryIndexLoaded = true;
+	}
+
+	private async ensureRecoveryDirtyLoaded(): Promise<void> {
+		if (this.recoveryDirtyLoaded) return;
+		const raw = await this.ctx.storage.get<unknown>(RECOVERY_DIRTY_KEY);
+		if (isRecoveryDirtyRecord(raw)) {
+			this.recoveryDirtyMarks = new Map(raw.entries.map((entry) => [entry.fileId, entry.seq]));
+			this.recoveryDirtySeq = raw.nextSeq;
+		} else {
+			this.recoveryDirtyMarks = new Map();
+			this.recoveryDirtySeq = 0;
+		}
+		this.recoveryDirtyLoaded = true;
+	}
+
+	private scheduleRecoveryDirtyFlush(): void {
+		if (this.recoveryDirtyFlushTimer) return;
+		this.recoveryDirtyFlushTimer = setTimeout(() => {
+			this.recoveryDirtyFlushTimer = null;
+			void this.flushRecoveryDirtyMarks();
+		}, 1000);
+	}
+
+	private async flushRecoveryDirtyMarks(): Promise<void> {
+		if (!this.recoveryDirtyLoaded) return;
+		if (this.recoveryDirtyFlushPromise) {
+			await this.recoveryDirtyFlushPromise;
+			return;
+		}
+		this.recoveryDirtyFlushPromise = (async () => {
+			if (this.recoveryDirtyMarks.size === 0) {
+				await this.ctx.storage.delete([RECOVERY_DIRTY_KEY]);
+				return;
+			}
+			const record: RecoveryDirtyRecord = {
+				storageVersion: "dirty-v1",
+				nextSeq: this.recoveryDirtySeq,
+				entries: Array.from(this.recoveryDirtyMarks, ([fileId, seq]) => ({ fileId, seq })),
+				updatedAt: new Date().toISOString(),
+			};
+			await this.ctx.storage.put(RECOVERY_DIRTY_KEY, record);
+		})().finally(() => {
+			this.recoveryDirtyFlushPromise = null;
+		});
+		await this.recoveryDirtyFlushPromise;
+	}
+
+	private markRecoveryDirtyFileIds(fileIds: Iterable<string>): void {
+		if (!this.recoveryDirtyLoaded) {
+			// Observers are attached only after ensureRecoveryDirtyLoaded(), but keep
+			// this guard so a future call site cannot accidentally create a partial
+			// in-memory dirty set before storage is read.
+			return;
+		}
+		let changed = false;
+		for (const fileId of fileIds) {
+			if (!fileId) continue;
+			this.recoveryDirtySeq++;
+			this.recoveryDirtyMarks.set(fileId, this.recoveryDirtySeq);
+			changed = true;
+		}
+		if (changed) this.scheduleRecoveryDirtyFlush();
+	}
+
+	private captureRecoveryDirtySnapshot(): { fileIds: string[]; watermark: number } {
+		return {
+			fileIds: Array.from(this.recoveryDirtyMarks.keys()).sort(),
+			watermark: this.recoveryDirtySeq,
+		};
+	}
+
+	private async clearProcessedRecoveryDirtyFileIds(
+		fileIds: string[],
+		watermark: number,
+	): Promise<void> {
+		for (const fileId of fileIds) {
+			const seq = this.recoveryDirtyMarks.get(fileId);
+			if (seq !== undefined && seq <= watermark) {
+				this.recoveryDirtyMarks.delete(fileId);
+			}
+		}
+		await this.flushRecoveryDirtyMarks();
+	}
+
+	private observeRecoveryText(fileId: string, ytext: Y.Text): void {
+		const existing = this.recoveryTextObservers.get(fileId);
+		if (existing?.ytext === ytext) return;
+		if (existing) {
+			existing.ytext.unobserve(existing.handler);
+		}
+		const handler = (): void => {
+			this.markRecoveryDirtyFileIds([fileId]);
+		};
+		ytext.observe(handler);
+		this.recoveryTextObservers.set(fileId, { ytext, handler });
+	}
+
+	private unobserveRecoveryText(fileId: string): void {
+		const existing = this.recoveryTextObservers.get(fileId);
+		if (!existing) return;
+		existing.ytext.unobserve(existing.handler);
+		this.recoveryTextObservers.delete(fileId);
+	}
+
+	private async attachRecoveryIndexObservers(): Promise<void> {
+		if (this.recoveryIndexObserversAttached) return;
+		await this.ensureRecoveryDirtyLoaded();
+		const meta = this.document.getMap<unknown>("meta");
+		const idToText = this.document.getMap<Y.Text>("idToText");
+
+		meta.observeDeep((events) => {
+			const affected = new Set<string>();
+			for (const event of events) {
+				if (event.target === meta) {
+					for (const [fileId] of event.changes.keys) {
+						affected.add(fileId);
+					}
+				} else {
+					const key = event.path[0];
+					if (typeof key === "string") affected.add(key);
+				}
+			}
+			this.markRecoveryDirtyFileIds(affected);
+		});
+
+		idToText.observe((event) => {
+			const affected = new Set<string>();
+			for (const [fileId, change] of event.changes.keys) {
+				affected.add(fileId);
+				if (change.action === "delete") {
+					this.unobserveRecoveryText(fileId);
+					continue;
+				}
+				const ytext = idToText.get(fileId);
+				if (ytext) this.observeRecoveryText(fileId, ytext);
+			}
+			this.markRecoveryDirtyFileIds(affected);
+		});
+
+		idToText.forEach((ytext, fileId) => {
+			this.observeRecoveryText(fileId, ytext);
+		});
+
+		this.recoveryIndexObserversAttached = true;
+	}
+
+	private recoveryDebugSummary(): Record<string, unknown> {
+		return {
+			indexHealth: this.recoveryIndexHealth,
+			indexLoaded: this.recoveryIndexLoaded,
+			dirtyLoaded: this.recoveryDirtyLoaded,
+			dirtyCount: this.recoveryDirtyMarks.size,
+			dirtySeq: this.recoveryDirtySeq,
+			automaticBootstrapFileLimit: RECOVERY_AUTOMATIC_BOOTSTRAP_FILE_LIMIT,
+			indexEntryCount: this.recoveryIndexSnapshot?.entries.length ?? null,
+			lastFullScanReason: this.recoveryLastFullScanReason,
+			lastIncrementalChangedCount: this.recoveryLastIncrementalChangedCount,
+			lastBuildMs: this.recoveryLastBuildMs,
+			lastHashCount: this.recoveryLastHashCount,
+			lastUploadMs: this.recoveryLastUploadMs,
+			pending: this.recoveryLastPendingProgress,
+		};
+	}
+
 	private recordSvEchoResult(result: SvEchoSendResult): void {
 		if (result.ok) {
 			if (result.kind === "baseline") this.svEchoCounters.baselineSent++;
@@ -315,6 +621,7 @@ export class VaultSyncServer extends YServer {
 	private async ensureDocumentLoaded(): Promise<void> {
 		if (this.documentLoaded) {
 			this.attachDocumentUpdateListener();
+			await this.attachRecoveryIndexObservers();
 			return;
 		}
 		const gate = { inFlight: this.loadPromise };
@@ -399,6 +706,7 @@ export class VaultSyncServer extends YServer {
 					this.getPersistenceCoordinator().health.journalBytes = 0;
 					this.documentLoaded = true;
 					this.attachDocumentUpdateListener();
+					await this.attachRecoveryIndexObservers();
 					await this.syncRoomMetaFromDocument();
 					await this.recordTrace("legacy-document-migrated", {
 						legacyBytes: legacyBytes.byteLength,
@@ -436,6 +744,7 @@ export class VaultSyncServer extends YServer {
 			this.getPersistenceCoordinator().health.journalBytes = state.journalStats.totalBytes;
 			this.documentLoaded = true;
 			this.attachDocumentUpdateListener();
+			await this.attachRecoveryIndexObservers();
 			await this.syncRoomMetaFromDocument();
 			await this.recordTrace("checkpoint-load", {
 				hasCheckpoint: state.checkpoint !== null,
@@ -478,6 +787,21 @@ export class VaultSyncServer extends YServer {
 			}
 		});
 		return count;
+	}
+
+	private estimateRecoveryFileCount(): number {
+		const meta = this.document.getMap<unknown>("meta");
+		const pathToId = this.document.getMap<string>("pathToId");
+		const idToText = this.document.getMap<Y.Text>("idToText");
+		let activeMetaCount = 0;
+		meta.forEach((value: unknown) => {
+			const decoded = decodeRecoveryFileMeta(value);
+			if (!decoded || typeof decoded.path !== "string" || decoded.path.length === 0) return;
+			const isDeleted = decoded.deleted === true ||
+				(typeof decoded.deletedAt === "number" && Number.isFinite(decoded.deletedAt));
+			if (!isDeleted) activeMetaCount++;
+		});
+		return Math.max(activeMetaCount, pathToId.size, idToText.size);
 	}
 
 	/** Check if doc has any semantic file state: meta entries, pathToId, or idToText. */
@@ -780,14 +1104,22 @@ export class VaultSyncServer extends YServer {
 				}
 
 				const vaultId = this.getRoomId();
+				await this.ensureRecoveryIndexLoaded();
+				await this.ensureRecoveryDirtyLoaded();
+
 				const pendingRaw = await this.ctx.storage.get<unknown>(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY);
-				const pendingUpload = isFileHistoryPendingUpload(pendingRaw) ? pendingRaw : null;
+				const pendingUpload = isPreparedFileHistoryPendingUpload(pendingRaw) ? pendingRaw : null;
+				if (pendingRaw !== undefined && !pendingUpload) {
+					await this.ctx.storage.delete(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY);
+				}
+				let auditStatus: RecoveryStorageAuditStatus | null = null;
 				if (!pendingUpload) {
 					try {
 						const audit = await auditRecoveryStorage(vaultId, bucket, {
 							repair: true,
 							contentCheckLimit: 0,
 						});
+						auditStatus = audit.status;
 						const successfulRepairs = audit.repairs.filter((repair) => repair.success);
 						if (successfulRepairs.length > 0) {
 							await this.recordTrace("recovery-storage-repaired", {
@@ -812,13 +1144,51 @@ export class VaultSyncServer extends YServer {
 							});
 						}
 					} catch (err) {
+						auditStatus = "degraded";
 						await this.recordTrace("recovery-storage-degraded", {
 							error: err instanceof Error ? err.message : String(err),
 						});
 					}
 				}
 
-				const result = await createRecoverySnapshot(
+				const dirtySnapshot = this.captureRecoveryDirtySnapshot();
+				const trustCleanIndex = !forceFull &&
+					!pendingUpload &&
+					this.recoveryIndexHealth === "healthy" &&
+					this.recoveryIndexSnapshot !== null &&
+					(auditStatus === null ||
+						auditStatus === "healthy" ||
+						auditStatus === "repaired" ||
+						auditStatus === "empty");
+
+				if (!pendingUpload && !trustCleanIndex && !forceFull) {
+					const estimatedFileCount = this.estimateRecoveryFileCount();
+					if (estimatedFileCount > RECOVERY_AUTOMATIC_BOOTSTRAP_FILE_LIMIT) {
+						const fullScanReason = this.recoveryIndexSnapshot
+							? "automatic_full_scan_deferred_index_untrusted"
+							: "automatic_full_scan_deferred_index_missing";
+						this.recoveryLastFullScanReason = fullScanReason;
+						this.recoveryLastIncrementalChangedCount = 0;
+						this.recoveryLastBuildMs = 0;
+						this.recoveryLastHashCount = 0;
+						this.recoveryLastUploadMs = 0;
+						this.recoveryLastPendingProgress = null;
+						await this.recordTrace("recovery-snapshot-bootstrap-deferred", {
+							reason: fullScanReason,
+							estimatedFileCount,
+							limit: RECOVERY_AUTOMATIC_BOOTSTRAP_FILE_LIMIT,
+							indexHealth: this.recoveryIndexHealth,
+							dirtyCount: dirtySnapshot.fileIds.length,
+							auditStatus,
+						});
+						return {
+							status: "noop",
+							reason: `File history index bootstrap deferred for large vault (${estimatedFileCount} files); create a manual file history point to initialize it.`,
+						} satisfies RecoverySnapshotResult;
+					}
+				}
+
+				const indexed = await createIndexedRecoverySnapshot(
 					this.document,
 					vaultId,
 					bucket,
@@ -828,11 +1198,32 @@ export class VaultSyncServer extends YServer {
 						reason: "automatic",
 						pinned: false,
 						contentUploadLimit: RECOVERY_SNAPSHOT_CONTENT_UPLOAD_LIMIT,
+						indexSnapshot: this.recoveryIndexSnapshot,
+						dirtyFileIds: dirtySnapshot.fileIds,
+						trustCleanIndex,
 						pendingUpload,
 					},
 				);
+				const result = indexed.result;
+				this.recoveryLastFullScanReason = indexed.fullScanReason;
+				this.recoveryLastIncrementalChangedCount = indexed.metrics.changedCount;
+				this.recoveryLastBuildMs = indexed.metrics.buildMs;
+				this.recoveryLastHashCount = indexed.metrics.hashedFileCount;
+				this.recoveryLastUploadMs = indexed.metrics.uploadMs;
+				this.recoveryLastPendingProgress = result.status === "pending" && result.pending
+					? result.pending
+					: null;
+
 				if (result.status === "pending" && result.pending && result.pendingUpload) {
-					await this.ctx.storage.put(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY, result.pendingUpload);
+					const prepared = indexed.preparedPendingUpload
+						? {
+							...indexed.preparedPendingUpload,
+							dirtyWatermark: pendingUpload?.dirtyWatermark ?? dirtySnapshot.watermark,
+						} satisfies PreparedFileHistoryPendingUpload
+						: null;
+					if (prepared) {
+						await this.ctx.storage.put(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY, prepared);
+					}
 					await this.recordTrace("recovery-snapshot-upload-pending", {
 						manifestId: result.manifestId,
 						uploadedContentCount: result.pending.uploadedContentCount,
@@ -842,6 +1233,13 @@ export class VaultSyncServer extends YServer {
 					return result;
 				}
 				await this.ctx.storage.delete(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY);
+				if (indexed.nextIndexSnapshot) {
+					await this.writeRecoveryIndexSnapshot(indexed.nextIndexSnapshot);
+				}
+				const dirtyWatermark = pendingUpload?.dirtyWatermark ?? dirtySnapshot.watermark;
+				if (indexed.processedDirtyFileIds.length > 0) {
+					await this.clearProcessedRecoveryDirtyFileIds(indexed.processedDirtyFileIds, dirtyWatermark);
+				}
 				if (result.status === "created" && result.index?.kind === "file-history") {
 					try {
 						await applyRecoveryRetention(this.getRoomId(), bucket);

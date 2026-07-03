@@ -172,8 +172,15 @@ console.log("\n--- Test 3c: recovery snapshot 5xx failures normalize to unavaila
 console.log("\n--- Test 3d: automatic snapshot triggers treat Bad Gateway as transient ---");
 {
 	const source = readFileSync("src/snapshots/snapshotService.ts", "utf8");
+	const serverSource = readFileSync("server/src/server.ts", "utf8");
 	assert(source.includes('lower.includes("(502)")'), "snapshot transient classifier includes HTTP 502");
 	assert(source.includes('lower.includes("bad gateway")'), "snapshot transient classifier includes Bad Gateway text");
+	assert(source.includes("5 * 60 * 1000"), "recovery pending retry uses minute-scale backoff");
+	assert(!source.includes("RECOVERY_SNAPSHOT_PENDING_RETRY_MS = 2_000"), "recovery pending retry no longer uses 2s storm backoff");
+	assert(source.includes("recoverySnapshotInFlight"), "automatic recovery snapshot trigger has an in-flight guard");
+	assert(source.includes("this.requestFileHistoryPoint(true)"), "manual file history point explicitly allows full bootstrap");
+	assert(serverSource.includes("RECOVERY_AUTOMATIC_BOOTSTRAP_FILE_LIMIT = 1000"), "automatic file history bootstrap has a large-vault threshold");
+	assert(serverSource.includes("recovery-snapshot-bootstrap-deferred"), "automatic large-vault bootstrap records a defer trace");
 }
 
 console.log("\n--- Test 4: blob uploads reject poisoned content-addressed keys ---");

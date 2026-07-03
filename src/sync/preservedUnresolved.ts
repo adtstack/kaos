@@ -11,6 +11,7 @@ export type PreservedUnresolvedReason =
 	| "remote-delete-stat-failed"
 	| "conflict-artifact-write-failed"
 	| "three-way-preserve-failed"
+	| "conflict-winner-flush-deferred"
 	| "multiple-editor-authorities"
 	| "path-collision"
 	| "unknown";

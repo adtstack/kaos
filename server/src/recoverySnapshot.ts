@@ -84,6 +84,65 @@ export interface CreateFileHistoryPointOptions {
 	pendingUpload?: FileHistoryPendingUpload | null;
 }
 
+export interface PreparedFileHistoryContent {
+	hash: string;
+	content: string;
+}
+
+export interface PreparedFileHistoryPendingUpload {
+	storageVersion: "prepared-v1";
+	manifestId: string;
+	createdAt: string;
+	day: string;
+	stateHash: string;
+	previousStateHash?: string;
+	reason: FileHistoryReason;
+	pinned: boolean;
+	triggeredBy?: string;
+	crdtSchemaVersion?: number;
+	changedEntries: FileHistoryEntry[];
+	contentHashes: string[];
+	contentQueue: PreparedFileHistoryContent[];
+	persistedState: RecoveryStateEntry[];
+	processedDirtyFileIds: string[];
+	dirtyWatermark?: number;
+	uploadedContentCount: number;
+}
+
+export interface RecoveryIndexSnapshot {
+	manifestId: string | null;
+	stateHash: string | null;
+	entries: RecoveryStateEntry[];
+}
+
+export interface CreateIndexedRecoverySnapshotOptions {
+	triggeredBy?: string;
+	reason?: FileHistoryReason;
+	forceFull?: boolean;
+	pinned?: boolean;
+	now?: Date;
+	contentUploadLimit?: number;
+	indexSnapshot: RecoveryIndexSnapshot | null;
+	dirtyFileIds: string[];
+	trustCleanIndex: boolean;
+	pendingUpload?: PreparedFileHistoryPendingUpload | null;
+}
+
+export interface CreateIndexedRecoverySnapshotResult {
+	result: RecoverySnapshotResult;
+	nextIndexSnapshot?: RecoveryIndexSnapshot;
+	processedDirtyFileIds: string[];
+	preparedPendingUpload?: PreparedFileHistoryPendingUpload;
+	fullScanReason: string | null;
+	metrics: {
+		buildMs: number;
+		uploadMs: number;
+		hashedFileCount: number;
+		changedCount: number;
+		contentObjectCount: number;
+	};
+}
+
 export interface RecoveryRetentionPolicy {
 	keepAllMs: number;
 	keepDailyMs: number;
@@ -150,7 +209,7 @@ export type RecoveryManifest = FileHistoryManifest;
 export type RecoverySnapshotResult = FileHistoryPointResult;
 export type CreateRecoverySnapshotOptions = CreateFileHistoryPointOptions;
 
-interface RecoveryStateEntry {
+export interface RecoveryStateEntry {
 	fileId: string;
 	path: string;
 	contentHash?: string;
@@ -322,13 +381,16 @@ async function stateHash(entries: RecoveryStateEntry[]): Promise<string> {
 	return sha256Hex(encoder.encode(JSON.stringify(stable)));
 }
 
-async function buildRecoveryState(doc: Y.Doc): Promise<InternalStateEntry[]> {
+async function buildRecoveryStateSelection(
+	doc: Y.Doc,
+	fileIds: Set<string> | null,
+): Promise<{ entries: InternalStateEntry[]; hashedFileCount: number }> {
 	const idToText = doc.getMap<Y.Text>("idToText");
 	const meta = doc.getMap<unknown>("meta");
 	const pathToId = doc.getMap<string>("pathToId");
 	const entriesByFileId = new Map<string, InternalStateEntry>();
 
-	meta.forEach((raw, fileId) => {
+	const addMetaEntry = (raw: unknown, fileId: string): void => {
 		const decoded = decodeRecoveryFileMeta(raw);
 		if (!decoded || typeof decoded.path !== "string") return;
 		const path = normalizeVaultPath(decoded.path);
@@ -340,10 +402,19 @@ async function buildRecoveryState(doc: Y.Doc): Promise<InternalStateEntry[]> {
 			mtime: typeof decoded.mtime === "number" ? decoded.mtime : undefined,
 			device: typeof decoded.device === "string" ? decoded.device : undefined,
 		});
-	});
+	};
+
+	if (fileIds) {
+		for (const fileId of fileIds) {
+			addMetaEntry(meta.get(fileId), fileId);
+		}
+	} else {
+		meta.forEach(addMetaEntry);
+	}
 
 	if (!usesV2MetaPathModel(doc)) {
 		pathToId.forEach((fileId, rawPath) => {
+			if (fileIds && !fileIds.has(fileId)) return;
 			const path = normalizeVaultPath(rawPath);
 			if (!path) return;
 			const existing = entriesByFileId.get(fileId);
@@ -358,11 +429,13 @@ async function buildRecoveryState(doc: Y.Doc): Promise<InternalStateEntry[]> {
 	}
 
 	const result: InternalStateEntry[] = [];
+	let hashedFileCount = 0;
 	for (const entry of entriesByFileId.values()) {
 		const text = idToText.get(entry.fileId);
 		const content = text?.toJSON();
 		if (typeof content === "string") {
 			const hash = await contentHash(content);
+			hashedFileCount++;
 			result.push({
 				...entry,
 				content,
@@ -375,7 +448,18 @@ async function buildRecoveryState(doc: Y.Doc): Promise<InternalStateEntry[]> {
 	}
 
 	result.sort((a, b) => a.fileId.localeCompare(b.fileId));
-	return result;
+	return { entries: result, hashedFileCount };
+}
+
+async function buildRecoveryState(doc: Y.Doc): Promise<InternalStateEntry[]> {
+	return (await buildRecoveryStateSelection(doc, null)).entries;
+}
+
+async function buildRecoveryStateForFileIds(
+	doc: Y.Doc,
+	fileIds: Set<string>,
+): Promise<{ entries: InternalStateEntry[]; hashedFileCount: number }> {
+	return await buildRecoveryStateSelection(doc, fileIds);
 }
 
 function toPersistedStateEntry(entry: InternalStateEntry): RecoveryStateEntry {
@@ -593,15 +677,9 @@ interface PutContentObjectsResult {
 	complete: boolean;
 }
 
-async function putContentObjects(
-	vaultId: string,
-	bucket: R2Bucket,
+function buildContentQueue(
 	entries: InternalStateEntry[],
-	options: {
-		uploadedContentCount?: number;
-		limit?: number;
-	} = {},
-): Promise<PutContentObjectsResult> {
+): { contentHashes: string[]; contentQueue: PreparedFileHistoryContent[] } {
 	const unique = new Map<string, string>();
 	for (const entry of entries) {
 		if (!entry.contentHash || typeof entry.content !== "string") continue;
@@ -609,6 +687,26 @@ async function putContentObjects(
 	}
 
 	const hashes = Array.from(unique.keys()).sort();
+	return {
+		contentHashes: hashes,
+		contentQueue: hashes.map((hash) => ({
+			hash,
+			content: unique.get(hash) ?? "",
+		})),
+	};
+}
+
+async function putPreparedContentObjects(
+	vaultId: string,
+	bucket: R2Bucket,
+	contentQueue: PreparedFileHistoryContent[],
+	options: {
+		uploadedContentCount?: number;
+		limit?: number;
+	} = {},
+): Promise<PutContentObjectsResult> {
+	const hashes = contentQueue.map((item) => item.hash);
+	const contentByHash = new Map(contentQueue.map((item) => [item.hash, item.content]));
 	const uploadedContentCount = Math.max(
 		0,
 		Math.min(Math.floor(options.uploadedContentCount ?? 0), hashes.length),
@@ -621,7 +719,7 @@ async function putContentObjects(
 
 	await mapWithConcurrency(hashesToUpload, RECOVERY_FETCH_CONCURRENCY, async (hash) => {
 		const key = recoveryContentKey(vaultId, hash);
-		const content = unique.get(hash) ?? "";
+		const content = contentByHash.get(hash) ?? "";
 		const bytes = encoder.encode(content);
 		const actualHash = await sha256Hex(bytes);
 		if (actualHash !== hash) {
@@ -639,6 +737,19 @@ async function putContentObjects(
 		nextUploadedContentCount,
 		complete: nextUploadedContentCount >= hashes.length,
 	};
+}
+
+async function putContentObjects(
+	vaultId: string,
+	bucket: R2Bucket,
+	entries: InternalStateEntry[],
+	options: {
+		uploadedContentCount?: number;
+		limit?: number;
+	} = {},
+): Promise<PutContentObjectsResult> {
+	const { contentQueue } = buildContentQueue(entries);
+	return await putPreparedContentObjects(vaultId, bucket, contentQueue, options);
 }
 
 async function listAllKeys(bucket: R2Bucket, prefix: string): Promise<string[]> {
@@ -1182,6 +1293,77 @@ export async function auditRecoveryStorage(
 	};
 }
 
+async function writeRecoverySnapshotArtifacts(
+	vaultId: string,
+	bucket: R2Bucket,
+	input: {
+		manifestId: string;
+		createdAt: string;
+		day: string;
+		reason: FileHistoryReason;
+		pinned: boolean;
+		changedEntries: RecoveryManifestEntry[];
+		contentHashes: string[];
+		stateHash: string;
+		persistedState: RecoveryStateEntry[];
+		crdtSchemaVersion?: number;
+	},
+): Promise<{ index: RecoveryManifestIndex; latest: RecoveryLatestState }> {
+	const indexBase = {
+		storageVersion: "v2" as const,
+		manifestId: input.manifestId,
+		vaultId,
+		kind: "file-history" as const,
+		createdAt: input.createdAt,
+		day: input.day,
+		reason: input.reason,
+		pinned: input.pinned,
+		changedCount: input.changedEntries.length,
+		contentHashes: input.contentHashes,
+		changedEntries: input.changedEntries,
+		stateHash: input.stateHash,
+		crdtSchemaVersion: input.crdtSchemaVersion,
+	};
+
+	const manifestWithoutHash = {
+		schemaVersion: RECOVERY_SCHEMA_VERSION,
+		...indexBase,
+		manifestHash: "",
+	} satisfies RecoveryManifest;
+	const manifestBytes = encoder.encode(JSON.stringify(manifestWithoutHash));
+	const manifestHash = await sha256Hex(manifestBytes);
+	const manifest: RecoveryManifest = {
+		...manifestWithoutHash,
+		manifestHash,
+	};
+	const index: RecoveryManifestIndex = {
+		...indexBase,
+		manifestHash,
+	};
+
+	const latest: RecoveryLatestState = {
+		schemaVersion: RECOVERY_SCHEMA_VERSION,
+		storageVersion: "v2",
+		manifestId: input.manifestId,
+		createdAt: input.createdAt,
+		stateHash: input.stateHash,
+		entries: input.persistedState,
+	};
+
+	await bucket.put(recoveryManifestKey(vaultId, input.day, input.manifestId), gzipSync(encoder.encode(JSON.stringify(manifest))), {
+		httpMetadata: { contentType: "application/gzip" },
+	});
+	await bucket.put(recoveryManifestIndexKey(vaultId, input.manifestId), JSON.stringify(index), {
+		httpMetadata: { contentType: "application/json" },
+	});
+	await writeLatestRecoveryState(vaultId, bucket, latest);
+	await bucket.put(recoveryLatestIndexKey(vaultId), JSON.stringify(index), {
+		httpMetadata: { contentType: "application/json" },
+	});
+
+	return { index, latest };
+}
+
 export async function createRecoverySnapshot(
 	doc: Y.Doc,
 	vaultId: string,
@@ -1266,63 +1448,327 @@ export async function createRecoverySnapshot(
 
 	const reason = options.reason ?? "automatic";
 	const pinned = options.pinned ?? (reason !== "automatic");
-
-	const indexBase = {
-		storageVersion: "v2" as const,
+	const { index } = await writeRecoverySnapshotArtifacts(vaultId, bucket, {
 		manifestId,
-		vaultId,
-		kind: "file-history" as const,
 		createdAt,
 		day,
 		reason,
 		pinned,
-		changedCount: changes.length,
-		contentHashes,
 		changedEntries,
+		contentHashes,
 		stateHash: nextStateHash,
+		persistedState,
 		crdtSchemaVersion: readStoredSchemaVersion(doc) ?? undefined,
-	};
-
-	const manifestWithoutHash = {
-		schemaVersion: RECOVERY_SCHEMA_VERSION,
-		...indexBase,
-		manifestHash: "",
-	} satisfies RecoveryManifest;
-	const manifestBytes = encoder.encode(JSON.stringify(manifestWithoutHash));
-	const manifestHash = await sha256Hex(manifestBytes);
-	const manifest: RecoveryManifest = {
-		...manifestWithoutHash,
-		manifestHash,
-	};
-	const index: RecoveryManifestIndex = {
-		...indexBase,
-		manifestHash,
-	};
-
-	const latest: RecoveryLatestState = {
-		schemaVersion: RECOVERY_SCHEMA_VERSION,
-		storageVersion: "v2",
-		manifestId,
-		createdAt,
-		stateHash: nextStateHash,
-		entries: persistedState,
-	};
-
-	await bucket.put(recoveryManifestKey(vaultId, day, manifestId), gzipSync(encoder.encode(JSON.stringify(manifest))), {
-		httpMetadata: { contentType: "application/gzip" },
-	});
-	await bucket.put(recoveryManifestIndexKey(vaultId, manifestId), JSON.stringify(index), {
-		httpMetadata: { contentType: "application/json" },
-	});
-	await writeLatestRecoveryState(vaultId, bucket, latest);
-	await bucket.put(recoveryLatestIndexKey(vaultId), JSON.stringify(index), {
-		httpMetadata: { contentType: "application/json" },
 	});
 
 	return {
 		status: "created",
 		manifestId,
 		index,
+	};
+}
+
+function entriesByFileId<T extends RecoveryStateEntry>(entries: T[]): Map<string, T> {
+	const out = new Map<string, T>();
+	for (const entry of entries) out.set(entry.fileId, entry);
+	return out;
+}
+
+function sortedPersistedStateFromMap(entries: Map<string, RecoveryStateEntry>): RecoveryStateEntry[] {
+	return Array.from(entries.values()).sort((a, b) => a.fileId.localeCompare(b.fileId));
+}
+
+export async function createIndexedRecoverySnapshot(
+	doc: Y.Doc,
+	vaultId: string,
+	bucket: R2Bucket,
+	options: CreateIndexedRecoverySnapshotOptions,
+): Promise<CreateIndexedRecoverySnapshotResult> {
+	const now = options.now ?? new Date();
+	const metrics = {
+		buildMs: 0,
+		uploadMs: 0,
+		hashedFileCount: 0,
+		changedCount: 0,
+		contentObjectCount: 0,
+	};
+
+	if (options.pendingUpload) {
+		const uploadStartedAt = Date.now();
+		const contentResult = await putPreparedContentObjects(vaultId, bucket, options.pendingUpload.contentQueue, {
+			uploadedContentCount: options.pendingUpload.uploadedContentCount,
+			limit: options.contentUploadLimit,
+		});
+		metrics.uploadMs = Date.now() - uploadStartedAt;
+		metrics.changedCount = options.pendingUpload.changedEntries.length;
+		metrics.contentObjectCount = options.pendingUpload.contentHashes.length;
+
+		if (!contentResult.complete) {
+			const preparedPendingUpload: PreparedFileHistoryPendingUpload = {
+				...options.pendingUpload,
+				uploadedContentCount: contentResult.nextUploadedContentCount,
+			};
+			return {
+				result: {
+					status: "pending",
+					manifestId: options.pendingUpload.manifestId,
+					reason: "File history content upload is still in progress",
+					pending: {
+						uploadedContentCount: contentResult.nextUploadedContentCount,
+						totalContentCount: options.pendingUpload.contentHashes.length,
+						remainingContentCount: options.pendingUpload.contentHashes.length - contentResult.nextUploadedContentCount,
+					},
+					pendingUpload: {
+						manifestId: options.pendingUpload.manifestId,
+						createdAt: options.pendingUpload.createdAt,
+						day: options.pendingUpload.day,
+						stateHash: options.pendingUpload.stateHash,
+						previousStateHash: options.pendingUpload.previousStateHash,
+						uploadedContentCount: contentResult.nextUploadedContentCount,
+					},
+				},
+				processedDirtyFileIds: [],
+				preparedPendingUpload,
+				fullScanReason: null,
+				metrics,
+			};
+		}
+
+		const { index } = await writeRecoverySnapshotArtifacts(vaultId, bucket, {
+			manifestId: options.pendingUpload.manifestId,
+			createdAt: options.pendingUpload.createdAt,
+			day: options.pendingUpload.day,
+			reason: options.pendingUpload.reason,
+			pinned: options.pendingUpload.pinned,
+			changedEntries: options.pendingUpload.changedEntries,
+			contentHashes: options.pendingUpload.contentHashes,
+			stateHash: options.pendingUpload.stateHash,
+			persistedState: options.pendingUpload.persistedState,
+			crdtSchemaVersion: options.pendingUpload.crdtSchemaVersion,
+		});
+
+		return {
+			result: {
+				status: "created",
+				manifestId: options.pendingUpload.manifestId,
+				index,
+			},
+			nextIndexSnapshot: {
+				manifestId: options.pendingUpload.manifestId,
+				stateHash: options.pendingUpload.stateHash,
+				entries: options.pendingUpload.persistedState,
+			},
+			processedDirtyFileIds: options.pendingUpload.processedDirtyFileIds,
+			fullScanReason: null,
+			metrics,
+		};
+	}
+
+	if (
+		options.indexSnapshot &&
+		options.trustCleanIndex &&
+		options.dirtyFileIds.length === 0
+	) {
+		return {
+			result: {
+				status: "noop",
+				reason: "No file-level changes since last file history point",
+			},
+			processedDirtyFileIds: [],
+			fullScanReason: null,
+			metrics,
+		};
+	}
+
+	const buildStartedAt = Date.now();
+	let previousEntries: RecoveryStateEntry[];
+	let previousManifestId: string | null;
+	let previousStateHash: string | null;
+	let persistedState: RecoveryStateEntry[];
+	let changes: RecoveryManifestEntry[];
+	let changedCurrentEntries: InternalStateEntry[];
+	let processedDirtyFileIds: string[];
+	let fullScanReason: string | null = null;
+
+	if (
+		options.indexSnapshot &&
+		options.trustCleanIndex &&
+		options.dirtyFileIds.length > 0
+	) {
+		previousEntries = options.indexSnapshot.entries;
+		previousManifestId = options.indexSnapshot.manifestId;
+		previousStateHash = options.indexSnapshot.stateHash;
+		processedDirtyFileIds = Array.from(new Set(options.dirtyFileIds)).sort();
+		const dirtySet = new Set(processedDirtyFileIds);
+		const selected = await buildRecoveryStateForFileIds(doc, dirtySet);
+		metrics.hashedFileCount = selected.hashedFileCount;
+		const currentByFileId = entriesByFileId(selected.entries);
+		const previousByFileId = entriesByFileId(previousEntries);
+		const persistedByFileId = entriesByFileId(previousEntries);
+
+		changes = [];
+		for (const entry of selected.entries) {
+			const change = buildChangeEntry(entry, previousByFileId.get(entry.fileId));
+			if (change) changes.push(change);
+			persistedByFileId.set(entry.fileId, toPersistedStateEntry(entry));
+		}
+		for (const fileId of dirtySet) {
+			if (currentByFileId.has(fileId)) continue;
+			const previous = previousByFileId.get(fileId);
+			if (previous) {
+				changes.push(buildDeletionEntry(previous));
+				persistedByFileId.delete(fileId);
+			}
+		}
+		persistedState = sortedPersistedStateFromMap(persistedByFileId);
+		changedCurrentEntries = changes
+			.filter((entry) => entry.kind !== "deleted" && entry.contentHash)
+			.map((entry) => currentByFileId.get(entry.fileId))
+			.filter((entry): entry is InternalStateEntry => !!entry && typeof entry.content === "string");
+	} else {
+		const latestState = await readLatestRecoveryStateWithFallback(vaultId, bucket);
+		previousEntries = latestState?.entries ?? [];
+		previousManifestId = latestState?.manifestId ?? null;
+		previousStateHash = latestState?.stateHash ?? null;
+		processedDirtyFileIds = Array.from(new Set(options.dirtyFileIds)).sort();
+		fullScanReason = options.forceFull
+			? "force_full"
+			: options.indexSnapshot
+				? "index_untrusted"
+				: "index_missing";
+		const current = await buildRecoveryStateSelection(doc, null);
+		metrics.hashedFileCount = current.hashedFileCount;
+		const currentByFileId = entriesByFileId(current.entries);
+		const previousByFileId = entriesByFileId(previousEntries);
+
+		changes = [];
+		for (const entry of current.entries) {
+			const change = buildChangeEntry(entry, previousByFileId.get(entry.fileId));
+			if (change) changes.push(change);
+		}
+		for (const previous of previousByFileId.values()) {
+			if (currentByFileId.has(previous.fileId)) continue;
+			changes.push(buildDeletionEntry(previous));
+		}
+		persistedState = current.entries.map(toPersistedStateEntry);
+		changedCurrentEntries = changes
+			.filter((entry) => entry.kind !== "deleted" && entry.contentHash)
+			.map((entry) => currentByFileId.get(entry.fileId))
+			.filter((entry): entry is InternalStateEntry => !!entry && typeof entry.content === "string");
+	}
+	metrics.buildMs = Date.now() - buildStartedAt;
+	metrics.changedCount = changes.length;
+
+	if (changes.length === 0 && previousManifestId) {
+		return {
+			result: {
+				status: "noop",
+				reason: "No file-level changes since last file history point",
+			},
+			nextIndexSnapshot: {
+				manifestId: previousManifestId,
+				stateHash: previousStateHash,
+				entries: previousEntries,
+			},
+			processedDirtyFileIds,
+			fullScanReason,
+			metrics,
+		};
+	}
+
+	const nextStateHash = await stateHash(persistedState);
+	const manifestId = generateRecoveryManifestId(now);
+	const createdAt = now.toISOString();
+	const day = today(now);
+	const reason = options.reason ?? "automatic";
+	const pinned = options.pinned ?? (reason !== "automatic");
+	const defaultDevice = options.triggeredBy;
+	const changedEntries = changes.map((change) => ({
+		...change,
+		device: change.device ?? defaultDevice,
+	}));
+	const { contentHashes, contentQueue } = buildContentQueue(changedCurrentEntries);
+	metrics.contentObjectCount = contentHashes.length;
+
+	const uploadStartedAt = Date.now();
+	const contentResult = await putPreparedContentObjects(vaultId, bucket, contentQueue, {
+		uploadedContentCount: 0,
+		limit: options.contentUploadLimit,
+	});
+	metrics.uploadMs = Date.now() - uploadStartedAt;
+
+	if (!contentResult.complete) {
+		const preparedPendingUpload: PreparedFileHistoryPendingUpload = {
+			storageVersion: "prepared-v1",
+			manifestId,
+			createdAt,
+			day,
+			stateHash: nextStateHash,
+			previousStateHash: previousStateHash ?? undefined,
+			reason,
+			pinned,
+			triggeredBy: defaultDevice,
+			crdtSchemaVersion: readStoredSchemaVersion(doc) ?? undefined,
+			changedEntries,
+			contentHashes,
+			contentQueue,
+			persistedState,
+			processedDirtyFileIds,
+			uploadedContentCount: contentResult.nextUploadedContentCount,
+		};
+		return {
+			result: {
+				status: "pending",
+				manifestId,
+				reason: "File history content upload is still in progress",
+				pending: {
+					uploadedContentCount: contentResult.nextUploadedContentCount,
+					totalContentCount: contentHashes.length,
+					remainingContentCount: contentHashes.length - contentResult.nextUploadedContentCount,
+				},
+				pendingUpload: {
+					manifestId,
+					createdAt,
+					day,
+					stateHash: nextStateHash,
+					previousStateHash: previousStateHash ?? undefined,
+					uploadedContentCount: contentResult.nextUploadedContentCount,
+				},
+			},
+			processedDirtyFileIds: [],
+			preparedPendingUpload,
+			fullScanReason,
+			metrics,
+		};
+	}
+
+	const { index } = await writeRecoverySnapshotArtifacts(vaultId, bucket, {
+		manifestId,
+		createdAt,
+		day,
+		reason,
+		pinned,
+		changedEntries,
+		contentHashes,
+		stateHash: nextStateHash,
+		persistedState,
+		crdtSchemaVersion: readStoredSchemaVersion(doc) ?? undefined,
+	});
+
+	return {
+		result: {
+			status: "created",
+			manifestId,
+			index,
+		},
+		nextIndexSnapshot: {
+			manifestId,
+			stateHash: nextStateHash,
+			entries: persistedState,
+		},
+		processedDirtyFileIds,
+		fullScanReason,
+		metrics,
 	};
 }
 

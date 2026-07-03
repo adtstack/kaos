@@ -38,7 +38,7 @@ import type {
 	DashboardSnapshotStatus,
 } from "../dashboard/dashboardTypes";
 
-const RECOVERY_SNAPSHOT_PENDING_RETRY_MS = 2_000;
+const RECOVERY_SNAPSHOT_PENDING_RETRY_MS = 5 * 60 * 1000;
 
 interface SnapshotServiceDeps {
 	app: App;
@@ -54,6 +54,7 @@ interface SnapshotServiceDeps {
 
 export class SnapshotService {
 	private recoverySnapshotRetryTimer: ReturnType<typeof setTimeout> | null = null;
+	private recoverySnapshotInFlight = false;
 
 	constructor(private readonly deps: SnapshotServiceDeps) {}
 
@@ -195,11 +196,15 @@ export class SnapshotService {
 		if (!this.deps.getServerSupportsSnapshots()) {
 			return;
 		}
+		if (this.recoverySnapshotInFlight) {
+			return;
+		}
 		const vaultSync = this.deps.getVaultSync();
 		if (!vaultSync?.connected || !vaultSync.providerSynced) {
 			return;
 		}
 
+		this.recoverySnapshotInFlight = true;
 		try {
 			const result = await this.requestFileHistoryPoint(forceFull);
 			if (result.status === "created") {
@@ -219,6 +224,8 @@ export class SnapshotService {
 			if (this.logTransientSnapshotNetworkError(err, "File history point")) return;
 			if (this.logSnapshotBackendAction(err, "File history")) return;
 			console.warn("[kaos] File history point failed:", err);
+		} finally {
+			this.recoverySnapshotInFlight = false;
 		}
 	}
 
@@ -239,7 +246,7 @@ export class SnapshotService {
 
 		new Notice("Creating file history point...");
 		try {
-			const result = await this.requestFileHistoryPoint(false);
+			const result = await this.requestFileHistoryPoint(true);
 			if (result.status === "created") {
 				const changed = typeof result.index?.changedCount === "number"
 					? `${result.index.changedCount} changed file(s)`

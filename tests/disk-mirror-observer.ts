@@ -317,11 +317,15 @@ console.log("\n--- Test 7: forced open flush does not overwrite disk when editor
 	});
 	ytext.insert(0, "REMOTE_FROM_CRDT\n");
 
-	await mirror.flushWrite(FILE_PATH, true);
+	const result = await mirror.flushWrite(FILE_PATH, true);
 
 	assert(
 		diskFiles.get(FILE_PATH) === "LOCAL_ON_EDITOR\n",
 		"force flush preserves disk when an open editor carries different content",
+	);
+	assert(
+		result.kind === "deferred" && result.reason === "open-editor-mismatch",
+		"force flush reports open-editor mismatch deferral",
 	);
 
 	doc.destroy();
@@ -345,11 +349,15 @@ console.log("\n--- Test 8: forced open flush rechecks editor after async read --
 	});
 	ytext.insert(0, "REMOTE_FROM_CRDT\n");
 
-	await mirror.flushWrite(FILE_PATH, true);
+	const result = await mirror.flushWrite(FILE_PATH, true);
 
 	assert(
 		diskFiles.get(FILE_PATH) === "DISK_BEFORE\n",
 		"force flush does not write stale CRDT content when the editor changes during read",
+	);
+	assert(
+		result.kind === "deferred" && result.reason === "open-editor-mismatch",
+		"async editor race reports open-editor mismatch deferral",
 	);
 
 	doc.destroy();
