@@ -75,6 +75,7 @@ function makeVaultSync(onFlightPathEvent: (event: FlightPathEventInput) => void)
 	vs._textToFileId = new WeakMap();
 	vs._pathIndex = new Map();
 	vs._deletedPathIndex = new Set();
+	vs._activePathCollisions = new Map();
 	vs._pathIndexesDirty = true;
 	vs._localReady = true;
 	vs._providerSynced = true;
@@ -171,7 +172,7 @@ function buildFixture(opts: {
 	return { controller, vaultSync, events, eventBoundary, flushWrites, oldFileId };
 }
 
-console.log("\n--- No-event structural reconcile: moved markdown is CRDT rename ---");
+console.log("\n--- No-event structural reconcile: moved markdown without evidence is unresolved ---");
 {
 	const fx = buildFixture({
 		oldPath: "Old/a.md",
@@ -183,10 +184,8 @@ console.log("\n--- No-event structural reconcile: moved markdown is CRDT rename 
 	await fx.controller.runReconciliation("authoritative");
 	const events = fx.events.slice(fx.eventBoundary);
 
-	assert(fx.vaultSync.getTextForPath("Old/a.md") === null, "old CRDT path removed");
-	assert(fx.vaultSync.getTextForPath("New/a.md") !== null, "new CRDT path exists");
-	assertEq(fx.vaultSync.getTextForPath("New/a.md")?.toString(), "# A\nsame\n", "new CRDT content preserved");
-	assertEq(fx.vaultSync.getFileId("New/a.md"), fx.oldFileId, "file ID preserved across inferred rename");
+	assert(fx.vaultSync.getTextForPath("Old/a.md") !== null, "old CRDT path remains until user resolves");
+	assert(fx.vaultSync.getTextForPath("New/a.md") === null, "new path is not silently bound to old fileId");
 	assertEq(fx.flushWrites.length, 0, "old path was not recreated on disk");
 	assertEq(
 		events.filter((event) => event.kind === "crdt.file.created" && event.path === "New/a.md").length,
@@ -195,21 +194,23 @@ console.log("\n--- No-event structural reconcile: moved markdown is CRDT rename 
 	);
 	assertEq(
 		events.filter((event) => event.kind === "crdt.file.renamed" && event.path === "New/a.md").length,
-		1,
-		"crdt.file.renamed emitted for new path",
+		0,
+		"no rename event emitted without rename evidence",
 	);
 	assertEq(
 		events.filter((event) =>
 			event.kind === "reconcile.file.decision" &&
-			event.data.decision === "rename-crdt-path-to-disk" &&
-			event.data.oldPath === "Old/a.md" &&
-			event.data.newPath === "New/a.md"
+			event.data.decision === "unresolved-ambiguous-structural-change" &&
+			Array.isArray(event.data.oldPaths) &&
+			event.data.oldPaths.includes("Old/a.md") &&
+			Array.isArray(event.data.newPaths) &&
+			event.data.newPaths.includes("New/a.md")
 		).length,
 		1,
-		"reconcile decision emitted for inferred rename",
+		"reconcile decision emitted for unresolved structural change",
 	);
 	assertEq(fx.controller.getState().lastReconcileStats?.plannedCreates, 0, "no disk create planned");
-	assertEq(fx.controller.getState().unresolvedStructuralChangeCount, 0, "no unresolved structural changes");
+	assertEq(fx.controller.getState().unresolvedStructuralChangeCount, 2, "old and new paths counted as unresolved");
 }
 
 console.log("\n--- No-event structural reconcile: same template daily notes are independent files ---");

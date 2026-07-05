@@ -23,17 +23,29 @@ function assertEq<T>(actual: T, expected: T, msg: string): void {
 	failed++;
 }
 
-console.log("\n--- No-event structural planner: unique file move ---");
+console.log("\n--- No-event structural planner: unique file move without evidence is unresolved ---");
 {
 	const plan = planNoEventStructuralRenames({
 		missingCrdtPaths: [{ path: "Old/a.md", contentHash: "h1" }],
 		extraDiskPaths: [{ path: "New/a.md", contentHash: "h1" }],
 	});
-	assertEq(plan.renames.length, 1, "one rename planned");
+	assertEq(plan.renames.length, 0, "no rename planned without rename evidence");
+	assertEq(plan.unresolved.length, 1, "same hash and basename are unresolved");
+	assertEq(plan.unresolved[0]?.reason, "ambiguous-structural-rename", "unresolved reason captures missing evidence");
+}
+
+console.log("\n--- No-event structural planner: explicit rename evidence is allowed ---");
+{
+	const plan = planNoEventStructuralRenames({
+		missingCrdtPaths: [{ path: "Old/a.md", contentHash: "h1" }],
+		extraDiskPaths: [{ path: "New/a.md", contentHash: "h1" }],
+		renameEvidence: [{ oldPath: "Old/a.md", newPath: "New/a.md", reason: "explicit-rename" }],
+	});
+	assertEq(plan.renames.length, 1, "one evidence-backed rename planned");
 	assertEq(plan.renames[0]?.oldPath, "Old/a.md", "old path captured");
 	assertEq(plan.renames[0]?.newPath, "New/a.md", "new path captured");
-	assertEq(plan.renames[0]?.reason, "unique-content-hash", "reason is unique-content-hash");
-	assertEq(plan.unresolved.length, 0, "no unresolved changes");
+	assertEq(plan.renames[0]?.reason, "explicit-rename", "reason records evidence");
+	assertEq(plan.unresolved.length, 0, "no unresolved changes with explicit evidence");
 }
 
 console.log("\n--- No-event structural planner: same content with different basename is not inferred as rename ---");
@@ -46,7 +58,7 @@ console.log("\n--- No-event structural planner: same content with different base
 	assertEq(plan.unresolved.length, 0, "different basenames are not surfaced as structural conflicts");
 }
 
-console.log("\n--- No-event structural planner: folder move with unique hashes ---");
+console.log("\n--- No-event structural planner: folder move without evidence is unresolved ---");
 {
 	const plan = planNoEventStructuralRenames({
 		missingCrdtPaths: [
@@ -60,23 +72,11 @@ console.log("\n--- No-event structural planner: folder move with unique hashes -
 			{ path: "New/b.md", contentHash: "hb" },
 		],
 	});
-	assertEq(plan.renames.length, 3, "all folder files planned");
-	assert(
-		plan.renames.some((rename) => rename.oldPath === "Old/a.md" && rename.newPath === "New/a.md"),
-		"a.md mapped",
-	);
-	assert(
-		plan.renames.some((rename) => rename.oldPath === "Old/b.md" && rename.newPath === "New/b.md"),
-		"b.md mapped",
-	);
-	assert(
-		plan.renames.some((rename) => rename.oldPath === "Old/c.md" && rename.newPath === "New/c.md"),
-		"c.md mapped",
-	);
-	assertEq(plan.unresolved.length, 0, "no unresolved changes");
+	assertEq(plan.renames.length, 0, "folder move is not inferred from hashes alone");
+	assertEq(plan.unresolved.length, 3, "each same-hash move is unresolved without evidence");
 }
 
-console.log("\n--- No-event structural planner: duplicate content with unique basename ---");
+console.log("\n--- No-event structural planner: duplicate content with unique basename is unresolved ---");
 {
 	const plan = planNoEventStructuralRenames({
 		missingCrdtPaths: [
@@ -88,12 +88,9 @@ console.log("\n--- No-event structural planner: duplicate content with unique ba
 			{ path: "New/a.md", contentHash: "same" },
 		],
 	});
-	assertEq(plan.renames.length, 2, "both duplicate-content files mapped by basename");
-	assert(
-		plan.renames.every((rename) => rename.reason === "unique-basename-with-duplicate-content"),
-		"duplicate-content matches use basename reason",
-	);
-	assertEq(plan.unresolved.length, 0, "no unresolved changes");
+	assertEq(plan.renames.length, 0, "duplicate-content files are not mapped by basename");
+	assertEq(plan.unresolved.length, 1, "duplicate-content candidates are unresolved");
+	assertEq(plan.unresolved[0]?.reason, "ambiguous-duplicate-content", "unresolved reason is duplicate ambiguity");
 }
 
 console.log("\n--- No-event structural planner: ambiguous duplicate content ---");
@@ -124,11 +121,11 @@ console.log("\n--- No-event structural planner: count mismatch leaves leftovers 
 			{ path: "New/a.md", contentHash: "same" },
 		],
 	});
-	assertEq(plan.renames.length, 1, "safe basename match still applies");
+	assertEq(plan.renames.length, 0, "basename match does not apply without evidence");
 	assertEq(plan.unresolved.length, 1, "unmatched side is unresolved");
 	assertEq(plan.unresolved[0]?.reason, "count-mismatch", "unresolved reason is count mismatch");
-	assertEq(plan.unresolved[0]?.oldPaths.length, 1, "one old path remains unresolved");
-	assertEq(plan.unresolved[0]?.newPaths.length, 0, "no new path remains unresolved");
+	assertEq(plan.unresolved[0]?.oldPaths.length, 2, "both old paths remain unresolved");
+	assertEq(plan.unresolved[0]?.newPaths.length, 1, "new path remains unresolved");
 }
 
 console.log("\n--- No-event structural planner: same basename with changed content is unresolved ---");

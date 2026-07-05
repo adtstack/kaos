@@ -36,6 +36,11 @@ import {
 	removeCachedHash,
 } from "./blobHashCache";
 import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry, type PreservedUnresolvedReason } from "./preservedUnresolved";
+import {
+	buildBlobConflictArtifactCopyPath,
+	buildBlobConflictArtifactPath,
+	isBaseBlobConflictArtifactPath,
+} from "../paths/conflictArtifactPath";
 
 // -------------------------------------------------------------------
 // Config
@@ -243,31 +248,6 @@ function isAlreadyExistsError(error: unknown): boolean {
 
 function hashPrefix(hash: string | null | undefined): string | null {
 	return typeof hash === "string" ? hash.slice(0, 12) : null;
-}
-
-function conflictPathFor(path: string, date = new Date()): string {
-	const normalized = normalizePath(path);
-	const slash = normalized.lastIndexOf("/");
-	const dir = slash >= 0 ? normalized.slice(0, slash + 1) : "";
-	const name = slash >= 0 ? normalized.slice(slash + 1) : normalized;
-	const dot = name.lastIndexOf(".");
-	const stamp = date
-		.toISOString()
-		.replace(/\.\d{3}Z$/, "Z")
-		.replace(/[:]/g, "-");
-	const suffix = ` (KAOS remote conflict ${stamp})`;
-	const ext = dot > 0 ? name.slice(dot) : "";
-	const base = dot > 0 ? name.slice(0, dot) : name;
-	// Cap base name to prevent filesystem path length issues (255 byte limit)
-	const maxBase = Math.max(20, 255 - suffix.length - ext.length - 4);
-	const cappedBase = base.length > maxBase ? base.slice(0, maxBase) : base;
-	return `${dir}${cappedBase}${suffix}${ext}`;
-}
-
-function isBlobConflictArtifactPath(path: string): boolean {
-	const normalized = normalizePath(path);
-	const name = normalized.split("/").pop() ?? normalized;
-	return /^.+ \(KAOS remote conflict \d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\)(?:\.[^/.]+)?$/.test(name);
 }
 
 // -------------------------------------------------------------------
@@ -564,7 +544,7 @@ export class BlobSyncManager {
 	handleFileChange(file: TFile): void {
 		if (
 			this.localOnlyBlobConflictPaths.has(file.path) ||
-			isBlobConflictArtifactPath(file.path)
+			isBaseBlobConflictArtifactPath(normalizePath(file.path))
 		) {
 			this.log(`handleFileChange: local-only blob conflict "${file.path}"`);
 			return;
@@ -684,7 +664,7 @@ export class BlobSyncManager {
 
 			if (
 				this.localOnlyBlobConflictPaths.has(file.path) ||
-				isBlobConflictArtifactPath(file.path)
+				isBaseBlobConflictArtifactPath(normalizePath(file.path))
 			) {
 				skipped++;
 				continue;
@@ -854,8 +834,8 @@ export class BlobSyncManager {
 			if (
 				this.localOnlyBlobConflictPaths.has(normalized) ||
 				this.localOnlyBlobConflictPaths.has(item.path) ||
-				isBlobConflictArtifactPath(normalized) ||
-				isBlobConflictArtifactPath(item.path) ||
+				isBaseBlobConflictArtifactPath(normalized) ||
+				isBaseBlobConflictArtifactPath(normalizePath(item.path)) ||
 				this.preservedUnresolvedPaths.has(normalized) ||
 				this.preservedUnresolvedPaths.has(item.path)
 			) {
@@ -863,8 +843,8 @@ export class BlobSyncManager {
 				const isLocalOnlyConflict =
 					this.localOnlyBlobConflictPaths.has(normalized) ||
 					this.localOnlyBlobConflictPaths.has(item.path) ||
-					isBlobConflictArtifactPath(normalized) ||
-					isBlobConflictArtifactPath(item.path);
+					isBaseBlobConflictArtifactPath(normalized) ||
+					isBaseBlobConflictArtifactPath(normalizePath(item.path));
 				this.trace?.(
 					"blob",
 					isLocalOnlyConflict
@@ -1448,12 +1428,9 @@ export class BlobSyncManager {
 		data: ArrayBuffer,
 		reason: "existing-changed-during-download" | "create-race-mismatch",
 	): Promise<string> {
-		const baseConflictPath = conflictPathFor(targetPath);
+		const baseConflictPath = buildBlobConflictArtifactPath(normalizePath(targetPath));
 		for (let i = 0; i < 100; i++) {
-			const conflictPath =
-				i === 0
-					? baseConflictPath
-					: baseConflictPath.replace(/(\.[^/.]+)?$/, ` ${i + 1}$1`);
+			const conflictPath = buildBlobConflictArtifactCopyPath(baseConflictPath, i + 1);
 			if (this.app.vault.getAbstractFileByPath(conflictPath)) continue;
 			try {
 				this.suppress(conflictPath);

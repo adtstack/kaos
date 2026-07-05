@@ -175,6 +175,13 @@ function buildOverview(input: KaosDashboardCollectorInput): DashboardMetric[] {
 			tone: "error",
 		});
 	}
+	if ((vaultSync?.pathBindingCollisionCount ?? 0) > 0) {
+		metrics.push({
+			label: "Path collisions",
+			value: String(vaultSync?.pathBindingCollisionCount ?? 0),
+			tone: "error",
+		});
+	}
 	return metrics;
 }
 

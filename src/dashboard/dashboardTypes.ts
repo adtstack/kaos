@@ -105,6 +105,7 @@ export interface DashboardVaultSyncDebug {
 	pathToIdCount: number;
 	activePathCount: number;
 	tombstonedPathCount: number;
+	pathBindingCollisionCount?: number;
 	blobPathCount: number;
 	serverReceipt: {
 		serverAppliedLocalState: boolean | null;

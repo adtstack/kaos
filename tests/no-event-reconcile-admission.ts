@@ -269,6 +269,7 @@ function __qaOnlyForTestInit(opts: QaTestInitOptions): VaultSync {
 	vs._textToFileId = new WeakMap();
 	vs._pathIndex = new Map();
 	vs._deletedPathIndex = new Set();
+	vs._activePathCollisions = new Map();
 	vs._pathIndexesDirty = true;
 	vs._localReady = opts.localReady;
 	vs._providerSynced = opts.providerSynced;

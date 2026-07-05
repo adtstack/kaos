@@ -34,6 +34,11 @@ import {
 	handleSvEchoCustomMessage,
 	type SvEchoCounters,
 } from "./svEchoMessage";
+import {
+	evaluatePathBindingIntegrity,
+	type PathBindingIntegrityInput,
+	type PathBindingIntegrityResult,
+} from "./pathBindingIntegrity";
 import type { CandidateStore, ScopeKey, ScopeMetadata } from "./candidateStore";
 import { FLIGHT_KIND } from "../telemetry/debug/flightEvents";
 import type { FlightPathEventInput } from "../telemetry/debug/flightEvents";
@@ -169,6 +174,7 @@ export class VaultSync {
 	private _textToFileId = new WeakMap<Y.Text, string>();
 	private _pathIndex = new Map<string, string>(); // path -> fileId (active only)
 	private _deletedPathIndex = new Set<string>(); // tombstoned paths
+	private _activePathCollisions = new Map<string, string[]>(); // active path -> all competing fileIds
 	private _pathIndexesDirty = true;
 
 	/**
@@ -751,7 +757,9 @@ export class VaultSync {
 
 		this._pathIndex.clear();
 		this._deletedPathIndex.clear();
+		this._activePathCollisions.clear();
 
+		const activeByPath = new Map<string, string[]>();
 		this.meta.forEach((value: unknown, fileId: string) => {
 			const path = getMetaPath(value);
 			if (!path) return;
@@ -764,23 +772,22 @@ export class VaultSync {
 				return;
 			}
 
-			const existingId = this._pathIndex.get(normalizedPath);
-			if (!existingId) {
-				this._pathIndex.set(normalizedPath, fileId);
-				this._deletedPathIndex.delete(normalizedPath);
-				return;
-			}
-
-			const existingValue = this.meta.get(existingId);
-			const existingMtime = getMetaMtime(existingValue) ?? 0;
-			const candidateMtime = getMetaMtime(value) ?? 0;
-
-			// If we see active path collisions, deterministically choose one winner.
-			if (candidateMtime > existingMtime || (candidateMtime === existingMtime && fileId > existingId)) {
-				this._pathIndex.set(normalizedPath, fileId);
-			}
-			this._deletedPathIndex.delete(normalizedPath);
+			const bucket = activeByPath.get(normalizedPath) ?? [];
+			bucket.push(fileId);
+			activeByPath.set(normalizedPath, bucket);
 		});
+
+		for (const [normalizedPath, fileIds] of activeByPath) {
+			fileIds.sort();
+			if (fileIds.length === 1) {
+				this._pathIndex.set(normalizedPath, fileIds[0]!);
+				this._deletedPathIndex.delete(normalizedPath);
+				continue;
+			}
+
+			this._activePathCollisions.set(normalizedPath, fileIds);
+			this._deletedPathIndex.delete(normalizedPath);
+		}
 
 		this._pathIndexesDirty = false;
 	}
@@ -984,7 +991,7 @@ export class VaultSync {
 	 *
 	 * Returns counts for logging.
 	 */
-	runIntegrityChecks(): { duplicateIds: number; orphansCleaned: number } {
+	runIntegrityChecks(): { duplicateIds: number; orphansCleaned: number; duplicateActivePaths: number } {
 		let duplicateIds = 0;
 		let orphansCleaned = 0;
 
@@ -1041,6 +1048,11 @@ export class VaultSync {
 		for (const fileId of this._pathIndex.values()) {
 			referencedIds.add(fileId);
 		}
+		for (const fileIds of this._activePathCollisions.values()) {
+			for (const fileId of fileIds) {
+				referencedIds.add(fileId);
+			}
+		}
 
 		// Also keep tombstoned IDs (they're intentionally orphaned from pathToId)
 		const tombstonedIds = new Set<string>();
@@ -1082,7 +1094,11 @@ export class VaultSync {
 			);
 		}
 
-		return { duplicateIds, orphansCleaned };
+		const duplicateActivePaths = this._activePathCollisions.size;
+		if (duplicateActivePaths > 0) {
+			this.log(`integrity: ${duplicateActivePaths} active path collision(s) preserved for explicit resolution`);
+		}
+		return { duplicateIds, orphansCleaned, duplicateActivePaths };
 	}
 
 	// -------------------------------------------------------------------
@@ -1179,10 +1195,12 @@ export class VaultSync {
 		const updatedOnDisk: string[] = [];
 		const seededToCrdt: string[] = [];
 		const untracked: string[] = [];
+		const pathBindingConflicts: string[] = [];
 		let skipped = 0;
 
 		this.ensurePathIndexes();
 		const crdtPaths = new Set<string>(this._pathIndex.keys());
+		const activePathCollisionPaths = new Set<string>(this._activePathCollisions.keys());
 
 		// CRDT files not on disk → create on disk
 		// IMPORTANT: use diskPresentPaths (all known disk paths), not
@@ -1212,6 +1230,13 @@ export class VaultSync {
 
 		// Disk files not in CRDT
 		for (const path of diskPresentPaths) {
+			if (activePathCollisionPaths.has(path)) {
+				this.log(`reconcile: "${path}" has duplicate active CRDT fileIds — preserving for explicit resolution`);
+				pathBindingConflicts.push(path);
+				skipped++;
+				continue;
+			}
+
 			const classification = classifyDiskPathForReconcile(
 				path,
 				crdtPaths.has(path),
@@ -1277,10 +1302,20 @@ export class VaultSync {
 			`${createdOnDisk.length} need disk creation, ` +
 			`${updatedOnDisk.length} need disk update, ` +
 			`${untracked.length} untracked, ` +
-			`${tombstonedDiskConflicts.length} tombstoned-disk conflicts`,
+			`${tombstonedDiskConflicts.length} tombstoned-disk conflicts, ` +
+			`${pathBindingConflicts.length} path-binding conflicts`,
 		);
 
-		return { mode, createdOnDisk, updatedOnDisk, seededToCrdt, untracked, tombstonedDiskConflicts, skipped };
+		return {
+			mode,
+			createdOnDisk,
+			updatedOnDisk,
+			seededToCrdt,
+			untracked,
+			tombstonedDiskConflicts,
+			pathBindingConflicts,
+			skipped,
+		};
 	}
 
 	// -------------------------------------------------------------------
@@ -1427,6 +1462,23 @@ export class VaultSync {
 		return this._pathIndex.get(path);
 	}
 
+	getActiveFileIdsForPath(path: string): string[] {
+		path = this.normPath(path);
+		this.ensurePathIndexes();
+		const collision = this._activePathCollisions.get(path);
+		if (collision) return [...collision];
+		const fileId = this._pathIndex.get(path);
+		return fileId ? [fileId] : [];
+	}
+
+	getPathBindingIntegrity(input: Omit<PathBindingIntegrityInput, "activeFileIdsForPath">): PathBindingIntegrityResult {
+		return evaluatePathBindingIntegrity({
+			...input,
+			path: this.normPath(input.path),
+			activeFileIdsForPath: this.getActiveFileIdsForPath(input.path),
+		});
+	}
+
 	/**
 	 * O(1) reverse lookup: given a Y.Text, get its fileId.
 	 * Returns undefined if the text isn't tracked (shouldn't happen
@@ -1439,6 +1491,11 @@ export class VaultSync {
 	getActiveMarkdownPaths(): string[] {
 		this.ensurePathIndexes();
 		return Array.from(this._pathIndex.keys());
+	}
+
+	getPathBindingCollisionCount(): number {
+		this.ensurePathIndexes();
+		return this._activePathCollisions.size;
 	}
 
 	isPathTombstoned(path: string): boolean {
@@ -1586,6 +1643,11 @@ export class VaultSync {
 	isPendingRenameTarget(path: string): boolean {
 		path = this.normPath(path);
 		return this._renameBatchNewToOld.has(path);
+	}
+
+	getPendingRenameOldPathForTarget(path: string): string | undefined {
+		path = this.normPath(path);
+		return this._renameBatchNewToOld.get(path);
 	}
 
 	/**
@@ -2119,6 +2181,7 @@ export class VaultSync {
 		pathToIdCount: number;
 		activePathCount: number;
 		tombstonedPathCount: number;
+		pathBindingCollisionCount: number;
 		storedSchemaVersion: number | null;
 		blobPathCount: number;
 		serverReceipt: ReturnType<ServerAckTracker["getState"]> & { persistenceUnavailable: boolean };
@@ -2137,6 +2200,7 @@ export class VaultSync {
 			pathToIdCount: this.pathToId.size,
 			activePathCount: this._pathIndex.size,
 			tombstonedPathCount: this._deletedPathIndex.size,
+			pathBindingCollisionCount: this._activePathCollisions.size,
 			storedSchemaVersion: this.storedSchemaVersion,
 			blobPathCount: this.pathToBlob.size,
 			serverReceipt: {
@@ -2243,6 +2307,11 @@ export interface ReconcileResult {
 	 * User should resolve manually or via explicit create action.
 	 */
 	tombstonedDiskConflicts: TombstonedDiskConflict[];
+	/**
+	 * Disk files whose CRDT path has multiple active fileIds.
+	 * They are not seeded or flushed until the binding is explicitly resolved.
+	 */
+	pathBindingConflicts: string[];
 	skipped: number;
 }
 

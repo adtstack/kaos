@@ -37,6 +37,7 @@ import type {
 	DashboardRecoveryStorageStatus,
 	DashboardSnapshotStatus,
 } from "../dashboard/dashboardTypes";
+import { DashboardSnapshotCache } from "./dashboardSnapshotCache";
 
 const RECOVERY_SNAPSHOT_PENDING_RETRY_MS = 5 * 60 * 1000;
 
@@ -55,6 +56,7 @@ interface SnapshotServiceDeps {
 export class SnapshotService {
 	private recoverySnapshotRetryTimer: ReturnType<typeof setTimeout> | null = null;
 	private recoverySnapshotInFlight = false;
+	private readonly dashboardSnapshotCache = new DashboardSnapshotCache();
 
 	constructor(private readonly deps: SnapshotServiceDeps) {}
 
@@ -70,13 +72,13 @@ export class SnapshotService {
 			return { status: "offline", message: "Not connected to server." };
 		}
 		try {
-			return {
+			return await this.dashboardSnapshotCache.get("snapshot-status", async () => ({
 				status: "ready",
 				summary: await getSnapshotStatus(
 					this.deps.getSettings(),
 					this.deps.getTraceHttpContext(),
 				),
-			};
+			}));
 		} catch (err) {
 			return { status: "error", message: formatUnknown(err) };
 		}
@@ -98,37 +100,39 @@ export class SnapshotService {
 		}
 
 		try {
-			const settings = this.deps.getSettings();
-			const listed = await listFileHistoryManifests(
-				settings,
-				this.deps.getTraceHttpContext(),
-				manifestLimit,
-			);
-			const changes: DashboardRecentChange[] = [];
-			for (const index of listed.manifests.slice(0, manifestLimit)) {
-				for (const entry of index.changedEntries) {
-					changes.push({
-						manifestId: index.manifestId,
-						snapshotKind: index.kind,
-						createdAt: index.createdAt,
-						fileId: entry.fileId,
-						changeKind: entry.kind,
-						path: entry.newPath ?? entry.path,
-						oldPath: entry.oldPath ?? null,
-						newPath: entry.newPath ?? null,
-						device: entry.device ?? null,
-						size: entry.size ?? null,
-						contentHash: entry.contentHash ?? null,
-					});
+			return await this.dashboardSnapshotCache.get(`recent-changes:${manifestLimit}:${changeLimit}`, async () => {
+				const settings = this.deps.getSettings();
+				const listed = await listFileHistoryManifests(
+					settings,
+					this.deps.getTraceHttpContext(),
+					manifestLimit,
+				);
+				const changes: DashboardRecentChange[] = [];
+				for (const index of listed.manifests.slice(0, manifestLimit)) {
+					for (const entry of index.changedEntries) {
+						changes.push({
+							manifestId: index.manifestId,
+							snapshotKind: index.kind,
+							createdAt: index.createdAt,
+							fileId: entry.fileId,
+							changeKind: entry.kind,
+							path: entry.newPath ?? entry.path,
+							oldPath: entry.oldPath ?? null,
+							newPath: entry.newPath ?? null,
+							device: entry.device ?? null,
+							size: entry.size ?? null,
+							contentHash: entry.contentHash ?? null,
+						});
+					}
 				}
-			}
-			changes.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
-			return {
-				status: "ready",
-				manifestCount: listed.manifests.length,
-				limited: listed.limited,
-				changes: changes.slice(0, changeLimit),
-			};
+				changes.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+				return {
+					status: "ready",
+					manifestCount: listed.manifests.length,
+					limited: listed.limited,
+					changes: changes.slice(0, changeLimit),
+				};
+			});
 		} catch (err) {
 			return { status: "error", message: formatUnknown(err) };
 		}
@@ -146,13 +150,13 @@ export class SnapshotService {
 			return { status: "offline", message: "Not connected to server." };
 		}
 		try {
-			return {
+			return await this.dashboardSnapshotCache.get("recovery-storage-status", async () => ({
 				status: "ready",
 				report: await getFileHistoryStorageStatus(
 					this.deps.getSettings(),
 					this.deps.getTraceHttpContext(),
 				),
-			};
+			}));
 		} catch (err) {
 			return { status: "error", message: formatUnknown(err) };
 		}
@@ -175,6 +179,7 @@ export class SnapshotService {
 				this.deps.getTraceHttpContext(),
 			);
 			if (result.status === "created") {
+				this.invalidateDashboardSnapshotCache();
 				this.deps.log(`Daily snapshot created: ${result.snapshotId}`);
 			} else if (result.status === "noop") {
 				this.deps.log(`Daily snapshot: ${result.reason ?? "no changes"}`);
@@ -208,6 +213,7 @@ export class SnapshotService {
 		try {
 			const result = await this.requestFileHistoryPoint(forceFull);
 			if (result.status === "created") {
+				this.invalidateDashboardSnapshotCache();
 				const changed = typeof result.index?.changedCount === "number"
 					? ` (${result.index.changedCount} changed)`
 					: "";
@@ -248,6 +254,7 @@ export class SnapshotService {
 		try {
 			const result = await this.requestFileHistoryPoint(true);
 			if (result.status === "created") {
+				this.invalidateDashboardSnapshotCache();
 				const changed = typeof result.index?.changedCount === "number"
 					? `${result.index.changedCount} changed file(s)`
 					: "changes recorded";
@@ -313,6 +320,7 @@ export class SnapshotService {
 				this.deps.getTraceHttpContext(),
 			);
 			if (result.status === "created" && result.index) {
+				this.invalidateDashboardSnapshotCache();
 				// Handle both new and old server response field names
 				const identical = normalizeSnapshotUnchanged(result);
 				const unchangedNote = identical
@@ -327,6 +335,9 @@ export class SnapshotService {
 				const deploymentMessage = snapshotBackendActionMessage(result.reason ?? "", "Vault snapshots");
 				new Notice(deploymentMessage ?? `Vault snapshot unavailable: ${result.reason ?? "R2 not configured"}`);
 			} else {
+				if (result.status === "created") {
+					this.invalidateDashboardSnapshotCache();
+				}
 				new Notice("Vault snapshot created.");
 			}
 		} catch (err) {
@@ -445,6 +456,7 @@ export class SnapshotService {
 				);
 			}
 			this.deps.log(`Vault snapshot prune: kept=${result.kept} pruned=${result.pruned} failed=${result.failed}`);
+			this.invalidateDashboardSnapshotCache();
 		} catch (err) {
 			this.showSnapshotFailure("Vault snapshot cleanup failed", "Vault snapshots", err);
 		}
@@ -476,6 +488,7 @@ export class SnapshotService {
 				`File history cleanup: kept=${result.kept} pruned=${result.prunedManifests} ` +
 				`contentDeleted=${result.contentDeleted} failed=${result.failed}`,
 			);
+			this.invalidateDashboardSnapshotCache();
 		} catch (err) {
 			this.showSnapshotFailure("File history cleanup failed", "File history", err);
 		}
@@ -506,6 +519,7 @@ export class SnapshotService {
 					: `File history storage ${report.status}. ${repaired} repair(s) applied.`,
 				8000,
 			);
+			this.invalidateDashboardSnapshotCache();
 		} catch (err) {
 			this.showSnapshotFailure("File history storage check failed", "File history", err);
 		}
@@ -615,6 +629,10 @@ export class SnapshotService {
 		console.warn(`[kaos] ${message}`);
 		this.deps.log(message);
 		new Notice(message, 12000);
+	}
+
+	private invalidateDashboardSnapshotCache(): void {
+		this.dashboardSnapshotCache.invalidate();
 	}
 
 	private logSnapshotBackendAction(err: unknown, featureLabel: string): boolean {

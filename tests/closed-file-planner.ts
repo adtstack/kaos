@@ -204,6 +204,23 @@ console.log("\n--- Test 11: disk == CRDT with null baseline => no-op (not confli
 	assert(action.kind === "no-op", "agreement overrides missing baseline");
 }
 
+// -----------------------------------------------------------------------
+// Path binding guard
+// -----------------------------------------------------------------------
+
+console.log("\n--- Test 12: non-ok path binding preserves CRDT as artifact ---");
+{
+	const action = planClosedFileReconcile(makeInput({
+		pathBindingStatus: "duplicate-active-path",
+		pathBindingReason: "multiple-active-file-ids-for-path",
+	}));
+	assert(action.kind === "create-conflict-artifact", "path binding issue creates conflict artifact");
+	assert(action.kind === "create-conflict-artifact" && action.reason === "path-binding-integrity", "reason records path binding integrity");
+	assert(action.kind === "create-conflict-artifact" && action.winner === "disk", "disk remains main path winner");
+	assert(action.kind === "create-conflict-artifact" && action.preserveSide === "crdt", "CRDT is preserved as artifact");
+	assert(action.kind === "create-conflict-artifact" && action.pathBindingStatus === "duplicate-active-path", "status is carried");
+}
+
 console.log(`\n${"─".repeat(55)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log(`${"─".repeat(55)}\n`);

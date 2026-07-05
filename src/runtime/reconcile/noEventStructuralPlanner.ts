@@ -1,20 +1,35 @@
+import {
+	evaluatePathBindingIntegrity,
+	type PathBindingRenameEvidence,
+} from "../../sync/pathBindingIntegrity";
+
 export interface StructuralPathHash {
 	path: string;
 	contentHash: string;
+}
+
+export interface StructuralRenameEvidence {
+	oldPath: string;
+	newPath: string;
+	reason: Extract<PathBindingRenameEvidence, "explicit-rename" | "pending-rename">;
 }
 
 export interface PlannedStructuralRename {
 	oldPath: string;
 	newPath: string;
 	contentHash: string;
-	reason: "unique-content-hash" | "unique-basename-with-duplicate-content";
+	reason: StructuralRenameEvidence["reason"];
 }
 
 export interface UnresolvedStructuralChange {
 	oldPaths: string[];
 	newPaths: string[];
 	contentHash: string;
-	reason: "ambiguous-duplicate-content" | "count-mismatch" | "content-diverged-same-basename";
+	reason:
+		| "ambiguous-structural-rename"
+		| "ambiguous-duplicate-content"
+		| "count-mismatch"
+		| "content-diverged-same-basename";
 }
 
 export interface NoEventStructuralPlan {
@@ -40,55 +55,43 @@ function groupByHash(paths: StructuralPathHash[]): Map<string, string[]> {
 	return groups;
 }
 
-function uniqueBasenameMatches(oldPaths: string[], newPaths: string[]): PlannedStructuralRename[] {
-	const oldByBase = new Map<string, string[]>();
-	const newByBase = new Map<string, string[]>();
-	for (const path of oldPaths) {
-		const key = basename(path);
-		const bucket = oldByBase.get(key) ?? [];
-		bucket.push(path);
-		oldByBase.set(key, bucket);
-	}
-	for (const path of newPaths) {
-		const key = basename(path);
-		const bucket = newByBase.get(key) ?? [];
-		bucket.push(path);
-		newByBase.set(key, bucket);
-	}
-
-	const matches: PlannedStructuralRename[] = [];
-	for (const [key, oldBucket] of oldByBase) {
-		const newBucket = newByBase.get(key);
-		if (oldBucket.length === 1 && newBucket?.length === 1) {
-			const oldPath = oldBucket[0]!;
-			const newPath = newBucket[0]!;
-			matches.push({
-				oldPath,
-				newPath,
-				contentHash: "",
-				reason: "unique-basename-with-duplicate-content",
-			});
-		}
-	}
-	matches.sort((a, b) => a.oldPath.localeCompare(b.oldPath) || a.newPath.localeCompare(b.newPath));
-	return matches;
-}
-
 export function planNoEventStructuralRenames(input: {
 	missingCrdtPaths: StructuralPathHash[];
 	extraDiskPaths: StructuralPathHash[];
+	renameEvidence?: StructuralRenameEvidence[];
 }): NoEventStructuralPlan {
 	const oldByHash = groupByHash(input.missingCrdtPaths);
 	const newByHash = groupByHash(input.extraDiskPaths);
+	const oldByPath = new Map(input.missingCrdtPaths.map((entry) => [entry.path, entry]));
+	const newByPath = new Map(input.extraDiskPaths.map((entry) => [entry.path, entry]));
 	const hashes = new Set<string>([...oldByHash.keys(), ...newByHash.keys()]);
 	const renames: PlannedStructuralRename[] = [];
 	const unresolved: UnresolvedStructuralChange[] = [];
 	const consumedOld = new Set<string>();
 	const consumedNew = new Set<string>();
 
+	for (const evidence of [...(input.renameEvidence ?? [])].sort((a, b) =>
+		a.oldPath.localeCompare(b.oldPath) || a.newPath.localeCompare(b.newPath)
+	)) {
+		const oldEntry = oldByPath.get(evidence.oldPath);
+		const newEntry = newByPath.get(evidence.newPath);
+		if (!oldEntry || !newEntry) continue;
+		if (consumedOld.has(evidence.oldPath) || consumedNew.has(evidence.newPath)) continue;
+		renames.push({
+			oldPath: evidence.oldPath,
+			newPath: evidence.newPath,
+			contentHash: oldEntry.contentHash === newEntry.contentHash
+				? oldEntry.contentHash
+				: `${oldEntry.contentHash}:${newEntry.contentHash}`,
+			reason: evidence.reason,
+		});
+		consumedOld.add(evidence.oldPath);
+		consumedNew.add(evidence.newPath);
+	}
+
 	for (const hash of [...hashes].sort()) {
-		const oldPaths = oldByHash.get(hash) ?? [];
-		const newPaths = newByHash.get(hash) ?? [];
+		const oldPaths = (oldByHash.get(hash) ?? []).filter((path) => !consumedOld.has(path));
+		const newPaths = (newByHash.get(hash) ?? []).filter((path) => !consumedNew.has(path));
 		if (oldPaths.length === 0 || newPaths.length === 0) continue;
 
 		if (oldPaths.length === 1 && newPaths.length === 1) {
@@ -97,42 +100,37 @@ export function planNoEventStructuralRenames(input: {
 			if (basename(oldPath) !== basename(newPath)) {
 				continue;
 			}
-			renames.push({
-				oldPath,
-				newPath,
+			const binding = evaluatePathBindingIntegrity({
+				path: oldPath,
+				candidatePath: newPath,
+				diskHash: hash,
+				crdtHash: hash,
+				baselineHash: null,
+				renameEvidence: "none",
+			});
+			unresolved.push({
+				oldPaths,
+				newPaths,
 				contentHash: hash,
-				reason: "unique-content-hash",
+				reason: binding.status === "ambiguous-structural-rename"
+					? "ambiguous-structural-rename"
+					: "ambiguous-duplicate-content",
 			});
 			consumedOld.add(oldPath);
 			consumedNew.add(newPath);
 			continue;
 		}
 
-		const basenameMatches = uniqueBasenameMatches(oldPaths, newPaths).map((match) => ({
-			...match,
+		for (const path of oldPaths) consumedOld.add(path);
+		for (const path of newPaths) consumedNew.add(path);
+		unresolved.push({
+			oldPaths,
+			newPaths,
 			contentHash: hash,
-		}));
-		renames.push(...basenameMatches);
-
-		const matchedOld = new Set(basenameMatches.map((match) => match.oldPath));
-		const matchedNew = new Set(basenameMatches.map((match) => match.newPath));
-		for (const path of matchedOld) consumedOld.add(path);
-		for (const path of matchedNew) consumedNew.add(path);
-		const remainingOld = oldPaths.filter((path) => !matchedOld.has(path));
-		const remainingNew = newPaths.filter((path) => !matchedNew.has(path));
-
-		if (remainingOld.length > 0 || remainingNew.length > 0) {
-			for (const path of remainingOld) consumedOld.add(path);
-			for (const path of remainingNew) consumedNew.add(path);
-			unresolved.push({
-				oldPaths: remainingOld,
-				newPaths: remainingNew,
-				contentHash: hash,
-				reason: remainingOld.length === remainingNew.length
-					? "ambiguous-duplicate-content"
-					: "count-mismatch",
-			});
-		}
+			reason: oldPaths.length === newPaths.length
+				? "ambiguous-duplicate-content"
+				: "count-mismatch",
+		});
 	}
 
 	const remainingOldByBase = new Map<string, StructuralPathHash[]>();

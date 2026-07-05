@@ -1,5 +1,11 @@
 import {
+	buildBlobConflictArtifactCopyPath,
+	buildBlobConflictArtifactPath,
+	buildMarkdownConflictArtifactCopyPath,
+	buildMarkdownConflictArtifactPath,
+	isBaseBlobConflictArtifactPath,
 	isBlobConflictArtifactPath,
+	isMarkdownConflictArtifactForOriginalPath,
 	isMarkdownConflictArtifactPath,
 	parseBlobConflictArtifactPath,
 	parseConflictArtifactPath,
@@ -82,6 +88,67 @@ console.log("\n--- Test 7: normal note is not a conflict artifact ---");
 	assert(parseConflictArtifactPath("notes/a.md") === null, "normal note returns null");
 	assert(!isMarkdownConflictArtifactPath("notes/a.md"), "markdown predicate false");
 	assert(!isBlobConflictArtifactPath("assets/a.png"), "blob predicate false");
+}
+
+console.log("\n--- Test 8: markdown artifact builder preserves controller filename format ---");
+{
+	const path = buildMarkdownConflictArtifactPath("notes/a.md", {
+		date: new Date("2026-06-23T14:20:40.123Z"),
+		deviceName: "Desk:/A* B?",
+		source: "crdt",
+	});
+	assert(
+		path === "notes/a (KAOS conflict - crdt from Desk--A- B- 2026-06-23T14-20-40Z).md",
+		"markdown artifact path is byte-identical",
+	);
+	assert(
+		buildMarkdownConflictArtifactCopyPath(path, 2) ===
+			"notes/a (KAOS conflict - crdt from Desk--A- B- 2026-06-23T14-20-40Z) 2.md",
+		"markdown copy suffix is inserted before .md",
+	);
+}
+
+console.log("\n--- Test 9: markdown artifact matcher preserves source-specific dedupe boundary ---");
+{
+	const candidate = "notes/a (KAOS conflict - disk from desktop 2026-06-23T14-20-40Z) 3.md";
+	assert(
+		isMarkdownConflictArtifactForOriginalPath(candidate, "notes/a.md", "disk"),
+		"source-specific matcher accepts matching copy artifact",
+	);
+	assert(
+		!isMarkdownConflictArtifactForOriginalPath(candidate, "notes/a.md", "crdt"),
+		"source-specific matcher rejects another source",
+	);
+	assert(
+		isMarkdownConflictArtifactForOriginalPath(
+			"notes/a (KAOS conflict from desktop 2026-06-23T14-20-40Z).md",
+			"notes/a.md",
+		),
+		"legacy source-less matcher remains source-less",
+	);
+}
+
+console.log("\n--- Test 10: blob artifact builder preserves blobSync filename format ---");
+{
+	const path = buildBlobConflictArtifactPath(
+		"assets/img.png",
+		new Date("2026-06-23T14:20:40.123Z"),
+	);
+	assert(
+		path === "assets/img (KAOS remote conflict 2026-06-23T14-20-40Z).png",
+		"blob artifact path is byte-identical",
+	);
+	assert(
+		buildBlobConflictArtifactCopyPath(path, 2) ===
+			"assets/img (KAOS remote conflict 2026-06-23T14-20-40Z) 2.png",
+		"blob copy suffix is inserted before extension",
+	);
+	assert(isBaseBlobConflictArtifactPath(path), "base blob predicate accepts primary artifact path");
+	assert(isBlobConflictArtifactPath(buildBlobConflictArtifactCopyPath(path, 2)), "parser blob predicate accepts copy artifact path");
+	assert(
+		!isBaseBlobConflictArtifactPath(buildBlobConflictArtifactCopyPath(path, 2)),
+		"base blob predicate preserves blobSync copy-suffix boundary",
+	);
 }
 
 console.log(`\nResults: ${passed} passed, ${failed} failed\n`);

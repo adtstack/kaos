@@ -22,6 +22,7 @@ import {
 	type ClosedFileConflictInput,
 	type MissingBaselineWinnerPolicy,
 } from "../../sync/closedFileConflict";
+import type { PathBindingIntegrityStatus } from "../../sync/pathBindingIntegrity";
 
 // -----------------------------------------------------------------------
 // Input type — everything the planner needs to decide
@@ -40,6 +41,11 @@ export interface ClosedFileReconcileInput {
 	// Mtime evidence for missing-baseline tiebreak
 	readonly diskMtime?: number;
 	readonly lastDiskIndexPersistedAt?: number;
+
+	// Optional path binding guard. Callers omit this when no integrity signal
+	// is available; non-ok statuses preserve rather than flushing CRDT blindly.
+	readonly pathBindingStatus?: PathBindingIntegrityStatus;
+	readonly pathBindingReason?: string;
 }
 
 // -----------------------------------------------------------------------
@@ -52,7 +58,8 @@ export type ClosedFileReconcileAction =
 	| { kind: "import-disk-to-crdt"; path: string; reason: string }
 	| { kind: "create-conflict-artifact"; path: string; reason: string;
 			winner: "disk" | "crdt"; preserveSide: "disk" | "crdt";
-			missingBaselinePolicy?: MissingBaselineWinnerPolicy }
+			missingBaselinePolicy?: MissingBaselineWinnerPolicy;
+			pathBindingStatus?: PathBindingIntegrityStatus; pathBindingReason?: string }
 	| { kind: "defer-to-crdt-flush"; path: string; reason: string };
 
 // -----------------------------------------------------------------------
@@ -70,7 +77,18 @@ export type ClosedFileReconcileAction =
  *      which uses three-way baseline comparison
  */
 export function planClosedFileReconcile(input: ClosedFileReconcileInput): ClosedFileReconcileAction {
-	const { path, mode, isOpenOrBound, diskHash, crdtHash, baselineHash, diskMtime, lastDiskIndexPersistedAt } = input;
+	const {
+		path,
+		mode,
+		isOpenOrBound,
+		diskHash,
+		crdtHash,
+		baselineHash,
+		diskMtime,
+		lastDiskIndexPersistedAt,
+		pathBindingStatus,
+		pathBindingReason,
+	} = input;
 
 	// Rule 1: non-authoritative mode → CRDT wins, flush to disk.
 	if (mode !== "authoritative") {
@@ -85,6 +103,18 @@ export function planClosedFileReconcile(input: ClosedFileReconcileInput): Closed
 	// Rule 3: disk and CRDT agree → nothing to do.
 	if (diskHash === crdtHash) {
 		return { kind: "no-op", path, reason: "disk-equals-crdt" };
+	}
+
+	if (pathBindingStatus && pathBindingStatus !== "ok" && pathBindingStatus !== "unknown") {
+		return {
+			kind: "create-conflict-artifact",
+			path,
+			reason: "path-binding-integrity",
+			winner: "disk",
+			preserveSide: "crdt",
+			pathBindingStatus,
+			pathBindingReason,
+		};
 	}
 
 	// Rule 4: authoritative + closed + hashes differ → three-way conflict resolution.

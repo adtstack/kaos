@@ -62,7 +62,13 @@ import {
 	planNoEventStructuralRenames,
 	type UnresolvedStructuralChange,
 } from "./reconcile/noEventStructuralPlanner";
-import { isMarkdownConflictArtifactPath } from "../paths/conflictArtifactPath";
+import { evaluatePathBindingIntegrity } from "../sync/pathBindingIntegrity";
+import {
+	buildMarkdownConflictArtifactCopyPath,
+	buildMarkdownConflictArtifactPath,
+	isMarkdownConflictArtifactForOriginalPath,
+	isMarkdownConflictArtifactPath,
+} from "../paths/conflictArtifactPath";
 
 export interface ReconciliationStats {
 	at: string;
@@ -222,11 +228,6 @@ const OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS = 1200;
 const OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS = 3000;
 const BOUND_RECOVERY_LOCK_MS = 1500;
 const TRACE_PATH_SAMPLE_LIMIT = 50;
-
-
-function escapeRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
 
 function tracePathList(prefix: string, paths: string[]): Record<string, unknown> {
 	return {
@@ -583,9 +584,17 @@ export class ReconciliationController {
 			});
 		}
 
+		const getPendingRenameOldPathForTarget =
+			(vaultSync as { getPendingRenameOldPathForTarget?: (path: string) => string | undefined })
+				.getPendingRenameOldPathForTarget;
 		const structuralPlan = planNoEventStructuralRenames({
 			missingCrdtPaths: missingWithHashes,
 			extraDiskPaths: extraWithHashes,
+			renameEvidence: extraDiskPaths.flatMap((newPath) => {
+				const oldPath = getPendingRenameOldPathForTarget?.call(vaultSync, newPath);
+				if (!oldPath || !missingCrdtPaths.includes(oldPath)) return [];
+				return [{ oldPath, newPath, reason: "pending-rename" as const }];
+			}),
 		});
 
 		const renameBatch = new Map<string, string>();
@@ -608,6 +617,8 @@ export class ReconciliationController {
 					conflictRisk: "none",
 					identityAmbiguous: false,
 					contentHash: rename.contentHash,
+					bindingStatus: "ok",
+					renameEvidence: rename.reason,
 				},
 			});
 			renameBatch.set(rename.oldPath, rename.newPath);
@@ -635,6 +646,11 @@ export class ReconciliationController {
 					conflictRisk: "high",
 					identityAmbiguous: true,
 					contentHash: change.contentHash,
+					bindingStatus:
+						change.reason === "ambiguous-structural-rename"
+							? "ambiguous-structural-rename"
+							: "unknown",
+					renameEvidence: "none",
 				},
 			});
 			this.deps.trace("reconcile", "reconcile-structural-change-unresolved", {
@@ -918,6 +934,27 @@ export class ReconciliationController {
 					},
 				});
 			}
+			for (const path of result.pathBindingConflicts ?? []) {
+				const getActiveFileIdsForPath =
+					(vaultSync as { getActiveFileIdsForPath?: (path: string) => string[] })
+						.getActiveFileIdsForPath;
+				this.deps.recordFlightPathEvent?.({
+					priority: "critical",
+					kind: PRODUCT_EVENT_KIND.reconcileFileDecision,
+					severity: "warn",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "reconcile",
+					path,
+					data: {
+						decision: "block-path-binding-conflict",
+						reason: "duplicate-active-path",
+						conflictRisk: "high",
+						bindingStatus: "duplicate-active-path",
+						activeFileIdsForPath: getActiveFileIdsForPath?.call(vaultSync, path) ?? [],
+					},
+				});
+			}
 			for (const path of result.untracked) {
 				this.deps.recordFlightPathEvent?.({
 					priority: "verbose",
@@ -1097,6 +1134,34 @@ export class ReconciliationController {
 						const crdtHash = await contentBaselineHash(crdtContent);
 						const baselineHash = this.deps.getDiskIndex()[path]?.contentHash ?? null;
 						const diskMtimeRaw = allStats.get(path)?.mtime;
+						const getFileIdForText =
+							(vaultSync as { getFileIdForText?: (text: typeof ytext) => string | undefined })
+								.getFileIdForText;
+						const getFileId =
+							(vaultSync as { getFileId?: (path: string) => string | undefined })
+								.getFileId;
+						const fileId =
+							getFileIdForText?.call(vaultSync, ytext) ??
+							getFileId?.call(vaultSync, path) ??
+							null;
+						const bindingInput = {
+							path,
+							fileId,
+							diskHash,
+							crdtHash,
+							baselineHash,
+							renameEvidence: "none",
+						} as const;
+						const getPathBindingIntegrity =
+							(vaultSync as {
+								getPathBindingIntegrity?: (input: typeof bindingInput) => ReturnType<typeof evaluatePathBindingIntegrity>;
+							}).getPathBindingIntegrity;
+						const bindingIntegrity = getPathBindingIntegrity
+							? getPathBindingIntegrity.call(vaultSync, bindingInput)
+							: evaluatePathBindingIntegrity({
+								...bindingInput,
+								activeFileIdsForPath: fileId ? [fileId] : [],
+							});
 						const rawLastSave = this.deps.getLastSaveDiskIndexAt?.();
 						const now = Date.now();
 						const lastDiskIndexPersistedAt =
@@ -1117,6 +1182,8 @@ export class ReconciliationController {
 							baselineHash,
 							diskMtime: diskMtimeRaw,
 							lastDiskIndexPersistedAt,
+							pathBindingStatus: bindingIntegrity.status,
+							pathBindingReason: bindingIntegrity.reason,
 						});
 
 						// Emit flight event for the decision.
@@ -1132,15 +1199,23 @@ export class ReconciliationController {
 								decision: action.kind,
 								reason: action.reason,
 								winner: action.kind === "create-conflict-artifact" ? action.winner : null,
+								fileId,
 								diskLength: diskContent.length,
 								crdtLength: crdtContent.length,
 								diskHash,
 								crdtHash,
 								baselineHash,
+								bindingStatus: bindingIntegrity.status,
+								bindingReason: bindingIntegrity.reason,
+								activeFileIdsForPath: bindingIntegrity.activeFileIdsForPath,
+								candidatePath: bindingIntegrity.candidatePath,
+								renameEvidence: bindingIntegrity.renameEvidence,
 								diskChangedSinceBaseline: baselineHash !== null ? diskHash !== baselineHash : null,
 								conflictRisk:
 									action.kind === "create-conflict-artifact"
-										? action.reason === "both-changed"
+										? action.reason === "path-binding-integrity"
+											? "high"
+											: action.reason === "both-changed"
 											? "high"
 											: "ambiguous"
 										: "none",
@@ -1379,10 +1454,11 @@ export class ReconciliationController {
 			this.reconciled = true;
 
 			const integrity = vaultSync.runIntegrityChecks();
-			if (integrity.duplicateIds > 0 || integrity.orphansCleaned > 0) {
+			if (integrity.duplicateIds > 0 || integrity.orphansCleaned > 0 || integrity.duplicateActivePaths > 0) {
 				this.deps.log(
 					`Integrity: ${integrity.duplicateIds} duplicate IDs fixed, ` +
-					`${integrity.orphansCleaned} orphans cleaned`,
+					`${integrity.orphansCleaned} orphans cleaned, ` +
+					`${integrity.duplicateActivePaths} active path collisions preserved`,
 				);
 			}
 
@@ -3764,11 +3840,12 @@ export class ReconciliationController {
 			return { path: existing, created: false };
 		}
 
-		const basePath = this.conflictArtifactPath(path, source);
+		const basePath = buildMarkdownConflictArtifactPath(path, {
+			deviceName: this.deps.getSettings().deviceName,
+			source,
+		});
 		for (let i = 0; i < 100; i++) {
-			const candidate = i === 0
-				? basePath
-				: basePath.replace(/(\.md)?$/, ` ${i + 1}$1`);
+			const candidate = buildMarkdownConflictArtifactCopyPath(basePath, i + 1);
 			if (this.deps.app.vault.getAbstractFileByPath(candidate)) continue;
 			await this.deps.getDiskMirror()?.suppressLocalCreate(candidate, content);
 			await this.deps.app.vault.create(candidate, content);
@@ -3792,10 +3869,9 @@ export class ReconciliationController {
 		const vault = this.deps.app.vault;
 		if (typeof vault.getMarkdownFiles !== "function") return null;
 
-		const matcher = this.conflictArtifactMatcher(path, source);
 		const targetFingerprint = contentFingerprint(content);
 		for (const file of vault.getMarkdownFiles()) {
-			if (!matcher(file.path)) continue;
+			if (!isMarkdownConflictArtifactForOriginalPath(file.path, path, source)) continue;
 			try {
 				const existingContent = await this.deps.app.vault.read(file);
 				if (contentFingerprint(existingContent) === targetFingerprint && existingContent === content) {
@@ -3807,58 +3883,6 @@ export class ReconciliationController {
 			}
 		}
 		return null;
-	}
-
-	private conflictArtifactMatcher(
-		path: string,
-		source?: "crdt" | "disk" | "editor",
-	): (candidate: string) => boolean {
-		const slash = path.lastIndexOf("/");
-		const dir = slash >= 0 ? path.slice(0, slash + 1) : "";
-		const name = slash >= 0 ? path.slice(slash + 1) : path;
-		const dot = name.toLowerCase().endsWith(".md") ? name.length - 3 : -1;
-		const base = dot >= 0 ? name.slice(0, dot) : name;
-		const ext = dot >= 0 ? name.slice(dot) : ".md";
-		const cappedBase = base.slice(0, 100);
-		const sourcePart = source ? ` - ${source}` : "";
-		const escapedDir = escapeRegExp(dir);
-		const escapedBase = escapeRegExp(cappedBase);
-		const escapedSourcePart = escapeRegExp(sourcePart);
-		const escapedExt = escapeRegExp(ext);
-		const re = new RegExp(
-			`^${escapedDir}${escapedBase} \\(KAOS conflict${escapedSourcePart} from [^/]+ ` +
-			`\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}Z\\)(?: \\d+)?${escapedExt}$`,
-		);
-		return (candidate: string) =>
-			isMarkdownConflictArtifactPath(candidate) && re.test(candidate.replace(/\\/g, "/"));
-	}
-
-	private conflictArtifactPath(path: string, source?: "crdt" | "disk" | "editor"): string {
-		const slash = path.lastIndexOf("/");
-		const dir = slash >= 0 ? path.slice(0, slash + 1) : "";
-		const name = slash >= 0 ? path.slice(slash + 1) : path;
-		const dot = name.toLowerCase().endsWith(".md") ? name.length - 3 : -1;
-		const base = dot >= 0 ? name.slice(0, dot) : name;
-		const ext = dot >= 0 ? name.slice(dot) : ".md";
-		// Cap device name to 50 chars to prevent overly long paths
-		const device = (this.deps.getSettings().deviceName
-			.replace(/[\\/:*?"<>|]/g, "-")
-			.trim() || "unknown-device").slice(0, 50);
-		const stamp = new Date().toISOString()
-			.replace(/\.\d{3}Z$/, "Z")
-			.replace(/[:]/g, "-");
-		// Cap base name to 100 chars to prevent filesystem path length issues
-		const cappedBase = base.slice(0, 100);
-		const sourcePart = source ? ` - ${source}` : "";
-		const suffix = ` (KAOS conflict${sourcePart} from ${device} ${stamp})`;
-		// Guard total filename length: suffix + ext + base + margin for
-		// counter suffix (" 99") ≈ suffix.length + ext.length + 4.
-		// Most filesystems cap at 255 bytes per component.
-		const maxBase = Math.max(20, 255 - suffix.length - ext.length - 4);
-		const finalBase = cappedBase.length > maxBase
-			? cappedBase.slice(0, maxBase)
-			: cappedBase;
-		return `${dir}${finalBase}${suffix}${ext}`;
 	}
 
 	private async updateDiskIndexForPath(

@@ -15,9 +15,19 @@ const MARKDOWN_CONFLICT_ARTIFACT_NAME_RE =
 const BLOB_CONFLICT_ARTIFACT_NAME_RE =
 	/^(.+) \(KAOS remote conflict (\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)\)(?: (\d+))?(\.[^/.]+)?$/;
 
+const BASE_BLOB_CONFLICT_ARTIFACT_NAME_RE =
+	/^.+ \(KAOS remote conflict \d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\)(?:\.[^/.]+)?$/;
+
 export type ConflictArtifactKind = "markdown" | "blob";
-export type ConflictArtifactSource = "disk" | "crdt" | "editor" | "remote";
+export type MarkdownConflictArtifactSource = "disk" | "crdt" | "editor";
+export type ConflictArtifactSource = MarkdownConflictArtifactSource | "remote";
 export type ConflictArtifactOriginalConfidence = "candidate" | "possibly-truncated";
+
+export interface BuildMarkdownConflictArtifactPathOptions {
+	deviceName: string;
+	source?: MarkdownConflictArtifactSource;
+	date?: Date;
+}
 
 export interface ParsedConflictArtifactPath {
 	kind: ConflictArtifactKind;
@@ -37,6 +47,11 @@ export function isMarkdownConflictArtifactPath(path: string): boolean {
 export function isBlobConflictArtifactPath(path: string): boolean {
 	const name = normalizeSlashes(path).split("/").pop() ?? path;
 	return BLOB_CONFLICT_ARTIFACT_NAME_RE.test(name);
+}
+
+export function isBaseBlobConflictArtifactPath(path: string): boolean {
+	const name = normalizeSlashes(path).split("/").pop() ?? path;
+	return BASE_BLOB_CONFLICT_ARTIFACT_NAME_RE.test(name);
 }
 
 export function parseConflictArtifactPath(path: string): ParsedConflictArtifactPath | null {
@@ -88,6 +103,71 @@ export function parseBlobConflictArtifactPath(path: string): ParsedConflictArtif
 	};
 }
 
+export function buildMarkdownConflictArtifactPath(
+	path: string,
+	options: BuildMarkdownConflictArtifactPathOptions,
+): string {
+	const { dir, name } = splitPath(path);
+	const dot = name.toLowerCase().endsWith(".md") ? name.length - 3 : -1;
+	const base = dot >= 0 ? name.slice(0, dot) : name;
+	const ext = dot >= 0 ? name.slice(dot) : ".md";
+	const device = sanitizeMarkdownConflictDeviceName(options.deviceName);
+	const stamp = formatConflictArtifactStamp(options.date ?? new Date());
+	const cappedBase = base.slice(0, 100);
+	const sourcePart = options.source ? ` - ${options.source}` : "";
+	const suffix = ` (KAOS conflict${sourcePart} from ${device} ${stamp})`;
+	const maxBase = Math.max(20, 255 - suffix.length - ext.length - 4);
+	const finalBase = cappedBase.length > maxBase
+		? cappedBase.slice(0, maxBase)
+		: cappedBase;
+	return `${dir}${finalBase}${suffix}${ext}`;
+}
+
+export function buildMarkdownConflictArtifactCopyPath(basePath: string, copyIndex: number): string {
+	if (!Number.isInteger(copyIndex) || copyIndex <= 1) return basePath;
+	return basePath.replace(/(\.md)?$/, ` ${copyIndex}$1`);
+}
+
+export function isMarkdownConflictArtifactForOriginalPath(
+	candidate: string,
+	originalPath: string,
+	source?: MarkdownConflictArtifactSource,
+): boolean {
+	const { dir, name } = splitPath(originalPath);
+	const dot = name.toLowerCase().endsWith(".md") ? name.length - 3 : -1;
+	const base = dot >= 0 ? name.slice(0, dot) : name;
+	const ext = dot >= 0 ? name.slice(dot) : ".md";
+	const cappedBase = base.slice(0, 100);
+	const sourcePart = source ? ` - ${source}` : "";
+	const escapedDir = escapeRegExp(dir);
+	const escapedBase = escapeRegExp(cappedBase);
+	const escapedSourcePart = escapeRegExp(sourcePart);
+	const escapedExt = escapeRegExp(ext);
+	const re = new RegExp(
+		`^${escapedDir}${escapedBase} \\(KAOS conflict${escapedSourcePart} from [^/]+ ` +
+		`\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}Z\\)(?: \\d+)?${escapedExt}$`,
+	);
+	return isMarkdownConflictArtifactPath(candidate) && re.test(candidate.replace(/\\/g, "/"));
+}
+
+export function buildBlobConflictArtifactPath(path: string, date = new Date()): string {
+	const normalized = normalizeSlashes(path);
+	const { dir, name } = splitPath(normalized);
+	const dot = name.lastIndexOf(".");
+	const stamp = formatConflictArtifactStamp(date);
+	const suffix = ` (KAOS remote conflict ${stamp})`;
+	const ext = dot > 0 ? name.slice(dot) : "";
+	const base = dot > 0 ? name.slice(0, dot) : name;
+	const maxBase = Math.max(20, 255 - suffix.length - ext.length - 4);
+	const cappedBase = base.length > maxBase ? base.slice(0, maxBase) : base;
+	return `${dir}${cappedBase}${suffix}${ext}`;
+}
+
+export function buildBlobConflictArtifactCopyPath(basePath: string, copyIndex: number): string {
+	if (!Number.isInteger(copyIndex) || copyIndex <= 1) return basePath;
+	return basePath.replace(/(\.[^/.]+)?$/, ` ${copyIndex}$1`);
+}
+
 function normalizeSlashes(path: string): string {
 	return path.replace(/\\/g, "/");
 }
@@ -107,6 +187,19 @@ function stampToIso(stamp: string): string {
 	);
 }
 
+function formatConflictArtifactStamp(date: Date): string {
+	return date
+		.toISOString()
+		.replace(/\.\d{3}Z$/, "Z")
+		.replace(/[:]/g, "-");
+}
+
+function sanitizeMarkdownConflictDeviceName(deviceName: string): string {
+	return (deviceName
+		.replace(/[\\/:*?"<>|]/g, "-")
+		.trim() || "unknown-device").slice(0, 50);
+}
+
 function parseCopyIndex(value: string | undefined): number | null {
 	if (!value) return null;
 	const parsed = Number(value);
@@ -115,4 +208,8 @@ function parseCopyIndex(value: string | undefined): number | null {
 
 function isMarkdownSource(value: string | undefined): value is "disk" | "crdt" | "editor" {
 	return value === "disk" || value === "crdt" || value === "editor";
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
