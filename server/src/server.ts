@@ -39,6 +39,10 @@ import {
 	PersistenceCoordinator,
 	type PersistenceHealth,
 } from "./persistenceCoordinator";
+import {
+	attachConnectionClientKind,
+	buildUpdateObservedTraceData,
+} from "./connectionMetadata";
 
 const MAX_DEBUG_TRACE_EVENTS = 200;
 const JOURNAL_COMPACT_MAX_ENTRIES = 50;
@@ -276,7 +280,14 @@ export class VaultSyncServer extends YServer {
 	}
 
 	async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
+		const clientKind = attachConnectionClientKind(connection, ctx.request);
 		await super.onConnect(connection, ctx);
+		console.debug(JSON.stringify({
+			source: "kaos-sync/server",
+			event: "server.connection.open",
+			roomId: this.getRoomId(),
+			clientKind,
+		}));
 		this.recordSvEchoResult(trySendSvEcho(connection, this.document, "baseline"));
 	}
 
@@ -289,10 +300,10 @@ export class VaultSyncServer extends YServer {
 			const docChanged = svBefore !== null && !equalBytes(svBefore, svAfter);
 			this.recordSvEchoResult(trySendSvEcho(connection, this.document, "postApply"));
 			// Fire-and-forget trace: do not block message processing.
-			void this.recordTrace("server.ydoc.update_observed", {
-				updateBytes: typeof message === "string" ? message.length : (message as ArrayBuffer).byteLength,
-				docChanged,
-			});
+			void this.recordTrace(
+				"server.ydoc.update_observed",
+				buildUpdateObservedTraceData(connection, message, docChanged),
+			);
 		}
 	}
 
@@ -549,6 +560,7 @@ export class VaultSyncServer extends YServer {
 		await this.ensureRecoveryDirtyLoaded();
 		const meta = this.document.getMap<unknown>("meta");
 		const idToText = this.document.getMap<Y.Text>("idToText");
+		const pathToId = this.document.getMap<string>("pathToId");
 
 		meta.observeDeep((events) => {
 			const affected = new Set<string>();
@@ -575,6 +587,16 @@ export class VaultSyncServer extends YServer {
 				}
 				const ytext = idToText.get(fileId);
 				if (ytext) this.observeRecoveryText(fileId, ytext);
+			}
+			this.markRecoveryDirtyFileIds(affected);
+		});
+
+		pathToId.observe((event) => {
+			const affected = new Set<string>();
+			for (const [path, change] of event.changes.keys) {
+				const nextFileId = pathToId.get(path);
+				if (typeof nextFileId === "string") affected.add(nextFileId);
+				if (typeof change.oldValue === "string") affected.add(change.oldValue);
 			}
 			this.markRecoveryDirtyFileIds(affected);
 		});

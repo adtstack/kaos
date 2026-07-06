@@ -5,6 +5,7 @@ import { fetchVaultSchemaVersion } from "./trace";
 import { verifyTicket } from "./ticket";
 import type { AuthState, Env, FatalAuthCode } from "./types";
 import { SERVER_MAX_SCHEMA_VERSION, SERVER_MIN_SCHEMA_VERSION } from "../version";
+import { parseSyncClientKind } from "../clientKind";
 
 const LEGACY_CLIENT_SCHEMA_VERSION = 1;
 
@@ -28,6 +29,8 @@ function parseClientSchemaVersion(url: URL): { version: number; source: "query" 
 	if (!Number.isInteger(parsed) || parsed < 0) return null;
 	return { version: parsed, source: "query" };
 }
+
+export { parseSyncClientKind };
 
 function isWebSocketRequest(req: Request): boolean {
 	return (req.headers.get("Upgrade") ?? "").toLowerCase() === "websocket";
@@ -163,6 +166,7 @@ export async function handleSyncSocketRoute(
 	const token = getSocketAuthToken(req);
 	const ticket = url.searchParams.get("ticket");
 	const clientSchema = parseClientSchemaVersion(url);
+	const clientKind = parseSyncClientKind(url);
 	const disableLegacyToken = !!env.KAOS_DISABLE_LEGACY_WS_TOKEN;
 
 	const authResult = await authenticateSocketRequest(
@@ -194,6 +198,7 @@ export async function handleSyncSocketRoute(
 				reason: "update_required",
 				detail: "invalid_client_schema",
 				rawSchema: url.searchParams.get("schemaVersion") ?? url.searchParams.get("schema") ?? null,
+				clientKind,
 			}),
 		);
 		return returnSocketResponse(req, rejectSocket(req, "update_required", {
@@ -219,6 +224,7 @@ export async function handleSyncSocketRoute(
 				detail,
 				clientSchemaVersion: clientSchema.version,
 				clientSchemaSource: clientSchema.source,
+				clientKind,
 				serverMinSchemaVersion: SERVER_MIN_SCHEMA_VERSION,
 				serverMaxSchemaVersion: SERVER_MAX_SCHEMA_VERSION,
 			}),
@@ -244,6 +250,7 @@ export async function handleSyncSocketRoute(
 				detail: "client_schema_older_than_room",
 				clientSchemaVersion: clientSchema.version,
 				clientSchemaSource: clientSchema.source,
+				clientKind,
 				roomSchemaVersion,
 			}),
 		);
@@ -264,6 +271,7 @@ export async function handleSyncSocketRoute(
 			vaultIdHint: vaultId.slice(0, 8),
 			clientSchemaVersion: clientSchema.version,
 			clientSchemaSource: clientSchema.source,
+			clientKind,
 			roomSchemaVersion,
 			authMethod: authResult.method,
 			cfRay: req.headers.get("cf-ray") ?? undefined,
