@@ -181,6 +181,8 @@ console.log("\n--- Test 3d: automatic snapshot triggers treat Bad Gateway as tra
 	assert(source.includes("this.requestFileHistoryPoint(true)"), "manual file history point explicitly allows full bootstrap");
 	assert(serverSource.includes("RECOVERY_AUTOMATIC_BOOTSTRAP_FILE_LIMIT = 1000"), "automatic file history bootstrap has a large-vault threshold");
 	assert(serverSource.includes("recovery-snapshot-bootstrap-deferred"), "automatic large-vault bootstrap records a defer trace");
+	assert(serverSource.includes("pathToId.observe"), "recovery dirty tracking observes legacy pathToId changes");
+	assert(serverSource.includes("change.oldValue"), "recovery dirty tracking marks previous pathToId file id on rename/delete");
 }
 
 console.log("\n--- Test 4: blob uploads reject poisoned content-addressed keys ---");
