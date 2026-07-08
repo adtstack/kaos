@@ -174,6 +174,26 @@ console.log("\n--- Test 9: missing baseline, disk NOT newer => conflict, CRDT wi
 }
 
 // -----------------------------------------------------------------------
+// Missing baseline: pending local create is disk authority
+// -----------------------------------------------------------------------
+
+console.log("\n--- Test 9b: missing baseline, pending local create => conflict, disk wins ---");
+{
+	const action = planClosedFileReconcile(makeInput({
+		diskHash: HASH_A,
+		crdtHash: HASH_B,
+		baselineHash: null,
+		diskMtime: 500,
+		lastDiskIndexPersistedAt: 1000,
+		hasPendingLocalCreate: true,
+	}));
+	assert(action.kind === "create-conflict-artifact", "conflict created");
+	assert(action.kind === "create-conflict-artifact" && action.winner === "disk", "pending create disk wins");
+	assert(action.kind === "create-conflict-artifact" && action.preserveSide === "crdt", "CRDT is preserved");
+	assert(action.kind === "create-conflict-artifact" && action.missingBaselinePolicy === "local-create-event", "policy: local create event");
+}
+
+// -----------------------------------------------------------------------
 // Path is preserved in all actions
 // -----------------------------------------------------------------------
 

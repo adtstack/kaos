@@ -266,6 +266,122 @@ console.log("\n--- Test 2c: conflict winner baseline waits for observed equality
 	doc.destroy();
 }
 
+console.log("\n--- Test 2c2: pending local create wins missing-baseline reconcile ---");
+{
+	const path = "new-file-race.md";
+	const diskContent = "local create body";
+	const crdtContent = "older crdt body";
+	const file = makeTFile(path);
+	const doc = new Y.Doc();
+	const ytext = doc.getText("content");
+	ytext.insert(0, crdtContent);
+	let diskIndex: DiskIndex = {};
+	const stats = new Map<string, { mtime: number; size: number }>([
+		[path, { mtime: 500, size: diskContent.length }],
+	]);
+	const createdFiles = new Map<string, string>();
+	const flushed: string[] = [];
+	const decisions: Array<Record<string, unknown>> = [];
+
+	const app = {
+		vault: {
+			getMarkdownFiles: () => [
+				file,
+				...Array.from(createdFiles.keys()).map(makeTFile),
+			],
+			read: async (readFile: TFile & { path: string }) => {
+				if (readFile.path === path) return diskContent;
+				return createdFiles.get(readFile.path) ?? "";
+			},
+			create: async (createdPath: string, content: string) => {
+				if (createdFiles.has(createdPath)) throw new Error("exists");
+				createdFiles.set(createdPath, content);
+			},
+			adapter: {
+				stat: async (candidate: string) => stats.get(candidate) ?? null,
+			},
+			getAbstractFileByPath: (candidate: string) =>
+				createdFiles.has(candidate) ? ({ path: candidate }) : null,
+		},
+		workspace: {
+			iterateAllLeaves: () => {},
+		},
+	};
+
+	const vaultSync = {
+		connected: true,
+		providerSynced: true,
+		getTextForPath: (candidate: string) => candidate === path ? ytext : null,
+		getActiveMarkdownPaths: () => [path],
+		reconcileVault: () => ({
+			mode: "authoritative",
+			createdOnDisk: [],
+			updatedOnDisk: [path],
+			seededToCrdt: [],
+			untracked: [],
+			tombstonedDiskConflicts: [],
+			skipped: 0,
+		}),
+		runIntegrityChecks: () => ({ duplicateIds: 0, orphansCleaned: 0 }),
+	};
+
+	const controller = new ReconciliationController({
+		app: app as any,
+		getSettings: () => ({ deviceName: "Device" }) as any,
+		getRuntimeConfig: () => ({
+			maxFileSizeBytes: 0,
+			maxFileSizeKB: 0,
+			excludePatterns: [],
+		}) as any,
+		getVaultSync: () => vaultSync as any,
+		getDiskMirror: () => ({
+			flushWrite: async (flushPath: string) => { flushed.push(flushPath); },
+			suppressLocalCreate: async () => {},
+		}) as any,
+		getBlobSync: () => null,
+		getEditorBindings: () => null,
+		getDiskIndex: () => diskIndex,
+		setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
+		isMarkdownPathSyncable: () => true,
+		shouldBlockFrontmatterIngest: () => false,
+		refreshServerCapabilities: async () => {},
+		validateOpenEditorBindings: () => {},
+		onReconciled: () => {},
+		getAwaitingFirstProviderSyncAfterStartup: () => false,
+		setAwaitingFirstProviderSyncAfterStartup: () => {},
+		getLastSaveDiskIndexAt: () => 1000,
+		saveDiskIndex: async () => {},
+		refreshStatusBar: () => {},
+		recordFlightPathEvent: (event) => {
+			if (event.kind === "reconcile.file.decision") decisions.push(event.data ?? {});
+		},
+		trace: () => {},
+		scheduleTraceStateSnapshot: () => {},
+		log: () => {},
+	});
+
+	controller.markMarkdownDirty(file, "create", "op-local-create");
+	const timer = (controller as any).markdownDrainTimer as ReturnType<typeof setTimeout> | null;
+	if (timer) clearTimeout(timer);
+	(controller as any).markdownDrainTimer = null;
+
+	await controller.runReconciliation("authoritative");
+
+	const artifactContent = Array.from(createdFiles.values())[0];
+	assert(ytext.toString() === diskContent, "pending create imports disk content to CRDT");
+	assert(flushed.length === 0, "pending create does not flush stale CRDT to disk");
+	assert(artifactContent === crdtContent, "stale CRDT side is preserved as a conflict artifact");
+	assert(
+		decisions.some((decision) =>
+			decision.reason === "missing-baseline" &&
+			decision.winner === "disk" &&
+			decision.missingBaselinePolicy === "local-create-event"
+		),
+		"decision records local-create-event missing-baseline policy",
+	);
+	doc.destroy();
+}
+
 console.log("\n--- Test 2d: startup open editor content wins before binding can overwrite it ---");
 {
 	const path = "open-reenable.md";

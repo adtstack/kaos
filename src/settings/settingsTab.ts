@@ -552,6 +552,19 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					}),
 			);
 
+		new Setting(containerEl)
+			.setName("Pause while another device is typing")
+			.setDesc("Warn and block local keystrokes when another device recently typed in the same note.")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.host.settings.remoteTypingGuardEnabled)
+					.onChange(async (value) => {
+						await this.host.updateSettings((settings) => {
+							settings.remoteTypingGuardEnabled = value;
+						}, "settings:remote-typing-guard");
+					}),
+			);
+
 		const manualDetails = createDetailsSection(containerEl, "Manual connection", setupIncomplete);
 		const manualBody = manualDetails.createDiv({ cls: "kaos-settings-details-body" });
 				if (setupIncomplete) {
@@ -624,18 +637,18 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 			new Setting(advancedBody)
 				.setName("Edits from other apps")
-				.setDesc("Choose how the plugin handles file changes from Git, scripts, or other editors.")
+				.setDesc("Closed files only is safest: open notes keep editor authority while Git, scripts, or other editors are changing files.")
 				.addDropdown((dropdown) =>
 					dropdown
+						.addOption("closed-only", "Closed files only")
 						.addOption("always", "Always import")
-					.addOption("closed-only", "Only when file is closed")
-					.addOption("never", "Never import")
-					.setValue(this.host.settings.externalEditPolicy)
-					.onChange(async (value) => {
-						await this.host.updateSettings((settings) => {
-							settings.externalEditPolicy = value as ExternalEditPolicy;
-						}, "settings:external-edit-policy");
-					}),
+						.addOption("never", "Never import")
+						.setValue(this.host.settings.externalEditPolicy)
+						.onChange(async (value) => {
+							await this.host.updateSettings((settings) => {
+								settings.externalEditPolicy = value as ExternalEditPolicy;
+							}, "settings:external-edit-policy");
+						}),
 			);
 
 		new Setting(advancedBody)

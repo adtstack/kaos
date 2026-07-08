@@ -34,8 +34,8 @@ export interface VaultSyncSettings {
 	maxFileSizeKB: number;
 	/**
 	 * How to handle external disk modifications (git pull, other editors).
-	 *   "always"      — always import into CRDT (default, current behavior)
-	 *   "closed-only" — import only for files not open in an editor
+	 *   "closed-only" — import only for files not open in an editor (default)
+	 *   "always"      — always import into CRDT, including open editor files
 	 *   "never"       — never import (CRDT is sole source of truth)
 	 */
 	externalEditPolicy: ExternalEditPolicy;
@@ -49,6 +49,8 @@ export interface VaultSyncSettings {
 	attachmentConcurrency: number;
 	/** Show remote cursors and selections in the editor. */
 	showRemoteCursors: boolean;
+	/** Pause local typing when another device is actively typing in the same note. */
+	remoteTypingGuardEnabled: boolean;
 	/** Enable QA flight recorder tracing. */
 	qaTraceEnabled: boolean;
 	/** QA trace mode: safe/qa-safe/full/local-private. */
@@ -72,13 +74,14 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	frontmatterGuardEnabled: true,
 	excludePatterns: "",
 	maxFileSizeKB: 2048,
-	externalEditPolicy: "always",
+	externalEditPolicy: "closed-only",
 	enableAttachmentSync: true,
 	attachmentSyncExplicitlyConfigured: false,
 	maxAttachmentSizeKB: MAX_ATTACHMENT_SIZE_KB,
 	// requestUrl cannot be hard-aborted; default to 1 to avoid stacked zombie transfers.
 	attachmentConcurrency: 1,
 	showRemoteCursors: true,
+	remoteTypingGuardEnabled: true,
 	qaTraceEnabled: false,
 	qaTraceMode: "safe",
 	qaTraceSecret: "",

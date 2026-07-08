@@ -56,6 +56,7 @@ const NODE = "node";
 const suites = [
 	[JITI, "tests/diff-regressions.mjs"],
 	[JITI, "tests/external-edit-policy-regressions.mjs"],
+	[JITI, "tests/remote-typing-guard.ts"],
 	[JITI, "tests/bound-recovery-regressions.mjs"],
 	[JITI, "tests/editor-binding-recent-activity.ts"],
 	[JITI, "tests/editor-binding-health-regressions.mjs"],

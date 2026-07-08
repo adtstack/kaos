@@ -147,7 +147,7 @@ console.log("\n--- Test 9: destructive provider patches only shield during recen
 {
 	const section = sliceBetween(
 		bindingSource,
-		"private filterRiskyNonUserPatch(transaction: Transaction): Transaction | TransactionSpec {",
+		"private filterRiskyNonUserPatch(transaction: Transaction):",
 		"private createYTextOriginCaptureExtension(",
 	);
 	assert(section !== null, "filterRiskyNonUserPatch section found");

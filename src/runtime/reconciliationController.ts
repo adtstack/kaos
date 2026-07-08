@@ -1182,6 +1182,7 @@ export class ReconciliationController {
 							baselineHash,
 							diskMtime: diskMtimeRaw,
 							lastDiskIndexPersistedAt,
+							hasPendingLocalCreate: this.hasPendingLocalCreate(path),
 							pathBindingStatus: bindingIntegrity.status,
 							pathBindingReason: bindingIntegrity.reason,
 						});
@@ -1652,6 +1653,22 @@ export class ReconciliationController {
 
 	markMarkdownDirty(file: TFile, reason: MarkdownDirtyReason, opId?: string): void {
 		this.queueDirtyMarkdownPath(file.path, reason, opId);
+	}
+
+	private hasPendingLocalCreate(path: string): boolean {
+		if (this.dirtyMarkdownPaths.get(path)?.reason === "create") {
+			return true;
+		}
+		const active = this.activeMarkdownIngests.get(path);
+		if (active?.entry.reason === "create") {
+			return true;
+		}
+		for (const ingest of this.activeMarkdownIngests.values()) {
+			if (ingest.redirectedTo === path && ingest.entry.reason === "create") {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private mergeDirtyEntryIntoPath(path: string, entry: MarkdownDirtyEntry): void {

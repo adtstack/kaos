@@ -17,6 +17,7 @@ export interface RuntimeConfig {
 	maxAttachmentSizeKB: number;
 	attachmentConcurrency: number;
 	showRemoteCursors: boolean;
+	remoteTypingGuardEnabled: boolean;
 	updateRepoUrl: string;
 	updateRepoBranch: string;
 	vaultConfigDir: string;
@@ -42,6 +43,7 @@ export function buildRuntimeConfig(
 		maxAttachmentSizeKB: settings.maxAttachmentSizeKB,
 		attachmentConcurrency: settings.attachmentConcurrency,
 		showRemoteCursors: settings.showRemoteCursors,
+		remoteTypingGuardEnabled: settings.remoteTypingGuardEnabled,
 		updateRepoUrl: settings.updateRepoUrl.trim(),
 		updateRepoBranch: settings.updateRepoBranch.trim() || "main",
 		vaultConfigDir,

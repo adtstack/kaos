@@ -24,6 +24,10 @@ import {
 } from "../../sync/closedFileConflict";
 import type { PathBindingIntegrityStatus } from "../../sync/pathBindingIntegrity";
 
+type ClosedFileMissingBaselinePolicy =
+	| MissingBaselineWinnerPolicy
+	| "local-create-event";
+
 // -----------------------------------------------------------------------
 // Input type — everything the planner needs to decide
 // -----------------------------------------------------------------------
@@ -41,6 +45,7 @@ export interface ClosedFileReconcileInput {
 	// Mtime evidence for missing-baseline tiebreak
 	readonly diskMtime?: number;
 	readonly lastDiskIndexPersistedAt?: number;
+	readonly hasPendingLocalCreate?: boolean;
 
 	// Optional path binding guard. Callers omit this when no integrity signal
 	// is available; non-ok statuses preserve rather than flushing CRDT blindly.
@@ -58,7 +63,7 @@ export type ClosedFileReconcileAction =
 	| { kind: "import-disk-to-crdt"; path: string; reason: string }
 	| { kind: "create-conflict-artifact"; path: string; reason: string;
 			winner: "disk" | "crdt"; preserveSide: "disk" | "crdt";
-			missingBaselinePolicy?: MissingBaselineWinnerPolicy;
+			missingBaselinePolicy?: ClosedFileMissingBaselinePolicy;
 			pathBindingStatus?: PathBindingIntegrityStatus; pathBindingReason?: string }
 	| { kind: "defer-to-crdt-flush"; path: string; reason: string };
 
@@ -86,6 +91,7 @@ export function planClosedFileReconcile(input: ClosedFileReconcileInput): Closed
 		baselineHash,
 		diskMtime,
 		lastDiskIndexPersistedAt,
+		hasPendingLocalCreate,
 		pathBindingStatus,
 		pathBindingReason,
 	} = input;
@@ -114,6 +120,17 @@ export function planClosedFileReconcile(input: ClosedFileReconcileInput): Closed
 			preserveSide: "crdt",
 			pathBindingStatus,
 			pathBindingReason,
+		};
+	}
+
+	if (baselineHash === null && hasPendingLocalCreate) {
+		return {
+			kind: "create-conflict-artifact",
+			path,
+			reason: "missing-baseline",
+			winner: "disk",
+			preserveSide: "crdt",
+			missingBaselinePolicy: "local-create-event",
 		};
 	}
 

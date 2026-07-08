@@ -1,5 +1,6 @@
 import {
 	attachmentSizeCapKB,
+	DEFAULT_SETTINGS,
 	MAX_ATTACHMENT_SIZE_KB,
 	readVaultSyncSettings,
 } from "../src/settings/settingsStore";
@@ -59,6 +60,32 @@ console.log("\n--- Test 4: server capability can lower the effective attachment 
 	assert(
 		attachmentSizeCapKB(null) === MAX_ATTACHMENT_SIZE_KB,
 		"missing server capability falls back to built-in ceiling",
+	);
+}
+
+console.log("\n--- Test 5: external edits default to closed files only ---");
+{
+	assert(
+		DEFAULT_SETTINGS.externalEditPolicy === "closed-only",
+		"default external edit policy protects open editor files",
+	);
+	const { settings } = readVaultSyncSettings(undefined);
+	assert(
+		settings.externalEditPolicy === "closed-only",
+		"loaded empty settings inherit the closed-only policy",
+	);
+}
+
+console.log("\n--- Test 6: remote typing guard is enabled by default ---");
+{
+	assert(
+		DEFAULT_SETTINGS.remoteTypingGuardEnabled,
+		"default settings pause local edits during active remote typing",
+	);
+	const { settings } = readVaultSyncSettings(undefined);
+	assert(
+		settings.remoteTypingGuardEnabled,
+		"loaded empty settings inherit the remote typing guard",
 	);
 }
 

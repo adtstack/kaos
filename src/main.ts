@@ -811,6 +811,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				(source, msg, details) => this.trace(source, msg, details),
 				(event) => this.recordFlightPathEvent(event),
 				bindingPropagationGate,
+				() => this.settings.remoteTypingGuardEnabled,
 			);
 
 			// 3. Global CM6 extension

@@ -12,6 +12,15 @@ import {
 	ORIGIN_EDITOR_AUTHORITY_SHIELD,
 	ORIGIN_EDITOR_HEALTH_HEAL,
 } from "./origins";
+import {
+	buildActiveFileAwareness,
+	buildTypingAwareness,
+	collectActiveRemoteTypers,
+	formatRemoteTypers,
+	KAOS_ACTIVE_FILE_AWARENESS_FIELD,
+	KAOS_TYPING_AWARENESS_FIELD,
+	type RemoteTypingPeer,
+} from "./remoteTypingGuard";
 
 /**
  * Manages per-editor CM6 bindings via yCollab.
@@ -34,6 +43,8 @@ const POST_BIND_HEALTH_GRACE_MS = 100;
 const LIVE_UPDATE_HEALTH_RETRY_DELAY_MS = 120;
 const RECENT_EDITOR_REPAIR_DEFER_MS = 1200;
 const RECENT_EDITOR_PATCH_SHIELD_MS = 5000;
+const TYPING_AWARENESS_MIN_INTERVAL_MS = 750;
+const CONCURRENT_TYPING_NOTICE_COOLDOWN_MS = 8_000;
 const CM_RESOLVE_RETRY_DELAYS_MS = [80, 160, 320, 640, 1000, 1500, 2000] as const;
 const CM_RESOLVE_DELAYED_ATTEMPT = 5;
 const CM_RESOLVE_IDLE_RETRY_DELAY_MS = 5000;
@@ -149,6 +160,8 @@ export class EditorBindingManager {
 	private editorAuthorityShieldLeafIds = new Set<string>();
 	private lastEditorDocChangeAtByPath = new Map<string, number>();
 	private pendingReplacementCmToLeafId = new WeakMap<EditorView, string>();
+	private lastTypingAwarenessAtByLeaf = new Map<string, number>();
+	private concurrentTypingNoticeAtByPath = new Map<string, number>();
 
 	private readonly debug: boolean;
 
@@ -158,6 +171,7 @@ export class EditorBindingManager {
 		private trace?: TraceRecord,
 		private recordFlightPathEvent?: (event: ProductFlightPathEventInput) => void,
 		private readonly bindingPropagationGate?: BindingPropagationGate,
+		private readonly isRemoteTypingGuardEnabled: () => boolean = () => true,
 	) {
 		this.debug = debug;
 		// Register the reconfigure hook so the harness can trigger CM extension
@@ -496,6 +510,7 @@ export class EditorBindingManager {
 		}
 
 		this.clearLocalCursor("unbind");
+		this.clearLocalPresence("unbind");
 
 		this.log(`unbind: unbound "${binding.path}" (leaf=${leafId}, cm=${binding.cmId})`);
 	}
@@ -513,6 +528,7 @@ export class EditorBindingManager {
 			this.log(`unbindAll: destroyed binding for "${binding.path}"`);
 		}
 		this.bindings.clear();
+		this.clearLocalPresence("unbind-all");
 	}
 
 	/**
@@ -535,6 +551,7 @@ export class EditorBindingManager {
 				}
 				this.cmToLeafId.delete(binding.cm);
 				this.bindings.delete(leafId);
+				this.lastTypingAwarenessAtByLeaf.delete(leafId);
 				this.lastEditorDocChangeAtByPath.delete(path);
 				this.log(`unbindByPath: unbound "${path}" (leaf=${leafId})`);
 				// Don't break — a path could theoretically be open in multiple leaves
@@ -568,6 +585,7 @@ export class EditorBindingManager {
 					this.lastEditorDocChangeAtByPath.delete(binding.path);
 				}
 				binding.path = newPath;
+				this.publishLocalActiveFile(binding);
 			}
 		}
 	}
@@ -749,6 +767,96 @@ export class EditorBindingManager {
 		}
 	}
 
+	clearLocalPresence(reason: string): void {
+		try {
+			this.vaultSync.provider.awareness.setLocalStateField(KAOS_ACTIVE_FILE_AWARENESS_FIELD, null);
+			this.vaultSync.provider.awareness.setLocalStateField(KAOS_TYPING_AWARENESS_FIELD, null);
+			this.trace?.("editor", "presence-cleared", { reason });
+		} catch {
+			// Provider may be disconnected
+		}
+	}
+
+	private publishLocalActiveFile(binding: EditorBinding, at = Date.now()): void {
+		try {
+			this.vaultSync.provider.awareness.setLocalStateField(
+				KAOS_ACTIVE_FILE_AWARENESS_FIELD,
+				buildActiveFileAwareness(binding.path, this.lastDeviceName, at),
+			);
+		} catch {
+			// Provider may be disconnected
+		}
+	}
+
+	private publishLocalTypingActivity(
+		leafId: string,
+		binding: EditorBinding,
+		at = Date.now(),
+	): void {
+		const lastPublishedAt = this.lastTypingAwarenessAtByLeaf.get(leafId) ?? 0;
+		if (at - lastPublishedAt < TYPING_AWARENESS_MIN_INTERVAL_MS) {
+			return;
+		}
+
+		this.lastTypingAwarenessAtByLeaf.set(leafId, at);
+		try {
+			this.vaultSync.provider.awareness.setLocalStateField(
+				KAOS_ACTIVE_FILE_AWARENESS_FIELD,
+				buildActiveFileAwareness(binding.path, this.lastDeviceName, at),
+			);
+			this.vaultSync.provider.awareness.setLocalStateField(
+				KAOS_TYPING_AWARENESS_FIELD,
+				buildTypingAwareness(binding.path, this.lastDeviceName, at),
+			);
+			this.trace?.("editor", "typing-awareness-published", {
+				path: binding.path,
+				leafId,
+			});
+		} catch {
+			// Provider may be disconnected
+		}
+	}
+
+	private getActiveRemoteTypersForPath(path: string, now = Date.now()): RemoteTypingPeer[] {
+		if (!this.isRemoteTypingGuardEnabled()) {
+			return [];
+		}
+
+		try {
+			const awareness = this.vaultSync.provider.awareness;
+			return collectActiveRemoteTypers(
+				awareness.getStates(),
+				typeof awareness.clientID === "number" ? awareness.clientID : null,
+				path,
+				now,
+			);
+		} catch {
+			return [];
+		}
+	}
+
+	private warnConcurrentTypingBlocked(path: string, remoteTypers: RemoteTypingPeer[], now = Date.now()): void {
+		const lastShownAt = this.concurrentTypingNoticeAtByPath.get(path) ?? 0;
+		if (now - lastShownAt < CONCURRENT_TYPING_NOTICE_COOLDOWN_MS) {
+			return;
+		}
+
+		this.concurrentTypingNoticeAtByPath.set(path, now);
+		const noteName = path.split("/").pop() ?? path;
+		new Notice(
+			`KAOS: Editing paused because ${formatRemoteTypers(remoteTypers)} recently typed in "${noteName}".`,
+			8000,
+		);
+		this.trace?.("editor", "concurrent-typing-blocked", {
+			path,
+			remoteTypers: remoteTypers.map((peer) => ({
+				clientId: peer.clientId,
+				deviceName: peer.deviceName,
+				ageMs: now - peer.at,
+			})),
+		});
+	}
+
 	/**
 	 * Get the CM6 EditorView from a MarkdownView.
 	 * Resolution is based on DOM containment over a set of known CM6 views
@@ -907,9 +1015,20 @@ export class EditorBindingManager {
 		};
 	}
 
-	private filterRiskyNonUserPatch(transaction: Transaction): Transaction | TransactionSpec {
-		if (!transaction.docChanged || this.isUserTransaction(transaction)) {
+	private filterRiskyNonUserPatch(transaction: Transaction): Transaction | TransactionSpec | readonly TransactionSpec[] {
+		if (!transaction.docChanged) {
 			return transaction;
+		}
+
+		if (this.isUserTransaction(transaction)) {
+			const match = this.findBindingForState(transaction.startState);
+			if (!match) return transaction;
+
+			const remoteTypers = this.getActiveRemoteTypersForPath(match.binding.path);
+			if (remoteTypers.length === 0) return transaction;
+
+			this.warnConcurrentTypingBlocked(match.binding.path, remoteTypers);
+			return [];
 		}
 
 		const match = this.findBindingForState(transaction.startState);
@@ -1114,6 +1233,7 @@ export class EditorBindingManager {
 				match.binding.path,
 				match.binding.lastEditorDocChangeAtMs,
 			);
+			this.publishLocalTypingActivity(match.leafId, match.binding, match.binding.lastEditorDocChangeAtMs);
 		}
 		this.maybeHealBinding(match.leafId, match.binding, "live-update");
 	}
@@ -1470,6 +1590,10 @@ export class EditorBindingManager {
 			lastEditorDocChangeAtMs,
 			settleWindowMs,
 		});
+		const binding = this.bindings.get(leafId);
+		if (binding) {
+			this.publishLocalActiveFile(binding);
+		}
 		this.cmToLeafId.set(cm, leafId);
 		this.schedulePostBindHealthCheck(leafId, settleWindowMs);
 		this.trace?.("editor", "binding-applied", {
