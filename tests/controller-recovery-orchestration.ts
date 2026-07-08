@@ -129,6 +129,8 @@ interface Fixture {
 	setDiskContent(content: string): void;
 	setEditorContent(content: string): void;
 	setBaselineContent(content: string): void;
+	clearDiskIndex(): void;
+	getCreatedFiles(): Map<string, string>;
 	getCurrentDiskContent(): string;
 	ingestDiskFileNow(reason?: "create" | "modify"): Promise<void>;
 }
@@ -143,6 +145,7 @@ function buildFixture(initial: {
 	let diskContent = initial.disk;
 	let editorContent = initial.editor;
 	let diskIngestPort: DiskIngestPort | null = null;
+	const createdFiles = new Map<string, string>();
 	let diskIndex: Record<string, { mtime: number; size: number; contentHash?: string }> = {
 		[path]: {
 			mtime: 0,
@@ -236,14 +239,26 @@ function buildFixture(initial: {
 	const app = {
 		vault: {
 			read: async (f: TFile & { path: string }) => {
-				if (f.path !== path) throw new Error(`unexpected read: ${f.path}`);
+				if (f.path !== path && !createdFiles.has(f.path)) throw new Error(`unexpected read: ${f.path}`);
+				if (createdFiles.has(f.path)) return createdFiles.get(f.path)!;
 				return diskContent;
+			},
+			create: async (createdPath: string, content: string) => {
+				if (createdFiles.has(createdPath)) throw new Error("exists");
+				createdFiles.set(createdPath, content);
 			},
 			adapter: {
 				stat: async () => ({ mtime: 1, size: diskContent.length }),
 			},
-			getAbstractFileByPath: (p: string) => (p === path ? file : null),
-			getMarkdownFiles: () => [file],
+			getAbstractFileByPath: (p: string) => (
+				p === path
+					? file
+					: (createdFiles.has(p) ? makeTFile(p) : null)
+			),
+			getMarkdownFiles: () => [
+				file,
+				...Array.from(createdFiles.keys()).map(makeTFile),
+			],
 		},
 		workspace: {
 			iterateAllLeaves: (cb: (leaf: { view: MarkdownView }) => void) => {
@@ -273,6 +288,7 @@ function buildFixture(initial: {
 		getDiskMirror: () => ({
 			shouldSuppressCreate: async () => false,
 			shouldSuppressModify: async () => false,
+			suppressLocalCreate: async () => {},
 			isPreservedUnresolved: () => false,
 			clearPreservedUnresolved: () => {},
 			flushWrite: async () => {},
@@ -321,6 +337,10 @@ function buildFixture(initial: {
 				},
 			};
 		},
+		clearDiskIndex: () => {
+			diskIndex = {};
+		},
+		getCreatedFiles: () => createdFiles,
 		getCurrentDiskContent: () => diskContent,
 		ingestDiskFileNow: (reason: "create" | "modify" = "modify") => {
 			if (!diskIngestPort) throw new Error("diskIngestPort not registered");
@@ -871,6 +891,45 @@ console.log("\n--- Test 5c: queued crdtOnly external edit still imports ---");
 		decision?.data.reason,
 		"bound-file-open-idle-disk-recovery",
 		"queued crdtOnly edit keeps the open-idle recovery path",
+	);
+}
+
+// -------------------------------------------------------------------
+// Test 5c2 — missing-baseline crdtOnly import does not spam disk artifacts
+// -------------------------------------------------------------------
+
+console.log("\n--- Test 5c2: missing-baseline crdtOnly edit preserves CRDT once, not disk snapshots ---");
+{
+	const fix = buildFixture({
+		path: "Notes/missing-baseline-crdtonly.md",
+		// editor==CRDT!=disk: an external/automation disk edit while the note
+		// is open. With no durable baseline, this used to choose CRDT and
+		// preserve every growing disk autosave as a KAOS conflict artifact.
+		disk: "external disk edit",
+		editor: "visible crdt",
+		crdt: "visible crdt",
+	});
+	fix.clearDiskIndex();
+
+	await fix.ingestDiskFileNow("modify");
+
+	assertEq(fix.ytext.toString(), "external disk edit", "missing-baseline crdtOnly edit imports disk into CRDT");
+	const createdEntries = Array.from(fix.getCreatedFiles().entries());
+	const crdtArtifacts = createdEntries.filter(([artifactPath]) =>
+		artifactPath.includes("KAOS conflict - crdt"),
+	);
+	const diskArtifacts = createdEntries.filter(([artifactPath]) =>
+		artifactPath.includes("KAOS conflict - disk"),
+	);
+	assertEq(crdtArtifacts.length, 1, "CRDT side is preserved exactly once");
+	assertEq(crdtArtifacts[0]?.[1], "visible crdt", "CRDT artifact contains the previous visible content");
+	assertEq(diskArtifacts.length, 0, "disk autosave is not demoted to a conflict artifact");
+
+	const needed = fix.captured.find((e) => e.kind === FLIGHT_KIND.recoveryDecision);
+	assertEq(
+		needed?.data.reason,
+		"bound-file-open-idle-disk-recovery",
+		"missing-baseline crdtOnly still follows the open-idle recovery path",
 	);
 }
 

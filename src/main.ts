@@ -445,8 +445,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				createFileHistoryPoint: async () => {
 					await this.snapshotService?.createFileHistoryPoint();
 				},
-				showRecoveryHistory: async () => {
-					await this.snapshotService?.showRecoveryHistory();
+				showRecoveryHistory: async (target) => {
+					await this.snapshotService?.showRecoveryHistory(target);
 				},
 				exportDiagnostics: () => {
 					void (this.lab?.diagnosticsService as import("./telemetry/diagnostics/diagnosticsService").DiagnosticsService | undefined)?.exportDiagnostics();
@@ -1790,7 +1790,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			: { status: "unavailable" as const, message: "Snapshot service not initialized." };
 		const recentChanges = this.snapshotService
 			? await this.snapshotService.getDashboardRecentChanges()
-			: { status: "unavailable" as const, message: "File history service not initialized." };
+			: {
+				status: "unavailable" as const,
+				message: "File history service not initialized.",
+				lastAttempt: null,
+			};
 		const recoveryStorageStatus = this.snapshotService
 			? await this.snapshotService.getDashboardRecoveryStorageStatus()
 			: { status: "unavailable" as const, message: "File history storage service not initialized." };

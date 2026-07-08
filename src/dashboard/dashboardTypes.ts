@@ -12,6 +12,26 @@ export interface DashboardMetric {
 	tone?: DashboardTone;
 }
 
+export interface DashboardFileHistoryAttempt {
+	attemptedAt: string;
+	status: "created" | "noop" | "unavailable" | "pending";
+	manifestId: string | null;
+	reason: string | null;
+	changedCount: number | null;
+	forceFull: boolean;
+	pending: {
+		uploadedContentCount: number;
+		totalContentCount: number;
+		remainingContentCount: number;
+	} | null;
+}
+
+export interface DashboardRecoveryHistoryTarget {
+	initialManifestId: string;
+	initialFileId: string;
+	autoExpandDiff: boolean;
+}
+
 export interface DashboardConflictArtifact {
 	artifactPath: string;
 	inferredOriginalPath: string;
@@ -53,8 +73,19 @@ export interface DashboardSnapshotStatusSummary {
 }
 
 export type DashboardRecentChanges =
-	| { status: "ready"; manifestCount: number; limited: boolean; changes: DashboardRecentChange[] }
-	| { status: "unavailable" | "offline" | "error"; message: string };
+	| {
+		status: "ready";
+		manifestCount: number;
+		limited: boolean;
+		latestCreatedAt: string | null;
+		lastAttempt: DashboardFileHistoryAttempt | null;
+		changes: DashboardRecentChange[];
+	}
+	| {
+		status: "unavailable" | "offline" | "error";
+		message: string;
+		lastAttempt: DashboardFileHistoryAttempt | null;
+	};
 
 export type DashboardRecoveryStorageStatus =
 	| { status: "ready"; report: RecoveryStorageAuditReport }
@@ -72,6 +103,7 @@ export interface DashboardRecentChange {
 	device: string | null;
 	size: number | null;
 	contentHash: string | null;
+	previousContentHash: string | null;
 }
 
 export interface DashboardActionState {

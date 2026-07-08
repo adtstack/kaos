@@ -135,6 +135,18 @@
 	min-width: 0;
 }
 
+.kaos-dashboard-recent-row {
+	padding: 9px 8px;
+	border-radius: 6px;
+	cursor: pointer;
+}
+
+.kaos-dashboard-recent-row:hover,
+.kaos-dashboard-recent-row:focus-visible {
+	background: var(--background-modifier-hover);
+	outline: none;
+}
+
 .kaos-dashboard-path {
 	font-weight: 600;
 	word-break: break-word;

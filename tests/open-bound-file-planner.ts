@@ -112,18 +112,34 @@ console.log("\n--- Test 7: missing baseline with disk newer lets disk win and pr
 	);
 }
 
-console.log("\n--- Test 8: missing baseline without evidence defaults to CRDT unless editor is distinct ---");
+console.log("\n--- Test 8: missing baseline without evidence follows visible open-file authority ---");
 {
 	const passiveDiskEditor = planOpenBoundFileReconcile(input({
 		baselineHash: null,
 		editorAuthority: { kind: "single", relation: "disk" },
 	}));
+	const passiveCrdtEditor = planOpenBoundFileReconcile(input({
+		baselineHash: null,
+		editorAuthority: { kind: "single", relation: "crdt" },
+	}));
 	const distinctEditor = planOpenBoundFileReconcile(input({
 		baselineHash: null,
 		editorAuthority: { kind: "single", relation: "distinct" },
 	}));
-	assert(passiveDiskEditor.kind === "apply-crdt-to-disk", "CRDT wins without evidence");
-	assert(passiveDiskEditor.kind === "apply-crdt-to-disk" && passiveDiskEditor.preserveDisk === true, "disk side is preserved");
+	assert(passiveDiskEditor.kind === "import-disk-to-crdt", "disk/editor side wins without durable baseline evidence");
+	assert(passiveDiskEditor.kind === "import-disk-to-crdt" && passiveDiskEditor.preserveCrdt === true, "CRDT side is preserved");
+	assert(
+		passiveDiskEditor.kind === "import-disk-to-crdt" &&
+			passiveDiskEditor.missingBaselinePolicy === "open-bound-visible-authority",
+		"open-bound policy is recorded for disk/editor authority",
+	);
+	assert(passiveCrdtEditor.kind === "import-disk-to-crdt", "crdtOnly external disk edit imports disk without durable baseline evidence");
+	assert(passiveCrdtEditor.kind === "import-disk-to-crdt" && passiveCrdtEditor.preserveCrdt === true, "visible CRDT side is preserved once");
+	assert(
+		passiveCrdtEditor.kind === "import-disk-to-crdt" &&
+			passiveCrdtEditor.missingBaselinePolicy === "open-bound-visible-authority",
+		"open-bound policy is recorded for crdtOnly authority",
+	);
 	assert(distinctEditor.kind === "editor-wins-preserve", "distinct editor authority still wins");
 }
 

@@ -4,6 +4,9 @@ import type {
 	DashboardConflictArtifact,
 	DashboardMetric,
 	DashboardRecentChange,
+	DashboardRecentChanges,
+	DashboardFileHistoryAttempt,
+	DashboardRecoveryHistoryTarget,
 	DashboardRecoveryStorageStatus,
 	DashboardTone,
 	KaosDashboardData,
@@ -34,7 +37,7 @@ export interface KaosDashboardActions {
 	takeSnapshotNow(): Promise<void>;
 	showSnapshotList(): Promise<void>;
 	createFileHistoryPoint(): Promise<void>;
-	showRecoveryHistory(): Promise<void>;
+	showRecoveryHistory(target?: DashboardRecoveryHistoryTarget): Promise<void>;
 	exportDiagnostics(): void;
 	exportDiagnosticsWithFilenames(): void;
 }
@@ -289,6 +292,7 @@ export class KaosDashboardView extends ItemView {
 				cls: storage.tone === "error" ? "kaos-dashboard-error" : "kaos-dashboard-muted",
 			});
 		}
+		this.renderFileHistoryState(section, data.recentChanges);
 
 		if (data.recentChanges.status !== "ready") {
 			section.createDiv({ text: data.recentChanges.message, cls: `kaos-dashboard-${data.recentChanges.status === "error" ? "error" : "muted"}` });
@@ -304,8 +308,43 @@ export class KaosDashboardView extends ItemView {
 		}
 	}
 
+	private renderFileHistoryState(section: HTMLElement, recentChanges: DashboardRecentChanges): void {
+		const row = section.createDiv({ cls: "kaos-dashboard-snapshot-summary" });
+		if (recentChanges.status === "ready") {
+			row.createDiv({
+				text: recentChanges.latestCreatedAt
+					? `Latest file history point: ${formatDateTime(recentChanges.latestCreatedAt)}`
+					: "Latest file history point: none",
+				cls: "kaos-dashboard-strong",
+			});
+		}
+		if (recentChanges.lastAttempt) {
+			row.createDiv({
+				text: formatFileHistoryAttempt(recentChanges.lastAttempt),
+				cls: `kaos-dashboard-muted ${toneClass(fileHistoryAttemptTone(recentChanges.lastAttempt))}`,
+			});
+		}
+		if (recentChanges.status !== "ready" && !recentChanges.lastAttempt) {
+			row.createDiv({
+				text: "Latest file history point: unavailable",
+				cls: "kaos-dashboard-muted",
+			});
+		}
+	}
+
 	private renderRecentChange(parent: HTMLElement, change: DashboardRecentChange, currentDeviceName: string): void {
-		const row = parent.createDiv({ cls: "kaos-dashboard-row" });
+		const row = parent.createDiv({ cls: "kaos-dashboard-row kaos-dashboard-recent-row" });
+		row.setAttr("role", "button");
+		row.setAttr("tabindex", "0");
+		row.setAttr("aria-label", `Review file history for ${change.path}`);
+		row.addEventListener("click", () => {
+			void this.openRecentChangeHistory(change);
+		});
+		row.addEventListener("keydown", (event) => {
+			if (event.key !== "Enter" && event.key !== " ") return;
+			event.preventDefault();
+			void this.openRecentChangeHistory(change);
+		});
 		const eventLine = row.createDiv({
 			cls: `kaos-dashboard-event-line ${changeKindClass(change.changeKind)}`,
 		});
@@ -332,6 +371,17 @@ export class KaosDashboardView extends ItemView {
 				cls: "kaos-dashboard-device-line",
 			});
 		}
+		const actions = row.createDiv({ cls: "kaos-dashboard-row-actions" });
+		actions.addEventListener("click", (event) => event.stopPropagation());
+		this.button(actions, "Open current file", () => this.openPath(change.path));
+	}
+
+	private async openRecentChangeHistory(change: DashboardRecentChange): Promise<void> {
+		await this.deps.actions.showRecoveryHistory({
+			initialManifestId: change.manifestId,
+			initialFileId: change.fileId,
+			autoExpandDiff: Boolean(change.contentHash || change.previousContentHash),
+		});
 	}
 
 	private renderConflicts(root: HTMLElement, conflicts: DashboardConflictArtifact[], currentDeviceName: string): void {
@@ -878,6 +928,34 @@ function recoveryStorageDisplay(status: DashboardRecoveryStorageStatus): { label
 				detail: report.issues[0]?.message ?? "File history storage is unavailable.",
 			};
 	}
+}
+
+function fileHistoryAttemptTone(attempt: DashboardFileHistoryAttempt): DashboardTone {
+	switch (attempt.status) {
+		case "created":
+			return "ok";
+		case "pending":
+			return "busy";
+		case "unavailable":
+			return "warn";
+		case "noop":
+			return "muted";
+	}
+}
+
+function formatFileHistoryAttempt(attempt: DashboardFileHistoryAttempt): string {
+	const detail = attempt.pending
+		? `upload ${attempt.pending.uploadedContentCount}/${attempt.pending.totalContentCount} content object(s)`
+		: attempt.changedCount !== null
+			? `${attempt.changedCount} changed file(s)`
+			: attempt.reason ?? "";
+	const mode = attempt.forceFull ? "full scan" : "incremental";
+	return [
+		`Last attempt: ${attempt.status}`,
+		detail,
+		mode,
+		formatDateTime(attempt.attemptedAt),
+	].filter(Boolean).join(" - ");
 }
 
 function formatDateTime(iso: string): string {

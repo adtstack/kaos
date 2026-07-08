@@ -4,21 +4,19 @@ import type {
 	FileHistoryManifestIndex,
 } from "../sync/recoverySnapshotClient";
 import { renderDiffText } from "../utils/textDiff";
-
-interface FileHistoryItem {
-	manifest: FileHistoryManifestIndex;
-	entry: FileHistoryEntry;
-}
+import {
+	buildRecoverySnapshotHistories,
+	fileHistoryDiffKey,
+	resolveRecoveryHistoryInitialSelection,
+	type RecoveryHistoryFileHistoryItem as FileHistoryItem,
+	type RecoveryHistoryInitialSelection,
+	type RecoveryHistorySnapshot as SnapshotHistory,
+} from "./recoveryHistorySelection";
 
 interface FileHistory {
 	fileId: string;
 	path: string;
 	items: FileHistoryItem[];
-}
-
-interface SnapshotHistory {
-	manifest: FileHistoryManifestIndex;
-	changedItems: FileHistoryItem[];
 }
 
 interface RecoveryHistoryModalDeps {
@@ -79,22 +77,30 @@ export class RecoveryHistoryModal extends Modal {
 	private selected: FileHistory | null = null;
 	private expandedDiffKey: string | null = null;
 	private diffText: string | null = null;
+	private initialDiffLoaded = false;
 
 	constructor(
 		app: App,
 		private readonly manifests: FileHistoryManifestIndex[],
 		private readonly deps: RecoveryHistoryModalDeps,
+		options: RecoveryHistoryInitialSelection = {},
 	) {
 		super(app);
 		this.histories = buildHistories(manifests);
 		this.historiesByFileId = new Map(this.histories.map((history) => [history.fileId, history]));
-		this.snapshots = buildSnapshotHistories(manifests);
-		this.selectedManifestId = this.snapshots[0]?.manifest.manifestId ?? null;
+		this.snapshots = buildRecoverySnapshotHistories(manifests);
+		const initial = resolveRecoveryHistoryInitialSelection(manifests, options);
+		this.selectedManifestId = initial.selectedManifestId;
+		this.selected = initial.selectedFileId
+			? this.historiesByFileId.get(initial.selectedFileId) ?? null
+			: null;
+		this.expandedDiffKey = initial.expandedDiffKey;
 	}
 
 	onOpen(): void {
 		this.modalEl.addClass("recovery-history-modal-frame");
 		this.render();
+		void this.expandInitialDiffOnce();
 	}
 
 	onClose(): void {
@@ -209,7 +215,7 @@ export class RecoveryHistoryModal extends Modal {
 		titleRow.createEl("h3", { text: history.path });
 
 		for (const item of history.items) {
-			const key = `${item.manifest.manifestId}:${item.entry.fileId}`;
+			const key = fileHistoryDiffKey(item);
 			const row = contentEl.createDiv({ cls: "recovery-history-event" });
 			row.createEl("div", {
 				text: `${displayKind(item.entry.kind)} · ${formatDate(item.manifest.createdAt)}`,
@@ -244,18 +250,36 @@ export class RecoveryHistoryModal extends Modal {
 					text: this.diffText,
 					cls: "recovery-history-diff",
 				});
+			} else if (this.expandedDiffKey === key) {
+				row.createEl("div", {
+					text: "Loading diff...",
+					cls: "setting-item-description",
+				});
 			}
 		}
 	}
 
 	private async toggleDiff(key: string, item: FileHistoryItem): Promise<void> {
-		if (this.expandedDiffKey === key) {
+		if (this.expandedDiffKey === key && this.diffText !== null) {
 			this.expandedDiffKey = null;
 			this.diffText = null;
 			this.render();
 			return;
 		}
 
+		await this.expandDiff(key, item);
+	}
+
+	private async expandInitialDiffOnce(): Promise<void> {
+		if (this.initialDiffLoaded || !this.expandedDiffKey || !this.selected) return;
+		this.initialDiffLoaded = true;
+		const key = this.expandedDiffKey;
+		const item = this.selected.items.find((candidate) => fileHistoryDiffKey(candidate) === key);
+		if (!item) return;
+		await this.expandDiff(key, item);
+	}
+
+	private async expandDiff(key: string, item: FileHistoryItem): Promise<void> {
 		const previousHash = item.entry.previousContentHash;
 		const currentHash = item.entry.contentHash;
 		const previous = previousHash ? await this.deps.downloadContent(previousHash) : "";
@@ -267,13 +291,3 @@ export class RecoveryHistoryModal extends Modal {
 }
 
 export type RecoveryHistoryFileItem = FileHistoryItem;
-
-function buildSnapshotHistories(manifests: FileHistoryManifestIndex[]): SnapshotHistory[] {
-	return manifests
-		.slice()
-		.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-		.map((manifest) => ({
-			manifest,
-			changedItems: manifest.changedEntries.map((entry) => ({ manifest, entry })),
-		}));
-}

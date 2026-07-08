@@ -4,6 +4,7 @@ import {
 	collectDashboardAttention,
 	collectDashboardConflictArtifacts,
 } from "../src/dashboard/dashboardData";
+import { resolveRecoveryHistoryInitialSelection } from "../src/snapshots/recoveryHistorySelection";
 import {
 	resolveKaosDashboardMode,
 	selectMobileOverviewMetrics,
@@ -172,6 +173,16 @@ const baseInput: KaosDashboardCollectorInput = {
 		status: "ready",
 		manifestCount: 1,
 		limited: false,
+		latestCreatedAt: "2026-06-24T01:00:00Z",
+		lastAttempt: {
+			attemptedAt: "2026-06-24T01:02:00Z",
+			status: "created",
+			manifestId: "m1",
+			reason: null,
+			changedCount: 1,
+			forceFull: false,
+			pending: null,
+		},
 		changes: [{
 			manifestId: "m1",
 			snapshotKind: "file-history",
@@ -184,6 +195,7 @@ const baseInput: KaosDashboardCollectorInput = {
 			device: "device-a",
 			size: 10,
 			contentHash: "hash",
+			previousContentHash: "oldhash",
 		}],
 	},
 	openFileCount: 1,
@@ -224,6 +236,9 @@ console.log("\n--- Test 4: dashboard data preserves snapshot unavailable and rec
 	assert(data.snapshotStatus.status === "unavailable", "snapshot unavailable preserved");
 	assert(data.recoveryStorageStatus.status === "ready" && data.recoveryStorageStatus.report.status === "healthy", "recovery storage status preserved");
 	assert(data.recentChanges.status === "ready" && data.recentChanges.changes.length === 1, "recent changes preserved");
+	assert(data.recentChanges.status === "ready" && data.recentChanges.latestCreatedAt === "2026-06-24T01:00:00Z", "latest file history timestamp preserved");
+	assert(data.recentChanges.status === "ready" && data.recentChanges.lastAttempt?.status === "created", "last file history attempt preserved");
+	assert(data.recentChanges.status === "ready" && data.recentChanges.changes[0]?.previousContentHash === "oldhash", "previous content hash preserved for dashboard history navigation");
 	assert(data.actions.snapshotsAvailable === false, "snapshot action disabled state represented");
 	assert(data.overview.some((metric) => metric.label === "Server receipt" && metric.value === "confirmed"), "server receipt metric built");
 }
@@ -290,6 +305,46 @@ console.log("\n--- Test 8: recovery storage audit response normalization is tole
 	const unknown = normalizeRecoveryStorageAuditReport({ status: "surprise", issues: "bad" });
 	assert(unknown.status === "unavailable", "unknown recovery storage status normalizes to unavailable");
 	assert(unknown.issues.length === 0, "invalid issue list normalizes to empty");
+}
+
+console.log("\n--- Test 9: recovery history initial selection resolves dashboard target ---");
+{
+	const manifests = [{
+		storageVersion: "v2" as const,
+		manifestId: "m1",
+		vaultId: "vault-1",
+		kind: "file-history" as const,
+		createdAt: "2026-06-24T01:00:00Z",
+		day: "2026-06-24",
+		reason: "automatic",
+		pinned: false,
+		changedCount: 1,
+		contentHashes: ["hash"],
+		changedEntries: [{
+			fileId: "f1",
+			kind: "modified" as const,
+			path: "notes/a.md",
+			contentHash: "hash",
+			previousContentHash: "oldhash",
+		}],
+		stateHash: "state",
+		manifestHash: "manifest",
+	}];
+	const resolved = resolveRecoveryHistoryInitialSelection(manifests, {
+		initialManifestId: "m1",
+		initialFileId: "f1",
+		autoExpandDiff: true,
+	});
+	assert(resolved.selectedManifestId === "m1", "initial manifest selected");
+	assert(resolved.selectedFileId === "f1", "initial file selected");
+	assert(resolved.expandedDiffKey === "m1:f1", "diff auto-expands when a content hash is present");
+
+	const fallback = resolveRecoveryHistoryInitialSelection(manifests, {
+		initialManifestId: "missing",
+		initialFileId: "f1",
+		autoExpandDiff: true,
+	});
+	assert(fallback.selectedManifestId === "m1" && fallback.selectedFileId === null, "missing manifest falls back to timeline");
 }
 
 console.log(`\nResults: ${passed} passed, ${failed} failed\n`);

@@ -32,9 +32,11 @@ import { formatUnknown } from "../utils/format";
 import { SnapshotDiffModal, SnapshotListModal } from "./snapshotModals";
 import { RecoveryHistoryModal, type RecoveryHistoryFileItem } from "./recoveryHistoryModals";
 import type {
+	DashboardFileHistoryAttempt,
 	DashboardRecentChange,
 	DashboardRecentChanges,
 	DashboardRecoveryStorageStatus,
+	DashboardRecoveryHistoryTarget,
 	DashboardSnapshotStatus,
 } from "../dashboard/dashboardTypes";
 import { DashboardSnapshotCache } from "./dashboardSnapshotCache";
@@ -57,6 +59,7 @@ export class SnapshotService {
 	private recoverySnapshotRetryTimer: ReturnType<typeof setTimeout> | null = null;
 	private recoverySnapshotInFlight = false;
 	private readonly dashboardSnapshotCache = new DashboardSnapshotCache();
+	private lastFileHistoryAttempt: DashboardFileHistoryAttempt | null = null;
 
 	constructor(private readonly deps: SnapshotServiceDeps) {}
 
@@ -90,17 +93,29 @@ export class SnapshotService {
 	): Promise<DashboardRecentChanges> {
 		const vaultSync = this.deps.getVaultSync();
 		if (!vaultSync) {
-			return { status: "unavailable", message: "Sync not initialized." };
+			return {
+				status: "unavailable",
+				message: "Sync not initialized.",
+				lastAttempt: this.getDashboardFileHistoryAttempt(),
+			};
 		}
 		if (!this.deps.getServerSupportsSnapshots()) {
-			return { status: "unavailable", message: "File history is unavailable." };
+			return {
+				status: "unavailable",
+				message: "File history is unavailable.",
+				lastAttempt: this.getDashboardFileHistoryAttempt(),
+			};
 		}
 		if (!vaultSync.connected) {
-			return { status: "offline", message: "Not connected to server." };
+			return {
+				status: "offline",
+				message: "Not connected to server.",
+				lastAttempt: this.getDashboardFileHistoryAttempt(),
+			};
 		}
 
 		try {
-			return await this.dashboardSnapshotCache.get(`recent-changes:${manifestLimit}:${changeLimit}`, async () => {
+			const cached = await this.dashboardSnapshotCache.get(`recent-changes:${manifestLimit}:${changeLimit}`, async () => {
 				const settings = this.deps.getSettings();
 				const listed = await listFileHistoryManifests(
 					settings,
@@ -122,19 +137,29 @@ export class SnapshotService {
 							device: entry.device ?? null,
 							size: entry.size ?? null,
 							contentHash: entry.contentHash ?? null,
+							previousContentHash: entry.previousContentHash ?? null,
 						});
 					}
 				}
 				changes.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
 				return {
-					status: "ready",
+					status: "ready" as const,
 					manifestCount: listed.manifests.length,
 					limited: listed.limited,
+					latestCreatedAt: listed.manifests[0]?.createdAt ?? null,
 					changes: changes.slice(0, changeLimit),
 				};
 			});
+			return {
+				...cached,
+				lastAttempt: this.getDashboardFileHistoryAttempt(),
+			};
 		} catch (err) {
-			return { status: "error", message: formatUnknown(err) };
+			return {
+				status: "error",
+				message: formatUnknown(err),
+				lastAttempt: this.getDashboardFileHistoryAttempt(),
+			};
 		}
 	}
 
@@ -274,12 +299,53 @@ export class SnapshotService {
 
 	private async requestFileHistoryPoint(forceFull: boolean): Promise<FileHistoryPointResult> {
 		const settings = this.deps.getSettings();
-		return await requestFileHistoryPointMaybe(
-			settings,
-			settings.deviceName,
-			this.deps.getTraceHttpContext(),
+		try {
+			const result = await requestFileHistoryPointMaybe(
+				settings,
+				settings.deviceName,
+				this.deps.getTraceHttpContext(),
+				forceFull,
+			);
+			this.recordFileHistoryAttempt(forceFull, result);
+			return result;
+		} catch (err) {
+			this.recordFileHistoryAttempt(forceFull, {
+				status: "unavailable",
+				reason: formatUnknown(err),
+			});
+			throw err;
+		}
+	}
+
+	private recordFileHistoryAttempt(
+		forceFull: boolean,
+		result: FileHistoryPointResult,
+	): void {
+		this.lastFileHistoryAttempt = {
+			attemptedAt: new Date().toISOString(),
+			status: result.status,
+			manifestId: result.manifestId ?? null,
+			reason: result.reason ?? null,
+			changedCount: result.index?.changedCount ?? null,
 			forceFull,
-		);
+			pending: result.pending
+				? {
+					uploadedContentCount: result.pending.uploadedContentCount,
+					totalContentCount: result.pending.totalContentCount,
+					remainingContentCount: result.pending.remainingContentCount,
+				}
+				: null,
+		};
+	}
+
+	private getDashboardFileHistoryAttempt(): DashboardFileHistoryAttempt | null {
+		if (!this.lastFileHistoryAttempt) return null;
+		return {
+			...this.lastFileHistoryAttempt,
+			pending: this.lastFileHistoryAttempt.pending
+				? { ...this.lastFileHistoryAttempt.pending }
+				: null,
+		};
 	}
 
 	private formatPendingFileHistoryPoint(result: FileHistoryPointResult): string {
@@ -384,7 +450,7 @@ export class SnapshotService {
 		}
 	}
 
-	async showRecoveryHistory(): Promise<void> {
+	async showRecoveryHistory(target?: DashboardRecoveryHistoryTarget): Promise<void> {
 		const vaultSync = this.deps.getVaultSync();
 		if (!vaultSync) {
 			new Notice("Sync not initialized");
@@ -411,16 +477,27 @@ export class SnapshotService {
 
 			const manifests: FileHistoryManifestIndex[] = listed.manifests;
 
-			new RecoveryHistoryModal(this.deps.app, manifests, {
-				downloadContent: async (hash) => await downloadFileHistoryContent(
-					settings,
-					hash,
-					this.deps.getTraceHttpContext(),
-				),
-				restoreVersion: async (item) => {
-					await this.restoreRecoveryHistoryItem(item);
+			new RecoveryHistoryModal(
+				this.deps.app,
+				manifests,
+				{
+					downloadContent: async (hash) => await downloadFileHistoryContent(
+						settings,
+						hash,
+						this.deps.getTraceHttpContext(),
+					),
+					restoreVersion: async (item) => {
+						await this.restoreRecoveryHistoryItem(item);
+					},
 				},
-			}).open();
+				target
+					? {
+						initialManifestId: target.initialManifestId,
+						initialFileId: target.initialFileId,
+						autoExpandDiff: target.autoExpandDiff,
+					}
+					: undefined,
+			).open();
 			void this.triggerRecoverySnapshot();
 		} catch (err) {
 			this.showSnapshotFailure("Failed to load file history", "File history", err);

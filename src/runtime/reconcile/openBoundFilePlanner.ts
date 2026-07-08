@@ -3,6 +3,10 @@ import {
 	type MissingBaselineWinnerPolicy,
 } from "../../sync/closedFileConflict";
 
+type OpenBoundMissingBaselinePolicy =
+	| MissingBaselineWinnerPolicy
+	| "open-bound-visible-authority";
+
 export type OpenBoundEditorAuthority =
 	| { kind: "single"; relation: "disk" | "crdt" | "both" | "distinct" }
 	| { kind: "multiple" }
@@ -26,20 +30,20 @@ export type OpenBoundFileReconcileAction =
 		kind: "import-disk-to-crdt";
 		reason: "crdt-at-baseline" | "both-changed" | "missing-baseline";
 		preserveCrdt?: true;
-		missingBaselinePolicy?: MissingBaselineWinnerPolicy;
+		missingBaselinePolicy?: OpenBoundMissingBaselinePolicy;
 	}
 	| {
 		kind: "apply-crdt-to-disk";
 		reason: "disk-at-baseline" | "both-changed" | "missing-baseline";
 		preserveDisk?: true;
-		missingBaselinePolicy?: MissingBaselineWinnerPolicy;
+		missingBaselinePolicy?: OpenBoundMissingBaselinePolicy;
 	}
 	| {
 		kind: "editor-wins-preserve";
 		reason: "both-changed" | "missing-baseline";
 		preserveCrdt?: true;
 		preserveDisk?: true;
-		missingBaselinePolicy?: MissingBaselineWinnerPolicy;
+		missingBaselinePolicy?: OpenBoundMissingBaselinePolicy;
 	}
 	| {
 		kind: "ambiguous-conflict";
@@ -83,6 +87,27 @@ export function planOpenBoundFileReconcile(
 			reason: baselineHash === null ? "missing-baseline" : "both-changed",
 			preserveCrdt: true,
 			preserveDisk: true,
+		};
+	}
+
+	if (baselineHash === null) {
+		const decision = decideClosedFileConflict({
+			baselineHash,
+			diskHash,
+			crdtHash,
+			diskMtime,
+			lastDiskIndexPersistedAt,
+		});
+		// Open/bound files have a visible editor authority. Without this
+		// override, missing-baseline autosave/external-edit streams can demote
+		// every growing disk version into a conflict artifact.
+		return {
+			kind: "import-disk-to-crdt",
+			reason: "missing-baseline",
+			preserveCrdt: true,
+			missingBaselinePolicy: decision._missingBaselinePolicy === "disk-mtime-after-last-index-save"
+				? decision._missingBaselinePolicy
+				: "open-bound-visible-authority",
 		};
 	}
 
