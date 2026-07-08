@@ -49,7 +49,9 @@ const JOURNAL_COMPACT_MAX_ENTRIES = 50;
 const JOURNAL_COMPACT_MAX_BYTES = 1 * 1024 * 1024;
 const TRACE_DEBUG_LIMIT = 100;
 const LOG_PREFIX = "[kaos-sync:server]";
-const RECOVERY_SNAPSHOT_CONTENT_UPLOAD_LIMIT = 5000;
+// Keep file-history upload continuations modest so large bootstraps do not
+// create sharp R2 request bursts; pending upload state resumes the next slice.
+const RECOVERY_SNAPSHOT_CONTENT_UPLOAD_LIMIT = 500;
 const RECOVERY_AUTOMATIC_BOOTSTRAP_FILE_LIMIT = 1000;
 const RECOVERY_INDEX_KEY = "recovery:index:v1";
 const RECOVERY_DIRTY_KEY = "recovery:dirty:v1";

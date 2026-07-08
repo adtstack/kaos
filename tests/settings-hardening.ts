@@ -1,6 +1,7 @@
 import {
 	attachmentSizeCapKB,
 	DEFAULT_SETTINGS,
+	EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION,
 	MAX_ATTACHMENT_SIZE_KB,
 	readVaultSyncSettings,
 } from "../src/settings/settingsStore";
@@ -87,6 +88,50 @@ console.log("\n--- Test 6: remote typing guard is enabled by default ---");
 		settings.remoteTypingGuardEnabled,
 		"loaded empty settings inherit the remote typing guard",
 	);
+}
+
+console.log("\n--- Test 7: old always external edit policy is migrated to closed-only ---");
+{
+	const { settings, migrated } = readVaultSyncSettings({
+		attachmentSyncExplicitlyConfigured: true,
+		externalEditPolicy: "always",
+	});
+	assert(
+		settings.externalEditPolicy === "closed-only",
+		"legacy always policy is migrated to closed-only",
+	);
+	assert(
+		settings.externalEditPolicySafetyMigrationVersion === EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION,
+		"legacy always migration records the safety migration marker",
+	);
+	assert(migrated, "legacy always policy marks settings as migrated");
+}
+
+console.log("\n--- Test 8: explicit post-migration always policy is preserved ---");
+{
+	const { settings, migrated } = readVaultSyncSettings({
+		attachmentSyncExplicitlyConfigured: true,
+		externalEditPolicy: "always",
+		externalEditPolicySafetyMigrationVersion: EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION,
+	});
+	assert(
+		settings.externalEditPolicy === "always",
+		"post-migration explicit always policy is preserved",
+	);
+	assert(!migrated, "post-migration explicit always policy does not re-migrate");
+}
+
+console.log("\n--- Test 9: invalid external edit policy falls back to closed-only ---");
+{
+	const { settings, migrated } = readVaultSyncSettings({
+		attachmentSyncExplicitlyConfigured: true,
+		externalEditPolicy: "surprise" as never,
+	});
+	assert(
+		settings.externalEditPolicy === "closed-only",
+		"invalid external edit policy is repaired to closed-only",
+	);
+	assert(migrated, "invalid external edit policy marks settings as migrated");
 }
 
 console.log("\n──────────────────────────────────────────────────");

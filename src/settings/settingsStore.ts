@@ -3,6 +3,7 @@ import { randomBase64Url } from "../utils/base64url";
 /** Controls how external disk edits (git, other editors) are imported into CRDT. */
 export type ExternalEditPolicy = "always" | "closed-only" | "never";
 export const MAX_ATTACHMENT_SIZE_KB = 10 * 1024;
+export const EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION = 1;
 
 export function attachmentSizeCapKB(serverMaxBlobUploadBytes?: number | null): number {
 	if (
@@ -39,6 +40,8 @@ export interface VaultSyncSettings {
 	 *   "never"       — never import (CRDT is sole source of truth)
 	 */
 	externalEditPolicy: ExternalEditPolicy;
+	/** Hidden marker: old "always" defaults have been migrated to the safer closed-only policy. */
+	externalEditPolicySafetyMigrationVersion: number;
 	/** Enable attachment (non-markdown) sync via R2 blob store. */
 	enableAttachmentSync: boolean;
 	/** True once the user has explicitly changed the attachment sync toggle. */
@@ -75,6 +78,7 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	excludePatterns: "",
 	maxFileSizeKB: 2048,
 	externalEditPolicy: "closed-only",
+	externalEditPolicySafetyMigrationVersion: EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION,
 	enableAttachmentSync: true,
 	attachmentSyncExplicitlyConfigured: false,
 	maxAttachmentSizeKB: MAX_ATTACHMENT_SIZE_KB,
@@ -117,12 +121,36 @@ function readPersistedState<TState extends Partial<VaultSyncSettings>>(value: un
 export function readVaultSyncSettings(
 	data: Partial<VaultSyncSettings> | null | undefined,
 ): { settings: VaultSyncSettings; migrated: boolean } {
+	const rawExternalEditPolicy = (data as { externalEditPolicy?: unknown } | null | undefined)?.externalEditPolicy;
+	const rawExternalEditPolicySafetyMigrationVersion =
+		(data as { externalEditPolicySafetyMigrationVersion?: unknown } | null | undefined)
+			?.externalEditPolicySafetyMigrationVersion;
 	const settings = Object.assign(
 		{},
 		DEFAULT_SETTINGS,
 		data as Partial<VaultSyncSettings>,
 	);
 	let migrated = false;
+	if (
+		rawExternalEditPolicy != null &&
+		rawExternalEditPolicy !== "always" &&
+		rawExternalEditPolicy !== "closed-only" &&
+		rawExternalEditPolicy !== "never"
+	) {
+		settings.externalEditPolicy = DEFAULT_SETTINGS.externalEditPolicy;
+		migrated = true;
+	}
+	if (
+		rawExternalEditPolicy === "always" &&
+		rawExternalEditPolicySafetyMigrationVersion !== EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION
+	) {
+		settings.externalEditPolicy = "closed-only";
+		settings.externalEditPolicySafetyMigrationVersion = EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION;
+		migrated = true;
+	} else if (settings.externalEditPolicySafetyMigrationVersion !== EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION) {
+		settings.externalEditPolicySafetyMigrationVersion = EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION;
+		migrated = true;
+	}
 	if (typeof data?.attachmentSyncExplicitlyConfigured !== "boolean") {
 		settings.attachmentSyncExplicitlyConfigured = data?.enableAttachmentSync === true;
 		if (data?.enableAttachmentSync !== true) {

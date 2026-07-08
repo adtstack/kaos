@@ -67,7 +67,6 @@ import {
 	buildMarkdownConflictArtifactCopyPath,
 	buildMarkdownConflictArtifactPath,
 	isMarkdownConflictArtifactForOriginalPath,
-	isMarkdownConflictArtifactPath,
 } from "../paths/conflictArtifactPath";
 
 export interface ReconciliationStats {
@@ -285,6 +284,14 @@ function classifyBindingHealth(
 	if (collab && collab.yTextMatchesExpected === false) reasons.push("ytext-mismatch");
 	if (collab && collab.awarenessMatchesProvider === false) reasons.push("awareness-mismatch");
 	return { healthy: reasons.length === 0, reasons };
+}
+
+function isMissingFileReadError(err: unknown): boolean {
+	const e = err as { code?: unknown; name?: unknown; message?: unknown } | null | undefined;
+	if (!e) return false;
+	if (e.code === "ENOENT" || e.name === "NotFoundError") return true;
+	if (typeof e.message !== "string") return false;
+	return e.message.includes("ENOENT") || e.message.includes("no such file or directory");
 }
 
 function traceRecoveryPostcondition(
@@ -740,6 +747,11 @@ export class ReconciliationController {
 			let changed: TFile[] = [];
 			let unchanged: TFile[] = [];
 			let allStats: Map<string, { mtime: number; size: number }> = new Map();
+			const dropMissingAfterScan = (path: string) => {
+				diskFiles.delete(path);
+				diskPresentPaths.delete(path);
+				allStats.delete(path);
+			};
 			if (mode === "authoritative") {
 				changed = eligibleFiles;
 				allStats = await collectFileStats(this.deps.app, eligibleFiles);
@@ -769,6 +781,10 @@ export class ReconciliationController {
 					}
 					diskFiles.set(file.path, content);
 				} catch (err) {
+					if (isMissingFileReadError(err)) {
+						dropMissingAfterScan(file.path);
+						continue;
+					}
 					console.error(`[kaos] Failed to read "${file.path}":`, err);
 				}
 			}
@@ -783,6 +799,10 @@ export class ReconciliationController {
 					}
 					diskFiles.set(file.path, content);
 				} catch (err) {
+					if (isMissingFileReadError(err)) {
+						dropMissingAfterScan(file.path);
+						continue;
+					}
 					console.error(`[kaos] Failed to read "${file.path}" during reconciliation:`, err);
 				}
 			}
