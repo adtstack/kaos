@@ -20,5 +20,8 @@ jobs:
       - run: npm ci
       - run: npm ci --prefix server
       - run: npm run build
+      - run: npm run build:headless:host
+      - run: npm run prepare:headless-host-oracle-upload
       - run: npm run test:ci:release
+      - run: npm run test:integration:headless-host
       - run: npm --prefix server run typecheck

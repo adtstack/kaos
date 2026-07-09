@@ -1,7 +1,7 @@
 /**
  * WebSocket ticket auth reconnect smoke tests.
  *
- * Proves the three behaviors the unit tests cannot reach:
+ * Proves the four behaviors the unit tests cannot reach:
  *
  *   1. Initial connect uses ?ticket= (not ?token=) when the server supports
  *      ticket auth.
@@ -14,6 +14,10 @@
  *   3. A ticket that expires mid-session does not permanently break sync: if
  *      the URL is patched with a fresh ticket before (or during) the
  *      disconnect, the reconnect succeeds.  This is the sleep/wake scenario.
+ *
+ *   4. If a reconnect races before the fresh ticket is patched and the server
+ *      rejects the stale ticket, the client can recover by fetching a fresh
+ *      ticket before treating the rejection as fatal.
  *
  * The server is expected to be running under wrangler dev with
  * KAOS_TICKET_TTL_MS=8000 injected via the worker-integration harness.
@@ -80,6 +84,21 @@ function patchTicketInUrl(urlStr, newTicket) {
 	u.searchParams.delete("token");
 	u.searchParams.set("ticket", newTicket);
 	return u.toString();
+}
+
+function parseServerErrorPayload(payload) {
+	const text = typeof payload === "string"
+		? payload
+		: typeof payload?.data === "string"
+			? payload.data
+			: "";
+	const jsonText = text.startsWith("__YPS:") ? text.slice("__YPS:".length) : text;
+	try {
+		const msg = JSON.parse(jsonText);
+		return msg?.type === "error" ? msg : null;
+	} catch {
+		return null;
+	}
 }
 
 /**
@@ -162,6 +181,58 @@ function waitForReconnected(provider, label) {
 			settled = true;
 			clearTimeout(timeout);
 			resolve(undefined);
+		});
+	});
+}
+
+function waitForRecoveredAfterUnauthorized(provider, label, vaultId, onFreshTicket = () => {}) {
+	return new Promise((resolve, reject) => {
+		let recoveryStarted = false;
+		let recovering = false;
+		let recoveredTicket = null;
+		let settled = false;
+		const timeout = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			reject(new Error(`${label}: timed out waiting for unauthorized recovery`));
+		}, 12_000);
+
+		const fail = (err) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			reject(err);
+		};
+
+		const recover = async () => {
+			if (recovering || settled) return;
+			recovering = true;
+			provider.disconnect();
+			try {
+				const { ticket } = await fetchTicket(vaultId);
+				recoveredTicket = ticket;
+				onFreshTicket(ticket);
+				provider.url = patchTicketInUrl(provider.url, ticket);
+				recoveryStarted = true;
+				void provider.connect();
+			} catch (err) {
+				fail(err);
+			}
+		};
+
+		const handlePayload = (payload) => {
+			const msg = parseServerErrorPayload(payload);
+			if (msg?.code !== "unauthorized") return;
+			void recover();
+		};
+
+		provider.on("message", handlePayload);
+		provider.on("custom-message", handlePayload);
+		provider.on("status", (event) => {
+			if (settled || !recoveryStarted || event.status !== "connected") return;
+			settled = true;
+			clearTimeout(timeout);
+			resolve(recoveredTicket);
 		});
 	});
 }
@@ -341,6 +412,62 @@ console.log("\n=== Test 3: post-expiry reconnect (sleep/wake simulation) ===");
 
 		console.log("  PASS  reconnect succeeded after ticket expiry");
 		console.log("  PASS  reconnect used fresh ticket, not expired one");
+	} finally {
+		await safeDestroy(provider, ydoc);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: Post-expiry unauthorized recovery
+//
+// This leaves provider.url stale on purpose. The first reconnect presents the
+// expired ticket and receives an unauthorized frame. The recovery handler then
+// fetches a fresh ticket, patches provider.url, and reconnects.
+// ---------------------------------------------------------------------------
+
+console.log("\n=== Test 4: post-expiry unauthorized recovery ===");
+{
+	const { ticket: ticketA, ttlMs } = await fetchTicket(ROOM_ID);
+	let activeTicket = ticketA;
+	const ttl = ttlMs;
+	console.log(`  ticket TTL: ${ttl}ms — waiting for expiry...`);
+
+	const ydoc = new Y.Doc();
+	const provider = new YSyncProvider(HOST, ROOM_ID, ydoc, {
+		prefix: `/vault/sync/${encodeURIComponent(ROOM_ID)}`,
+		params: async () => ({ ticket: activeTicket, schemaVersion: "2" }),
+		WebSocketPolyfill: globalThis.WebSocket ?? WebSocket,
+		connect: false,
+		maxBackoffTime: 500,
+	});
+
+	try {
+		const syncPromise = waitForSync(provider, "Test 4 initial sync");
+		void provider.connect();
+		await syncPromise;
+		console.log("  connected with ticketA");
+
+		await wait(ttl + 500);
+
+		const recoveryPromise = waitForRecoveredAfterUnauthorized(provider, "Test 4 recovery", ROOM_ID, (ticket) => {
+			activeTicket = ticket;
+		});
+		forceSocketClose(provider);
+		const ticketB = await recoveryPromise;
+
+		if (!ticketB || ticketB === ticketA) {
+			throw new Error("Test 4: recovery did not fetch a distinct fresh ticket");
+		}
+		const reconnectUrl = new URL(provider.url);
+		if (reconnectUrl.searchParams.get("ticket") !== ticketB) {
+			throw new Error("Test 4: provider.url does not contain the recovery ticket");
+		}
+		if (reconnectUrl.searchParams.has("token")) {
+			throw new Error("Test 4: recovery URL contains legacy token param");
+		}
+
+		console.log("  PASS  stale ticket produced unauthorized and was recovered");
+		console.log("  PASS  reconnect used recovery ticket");
 	} finally {
 		await safeDestroy(provider, ydoc);
 	}

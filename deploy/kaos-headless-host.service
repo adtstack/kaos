@@ -1,0 +1,35 @@
+[Unit]
+Description=KAOS headless host
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kaos
+Group=kaos
+WorkingDirectory=/opt/kaos
+EnvironmentFile=/etc/kaos/headless.env
+ExecStartPre=/usr/bin/node -- /opt/kaos/kaos-headless-host.mjs --doctor --require-sync-config --skip-worker-capabilities \
+  --vault /srv/kaos/vault \
+  --data-file /var/lib/kaos-headless/data.json \
+  --lock-file /run/kaos-headless/kaos.lock \
+  --token-file /etc/kaos/sync-token
+ExecStart=/usr/bin/node -- /opt/kaos/kaos-headless-host.mjs \
+  --vault /srv/kaos/vault \
+  --data-file /var/lib/kaos-headless/data.json \
+  --lock-file /run/kaos-headless/kaos.lock \
+  --token-file /etc/kaos/sync-token \
+  --poll-interval-ms 1000
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=kaos-headless
+StateDirectory=kaos-headless
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/kaos/vault /var/lib/kaos-headless /run/kaos-headless
+
+[Install]
+WantedBy=multi-user.target

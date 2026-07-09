@@ -1,0 +1,15 @@
+[Unit]
+Description=KAOS headless host (user)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/kaos/headless.env
+ExecStartPre=/usr/bin/env node -- %h/.local/bin/kaos update --startup --config %h/.config/kaos/install.json
+ExecStart=/usr/bin/env node -- %h/.local/lib/kaos/current/kaos-headless-host.mjs --vault %h/YOUR_VAULT --data-file %h/.local/state/kaos-headless/data.json --lock-file %h/.local/state/kaos-headless/run/kaos-headless/kaos.lock --token-file %h/.config/kaos/sync-token --plugin-dir %h/YOUR_VAULT/.obsidian/plugins/kaos
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

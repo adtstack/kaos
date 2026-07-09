@@ -3,26 +3,37 @@ import type {
 	FileHistoryEntry,
 	FileHistoryManifestIndex,
 } from "../sync/recoverySnapshotClient";
-import { renderDiffText } from "../utils/textDiff";
 import {
+	renderDiffLines,
+	type RenderedDiffLine,
+} from "../utils/textDiff";
+import {
+	buildRecoveryHistoryChanges,
 	buildRecoverySnapshotHistories,
-	fileHistoryDiffKey,
-	resolveRecoveryHistoryInitialSelection,
+	filterRecoveryHistoryChanges,
+	resolveRecoveryHistoryFeedState,
+	resolveVisibleRecoveryHistorySelection,
+	type RecoveryHistoryChangeItem,
 	type RecoveryHistoryFileHistoryItem as FileHistoryItem,
 	type RecoveryHistoryInitialSelection,
+	type RecoveryHistoryKindFilter,
+	type RecoveryHistoryScope,
 	type RecoveryHistorySnapshot as SnapshotHistory,
 } from "./recoveryHistorySelection";
-
-interface FileHistory {
-	fileId: string;
-	path: string;
-	items: FileHistoryItem[];
-}
 
 interface RecoveryHistoryModalDeps {
 	downloadContent(hash: string): Promise<string>;
 	restoreVersion(item: FileHistoryItem): Promise<void>;
 }
+
+const KIND_FILTERS: Array<RecoveryHistoryKindFilter> = [
+	"all",
+	"created",
+	"modified",
+	"renamed",
+	"deleted",
+	"restored",
+];
 
 function displayKind(kind: FileHistoryEntry["kind"]): string {
 	switch (kind) {
@@ -35,7 +46,9 @@ function displayKind(kind: FileHistoryEntry["kind"]): string {
 }
 
 function formatDate(iso: string): string {
-	return new Date(iso).toLocaleString(undefined, {
+	const date = new Date(iso);
+	if (Number.isNaN(date.getTime())) return iso;
+	return date.toLocaleString(undefined, {
 		year: "numeric",
 		month: "short",
 		day: "numeric",
@@ -44,40 +57,35 @@ function formatDate(iso: string): string {
 	});
 }
 
-function buildHistories(manifests: FileHistoryManifestIndex[]): FileHistory[] {
-	const byFileId = new Map<string, FileHistory>();
-	const sorted = manifests.slice().sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-	for (const manifest of sorted) {
-		for (const entry of manifest.changedEntries) {
-			const path = entry.newPath ?? entry.path;
-			const existing = byFileId.get(entry.fileId);
-			if (existing) {
-				existing.items.push({ manifest, entry });
-				if (manifest.createdAt >= existing.items[0]!.manifest.createdAt) {
-					existing.path = path;
-				}
-			} else {
-				byFileId.set(entry.fileId, {
-					fileId: entry.fileId,
-					path,
-					items: [{ manifest, entry }],
-				});
-			}
-		}
-	}
-	return Array.from(byFileId.values())
-		.sort((a, b) => b.items[0]!.manifest.createdAt.localeCompare(a.items[0]!.manifest.createdAt));
+function formatBytes(bytes: number): string {
+	if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+	if (bytes < 1024) return `${Math.round(bytes)} B`;
+	if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function sameScope(left: RecoveryHistoryScope, right: RecoveryHistoryScope): boolean {
+	if (left.kind !== right.kind) return false;
+	if (left.kind === "all") return true;
+	return right.kind === "manifest" && left.manifestId === right.manifestId;
 }
 
 export class RecoveryHistoryModal extends Modal {
-	private histories: FileHistory[];
-	private historiesByFileId: Map<string, FileHistory>;
-	private snapshots: SnapshotHistory[];
-	private selectedManifestId: string | null;
-	private selected: FileHistory | null = null;
-	private expandedDiffKey: string | null = null;
-	private diffText: string | null = null;
-	private initialDiffLoaded = false;
+	private readonly snapshots: SnapshotHistory[];
+	private readonly changes: RecoveryHistoryChangeItem[];
+	private readonly changeByKey: Map<string, RecoveryHistoryChangeItem>;
+	private historyScope: RecoveryHistoryScope;
+	private query = "";
+	private kindFilter: RecoveryHistoryKindFilter = "all";
+	private selectedChangeKey: string | null;
+	private diffKey: string | null = null;
+	private diffLines: RenderedDiffLine[] | null = null;
+	private diffError: string | null = null;
+	private diffLoadSeq = 0;
+	private readonly contentCache = new Map<string, Promise<string>>();
+	private railEl: HTMLElement | null = null;
+	private feedEl: HTMLElement | null = null;
+	private previewEl: HTMLElement | null = null;
 
 	constructor(
 		app: App,
@@ -86,21 +94,19 @@ export class RecoveryHistoryModal extends Modal {
 		options: RecoveryHistoryInitialSelection = {},
 	) {
 		super(app);
-		this.histories = buildHistories(manifests);
-		this.historiesByFileId = new Map(this.histories.map((history) => [history.fileId, history]));
 		this.snapshots = buildRecoverySnapshotHistories(manifests);
-		const initial = resolveRecoveryHistoryInitialSelection(manifests, options);
-		this.selectedManifestId = initial.selectedManifestId;
-		this.selected = initial.selectedFileId
-			? this.historiesByFileId.get(initial.selectedFileId) ?? null
-			: null;
-		this.expandedDiffKey = initial.expandedDiffKey;
+		this.changes = buildRecoveryHistoryChanges(manifests);
+		this.changeByKey = new Map(this.changes.map((item) => [item.key, item]));
+		const initial = resolveRecoveryHistoryFeedState(manifests, options);
+		this.historyScope = initial.scope;
+		this.selectedChangeKey = initial.selectedChangeKey;
 	}
 
 	onOpen(): void {
 		this.modalEl.addClass("recovery-history-modal-frame");
+		this.normalizeSelectedChange();
 		this.render();
-		void this.expandInitialDiffOnce();
+		void this.loadSelectedDiff();
 	}
 
 	onClose(): void {
@@ -112,182 +118,420 @@ export class RecoveryHistoryModal extends Modal {
 		const { contentEl } = this;
 		contentEl.empty();
 		contentEl.addClass("recovery-history-modal");
-		if (this.selected) {
-			this.renderDetail(contentEl, this.selected);
-		} else {
-			this.renderTimeline(contentEl);
-		}
-	}
+		this.renderHeader(contentEl);
 
-	private renderTimeline(contentEl: HTMLElement): void {
-		contentEl.createEl("h3", { text: "File history" });
-		contentEl.createEl("p", {
-			text: `${this.snapshots.length} point(s), ${this.histories.length} changed file(s).`,
-			cls: "setting-item-description",
-		});
-
-		if (this.snapshots.length === 0) {
+		if (this.changes.length === 0) {
 			contentEl.createEl("p", { text: "No file history points found yet." });
 			return;
 		}
 
 		const shell = contentEl.createDiv({ cls: "recovery-history-shell" });
-		const sidebar = shell.createDiv({ cls: "recovery-history-sidebar" });
-		const detail = shell.createDiv({ cls: "recovery-history-main" });
-
-		for (const snapshot of this.snapshots) {
-			const selected = snapshot.manifest.manifestId === this.selectedManifestId;
-			const row = sidebar.createDiv({
-				cls: `recovery-history-snapshot-row${selected ? " is-selected" : ""}`,
-			});
-			row.createEl("div", {
-				text: formatDate(snapshot.manifest.createdAt),
-				cls: "recovery-history-snapshot-date",
-			});
-			row.createEl("div", {
-				text: `${snapshot.changedItems.length} changed`,
-				cls: "setting-item-description",
-			});
-			row.addEventListener("click", () => {
-				this.selectedManifestId = snapshot.manifest.manifestId;
-				this.expandedDiffKey = null;
-				this.diffText = null;
-				this.render();
-			});
-		}
-
-		const selectedSnapshot = this.snapshots.find((snapshot) => snapshot.manifest.manifestId === this.selectedManifestId)
-			?? this.snapshots[0]!;
-		this.renderSnapshotDetail(detail, selectedSnapshot);
+		this.railEl = shell.createDiv({ cls: "recovery-history-sidebar" });
+		this.feedEl = shell.createDiv({ cls: "recovery-history-feed" });
+		this.previewEl = shell.createDiv({ cls: "recovery-history-preview" });
+		this.renderResults();
 	}
 
-	private renderSnapshotDetail(contentEl: HTMLElement, snapshot: SnapshotHistory): void {
-		contentEl.createEl("h4", {
-			text: formatDate(snapshot.manifest.createdAt),
-			cls: "recovery-history-snapshot-heading",
-		});
-		contentEl.createEl("div", {
-			text: `${snapshot.manifest.changedCount} changed file(s).`,
+	private renderHeader(contentEl: HTMLElement): void {
+		const header = contentEl.createDiv({ cls: "recovery-history-header" });
+		const title = header.createDiv({ cls: "recovery-history-heading" });
+		title.createEl("h3", { text: "File history" });
+		title.createDiv({
+			text: `${this.snapshots.length} point(s), ${this.changes.length} changed file event(s).`,
 			cls: "setting-item-description",
 		});
 
-		if (snapshot.changedItems.length === 0) {
-			contentEl.createEl("p", {
-				text: "This file history point has no file-level changes.",
-				cls: "setting-item-description",
-			});
-			return;
-		}
-
-		const list = contentEl.createDiv({ cls: "recovery-history-list" });
-		for (const item of snapshot.changedItems) {
-			const history = this.historiesByFileId.get(item.entry.fileId);
-			const row = list.createDiv({ cls: "recovery-history-row" });
-			row.createEl("div", {
-				text: item.entry.newPath ?? item.entry.path,
-				cls: "recovery-history-path",
-			});
-			row.createEl("div", {
-				text: `${displayKind(item.entry.kind)} · ${history?.items.length ?? 1} event(s) for this file`,
-				cls: "setting-item-description",
-			});
-			row.addEventListener("click", () => {
-				this.selected = history ?? {
-					fileId: item.entry.fileId,
-					path: item.entry.newPath ?? item.entry.path,
-					items: [item],
-				};
-				this.expandedDiffKey = null;
-				this.diffText = null;
-				this.render();
-			});
-		}
-	}
-
-	private renderDetail(contentEl: HTMLElement, history: FileHistory): void {
-		const titleRow = contentEl.createDiv({ cls: "recovery-history-title-row" });
-		titleRow.createEl("button", { text: "Back to file history" }).addEventListener("click", () => {
-			this.selected = null;
-			this.expandedDiffKey = null;
-			this.diffText = null;
-			this.render();
+		const controls = header.createDiv({ cls: "recovery-history-controls" });
+		const search = controls.createEl("input", {
+			type: "search",
+			placeholder: "Search paths",
+			cls: "recovery-history-search",
 		});
-		titleRow.createEl("h3", { text: history.path });
+		search.value = this.query;
+		search.addEventListener("input", () => {
+			this.query = search.value;
+			this.renderResultsAndLoadDiff();
+		});
 
-		for (const item of history.items) {
-			const key = fileHistoryDiffKey(item);
-			const row = contentEl.createDiv({ cls: "recovery-history-event" });
-			row.createEl("div", {
-				text: `${displayKind(item.entry.kind)} · ${formatDate(item.manifest.createdAt)}`,
-				cls: "recovery-history-event-title",
+		const select = controls.createEl("select", { cls: "recovery-history-kind-filter" });
+		for (const filter of KIND_FILTERS) {
+			const option = select.createEl("option", {
+				text: filter === "all" ? "All types" : displayKind(filter),
 			});
-			const details = [
-				item.entry.oldPath && item.entry.newPath ? `${item.entry.oldPath} -> ${item.entry.newPath}` : item.entry.path,
-				item.entry.contentHash ? `hash ${item.entry.contentHash.slice(0, 12)}` : "",
-			].filter(Boolean).join(" · ");
-			row.createEl("div", { text: details, cls: "setting-item-description" });
+			option.value = filter;
+			option.selected = filter === this.kindFilter;
+		}
+		select.addEventListener("change", () => {
+			this.kindFilter = normalizeKindFilter(select.value);
+			this.renderResultsAndLoadDiff();
+		});
+	}
 
-			const actions = row.createDiv({ cls: "recovery-history-actions" });
-			if (item.entry.previousContentHash || item.entry.contentHash) {
-				actions.createEl("button", { text: "Diff" }).addEventListener("click", () => {
-					void this.toggleDiff(key, item);
-				});
-			}
-			if (item.entry.contentHash) {
-				actions.createEl("button", {
-					text: "Restore this version",
-					cls: "mod-cta",
-				}).addEventListener("click", () => {
-					void this.deps.restoreVersion(item).then(
-						() => this.close(),
-						(err) => new Notice(`Restore failed: ${err instanceof Error ? err.message : String(err)}`, 8000),
-					);
-				});
-			}
+	private renderResultsAndLoadDiff(): void {
+		const previous = this.selectedChangeKey;
+		this.normalizeSelectedChange();
+		if (previous !== this.selectedChangeKey) {
+			this.resetDiffState();
+		}
+		this.renderResults();
+		void this.loadSelectedDiff();
+	}
 
-			if (this.expandedDiffKey === key && this.diffText !== null) {
-				row.createEl("pre", {
-					text: this.diffText,
-					cls: "recovery-history-diff",
-				});
-			} else if (this.expandedDiffKey === key) {
-				row.createEl("div", {
-					text: "Loading diff...",
-					cls: "setting-item-description",
-				});
-			}
+	private renderResults(): void {
+		if (!this.railEl || !this.feedEl || !this.previewEl) return;
+		this.railEl.empty();
+		this.feedEl.empty();
+		this.previewEl.empty();
+		this.renderScopeRail(this.railEl);
+		const visible = this.visibleChanges();
+		this.renderFeed(this.feedEl, visible);
+		this.renderPreview(this.previewEl, this.selectedChange());
+	}
+
+	private renderPreviewOnly(): void {
+		if (!this.previewEl) return;
+		this.previewEl.empty();
+		this.renderPreview(this.previewEl, this.selectedChange());
+	}
+
+	private renderScopeRail(parent: HTMLElement): void {
+		this.renderScopeRow(parent, {
+			label: "All changes",
+			detail: `${this.changes.length} changed`,
+			scope: { kind: "all" },
+		});
+
+		for (const snapshot of this.snapshots) {
+			this.renderScopeRow(parent, {
+				label: formatDate(snapshot.manifest.createdAt),
+				detail: `${snapshot.changedItems.length} changed`,
+				scope: { kind: "manifest", manifestId: snapshot.manifest.manifestId },
+			});
 		}
 	}
 
-	private async toggleDiff(key: string, item: FileHistoryItem): Promise<void> {
-		if (this.expandedDiffKey === key && this.diffText !== null) {
-			this.expandedDiffKey = null;
-			this.diffText = null;
-			this.render();
+	private renderScopeRow(
+		parent: HTMLElement,
+		options: {
+			label: string;
+			detail: string;
+			scope: RecoveryHistoryScope;
+		},
+	): void {
+		const selected = sameScope(this.historyScope, options.scope);
+		const row = parent.createDiv({
+			cls: `recovery-history-snapshot-row${selected ? " is-selected" : ""}`,
+		});
+		row.setAttr("role", "button");
+		row.setAttr("tabindex", "0");
+		row.createEl("div", {
+			text: options.label,
+			cls: "recovery-history-snapshot-date",
+		});
+		row.createEl("div", {
+			text: options.detail,
+			cls: "setting-item-description",
+		});
+		this.onActivate(row, () => {
+			this.historyScope = options.scope;
+			this.renderResultsAndLoadDiff();
+		});
+	}
+
+	private renderFeed(parent: HTMLElement, changes: RecoveryHistoryChangeItem[]): void {
+		const header = parent.createDiv({ cls: "recovery-history-feed-header" });
+		header.createDiv({
+			text: `${changes.length} visible change(s)`,
+			cls: "recovery-history-feed-count",
+		});
+
+		if (changes.length === 0) {
+			parent.createDiv({
+				text: "No changes match the current filters.",
+				cls: "setting-item-description recovery-history-empty",
+			});
 			return;
 		}
 
-		await this.expandDiff(key, item);
+		const list = parent.createDiv({ cls: "recovery-history-list" });
+		for (const item of changes) {
+			this.renderChangeRow(list, item);
+		}
 	}
 
-	private async expandInitialDiffOnce(): Promise<void> {
-		if (this.initialDiffLoaded || !this.expandedDiffKey || !this.selected) return;
-		this.initialDiffLoaded = true;
-		const key = this.expandedDiffKey;
-		const item = this.selected.items.find((candidate) => fileHistoryDiffKey(candidate) === key);
+	private renderChangeRow(parent: HTMLElement, item: RecoveryHistoryChangeItem): void {
+		const selected = item.key === this.selectedChangeKey;
+		const row = parent.createDiv({
+			cls: `recovery-history-row${selected ? " is-selected" : ""}`,
+		});
+		row.setAttr("role", "button");
+		row.setAttr("tabindex", "0");
+		row.setAttr("aria-label", `Show diff for ${item.displayPath}`);
+
+		const eventLine = row.createDiv({ cls: "recovery-history-event-line" });
+		eventLine.createEl("span", {
+			text: displayKind(item.entry.kind),
+			cls: `recovery-history-event-badge is-${item.entry.kind}`,
+		});
+		eventLine.createEl("span", {
+			text: formatDate(item.occurredAt),
+			cls: "recovery-history-event-time",
+		});
+		row.createEl("div", {
+			text: item.displayPath,
+			cls: "recovery-history-path",
+		});
+		const detail = this.changeDetailParts(item).join(" · ");
+		if (detail.length > 0) {
+			row.createEl("div", {
+				text: detail,
+				cls: "setting-item-description",
+			});
+		}
+
+		this.onActivate(row, () => {
+			if (this.selectedChangeKey === item.key) return;
+			this.selectedChangeKey = item.key;
+			this.resetDiffState();
+			this.renderResults();
+			void this.loadSelectedDiff();
+		});
+	}
+
+	private renderPreview(parent: HTMLElement, item: RecoveryHistoryChangeItem | null): void {
+		if (!item) {
+			parent.createDiv({
+				text: "No change selected.",
+				cls: "setting-item-description recovery-history-empty",
+			});
+			return;
+		}
+
+		const heading = parent.createDiv({ cls: "recovery-history-preview-heading" });
+		heading.createEl("div", {
+			text: displayKind(item.entry.kind),
+			cls: `recovery-history-event-badge is-${item.entry.kind}`,
+		});
+		heading.createEl("h4", { text: item.displayPath });
+		heading.createDiv({
+			text: formatDate(item.occurredAt),
+			cls: "setting-item-description",
+		});
+
+		const meta = this.changeDetailParts(item);
+		if (meta.length > 0) {
+			parent.createDiv({
+				text: meta.join(" · "),
+				cls: "setting-item-description recovery-history-preview-meta",
+			});
+		}
+
+		const actions = parent.createDiv({ cls: "recovery-history-actions" });
+		if (item.entry.contentHash) {
+			actions.createEl("button", {
+				text: "Restore this version",
+				cls: "mod-cta",
+			}).addEventListener("click", () => {
+				void this.deps.restoreVersion(item).then(
+					() => this.close(),
+					(err) => new Notice(`Restore failed: ${err instanceof Error ? err.message : String(err)}`, 8000),
+				);
+			});
+		}
+
+		if (!hasTextVersions(item)) {
+			parent.createDiv({
+				text: textUnavailableMessage(item),
+				cls: "setting-item-description recovery-history-diff-status",
+			});
+			return;
+		}
+
+		if (this.diffKey !== item.key || (this.diffLines === null && this.diffError === null)) {
+			parent.createDiv({
+				text: "Loading diff...",
+				cls: "setting-item-description recovery-history-diff-status",
+			});
+			return;
+		}
+
+		if (this.diffError) {
+			parent.createDiv({
+				text: this.diffError,
+				cls: "setting-item-description recovery-history-diff-status is-error",
+			});
+			return;
+		}
+
+		this.renderDiff(parent, item, this.diffLines ?? []);
+	}
+
+	private async loadSelectedDiff(): Promise<void> {
+		const item = this.selectedChange();
 		if (!item) return;
-		await this.expandDiff(key, item);
+		const key = item.key;
+		if (this.diffKey === key && (this.diffLines !== null || this.diffError !== null)) {
+			return;
+		}
+
+		this.diffKey = key;
+		this.diffLines = null;
+		this.diffError = null;
+		this.renderPreviewOnly();
+
+		if (!hasTextVersions(item)) {
+			this.diffLines = [];
+			this.renderPreviewOnly();
+			return;
+		}
+
+		const seq = ++this.diffLoadSeq;
+		try {
+			const previousHash = item.entry.previousContentHash;
+			const currentHash = item.entry.contentHash;
+			const previous = previousHash ? await this.downloadCached(previousHash) : "";
+			const current = currentHash ? await this.downloadCached(currentHash) : "";
+			if (seq !== this.diffLoadSeq || this.selectedChangeKey !== key) return;
+			this.diffLines = renderDiffLines(previous, current, {
+				contextLines: 0,
+				maxSegments: 80,
+				maxLinesPerSegment: 12,
+			});
+			this.diffError = null;
+		} catch (err) {
+			if (seq !== this.diffLoadSeq || this.selectedChangeKey !== key) return;
+			this.diffLines = null;
+			this.diffError = `Diff failed: ${err instanceof Error ? err.message : String(err)}`;
+		}
+		this.renderPreviewOnly();
 	}
 
-	private async expandDiff(key: string, item: FileHistoryItem): Promise<void> {
-		const previousHash = item.entry.previousContentHash;
-		const currentHash = item.entry.contentHash;
-		const previous = previousHash ? await this.deps.downloadContent(previousHash) : "";
-		const current = currentHash ? await this.deps.downloadContent(currentHash) : "";
-		this.expandedDiffKey = key;
-		this.diffText = renderDiffText(previous, current);
-		this.render();
+	private downloadCached(hash: string): Promise<string> {
+		const existing = this.contentCache.get(hash);
+		if (existing) return existing;
+		const promise = this.deps.downloadContent(hash).catch((err) => {
+			this.contentCache.delete(hash);
+			throw err;
+		});
+		this.contentCache.set(hash, promise);
+		return promise;
 	}
+
+	private renderDiff(parent: HTMLElement, item: RecoveryHistoryChangeItem, lines: RenderedDiffLine[]): void {
+		const root = parent.createDiv({ cls: "recovery-history-diff" });
+		const status = diffStatusMessage(item);
+		if (status) {
+			root.createDiv({
+				text: status,
+				cls: "setting-item-description recovery-history-diff-status",
+			});
+		}
+
+		const legend = root.createDiv({ cls: "recovery-history-diff-legend" });
+		legend.createEl("span", { text: "- before", cls: "recovery-history-diff-delete" });
+		legend.createEl("span", { text: "+ after", cls: "recovery-history-diff-insert" });
+
+		const body = root.createDiv({ cls: "recovery-history-diff-body" });
+		if (lines.length === 0) {
+			body.createDiv({
+				text: "No textual diff.",
+				cls: "recovery-history-diff-line is-context",
+			});
+			return;
+		}
+
+		for (const line of lines) {
+			const prefix = line.kind === "delete" ? "- " : line.kind === "insert" ? "+ " : "  ";
+			const cls = line.kind === "delete"
+				? "recovery-history-diff-line is-delete"
+				: line.kind === "insert"
+					? "recovery-history-diff-line is-insert"
+					: line.kind === "context"
+						? "recovery-history-diff-line is-context"
+						: "recovery-history-diff-line";
+			body.createDiv({ text: `${prefix}${line.text}` || " ", cls });
+		}
+	}
+
+	private visibleChanges(): RecoveryHistoryChangeItem[] {
+		return filterRecoveryHistoryChanges(this.changes, {
+			scope: this.historyScope,
+			query: this.query,
+			kindFilter: this.kindFilter,
+		});
+	}
+
+	private normalizeSelectedChange(): void {
+		this.selectedChangeKey = resolveVisibleRecoveryHistorySelection(
+			this.changes,
+			{
+				scope: this.historyScope,
+				query: this.query,
+				kindFilter: this.kindFilter,
+			},
+			this.selectedChangeKey,
+		);
+	}
+
+	private selectedChange(): RecoveryHistoryChangeItem | null {
+		if (!this.selectedChangeKey) return null;
+		return this.changeByKey.get(this.selectedChangeKey) ?? null;
+	}
+
+	private resetDiffState(): void {
+		this.diffKey = null;
+		this.diffLines = null;
+		this.diffError = null;
+		this.diffLoadSeq++;
+	}
+
+	private changeDetailParts(item: RecoveryHistoryChangeItem): string[] {
+		return [
+			item.entry.oldPath && item.entry.newPath ? `${item.entry.oldPath} -> ${item.entry.newPath}` : "",
+			item.entry.device ?? "",
+			item.entry.size !== undefined ? formatBytes(item.entry.size) : "",
+			`${item.historyCount} event(s) for this file`,
+		].filter(Boolean);
+	}
+
+	private onActivate(el: HTMLElement, handler: () => void): void {
+		el.addEventListener("click", handler);
+		el.addEventListener("keydown", (event) => {
+			if (event.key !== "Enter" && event.key !== " ") return;
+			event.preventDefault();
+			handler();
+		});
+	}
+}
+
+function normalizeKindFilter(value: string): RecoveryHistoryKindFilter {
+	return KIND_FILTERS.includes(value as RecoveryHistoryKindFilter)
+		? value as RecoveryHistoryKindFilter
+		: "all";
+}
+
+function hasTextVersions(item: RecoveryHistoryChangeItem): boolean {
+	return Boolean(item.entry.previousContentHash || item.entry.contentHash);
+}
+
+function textUnavailableMessage(item: RecoveryHistoryChangeItem): string {
+	if (item.entry.oldPath && item.entry.newPath) {
+		return "Path changed only. No text diff was captured for this history entry.";
+	}
+	return "No text content was captured for this history entry.";
+}
+
+function diffStatusMessage(item: RecoveryHistoryChangeItem): string | null {
+	if (!item.entry.previousContentHash && item.entry.contentHash) {
+		return "Created content. The file version appears as additions.";
+	}
+	if (item.entry.previousContentHash && !item.entry.contentHash) {
+		return "Deleted content. The previous file version appears as removals.";
+	}
+	if (item.entry.previousContentHash && item.entry.contentHash && item.entry.previousContentHash === item.entry.contentHash) {
+		return "Content hash did not change.";
+	}
+	return null;
 }
 
 export type RecoveryHistoryFileItem = FileHistoryItem;

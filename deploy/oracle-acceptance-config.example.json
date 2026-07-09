@@ -1,0 +1,12 @@
+{
+  "sshTarget": "opc@YOUR_ORACLE_VM",
+  "remoteDir": "kaos-headless-acceptance-YYYYMMDDTHHMMSSZ",
+  "workerHost": "https://YOUR_WORKER_HOST",
+  "vaultId": "YOUR_VAULT_ID",
+  "deviceName": "oracle-headless",
+  "tokenFile": "/secure/local/path/to/sync-token",
+  "evidenceRoot": "./oracle-acceptance-logs",
+  "releaseDir": ".",
+  "waitSshTimeoutMs": 300000,
+  "waitSshIntervalMs": 5000
+}

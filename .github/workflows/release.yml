@@ -22,8 +22,11 @@ jobs:
       - run: npm ci
       - run: npm ci --prefix server
       - run: npm run build
+      - run: npm run build:headless:host
+      - run: npm run prepare:headless-host-oracle-upload
       - run: npm run build:server-release
       - run: npm run test:ci:release
+      - run: npm run test:integration:headless-host
       - run: npm --prefix server run typecheck
 
       # Sanity check: the tag must match manifest.json version
@@ -46,6 +49,35 @@ jobs:
               kaos.zip \
               dist/release-assets/kaos-server.zip \
               dist/release-assets/update-manifest.json \
+              dist/kaos-headless-host.mjs \
+              dist/kaos-headless-host.mjs.sha256 \
+              dist/kaos-headless-host-manifest.json \
+              dist/kaosctl.mjs \
+              dist/kaosctl.mjs.sha256 \
+              dist/kaos-headless-user-manifest.json \
+              dist/kaos-headless-user.zip \
+              dist/kaos-headless-user.zip.sha256 \
+              dist/kaos-plugin.zip \
+              dist/kaos-plugin.zip.sha256 \
+              dist/kaos-headless-host-oracle.zip \
+              dist/kaos-headless-host-oracle.zip.sha256 \
+              deploy/kaos-headless-host.service \
+              deploy/kaos-headless-host.user.service \
+              deploy/oracle-acceptance-config.example.json \
+              scripts/install.sh \
+              scripts/bootstrap-headless-host-oracle.mjs \
+              scripts/install-headless-host.mjs \
+              scripts/update-headless-host-from-release.mjs \
+              scripts/verify-headless-host-bundle.mjs \
+              scripts/validate-headless-host-release-assets.mjs \
+              scripts/run-headless-host-oracle-rehearsal.mjs \
+              scripts/run-headless-host-oracle-remote-rehearsal.mjs \
+              scripts/run-headless-host-oracle-acceptance.mjs \
+              scripts/verify-headless-host-oracle-acceptance.mjs \
+              scripts/verify-headless-host-oracle-rehearsal.mjs \
+              scripts/smoke-headless-host-sync.mjs \
+              scripts/postflight-headless-host.mjs \
+              scripts/rollback-headless-host.mjs \
               main.js \
               telemetry.js \
               manifest.json \
@@ -58,6 +90,35 @@ jobs:
               kaos.zip \
               dist/release-assets/kaos-server.zip \
               dist/release-assets/update-manifest.json \
+              dist/kaos-headless-host.mjs \
+              dist/kaos-headless-host.mjs.sha256 \
+              dist/kaos-headless-host-manifest.json \
+              dist/kaosctl.mjs \
+              dist/kaosctl.mjs.sha256 \
+              dist/kaos-headless-user-manifest.json \
+              dist/kaos-headless-user.zip \
+              dist/kaos-headless-user.zip.sha256 \
+              dist/kaos-plugin.zip \
+              dist/kaos-plugin.zip.sha256 \
+              dist/kaos-headless-host-oracle.zip \
+              dist/kaos-headless-host-oracle.zip.sha256 \
+              deploy/kaos-headless-host.service \
+              deploy/kaos-headless-host.user.service \
+              deploy/oracle-acceptance-config.example.json \
+              scripts/install.sh \
+              scripts/bootstrap-headless-host-oracle.mjs \
+              scripts/install-headless-host.mjs \
+              scripts/update-headless-host-from-release.mjs \
+              scripts/verify-headless-host-bundle.mjs \
+              scripts/validate-headless-host-release-assets.mjs \
+              scripts/run-headless-host-oracle-rehearsal.mjs \
+              scripts/run-headless-host-oracle-remote-rehearsal.mjs \
+              scripts/run-headless-host-oracle-acceptance.mjs \
+              scripts/verify-headless-host-oracle-acceptance.mjs \
+              scripts/verify-headless-host-oracle-rehearsal.mjs \
+              scripts/smoke-headless-host-sync.mjs \
+              scripts/postflight-headless-host.mjs \
+              scripts/rollback-headless-host.mjs \
               main.js \
               telemetry.js \
               manifest.json \

@@ -29,7 +29,7 @@ export function renderDiffLines(
 		options.contextLines,
 	);
 	if (diffLines.length <= maxLines) return diffLines;
-	return diffLines.slice(0, maxLines).concat({ kind: "equal", text: "..." });
+	return diffLines.slice(0, maxLines).concat({ kind: "context", text: "..." });
 }
 
 export function renderDiffText(

@@ -53,3 +53,31 @@ console.log("\n--- Test 5: renderDiffLines compacts unchanged context ---");
 		{ kind: "context", text: "..." },
 	]);
 }
+
+console.log("\n--- Test 6: renderDiffLines can omit all unchanged file content ---");
+{
+	const previous = [
+		"unchanged-a",
+		"old-value",
+		"unchanged-b",
+		"unchanged-c",
+		"old-tail",
+	].join("\n");
+	const current = [
+		"unchanged-a",
+		"new-value",
+		"unchanged-b",
+		"unchanged-c",
+		"new-tail",
+	].join("\n");
+	const output = renderDiffLines(previous, current, { contextLines: 0 });
+	assert.deepEqual(output, [
+		{ kind: "context", text: "..." },
+		{ kind: "delete", text: "old-value" },
+		{ kind: "insert", text: "new-value" },
+		{ kind: "context", text: "..." },
+		{ kind: "delete", text: "old-tail" },
+		{ kind: "insert", text: "new-tail" },
+	]);
+	assert(!output.some((line) => line.text.startsWith("unchanged")), "unchanged file content is omitted");
+}
