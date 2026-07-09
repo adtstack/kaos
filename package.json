@@ -1,14 +1,12 @@
 {
 	"name": "kaos",
-	"version": "1.8.17",
+	"version": "1.8.18",
 	"description": "A zero-terminal, real-time sync engine powered by your own Cloudflare Worker.",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
-		"headless": "node --import jiti/register src/headless/cli.ts",
-		"build:headless": "node scripts/build-headless.mjs",
 		"headless:host": "node dist/kaos-headless-host.mjs",
 		"build:headless:host": "node scripts/build-headless-host.mjs",
 		"prepare:headless-host-oracle-upload": "node scripts/prepare-headless-host-oracle-upload.mjs",

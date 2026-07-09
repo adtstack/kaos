@@ -60,6 +60,44 @@ const allowMigrationUpdate =
 const allowSchemaRangeUpdate =
 	process.env.KAOS_ALLOW_SCHEMA_RANGE_UPDATE?.trim().toLowerCase() === "true";
 
+function assertSafeServerUpdateTarget() {
+	if (existsSync(join(repoRoot, ".obsidian"))) {
+		throw new Error(
+			[
+				"Refusing to apply a KAOS server update inside an Obsidian vault.",
+				`Current directory: ${repoRoot}`,
+				"This updater writes server-owned files such as package.json, package-lock.json, scripts/, and src/.",
+				"Run it from the generated Cloudflare Worker/server repository instead, not from your note vault.",
+			].join(" "),
+		);
+	}
+
+	const packagePath = join(repoRoot, "package.json");
+	const versionPath = join(repoRoot, "src/version.ts");
+	const wranglerPath = join(repoRoot, "wrangler.toml");
+	if (!existsSync(packagePath) || !existsSync(versionPath) || !existsSync(wranglerPath)) {
+		throw new Error(
+			[
+				"Refusing to apply a KAOS server update outside a KAOS server repository.",
+				`Current directory: ${repoRoot}`,
+				"Expected package.json, src/version.ts, and wrangler.toml.",
+				"Run this updater from the generated Cloudflare Worker/server repository.",
+			].join(" "),
+		);
+	}
+
+	const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
+	if (packageJson?.name !== "kaos-server") {
+		throw new Error(
+			[
+				"Refusing to apply a KAOS server update because package.json is not the KAOS server package.",
+				`Current directory: ${repoRoot}`,
+				`Found package name: ${String(packageJson?.name ?? "missing")}`,
+			].join(" "),
+		);
+	}
+}
+
 function collectTomlArrayBindingValues(source, sectionName, keyName) {
 	const values = new Set();
 	const escapedSection = sectionName.replaceAll(".", "\\.");
@@ -359,6 +397,7 @@ async function stageArtifactZip() {
 }
 
 async function main() {
+	assertSafeServerUpdateTarget();
 	await stageArtifactZip();
 	mkdirSync(extractDir, { recursive: true });
 	execFileSync("unzip", ["-q", zipPath, "-d", extractDir], { stdio: "inherit" });

@@ -241,6 +241,40 @@ try {
 		throw new Error("Schema gap test failed: rejected update still modified src/version.ts");
 	}
 
+	const vaultDir = join(tempDir, "vault");
+	cpSync(resolve(rootDir, "server"), vaultDir, { recursive: true });
+	mkdirSync(join(vaultDir, ".obsidian"), { recursive: true });
+	const vaultGuardOutput = runExpectFailure("node", ["scripts/update-from-release.mjs"], {
+		cwd: vaultDir,
+		env: {
+			...process.env,
+			KAOS_RELEASE_FILE: artifactPath,
+		},
+	});
+	if (!vaultGuardOutput.includes("Refusing to apply a KAOS server update inside an Obsidian vault")) {
+		throw new Error(`Expected Obsidian vault guard rejection, got:\n${vaultGuardOutput}`);
+	}
+	const vaultRevertGuardOutput = runExpectFailure("node", ["scripts/revert-last-update.mjs"], {
+		cwd: vaultDir,
+	});
+	if (!vaultRevertGuardOutput.includes("Refusing to revert a KAOS server update inside an Obsidian vault")) {
+		throw new Error(`Expected Obsidian vault revert guard rejection, got:\n${vaultRevertGuardOutput}`);
+	}
+
+	const notServerDir = join(tempDir, "not-server");
+	mkdirSync(notServerDir, { recursive: true });
+	writeFileSync(join(notServerDir, "package.json"), `${JSON.stringify({ name: "not-kaos-server" }, null, 2)}\n`);
+	const repoGuardOutput = runExpectFailure("node", [resolve(rootDir, "server/scripts/update-from-release.mjs")], {
+		cwd: notServerDir,
+		env: {
+			...process.env,
+			KAOS_RELEASE_FILE: artifactPath,
+		},
+	});
+	if (!repoGuardOutput.includes("Refusing to apply a KAOS server update outside a KAOS server repository")) {
+		throw new Error(`Expected server repo guard rejection, got:\n${repoGuardOutput}`);
+	}
+
 	console.log("Local KAOS server update/revert smoke test passed.");
 } finally {
 	rmSync(tempDir, { recursive: true, force: true });

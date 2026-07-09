@@ -2,13 +2,14 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { createReadStream, createWriteStream } from "node:fs";
-import { access, chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { constants, openSync, closeSync } from "node:fs";
 import { hostname, homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
 import readline from "node:readline/promises";
+import { emitKeypressEvents } from "node:readline";
 import { unzipSync } from "fflate";
 
 const DEFAULT_REPO = "adtstack/kaos";
@@ -20,6 +21,11 @@ const RUNNER = "kaos-headless-host.mjs";
 const KAOSCTL = "kaosctl.mjs";
 const VERSION_FILE = "VERSION";
 const PLUGIN_FILES = ["manifest.json", "main.js", "telemetry.js", "styles.css"];
+const RESOLVER_DIR = ".kaos-resolver";
+const MARKDOWN_CONFLICT_ARTIFACT_NAME_RE =
+	/^(.+) \(KAOS conflict(?: - (crdt|disk|editor))? from (.+) (\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)\)(?: (\d+))?(\.md)$/;
+const BLOB_CONFLICT_ARTIFACT_NAME_RE =
+	/^(.+) \(KAOS remote conflict (\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)\)(?: (\d+))?(\.[^/.]+)?$/;
 
 async function main() {
 	const [command = "help", ...args] = process.argv.slice(2);
@@ -43,6 +49,14 @@ async function main() {
 		await runDoctorCommand(parseArgs(args));
 		return;
 	}
+	if (command === "conflicts") {
+		await runConflictsCommand(args);
+		return;
+	}
+	if (command === "ui") {
+		await runConflictUi(parseArgs(args));
+		return;
+	}
 	throw new Error(`unknown command: ${command}`);
 }
 
@@ -50,8 +64,8 @@ function parseArgs(argv) {
 	const out = {};
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
-		if (arg === "--startup") {
-			out.startup = "true";
+		if (["--startup", "--json", "--full", "--force"].includes(arg)) {
+			out[arg.slice(2)] = "true";
 			continue;
 		}
 		if (arg === "--help" || arg === "-h") {
@@ -293,6 +307,798 @@ async function runDoctorCommand(raw) {
 	const paths = pathsFromConfig(config);
 	const result = runNodeJson(join(paths.currentLink, RUNNER), doctorArgs({ config, paths }));
 	console.log(JSON.stringify(result, null, 2));
+}
+
+async function runConflictsCommand(argv) {
+	const [subcommand = "list", ...rest] = argv;
+	if (subcommand === "--help" || subcommand === "-h" || subcommand === "help") {
+		printConflictsUsage();
+		return;
+	}
+	const { id, raw } = parseSubcommandArgs(rest);
+	if (raw.help === "true") {
+		printConflictsUsage();
+		return;
+	}
+	if (subcommand === "list") {
+		const inventory = await scanConflictInventory(raw);
+		if (raw.json === "true") {
+			console.log(JSON.stringify(inventory, null, 2));
+		} else {
+			printConflictList(inventory);
+		}
+		return;
+	}
+	if (subcommand === "show") {
+		const item = await requireConflictItem(raw, id);
+		printConflictDetail(item, { json: raw.json === "true" });
+		return;
+	}
+	if (subcommand === "diff") {
+		const { context, item } = await requireConflictItemWithContext(raw, id);
+		console.log(await renderConflictDiff(context, item, { full: raw.full === "true" }));
+		return;
+	}
+	if (["keep-current", "keep-artifact", "keep-local", "accept-delete"].includes(subcommand)) {
+		const result = await applyConflictAction(raw, id, subcommand);
+		console.log(JSON.stringify(result, null, 2));
+		return;
+	}
+	throw new Error(`unknown conflicts command: ${subcommand}`);
+}
+
+function parseSubcommandArgs(argv) {
+	let id = null;
+	let rest = argv;
+	if (rest[0] && !rest[0].startsWith("--")) {
+		id = rest[0];
+		rest = rest.slice(1);
+	}
+	return { id, raw: parseArgs(rest) };
+}
+
+async function runConflictUi(raw) {
+	if (raw.help === "true") {
+		printUsage();
+		return;
+	}
+	if (!process.stdin.isTTY || !process.stdout.isTTY) {
+		console.error("kaos ui requires an interactive TTY; showing read-only conflict list instead.");
+		printConflictList(await scanConflictInventory(raw));
+		return;
+	}
+
+	const context = await resolveConflictContext(raw);
+	let readOnly = false;
+	let stoppedService = false;
+	const lock = await readResolverLock(context);
+	if (lock.held) {
+		const stop = await promptStdYesNo(
+			`Headless host lock exists at ${lock.path}. Stop the user service before resolving conflicts?`,
+			false,
+		);
+		if (stop) {
+			try {
+				runChecked("systemctl", ["--user", "stop", "kaos-headless-host"]);
+				stoppedService = true;
+			} catch (err) {
+				readOnly = true;
+				console.error(`Failed to stop kaos-headless-host: ${errorMessage(err)}`);
+				console.error("Continuing in read-only mode.");
+			}
+		} else {
+			readOnly = true;
+		}
+	}
+
+	let inventory = await scanConflictInventory({ ...raw, _context: context });
+	let selected = 0;
+	let message = "Close Obsidian for this vault before applying changes. Press q to quit.";
+	let mode = "list";
+	let detailText = "";
+	emitKeypressEvents(process.stdin);
+	const keyReader = createKeyReader(process.stdin);
+	process.stdin.setRawMode?.(true);
+	let uiError = null;
+	try {
+		while (true) {
+			renderConflictUi({ inventory, selected, message, mode, detailText, readOnly });
+			const key = await keyReader.read();
+			const name = key?.name;
+			const item = inventory.items[selected] ?? null;
+			if (name === "q" || (key?.ctrl && name === "c")) break;
+			if (name === "j" || name === "down") {
+				selected = moveConflictSelection(inventory, selected, 1);
+				mode = "list";
+				continue;
+			}
+			if (name === "k" || name === "up") {
+				selected = moveConflictSelection(inventory, selected, -1);
+				mode = "list";
+				continue;
+			}
+			if (!item) {
+				message = "No conflicts found.";
+				continue;
+			}
+			if (name === "return") {
+				mode = "detail";
+				detailText = formatConflictDetail(item);
+				continue;
+			}
+			if (name === "d") {
+				mode = "detail";
+				detailText = await renderConflictDiff(context, item, { full: false });
+				continue;
+			}
+			if (name === "b") {
+				message = `Backups: ${join(context.vaultRoot, RESOLVER_DIR, "backups")}`;
+				continue;
+			}
+			const action = resolveUiAction(item, key);
+			if (!action) continue;
+			if (readOnly) {
+				message = "Read-only mode: stop headless-host before applying changes.";
+				continue;
+			}
+			try {
+				const result = await applyConflictAction({ ...raw, _context: context }, item.id, action);
+				message = `${action} applied. Backup: ${result.backupDir}`;
+				inventory = await scanConflictInventory({ ...raw, _context: context });
+				selected = Math.min(selected, Math.max(0, inventory.items.length - 1));
+				mode = "list";
+			} catch (err) {
+				message = errorMessage(err);
+			}
+		}
+	} catch (err) {
+		uiError = err;
+	} finally {
+		keyReader.close();
+		process.stdin.setRawMode?.(false);
+		process.stdout.write("\x1b[?25h\x1b[0m\n");
+	}
+	try {
+		if (!uiError && stoppedService) {
+			const start = await promptStdYesNo("Start kaos-headless-host user service again?", true);
+			if (start) {
+				try {
+					runChecked("systemctl", ["--user", "start", "kaos-headless-host"]);
+				} catch (err) {
+					console.error(`Failed to start kaos-headless-host: ${errorMessage(err)}`);
+				}
+			}
+		}
+	} finally {
+		process.stdin.pause();
+	}
+	if (uiError) throw uiError;
+}
+
+async function scanConflictInventory(raw = {}) {
+	const context = raw._context ?? await resolveConflictContext(raw);
+	const items = [
+		...await scanConflictArtifacts(context),
+		...await scanPreservedUnresolved(context),
+	].sort(compareConflictItems);
+	for (let i = 0; i < items.length; i++) {
+		items[i].id = `C${String(i + 1).padStart(3, "0")}`;
+	}
+	return {
+		kind: "kaos-conflicts",
+		ok: true,
+		vaultRoot: context.vaultRoot,
+		count: items.length,
+		items,
+	};
+}
+
+async function resolveConflictContext(raw) {
+	if (raw._context) return raw._context;
+	const defaults = defaultUserPaths();
+	const explicitConfig = asNonEmptyString(raw.config);
+	const configPath = explicitConfig ? resolveUserPath(explicitConfig) : defaults.installConfig;
+	const config = explicitConfig
+		? await readJsonFile(configPath)
+		: raw.vault
+			? null
+			: await readJsonIfExists(configPath);
+	const paths = isRecord(config) ? pathsFromConfig(config) : defaults;
+	const rawVaultRoot = asNonEmptyString(raw.vault) ?? asNonEmptyString(config?.vaultRoot);
+	if (!rawVaultRoot) {
+		throw new Error("Choose a vault with --vault or install KAOS headless first.");
+	}
+	const vaultRoot = resolveUserPath(rawVaultRoot);
+	const vaultInfo = await lstatOrNull(vaultRoot);
+	if (!vaultInfo?.isDirectory()) {
+		throw new Error(`vault does not exist or is not a directory: ${vaultRoot}`);
+	}
+	const pluginDir = resolveUserPath(raw["plugin-dir"] ?? config?.pluginDir ?? join(vaultRoot, ".obsidian", "plugins", "kaos"));
+	const dataFiles = uniquePaths([
+		raw["data-file"] ? resolveUserPath(raw["data-file"]) : (config ? paths.dataFile : null),
+		join(pluginDir, "data.json"),
+	]);
+	return {
+		vaultRoot,
+		pluginDir,
+		dataFiles,
+		lockFile: raw["lock-file"] ? resolveUserPath(raw["lock-file"]) : (config ? paths.lockFile : null),
+		resolverDir: join(vaultRoot, RESOLVER_DIR),
+	};
+}
+
+async function scanConflictArtifacts(context) {
+	const files = await walkVaultFiles(context.vaultRoot);
+	const items = [];
+	for (const path of files) {
+		const parsed = parseConflictArtifactPath(path);
+		if (!parsed) continue;
+		const currentExists = await pathExists(vaultPath(context, parsed.inferredOriginalPath));
+		items.push({
+			id: null,
+			type: `${parsed.kind}-artifact`,
+			kind: parsed.kind,
+			path: parsed.inferredOriginalPath,
+			currentPath: parsed.inferredOriginalPath,
+			artifactPath: parsed.artifactPath,
+			source: parsed.source,
+			deviceName: parsed.deviceName,
+			timestamp: parsed.timestamp,
+			copyIndex: parsed.copyIndex,
+			originalPathConfidence: parsed.originalPathConfidence,
+			currentExists,
+			artifactExists: true,
+			current: await describeVaultFile(context, parsed.inferredOriginalPath),
+			artifact: await describeVaultFile(context, parsed.artifactPath),
+		});
+	}
+	return items;
+}
+
+async function scanPreservedUnresolved(context) {
+	const merged = new Map();
+	for (const dataFile of context.dataFiles) {
+		const data = await readJsonIfExists(dataFile);
+		if (!isRecord(data) || !Array.isArray(data._preservedUnresolved)) continue;
+		for (const rawEntry of data._preservedUnresolved) {
+			if (!isRecord(rawEntry)) continue;
+			const path = normalizeVaultPath(rawEntry.path);
+			const kind = rawEntry.kind === "blob" ? "blob" : rawEntry.kind === "markdown" ? "markdown" : null;
+			if (!path || !kind) continue;
+			const key = `${kind}:${path}`;
+			const previous = merged.get(key);
+			const firstSeenAt = toNumber(rawEntry.firstSeenAt) ?? previous?.firstSeenAt ?? Date.now();
+			const lastSeenAt = Math.max(toNumber(rawEntry.lastSeenAt) ?? 0, previous?.lastSeenAt ?? 0, firstSeenAt);
+			merged.set(key, {
+				id: null,
+				type: "preserved-unresolved",
+				kind,
+				path,
+				currentPath: path,
+				reason: asNonEmptyString(rawEntry.reason) ?? previous?.reason ?? "unknown",
+				firstSeenAt,
+				lastSeenAt,
+				currentExists: await pathExists(vaultPath(context, path)),
+				current: await describeVaultFile(context, path),
+				dataSources: uniquePaths([...(previous?.dataSources ?? []), dataFile]),
+			});
+		}
+	}
+	return Array.from(merged.values());
+}
+
+async function walkVaultFiles(vaultRoot) {
+	const out = [];
+	async function walk(relDir) {
+		const absDir = relDir ? vaultPath({ vaultRoot }, relDir) : vaultRoot;
+		let entries;
+		try {
+			entries = await readdir(absDir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const entry of entries) {
+			const rel = normalizeVaultPath(relDir ? `${relDir}/${entry.name}` : entry.name);
+			if (isResolverExcludedPath(rel)) continue;
+			if (entry.isDirectory()) {
+				await walk(rel);
+			} else if (entry.isFile()) {
+				out.push(rel);
+			}
+		}
+	}
+	await walk("");
+	return out;
+}
+
+function isResolverExcludedPath(path) {
+	const first = normalizeVaultPath(path).split("/")[0];
+	return [".obsidian", ".trash", ".kaos-headless-host", RESOLVER_DIR].includes(first);
+}
+
+async function describeVaultFile(context, path) {
+	const abs = vaultPath(context, path);
+	const info = await lstatOrNull(abs);
+	if (!info || !info.isFile()) return { exists: false };
+	return {
+		exists: true,
+		size: info.size,
+		mtimeMs: Math.trunc(info.mtimeMs),
+		sha256: await sha256File(abs).catch(() => null),
+	};
+}
+
+function compareConflictItems(a, b) {
+	const at = itemSortTime(a);
+	const bt = itemSortTime(b);
+	if (at !== bt) return bt - at;
+	return `${a.type}:${a.path}:${a.artifactPath ?? ""}`.localeCompare(`${b.type}:${b.path}:${b.artifactPath ?? ""}`);
+}
+
+function itemSortTime(item) {
+	if (typeof item.lastSeenAt === "number") return item.lastSeenAt;
+	const parsed = Date.parse(item.timestamp ?? "");
+	return Number.isFinite(parsed) ? parsed : 0;
+}
+
+async function requireConflictItem(raw, id) {
+	return (await requireConflictItemWithContext(raw, id)).item;
+}
+
+async function requireConflictItemWithContext(raw, id) {
+	if (!id) throw new Error("conflict id is required");
+	const context = raw._context ?? await resolveConflictContext(raw);
+	const inventory = await scanConflictInventory({ ...raw, _context: context });
+	const item = inventory.items.find((candidate) => candidate.id === id);
+	if (!item) throw new Error(`conflict not found: ${id}`);
+	return { context, item };
+}
+
+function printConflictList(inventory) {
+	if (inventory.items.length === 0) {
+		console.log(`No conflicts found in ${inventory.vaultRoot}.`);
+		return;
+	}
+	console.log(`Conflicts in ${inventory.vaultRoot}`);
+	for (const item of inventory.items) {
+		console.log(`${item.id}  ${formatConflictSummary(item)}`);
+	}
+}
+
+function printConflictDetail(item, { json }) {
+	if (json) {
+		console.log(JSON.stringify(item, null, 2));
+	} else {
+		console.log(formatConflictDetail(item));
+	}
+}
+
+function formatConflictSummary(item) {
+	if (item.type === "preserved-unresolved") {
+		return `${item.kind} preserved-unresolved  ${item.path}  (${item.reason})`;
+	}
+	const current = item.currentExists ? "current" : "current-missing";
+	return `${item.kind} artifact  ${item.path}  <- ${item.artifactPath}  [${item.source ?? "unknown"}, ${current}]`;
+}
+
+function formatConflictDetail(item) {
+	const lines = [
+		`${item.id} ${formatConflictSummary(item)}`,
+		`type: ${item.type}`,
+		`path: ${item.path}`,
+	];
+	if (item.artifactPath) lines.push(`artifact: ${item.artifactPath}`);
+	if (item.source) lines.push(`source: ${item.source}`);
+	if (item.deviceName) lines.push(`device: ${item.deviceName}`);
+	if (item.timestamp) lines.push(`timestamp: ${item.timestamp}`);
+	if (item.reason) lines.push(`reason: ${item.reason}`);
+	if (item.originalPathConfidence) lines.push(`original confidence: ${item.originalPathConfidence}`);
+	if (item.current) lines.push(`current: ${formatFileDescription(item.current)}`);
+	if (item.artifact) lines.push(`artifact: ${formatFileDescription(item.artifact)}`);
+	if (item.dataSources?.length) lines.push(`data sources: ${item.dataSources.join(", ")}`);
+	return lines.join("\n");
+}
+
+function formatFileDescription(info) {
+	if (!info?.exists) return "missing";
+	return `${info.size} bytes, sha256 ${String(info.sha256 ?? "").slice(0, 12) || "unknown"}`;
+}
+
+async function renderConflictDiff(context, item, { full }) {
+	if (item.type === "preserved-unresolved") {
+		return [
+			formatConflictDetail(item),
+			"",
+			"Preserved unresolved entries have no artifact diff.",
+			"Use keep-local to keep the file or accept-delete to move it aside and accept the remote delete.",
+		].join("\n");
+	}
+	const currentAbs = vaultPath(context, item.currentPath);
+	const artifactAbs = vaultPath(context, item.artifactPath);
+	if (item.kind !== "markdown") {
+		return [
+			formatConflictDetail(item),
+			"",
+			"Binary/blob conflict: content diff is not shown.",
+			`current:  ${item.currentPath}  ${formatFileDescription(await describeVaultFile(context, item.currentPath))}`,
+			`artifact: ${item.artifactPath}  ${formatFileDescription(await describeVaultFile(context, item.artifactPath))}`,
+		].join("\n");
+	}
+	const currentText = await readFile(currentAbs, "utf8").catch(() => "");
+	const artifactText = await readFile(artifactAbs, "utf8");
+	return renderLineDiff(currentText, artifactText, {
+		leftLabel: `current:${item.currentPath}`,
+		rightLabel: `artifact:${item.artifactPath}`,
+		full,
+	});
+}
+
+function renderLineDiff(left, right, { leftLabel, rightLabel, full }) {
+	if (left === right) return `No textual differences.\n--- ${leftLabel}\n+++ ${rightLabel}`;
+	const leftLines = left.split(/\r?\n/);
+	const rightLines = right.split(/\r?\n/);
+	let prefix = 0;
+	while (prefix < leftLines.length && prefix < rightLines.length && leftLines[prefix] === rightLines[prefix]) prefix++;
+	let suffix = 0;
+	while (
+		suffix + prefix < leftLines.length &&
+		suffix + prefix < rightLines.length &&
+		leftLines[leftLines.length - 1 - suffix] === rightLines[rightLines.length - 1 - suffix]
+	) {
+		suffix++;
+	}
+	const context = 3;
+	const leftStart = full ? 0 : Math.max(0, prefix - context);
+	const rightStart = full ? 0 : Math.max(0, prefix - context);
+	const leftEnd = full ? leftLines.length : Math.min(leftLines.length, leftLines.length - suffix + context);
+	const rightEnd = full ? rightLines.length : Math.min(rightLines.length, rightLines.length - suffix + context);
+	const out = [`--- ${leftLabel}`, `+++ ${rightLabel}`];
+	for (let i = leftStart; i < prefix; i++) out.push(` ${leftLines[i] ?? ""}`);
+	let changed = 0;
+	for (let i = prefix; i < leftLines.length - suffix; i++) {
+		if (!full && changed >= 400) {
+			out.push("... diff truncated; rerun with --full for complete output");
+			break;
+		}
+		out.push(`-${leftLines[i] ?? ""}`);
+		changed++;
+	}
+	changed = 0;
+	for (let i = prefix; i < rightLines.length - suffix; i++) {
+		if (!full && changed >= 400) break;
+		out.push(`+${rightLines[i] ?? ""}`);
+		changed++;
+	}
+	for (let i = leftLines.length - suffix; i < leftEnd; i++) out.push(` ${leftLines[i] ?? ""}`);
+	if (!full && (leftStart > 0 || rightStart > 0)) out.splice(2, 0, "... unchanged prefix omitted");
+	if (!full && (leftEnd < leftLines.length || rightEnd < rightLines.length)) out.push("... unchanged suffix omitted");
+	return out.join("\n");
+}
+
+async function applyConflictAction(raw, id, action) {
+	const { context, item } = await requireConflictItemWithContext(raw, id);
+	await assertNoHeadlessLock(context);
+	if (item.type === "preserved-unresolved") {
+		if (!["keep-local", "accept-delete"].includes(action)) {
+			throw new Error(`${action} is only valid for conflict artifacts`);
+		}
+	} else if (!["keep-current", "keep-artifact"].includes(action)) {
+		throw new Error(`${action} is only valid for preserved-unresolved entries`);
+	}
+	if (item.originalPathConfidence === "possibly-truncated" && action === "keep-artifact" && raw.force !== "true") {
+		throw new Error("refusing to replace current path for possibly-truncated artifact; inspect manually or pass --force");
+	}
+	const workspace = await createResolutionWorkspace(context, item, action);
+	if (action === "keep-current") {
+		if (!item.currentExists) throw new Error("current file is missing; cannot keep current");
+		await moveVaultFileToTrash(context, item.artifactPath, workspace.trashDir);
+	} else if (action === "keep-artifact") {
+		await copyVaultFile(context, item.artifactPath, item.currentPath);
+		await moveVaultFileToTrash(context, item.artifactPath, workspace.trashDir);
+	} else if (action === "keep-local") {
+		await removePreservedUnresolvedEntries(context, item);
+	} else if (action === "accept-delete") {
+		if (item.currentExists) await moveVaultFileToTrash(context, item.currentPath, workspace.trashDir);
+		await removePreservedUnresolvedEntries(context, item);
+	}
+	return {
+		kind: "kaos-conflict-resolution",
+		ok: true,
+		action,
+		id,
+		path: item.path,
+		backupDir: workspace.backupDir,
+		trashDir: workspace.trashDir,
+	};
+}
+
+async function assertNoHeadlessLock(context) {
+	const lock = await readResolverLock(context);
+	if (lock.held) {
+		throw new Error(`headless host lock exists at ${lock.path}; stop kaos-headless-host before resolving conflicts`);
+	}
+}
+
+async function readResolverLock(context) {
+	if (!context.lockFile) return { held: false, path: null, data: null };
+	const text = await readFile(context.lockFile, "utf8").catch((err) => {
+		if (err?.code === "ENOENT") return null;
+		throw err;
+	});
+	if (text === null) return { held: false, path: context.lockFile, data: null };
+	let data = null;
+	try {
+		data = JSON.parse(text);
+	} catch {
+		data = { raw: text };
+	}
+	return { held: true, path: context.lockFile, data };
+}
+
+async function createResolutionWorkspace(context, item, action) {
+	const stamp = formatResolverStamp(new Date());
+	const name = `${stamp}-${item.id}-${action}`;
+	const backupDir = join(context.resolverDir, "backups", name);
+	const trashDir = join(context.resolverDir, "trash", name);
+	await mkdir(backupDir, { recursive: true });
+	await mkdir(trashDir, { recursive: true });
+	const manifest = {
+		kind: "kaos-conflict-resolution-backup",
+		action,
+		createdAt: new Date().toISOString(),
+		item,
+		files: [],
+		dataFiles: [],
+	};
+	if (item.currentPath) await backupVaultFile(context, item.currentPath, backupDir, "current", manifest);
+	if (item.artifactPath) await backupVaultFile(context, item.artifactPath, backupDir, "artifact", manifest);
+	for (const dataFile of context.dataFiles) {
+		await backupDataFile(dataFile, backupDir, manifest);
+	}
+	await writeJsonAtomic(join(backupDir, "manifest.json"), manifest, 0o600);
+	return { backupDir, trashDir };
+}
+
+async function backupVaultFile(context, relPath, backupDir, label, manifest) {
+	const source = vaultPath(context, relPath);
+	const info = await lstatOrNull(source);
+	if (!info || !info.isFile()) {
+		manifest.files.push({ label, path: relPath, exists: false });
+		return;
+	}
+	const target = safeJoin(join(backupDir, label), relPath);
+	await mkdir(dirname(target), { recursive: true });
+	await copyFile(source, target);
+	manifest.files.push({ label, path: relPath, backupPath: target, exists: true });
+}
+
+async function backupDataFile(dataFile, backupDir, manifest) {
+	const info = await lstatOrNull(dataFile);
+	if (!info || !info.isFile()) {
+		manifest.dataFiles.push({ path: dataFile, exists: false });
+		return;
+	}
+	const target = join(backupDir, "data", `data-${manifest.dataFiles.length + 1}.json`);
+	await mkdir(dirname(target), { recursive: true });
+	await copyFile(dataFile, target);
+	manifest.dataFiles.push({ path: dataFile, backupPath: target, exists: true });
+}
+
+async function copyVaultFile(context, fromRel, toRel) {
+	const source = vaultPath(context, fromRel);
+	const target = vaultPath(context, toRel);
+	await mkdir(dirname(target), { recursive: true });
+	const temp = `${target}.tmp-${process.pid}-${Date.now()}`;
+	await copyFile(source, temp);
+	await rename(temp, target);
+}
+
+async function moveVaultFileToTrash(context, relPath, trashDir) {
+	const source = vaultPath(context, relPath);
+	const target = safeJoin(trashDir, relPath);
+	await mkdir(dirname(target), { recursive: true });
+	try {
+		await rename(source, target);
+	} catch (err) {
+		if (err?.code !== "EXDEV") throw err;
+		await copyFile(source, target);
+		await rm(source, { force: true });
+	}
+}
+
+async function removePreservedUnresolvedEntries(context, item) {
+	let changedAny = false;
+	for (const dataFile of context.dataFiles) {
+		const data = await readJsonIfExists(dataFile);
+		if (!isRecord(data) || !Array.isArray(data._preservedUnresolved)) continue;
+		const before = data._preservedUnresolved.length;
+		data._preservedUnresolved = data._preservedUnresolved.filter((entry) => {
+			if (!isRecord(entry)) return true;
+			return !(normalizeVaultPath(entry.path) === item.path && entry.kind === item.kind);
+		});
+		if (data._preservedUnresolved.length === 0) delete data._preservedUnresolved;
+		if ((data._preservedUnresolved?.length ?? 0) !== before) {
+			await writeJsonAtomic(dataFile, data, 0o600);
+			changedAny = true;
+		}
+	}
+	if (!changedAny) throw new Error(`preserved-unresolved entry already resolved: ${item.path}`);
+}
+
+function parseConflictArtifactPath(path) {
+	return parseMarkdownConflictArtifactPath(path) ?? parseBlobConflictArtifactPath(path);
+}
+
+function parseMarkdownConflictArtifactPath(path) {
+	const normalized = normalizeVaultPath(path);
+	const { dir, name } = splitVaultPath(normalized);
+	const match = MARKDOWN_CONFLICT_ARTIFACT_NAME_RE.exec(name);
+	if (!match) return null;
+	const base = match[1];
+	const source = match[2];
+	const device = match[3];
+	const stamp = match[4];
+	const ext = match[6];
+	if (!base || !ext || !device || !stamp) return null;
+	return {
+		kind: "markdown",
+		artifactPath: normalized,
+		inferredOriginalPath: `${dir}${base}${ext}`,
+		originalPathConfidence: base.length >= 100 ? "possibly-truncated" : "candidate",
+		source: ["crdt", "disk", "editor"].includes(source) ? source : null,
+		deviceName: device,
+		timestamp: stampToIso(stamp),
+		copyIndex: parseCopyIndex(match[5]),
+	};
+}
+
+function parseBlobConflictArtifactPath(path) {
+	const normalized = normalizeVaultPath(path);
+	const { dir, name } = splitVaultPath(normalized);
+	const match = BLOB_CONFLICT_ARTIFACT_NAME_RE.exec(name);
+	if (!match) return null;
+	const base = match[1];
+	const stamp = match[2];
+	if (!base || !stamp) return null;
+	const ext = match[4] ?? "";
+	return {
+		kind: "blob",
+		artifactPath: normalized,
+		inferredOriginalPath: `${dir}${base}${ext}`,
+		originalPathConfidence: base.length >= 180 ? "possibly-truncated" : "candidate",
+		source: "remote",
+		deviceName: null,
+		timestamp: stampToIso(stamp),
+		copyIndex: parseCopyIndex(match[3]),
+	};
+}
+
+function splitVaultPath(path) {
+	const slash = path.lastIndexOf("/");
+	return {
+		dir: slash >= 0 ? path.slice(0, slash + 1) : "",
+		name: slash >= 0 ? path.slice(slash + 1) : path,
+	};
+}
+
+function stampToIso(stamp) {
+	return stamp.replace(/T(\d{2})-(\d{2})-(\d{2})Z$/, "T$1:$2:$3Z");
+}
+
+function parseCopyIndex(value) {
+	if (!value) return null;
+	const parsed = Number(value);
+	return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function normalizeVaultPath(path) {
+	if (typeof path !== "string") return "";
+	return path.replace(/\\/g, "/").split("/").filter((part) => part && part !== ".").join("/");
+}
+
+function vaultPath(context, relPath) {
+	const normalized = normalizeVaultPath(relPath);
+	if (!normalized || normalized.startsWith("../") || normalized === "..") {
+		throw new Error(`invalid vault path: ${relPath}`);
+	}
+	const target = resolve(context.vaultRoot, ...normalized.split("/"));
+	const root = resolve(context.vaultRoot);
+	if (target !== root && !target.startsWith(`${root}${sep}`)) {
+		throw new Error(`path escapes vault root: ${relPath}`);
+	}
+	return target;
+}
+
+function formatResolverStamp(date) {
+	return date.toISOString().replace(/\.\d{3}Z$/, "Z").replace(/[:]/g, "-");
+}
+
+function toNumber(value) {
+	const parsed = typeof value === "number" ? value : Number(value);
+	return Number.isFinite(parsed) ? parsed : null;
+}
+
+function uniquePaths(paths) {
+	return Array.from(new Set(paths.filter((path) => typeof path === "string" && path.length > 0)));
+}
+
+function resolveUserPath(path) {
+	return resolve(String(path).replace(/^~(?=$|\/)/, homedir()));
+}
+
+function renderConflictUi({ inventory, selected, message, mode, detailText, readOnly }) {
+	process.stdout.write("\x1b[?25l\x1b[2J\x1b[H");
+	process.stdout.write(`KAOS conflict resolver${readOnly ? " (read-only)" : ""}\n`);
+	process.stdout.write(`${message}\n\n`);
+	if (inventory.items.length === 0) {
+		process.stdout.write("No conflicts found.\n\nq quit\n");
+		return;
+	}
+	for (let i = 0; i < inventory.items.length; i++) {
+		const prefix = i === selected ? ">" : " ";
+		process.stdout.write(`${prefix} ${inventory.items[i].id} ${formatConflictSummary(inventory.items[i])}\n`);
+	}
+	process.stdout.write("\nKeys: j/k move  enter detail  d diff  1 keep-current/keep-local  2 keep-artifact  x accept-delete  b backups  q quit\n\n");
+	if (mode === "detail") {
+		process.stdout.write(detailText);
+		process.stdout.write("\n");
+	}
+}
+
+function createKeyReader(input) {
+	const queue = [];
+	const waiters = [];
+	const onKey = (_str, key) => {
+		const waiter = waiters.shift();
+		if (waiter) {
+			waiter(key);
+		} else {
+			queue.push(key);
+		}
+	};
+	input.on("keypress", onKey);
+	return {
+		read() {
+			const queued = queue.shift();
+			if (queued) return Promise.resolve(queued);
+			return new Promise((resolvePromise) => waiters.push(resolvePromise));
+		},
+		close() {
+			input.off("keypress", onKey);
+			while (waiters.length > 0) {
+				waiters.shift()?.(null);
+			}
+		},
+	};
+}
+
+function moveConflictSelection(inventory, selected, delta) {
+	if (inventory.items.length === 0) return 0;
+	return Math.max(0, Math.min(inventory.items.length - 1, selected + delta));
+}
+
+function resolveUiAction(item, key) {
+	if (!key) return null;
+	if (item.type === "preserved-unresolved") {
+		if (key.sequence === "1") return "keep-local";
+		if (key.name === "x") return "accept-delete";
+		return null;
+	}
+	if (key.sequence === "1") return "keep-current";
+	if (key.sequence === "2") return "keep-artifact";
+	return null;
+}
+
+async function promptStdYesNo(label, defaultYes) {
+	const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+	try {
+		const suffix = defaultYes ? " [Y/n]" : " [y/N]";
+		const answer = (await rl.question(`${label}${suffix}: `)).trim().toLowerCase();
+		if (!answer) return defaultYes;
+		return ["y", "yes"].includes(answer);
+	} finally {
+		rl.close();
+	}
 }
 
 function defaultUserPaths() {
@@ -829,9 +1635,29 @@ function printUsage() {
   kaos update [--startup]
   kaos status
   kaos doctor
+  kaos ui [--vault <path>]
+  kaos conflicts <command> [options]
 
 Install is always interactive. Update is non-interactive and is used by the
 user systemd service during startup.
+`);
+}
+
+function printConflictsUsage() {
+	console.log(`Usage:
+  kaos conflicts list [--json] [--vault <path>]
+  kaos conflicts show <id> [--json] [--vault <path>]
+  kaos conflicts diff <id> [--full] [--vault <path>]
+  kaos conflicts keep-current <id> [--vault <path>]
+  kaos conflicts keep-artifact <id> [--force] [--vault <path>]
+  kaos conflicts keep-local <id> [--vault <path>]
+  kaos conflicts accept-delete <id> [--vault <path>]
+
+Options:
+  --vault <path>       Override the installed vault path.
+  --data-file <path>   Add/override the headless data file for preserved entries.
+  --plugin-dir <path>  Override the vault plugin directory.
+  --lock-file <path>   Override the headless-host lock path.
 `);
 }
 
