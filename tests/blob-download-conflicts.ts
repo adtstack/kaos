@@ -944,6 +944,26 @@ console.log("\n--- Test 21: processUpload skips preserved-unresolved paths (queu
 	assert(!!skipTrace, "trace emitted for skipped preserved-unresolved upload");
 }
 
+// ── Test 24: excluded remote tombstones do not delete local tool files ──────
+
+console.log("\n--- Test 24: excluded remote delete leaves local tool file untouched ---");
+{
+	const { app, manager, files, put } = makeHarness(
+		(path) => !path.includes("/node_modules/"),
+	);
+	put("tools/node_modules/cache.bin", bytes("local tool cache"));
+	const deletedPaths: string[] = [];
+	(app as any).vault.delete = async (file: TFile & { path: string }) => {
+		deletedPaths.push(file.path);
+		files.delete(file.path);
+	};
+
+	await (manager as any).handleRemoteDelete("tools/node_modules/cache.bin", "known-hash");
+
+	assert(files.has("tools/node_modules/cache.bin"), "excluded tool file is preserved locally");
+	assert(deletedPaths.length === 0, "excluded remote delete does not call vault.delete");
+}
+
 console.log("\n──────────────────────────────────────────────────");
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log("──────────────────────────────────────────────────");

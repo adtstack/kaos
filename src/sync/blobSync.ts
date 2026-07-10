@@ -1522,6 +1522,10 @@ export class BlobSyncManager {
 		knownHash: string | null,
 	): Promise<void> {
 		const normalized = normalizePath(path);
+		if (!this.isBlobPathSyncable(normalized)) {
+			this.log(`handleRemoteDelete: skipping excluded path "${normalized}"`);
+			return;
+		}
 		if (this.remoteDeleteInFlight.has(normalized) && !knownHash) {
 			this.trace?.("blob", "remote-delete-duplicate-ignored", {
 				path: normalized,

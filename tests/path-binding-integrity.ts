@@ -196,6 +196,37 @@ console.log("\n--- VaultSync reconcile: excluded CRDT paths are not restored to 
 	assertEq(vs.getTextForPath(".obsidian-mobile/plugins/example/README.md")?.toString(), "hidden", "excluded CRDT data is retained without writing it");
 }
 
+console.log("\n--- VaultSync cleanup: intrinsic exclusions tombstone remote entries only ---");
+{
+	const vs = makeVaultSync();
+	const hiddenText = new Y.Text();
+	hiddenText.insert(0, "plugin documentation");
+	const visibleText = new Y.Text();
+	visibleText.insert(0, "keep this note");
+	vs.idToText.set("hidden", hiddenText);
+	vs.idToText.set("visible", visibleText);
+	vs.meta.set("hidden", createNestedActiveMeta(".obsidian-mobile/plugins/example/README.md", 10, "A"));
+	vs.meta.set("visible", createNestedActiveMeta("notes/keep.md", 10, "A"));
+	vs.pathToBlob.set("tools/node_modules/cache.bin", { hash: "bad", size: 1 });
+	vs.pathToBlob.set("attachments/keep.png", { hash: "good", size: 2 });
+
+	const cleanup = vs.tombstoneIntrinsicExcludedEntries(
+		(path) => path.startsWith(".obsidian-mobile/"),
+		(path) => path.includes("/node_modules/"),
+		"TestDevice",
+	);
+
+	assertEq(cleanup.markdownPaths.join(","), ".obsidian-mobile/plugins/example/README.md", "intrinsic markdown path is selected for remote tombstoning");
+	assertEq(cleanup.blobPaths.join(","), "tools/node_modules/cache.bin", "intrinsic blob path is selected for remote tombstoning");
+	assert(vs.isMarkdownTombstoned(".obsidian-mobile/plugins/example/README.md"), "intrinsic markdown path is tombstoned");
+	assertEq(vs.getTextForPath(".obsidian-mobile/plugins/example/README.md"), null, "tombstoned markdown no longer has an active remote path");
+	assertEq(vs.idToText.get("hidden")?.toString(), "plugin documentation", "tombstone retains CRDT history to block stale resurrection");
+	assertEq(vs.getTextForPath("notes/keep.md")?.toString(), "keep this note", "ordinary markdown is retained");
+	assert(!vs.pathToBlob.has("tools/node_modules/cache.bin"), "intrinsic blob ref is removed from the remote path map");
+	assert(vs.isBlobTombstoned("tools/node_modules/cache.bin"), "intrinsic blob path is tombstoned");
+	assert(vs.pathToBlob.has("attachments/keep.png"), "ordinary blob ref is retained");
+}
+
 console.log(`\npath-binding-integrity: ${passed} passed, ${failed} failed`);
 if (failed > 0) {
 	process.exit(1);

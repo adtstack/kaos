@@ -1508,6 +1508,68 @@ export class VaultSync {
 		return Array.from(this._pathIndex.keys());
 	}
 
+	/**
+	 * Tombstone active CRDT entries that the product has classified as
+	 * intrinsically unsafe to synchronize. The caller owns that policy: it must
+	 * not pass user-configured exclusions here, because changing a preference
+	 * must not silently delete a user's remote document.
+	 *
+	 * Tombstones are intentional. They remove the remote path reference and
+	 * stop all replicas from materializing it, while retaining deletion history
+	 * so an offline client cannot resurrect the entry.
+	 */
+	tombstoneIntrinsicExcludedEntries(
+		shouldTombstoneMarkdownPath: (path: string) => boolean,
+		shouldTombstoneBlobPath: (path: string) => boolean,
+		device?: string,
+	): { markdownPaths: string[]; blobPaths: string[] } {
+		const markdownEntries: Array<{ fileId: string; path: string }> = [];
+		this.meta.forEach((value: unknown, fileId: string) => {
+			if (isFileMetaDeletedValue(value)) return;
+			const rawPath = getMetaPath(value);
+			if (!rawPath) return;
+			const path = this.normPath(rawPath);
+			if (shouldTombstoneMarkdownPath(path)) {
+				markdownEntries.push({ fileId, path });
+			}
+		});
+
+		const blobPaths: string[] = [];
+		this.pathToBlob.forEach((_ref, rawPath) => {
+			const path = this.normPath(rawPath);
+			if (!this.isBlobTombstoned(path) && shouldTombstoneBlobPath(path)) {
+				blobPaths.push(path);
+			}
+		});
+
+		if (markdownEntries.length === 0 && blobPaths.length === 0) {
+			return { markdownPaths: [], blobPaths: [] };
+		}
+
+		this.ydoc.transact(() => {
+			for (const { fileId, path } of markdownEntries) {
+				if (this.shouldWriteLegacyPathMap()) {
+					this.pathToId.delete(path);
+				}
+				this.setMetaDeleted(fileId, path, device);
+			}
+			for (const path of blobPaths) {
+				this.pathToBlob.delete(path);
+				this.blobTombstones.set(path, {
+					deletedAt: Date.now(),
+					device,
+				});
+			}
+		}, ORIGIN_SEED);
+
+		this._pathIndexesDirty = markdownEntries.length > 0;
+		const uniqueMarkdownPaths = [...new Set(markdownEntries.map(({ path }) => path))];
+		this.log(
+			`tombstoneIntrinsicExcludedEntries: markdown=${uniqueMarkdownPaths.length}, blobs=${blobPaths.length}`,
+		);
+		return { markdownPaths: uniqueMarkdownPaths, blobPaths };
+	}
+
 	getPathBindingCollisionCount(): number {
 		this.ensurePathIndexes();
 		return this._activePathCollisions.size;

@@ -154,6 +154,10 @@ interface ReconciliationControllerDeps {
 	recordBaselineText?(contentHash: string, text: string): void;
 	recordConflictMergeBase?(artifactPath: string, baseHash: string): void;
 	isMarkdownPathSyncable(path: string): boolean;
+	/** True only for built-in system/generated paths, never a user preference. */
+	shouldTombstoneIntrinsicMarkdownPath?(path: string): boolean;
+	/** True only for built-in system/generated paths, never a user preference. */
+	shouldTombstoneIntrinsicBlobPath?(path: string): boolean;
 	shouldBlockFrontmatterIngest(
 		path: string,
 		previousContent: string | null,
@@ -727,6 +731,28 @@ export class ReconciliationController {
 				},
 			});
 			const runtimeConfig = this.deps.getRuntimeConfig();
+			// Only clean remote references after full provider sync. A stale local
+			// cache must never make a deletion decision. This is intentionally
+			// limited to intrinsic system/generated paths; user exclude patterns
+			// continue to mean "do not sync", not "delete remotely".
+			if (
+				mode === "authoritative" &&
+				vaultSync.providerSynced &&
+				this.deps.shouldTombstoneIntrinsicMarkdownPath &&
+				this.deps.shouldTombstoneIntrinsicBlobPath
+			) {
+				const cleanup = vaultSync.tombstoneIntrinsicExcludedEntries(
+					this.deps.shouldTombstoneIntrinsicMarkdownPath,
+					this.deps.shouldTombstoneIntrinsicBlobPath,
+					this.deps.getSettings().deviceName,
+				);
+				if (cleanup.markdownPaths.length > 0 || cleanup.blobPaths.length > 0) {
+					this.deps.log(
+						`reconcile: tombstoned ${cleanup.markdownPaths.length} intrinsic markdown and ` +
+						`${cleanup.blobPaths.length} intrinsic blob paths from remote sync`,
+					);
+				}
+			}
 			const diskFiles = new Map<string, string>();
 			const diskPresentPaths = new Set<string>();
 			const allMdFiles = this.deps.app.vault.getMarkdownFiles();

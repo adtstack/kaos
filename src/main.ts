@@ -261,6 +261,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.conflictMergeBases[artifactPath] = baseHash;
 			},
 			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
+			shouldTombstoneIntrinsicMarkdownPath: (path) => this.isIntrinsicMarkdownPathExcluded(path),
+			shouldTombstoneIntrinsicBlobPath: (path) => this.isIntrinsicBlobPathExcluded(path),
 			shouldBlockFrontmatterIngest: (path, previousContent, nextContent, reason) =>
 				this.shouldBlockFrontmatterIngest(path, previousContent, nextContent, reason),
 			refreshServerCapabilities: (reason) => this.refreshServerCapabilities(reason),
@@ -304,6 +306,19 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private isBlobPathSyncable(path: string): boolean {
 		return isBlobSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
+	}
+
+	/**
+	 * Remote cleanup deliberately ignores user-configured exclusions. These are
+	 * the hard system/temp/generated-path rules that KAOS can safely tombstone
+	 * after a complete provider sync.
+	 */
+	private isIntrinsicMarkdownPathExcluded(path: string): boolean {
+		return !isMarkdownSyncable(path, [], this.getRuntimeConfig().vaultConfigDir);
+	}
+
+	private isIntrinsicBlobPathExcluded(path: string): boolean {
+		return !isBlobSyncable(path, [], this.getRuntimeConfig().vaultConfigDir);
 	}
 
 	private getRuntimeConfig(): RuntimeConfig {
