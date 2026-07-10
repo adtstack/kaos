@@ -1,6 +1,7 @@
 import { App, Modal, Notice } from "obsidian";
 import type {
 	FileHistoryEntry,
+	FileHistoryManifestList,
 	FileHistoryManifestIndex,
 } from "../sync/recoverySnapshotClient";
 import {
@@ -24,6 +25,7 @@ import {
 interface RecoveryHistoryModalDeps {
 	downloadContent(hash: string): Promise<string>;
 	restoreVersion(item: FileHistoryItem): Promise<void>;
+	loadMoreHistory(cursor: string): Promise<FileHistoryManifestList>;
 }
 
 const KIND_FILTERS: Array<RecoveryHistoryKindFilter> = [
@@ -65,15 +67,17 @@ function formatBytes(bytes: number): string {
 }
 
 function sameScope(left: RecoveryHistoryScope, right: RecoveryHistoryScope): boolean {
-	if (left.kind !== right.kind) return false;
-	if (left.kind === "all") return true;
-	return right.kind === "manifest" && left.manifestId === right.manifestId;
+	if (left.kind === "none" || right.kind === "none") {
+		return left.kind === right.kind;
+	}
+	return left.manifestId === right.manifestId;
 }
 
 export class RecoveryHistoryModal extends Modal {
-	private readonly snapshots: SnapshotHistory[];
-	private readonly changes: RecoveryHistoryChangeItem[];
-	private readonly changeByKey: Map<string, RecoveryHistoryChangeItem>;
+	private manifests: FileHistoryManifestIndex[];
+	private snapshots: SnapshotHistory[] = [];
+	private changes: RecoveryHistoryChangeItem[] = [];
+	private changeByKey = new Map<string, RecoveryHistoryChangeItem>();
 	private historyScope: RecoveryHistoryScope;
 	private query = "";
 	private kindFilter: RecoveryHistoryKindFilter = "all";
@@ -86,23 +90,29 @@ export class RecoveryHistoryModal extends Modal {
 	private railEl: HTMLElement | null = null;
 	private feedEl: HTMLElement | null = null;
 	private previewEl: HTMLElement | null = null;
+	private nextCursor: string | null;
+	private loadingMoreHistory = false;
+	private loadMoreHistoryError: string | null = null;
+	private closed = false;
 
 	constructor(
 		app: App,
-		private readonly manifests: FileHistoryManifestIndex[],
+		manifests: FileHistoryManifestIndex[],
 		private readonly deps: RecoveryHistoryModalDeps,
 		options: RecoveryHistoryInitialSelection = {},
+		nextCursor: string | null = null,
 	) {
 		super(app);
-		this.snapshots = buildRecoverySnapshotHistories(manifests);
-		this.changes = buildRecoveryHistoryChanges(manifests);
-		this.changeByKey = new Map(this.changes.map((item) => [item.key, item]));
-		const initial = resolveRecoveryHistoryFeedState(manifests, options);
+		this.manifests = manifests.slice();
+		this.nextCursor = nextCursor;
+		this.rebuildHistory();
+		const initial = resolveRecoveryHistoryFeedState(this.manifests, options);
 		this.historyScope = initial.scope;
 		this.selectedChangeKey = initial.selectedChangeKey;
 	}
 
 	onOpen(): void {
+		this.closed = false;
 		this.modalEl.addClass("recovery-history-modal-frame");
 		this.normalizeSelectedChange();
 		this.render();
@@ -110,6 +120,7 @@ export class RecoveryHistoryModal extends Modal {
 	}
 
 	onClose(): void {
+		this.closed = true;
 		this.modalEl.removeClass("recovery-history-modal-frame");
 		this.contentEl.empty();
 	}
@@ -127,6 +138,10 @@ export class RecoveryHistoryModal extends Modal {
 
 		const shell = contentEl.createDiv({ cls: "recovery-history-shell" });
 		this.railEl = shell.createDiv({ cls: "recovery-history-sidebar" });
+		this.railEl.addEventListener("scroll", () => this.loadMoreHistoryIfNeeded());
+		this.railEl.addEventListener("wheel", (event) => {
+			if (event.deltaY > 0) this.loadMoreHistoryIfNeeded();
+		});
 		this.feedEl = shell.createDiv({ cls: "recovery-history-feed" });
 		this.previewEl = shell.createDiv({ cls: "recovery-history-preview" });
 		this.renderResults();
@@ -137,7 +152,7 @@ export class RecoveryHistoryModal extends Modal {
 		const title = header.createDiv({ cls: "recovery-history-heading" });
 		title.createEl("h3", { text: "File history" });
 		title.createDiv({
-			text: `${this.snapshots.length} point(s), ${this.changes.length} changed file event(s).`,
+			text: "Older history points load as you scroll.",
 			cls: "setting-item-description",
 		});
 
@@ -179,6 +194,7 @@ export class RecoveryHistoryModal extends Modal {
 
 	private renderResults(): void {
 		if (!this.railEl || !this.feedEl || !this.previewEl) return;
+		const railScrollTop = this.railEl.scrollTop;
 		this.railEl.empty();
 		this.feedEl.empty();
 		this.previewEl.empty();
@@ -186,6 +202,7 @@ export class RecoveryHistoryModal extends Modal {
 		const visible = this.visibleChanges();
 		this.renderFeed(this.feedEl, visible);
 		this.renderPreview(this.previewEl, this.selectedChange());
+		this.railEl.scrollTop = railScrollTop;
 	}
 
 	private renderPreviewOnly(): void {
@@ -195,12 +212,6 @@ export class RecoveryHistoryModal extends Modal {
 	}
 
 	private renderScopeRail(parent: HTMLElement): void {
-		this.renderScopeRow(parent, {
-			label: "All changes",
-			detail: `${this.changes.length} changed`,
-			scope: { kind: "all" },
-		});
-
 		for (const snapshot of this.snapshots) {
 			this.renderScopeRow(parent, {
 				label: formatDate(snapshot.manifest.createdAt),
@@ -208,6 +219,39 @@ export class RecoveryHistoryModal extends Modal {
 				scope: { kind: "manifest", manifestId: snapshot.manifest.manifestId },
 			});
 		}
+		this.renderLoadMoreHistoryControl(parent);
+	}
+
+	private renderLoadMoreHistoryControl(parent: HTMLElement): void {
+		if (this.loadingMoreHistory) {
+			parent.createDiv({
+				text: "Loading older history...",
+				cls: "setting-item-description recovery-history-load-more",
+			});
+			return;
+		}
+
+		if (this.loadMoreHistoryError) {
+			const control = parent.createDiv({ cls: "recovery-history-load-more" });
+			control.createDiv({
+				text: this.loadMoreHistoryError,
+				cls: "setting-item-description is-error",
+			});
+			control.createEl("button", { text: "Retry loading older history" }).addEventListener("click", () => {
+				void this.loadMoreHistory();
+			});
+			return;
+		}
+
+		if (!this.nextCursor) return;
+		const control = parent.createDiv({ cls: "recovery-history-load-more" });
+		control.createDiv({
+			text: "Scroll down to load older history.",
+			cls: "setting-item-description",
+		});
+		control.createEl("button", { text: "Load older history" }).addEventListener("click", () => {
+			void this.loadMoreHistory();
+		});
 	}
 
 	private renderScopeRow(
@@ -483,6 +527,40 @@ export class RecoveryHistoryModal extends Modal {
 		this.diffLines = null;
 		this.diffError = null;
 		this.diffLoadSeq++;
+	}
+
+	private loadMoreHistoryIfNeeded(): void {
+		const rail = this.railEl;
+		if (!rail || !this.nextCursor || this.loadingMoreHistory) return;
+		if (rail.scrollTop + rail.clientHeight < rail.scrollHeight - 64) return;
+		void this.loadMoreHistory();
+	}
+
+	private async loadMoreHistory(): Promise<void> {
+		const cursor = this.nextCursor;
+		if (!cursor || this.loadingMoreHistory) return;
+
+		this.loadingMoreHistory = true;
+		this.loadMoreHistoryError = null;
+		this.renderResults();
+		try {
+			const page = await this.deps.loadMoreHistory(cursor);
+			const knownManifestIds = new Set(this.manifests.map((manifest) => manifest.manifestId));
+			this.manifests.push(...page.manifests.filter((manifest) => !knownManifestIds.has(manifest.manifestId)));
+			this.nextCursor = page.nextCursor;
+			this.rebuildHistory();
+		} catch (err) {
+			this.loadMoreHistoryError = `Could not load older history: ${err instanceof Error ? err.message : String(err)}`;
+		} finally {
+			this.loadingMoreHistory = false;
+			if (!this.closed) this.renderResults();
+		}
+	}
+
+	private rebuildHistory(): void {
+		this.snapshots = buildRecoverySnapshotHistories(this.manifests);
+		this.changes = buildRecoveryHistoryChanges(this.manifests);
+		this.changeByKey = new Map(this.changes.map((item) => [item.key, item]));
 	}
 
 	private changeDetailParts(item: RecoveryHistoryChangeItem): string[] {

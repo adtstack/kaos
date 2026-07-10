@@ -20,6 +20,7 @@ const workspaceTempDirs = [];
 const helperNames = [
 	"install-headless-host.mjs",
 	"bootstrap-headless-host-oracle.mjs",
+	"uninstall-headless-host.mjs",
 	"update-headless-host-from-release.mjs",
 	"verify-headless-host-bundle.mjs",
 	"validate-headless-host-release-assets.mjs",
@@ -56,6 +57,7 @@ try {
 		"oracle-acceptance-config.example.json",
 		"bootstrap-headless-host-oracle.mjs",
 		"install-headless-host.mjs",
+		"uninstall-headless-host.mjs",
 		"update-headless-host-from-release.mjs",
 		"verify-headless-host-bundle.mjs",
 		"validate-headless-host-release-assets.mjs",
@@ -76,6 +78,7 @@ try {
 	assert.equal(oracleBundleManifest.kind, "kaos-headless-host-oracle-bundle");
 	assert.equal(oracleBundleManifest.assets["kaos-headless-host.mjs"].sha256, builtManifest.assets["kaos-headless-host.mjs"].sha256);
 	assert.ok(builtManifest.assets["bootstrap-headless-host-oracle.mjs"].sha256);
+	assert.ok(builtManifest.assets["uninstall-headless-host.mjs"].sha256);
 	assert.ok(builtManifest.assets["oracle-acceptance-config.example.json"].sha256);
 	assert.ok(builtManifest.assets["verify-headless-host-bundle.mjs"].sha256);
 	assert.ok(builtManifest.assets["run-headless-host-oracle-rehearsal.mjs"].sha256);
@@ -84,6 +87,7 @@ try {
 	assert.ok(builtManifest.assets["verify-headless-host-oracle-acceptance.mjs"].sha256);
 	assert.ok(builtManifest.assets["verify-headless-host-oracle-rehearsal.mjs"].sha256);
 	assert.equal(sha256Bytes(oracleBundle["bootstrap-headless-host-oracle.mjs"]), oracleBundleManifest.assets["bootstrap-headless-host-oracle.mjs"].sha256);
+	assert.equal(sha256Bytes(oracleBundle["uninstall-headless-host.mjs"]), oracleBundleManifest.assets["uninstall-headless-host.mjs"].sha256);
 	assert.equal(sha256Bytes(oracleBundle["oracle-acceptance-config.example.json"]), oracleBundleManifest.assets["oracle-acceptance-config.example.json"].sha256);
 	assert.equal(sha256Bytes(oracleBundle["verify-headless-host-bundle.mjs"]), oracleBundleManifest.assets["verify-headless-host-bundle.mjs"].sha256);
 	assert.equal(sha256Bytes(oracleBundle["validate-headless-host-release-assets.mjs"]), oracleBundleManifest.assets["validate-headless-host-release-assets.mjs"].sha256);
@@ -573,6 +577,7 @@ ExecStart=/usr/bin/node /opt/kaos/kaos-headless-host.mjs --vault /srv/kaos/vault
 	await copyFile("dist/kaos-headless-host.mjs.sha256", join(releaseDir, "kaos-headless-host.mjs.sha256"));
 	await copyFile("deploy/kaos-headless-host.service", join(releaseDir, "kaos-headless-host.service"));
 	await copyFile("scripts/bootstrap-headless-host-oracle.mjs", join(releaseDir, "bootstrap-headless-host-oracle.mjs"));
+	await copyFile("scripts/uninstall-headless-host.mjs", join(releaseDir, "uninstall-headless-host.mjs"));
 	await writeFile(join(releaseDir, "install-headless-host.mjs"), `#!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";

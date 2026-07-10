@@ -67,6 +67,7 @@ jobs:
               scripts/install.sh \
               scripts/bootstrap-headless-host-oracle.mjs \
               scripts/install-headless-host.mjs \
+              scripts/uninstall-headless-host.mjs \
               scripts/update-headless-host-from-release.mjs \
               scripts/verify-headless-host-bundle.mjs \
               scripts/validate-headless-host-release-assets.mjs \
@@ -108,6 +109,7 @@ jobs:
               scripts/install.sh \
               scripts/bootstrap-headless-host-oracle.mjs \
               scripts/install-headless-host.mjs \
+              scripts/uninstall-headless-host.mjs \
               scripts/update-headless-host-from-release.mjs \
               scripts/verify-headless-host-bundle.mjs \
               scripts/validate-headless-host-release-assets.mjs \

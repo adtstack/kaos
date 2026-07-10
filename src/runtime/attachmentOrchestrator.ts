@@ -2,6 +2,7 @@ import { type App, Notice } from "obsidian";
 import { BlobSyncManager, type BlobQueueSnapshot } from "../sync/blobSync";
 import type { BlobHashCache } from "../sync/blobHashCache";
 import type { VaultSync } from "../sync/vaultSync";
+import { isBlobSyncable } from "../types";
 import type { RuntimeConfig } from "./runtimeConfig";
 import { formatUnknown } from "../utils/format";
 import type { TraceHttpContext, TraceRecord } from "../observability/traceContext";
@@ -77,7 +78,12 @@ export class AttachmentOrchestrator {
 			this.deps.getBlobHashCache(),
 			this.deps.trace,
 			this.deps.getPreservedUnresolvedEntries(),
-			this.deps.onPreservedUnresolvedChanged,
+			() => this.deps.onPreservedUnresolvedChanged(),
+			(path) => isBlobSyncable(
+				path,
+				this.deps.getExcludePatterns(),
+				this.deps.app.vault.configDir,
+			),
 		);
 
 		this.blobSync = blobSync;

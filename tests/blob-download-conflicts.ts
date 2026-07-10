@@ -35,7 +35,7 @@ interface StoredFile {
 	data: ArrayBuffer;
 }
 
-function makeHarness() {
+function makeHarness(isBlobPathSyncable: (path: string) => boolean = () => true) {
 	let clock = 1;
 	const files = new Map<string, StoredFile>();
 	const traces: Array<{ source: string; msg: string; details?: Record<string, unknown> }> = [];
@@ -93,6 +93,9 @@ function makeHarness() {
 		},
 		{},
 		(source, msg, details) => traces.push({ source, msg, details }),
+		[],
+		undefined,
+		isBlobPathSyncable,
 	);
 
 	return { app, manager, files, put, traces };
@@ -575,6 +578,23 @@ console.log("\n--- Test 14: debug snapshot includes permanent failure counters -
 		snapshot.permanentDownloadFailures === 0,
 		"initial permanent download failures is 0",
 	);
+}
+
+// ── Test 14b: excluded persisted blob transfers are never restored ─────────
+
+console.log("\n--- Test 14b: excluded persisted blob transfers are skipped ---");
+{
+	const { manager } = makeHarness((path) => !path.includes("/.obsidian/"));
+	(manager as any).importQueue({
+		uploads: [{ path: "docs/sample-vault/.obsidian/workspace.json" }],
+		downloads: [{
+			path: "docs/sample-vault/.obsidian/workspace.json",
+			hash: "a".repeat(64),
+		}],
+	});
+	const snapshot = (manager as any).getDebugSnapshot();
+	assert(snapshot.pendingUploads === 0, "excluded upload is not restored");
+	assert(snapshot.pendingDownloads === 0, "excluded download is not restored");
 }
 
 // ── Test 15: destroy() during in-flight transfer does not resurrect queue state ──

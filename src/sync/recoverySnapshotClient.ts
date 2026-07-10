@@ -69,6 +69,7 @@ export interface FileHistoryManifestList {
 	manifests: FileHistoryManifestIndex[];
 	totalManifestKeys: number;
 	limited: boolean;
+	nextCursor: string | null;
 }
 
 export interface FileHistoryRetentionResult {
@@ -201,8 +202,11 @@ export async function listFileHistoryManifests(
 	settings: VaultSyncSettings,
 	trace?: TraceHttpContext,
 	limit = 50,
+	cursor?: string,
 ): Promise<FileHistoryManifestList> {
-	return await serverGet(settings, `recovery-snapshots?limit=${encodeURIComponent(String(limit))}`, trace) as FileHistoryManifestList;
+	const params = new URLSearchParams({ limit: String(limit) });
+	if (cursor) params.set("cursor", cursor);
+	return await serverGet(settings, `recovery-snapshots?${params.toString()}`, trace) as FileHistoryManifestList;
 }
 
 export const listRecoverySnapshots = listFileHistoryManifests;

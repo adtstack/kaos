@@ -18,6 +18,7 @@ const REQUIRED_ENTRIES = [
 	"README-headless-host.txt",
 	"bootstrap-headless-host-oracle.mjs",
 	"install-headless-host.mjs",
+	"uninstall-headless-host.mjs",
 	"update-headless-host-from-release.mjs",
 	"verify-headless-host-bundle.mjs",
 	"validate-headless-host-release-assets.mjs",
@@ -32,6 +33,7 @@ const REQUIRED_ENTRIES = [
 ];
 
 const README_SNIPPETS = [
+	"uninstall-headless-host.mjs",
 	"verify-headless-host-bundle.mjs",
 	"validate-headless-host-release-assets.mjs",
 	"run-headless-host-oracle-rehearsal.mjs",
@@ -51,6 +53,7 @@ const README_SNIPPETS = [
 	"--postflight-verify-running",
 	"--rollback-on-postflight-failure",
 	"--enable-service",
+	"--purge-vault",
 ];
 
 async function main() {

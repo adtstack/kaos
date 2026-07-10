@@ -15,6 +15,7 @@ const ASSETS = {
 	helpers: [
 		"install-headless-host.mjs",
 		"bootstrap-headless-host-oracle.mjs",
+		"uninstall-headless-host.mjs",
 		"update-headless-host-from-release.mjs",
 		"verify-headless-host-bundle.mjs",
 		"validate-headless-host-release-assets.mjs",
@@ -1048,7 +1049,7 @@ Options:
                             Service commands must use "<node> -- <script>" form.
   --no-manifest             Do not download or verify kaos-headless-host-manifest.json.
   --no-service              Do not download or install the systemd service file.
-  --no-helper-scripts       Do not download or install install/update/verify/rehearsal/smoke/postflight/rollback helper scripts.
+  --no-helper-scripts       Do not download or install install/uninstall/update/verify/rehearsal/smoke/postflight/rollback helper scripts.
                             Helper defaults then resolve next to this update wrapper.
   --metadata-path <path>    Install metadata JSON path.
   --installer <path>        Local install-headless-host.mjs path.

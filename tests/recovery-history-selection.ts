@@ -82,12 +82,16 @@ console.log("\n--- Test 1: recovery history changes flatten newest-first ---");
 
 console.log("\n--- Test 2: recovery history feed target selects dashboard change ---");
 {
+	const initial = resolveRecoveryHistoryFeedState(manifests);
+	assert.deepEqual(initial.scope, { kind: "manifest", manifestId: "m2" });
+	assert.equal(initial.selectedChangeKey, "m2:f3:0");
+
 	const resolved = resolveRecoveryHistoryFeedState(manifests, {
 		initialManifestId: "m2",
 		initialFileId: "f1",
 		autoExpandDiff: true,
 	});
-	assert.deepEqual(resolved.scope, { kind: "all" });
+	assert.deepEqual(resolved.scope, { kind: "manifest", manifestId: "m2" });
 	assert.equal(resolved.selectedChangeKey, "m2:f1:1");
 
 	const fallback = resolveRecoveryHistoryFeedState(manifests, {
@@ -119,7 +123,7 @@ console.log("\n--- Test 4: recovery history selection falls back to first visibl
 	const selected = resolveVisibleRecoveryHistorySelection(
 		changes,
 		{
-			scope: { kind: "all" },
+			scope: { kind: "manifest", manifestId: "m1" },
 			query: "",
 			kindFilter: "deleted",
 		},

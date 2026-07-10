@@ -107,6 +107,7 @@ const suites = [
 	[NODE, "tests/headless-host-oracle-rehearsal-verifier.mjs"],
 	[NODE, "tests/headless-host-release-workflow.mjs"],
 	[NODE, "tests/headless-host-user-install.mjs"],
+	[NODE, "tests/headless-host-uninstall.mjs"],
 	[JITI, "tests/v2-offline-rename-regressions.mjs"],
 	[JITI, "tests/sync-facts.ts"],
 	[JITI, "tests/offline-handoff.ts"],

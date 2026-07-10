@@ -45,6 +45,7 @@ assert.ok(preparedPayload.entries.some((entry) => entry.entry === "run-headless-
 assert.ok(preparedPayload.entries.some((entry) => entry.entry === "run-headless-host-oracle-acceptance.mjs"));
 assert.ok(preparedPayload.entries.some((entry) => entry.entry === "verify-headless-host-oracle-acceptance.mjs"));
 assert.ok(preparedPayload.entries.some((entry) => entry.entry === "verify-headless-host-oracle-rehearsal.mjs"));
+assert.ok(preparedPayload.entries.some((entry) => entry.entry === "uninstall-headless-host.mjs"));
 assert.ok(preparedPayload.entries.some((entry) => entry.entry === "oracle-acceptance-config.example.json"));
 assert.match(preparedPayload.uploadCommand, /scp .*kaos-headless-host-oracle\.zip .*kaos-headless-host-oracle\.zip\.sha256 opc@example\.invalid:\/home\/opc\/kaos/);
 assert.equal((await stat(join(extractDir, "verify-headless-host-bundle.mjs"))).isFile(), true);

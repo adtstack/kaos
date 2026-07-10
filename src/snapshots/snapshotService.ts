@@ -42,6 +42,7 @@ import type {
 import { DashboardSnapshotCache } from "./dashboardSnapshotCache";
 
 const RECOVERY_SNAPSHOT_PENDING_RETRY_MS = 5 * 60 * 1000;
+const RECOVERY_HISTORY_RECENT_POINT_LIMIT = 10;
 
 interface SnapshotServiceDeps {
 	app: App;
@@ -469,7 +470,11 @@ export class SnapshotService {
 
 		try {
 			const settings = this.deps.getSettings();
-			const listed = await listFileHistoryManifests(settings, this.deps.getTraceHttpContext(), 50);
+			const listed = await listFileHistoryManifests(
+				settings,
+				this.deps.getTraceHttpContext(),
+				RECOVERY_HISTORY_RECENT_POINT_LIMIT,
+			);
 			if (listed.manifests.length === 0) {
 				new Notice("No file history found yet. Create a file history point after the next file change.");
 				return;
@@ -489,6 +494,12 @@ export class SnapshotService {
 					restoreVersion: async (item) => {
 						await this.restoreRecoveryHistoryItem(item);
 					},
+					loadMoreHistory: async (cursor) => await listFileHistoryManifests(
+						settings,
+						this.deps.getTraceHttpContext(),
+						RECOVERY_HISTORY_RECENT_POINT_LIMIT,
+						cursor,
+					),
 				},
 				target
 					? {
@@ -497,6 +508,7 @@ export class SnapshotService {
 						autoExpandDiff: target.autoExpandDiff,
 					}
 					: undefined,
+				listed.nextCursor,
 			).open();
 			void this.triggerRecoverySnapshot();
 		} catch (err) {

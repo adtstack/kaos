@@ -1776,10 +1776,25 @@ export async function listRecoveryManifestIndexes(
 	vaultId: string,
 	bucket: R2Bucket,
 	limit = 50,
-): Promise<{ manifests: RecoveryManifestIndex[]; totalManifestKeys: number; limited: boolean }> {
+cursor?: string,
+): Promise<{
+	manifests: RecoveryManifestIndex[];
+	totalManifestKeys: number;
+	limited: boolean;
+	nextCursor: string | null;
+}> {
 	const boundedManifestIds = await listRecoveryManifestIds(vaultId, bucket);
 	const totalManifestKeys = boundedManifestIds.length;
-	const fetchManifestIds = boundedManifestIds.slice(0, Math.max(1, Math.min(limit, 200)));
+	const pageSize = Math.max(1, Math.min(limit, 200));
+	const cursorStartIndex = cursor
+		? boundedManifestIds.findIndex((manifestId) => manifestId < cursor)
+		: 0;
+	const startIndex = cursorStartIndex >= 0 ? cursorStartIndex : totalManifestKeys;
+	const fetchManifestIds = boundedManifestIds.slice(startIndex, startIndex + pageSize);
+	const finalManifestId = fetchManifestIds[fetchManifestIds.length - 1];
+	const hasMore = Boolean(
+		finalManifestId && boundedManifestIds.some((manifestId) => manifestId < finalManifestId),
+	);
 	const manifests = await mapWithConcurrency(fetchManifestIds, RECOVERY_FETCH_CONCURRENCY, async (manifestId): Promise<RecoveryManifestIndex | null> => {
 		return await readRecoveryManifestIndex(vaultId, manifestId, bucket)
 			?? synthesizeRecoveryManifestIndex(vaultId, manifestId);
@@ -1788,7 +1803,8 @@ export async function listRecoveryManifestIndexes(
 		manifests: manifests.filter((index): index is RecoveryManifestIndex => index !== null)
 			.sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
 		totalManifestKeys,
-		limited: totalManifestKeys > fetchManifestIds.length,
+		limited: hasMore,
+		nextCursor: hasMore ? finalManifestId ?? null : null,
 	};
 }
 

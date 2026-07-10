@@ -41,6 +41,10 @@ async function main() {
 		await updateNonInteractive(parseArgs(args));
 		return;
 	}
+	if (command === "uninstall") {
+		await uninstallUserHeadless(args);
+		return;
+	}
 	if (command === "status") {
 		await printStatus(parseArgs(args));
 		return;
@@ -89,6 +93,25 @@ function parseArgs(argv) {
 		i++;
 	}
 	return out;
+}
+
+async function uninstallUserHeadless(args) {
+	if (args.includes("--help") || args.includes("-h")) {
+		printUsage();
+		return;
+	}
+	if (args.some((arg) => ["--scope", "--remove-user", "--remove-group"].includes(arg.split("=", 1)[0]))) {
+		throw new Error("kaos uninstall only supports the user installation; run uninstall-headless-host.mjs directly for a system installation");
+	}
+	const helper = fileURLToPath(new URL("./uninstall-headless-host.mjs", import.meta.url));
+	const result = spawnSync(process.execPath, ["--", helper, "--scope", "user", ...args], {
+		encoding: "utf8",
+	});
+	if (result.stdout) process.stdout.write(result.stdout);
+	if (result.stderr) process.stderr.write(result.stderr);
+	if (result.status !== 0) {
+		process.exitCode = result.status ?? 1;
+	}
 }
 
 async function installInteractive(raw) {
@@ -1633,6 +1656,7 @@ function printUsage() {
 	console.log(`Usage:
   kaos install
   kaos update [--startup]
+  kaos uninstall [--dry-run] [--yes] [--purge-vault --vault <path>]
   kaos status
   kaos doctor
   kaos ui [--vault <path>]

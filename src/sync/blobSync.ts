@@ -391,6 +391,7 @@ export class BlobSyncManager {
 		private trace?: TraceRecord,
 		initialPreservedUnresolved: PreservedUnresolvedEntry[] = [],
 		private onPreservedUnresolvedChanged?: () => void,
+		private readonly isBlobPathSyncable: (path: string) => boolean = () => true,
 	) {
 		this.blobClient = new BlobHttpClient(
 			settings.host,
@@ -423,6 +424,10 @@ export class BlobSyncManager {
 			event.changes.keys.forEach((change, path) => {
 				if (change.action === "add" || change.action === "update") {
 					if (event.transaction.origin === ORIGIN_SEED) return;
+					if (!this.isBlobPathSyncable(path)) {
+						this.dropExcludedQueuedDownload(path, "observer");
+						return;
+					}
 					const ref = this.vaultSync.pathToBlob.get(path);
 					if (!ref) return;
 					this.log(
@@ -479,6 +484,7 @@ export class BlobSyncManager {
 	}
 
 	private enqueueUpload(path: string, retries = 0, sizeBytes?: number): void {
+		if (!this.isBlobPathSyncable(path)) return;
 		const existing = this.uploadQueue.get(path);
 		if (existing) {
 			if (sizeBytes && sizeBytes > 0) existing.sizeBytes = sizeBytes;
@@ -508,6 +514,7 @@ export class BlobSyncManager {
 		sizeBytes?: number,
 		retries = 0,
 	): void {
+		if (!this.isBlobPathSyncable(path)) return;
 		const existing = this.downloadQueue.get(path);
 		if (existing) {
 			existing.hash = hash;
@@ -542,6 +549,7 @@ export class BlobSyncManager {
 	 * Debounces and queues upload.
 	 */
 	handleFileChange(file: TFile): void {
+		if (!this.isBlobPathSyncable(file.path)) return;
 		if (
 			this.localOnlyBlobConflictPaths.has(file.path) ||
 			isBaseBlobConflictArtifactPath(normalizePath(file.path))
@@ -676,8 +684,10 @@ export class BlobSyncManager {
 		// Collect CRDT blob paths (non-tombstoned)
 		const crdtBlobPaths = new Set<string>();
 		this.vaultSync.pathToBlob.forEach((_ref, path) => {
-			if (!this.vaultSync.isBlobTombstoned(path)) {
+			if (!this.vaultSync.isBlobTombstoned(path) && this.isBlobPathSyncable(path)) {
 				crdtBlobPaths.add(path);
+			} else if (!this.vaultSync.isBlobTombstoned(path)) {
+				skipped++;
 			}
 		});
 
@@ -686,8 +696,11 @@ export class BlobSyncManager {
 			if (!diskBlobs.has(path)) {
 				const ref = this.vaultSync.pathToBlob.get(path);
 				if (ref) {
-					this.scheduleDownload(path, ref.hash, ref.size);
-					downloadQueued++;
+					if (this.scheduleDownload(path, ref.hash, ref.size)) {
+						downloadQueued++;
+					} else {
+						skipped++;
+					}
 				}
 			}
 		}
@@ -826,6 +839,11 @@ export class BlobSyncManager {
 		);
 		try {
 			const normalized = normalizePath(item.path);
+			if (!this.isBlobPathSyncable(normalized)) {
+				this.uploadQueue.delete(item.path);
+				this.log(`upload: skipped excluded path "${item.path}"`);
+				return;
+			}
 
 			// Guard: do not upload preserved-unresolved paths or local-only
 			// blob conflict artifacts. This can happen
@@ -1020,9 +1038,14 @@ export class BlobSyncManager {
 		path: string,
 		hash: string,
 		sizeBytes?: number,
-	): void {
+	): boolean {
+		if (!this.isBlobPathSyncable(path)) {
+			this.dropExcludedQueuedDownload(path, "schedule");
+			return false;
+		}
 		this.enqueueDownload(path, hash, sizeBytes);
 		this.kickDownloadDrain();
+		return true;
 	}
 
 	/**
@@ -1033,6 +1056,7 @@ export class BlobSyncManager {
 	prioritizeDownloads(paths: string[]): number {
 		let queued = 0;
 		for (const path of paths) {
+			if (!this.isBlobPathSyncable(path)) continue;
 			// Already queued
 			if (this.downloadQueue.has(path)) continue;
 
@@ -1047,8 +1071,7 @@ export class BlobSyncManager {
 			if (!ref) continue;
 			if (this.vaultSync.isBlobTombstoned(path)) continue;
 
-			this.enqueueDownload(path, ref.hash, ref.size);
-			queued++;
+			if (this.scheduleDownload(path, ref.hash, ref.size)) queued++;
 		}
 
 		if (queued > 0) {
@@ -1113,6 +1136,11 @@ export class BlobSyncManager {
 		);
 		try {
 			const normalized = normalizePath(item.path);
+			if (!this.isBlobPathSyncable(normalized)) {
+				this.downloadQueue.delete(item.path);
+				this.log(`download: skipped excluded path "${item.path}"`);
+				return;
+			}
 
 			// Check if file already exists with matching hash
 			const existing = this.app.vault.getAbstractFileByPath(normalized);
@@ -1832,9 +1860,14 @@ export class BlobSyncManager {
 	 */
 	importQueue(snapshot: BlobQueueSnapshot): void {
 		let restored = 0;
+		let skipped = 0;
 
 		if (snapshot.uploads) {
 			for (const item of snapshot.uploads) {
+				if (!this.isBlobPathSyncable(item.path)) {
+					skipped++;
+					continue;
+				}
 				if (
 					!this.uploadQueue.has(item.path) &&
 					!this.uploadDebounce.has(item.path)
@@ -1855,6 +1888,10 @@ export class BlobSyncManager {
 
 		if (snapshot.downloads) {
 			for (const item of snapshot.downloads) {
+				if (!this.isBlobPathSyncable(item.path)) {
+					skipped++;
+					continue;
+				}
 				if (!this.downloadQueue.has(item.path)) {
 					this.downloadQueue.set(item.path, {
 						path: item.path,
@@ -1875,6 +1912,9 @@ export class BlobSyncManager {
 			this.log(`importQueue: restored ${restored} pending transfers`);
 			if (this.uploadQueue.size > 0) this.kickUploadDrain();
 			if (this.downloadQueue.size > 0) this.kickDownloadDrain();
+		}
+		if (skipped > 0) {
+			this.log(`importQueue: skipped ${skipped} excluded transfers`);
 		}
 	}
 
@@ -1899,6 +1939,11 @@ export class BlobSyncManager {
 	private pruneSatisfiedQueuedDownloads(): number {
 		let dropped = 0;
 		for (const [path, item] of this.downloadQueue) {
+			if (!this.isBlobPathSyncable(path)) {
+				this.downloadQueue.delete(path);
+				dropped++;
+				continue;
+			}
 			if (item.status !== "pending") continue;
 			const existing = this.app.vault.getAbstractFileByPath(
 				normalizePath(path),
@@ -1916,6 +1961,11 @@ export class BlobSyncManager {
 			dropped++;
 		}
 		return dropped;
+	}
+
+	private dropExcludedQueuedDownload(path: string, source: string): void {
+		if (!this.downloadQueue.delete(path)) return;
+		this.log(`download: dropped excluded path "${path}" (${source})`);
 	}
 
 	// -------------------------------------------------------------------

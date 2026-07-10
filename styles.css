@@ -822,6 +822,13 @@
 	font-weight: 650;
 }
 
+.recovery-history-load-more {
+	display: grid;
+	gap: 6px;
+	padding: 12px 8px 4px;
+	text-align: center;
+}
+
 .recovery-history-feed-header {
 	display: flex;
 	align-items: center;

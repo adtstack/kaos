@@ -22,6 +22,7 @@ const HEADLESS_RELEASE_ASSETS = [
 	"scripts/install.sh",
 	"scripts/bootstrap-headless-host-oracle.mjs",
 	"scripts/install-headless-host.mjs",
+	"scripts/uninstall-headless-host.mjs",
 	"scripts/update-headless-host-from-release.mjs",
 	"scripts/verify-headless-host-bundle.mjs",
 	"scripts/validate-headless-host-release-assets.mjs",
@@ -76,6 +77,7 @@ console.log("\n--- headless host package scripts: release regression includes or
 const packageJson = JSON.parse(await readFile("package.json", "utf8"));
 assert.equal(packageJson.scripts["test:headless-host:oracle-deploy"], "node tests/headless-host-oracle-deploy.mjs");
 assert.equal(packageJson.scripts["prepare:headless-host-oracle-upload"], "node scripts/prepare-headless-host-oracle-upload.mjs");
+assert.equal(packageJson.scripts["uninstall:headless-host"], "node scripts/uninstall-headless-host.mjs");
 assert.equal(packageJson.scripts["verify:headless-host-bundle"], "node scripts/prepare-headless-host-oracle-upload.mjs");
 assert.equal(packageJson.scripts["run:headless-host-oracle-rehearsal"], "node scripts/run-headless-host-oracle-rehearsal.mjs");
 assert.equal(packageJson.scripts["run:headless-host-oracle-remote-rehearsal"], "node scripts/run-headless-host-oracle-remote-rehearsal.mjs");
@@ -91,6 +93,7 @@ assert(runner.includes("tests/headless-host-oracle-acceptance.mjs"), "release re
 assert(runner.includes("tests/headless-host-oracle-rehearsal-verifier.mjs"), "release regressions must include Oracle rehearsal verifier coverage");
 assert(runner.includes("tests/headless-host-release-workflow.mjs"), "release regressions must include workflow asset guard");
 assert(runner.includes("tests/headless-host-user-install.mjs"), "release regressions must include user install/update coverage");
+assert(runner.includes("tests/headless-host-uninstall.mjs"), "release regressions must include uninstall coverage");
 console.log("  PASS  package and regression runner keep Oracle deploy gates reachable");
 
 console.log("\n--- headless host Oracle rehearsal docs: real VM gate stays explicit ---");

@@ -1,6 +1,6 @@
 {
 	"name": "kaos",
-	"version": "1.8.19",
+	"version": "1.8.20",
 	"description": "A zero-terminal, real-time sync engine powered by your own Cloudflare Worker.",
 	"main": "main.js",
 	"type": "module",
@@ -21,6 +21,7 @@
 		"smoke:headless-host": "node scripts/smoke-headless-host-sync.mjs",
 		"postflight:headless-host": "node scripts/postflight-headless-host.mjs",
 		"rollback:headless-host": "node scripts/rollback-headless-host.mjs",
+		"uninstall:headless-host": "node scripts/uninstall-headless-host.mjs",
 		"install:plugin": "node scripts/install-plugin.mjs",
 		"build:qa-product": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs qa-product",
 		"build:server-release": "node build-server-release.mjs",

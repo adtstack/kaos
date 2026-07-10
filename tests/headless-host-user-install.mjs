@@ -35,6 +35,7 @@ try {
 	for (const entry of [
 		"kaos-headless-host.mjs",
 		"kaosctl.mjs",
+		"uninstall-headless-host.mjs",
 		"kaos-plugin.zip",
 		"kaos-headless-host.user.service",
 		"VERSION",

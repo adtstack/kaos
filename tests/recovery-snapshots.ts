@@ -843,6 +843,17 @@ async function testListIsNewestFirst(): Promise<void> {
 	assertEqual(listed.manifests[0]?.kind, "file-history", "list reads file-history kind from lightweight index");
 	assertEqual(listed.manifests[0]?.changedEntries.length, 1, "list reads changed entry preview from lightweight index");
 	assertEqual(listed.manifests[0]?.changedEntries[0]?.fileId, "file-a", "list preview includes changed file id");
+	assertEqual(listed.nextCursor, second.manifestId, "list supplies the final manifest id as the next-page cursor");
+	const olderPage = await listRecoveryManifestIndexes(
+		vaultId,
+		bucket as unknown as R2Bucket,
+		1,
+		listed.nextCursor ?? undefined,
+	);
+	assertEqual(olderPage.manifests.length, 1, "next page respects the list limit");
+	assertEqual(olderPage.manifests[0]?.manifestId, first.manifestId, "next page continues with the older manifest");
+	assertEqual(olderPage.limited, false, "last page is not marked as limited");
+	assertEqual(olderPage.nextCursor, null, "last page has no next-page cursor");
 	assert(first.manifestId !== second.manifestId, "test created two distinct manifests");
 	assert(bucket.putOrder.some((key) => key === `v2/${vaultId}/recovery/manifest-indexes/${second.manifestId}.json`), "lightweight manifest index is written");
 	assert(!bucket.getOrder.some((key) => key.includes("/recovery/manifests/") && key.endsWith(".json.gz")), "listing does not read full gzip manifests");

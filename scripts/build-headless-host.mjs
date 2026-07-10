@@ -24,6 +24,7 @@ const releaseAssets = [
 	"deploy/oracle-acceptance-config.example.json",
 	"scripts/bootstrap-headless-host-oracle.mjs",
 	"scripts/install-headless-host.mjs",
+	"scripts/uninstall-headless-host.mjs",
 	"scripts/update-headless-host-from-release.mjs",
 	"scripts/verify-headless-host-bundle.mjs",
 	"scripts/validate-headless-host-release-assets.mjs",
@@ -92,6 +93,9 @@ await esbuild.build({
 });
 await chmod(kaosctlOutfile, 0o755);
 const kaosctlArtifact = await readFile(kaosctlOutfile);
+const uninstallerArtifact = await readFile("scripts/uninstall-headless-host.mjs");
+await writeFile("dist/uninstall-headless-host.mjs", uninstallerArtifact);
+await chmod("dist/uninstall-headless-host.mjs", 0o755);
 await writeFile(`${kaosctlOutfile}.sha256`, `${sha256Bytes(kaosctlArtifact)}  kaosctl.mjs\n`, "utf8");
 
 const artifact = await readFile(outfile);
@@ -143,7 +147,7 @@ for (const assetPath of [...releaseAssets, manifestOutfile]) {
 const readme = Buffer.from(`KAOS Headless Host Oracle bundle
 
 This bundle contains the headless host binary, checksum, release manifest,
-systemd service template, and bootstrap/install/update/verify/local+remote rehearsal/smoke/postflight/rollback helpers.
+systemd service template, and bootstrap/install/uninstall/update/verify/local+remote rehearsal/smoke/postflight/rollback helpers.
 
 For the safest real-VM acceptance run from a local release directory, use
 run-headless-host-oracle-acceptance.mjs next to this zip and checksum. It wraps
@@ -393,6 +397,14 @@ omit postflight:
     --bundle-dir . \\
     --install-dir /opt/kaos \\
     --service-path /etc/systemd/system/kaos-headless-host.service
+
+To remove the system installation while preserving the vault:
+
+  sudo node /opt/kaos/uninstall-headless-host.mjs --yes
+
+Add --purge-vault only when /srv/kaos/vault should also be deleted. Removing
+the dedicated service account additionally requires --remove-user; use
+--remove-group as well only when the kaos group is no longer shared.
 `, "utf8");
 bundleEntries["README-headless-host.txt"] = readme;
 bundleAssets["README-headless-host.txt"] = {
@@ -415,6 +427,7 @@ await writeFile(`${oracleBundleOutfile}.sha256`, `${sha256Bytes(bundle)}  kaos-h
 const userBundleEntries = {
 	"kaos-headless-host.mjs": artifact,
 	"kaosctl.mjs": kaosctlArtifact,
+	"uninstall-headless-host.mjs": uninstallerArtifact,
 	"kaos-plugin.zip": pluginBundle,
 	"VERSION": Buffer.from(`${headlessVersion}\n`, "utf8"),
 	"kaos-headless-host.user.service": await readFile("deploy/kaos-headless-host.user.service"),
@@ -429,6 +442,13 @@ The installer is intentionally interactive. Service startup runs:
 Updates are non-interactive, verify the newly installed runner with doctor,
 and roll back the current symlink if verification fails. Vault plugin files are
 read from the configured vault and are not overwritten by headless updates.
+
+Remove the user service, runner, state, and sync configuration with:
+
+  kaos uninstall --yes
+
+The vault is preserved. Add --purge-vault --vault /path/to/vault only when the
+vault itself should be deleted.
 
 Install from the public release with:
 

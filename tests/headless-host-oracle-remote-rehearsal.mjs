@@ -686,6 +686,7 @@ function releaseAssets() {
     "oracle-acceptance-config.example.json",
     "install-headless-host.mjs",
     "bootstrap-headless-host-oracle.mjs",
+    "uninstall-headless-host.mjs",
     "update-headless-host-from-release.mjs",
     "verify-headless-host-bundle.mjs",
     "validate-headless-host-release-assets.mjs",

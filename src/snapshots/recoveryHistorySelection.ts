@@ -22,7 +22,7 @@ export interface RecoveryHistoryChangeItem extends RecoveryHistoryFileHistoryIte
 }
 
 export type RecoveryHistoryScope =
-	| { kind: "all" }
+	| { kind: "none" }
 	| { kind: "manifest"; manifestId: string };
 
 export type RecoveryHistoryKindFilter = FileHistoryEntryKind | "all";
@@ -109,7 +109,8 @@ export function filterRecoveryHistoryChanges(
 ): RecoveryHistoryChangeItem[] {
 	const query = filters.query.trim().toLowerCase();
 	return changes.filter((item) => {
-		if (filters.scope.kind === "manifest" && item.manifest.manifestId !== filters.scope.manifestId) {
+		if (filters.scope.kind === "none") return false;
+		if (item.manifest.manifestId !== filters.scope.manifestId) {
 			return false;
 		}
 		if (filters.kindFilter !== "all" && item.entry.kind !== filters.kindFilter) {
@@ -137,11 +138,19 @@ export function resolveRecoveryHistoryFeedState(
 	options?: RecoveryHistoryInitialSelection,
 ): RecoveryHistoryResolvedFeedState {
 	const changes = buildRecoveryHistoryChanges(manifests);
-	const allScope: RecoveryHistoryScope = { kind: "all" };
+	const latestManifestId = manifests
+		.slice()
+		.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0]
+		?.manifestId;
+	const latestScope: RecoveryHistoryScope = latestManifestId
+		? { kind: "manifest" as const, manifestId: latestManifestId }
+		: { kind: "none" };
 	if (!options?.initialManifestId || !options.initialFileId) {
 		return {
-			scope: allScope,
-			selectedChangeKey: changes[0]?.key ?? null,
+			scope: latestScope,
+			selectedChangeKey: latestManifestId
+				? changes.find((item) => item.manifest.manifestId === latestManifestId)?.key ?? null
+				: null,
 		};
 	}
 
@@ -150,7 +159,7 @@ export function resolveRecoveryHistoryFeedState(
 		item.entry.fileId === options.initialFileId);
 	if (selected) {
 		return {
-			scope: allScope,
+			scope: { kind: "manifest", manifestId: selected.manifest.manifestId },
 			selectedChangeKey: selected.key,
 		};
 	}
@@ -165,8 +174,10 @@ export function resolveRecoveryHistoryFeedState(
 	}
 
 	return {
-		scope: allScope,
-		selectedChangeKey: changes[0]?.key ?? null,
+		scope: latestScope,
+		selectedChangeKey: latestManifestId
+			? changes.find((item) => item.manifest.manifestId === latestManifestId)?.key ?? null
+			: null,
 	};
 }
 

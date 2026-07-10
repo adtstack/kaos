@@ -61,10 +61,32 @@ console.log("\n--- Test 3: .obsidian/ path = excluded ---");
 	assert(cat.kind === "excluded" && cat.reason === "excluded-by-pattern", "reason correct");
 }
 
+console.log("\n--- Test 3b: nested hidden path = excluded ---");
+{
+	const cat = classify("docs/sample-vault/.obsidian/plugins/example/data.json");
+	assert(cat.kind === "excluded", "nested .obsidian config is excluded");
+	assert(
+		classify("docs/sample-vault/SYSTEM/MEDIA/.gitkeep").kind === "excluded",
+		"nested hidden file is excluded",
+	);
+}
+
 console.log("\n--- Test 4: .trash/ path = excluded ---");
 {
 	const cat = classify(".trash/deleted.md");
 	assert(cat.kind === "excluded", ".trash/deleted.md is excluded");
+}
+
+console.log("\n--- Test 4b: tool, generated, and temporary paths = excluded ---");
+{
+	assert(classify("packages/app/node_modules/lib/index.js").kind === "excluded", "node_modules is excluded");
+	assert(classify("docs/site/dist/app.js").kind === "excluded", "dist is excluded");
+	assert(classify("docs/site/build/guide.md").kind === "excluded", "build is excluded");
+	assert(classify("coverage/lcov.info").kind === "excluded", "coverage is excluded");
+	assert(classify("notes/draft.tmp").kind === "excluded", "temporary suffix is excluded");
+	assert(classify("reports/app.js.map").kind === "excluded", "source map is excluded");
+	assert(classify("assets/Thumbs.db").kind === "excluded", "system metadata is excluded");
+	assert(classify("assets/~$budget.xlsx").kind === "excluded", "office lock file is excluded");
 }
 
 console.log("\n--- Test 5: user-excluded prefix = excluded ---");

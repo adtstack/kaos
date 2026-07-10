@@ -213,7 +213,8 @@ export async function handleRecoverySnapshotRoute(
 		const url = new URL(req.url);
 		const limitParam = url.searchParams.get("limit");
 		const limit = limitParam ? Math.min(Math.max(1, parseInt(limitParam, 10) || 50), 200) : 50;
-		const result = await listRecoveryManifestIndexes(vaultId, bucket, limit);
+		const cursor = url.searchParams.get("cursor") ?? undefined;
+		const result = await listRecoveryManifestIndexes(vaultId, bucket, limit, cursor);
 		return json(result);
 	}
 
