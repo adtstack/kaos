@@ -1,9 +1,9 @@
-export const SERVER_VERSION = "0.5.7";
+export const SERVER_VERSION = "0.5.8";
 
 // Compatibility metadata is intentionally explicit so the plugin can reason
 // about safe upgrade paths before we add richer release-manifest logic.
 export const SERVER_MIN_PLUGIN_VERSION: string | null = null;
-export const SERVER_RECOMMENDED_PLUGIN_VERSION = "1.8.21";
+export const SERVER_RECOMMENDED_PLUGIN_VERSION = "1.8.26";
 export const SERVER_MIN_COMPATIBLE_SERVER_VERSION_FOR_PLUGIN = "0.5.0";
 export const SERVER_MIN_COMPATIBLE_PLUGIN_VERSION_FOR_SERVER = "1.3.3";
 // Keep v2 in the supported range during the v2 -> v3 rolling-upgrade window.

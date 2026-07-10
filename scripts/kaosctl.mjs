@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import process from "node:process";
 import readline from "node:readline/promises";
 import { emitKeypressEvents } from "node:readline";
+import { gunzipSync } from "node:zlib";
 import { unzipSync } from "fflate";
 
 const DEFAULT_REPO = "adtstack/kaos";
@@ -55,6 +56,10 @@ async function main() {
 	}
 	if (command === "conflicts") {
 		await runConflictsCommand(args);
+		return;
+	}
+	if (command === "history") {
+		await runHistoryCommand(args);
 		return;
 	}
 	if (command === "ui") {
@@ -396,6 +401,469 @@ async function runConflictsCommand(argv) {
 		return;
 	}
 	throw new Error(`unknown conflicts command: ${subcommand}`);
+}
+
+async function runHistoryCommand(argv) {
+	const [subcommand, ...rest] = argv;
+	if (["help", "--help", "-h"].includes(subcommand)) {
+		printHistoryUsage();
+		return;
+	}
+	if (!subcommand || subcommand.startsWith("--")) {
+		const raw = parseArgs(subcommand ? argv : []);
+		if (process.stdin.isTTY && process.stdout.isTTY) {
+			await runHistoryTui(raw);
+		} else {
+			printHistoryList(await listHistoryPoints(await resolveHistoryConnection(raw), raw));
+		}
+		return;
+	}
+	const { id, raw } = parseSubcommandArgs(rest);
+	if (raw.help === "true") {
+		printHistoryUsage();
+		return;
+	}
+	if (subcommand === "tui") {
+		if (!process.stdin.isTTY || !process.stdout.isTTY) {
+			throw new Error("kaos history tui requires an interactive TTY; use `kaos history list` instead");
+		}
+		await runHistoryTui(raw);
+		return;
+	}
+	const connection = await resolveHistoryConnection(raw);
+	if (subcommand === "list") {
+		const page = await listHistoryPoints(connection, raw);
+		if (raw.json === "true") {
+			console.log(JSON.stringify({ kind: "kaos-file-history", ok: true, ...page }, null, 2));
+		} else {
+			printHistoryList(page);
+		}
+		return;
+	}
+	if (subcommand === "show") {
+		if (!id) throw new Error("history point id is required");
+		const manifest = await fetchHistoryManifest(connection, id);
+		if (raw.json === "true") {
+			console.log(JSON.stringify(manifest, null, 2));
+		} else {
+			printHistoryManifest(manifest);
+		}
+		return;
+	}
+	if (subcommand === "diff") {
+		if (!id) throw new Error("history event id is required (for example, <point-id>:0)");
+		console.log(await renderHistoryEventDiff(connection, id, { full: raw.full === "true" }));
+		return;
+	}
+	throw new Error(`unknown history command: ${subcommand}`);
+}
+
+async function resolveHistoryConnection(raw) {
+	const defaults = defaultUserPaths();
+	const explicitConfig = asNonEmptyString(raw.config);
+	const configPath = explicitConfig ? resolveUserPath(explicitConfig) : defaults.installConfig;
+	const installConfig = explicitConfig
+		? await readJsonFile(configPath)
+		: await readJsonIfExists(configPath);
+	const paths = isRecord(installConfig) ? pathsFromConfig(installConfig) : defaults;
+	const vaultRoot = asNonEmptyString(raw.vault) ?? asNonEmptyString(installConfig?.vaultRoot);
+	const pluginDir = asNonEmptyString(raw["plugin-dir"])
+		? resolveUserPath(raw["plugin-dir"])
+		: vaultRoot
+			? join(resolveUserPath(vaultRoot), ".obsidian", "plugins", "kaos")
+			: null;
+	const dataFiles = uniquePaths([
+		raw["data-file"] ? resolveUserPath(raw["data-file"]) : (isRecord(installConfig) ? paths.dataFile : null),
+		pluginDir ? join(pluginDir, "data.json") : null,
+	]);
+	const data = await readHistoryConfig(dataFiles);
+	const tokenFile = raw["token-file"]
+		? resolveUserPath(raw["token-file"])
+		: (isRecord(installConfig) ? paths.tokenFile : null);
+	const token = asNonEmptyString(raw.token)
+		?? await readHistoryToken(tokenFile)
+		?? asNonEmptyString(data?.token);
+	const host = asNonEmptyString(raw.host) ?? asNonEmptyString(data?.host);
+	const vaultId = asNonEmptyString(raw["vault-id"]) ?? asNonEmptyString(data?.vaultId);
+	if (!host || !vaultId || !token) {
+		throw new Error("File history needs host, vault id, and token. Install KAOS headless first or pass --host, --vault-id, and --token.");
+	}
+	return { host: host.replace(/\/$/, ""), vaultId, token };
+}
+
+async function readHistoryConfig(paths) {
+	const config = {};
+	for (const path of [...paths].reverse()) {
+		const value = await readJsonIfExists(path);
+		if (isRecord(value)) Object.assign(config, value);
+	}
+	return config;
+}
+
+async function readHistoryToken(path) {
+	if (!path) return null;
+	try {
+		return asNonEmptyString(await readFile(path, "utf8"));
+	} catch {
+		return null;
+	}
+}
+
+function historyApiUrl(connection, endpoint) {
+	return `${connection.host}/vault/${encodeURIComponent(connection.vaultId)}/${endpoint}`;
+}
+
+async function historyFetch(connection, endpoint) {
+	const res = await fetch(historyApiUrl(connection, endpoint), {
+		headers: { Authorization: `Bearer ${connection.token}` },
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(`file history request failed (${res.status}): ${text || res.statusText}`);
+	}
+	return res;
+}
+
+async function historyFetchJson(connection, endpoint) {
+	return await (await historyFetch(connection, endpoint)).json();
+}
+
+async function listHistoryPoints(connection, raw = {}) {
+	const requestedLimit = Number.parseInt(raw.limit ?? "10", 10);
+	const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(requestedLimit, 200)) : 10;
+	const params = new URLSearchParams({ limit: String(limit) });
+	if (asNonEmptyString(raw.cursor)) params.set("cursor", raw.cursor);
+	const value = await historyFetchJson(connection, `recovery-snapshots?${params.toString()}`);
+	if (!isRecord(value) || !Array.isArray(value.manifests)) {
+		throw new Error("file history server returned an invalid page");
+	}
+	return {
+		manifests: value.manifests.filter(isHistoryManifest),
+		totalManifestKeys: typeof value.totalManifestKeys === "number" ? value.totalManifestKeys : null,
+		limited: value.limited === true,
+		nextCursor: asNonEmptyString(value.nextCursor),
+	};
+}
+
+async function fetchHistoryManifest(connection, manifestId) {
+	const value = await historyFetchJson(connection, `recovery-snapshots/${encodeURIComponent(manifestId)}/manifest`);
+	if (!isHistoryManifest(value)) throw new Error("file history server returned an invalid point");
+	return value;
+}
+
+async function fetchHistoryContent(connection, hash) {
+	const compressed = new Uint8Array(await (await historyFetch(
+		connection,
+		`recovery-content/${encodeURIComponent(hash)}`,
+	)).arrayBuffer());
+	const content = new TextDecoder().decode(gunzipSync(compressed));
+	const actualHash = createHash("sha256").update(content).digest("hex");
+	if (actualHash !== hash) throw new Error(`file history content hash mismatch for ${hash}`);
+	return content;
+}
+
+function isHistoryManifest(value) {
+	return isRecord(value) &&
+		typeof value.manifestId === "string" &&
+		typeof value.createdAt === "string" &&
+		typeof value.changedCount === "number" &&
+		Array.isArray(value.changedEntries);
+}
+
+function historyEventId(manifestId, index) {
+	return `${manifestId}:${index}`;
+}
+
+function parseHistoryEventId(value) {
+	const delimiter = value.lastIndexOf(":");
+	if (delimiter < 1) throw new Error("history event id must be <point-id>:<entry-index>");
+	const manifestId = value.slice(0, delimiter);
+	const index = Number.parseInt(value.slice(delimiter + 1), 10);
+	if (!Number.isInteger(index) || index < 0) throw new Error("history event id has an invalid entry index");
+	return { manifestId, index };
+}
+
+async function renderHistoryEventDiff(connection, eventId, { full }) {
+	const { manifestId, index } = parseHistoryEventId(eventId);
+	const manifest = await fetchHistoryManifest(connection, manifestId);
+	const entry = manifest.changedEntries[index];
+	if (!isRecord(entry)) throw new Error(`history event not found: ${eventId}`);
+	const previousHash = asNonEmptyString(entry.previousContentHash);
+	const contentHash = asNonEmptyString(entry.contentHash);
+	if (!previousHash && !contentHash) {
+		return `${eventId}  ${historyEntryKind(entry)}  ${historyEntryPath(entry)}\n\nNo text content was captured for this history event.`;
+	}
+	const previous = previousHash ? await fetchHistoryContent(connection, previousHash) : "";
+	const current = contentHash ? await fetchHistoryContent(connection, contentHash) : "";
+	return renderLineDiff(previous, current, {
+		leftLabel: previousHash ? `before:${historyEntryPath(entry)}` : "before:empty",
+		rightLabel: contentHash ? `after:${historyEntryPath(entry)}` : "after:empty",
+		full,
+	});
+}
+
+function printHistoryList(page) {
+	if (page.manifests.length === 0) {
+		console.log("No file history points found.");
+		return;
+	}
+	console.log("File history");
+	console.log("TIME                         CHANGES  REASON       POINT");
+	for (const manifest of page.manifests) {
+		console.log(`${padRight(formatHistoryDate(manifest.createdAt), 28)} ${padLeft(String(manifest.changedCount), 7)}  ${padRight(safeTerminalText(manifest.reason ?? "automatic"), 11)} ${manifest.manifestId}`);
+	}
+	if (page.nextCursor) {
+		console.log(`\nMore: kaos history list --cursor ${page.nextCursor}`);
+	}
+}
+
+function printHistoryManifest(manifest) {
+	console.log(`${manifest.manifestId}  ${formatHistoryDate(manifest.createdAt)}`);
+	console.log(`${manifest.changedCount} changed file(s) · ${safeTerminalText(manifest.reason ?? "automatic")}`);
+	if (manifest.changedEntries.length === 0) {
+		console.log("No file-level changes in this point.");
+		return;
+	}
+	console.log("\nEVENT                 TYPE       PATH");
+	for (let index = 0; index < manifest.changedEntries.length; index++) {
+		const entry = manifest.changedEntries[index];
+		if (!isRecord(entry)) continue;
+		console.log(`${padRight(historyEventId(manifest.manifestId, index), 22)} ${padRight(historyEntryKind(entry), 10)} ${historyEntryPath(entry)}`);
+	}
+}
+
+async function runHistoryTui(raw) {
+	const connection = await resolveHistoryConnection(raw);
+	const firstPage = await listHistoryPoints(connection, { ...raw, limit: raw.limit ?? "10" });
+	const state = {
+		connection,
+		manifests: firstPage.manifests,
+		nextCursor: firstPage.nextCursor,
+		selectedPoint: 0,
+		selectedChange: 0,
+		focus: "points",
+		kindFilter: "all",
+		diffText: null,
+		message: "Select a point, then inspect its changed files.",
+	};
+	if (state.manifests.length === 0) {
+		console.log("No file history points found.");
+		return;
+	}
+
+	emitKeypressEvents(process.stdin);
+	const keyReader = createKeyReader(process.stdin);
+	process.stdin.setRawMode?.(true);
+	try {
+		while (true) {
+			renderHistoryTui(state);
+			const key = await keyReader.read();
+			const name = key?.name;
+			if (name === "q" || (key?.ctrl && name === "c")) break;
+			if (name === "tab" || name === "right" || name === "left") {
+				state.focus = state.focus === "points" ? "changes" : "points";
+				state.diffText = null;
+				continue;
+			}
+			if (name === "j" || name === "down") {
+				await moveHistorySelection(state, 1);
+				continue;
+			}
+			if (name === "k" || name === "up") {
+				await moveHistorySelection(state, -1);
+				continue;
+			}
+			if (name === "n") {
+				await loadOlderHistoryPoints(state);
+				continue;
+			}
+			if (name === "t") {
+				state.kindFilter = nextHistoryKindFilter(state.kindFilter);
+				state.selectedChange = 0;
+				state.diffText = null;
+				state.message = `Filtering ${state.kindFilter === "all" ? "all change types" : state.kindFilter}.`;
+				continue;
+			}
+			if (name === "return" && state.focus === "points") {
+				state.focus = "changes";
+				state.diffText = null;
+				continue;
+			}
+			if (name === "return" || name === "d") {
+				await loadHistoryTuiDiff(state);
+				continue;
+			}
+			if (name === "?") {
+				state.message = "j/k move · Tab switch pane · Enter/d diff · t type filter · n older points · q quit";
+			}
+		}
+	} finally {
+		keyReader.close();
+		process.stdin.setRawMode?.(false);
+		process.stdin.pause();
+		process.stdout.write("\x1b[?25h\n");
+	}
+}
+
+async function moveHistorySelection(state, delta) {
+	if (state.focus === "points") {
+		const next = state.selectedPoint + delta;
+		if (next >= state.manifests.length && delta > 0 && state.nextCursor) {
+			await loadOlderHistoryPoints(state);
+		}
+		state.selectedPoint = Math.max(0, Math.min(state.manifests.length - 1, state.selectedPoint + delta));
+		state.selectedChange = 0;
+		state.diffText = null;
+		return;
+	}
+	const changes = historyVisibleEntries(state.manifests[state.selectedPoint], state.kindFilter);
+	state.selectedChange = Math.max(0, Math.min(Math.max(0, changes.length - 1), state.selectedChange + delta));
+	state.diffText = null;
+}
+
+async function loadOlderHistoryPoints(state) {
+	if (!state.nextCursor) {
+		state.message = "No older file history points remain.";
+		return;
+	}
+	state.message = "Loading older history...";
+	try {
+		const page = await listHistoryPoints(state.connection, { limit: "10", cursor: state.nextCursor });
+		const known = new Set(state.manifests.map((manifest) => manifest.manifestId));
+		state.manifests.push(...page.manifests.filter((manifest) => !known.has(manifest.manifestId)));
+		state.nextCursor = page.nextCursor;
+		state.message = page.manifests.length > 0 ? "Older history loaded." : "No older file history points remain.";
+	} catch (err) {
+		state.message = `Could not load older history: ${errorMessage(err)}`;
+	}
+}
+
+async function loadHistoryTuiDiff(state) {
+	const manifest = state.manifests[state.selectedPoint];
+	const changes = historyVisibleEntries(manifest, state.kindFilter);
+	const selected = changes[state.selectedChange];
+	if (!selected) {
+		state.message = "No change selected.";
+		return;
+	}
+	state.message = "Loading diff...";
+	try {
+		state.diffText = await renderHistoryEventDiff(
+			state.connection,
+			historyEventId(manifest.manifestId, selected.index),
+			{ full: false },
+		);
+		state.message = "Diff loaded.";
+	} catch (err) {
+		state.diffText = null;
+		state.message = `Diff failed: ${errorMessage(err)}`;
+	}
+}
+
+function renderHistoryTui(state) {
+	const width = Math.max(60, process.stdout.columns ?? 100);
+	const height = Math.max(14, process.stdout.rows ?? 28);
+	const manifest = state.manifests[state.selectedPoint];
+	const changes = historyVisibleEntries(manifest, state.kindFilter);
+	const lines = [
+		`KAOS file history  ·  ${state.manifests.length} point(s) loaded${state.nextCursor ? "  ·  more available" : ""}`,
+		`${safeTerminalText(state.message)}`,
+		"",
+	];
+
+	if (width < 92) {
+		lines.push(`${state.focus === "points" ? ">" : " "} Points`, "");
+		for (let index = 0; index < Math.min(state.manifests.length, height - 8); index++) {
+			lines.push(historyTuiPointLine(state.manifests[index], index === state.selectedPoint, width));
+		}
+		lines.push("", `${state.focus === "changes" ? ">" : " "} ${formatHistoryDate(manifest.createdAt)} · ${changes.length} change(s)`);
+		for (let index = 0; index < Math.min(changes.length, 4); index++) {
+			lines.push(historyTuiChangeLine(changes[index], index === state.selectedChange, width));
+		}
+	} else {
+		const leftWidth = Math.min(42, Math.max(32, Math.floor(width * 0.38)));
+		const rightWidth = width - leftWidth - 3;
+		lines.push(`${padRight(`${state.focus === "points" ? ">" : " "} POINTS`, leftWidth)} │ ${state.focus === "changes" ? ">" : " "} ${truncateTerminalText(`${formatHistoryDate(manifest.createdAt)} · ${changes.length} change(s) · ${state.kindFilter}`, rightWidth - 2)}`);
+		lines.push(`${"─".repeat(leftWidth)}─┼─${"─".repeat(rightWidth)}`);
+		const contentLines = state.diffText
+			? state.diffText.split("\n").map((line) => safeTerminalText(line))
+			: changes.map((change, index) => historyTuiChangeLine(change, index === state.selectedChange, rightWidth));
+		const rowCount = Math.max(5, height - 7);
+		for (let index = 0; index < rowCount; index++) {
+			const point = state.manifests[index]
+				? historyTuiPointLine(state.manifests[index], index === state.selectedPoint, leftWidth)
+				: "";
+			const detail = contentLines[index] ?? "";
+			lines.push(`${padRight(point, leftWidth)} │ ${truncateTerminalText(detail, rightWidth)}`);
+		}
+	}
+	lines.push("", "j/k move · Tab switch pane · Enter/d diff · t type filter · n older points · q quit");
+	process.stdout.write(`\x1b[?25l\x1b[2J\x1b[H${lines.join("\n")}\n`);
+}
+
+function historyVisibleEntries(manifest, kindFilter) {
+	if (!manifest || !Array.isArray(manifest.changedEntries)) return [];
+	return manifest.changedEntries
+		.map((entry, index) => ({ entry, index }))
+		.filter(({ entry }) => isRecord(entry) && (kindFilter === "all" || entry.kind === kindFilter));
+}
+
+function nextHistoryKindFilter(current) {
+	const filters = ["all", "created", "modified", "renamed", "deleted", "restored"];
+	const index = filters.indexOf(current);
+	return filters[(index + 1) % filters.length] ?? "all";
+}
+
+function historyTuiPointLine(manifest, selected, width) {
+	const marker = selected ? ">" : " ";
+	return truncateTerminalText(`${marker} ${formatHistoryDate(manifest.createdAt)}  ${manifest.changedCount} change(s)`, width);
+}
+
+function historyTuiChangeLine(change, selected, width) {
+	const marker = selected ? ">" : " ";
+	return truncateTerminalText(`${marker} ${historyEntryKind(change.entry)}  ${historyEntryPath(change.entry)}`, width);
+}
+
+function historyEntryKind(entry) {
+	return safeTerminalText(asNonEmptyString(entry.kind) ?? "changed");
+}
+
+function historyEntryPath(entry) {
+	const path = asNonEmptyString(entry.newPath) ?? asNonEmptyString(entry.path) ?? "(unknown path)";
+	const oldPath = asNonEmptyString(entry.oldPath);
+	return safeTerminalText(oldPath && oldPath !== path ? `${oldPath} → ${path}` : path);
+}
+
+function formatHistoryDate(value) {
+	const date = new Date(value);
+	return Number.isNaN(date.getTime()) ? safeTerminalText(value) : date.toLocaleString(undefined, {
+		year: "numeric",
+		month: "short",
+		day: "2-digit",
+		hour: "2-digit",
+		minute: "2-digit",
+	});
+}
+
+function safeTerminalText(value) {
+	return Array.from(String(value), (character) => {
+		const code = character.charCodeAt(0);
+		return code < 32 || code === 127 ? "?" : character;
+	}).join("");
+}
+
+function truncateTerminalText(value, width) {
+	const text = safeTerminalText(value);
+	if (text.length <= width) return text;
+	return width <= 1 ? text.slice(0, width) : `${text.slice(0, width - 1)}…`;
+}
+
+function padLeft(value, width) {
+	return String(value).padStart(width, " ");
+}
+
+function padRight(value, width) {
+	return String(value).padEnd(width, " ");
 }
 
 function parseSubcommandArgs(argv) {
@@ -1738,6 +2206,8 @@ function printUsage() {
   kaos doctor
   kaos ui [--vault <path>]
   kaos conflicts <command> [options]
+  kaos history [--config <path>]
+  kaos history <list|show|diff|tui> [options]
 
 Install is always interactive. Update is non-interactive and is used by the
 user systemd service during startup.
@@ -1759,6 +2229,28 @@ Options:
   --data-file <path>   Add/override the headless data file for preserved entries.
   --plugin-dir <path>  Override the vault plugin directory.
   --lock-file <path>   Override the headless-host lock path.
+`);
+}
+
+function printHistoryUsage() {
+	console.log(`Usage:
+  kaos history [--config <path>]
+  kaos history list [--limit <n>] [--cursor <point-id>] [--json]
+  kaos history show <point-id> [--json]
+  kaos history diff <point-id>:<entry-index> [--full]
+  kaos history tui
+
+The default command opens a read-only TUI in an interactive terminal and
+prints the latest page in non-interactive use. Older history points load in
+pages of 10 from the TUI with n or while moving past the final point.
+
+Connection options:
+  --config <path>       KAOS headless install config.
+  --host <url>          KAOS Worker host.
+  --vault-id <id>       KAOS vault id.
+  --token <token>       KAOS auth token.
+  --token-file <path>   Read the KAOS auth token from a file.
+  --data-file <path>    Read the KAOS plugin/headless data file.
 `);
 }
 

@@ -162,6 +162,7 @@ const suites = [
 	[JITI, "tests/path-category.ts"],
 	[JITI, "tests/conflict-artifact-path.ts"],
 	[NODE, "tests/kaos-conflict-resolver.mjs"],
+	[NODE, "tests/kaos-file-history-cli.mjs"],
 	[JITI, "tests/dashboard-snapshot-cache.ts"],
 	[JITI, "tests/dashboard-data.ts"],
 	[JITI, "tests/recovery-history-selection.ts"],
