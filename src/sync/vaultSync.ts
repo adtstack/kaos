@@ -1193,6 +1193,8 @@ export class VaultSync {
 		 *    or any user-visible surface.
 		 */
 		mintAdmissionOpId?: (path: string) => { opId: string; emitDecision: () => void },
+		/** Product-owned path predicate; VaultSync itself remains policy-neutral. */
+		isPathSyncable: (path: string) => boolean = () => true,
 	): ReconcileResult {
 		const createdOnDisk: string[] = [];
 		const updatedOnDisk: string[] = [];
@@ -1202,14 +1204,24 @@ export class VaultSync {
 		let skipped = 0;
 
 		this.ensurePathIndexes();
-		const crdtPaths = new Set<string>(this._pathIndex.keys());
-		const activePathCollisionPaths = new Set<string>(this._activePathCollisions.keys());
+		const crdtPaths = new Set<string>(
+			[...this._pathIndex.keys()].filter((path) => isPathSyncable(path)),
+		);
+		const activePathCollisionPaths = new Set<string>(
+			[...this._activePathCollisions.keys()].filter((path) => isPathSyncable(path)),
+		);
+		const syncableDiskFiles = new Map(
+			[...diskFiles].filter(([path]) => isPathSyncable(path)),
+		);
+		const syncableDiskPresentPaths = new Set(
+			[...diskPresentPaths].filter((path) => isPathSyncable(path)),
+		);
 
 		// CRDT files not on disk → create on disk
 		// IMPORTANT: use diskPresentPaths (all known disk paths), not
 		// diskFiles (only the subset whose content was read this run).
 		for (const path of crdtPaths) {
-			if (!diskPresentPaths.has(path)) {
+			if (!syncableDiskPresentPaths.has(path)) {
 				createdOnDisk.push(path);
 			}
 		}
@@ -1218,7 +1230,7 @@ export class VaultSync {
 		// In authoritative mode, CRDT is source of truth and should be
 		// flushed to disk so reopened clients converge reliably.
 		if (mode === "authoritative") {
-			for (const [path, diskContent] of diskFiles) {
+			for (const [path, diskContent] of syncableDiskFiles) {
 				if (!crdtPaths.has(path)) continue;
 				const ytext = this.getTextForPath(path);
 				if (!ytext) continue;
@@ -1232,7 +1244,7 @@ export class VaultSync {
 		const tombstonedDiskConflicts: TombstonedDiskConflict[] = [];
 
 		// Disk files not in CRDT
-		for (const path of diskPresentPaths) {
+		for (const path of syncableDiskPresentPaths) {
 			if (activePathCollisionPaths.has(path)) {
 				this.log(`reconcile: "${path}" has duplicate active CRDT fileIds — preserving for explicit resolution`);
 				pathBindingConflicts.push(path);
@@ -1260,7 +1272,7 @@ export class VaultSync {
 					continue;
 
 				case "seed-to-crdt": {
-					const content = diskFiles.get(path);
+					const content = syncableDiskFiles.get(path);
 					if (content === undefined) {
 						// Presence is known, but content wasn't read this pass. Skip seeding
 						// to avoid accidentally creating empty/incorrect files.

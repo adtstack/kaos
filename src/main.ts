@@ -840,6 +840,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.preservedUnresolvedEntries,
 				() => this.persistPreservedUnresolvedState(),
 			);
+			this.diskMirror.setMarkdownPathSyncabilityPredicate((path) => this.isMarkdownPathSyncable(path));
 			this.diskMirror.startMapObservers();
 			this.diskMirror.setFlightEventHandler((event) => this.recordFlightPathEvent(event as import("./telemetry/debug/flightEvents").FlightPathEventInput));
 			// Track SHA-256 baseline hash after every successful flushWrite.

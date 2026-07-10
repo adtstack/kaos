@@ -27,6 +27,7 @@ export type RemoteDeleteDecision =
 
 export type DiskWriteDeferReason =
 	| "missing-ytext"
+	| "path-excluded"
 	| "open-editor-mismatch"
 	| "active-editor-unflushed"
 	| "recent-editor-activity"
@@ -177,6 +178,8 @@ export class DiskMirror {
 	 * .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md (R8).
 	 */
 	private lastDiskWriteOkAt = new Map<string, number>();
+	/** Supplied by the plugin; DiskMirror does not own sync-path policy. */
+	private isMarkdownPathSyncable: (path: string) => boolean = () => true;
 
 	private readonly debug: boolean;
 
@@ -218,6 +221,10 @@ export class DiskMirror {
 	 */
 	setDiskWriteCallback(callback: (path: string, contentHash: string, content: string) => void): void {
 		this._onDiskWriteCallback = callback;
+	}
+
+	setMarkdownPathSyncabilityPredicate(predicate: (path: string) => boolean): void {
+		this.isMarkdownPathSyncable = predicate;
 	}
 
 	// -------------------------------------------------------------------
@@ -419,6 +426,10 @@ export class DiskMirror {
 
 	scheduleWrite(path: string): void {
 		path = normalizePath(path);
+		if (!this.isMarkdownPathSyncable(path)) {
+			this.log(`scheduleWrite: skipping excluded path "${path}"`);
+			return;
+		}
 		if (this.openPaths.has(path) || this.isOpenInWorkspace(path)) {
 			this.scheduleOpenWrite(path);
 			return;
@@ -446,6 +457,10 @@ export class DiskMirror {
 	}
 
 	private scheduleOpenWrite(path: string): void {
+		if (!this.isMarkdownPathSyncable(path)) {
+			this.log(`scheduleOpenWrite: skipping excluded path "${path}"`);
+			return;
+		}
 		this.pendingOpenWrites.add(path);
 
 		const existing = this.openWriteTimers.get(path);
@@ -538,6 +553,10 @@ export class DiskMirror {
 		options: DiskWriteOptions = {},
 	): Promise<DiskWriteResult> {
 		path = normalizePath(path);
+		if (!this.isMarkdownPathSyncable(path)) {
+			this.log(`flushWrite: skipping excluded path "${path}"`);
+			return { kind: "deferred", path, reason: "path-excluded" };
+		}
 		return this.runPathWriteLocked(path, () => this.flushWriteUnlocked(path, force, options));
 	}
 
@@ -774,6 +793,10 @@ export class DiskMirror {
 		options: { baselineText?: string | null } = {},
 	): Promise<void> {
 		const normalized = normalizePath(path);
+		if (!this.isMarkdownPathSyncable(normalized)) {
+			this.log(`remote delete: skipping excluded path "${normalized}"`);
+			return;
+		}
 		const wasOpen = this.openPaths.has(normalized);
 		const wasObserved = this.textObservers.has(normalized);
 		const wasSuppressed = this.isSuppressed(normalized);
@@ -1055,6 +1078,10 @@ export class DiskMirror {
 		const oldNormalized = normalizePath(oldPath);
 		const newNormalized = normalizePath(newPath);
 		if (oldNormalized === newNormalized) return;
+		if (!this.isMarkdownPathSyncable(oldNormalized) || !this.isMarkdownPathSyncable(newNormalized)) {
+			this.log(`remote rename: skipping excluded path "${oldNormalized}" -> "${newNormalized}"`);
+			return;
+		}
 
 		const wasOpen = this.openPaths.delete(oldNormalized);
 		if (wasOpen) {

@@ -171,6 +171,31 @@ console.log("\n--- VaultSync reconcile: duplicate active path is not seeded as a
 	assertEq(vs.getActiveFileIdsForPath("Shared/path.md").join(","), "id-a,id-b", "original collided ids are preserved");
 }
 
+console.log("\n--- VaultSync reconcile: excluded CRDT paths are not restored to disk ---");
+{
+	const vs = makeVaultSync();
+	const hiddenText = new Y.Text();
+	hiddenText.insert(0, "hidden");
+	const visibleText = new Y.Text();
+	visibleText.insert(0, "visible");
+	vs.idToText.set("hidden", hiddenText);
+	vs.idToText.set("visible", visibleText);
+	vs.meta.set("hidden", createNestedActiveMeta(".obsidian-mobile/plugins/example/README.md", 10, "A"));
+	vs.meta.set("visible", createNestedActiveMeta("notes/visible.md", 10, "A"));
+
+	const result = vs.reconcileVault(
+		new Map(),
+		new Set(),
+		"authoritative",
+		"TestDevice",
+		undefined,
+		(path) => !path.split("/").some((part) => part.startsWith(".")),
+	);
+
+	assertEq(result.createdOnDisk.join(","), "notes/visible.md", "excluded CRDT path is not scheduled for disk creation");
+	assertEq(vs.getTextForPath(".obsidian-mobile/plugins/example/README.md")?.toString(), "hidden", "excluded CRDT data is retained without writing it");
+}
+
 console.log(`\npath-binding-integrity: ${passed} passed, ${failed} failed`);
 if (failed > 0) {
 	process.exit(1);

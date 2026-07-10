@@ -554,7 +554,8 @@ export class ReconciliationController {
 		unresolvedCount: number;
 	}> {
 		const { vaultSync, diskFiles, diskPresentPaths, deviceName } = input;
-		const activePaths = vaultSync.getActiveMarkdownPaths();
+		const activePaths = vaultSync.getActiveMarkdownPaths()
+			.filter((path) => this.deps.isMarkdownPathSyncable(path));
 		const missingCrdtPaths = activePaths.filter((path) => !diskPresentPaths.has(path));
 		const extraDiskPaths = [...diskPresentPaths].filter((path) =>
 			!vaultSync.getTextForPath(path) && !vaultSync.isMarkdownTombstoned(path)
@@ -904,6 +905,7 @@ export class ReconciliationController {
 						},
 					};
 				},
+				(path) => this.deps.isMarkdownPathSyncable(path),
 			);
 
 			let flushedCreates = 0;
@@ -1013,6 +1015,12 @@ export class ReconciliationController {
 					...result.updatedOnDisk,
 				]);
 				for (const path of result.createdOnDisk) {
+					// VaultSync filters these already, but keep the controller boundary
+					// closed as well: stale CRDT entries for excluded paths must never
+					// reach DiskMirror, even if a future reconcile implementation changes.
+					if (!this.deps.isMarkdownPathSyncable(path)) {
+						continue;
+					}
 					this.deps.recordFlightPathEvent?.({
 						priority: "important",
 						kind: PRODUCT_EVENT_KIND.reconcileFileDecision,

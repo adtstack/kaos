@@ -67,6 +67,7 @@ function makeHarness(options: {
 	openEditorContent?: string | (() => string);
 	initialDiskContent?: string;
 	onRead?: () => void | Promise<void>;
+	isMarkdownPathSyncable?: (path: string) => boolean;
 } = {}) {
 	const doc = new Y.Doc();
 	const meta = doc.getMap<{ path: string; deleted?: boolean }>("meta");
@@ -139,8 +140,28 @@ function makeHarness(options: {
 
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const mirror = new DiskMirror(fakeApp as any, fakeVaultSync as any, fakeEditorBindings as any, false);
+	mirror.setMarkdownPathSyncabilityPredicate(options.isMarkdownPathSyncable ?? (() => true));
 
 	return { doc, ytext, fakeProvider, meta, mirror, diskFiles };
+}
+
+// ── Test 2b: excluded remote paths never enter the write queue ───────────────
+
+console.log("\n--- Test 2b: excluded remote path is never scheduled or written ---");
+{
+	const { doc, ytext, fakeProvider, mirror, diskFiles } = makeHarness({
+		isMarkdownPathSyncable: () => false,
+	});
+	mirror.startMapObservers();
+
+	doc.transact(() => { ytext.insert(0, "remote hidden content"); }, fakeProvider);
+	assert(debounceTimerCount(mirror) === 0, "excluded provider update does not enter the debounce queue");
+
+	const result = await mirror.flushWrite(FILE_PATH, true);
+	assert(result.kind === "deferred" && result.reason === "path-excluded", "excluded direct flush is deferred");
+	assert(!diskFiles.has(FILE_PATH), "excluded direct flush does not create a disk file");
+
+	doc.destroy();
 }
 
 // Private-field accessors — DiskMirror internals are not exposed publicly
