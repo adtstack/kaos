@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { HeadlessVault } from "../src/headless-host/core/vault";
 import { TFile, TFolder } from "../src/headless-host/core/fileTypes";
-import { isExcluded } from "../src/sync/exclude";
 
 const root = await mkdtemp(join(tmpdir(), "kaos-headless-host-vault-"));
 const vault = new HeadlessVault({
@@ -92,25 +91,6 @@ try {
 	]);
 	console.log("  PASS  scans stay sorted and skip host-private files");
 
-	console.log("\n--- headless host vault adapter: injected KAOS policy excludes tool and hidden paths ---");
-	const policyRoot = join(root, "policy-vault");
-	const policyVault = new HeadlessVault({
-		vaultRoot: policyRoot,
-		isPathExcluded: (path) => isExcluded(path, [], ".obsidian"),
-	});
-	await mkdir(join(policyRoot, "sample-vault", ".obsidian"), { recursive: true });
-	await mkdir(join(policyRoot, "project", "node_modules", "pkg"), { recursive: true });
-	await mkdir(join(policyRoot, "project", "dist"), { recursive: true });
-	await mkdir(join(policyRoot, "notes"), { recursive: true });
-	await writeFile(join(policyRoot, "sample-vault", ".obsidian", "workspace.json"), "{}", "utf8");
-	await writeFile(join(policyRoot, "project", "node_modules", "pkg", "index.js"), "module.exports = {};", "utf8");
-	await writeFile(join(policyRoot, "project", "dist", "bundle.js"), "compiled", "utf8");
-	await writeFile(join(policyRoot, "notes", "draft.md.swp"), "temporary", "utf8");
-	await writeFile(join(policyRoot, "notes", "kept.md"), "kept", "utf8");
-	assert.deepEqual(policyVault.getFiles().map((file) => file.path), ["notes/kept.md"]);
-	assert.equal(policyVault.getAbstractFileByPath("sample-vault/.obsidian/workspace.json"), null);
-	assert.equal(policyVault.getAbstractFileByPath("project/node_modules/pkg/index.js"), null);
-	console.log("  PASS  injected policy prevents hidden/generated paths from reaching the poller");
 } finally {
 	await rm(root, { recursive: true, force: true });
 }

@@ -15,7 +15,6 @@ export interface HeadlessAppOptions {
 	pluginDataMode?: HeadlessPluginDataMode;
 	configDir?: string;
 	excludedPaths?: string[];
-	isPathExcluded?: (path: string) => boolean;
 }
 
 export class HeadlessApp {
@@ -39,7 +38,6 @@ export class HeadlessApp {
 			vaultRoot: options.vaultRoot,
 			configDir: options.configDir,
 			excludedPaths: options.excludedPaths,
-			isPathExcluded: options.isPathExcluded,
 		});
 		this.metadataCache = new HeadlessMetadataCache(this.vault);
 		this.fileManager = new HeadlessFileManager(this.vault);
