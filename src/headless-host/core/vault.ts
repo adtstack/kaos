@@ -10,6 +10,8 @@ export interface HeadlessVaultOptions {
 	trashDir?: string;
 	name?: string;
 	excludedPaths?: string[];
+	/** Product-specific scan policy supplied by the host integration. */
+	isPathExcluded?: (path: string) => boolean;
 }
 
 export class HeadlessVault extends HeadlessEventEmitter {
@@ -18,6 +20,7 @@ export class HeadlessVault extends HeadlessEventEmitter {
 	private readonly name: string;
 	private readonly trashDir: string;
 	private readonly excludedPaths: string[];
+	private readonly isPathExcluded: ((path: string) => boolean) | undefined;
 
 	constructor(options: HeadlessVaultOptions) {
 		super();
@@ -30,6 +33,7 @@ export class HeadlessVault extends HeadlessEventEmitter {
 			this.trashDir,
 			...(options.excludedPaths ?? []),
 		].map((path) => normalizePath(path)).filter(Boolean);
+		this.isPathExcluded = options.isPathExcluded;
 	}
 
 	getName(): string {
@@ -98,6 +102,7 @@ export class HeadlessVault extends HeadlessEventEmitter {
 
 	getAbstractFileByPath(path: string): TFile | TFolder | null {
 		const normalized = normalizePath(path);
+		if (this.isExcludedPath(normalized)) return null;
 		const abs = this.adapter.toFsPath(normalized);
 		try {
 			const s = statSync(abs);
@@ -158,6 +163,7 @@ export class HeadlessVault extends HeadlessEventEmitter {
 	private isExcludedPath(path: string): boolean {
 		const normalized = normalizePath(path);
 		if (isInternalTempFile(normalized)) return true;
+		if (this.isPathExcluded?.(normalized)) return true;
 		return this.excludedPaths.some((prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`));
 	}
 }

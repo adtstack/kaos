@@ -36,6 +36,7 @@ const releaseAssets = [
 	"scripts/smoke-headless-host-sync.mjs",
 	"scripts/postflight-headless-host.mjs",
 	"scripts/rollback-headless-host.mjs",
+	pluginBundleOutfile,
 ];
 
 const obsidianAliasPlugin = {
@@ -176,8 +177,8 @@ files are preserved unless --force-env or --force-token is passed.
 The headless host binary is only the runner. It loads the KAOS Obsidian plugin
 from the configured vault, by default /srv/kaos/vault/.obsidian/plugins/kaos.
 Install or sync the plugin into that vault before starting the service; the
-service doctor checks manifest.json and main.js there. Updating /opt/kaos
-updates the runner/helpers, not the vault plugin.
+service doctor checks manifest.json and main.js there. Release updates keep
+that plugin in step with the runner while preserving its data.json settings.
 The bundled systemd service uses /usr/bin/node -- /opt/kaos/kaos-headless-host.mjs
 so headless host flags are not parsed as Node.js options. If you change the
 bootstrap user or paths, update User=/Group=, ExecStart/ExecStartPre, and
@@ -440,8 +441,9 @@ The installer is intentionally interactive. Service startup runs:
   kaos update --startup
 
 Updates are non-interactive, verify the newly installed runner with doctor,
-and roll back the current symlink if verification fails. Vault plugin files are
-read from the configured vault and are not overwritten by headless updates.
+and roll back the current symlink if verification fails. Updates also replace
+the KAOS runtime files in the configured vault from the verified release bundle,
+while preserving its data.json settings.
 
 Remove the user service, runner, state, and sync configuration with:
 

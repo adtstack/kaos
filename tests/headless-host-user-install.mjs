@@ -56,7 +56,7 @@ try {
 	}
 	console.log("  PASS  user release assets are complete and checksummed");
 
-	console.log("\n--- headless host user install: non-interactive update applies release and preserves vault plugin ---");
+	console.log("\n--- headless host user install: non-interactive update applies runner and vault plugin release ---");
 	const home = join(root, "home");
 	const vaultRoot = join(home, "Vault");
 	const installRoot = join(home, ".local", "lib", "kaos");
@@ -137,17 +137,27 @@ try {
 	assert.equal(updatePayload.updated, true);
 	assert.equal(updatePayload.previousVersion, "0.0.0");
 	assert.equal(updatePayload.version, releaseManifest.version);
+	assert.equal(updatePayload.pluginUpdated, true);
+	assert.equal(updatePayload.pluginVersion, pluginVersion);
 	assert.equal((await readFile(join(currentLink, "VERSION"), "utf8")).trim(), releaseManifest.version);
-	assert.equal(JSON.parse(await readFile(join(pluginDir, "manifest.json"), "utf8")).version, "0.0.0-local");
+	assert.equal(JSON.parse(await readFile(join(pluginDir, "manifest.json"), "utf8")).version, pluginVersion);
+	assert.deepEqual(JSON.parse(await readFile(join(pluginDir, "data.json"), "utf8")), {
+		host: "https://worker.example.invalid",
+		token: "secret-token",
+		vaultId: "vault-user",
+		deviceName: "desktop",
+		enableAttachmentSync: true,
+	});
 	const updatedConfig = JSON.parse(await readFile(paths.installConfig, "utf8"));
 	assert.equal(updatedConfig.version, releaseManifest.version);
+	assert.equal(updatedConfig.pluginVersion, pluginVersion);
 	const status = spawnSync(paths.binKaos, ["status", "--config", paths.installConfig], {
 		encoding: "utf8",
 		env: { ...process.env, HOME: home },
 	});
 	assert.equal(status.status, 0, status.stderr || status.stdout);
 	assert.equal(JSON.parse(status.stdout).currentVersion, releaseManifest.version);
-	console.log("  PASS  kaos update installs the user release without overwriting the vault plugin");
+	console.log("  PASS  kaos update installs matching runner/plugin releases and preserves data.json");
 
 	console.log("\n--- headless host user install: startup update is failure-tolerant ---");
 	const badConfig = join(configDir, "bad-install.json");

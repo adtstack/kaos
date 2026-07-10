@@ -9,6 +9,7 @@ import * as codeMirrorStateShim from "../codeMirrorStateShim";
 import * as codeMirrorViewShim from "../codeMirrorViewShim";
 import * as obsidianShim from "../obsidianShim";
 import { installHeadlessHostPolyfills } from "../polyfills";
+import { isExcluded } from "../../sync/exclude";
 
 export interface BootKaosHeadlessPluginOptions {
 	vaultRoot: string;
@@ -28,12 +29,17 @@ export async function bootKaosHeadlessPlugin(options: BootKaosHeadlessPluginOpti
 	const pluginId = options.pluginId ?? "kaos";
 	const pluginDir = resolve(options.pluginDir ?? join(vaultRoot, ".obsidian", "plugins", pluginId));
 	const pluginVaultDir = vaultRelativePluginDir(vaultRoot, pluginDir);
+	const configDir = pluginVaultDir.split("/", 1)[0]!;
 	const manifest = await readPluginManifest(pluginDir);
 	const PluginClass = await loadPluginMain(join(pluginDir, "main.js"));
 	const app = new HeadlessApp({
 		vaultRoot,
 		dataFile: resolve(options.dataFile),
 		excludedPaths: dataFileExclusionPaths(options.vaultRoot, options.dataFile),
+		// The core vault remains product-agnostic, but KAOS must not poll paths
+		// that Obsidian itself does not expose as ordinary vault files. This is a
+		// defense-in-depth counterpart to the plugin's sync admission checks.
+		isPathExcluded: (path) => isExcluded(path, [], configDir),
 	});
 	const pluginManifest = {
 		...manifest,

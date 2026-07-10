@@ -168,7 +168,8 @@ async function installInteractive(raw) {
 				asset: PLUGIN_ZIP,
 				workDir,
 			});
-			await installPluginZip(pluginZip, pluginDir);
+			const pluginInstall = await installPluginZip(pluginZip, pluginDir);
+			await finalizePluginInstall(pluginInstall);
 			await enableVaultPlugin(vaultRoot, "kaos");
 			installedPluginDuringInstall = true;
 			writeTty(tty, "Installed KAOS plugin into the vault.\n");
@@ -247,33 +248,58 @@ async function updateNonInteractive(raw) {
 		const manifest = await fetchJson(assetUrl(releaseBaseUrl, USER_MANIFEST));
 		assertUserReleaseManifest(manifest);
 		const latestVersion = readManifestVersion(manifest);
+		const latestPluginVersion = readManifestPluginVersion(manifest);
 		const currentVersion = await readCurrentVersion(paths).catch(() => asNonEmptyString(config.version) ?? "0.0.0");
-		if (compareVersions(latestVersion, currentVersion) <= 0) {
+		const pluginState = await inspectVaultPlugin(config.pluginDir);
+		const installedPluginVersion = asNonEmptyString(pluginState.manifest?.version);
+		const pluginNeedsUpdate = !pluginState.usable
+			|| !installedPluginVersion
+			|| compareVersions(latestPluginVersion, installedPluginVersion) > 0;
+		const releaseNeedsUpdate = compareVersions(latestVersion, currentVersion) > 0;
+		if (!releaseNeedsUpdate && !pluginNeedsUpdate) {
 			console.log(JSON.stringify({
 				kind: "kaos-user-update",
 				ok: true,
 				updated: false,
 				currentVersion,
 				latestVersion,
+				pluginVersion: installedPluginVersion,
+				latestPluginVersion,
 			}, null, 2));
 			return;
 		}
 
 		const workDir = resolve(raw["work-dir"] ?? await mkdtemp(join(tmpdir(), "kaos-user-update-")));
-		const userZip = await obtainReleaseAsset({ manifest, baseUrl: releaseBaseUrl, asset: USER_ZIP, workDir });
+		const userZip = releaseNeedsUpdate
+			? await obtainReleaseAsset({ manifest, baseUrl: releaseBaseUrl, asset: USER_ZIP, workDir })
+			: null;
+		const pluginZip = pluginNeedsUpdate
+			? await obtainReleaseAsset({ manifest, baseUrl: releaseBaseUrl, asset: PLUGIN_ZIP, workDir })
+			: null;
 		const previousCurrent = await resolveCurrentSymlink(paths).catch(() => null);
 		let installedReleaseDir = null;
+		let pluginInstall = null;
 		try {
-			installedReleaseDir = await installUserRelease({ userZip, version: latestVersion, paths });
-			await verifyInstalledHeadless({ paths, config, releaseDir: installedReleaseDir });
-			await linkKaosCommands(paths);
+			if (pluginZip) {
+				pluginInstall = await installPluginZip(pluginZip, config.pluginDir);
+			}
+			if (userZip) {
+				installedReleaseDir = await installUserRelease({ userZip, version: latestVersion, paths });
+				await verifyInstalledHeadless({ paths, config, releaseDir: installedReleaseDir });
+				await linkKaosCommands(paths);
+			}
 			await writeJsonAtomic(configPath, {
 				...config,
-				version: latestVersion,
+				version: releaseNeedsUpdate ? latestVersion : currentVersion,
+				pluginVersion: pluginNeedsUpdate ? latestPluginVersion : installedPluginVersion,
 				updatedAt: new Date().toISOString(),
 			}, 0o600);
+			if (pluginInstall) await finalizePluginInstall(pluginInstall);
 		} catch (err) {
-			await restoreCurrentSymlink(paths, previousCurrent).catch(() => undefined);
+			if (releaseNeedsUpdate) {
+				await restoreCurrentSymlink(paths, previousCurrent).catch(() => undefined);
+			}
+			if (pluginInstall) await rollbackPluginInstall(pluginInstall).catch(() => undefined);
 			throw err;
 		}
 
@@ -282,8 +308,10 @@ async function updateNonInteractive(raw) {
 			ok: true,
 			updated: true,
 			previousVersion: currentVersion,
-			version: latestVersion,
+			version: releaseNeedsUpdate ? latestVersion : currentVersion,
 			releaseDir: installedReleaseDir,
+			pluginUpdated: pluginNeedsUpdate,
+			pluginVersion: latestPluginVersion,
 		}, null, 2));
 	} catch (err) {
 		if (startup) {
@@ -1205,12 +1233,55 @@ async function installUserRelease({ userZip, version, paths }) {
 }
 
 async function installPluginZip(pluginZip, pluginDir) {
-	await mkdir(pluginDir, { recursive: true });
 	const entries = unzipSync(await readFile(pluginZip));
 	for (const file of PLUGIN_FILES) {
-		const bytes = entries[file];
-		if (!bytes) throw new Error(`plugin zip is missing ${file}`);
-		await writeFile(join(pluginDir, file), bytes);
+		if (!entries[file]) throw new Error(`plugin zip is missing ${file}`);
+	}
+	await mkdir(pluginDir, { recursive: true });
+	const transactionId = `${process.pid}-${Date.now()}`;
+	const installed = [];
+	const staged = [];
+	try {
+		for (const file of PLUGIN_FILES) {
+			const target = join(pluginDir, file);
+			const tempPath = join(pluginDir, `.${file}.kaos-update-${transactionId}.tmp`);
+			const backupPath = join(pluginDir, `.${file}.kaos-update-${transactionId}.previous`);
+			await rm(tempPath, { force: true });
+			await rm(backupPath, { force: true });
+			await writeFile(tempPath, entries[file]);
+			staged.push(tempPath);
+			installed.push({ file, target, tempPath, backupPath, existed: await pathExists(target) });
+		}
+		for (const entry of installed) {
+			if (entry.existed) await rename(entry.target, entry.backupPath);
+			await rename(entry.tempPath, entry.target);
+		}
+		return { pluginDir, entries: installed };
+	} catch (err) {
+		await rollbackPluginInstall({ pluginDir, entries: installed }).catch(() => undefined);
+		await Promise.all(staged.map((path) => rm(path, { force: true }).catch(() => undefined)));
+		throw err;
+	}
+}
+
+async function rollbackPluginInstall(pluginInstall) {
+	for (const entry of [...pluginInstall.entries].reverse()) {
+		await rm(entry.tempPath, { force: true }).catch(() => undefined);
+		if (entry.existed) {
+			if (await pathExists(entry.backupPath)) {
+				await rm(entry.target, { force: true });
+				await rename(entry.backupPath, entry.target);
+			}
+		} else {
+			await rm(entry.target, { force: true });
+		}
+	}
+}
+
+async function finalizePluginInstall(pluginInstall) {
+	await Promise.all(pluginInstall.entries.map((entry) => rm(entry.backupPath, { force: true }).catch(() => undefined)));
+	for (const entry of pluginInstall.entries) {
+		await rm(entry.tempPath, { force: true }).catch(() => undefined);
 	}
 }
 
@@ -1413,6 +1484,12 @@ function assertUserReleaseManifest(manifest) {
 function readManifestVersion(manifest) {
 	const version = asNonEmptyString(manifest?.version);
 	if (!version) throw new Error("release manifest is missing version");
+	return version;
+}
+
+function readManifestPluginVersion(manifest) {
+	const version = asNonEmptyString(manifest?.pluginVersion);
+	if (!version) throw new Error("release manifest is missing pluginVersion");
 	return version;
 }
 

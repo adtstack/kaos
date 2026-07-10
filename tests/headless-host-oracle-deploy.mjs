@@ -34,6 +34,7 @@ const helperNames = [
 	"rollback-headless-host.mjs",
 ];
 const fullReleaseDownloadCount = 4 + helperNames.length;
+const pluginReleaseDownloadCount = fullReleaseDownloadCount + 1;
 const rollbackWithServiceArtifactCount = helperNames.length + 3;
 let oracleBundle;
 
@@ -42,10 +43,12 @@ try {
 	buildProductPluginBundle();
 	run(process.execPath, ["scripts/build-headless-host.mjs"]);
 	const builtManifest = JSON.parse(await readFile("dist/kaos-headless-host-manifest.json", "utf8"));
+	const pluginVersion = JSON.parse(await readFile("manifest.json", "utf8")).version;
 	assert.equal(builtManifest.kind, "kaos-headless-host-release-manifest");
 	assert.equal(builtManifest.assets["kaos-headless-host.mjs"].sha256, await readChecksum("dist/kaos-headless-host.mjs.sha256"));
 	assert.ok(builtManifest.assets["update-headless-host-from-release.mjs"].sha256);
 	assert.ok(builtManifest.assets["validate-headless-host-release-assets.mjs"].sha256);
+	assert.ok(builtManifest.assets["kaos-plugin.zip"].sha256);
 	const oracleBundleBytes = await readFile("dist/kaos-headless-host-oracle.zip");
 	assert.equal(sha256Bytes(oracleBundleBytes), await readChecksum("dist/kaos-headless-host-oracle.zip.sha256"));
 	oracleBundle = unzipSync(oracleBundleBytes);
@@ -341,6 +344,9 @@ ExecStart=/usr/bin/node /opt/kaos/kaos-headless-host.mjs --vault /srv/kaos/vault
 	const bundleServicePath = join(root, "etc", "systemd", "system", "kaos-headless-host-bundle.service");
 	const bundleMetadataPath = join(root, "oracle-bundle-metadata.json");
 	const bundleServiceNode = join(root, "bundle", "bin", "node");
+	const bundlePluginDir = join(root, "srv", "kaos", "vault", ".obsidian", "plugins", "kaos");
+	await mkdir(bundlePluginDir, { recursive: true });
+	await writeFile(join(bundlePluginDir, "data.json"), "{\"kept\":true}\n", "utf8");
 	const bundleVerify = run(process.execPath, [
 		join(bundleDir, "verify-headless-host-bundle.mjs"),
 		"--bundle-dir",
@@ -410,14 +416,19 @@ ExecStart=/usr/bin/node /opt/kaos/kaos-headless-host.mjs --vault /srv/kaos/vault
 		bundleServiceNode,
 		"--metadata-path",
 		bundleMetadataPath,
+		"--plugin-dir",
+		bundlePluginDir,
 	]);
 	const bundleInstallPayload = JSON.parse(bundleInstall.stdout);
 	assert.equal(bundleInstallPayload.kind, "headless-host-release-update");
+	assert.equal(bundleInstallPayload.plugin.pluginDir, bundlePluginDir);
+	assert.equal(JSON.parse(await readFile(join(bundlePluginDir, "manifest.json"), "utf8")).version, pluginVersion);
+	assert.equal(await readFile(join(bundlePluginDir, "data.json"), "utf8"), "{\"kept\":true}\n");
 	assert.equal(bundleInstallPayload.ok, true);
 	assert.match(bundleInstallPayload.baseUrl, /^file:\/\//);
 	assert.equal(bundleInstallPayload.bundleVerification.ok, true);
 	assert.equal(bundleInstallPayload.bundleVerification.kind, "headless-host-bundle-verify");
-	assert.equal(bundleInstallPayload.downloaded.length, fullReleaseDownloadCount);
+	assert.equal(bundleInstallPayload.downloaded.length, pluginReleaseDownloadCount);
 	assert.equal(bundleInstallPayload.helpers.length, helperNames.length);
 	assert.equal(bundleInstallPayload.install.serviceNode, bundleServiceNode);
 	assert.equal(await sha256File(join(bundleInstallDir, "kaos-headless-host.mjs")), await readChecksum(join(bundleDir, "kaos-headless-host.mjs.sha256")));

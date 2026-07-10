@@ -11,6 +11,7 @@ const ASSETS = {
 	binary: "kaos-headless-host.mjs",
 	checksum: "kaos-headless-host.mjs.sha256",
 	manifest: "kaos-headless-host-manifest.json",
+	plugin: "kaos-plugin.zip",
 	service: "kaos-headless-host.service",
 	helpers: [
 		"install-headless-host.mjs",
@@ -59,6 +60,11 @@ async function main() {
 	const enableServiceName = raw["postflight-service"] ?? inferServiceName(servicePath) ?? "kaos-headless-host";
 	const enableSystemctl = raw["postflight-systemctl"] ?? "systemctl";
 	const bundleDir = raw["bundle-dir"] ? resolve(raw["bundle-dir"]) : null;
+	const pluginUpdateRequested = raw["no-plugin-update"] !== "true";
+	const pluginVaultRoot = resolve(raw["postflight-vault"] ?? "/srv/kaos/vault");
+	const pluginDir = pluginUpdateRequested
+		? resolve(raw["plugin-dir"] ?? join(pluginVaultRoot, ".obsidian", "plugins", "kaos"))
+		: null;
 	if (enableService && !serviceEnabled) {
 		throw new Error("--enable-service requires a systemd service; remove --no-service.");
 	}
@@ -107,14 +113,9 @@ async function main() {
 	await mkdir(workDir, { recursive: true });
 	const binaryPath = join(workDir, ASSETS.binary);
 	const checksumPath = join(workDir, ASSETS.checksum);
+	const pluginZipPath = join(workDir, ASSETS.plugin);
 	const serviceSource = serviceEnabled ? join(workDir, ASSETS.service) : undefined;
 
-	const selectedAssets = [
-		ASSETS.binary,
-		ASSETS.checksum,
-		...(serviceEnabled ? [ASSETS.service] : []),
-		...(helpersEnabled ? ASSETS.helpers : []),
-	];
 	const downloaded = [];
 	let releaseManifest = null;
 	if (manifestEnabled) {
@@ -124,6 +125,18 @@ async function main() {
 		downloaded.push({ asset: ASSETS.manifest, url: redactUrl(url), path, sha256: await sha256File(path) });
 		releaseManifest = await readReleaseManifest(path);
 	}
+	// Older release manifests did not list the plugin bundle. Keep their
+	// runner-only updater compatible; current manifests always include it and
+	// therefore make plugin replacement part of the verified transaction.
+	const pluginUpdateEnabled = pluginUpdateRequested
+		&& (!releaseManifest || Boolean(releaseManifest.assets?.[ASSETS.plugin]));
+	const selectedAssets = [
+		ASSETS.binary,
+		ASSETS.checksum,
+		...(pluginUpdateEnabled ? [ASSETS.plugin] : []),
+		...(serviceEnabled ? [ASSETS.service] : []),
+		...(helpersEnabled ? ASSETS.helpers : []),
+	];
 	for (const asset of selectedAssets) {
 		const url = assetUrl(baseUrl, asset);
 		const path = join(workDir, asset);
@@ -151,9 +164,20 @@ async function main() {
 		installArgs.push("--metadata-path", metadataPath);
 	}
 
-	const { installPayload, helpers } = dryRun
-		? await planReleaseInstall({ installer, installArgs, workDir, installDir, helpersEnabled })
-		: await installRelease({ installer, installArgs, workDir, installDir, helpersEnabled });
+	let pluginInstall = null;
+	let installPayload;
+	let helpers;
+	try {
+		pluginInstall = pluginUpdateEnabled
+			? await installPluginZip({ pluginZipPath, pluginDir, dryRun })
+			: null;
+		({ installPayload, helpers } = dryRun
+			? await planReleaseInstall({ installer, installArgs, workDir, installDir, helpersEnabled })
+			: await installRelease({ installer, installArgs, workDir, installDir, helpersEnabled }));
+	} catch (err) {
+		if (pluginInstall && !dryRun) await rollbackPluginInstall(pluginInstall).catch(() => undefined);
+		throw err;
+	}
 	const updateMetadataPath = installPayload.metadataPath ? resolve(installPayload.metadataPath) : metadataPath;
 	if (!dryRun && updateMetadataPath) {
 		try {
@@ -181,17 +205,21 @@ async function main() {
 					helpersEnabled,
 					metadataPath: updateMetadataPath,
 				}));
+				const pluginRollback = await rollbackPluginInstall(pluginInstall);
 				throw new ReleaseUpdateError("release metadata write failed after install; rollback completed", {
 					metadataWrite,
 					rollback,
+					pluginRollback,
 					rollbackSummary: summarizeRollback(rollback),
 					rolledBack: true,
 				});
 			} catch (rollbackErr) {
 				if (rollbackErr instanceof ReleaseUpdateError) throw rollbackErr;
+				const pluginRollback = await rollbackPluginInstall(pluginInstall).catch((pluginRollbackErr) => describeError(pluginRollbackErr));
 				throw new ReleaseUpdateError("release metadata write failed after install and rollback failed", {
 					metadataWrite,
 					rollback: describeScriptFailure(rollbackErr),
+					pluginRollback,
 					rolledBack: false,
 				});
 			}
@@ -229,12 +257,15 @@ async function main() {
 					metadataPath: updateMetadataPath,
 				}));
 			} catch (rollbackErr) {
+				const pluginRollback = await rollbackPluginInstall(pluginInstall).catch((pluginRollbackErr) => describeError(pluginRollbackErr));
 				throw new ReleaseUpdateError("postflight failed after release install and rollback failed", {
 					postflight: postflightFailure,
 					rollback: describeScriptFailure(rollbackErr),
+					pluginRollback,
 					rolledBack: false,
 				});
 			}
+			const pluginRollback = await rollbackPluginInstall(pluginInstall);
 
 			let rollbackPostflight = null;
 			if (rollbackPostflightEnabled) {
@@ -260,6 +291,7 @@ async function main() {
 			throw new ReleaseUpdateError("postflight failed after release install; rollback completed and recovery postflight passed", {
 				postflight: postflightFailure,
 				rollback,
+				pluginRollback,
 				rollbackSummary: summarizeRollback(rollback),
 				rollbackPostflight,
 				rolledBack: true,
@@ -288,6 +320,7 @@ async function main() {
 			}
 		}
 	}
+	if (pluginInstall && !dryRun) await finalizePluginInstall(pluginInstall);
 
 	console.log(JSON.stringify(redactObject({
 		kind: "headless-host-release-update",
@@ -297,6 +330,7 @@ async function main() {
 		installDir,
 		installer,
 		servicePath: servicePath ?? null,
+		plugin: pluginInstall,
 		downloaded,
 		manifest: releaseManifest,
 		bundleVerification,
@@ -322,6 +356,8 @@ function assertPostflightOnlyArgs(raw) {
 		"no-manifest",
 		"skip-bundle-verify",
 		"no-service",
+		"no-plugin-update",
+		"plugin-dir",
 		"no-rollback-postflight",
 	];
 	const used = forbidden.filter((key) => raw[key] !== undefined);
@@ -544,6 +580,78 @@ async function verifyManifestAssets(manifest, assets, workDir) {
 		if (actual !== expected.toLowerCase()) {
 			throw new Error(`sha256 mismatch for release asset ${asset}: expected ${expected.toLowerCase()}, got ${actual}`);
 		}
+	}
+}
+
+const PLUGIN_FILES = ["manifest.json", "main.js", "telemetry.js", "styles.css"];
+
+async function installPluginZip({ pluginZipPath, pluginDir, dryRun }) {
+	if (!pluginDir) throw new Error("pluginDir is required when plugin updates are enabled");
+	const zipEntries = new Map(PLUGIN_FILES.map((file) => [file, readZipEntry(pluginZipPath, file)]));
+	const transactionId = `${process.pid}-${Date.now()}`;
+	const entries = await Promise.all(PLUGIN_FILES.map(async (file) => {
+		const target = join(pluginDir, file);
+		return {
+			file,
+			target,
+			tempPath: join(pluginDir, `.${file}.kaos-update-${transactionId}.tmp`),
+			backupPath: join(pluginDir, `.${file}.kaos-update-${transactionId}.previous`),
+			existed: await pathExists(target),
+		};
+	}));
+	if (dryRun) return { pluginDir, dryRun: true, entries };
+	await mkdir(pluginDir, { recursive: true });
+	try {
+		for (const entry of entries) {
+			await rm(entry.tempPath, { force: true });
+			await rm(entry.backupPath, { force: true });
+			await writeFile(entry.tempPath, zipEntries.get(entry.file));
+		}
+		for (const entry of entries) {
+			if (entry.existed) await rename(entry.target, entry.backupPath);
+			await rename(entry.tempPath, entry.target);
+		}
+		return { pluginDir, dryRun: false, entries };
+	} catch (err) {
+		await rollbackPluginInstall({ pluginDir, dryRun: false, entries }).catch(() => undefined);
+		throw err;
+	}
+}
+
+function readZipEntry(zipPath, entry) {
+	const result = spawnSync("unzip", ["-p", zipPath, entry], {
+		encoding: null,
+		maxBuffer: 64 * 1024 * 1024,
+	});
+	if (result.error) {
+		throw new Error(`unable to read ${entry} from plugin zip: ${result.error.message}`);
+	}
+	if (result.status !== 0 || !result.stdout || result.stdout.length === 0) {
+		const detail = result.stderr?.toString("utf8").trim();
+		throw new Error(`plugin zip is missing or unreadable: ${entry}${detail ? ` (${detail})` : ""}`);
+	}
+	return result.stdout;
+}
+
+async function rollbackPluginInstall(pluginInstall) {
+	if (!pluginInstall || pluginInstall.dryRun) return { restored: false, skipped: true };
+	for (const entry of [...pluginInstall.entries].reverse()) {
+		await rm(entry.tempPath, { force: true }).catch(() => undefined);
+		if (entry.existed && await pathExists(entry.backupPath)) {
+			await rm(entry.target, { force: true });
+			await rename(entry.backupPath, entry.target);
+		} else if (!entry.existed) {
+			await rm(entry.target, { force: true });
+		}
+	}
+	return { restored: true, pluginDir: pluginInstall.pluginDir };
+}
+
+async function finalizePluginInstall(pluginInstall) {
+	if (!pluginInstall || pluginInstall.dryRun) return;
+	for (const entry of pluginInstall.entries) {
+		await rm(entry.tempPath, { force: true }).catch(() => undefined);
+		await rm(entry.backupPath, { force: true }).catch(() => undefined);
 	}
 }
 
@@ -1047,6 +1155,8 @@ Options:
                             /etc/systemd/system/kaos-headless-host.service.
   --service-node <path>     Rewrite installed service ExecStart/ExecStartPre to use this Node binary.
                             Service commands must use "<node> -- <script>" form.
+	--plugin-dir <path>       Vault KAOS plugin directory. Defaults under --postflight-vault.
+	--no-plugin-update        Leave the vault KAOS plugin untouched (emergency compatibility escape hatch).
   --no-manifest             Do not download or verify kaos-headless-host-manifest.json.
   --no-service              Do not download or install the systemd service file.
   --no-helper-scripts       Do not download or install install/uninstall/update/verify/rehearsal/smoke/postflight/rollback helper scripts.
