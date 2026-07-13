@@ -35,7 +35,15 @@ import {
 	setCachedHash,
 	removeCachedHash,
 } from "./blobHashCache";
-import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry, type PreservedUnresolvedReason } from "./preservedUnresolved";
+import {
+	PreservedUnresolvedRegistry,
+	getPreservedUnresolvedEpisodeId,
+	getRemoteDeleteEpisodeId,
+	isRemoteDeletePreservedUnresolvedEntry,
+	type PreservedUnresolvedEntry,
+	type PreservedUnresolvedReason,
+	type RemoteDeletePreservedUnresolvedReason,
+} from "./preservedUnresolved";
 import {
 	buildBlobConflictArtifactCopyPath,
 	buildBlobConflictArtifactPath,
@@ -260,6 +268,15 @@ interface UploadItem {
 	retries: number;
 	status: "pending" | "processing";
 	readyAt: number;
+	/** Per-path fence captured when this transfer was queued. */
+	generation: number;
+	/**
+	 * Explicit dashboard resolution intent. Unlike an ordinary upload, this is
+	 * allowed to pass the preserved-unresolved guard while the tombstone and
+	 * marker remain in place. The intent is persisted with the queue so a
+	 * restart cannot silently turn it into an ordinary guarded upload.
+	 */
+	attentionResolution?: BlobKeepLocalUploadResolution;
 	needsRerun?: boolean;
 	/** How many times this item has been reset via needsRerun. Capped at MAX_RERUN_RESETS. */
 	rerunResets: number;
@@ -269,12 +286,31 @@ interface DownloadItem {
 	path: string;
 	hash: string;
 	sizeBytes?: number;
+	/** Latest target received while the current immutable attempt is running. */
+	nextHash?: string;
+	nextSizeBytes?: number;
 	retries: number;
 	status: "pending" | "processing";
 	readyAt: number;
+	/** Per-path fence captured when this transfer was queued. */
+	generation: number;
 	needsRerun?: boolean;
 	/** How many times this item has been reset via needsRerun. Capped at MAX_RERUN_RESETS. */
 	rerunResets: number;
+}
+
+export interface BlobKeepLocalUploadResolution {
+	kind: "keep-local-remote-delete";
+	expectedReason: RemoteDeletePreservedUnresolvedReason;
+	/** Identifies the preserved-unresolved episode across queue persistence. */
+	episodeId: string;
+	/** Identifies the exact authoritative blob tombstone being resolved. */
+	remoteDeleteFingerprint: string;
+}
+
+export interface BlobRemoteDeleteResolutionIdentity {
+	episodeId?: string;
+	remoteDeleteFingerprint?: string;
 }
 
 /**
@@ -288,6 +324,7 @@ export interface BlobQueueSnapshot {
 		retries?: number;
 		status?: "pending" | "processing";
 		readyAt?: number;
+		attentionResolution?: BlobKeepLocalUploadResolution;
 		needsRerun?: boolean;
 		rerunResets?: number;
 	}[];
@@ -322,6 +359,8 @@ export class BlobSyncManager {
 	private inflightUploads = new Set<string>();
 	/** Paths currently downloading. */
 	private inflightDownloads = new Set<string>();
+	/** Promises that must settle before a manager replacement may start. */
+	private activeTransferPromises = new Set<Promise<void>>();
 	/** Retry timers for failed transfers. */
 	private retryTimers = new Set<ReturnType<typeof setTimeout>>();
 	/** True while upload drain is running. */
@@ -347,6 +386,17 @@ export class BlobSyncManager {
 	private _blobConflictArtifacts = 0;
 	private localOnlyBlobConflictPaths = new Set<string>();
 	private remoteDeleteInFlight = new Set<string>();
+	/**
+	 * Monotonic per-path fences. Accepting a remote delete advances the fence;
+	 * queued/in-flight work must re-check its captured value immediately before
+	 * publishing a blob ref or writing downloaded bytes.
+	 */
+	private transferGenerations = new Map<string, number>();
+	/** Paths whose local delete callback is currently running. */
+	private attentionAcceptInFlight = new Set<string>();
+	/** Waiters used by Accept to let already-started disk writes settle first. */
+	private transferSettleWaiters = new Map<string, Set<() => void>>();
+	private destroyed = false;
 	private remoteDeleteHashesByTransaction = new WeakMap<
 		import("yjs").Transaction,
 		Map<string, string>
@@ -403,10 +453,23 @@ export class BlobSyncManager {
 		this.maxSize = settings.maxAttachmentSizeKB * 1024;
 		this.debug = settings.debug;
 		this.hashCache = hashCache;
+		const initialBlobEntries = initialPreservedUnresolved.filter(
+			(entry) => entry.kind === "blob",
+		);
+		const retainedBlobEntries = initialBlobEntries.filter((entry) => {
+			if (!isRemoteDeletePreservedUnresolvedEntry(entry)) return true;
+			// A live ref proves the remote-delete episode ended. This also heals
+			// a durable stale marker if Keep-local committed just before a crash.
+			return !this.vaultSync.getBlobRef(entry.path)
+				|| this.getAuthoritativeBlobDeleteFingerprint(entry.path) !== null;
+		});
 		this.preservedUnresolved = new PreservedUnresolvedRegistry(
-			initialPreservedUnresolved.filter((entry) => entry.kind === "blob"),
+			retainedBlobEntries,
 		);
 		this.preservedUnresolvedPaths = this.preservedUnresolved.paths;
+		if (retainedBlobEntries.length !== initialBlobEntries.length) {
+			queueMicrotask(() => this.onPreservedUnresolvedChanged?.());
+		}
 	}
 
 	// -------------------------------------------------------------------
@@ -483,13 +546,24 @@ export class BlobSyncManager {
 		this.log("Blob observers started");
 	}
 
-	private enqueueUpload(path: string, retries = 0, sizeBytes?: number): void {
+	private enqueueUpload(
+		path: string,
+		retries = 0,
+		sizeBytes?: number,
+		attentionResolution?: BlobKeepLocalUploadResolution,
+	): void {
 		if (!this.isBlobPathSyncable(path)) return;
+		if (this.attentionAcceptInFlight?.has(normalizePath(path))) return;
+		const generation = this.currentTransferGeneration(path);
 		const existing = this.uploadQueue.get(path);
 		if (existing) {
 			if (sizeBytes && sizeBytes > 0) existing.sizeBytes = sizeBytes;
 			existing.retries = Math.min(existing.retries, retries);
 			existing.readyAt = 0;
+			existing.generation = generation;
+			if (attentionResolution) {
+				existing.attentionResolution = attentionResolution;
+			}
 			if (existing.status === "processing") {
 				existing.needsRerun = true;
 			} else {
@@ -504,6 +578,8 @@ export class BlobSyncManager {
 			retries,
 			status: "pending",
 			readyAt: 0,
+			generation,
+			attentionResolution,
 			rerunResets: 0,
 		});
 	}
@@ -515,15 +591,22 @@ export class BlobSyncManager {
 		retries = 0,
 	): void {
 		if (!this.isBlobPathSyncable(path)) return;
+		if (this.attentionAcceptInFlight?.has(normalizePath(path))) return;
+		const generation = this.currentTransferGeneration(path);
 		const existing = this.downloadQueue.get(path);
 		if (existing) {
-			existing.hash = hash;
-			if (sizeBytes && sizeBytes > 0) existing.sizeBytes = sizeBytes;
-			existing.retries = Math.min(existing.retries, retries);
-			existing.readyAt = 0;
 			if (existing.status === "processing") {
+				// Do not mutate the hash that processDownload is verifying across
+				// awaits. Store the newer target for a distinct rerun attempt.
+				existing.nextHash = hash;
+				existing.nextSizeBytes = sizeBytes;
 				existing.needsRerun = true;
 			} else {
+				existing.hash = hash;
+				if (sizeBytes && sizeBytes > 0) existing.sizeBytes = sizeBytes;
+				existing.retries = Math.min(existing.retries, retries);
+				existing.readyAt = 0;
+				existing.generation = generation;
 				existing.status = "pending";
 			}
 			return;
@@ -536,8 +619,115 @@ export class BlobSyncManager {
 			retries,
 			status: "pending",
 			readyAt: 0,
+			generation,
 			rerunResets: 0,
 		});
+	}
+
+	private currentTransferGeneration(path: string): number {
+		return this.transferGenerations?.get(normalizePath(path)) ?? 0;
+	}
+
+	private isTransferCurrent(path: string, generation: number): boolean {
+		const normalized = normalizePath(path);
+		return !this.destroyed
+			&& !this.attentionAcceptInFlight?.has(normalized)
+			&& this.currentTransferGeneration(normalized) === generation;
+	}
+
+	private discardUploadItem(item: UploadItem): void {
+		if (this.uploadQueue.get(item.path) === item) {
+			this.uploadQueue.delete(item.path);
+		}
+	}
+
+	private discardDownloadItem(item: DownloadItem): void {
+		if (this.downloadQueue.get(item.path) === item) {
+			this.downloadQueue.delete(item.path);
+		}
+	}
+
+	/**
+	 * Advance the path fence and remove all queued/debounced work. Network
+	 * requests already in progress cannot always be aborted by Obsidian's HTTP
+	 * API, so their commit/write sites are fenced by the returned generation.
+	 */
+	private fenceTransfersForPath(path: string, reason: string): number {
+		const normalized = normalizePath(path);
+		const generation = this.currentTransferGeneration(normalized) + 1;
+		if (!this.transferGenerations) {
+			this.transferGenerations = new Map<string, number>();
+		}
+		this.transferGenerations.set(normalized, generation);
+
+		if (this.uploadDebounce) {
+			for (const [queuedPath, timer] of this.uploadDebounce) {
+				if (normalizePath(queuedPath) !== normalized) continue;
+				clearTimeout(timer);
+				this.uploadDebounce.delete(queuedPath);
+			}
+		}
+		if (this.uploadQueue) {
+			for (const queuedPath of this.uploadQueue.keys()) {
+				if (normalizePath(queuedPath) === normalized) {
+					this.uploadQueue.delete(queuedPath);
+				}
+			}
+		}
+		if (this.downloadQueue) {
+			for (const queuedPath of this.downloadQueue.keys()) {
+				if (normalizePath(queuedPath) === normalized) {
+					this.downloadQueue.delete(queuedPath);
+				}
+			}
+		}
+
+		this.trace?.("blob", "transfer-path-fenced", {
+			path: normalized,
+			generation,
+			reason,
+		});
+		return generation;
+	}
+
+	private hasInFlightTransferForPath(path: string): boolean {
+		const normalized = normalizePath(path);
+		return Array.from(this.inflightUploads ?? []).some(
+			(candidate) => normalizePath(candidate) === normalized,
+		) || Array.from(this.inflightDownloads ?? []).some(
+			(candidate) => normalizePath(candidate) === normalized,
+		);
+	}
+
+	private async waitForTransfersToSettle(path: string): Promise<void> {
+		const normalized = normalizePath(path);
+		while (this.hasInFlightTransferForPath(normalized)) {
+			await new Promise<void>((resolve) => {
+				let waiters = this.transferSettleWaiters.get(normalized);
+				if (!waiters) {
+					waiters = new Set();
+					this.transferSettleWaiters.set(normalized, waiters);
+				}
+				waiters.add(resolve);
+				// Avoid a lost wake-up if a transfer settled between the loop check
+				// and waiter registration.
+				if (!this.hasInFlightTransferForPath(normalized)) {
+					waiters.delete(resolve);
+					if (waiters.size === 0) {
+						this.transferSettleWaiters.delete(normalized);
+					}
+					resolve();
+				}
+			});
+		}
+	}
+
+	private notifyTransferSettled(path: string): void {
+		const normalized = normalizePath(path);
+		const waiters = this.transferSettleWaiters.get(normalized);
+		if (!waiters) return;
+		this.transferSettleWaiters.delete(normalized);
+		for (const resolve of waiters) resolve();
 	}
 
 	// -------------------------------------------------------------------
@@ -550,6 +740,7 @@ export class BlobSyncManager {
 	 */
 	handleFileChange(file: TFile): void {
 		if (!this.isBlobPathSyncable(file.path)) return;
+		if (this.attentionAcceptInFlight.has(normalizePath(file.path))) return;
 		if (
 			this.localOnlyBlobConflictPaths.has(file.path) ||
 			isBaseBlobConflictArtifactPath(normalizePath(file.path))
@@ -565,7 +756,14 @@ export class BlobSyncManager {
 
 		// If the user explicitly modifies a preserved-unresolved file, that
 		// constitutes intentional user action. Clear the guard and allow upload.
-		if (this.preservedUnresolvedPaths.has(file.path)) {
+		// An already queued dashboard Keep-local resolution is the exception: its
+		// marker must remain durable until the two-phase upload commit succeeds.
+		const queuedResolution = this.uploadQueue.get(file.path)
+			?.attentionResolution;
+		if (
+			this.preservedUnresolvedPaths.has(file.path)
+			&& queuedResolution?.kind !== "keep-local-remote-delete"
+		) {
 			if (this.preservedUnresolved.resolve(file.path)) {
 				this.onPreservedUnresolvedChanged?.();
 			}
@@ -596,23 +794,39 @@ export class BlobSyncManager {
 	 * Handle a local file delete for a blob-syncable file.
 	 */
 	handleFileDelete(path: string, device?: string): void {
+		const normalized = normalizePath(path);
+		const acceptingAttentionDelete =
+			this.attentionAcceptInFlight.has(normalized);
+		if (!acceptingAttentionDelete) {
+			this.fenceTransfersForPath(normalized, "local-file-delete");
+		}
 		// Cancel any pending upload
-		const pendingUpload = this.uploadDebounce.get(path);
+		const pendingUpload = this.uploadDebounce.get(normalized);
 		if (pendingUpload) {
 			clearTimeout(pendingUpload);
 		}
-		this.uploadDebounce.delete(path);
-		this.uploadQueue.delete(path);
+		this.uploadDebounce.delete(normalized);
+		this.uploadQueue.delete(normalized);
 
-		// If user deletes a preserved-unresolved file, that resolves the conflict.
-		if (this.preservedUnresolved.resolve(path)) {
+		// The explicit Accept flow owns marker completion and only clears it after
+		// its delete callback resolves. Ordinary user deletes still resolve here.
+		if (
+			!acceptingAttentionDelete
+			&& this.preservedUnresolved.resolve(normalized)
+		) {
 			this.onPreservedUnresolvedChanged?.();
 		}
 
 		// Remove from hash cache
-		removeCachedHash(this.hashCache, path);
+		removeCachedHash(this.hashCache, normalized);
+		if (acceptingAttentionDelete) {
+			// The remote tombstone already owns CRDT authority. In particular, do
+			// not tombstone a concurrent remote revival observed while trashFile()
+			// is dispatching its local delete event.
+			return;
+		}
 
-		this.vaultSync.deleteBlobRef(path, device);
+		this.vaultSync.deleteBlobRef(normalized, device);
 	}
 
 	/**
@@ -639,6 +853,213 @@ export class BlobSyncManager {
 
 	getPreservedUnresolvedEntries(): PreservedUnresolvedEntry[] {
 		return this.preservedUnresolved.getEntries();
+	}
+
+	isKeepLocalRemoteDeletePending(path: string, episodeId: string): boolean {
+		const normalized = normalizePath(path);
+		for (const item of this.uploadQueue.values()) {
+			if (normalizePath(item.path) !== normalized) continue;
+			const resolution = item.attentionResolution;
+			return resolution?.kind === "keep-local-remote-delete"
+				&& resolution.episodeId === episodeId;
+		}
+		return false;
+	}
+
+	private getAuthoritativeBlobDeleteFingerprint(path: string): string | null {
+		const normalized = normalizePath(path);
+		const snapshotGetter = (
+			this.vaultSync as unknown as {
+				getAuthoritativeBlobDeleteSnapshot?: (
+					candidate: string,
+				) => { fingerprint: string } | null;
+			}
+		).getAuthoritativeBlobDeleteSnapshot;
+		if (typeof snapshotGetter === "function") {
+			return snapshotGetter.call(this.vaultSync, normalized)?.fingerprint ?? null;
+		}
+
+		// Backward-compatible fallback for focused tests and older VaultSync
+		// doubles. Production VaultSync always uses the authoritative snapshot,
+		// where a live ref wins over a stale tombstone.
+		const tombstoned = typeof this.vaultSync.isBlobTombstoned === "function"
+			? this.vaultSync.isBlobTombstoned(normalized)
+			: true;
+		if (!tombstoned || this.vaultSync.getBlobRef?.(normalized)) {
+			return null;
+		}
+		return JSON.stringify(["legacy-blob-delete", normalized]);
+	}
+
+	private captureBlobRemoteDeleteIdentity(
+		path: string,
+		entry: PreservedUnresolvedEntry,
+		expected?: BlobRemoteDeleteResolutionIdentity,
+	): Required<BlobRemoteDeleteResolutionIdentity> {
+		const normalized = normalizePath(path);
+		const episodeId = getPreservedUnresolvedEpisodeId(entry);
+		if (expected?.episodeId !== undefined && expected.episodeId !== episodeId) {
+			throw new Error(`Attention state changed for "${normalized}". Refresh the dashboard.`);
+		}
+
+		const remoteDeleteFingerprint =
+			this.getAuthoritativeBlobDeleteFingerprint(normalized);
+		if (remoteDeleteFingerprint === null) {
+			throw new Error(`Remote deletion is no longer authoritative for "${normalized}". Refresh the dashboard.`);
+		}
+		if (
+			expected?.remoteDeleteFingerprint !== undefined
+			&& expected.remoteDeleteFingerprint !== remoteDeleteFingerprint
+		) {
+			throw new Error(`Remote deletion changed for "${normalized}". Refresh the dashboard.`);
+		}
+		return { episodeId, remoteDeleteFingerprint };
+	}
+
+	keepLocalRemoteDeletedBlob(
+		path: string,
+		expectedReason: RemoteDeletePreservedUnresolvedReason,
+		expectedIdentity?: BlobRemoteDeleteResolutionIdentity,
+	): void {
+		const normalized = normalizePath(path);
+		const entry = this.preservedUnresolved.get(normalized);
+		if (!entry) {
+			throw new Error(`Attention entry is no longer active for "${normalized}".`);
+		}
+		if (
+			entry.kind !== "blob"
+			|| entry.reason !== expectedReason
+			|| !isRemoteDeletePreservedUnresolvedEntry(entry)
+		) {
+			throw new Error(`Attention state changed for "${normalized}". Refresh the dashboard.`);
+		}
+		const identity = this.captureBlobRemoteDeleteIdentity(
+			normalized,
+			entry,
+			expectedIdentity,
+		);
+		if (this.isKeepLocalRemoteDeletePending(normalized, identity.episodeId)) {
+			throw new Error(`Keep local upload is already pending for "${normalized}".`);
+		}
+		if (!this.isBlobPathSyncable(normalized)) {
+			throw new Error(`Attachment is no longer in sync scope: ${normalized}`);
+		}
+
+		const file = this.app.vault.getAbstractFileByPath(normalized);
+		if (!(file instanceof TFile)) {
+			throw new Error(`Local file not found: ${normalized}`);
+		}
+		if (this.maxSize > 0 && file.stat.size > this.maxSize) {
+			throw new Error(`Attachment exceeds the configured size limit: ${normalized}`);
+		}
+
+		// Keep both the tombstone and Attention marker until setBlobRef commits.
+		// The explicit resolution intent is serialized in exportQueue(), allowing
+		// only this upload to bypass the normal preserved-unresolved guard.
+		this.fenceTransfersForPath(normalized, "attention-keep-local");
+		this.trace?.("blob", "preserved-unresolved-keep-local-queued", {
+			path: normalized,
+			reason: entry.reason,
+		});
+		this.enqueueUpload(normalized, 0, file.stat.size, {
+			kind: "keep-local-remote-delete",
+			expectedReason,
+			episodeId: identity.episodeId,
+			remoteDeleteFingerprint: identity.remoteDeleteFingerprint,
+		});
+		this.kickUploadDrain();
+	}
+
+	/**
+	 * Accept a remote blob deletion safely.
+	 *
+	 * Ordering is intentional: this method first fences and removes queued
+	 * uploads/downloads, then invokes the caller-owned local deletion, and only
+	 * after that promise succeeds and the file is absent does it clear the
+	 * preserved-unresolved marker. Callers must perform their trash/delete inside
+	 * `deleteLocalFile`; clearing the marker separately would break this order.
+	 */
+	async acceptRemoteDeletedBlob(
+		path: string,
+		expectedReason: RemoteDeletePreservedUnresolvedReason,
+		deleteLocalFile: (file: TFile) => Promise<void>,
+		expectedIdentity?: BlobRemoteDeleteResolutionIdentity,
+		persistFencedQueue?: (snapshot: BlobQueueSnapshot) => Promise<void>,
+	): Promise<void> {
+		const normalized = normalizePath(path);
+		const entry = this.preservedUnresolved.get(normalized);
+		if (!entry) {
+			throw new Error(`Attention entry is no longer active for "${normalized}".`);
+		}
+		if (
+			entry.kind !== "blob"
+			|| entry.reason !== expectedReason
+			|| !isRemoteDeletePreservedUnresolvedEntry(entry)
+		) {
+			throw new Error(`Attention state changed for "${normalized}". Refresh the dashboard.`);
+		}
+		const identity = this.captureBlobRemoteDeleteIdentity(
+			normalized,
+			entry,
+			expectedIdentity,
+		);
+
+		const initialFile = this.app.vault.getAbstractFileByPath(normalized);
+		if (initialFile && !(initialFile instanceof TFile)) {
+			throw new Error(`Attention path is not a file: ${normalized}`);
+		}
+
+		this.attentionAcceptInFlight.add(normalized);
+		const generation = this.fenceTransfersForPath(
+			normalized,
+			"attention-accept-remote-delete",
+		);
+		try {
+			await persistFencedQueue?.(this.exportQueue());
+			// A transfer that already crossed its final pre-write fence may still
+			// be awaiting the filesystem. Let it finish, then delete its result.
+			await this.waitForTransfersToSettle(normalized);
+			if (this.currentTransferGeneration(normalized) !== generation) {
+				throw new Error(`Attention state changed for "${normalized}". Refresh the dashboard.`);
+			}
+			const file = this.app.vault.getAbstractFileByPath(normalized);
+			if (file && !(file instanceof TFile)) {
+				throw new Error(`Attention path is not a file: ${normalized}`);
+			}
+			if (file instanceof TFile) {
+				await deleteLocalFile(file);
+			}
+
+			const remaining = this.app.vault.getAbstractFileByPath(normalized);
+			if (remaining) {
+				throw new Error(`Local attachment was not deleted: ${normalized}`);
+			}
+			if (this.currentTransferGeneration(normalized) !== generation) {
+				throw new Error(`Attention state changed for "${normalized}". Refresh the dashboard.`);
+			}
+			const current = this.preservedUnresolved.get(normalized);
+			if (
+				!current
+				|| current.kind !== "blob"
+				|| current.reason !== expectedReason
+				|| getPreservedUnresolvedEpisodeId(current) !== identity.episodeId
+				|| this.getAuthoritativeBlobDeleteFingerprint(normalized)
+					!== identity.remoteDeleteFingerprint
+			) {
+				throw new Error(`Attention state changed for "${normalized}". Refresh the dashboard.`);
+			}
+			if (!this.preservedUnresolved.resolve(normalized)) {
+				throw new Error(`Attention entry is no longer active for "${normalized}".`);
+			}
+			this.onPreservedUnresolvedChanged?.();
+			this.trace?.("blob", "preserved-unresolved-accepted-remote-delete", {
+				path: normalized,
+				reason: current.reason,
+				generation,
+			});
+		} finally {
+			this.attentionAcceptInFlight.delete(normalized);
+		}
 	}
 
 	/**
@@ -812,9 +1233,12 @@ export class BlobSyncManager {
 						})
 						.finally(() => {
 							inFlight.delete(p);
+							this.activeTransferPromises.delete(p);
 							this.inflightUploads.delete(item.path);
+							this.notifyTransferSettled(item.path);
 						});
 					inFlight.add(p);
+					this.activeTransferPromises.add(p);
 				}
 
 				if (inFlight.size === 0) {
@@ -834,11 +1258,22 @@ export class BlobSyncManager {
 
 	private async processUpload(item: UploadItem): Promise<void> {
 		const start = Date.now();
+		const generation = item.generation
+			?? this.currentTransferGeneration(item.path);
+		item.generation = generation;
 		this.log(
 			`upload: started "${item.path}" (attempt ${item.retries + 1})`,
 		);
 		try {
 			const normalized = normalizePath(item.path);
+			if (!this.isTransferCurrent(normalized, generation)) {
+				this.discardUploadItem(item);
+				this.trace?.("blob", "upload-cancelled-by-path-fence", {
+					path: normalized,
+					generation,
+				});
+				return;
+			}
 			if (!this.isBlobPathSyncable(normalized)) {
 				this.uploadQueue.delete(item.path);
 				this.log(`upload: skipped excluded path "${item.path}"`);
@@ -849,13 +1284,28 @@ export class BlobSyncManager {
 			// blob conflict artifacts. This can happen
 			// if a queue snapshot was restored with a stale entry for a path
 			// that was later guarded by conflict handling.
+			const explicitKeepLocal = item.attentionResolution?.kind
+				=== "keep-local-remote-delete";
+			if (
+				explicitKeepLocal
+				&& !this.isKeepLocalUploadResolutionActive(item, normalized)
+			) {
+				this.discardUploadItem(item);
+				this.trace?.("blob", "upload-skipped-stale-attention-resolution", {
+					path: normalized,
+					reason: "attention-episode-or-tombstone-changed",
+				});
+				return;
+			}
 			if (
 				this.localOnlyBlobConflictPaths.has(normalized) ||
 				this.localOnlyBlobConflictPaths.has(item.path) ||
 				isBaseBlobConflictArtifactPath(normalized) ||
 				isBaseBlobConflictArtifactPath(normalizePath(item.path)) ||
-				this.preservedUnresolvedPaths.has(normalized) ||
-				this.preservedUnresolvedPaths.has(item.path)
+				(!explicitKeepLocal && (
+					this.preservedUnresolvedPaths.has(normalized) ||
+					this.preservedUnresolvedPaths.has(item.path)
+				))
 			) {
 				this.uploadQueue.delete(item.path);
 				const isLocalOnlyConflict =
@@ -913,7 +1363,7 @@ export class BlobSyncManager {
 
 			// Check if CRDT already has this exact hash for this path
 			const existingRef = this.vaultSync.getBlobRef(item.path);
-			if (existingRef && existingRef.hash === hash) {
+			if (!explicitKeepLocal && existingRef && existingRef.hash === hash) {
 				if (item.needsRerun) {
 					item.needsRerun = false;
 					item.status = "pending";
@@ -954,9 +1404,35 @@ export class BlobSyncManager {
 				);
 			}
 
-			// Two-phase commit: update CRDT only after successful upload
+			// Two-phase commit: update CRDT only after successful upload. This is
+			// also the final cancellation point for an Accept action that fenced an
+			// HTTP request while it was in flight.
+			if (
+				!this.isTransferCurrent(normalized, generation)
+				|| (explicitKeepLocal
+					&& !this.isKeepLocalUploadResolutionActive(item, normalized))
+			) {
+				this.discardUploadItem(item);
+				this.trace?.("blob", "upload-cancelled-before-blob-ref-commit", {
+					path: normalized,
+					generation,
+				});
+				return;
+			}
 			const mime = guessMime(item.path);
 			this.vaultSync.setBlobRef(item.path, hash, file.stat.size, mime);
+			if (explicitKeepLocal) {
+				const resolution = item.attentionResolution!;
+				if (this.preservedUnresolved.resolve(normalized)) {
+					this.onPreservedUnresolvedChanged?.();
+				}
+				item.attentionResolution = undefined;
+				this.trace?.("blob", "preserved-unresolved-kept-local", {
+					path: normalized,
+					reason: resolution.expectedReason,
+					generation,
+				});
+			}
 			this._completedUploads++;
 			if (item.needsRerun) {
 				item.needsRerun = false;
@@ -974,6 +1450,14 @@ export class BlobSyncManager {
 				);
 			}
 		} catch (err) {
+			if (!this.isTransferCurrent(item.path, generation)) {
+				this.discardUploadItem(item);
+				this.trace?.("blob", "upload-cancelled-by-path-fence", {
+					path: normalizePath(item.path),
+					generation,
+				});
+				return;
+			}
 			const reason = err instanceof Error ? err.message : String(err);
 			if (item.retries < MAX_RETRIES) {
 				const delay = RETRY_BASE_MS * Math.pow(4, item.retries);
@@ -1012,6 +1496,24 @@ export class BlobSyncManager {
 				);
 			}
 		}
+	}
+
+	private isKeepLocalUploadResolutionActive(
+		item: UploadItem,
+		normalizedPath: string,
+	): boolean {
+		const resolution = item.attentionResolution;
+		if (!resolution || resolution.kind !== "keep-local-remote-delete") {
+			return false;
+		}
+		const entry = this.preservedUnresolved.get(normalizedPath);
+		return !!entry
+			&& entry.kind === "blob"
+			&& entry.reason === resolution.expectedReason
+			&& getPreservedUnresolvedEpisodeId(entry) === resolution.episodeId
+			&& isRemoteDeletePreservedUnresolvedEntry(entry)
+			&& this.getAuthoritativeBlobDeleteFingerprint(normalizedPath)
+				=== resolution.remoteDeleteFingerprint;
 	}
 
 	private nextPendingUpload(): UploadItem | null {
@@ -1109,9 +1611,12 @@ export class BlobSyncManager {
 						})
 						.finally(() => {
 							inFlight.delete(p);
+							this.activeTransferPromises.delete(p);
 							this.inflightDownloads.delete(item.path);
+							this.notifyTransferSettled(item.path);
 						});
 					inFlight.add(p);
+					this.activeTransferPromises.add(p);
 				}
 
 				if (inFlight.size === 0) {
@@ -1131,11 +1636,19 @@ export class BlobSyncManager {
 
 	private async processDownload(item: DownloadItem): Promise<void> {
 		const start = Date.now();
+		const generation = item.generation
+			?? this.currentTransferGeneration(item.path);
+		item.generation = generation;
+		const attemptHash = item.hash;
+		const attemptSizeBytes = item.sizeBytes;
 		this.log(
 			`download: started "${item.path}" (attempt ${item.retries + 1})`,
 		);
 		try {
 			const normalized = normalizePath(item.path);
+			if (this.cancelDownloadIfFenced(item, generation, "start")) {
+				return;
+			}
 			if (!this.isBlobPathSyncable(normalized)) {
 				this.downloadQueue.delete(item.path);
 				this.log(`download: skipped excluded path "${item.path}"`);
@@ -1173,39 +1686,41 @@ export class BlobSyncManager {
 				}
 				diskHashBefore = diskHash ?? null;
 
-				if (diskHash === item.hash) {
-					this.downloadQueue.delete(item.path);
+				if (diskHash === attemptHash) {
 					this.log(
 						`download: "${item.path}" already matches, skipping`,
 					);
 					this.trace?.("blob", "download-overwrite-decision", {
 						path: item.path,
-						hashPrefix: hashPrefix(item.hash),
+						hashPrefix: hashPrefix(attemptHash),
 						diskHashBeforePrefix: hashPrefix(diskHashBefore),
 						action: "skip-existing-match",
-						sizeBytes: item.sizeBytes ?? null,
+						sizeBytes: attemptSizeBytes ?? null,
 					});
+					if (item.needsRerun) {
+						this.prepareDownloadRerun(item);
+						this.kickDownloadDrain();
+					} else {
+						this.discardDownloadItem(item);
+					}
 					return;
 				}
 			}
 
-			const downloadTimeoutMs = transferTimeoutMs(item.sizeBytes);
+			const downloadTimeoutMs = transferTimeoutMs(attemptSizeBytes);
 			const data = await this.blobClient.download(
-				item.hash,
+				attemptHash,
 				downloadTimeoutMs,
 			);
 			let targetHasRemoteBytes = false;
 
 			// Verify hash of downloaded data
 			const downloadHash = await hashArrayBuffer(data);
-			if (downloadHash !== item.hash) {
+			if (downloadHash !== attemptHash) {
 				throw new Error(
-					`Hash mismatch: expected ${item.hash.slice(0, 12)}… got ${downloadHash.slice(0, 12)}…`,
+					`Hash mismatch: expected ${attemptHash.slice(0, 12)}… got ${downloadHash.slice(0, 12)}…`,
 				);
 			}
-
-			// Suppress path to prevent re-upload from vault event
-			this.suppress(item.path);
 
 			// Write to disk
 			if (existing instanceof TFile) {
@@ -1218,16 +1733,22 @@ export class BlobSyncManager {
 					diskHashAfterDownload !== null &&
 					diskHashAfterDownload !== diskHashBefore
 				) {
+					if (this.cancelDownloadIfFenced(
+						item,
+						generation,
+						"conflict-artifact-write",
+					)) return;
 					const conflictPath =
 						await this.writeDownloadConflictArtifact(
 							normalized,
 							data,
 							"existing-changed-during-download",
+							{ path: normalized, generation },
 						);
 					this.trace?.("blob", "download-conflict-quarantined", {
 						path: item.path,
 						conflictPath,
-						hashPrefix: hashPrefix(item.hash),
+						hashPrefix: hashPrefix(attemptHash),
 						diskHashBeforePrefix: hashPrefix(diskHashBefore),
 						diskHashAfterPrefix: hashPrefix(diskHashAfterDownload),
 						reason: "existing-changed-during-download",
@@ -1238,9 +1759,16 @@ export class BlobSyncManager {
 							`(local file changed during download)`,
 					);
 				} else {
+					if (this.cancelDownloadIfFenced(
+						item,
+						generation,
+						"modify-existing",
+					)) return;
+					// Suppress path to prevent re-upload from our own disk write.
+					this.suppress(item.path);
 					this.trace?.("blob", "download-overwrite-decision", {
 						path: item.path,
-						hashPrefix: hashPrefix(item.hash),
+						hashPrefix: hashPrefix(attemptHash),
 						diskHashBeforePrefix: hashPrefix(diskHashBefore),
 						diskHashAfterPrefix: hashPrefix(diskHashAfterDownload),
 						action: "overwrite-existing",
@@ -1255,7 +1783,7 @@ export class BlobSyncManager {
 			} else {
 				this.trace?.("blob", "download-overwrite-decision", {
 					path: item.path,
-					hashPrefix: hashPrefix(item.hash),
+					hashPrefix: hashPrefix(attemptHash),
 					diskHashBeforePrefix: null,
 					action: "create-missing",
 					sizeBytes: data.byteLength,
@@ -1266,6 +1794,11 @@ export class BlobSyncManager {
 					normalized.lastIndexOf("/"),
 				);
 				if (dir) {
+					if (this.cancelDownloadIfFenced(
+						item,
+						generation,
+						"create-parent-folder",
+					)) return;
 					const dirExists = this.app.vault.getAbstractFileByPath(
 						normalizePath(dir),
 					);
@@ -1277,6 +1810,12 @@ export class BlobSyncManager {
 						}
 					}
 				}
+				if (this.cancelDownloadIfFenced(
+					item,
+					generation,
+					"create-missing",
+				)) return;
+				this.suppress(item.path);
 				try {
 					await this.app.vault.createBinary(normalized, data);
 					targetHasRemoteBytes = true;
@@ -1310,10 +1849,10 @@ export class BlobSyncManager {
 						);
 					}
 
-					if (diskHash === item.hash) {
+					if (diskHash === attemptHash) {
 						this.trace?.("blob", "download-overwrite-decision", {
 							path: item.path,
-							hashPrefix: hashPrefix(item.hash),
+							hashPrefix: hashPrefix(attemptHash),
 							diskHashBeforePrefix: hashPrefix(diskHash),
 							action: "skip-create-race-match",
 							sizeBytes: data.byteLength,
@@ -1324,16 +1863,22 @@ export class BlobSyncManager {
 						);
 						targetHasRemoteBytes = true;
 					} else {
+						if (this.cancelDownloadIfFenced(
+							item,
+							generation,
+							"create-race-conflict-artifact",
+						)) return;
 						const conflictPath =
 							await this.writeDownloadConflictArtifact(
 								normalized,
 								data,
 								"create-race-mismatch",
+								{ path: normalized, generation },
 							);
 						this.trace?.("blob", "download-conflict-quarantined", {
 							path: item.path,
 							conflictPath,
-							hashPrefix: hashPrefix(item.hash),
+							hashPrefix: hashPrefix(attemptHash),
 							diskHashBeforePrefix: hashPrefix(diskHash),
 							reason: "create-race-mismatch",
 							sizeBytes: data.byteLength,
@@ -1357,7 +1902,7 @@ export class BlobSyncManager {
 							this.hashCache,
 							item.path,
 							{ mtime: freshStat.mtime, size: freshStat.size },
-							item.hash,
+							attemptHash,
 						);
 					}
 				} catch {
@@ -1367,19 +1912,33 @@ export class BlobSyncManager {
 
 			this._completedDownloads++;
 			if (item.needsRerun) {
-				item.needsRerun = false;
-				item.status = "pending";
-				item.retries = 0;
-				item.readyAt = 0;
+				this.prepareDownloadRerun(item);
 				this.log(
 					`download: success "${item.path}" in ${Date.now() - start}ms (queued rerun)`,
 				);
 				this.kickDownloadDrain();
 			} else {
-				this.downloadQueue.delete(item.path);
+				this.discardDownloadItem(item);
 			}
 		} catch (err) {
+			if (!this.isTransferCurrent(item.path, generation)) {
+				this.discardDownloadItem(item);
+				this.trace?.("blob", "download-cancelled-by-path-fence", {
+					path: normalizePath(item.path),
+					generation,
+					stage: "error",
+				});
+				return;
+			}
 			const reason = err instanceof Error ? err.message : String(err);
+			if (item.needsRerun && item.nextHash) {
+				this.prepareDownloadRerun(item);
+				this.log(
+					`download: "${item.path}" target changed during failed attempt; starting latest hash`,
+				);
+				this.kickDownloadDrain();
+				return;
+			}
 			if (item.retries < MAX_RETRIES) {
 				const delay = RETRY_BASE_MS * Math.pow(4, item.retries);
 				this.log(
@@ -1392,11 +1951,8 @@ export class BlobSyncManager {
 				this.scheduleRetryKick(delay, "download");
 			} else {
 				if (item.needsRerun && item.rerunResets < MAX_RERUN_RESETS) {
-					item.needsRerun = false;
-					item.status = "pending";
-					item.retries = 0;
-					item.readyAt = 0;
 					item.rerunResets++;
+					this.prepareDownloadRerun(item);
 					this.log(
 						`download: "${item.path}" had pending rerun (reset ${item.rerunResets}/${MAX_RERUN_RESETS}); restarting fresh`,
 					);
@@ -1417,6 +1973,34 @@ export class BlobSyncManager {
 				);
 			}
 		}
+	}
+
+	private prepareDownloadRerun(item: DownloadItem): void {
+		if (item.nextHash) {
+			item.hash = item.nextHash;
+			item.sizeBytes = item.nextSizeBytes;
+		}
+		item.nextHash = undefined;
+		item.nextSizeBytes = undefined;
+		item.needsRerun = false;
+		item.status = "pending";
+		item.retries = 0;
+		item.readyAt = 0;
+	}
+
+	private cancelDownloadIfFenced(
+		item: DownloadItem,
+		generation: number,
+		stage: string,
+	): boolean {
+		if (this.isTransferCurrent(item.path, generation)) return false;
+		this.discardDownloadItem(item);
+		this.trace?.("blob", "download-cancelled-by-path-fence", {
+			path: normalizePath(item.path),
+			generation,
+			stage,
+		});
+		return true;
 	}
 
 	private async hashExistingFile(
@@ -1455,12 +2039,22 @@ export class BlobSyncManager {
 		targetPath: string,
 		data: ArrayBuffer,
 		reason: "existing-changed-during-download" | "create-race-mismatch",
+		transferFence?: { path: string; generation: number },
 	): Promise<string> {
 		const baseConflictPath = buildBlobConflictArtifactPath(normalizePath(targetPath));
 		for (let i = 0; i < 100; i++) {
 			const conflictPath = buildBlobConflictArtifactCopyPath(baseConflictPath, i + 1);
 			if (this.app.vault.getAbstractFileByPath(conflictPath)) continue;
 			try {
+				if (
+					transferFence
+					&& !this.isTransferCurrent(
+						transferFence.path,
+						transferFence.generation,
+					)
+				) {
+					throw new Error("blob download cancelled by path fence");
+				}
 				this.suppress(conflictPath);
 				await this.app.vault.createBinary(conflictPath, data);
 				this.localOnlyBlobConflictPaths.add(conflictPath);
@@ -1534,6 +2128,23 @@ export class BlobSyncManager {
 			return;
 		}
 		this.remoteDeleteInFlight.add(normalized);
+		const transferGeneration = this.fenceTransfersForPath(
+			normalized,
+			"remote-delete-observed",
+		);
+		await this.waitForTransfersToSettle(normalized);
+		if (
+			this.destroyed
+			|| this.currentTransferGeneration(normalized) !== transferGeneration
+		) {
+			this.remoteDeleteInFlight.delete(normalized);
+			return;
+		}
+		const deleteFingerprint = this.getAuthoritativeBlobDeleteFingerprint(normalized);
+		if (!deleteFingerprint) {
+			this.remoteDeleteInFlight.delete(normalized);
+			return;
+		}
 		const file = this.app.vault.getAbstractFileByPath(normalized);
 		if (!(file instanceof TFile)) {
 			this.remoteDeleteInFlight.delete(normalized);
@@ -1621,6 +2232,18 @@ export class BlobSyncManager {
 					unresolvedReason = "remote-delete-missing-baseline";
 				}
 
+				if (
+					this.destroyed
+					|| this.currentTransferGeneration(normalized) !== transferGeneration
+					|| this.getAuthoritativeBlobDeleteFingerprint(normalized) !== deleteFingerprint
+				) {
+					this.trace?.("blob", "remote-delete-resolution-stale", {
+						path: normalized,
+						reason: "delete-episode-or-transfer-generation-changed",
+					});
+					return;
+				}
+
 				if (decision.kind === "apply-delete") {
 					// Clear any prior unresolved marker — we now have a baseline.
 					if (this.preservedUnresolved.resolve(normalized)) {
@@ -1671,6 +2294,10 @@ export class BlobSyncManager {
 						path: normalized,
 						kind: "blob",
 						reason: unresolvedReason ?? "unknown",
+						episodeId: getRemoteDeleteEpisodeId(
+							"blob",
+							deleteFingerprint,
+						),
 						knownRemoteHash: knownHash,
 					});
 					this.onPreservedUnresolvedChanged?.();
@@ -1824,6 +2451,7 @@ export class BlobSyncManager {
 				retries: item.retries,
 				status: item.status,
 				readyAt: item.readyAt,
+				attentionResolution: item.attentionResolution,
 				needsRerun: item.needsRerun,
 				rerunResets: item.rerunResets,
 			});
@@ -1845,12 +2473,12 @@ export class BlobSyncManager {
 		for (const [, item] of this.downloadQueue) {
 			downloads.push({
 				path: item.path,
-				hash: item.hash,
-				sizeBytes: item.sizeBytes,
+				hash: item.nextHash ?? item.hash,
+				sizeBytes: item.nextHash ? item.nextSizeBytes : item.sizeBytes,
 				retries: item.retries,
 				status: item.status,
 				readyAt: item.readyAt,
-				needsRerun: item.needsRerun,
+				needsRerun: item.nextHash ? false : item.needsRerun,
 				rerunResets: item.rerunResets,
 			});
 		}
@@ -1882,6 +2510,8 @@ export class BlobSyncManager {
 						retries: item.retries ?? 0,
 						status: "pending",
 						readyAt: 0,
+						generation: this.currentTransferGeneration(item.path),
+						attentionResolution: item.attentionResolution,
 						needsRerun: item.needsRerun ?? false,
 						rerunResets: item.rerunResets ?? 0,
 					});
@@ -1896,6 +2526,19 @@ export class BlobSyncManager {
 					skipped++;
 					continue;
 				}
+				const canValidateRemoteRef = typeof this.vaultSync.getBlobRef === "function";
+				const currentRef = canValidateRemoteRef
+					? this.vaultSync.getBlobRef(item.path)
+					: undefined;
+				if (canValidateRemoteRef && (
+					!currentRef
+					|| currentRef.hash !== item.hash
+				)) {
+					// Persisted downloads are only hints. Never restore bytes for a
+					// deleted path or for a superseded content hash.
+					skipped++;
+					continue;
+				}
 				if (!this.downloadQueue.has(item.path)) {
 					this.downloadQueue.set(item.path, {
 						path: item.path,
@@ -1904,6 +2547,7 @@ export class BlobSyncManager {
 						retries: item.retries ?? 0,
 						status: "pending",
 						readyAt: 0,
+						generation: this.currentTransferGeneration(item.path),
 						needsRerun: item.needsRerun ?? false,
 						rerunResets: item.rerunResets ?? 0,
 					});
@@ -1976,7 +2620,8 @@ export class BlobSyncManager {
 	// Cleanup
 	// -------------------------------------------------------------------
 
-	destroy(): void {
+	async destroy(): Promise<void> {
+		this.destroyed = true;
 		for (const cleanup of this.observerCleanups) {
 			cleanup();
 		}
@@ -1993,11 +2638,19 @@ export class BlobSyncManager {
 
 		this.uploadQueue.clear();
 		this.downloadQueue.clear();
+		await Promise.allSettled(Array.from(this.activeTransferPromises));
+		this.activeTransferPromises.clear();
 		this.inflightUploads.clear();
 		this.inflightDownloads.clear();
 		this.suppressedPaths.clear();
 		this.localOnlyBlobConflictPaths.clear();
 		this.remoteDeleteInFlight.clear();
+		this.attentionAcceptInFlight.clear();
+		for (const waiters of this.transferSettleWaiters.values()) {
+			for (const resolve of waiters) resolve();
+		}
+		this.transferSettleWaiters.clear();
+		this.transferGenerations.clear();
 		this.preservedUnresolved.clear();
 		this.log("BlobSyncManager destroyed");
 	}

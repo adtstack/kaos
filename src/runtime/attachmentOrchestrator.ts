@@ -111,27 +111,34 @@ export class AttachmentOrchestrator {
 	}
 
 	async stop(reason: string): Promise<void> {
-		if (!this.blobSync) return;
-		const snapshot = this.blobSync.exportQueue();
-		if (snapshot.uploads.length > 0 || snapshot.downloads.length > 0) {
-			await this.deps.persistBlobQueue(snapshot);
-		}
-		this.blobSync.destroy();
+		const blobSync = this.blobSync;
+		if (!blobSync) return;
 		this.blobSync = null;
+		const snapshot = blobSync.exportQueue();
+		try {
+			if (snapshot.uploads.length > 0 || snapshot.downloads.length > 0) {
+				await this.deps.persistBlobQueue(snapshot);
+			}
+		} finally {
+			await blobSync.destroy();
+		}
 		this.deps.log(`Attachment sync engine stopped (${reason})`);
 	}
 
-	destroy(): void {
-		if (this.blobSync) {
-			const snapshot = this.blobSync.exportQueue();
-			if (snapshot.uploads.length > 0 || snapshot.downloads.length > 0) {
-				void this.deps.persistBlobQueue(snapshot);
+	async destroy(): Promise<void> {
+		const blobSync = this.blobSync;
+		try {
+			if (blobSync) {
+				const snapshot = blobSync.exportQueue();
+				if (snapshot.uploads.length > 0 || snapshot.downloads.length > 0) {
+					await this.deps.persistBlobQueue(snapshot);
+				}
 			}
+		} finally {
+			await blobSync?.destroy();
+			this.shownAttachmentNudge = false;
+			this.downloadGateStartupReady = false;
 		}
-		this.blobSync?.destroy();
-		this.blobSync = null;
-		this.shownAttachmentNudge = false;
-		this.downloadGateStartupReady = false;
 	}
 
 	async refresh(reason = "settings-change"): Promise<void> {

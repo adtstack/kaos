@@ -1,11 +1,17 @@
 import { TFile } from "obsidian";
 import {
+	getPreservedUnresolvedEpisodeId,
+	isRemoteDeletePreservedUnresolvedEntry,
+	type PreservedUnresolvedKind,
+} from "../sync/preservedUnresolved";
+import {
 	parseConflictArtifactPath,
 	type ParsedConflictArtifactPath,
 } from "../paths/conflictArtifactPath";
 import type {
 	DashboardAttentionItem,
 	DashboardConflictArtifact,
+	DashboardLocalFileIdentity,
 	DashboardMetric,
 	DashboardVaultSyncDebug,
 	KaosDashboardCollectorInput,
@@ -26,6 +32,7 @@ export function buildKaosDashboardData(input: KaosDashboardCollectorInput): Kaos
 		recentChanges: input.recentChanges,
 		conflicts: collectDashboardConflictArtifacts(input),
 		attention: collectDashboardAttention(input),
+		attentionTotalCount: getDashboardAttentionTotalCount(input),
 		actions: {
 			syncInitialized: input.vaultSync !== null,
 			untrackedFileCount: input.reconciliationState.untrackedFileCount,
@@ -56,11 +63,38 @@ export function collectDashboardConflictArtifacts(
 export function collectDashboardAttention(
 	input: Pick<
 		KaosDashboardCollectorInput,
-		"preservedUnresolvedEntries" | "frontmatterQuarantineEntries" | "reconciliationState"
+		| "app"
+		| "preservedUnresolvedEntries"
+		| "frontmatterQuarantineEntries"
+		| "reconciliationState"
+		| "remoteDeleteResolutionState"
 	>,
 ): DashboardAttentionItem[] {
 	const items: DashboardAttentionItem[] = [];
 	for (const entry of input.preservedUnresolvedEntries.slice(0, ATTENTION_SAMPLE_LIMIT)) {
+		const remoteDeleteReason = isRemoteDeletePreservedUnresolvedEntry(entry)
+			? entry.reason
+			: null;
+		const episodeId = getPreservedUnresolvedEpisodeId(entry);
+		const localFile = getDashboardLocalFileIdentity(input, entry.path);
+		const engineAvailable = entry.kind === "markdown"
+			? input.remoteDeleteResolutionState?.markdownAvailable === true
+			: input.remoteDeleteResolutionState?.blobAvailable === true;
+		const remoteDeleteFingerprint = remoteDeleteReason
+			? input.remoteDeleteResolutionState?.getFingerprint(entry.kind, entry.path) ?? null
+			: null;
+		const keepLocalPending = remoteDeleteReason !== null
+			&& input.remoteDeleteResolutionState?.isKeepLocalPending(
+				entry.kind,
+				entry.path,
+				episodeId,
+			) === true;
+		const commonUnavailableReason = getCommonResolutionUnavailableReason(
+			entry.kind,
+			engineAvailable,
+			remoteDeleteFingerprint,
+			localFile.kind,
+		);
 		items.push({
 			kind: "preserved-unresolved",
 			title: `${entry.kind} needs attention`,
@@ -69,6 +103,26 @@ export function collectDashboardAttention(
 			firstSeenAt: new Date(entry.firstSeenAt).toISOString(),
 			lastSeenAt: new Date(entry.lastSeenAt).toISOString(),
 			tone: "warn",
+			resolution: remoteDeleteReason ? {
+				kind: "remote-delete",
+				fileKind: entry.kind,
+				reason: remoteDeleteReason,
+				episodeId,
+				remoteDeleteFingerprint,
+				localFile,
+				canKeepLocal: commonUnavailableReason === null
+					&& localFile.kind === "file"
+					&& !keepLocalPending,
+				canAcceptRemoteDelete: commonUnavailableReason === null && !keepLocalPending,
+				keepLocalPending,
+				keepLocalUnavailableReason: keepLocalPending
+					? "The local attachment is still being published."
+					: commonUnavailableReason
+					?? (localFile.kind === "missing" ? "The local file no longer exists." : null),
+				acceptRemoteDeleteUnavailableReason: keepLocalPending
+					? "Wait for the pending Keep local upload to finish."
+					: commonUnavailableReason,
+			} : null,
 		});
 	}
 
@@ -86,6 +140,7 @@ export function collectDashboardAttention(
 			firstSeenAt: null,
 			lastSeenAt: null,
 			tone: "warn",
+			resolution: null,
 		});
 	});
 
@@ -100,6 +155,7 @@ export function collectDashboardAttention(
 			firstSeenAt: null,
 			lastSeenAt: input.reconciliationState.lastBlockedDivergenceAt,
 			tone: "error",
+			resolution: null,
 		});
 	}
 
@@ -112,6 +168,7 @@ export function collectDashboardAttention(
 			firstSeenAt: new Date(entry.firstSeenAt).toISOString(),
 			lastSeenAt: new Date(entry.lastSeenAt).toISOString(),
 			tone: "warn",
+			resolution: null,
 		});
 	}
 
@@ -119,6 +176,56 @@ export function collectDashboardAttention(
 		(Date.parse(right.lastSeenAt ?? right.firstSeenAt ?? "0") || 0)
 		- (Date.parse(left.lastSeenAt ?? left.firstSeenAt ?? "0") || 0),
 	);
+}
+
+export function getDashboardAttentionTotalCount(
+	input: Pick<
+		KaosDashboardCollectorInput,
+		"preservedUnresolvedEntries" | "frontmatterQuarantineEntries" | "reconciliationState"
+	>,
+): number {
+	return input.preservedUnresolvedEntries.length
+		+ input.frontmatterQuarantineEntries.length
+		+ input.reconciliationState.unresolvedStructuralChangeCount
+		+ input.reconciliationState.blockedDivergenceCount;
+}
+
+function getDashboardLocalFileIdentity(
+	input: Pick<KaosDashboardCollectorInput, "app">,
+	path: string,
+): DashboardLocalFileIdentity {
+	const abstractFile = input.app.vault.getAbstractFileByPath(path);
+	if (abstractFile === null) {
+		return { kind: "missing", mtime: null, size: null };
+	}
+	if (!(abstractFile instanceof TFile)) {
+		return { kind: "other", mtime: null, size: null };
+	}
+	return {
+		kind: "file",
+		mtime: typeof abstractFile.stat?.mtime === "number" ? abstractFile.stat.mtime : null,
+		size: typeof abstractFile.stat?.size === "number" ? abstractFile.stat.size : null,
+	};
+}
+
+function getCommonResolutionUnavailableReason(
+	kind: PreservedUnresolvedKind,
+	engineAvailable: boolean,
+	remoteDeleteFingerprint: string | null,
+	localFileKind: "file" | "missing" | "other",
+): string | null {
+	if (!engineAvailable) {
+		return kind === "markdown"
+			? "Markdown sync is not initialized."
+			: "Attachment sync is not initialized.";
+	}
+	if (remoteDeleteFingerprint === null) {
+		return "The remote deletion changed or is no longer active. Refresh the dashboard.";
+	}
+	if (localFileKind === "other") {
+		return "This path is no longer a file.";
+	}
+	return null;
 }
 
 function buildConflictArtifact(

@@ -614,7 +614,7 @@ console.log("\n--- Test 15: destroy during in-flight does not resurrect ---");
 	(manager as any).blobClient = {
 		download: async () => {
 			// download started — destroy while in flight
-			manager.destroy();
+			await manager.destroy();
 			await downloadPromise; // wait until test signals
 			return remoteData;
 		},
@@ -655,7 +655,7 @@ console.log("\n--- Test 15: destroy during in-flight does not resurrect ---");
 
 	// Clear any deferred queue work that may have been scheduled after the
 	// in-flight operation resolved.
-	manager.destroy();
+	await manager.destroy();
 }
 
 // ── Test 16: kickUploadDrain does not start duplicate drain loops ────────────
@@ -780,7 +780,7 @@ console.log("\n--- Test 18: conflict artifact does not pollute target hash cache
 		"target hash cache keeps a local-file hash after conflict",
 	);
 
-	manager.destroy();
+	await manager.destroy();
 }
 
 console.log("\n--- Test 19: Multi-pass: unknown-baseline preserved blob is NOT re-uploaded by reconcile scan ---");
@@ -879,7 +879,7 @@ console.log("\n--- Test 19: Multi-pass: unknown-baseline preserved blob is NOT r
 		"preserved-unresolved cleared after user modify event (handleFileChange)",
 	);
 
-	manager.destroy();
+	await manager.destroy();
 }
 
 console.log("\n--- Test 20: Multi-pass: stat-failure during blob remote-delete becomes preserve-unresolved ---");

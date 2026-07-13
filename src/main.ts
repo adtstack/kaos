@@ -1,4 +1,4 @@
-import { MarkdownView, Notice, Plugin, TFile, arrayBufferToHex, type WorkspaceLeaf } from "obsidian";
+import { MarkdownView, Notice, Plugin, TFile, arrayBufferToHex, normalizePath, type WorkspaceLeaf } from "obsidian";
 import {
 	DEFAULT_SETTINGS,
 	VaultSyncSettingTab,
@@ -46,7 +46,11 @@ import {
 	type BaselineTextStore,
 	type ConflictMergeBaseStore,
 } from "./sync/baselineTextStore";
-import type { PreservedUnresolvedEntry } from "./sync/preservedUnresolved";
+import {
+	getPreservedUnresolvedEpisodeId,
+	isRemoteDeletePreservedUnresolvedEntry,
+	type PreservedUnresolvedEntry,
+} from "./sync/preservedUnresolved";
 import {
 	SnapshotService,
 } from "./snapshots/snapshotService";
@@ -89,11 +93,19 @@ import { SetupLinkController } from "./runtime/setupLinkController";
 import { TraceRuntimeController } from "./runtime/traceRuntimeController";
 import { registerCommands } from "./commands";
 import { buildKaosDashboardData } from "./dashboard/dashboardData";
+import { withAttentionResolutionLock } from "./dashboard/attentionResolutionLock";
 import {
 	KAOS_DASHBOARD_VIEW_TYPE,
 	KaosDashboardView,
 } from "./dashboard/KaosDashboardView";
-import type { KaosDashboardData, DashboardTone } from "./dashboard/dashboardTypes";
+import type {
+	DashboardRemoteDeleteResolutionChoice,
+	DashboardRemoteDeleteResolutionResult,
+	DashboardRemoteDeleteResolutionTarget,
+	DashboardLocalFileIdentity,
+	KaosDashboardData,
+	DashboardTone,
+} from "./dashboard/dashboardTypes";
 import {
 	getSyncStatusLabel,
 	renderConnectionState,
@@ -216,6 +228,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	/** Persisted blob queue snapshot for crash resilience. */
 	private savedBlobQueue: BlobQueueSnapshot | null = null;
 	private preservedUnresolvedEntries: PreservedUnresolvedEntry[] = [];
+	/** Canonical kind:path locks spanning the full dashboard resolution action. */
+	private attentionResolutionInFlight = new Set<string>();
+	/** Markdown trash events owned by Accept must not publish a second delete. */
+	private attentionMarkdownDeleteInFlight = new Map<string, TFile>();
 	private persistedState: PersistedPluginState = {};
 	private persistWriteChain: Promise<void> = Promise.resolve();
 	private diskIndexSaveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -469,6 +485,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				exportDiagnosticsWithFilenames: () => {
 					void (this.lab?.diagnosticsService as import("./telemetry/diagnostics/diagnosticsService").DiagnosticsService | undefined)?.exportDiagnosticsWithFilenames();
 				},
+				resolveRemoteDeleteAttention: (target, choice) =>
+					this.resolveRemoteDeleteAttention(target, choice),
 			},
 		}));
 		this.addRibbonIcon("layout-dashboard", "Open dashboard", () => {
@@ -728,7 +746,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private async initSync(): Promise<void> {
 		const initSyncStartedAt = Date.now();
-		this.attachmentOrchestrator?.destroy();
+		await this.attachmentOrchestrator?.destroy();
 		this.trace("trace", "startup-init-sync-start", {
 			hostConfigured: !!this.settings.host,
 			tokenConfigured: !!this.settings.token,
@@ -1432,6 +1450,27 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						});
 						return;
 					}
+					const attentionDelete = this.attentionMarkdownDeleteInFlight.get(
+						normalizePath(file.path),
+					);
+					if (attentionDelete === file) {
+						this.attentionMarkdownDeleteInFlight.delete(normalizePath(file.path));
+						this.editorWorkspace?.onMarkdownDeleted(file.path);
+						this.traceSink.recordPath({
+							kind: "disk.event.suppressed",
+							scope: "file",
+							severity: "debug",
+							priority: "important",
+							opId,
+							path: file.path,
+							data: {
+								reason: "dashboard-accept-remote-delete",
+								decision: "suppress",
+							},
+						});
+						this.log(`Accepted remote delete locally: "${file.path}"`);
+						return;
+					}
 					this.traceSink.recordPath({
 						kind: "disk.delete.observed",
 						scope: "file",
@@ -1441,6 +1480,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						path: file.path,
 					});
 					this.editorWorkspace?.onMarkdownDeleted(file.path);
+					this.diskMirror?.clearPreservedUnresolved(file.path);
 
 					this.vaultSync?.handleDelete(
 						file.path,
@@ -1521,7 +1561,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.editorBindings?.unbindAll();
 		this.diskMirror?.destroy();
 
-		this.attachmentOrchestrator?.destroy();
+		await this.attachmentOrchestrator?.destroy();
 
 		if (this.statusInterval) {
 			clearInterval(this.statusInterval);
@@ -1815,6 +1855,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const recoveryStorageStatus = this.snapshotService
 			? await this.snapshotService.getDashboardRecoveryStorageStatus()
 			: { status: "unavailable" as const, message: "File history storage service not initialized." };
+		const vaultSync = this.vaultSync;
+		const blobSync = this.getBlobSync();
 		return buildKaosDashboardData({
 			app: this.app,
 			generatedAt: new Date().toISOString(),
@@ -1832,6 +1874,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			diskMirror: this.diskMirror?.getDebugSnapshot() ?? null,
 			blobSync: this.getBlobSync()?.getDebugSnapshot() ?? null,
 			preservedUnresolvedEntries: this.collectPreservedUnresolvedEntries(),
+			remoteDeleteResolutionState: {
+				markdownAvailable: vaultSync !== null && this.diskMirror !== null,
+				blobAvailable: vaultSync !== null && blobSync !== null,
+				getFingerprint: (kind, path) => kind === "markdown"
+					? vaultSync?.getAuthoritativeMarkdownDeleteSnapshot(path)?.fingerprint ?? null
+					: vaultSync?.getAuthoritativeBlobDeleteSnapshot(path)?.fingerprint ?? null,
+				isKeepLocalPending: (kind, path, episodeId) => kind === "blob"
+					&& blobSync?.isKeepLocalRemoteDeletePending(path, episodeId) === true,
+			},
 			frontmatterQuarantineEntries: this.frontmatterQuarantineEntries,
 			diskIndex: this.diskIndex,
 			snapshotStatus,
@@ -1840,6 +1891,249 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			openFileCount: this.editorWorkspace?.openFileCount ?? 0,
 			snapshotsAvailable: this.serverSupportsSnapshots,
 		});
+	}
+
+	private async resolveRemoteDeleteAttention(
+		target: DashboardRemoteDeleteResolutionTarget,
+		choice: DashboardRemoteDeleteResolutionChoice,
+	): Promise<DashboardRemoteDeleteResolutionResult> {
+		const normalizedTarget: DashboardRemoteDeleteResolutionTarget = {
+			...target,
+			path: normalizePath(target.path),
+		};
+		const lockKey = `${normalizedTarget.fileKind}:${normalizedTarget.path}`;
+		return withAttentionResolutionLock(
+			this.attentionResolutionInFlight,
+			lockKey,
+			normalizedTarget.path,
+			async () => {
+			this.getCurrentRemoteDeleteAttention(normalizedTarget);
+			this.assertRemoteDeleteFingerprint(normalizedTarget);
+			this.assertDashboardLocalFileIdentity(normalizedTarget);
+
+			if (choice === "keep-local") {
+				if (normalizedTarget.fileKind === "markdown") {
+					await this.reconciliationController.keepLocalRemoteDeletedMarkdown(
+						normalizedTarget.path,
+						normalizedTarget.reason,
+						{
+							reason: normalizedTarget.reason,
+							episodeId: normalizedTarget.episodeId,
+							remoteDeleteFingerprint: normalizedTarget.remoteDeleteFingerprint ?? undefined,
+							localFile: normalizedTarget.localFile,
+						},
+					);
+					await this.persistPluginState();
+					return { status: "completed" };
+				}
+
+				const blobSync = this.getBlobSync();
+				if (!blobSync) throw new Error("Attachment sync is not initialized.");
+				if (blobSync.isKeepLocalRemoteDeletePending(
+					normalizedTarget.path,
+					normalizedTarget.episodeId,
+				)) {
+					return {
+						status: "pending",
+						message: `The local attachment is already being published: ${normalizedTarget.path}`,
+					};
+				}
+				blobSync.keepLocalRemoteDeletedBlob(
+					normalizedTarget.path,
+					normalizedTarget.reason,
+					{
+						episodeId: normalizedTarget.episodeId,
+						remoteDeleteFingerprint: normalizedTarget.remoteDeleteFingerprint ?? undefined,
+					},
+				);
+				await this.persistBlobQueueSnapshot(blobSync.exportQueue());
+				if (!blobSync.isPreservedUnresolved(normalizedTarget.path)) {
+					return { status: "completed" };
+				}
+				if (!blobSync.isKeepLocalRemoteDeletePending(
+					normalizedTarget.path,
+					normalizedTarget.episodeId,
+				)) {
+					throw new Error(`The local attachment could not be queued: ${normalizedTarget.path}`);
+				}
+				return {
+					status: "pending",
+					message: `Publishing local attachment; Attention will clear after upload succeeds: ${normalizedTarget.path}`,
+				};
+			}
+
+			if (normalizedTarget.fileKind === "markdown") {
+				const lease = await this.reconciliationController.beginAcceptRemoteDeletedMarkdown(
+					normalizedTarget.path,
+					normalizedTarget.reason,
+					{
+						reason: normalizedTarget.reason,
+						episodeId: normalizedTarget.episodeId,
+						remoteDeleteFingerprint: normalizedTarget.remoteDeleteFingerprint ?? undefined,
+						localFile: normalizedTarget.localFile,
+					},
+				);
+				try {
+					this.getCurrentRemoteDeleteAttention(normalizedTarget);
+					this.assertRemoteDeleteFingerprint(normalizedTarget);
+					this.assertDashboardLocalFileIdentity(normalizedTarget);
+					const file = this.app.vault.getAbstractFileByPath(normalizedTarget.path);
+					if (file instanceof TFile) {
+						this.attentionMarkdownDeleteInFlight.set(normalizedTarget.path, file);
+						let trashSucceeded = false;
+						try {
+							await this.app.fileManager.trashFile(file);
+							trashSucceeded = true;
+						} finally {
+							if (!trashSucceeded) {
+								this.attentionMarkdownDeleteInFlight.delete(normalizedTarget.path);
+							} else if (this.attentionMarkdownDeleteInFlight.get(normalizedTarget.path) === file) {
+								// Obsidian normally emits delete before trashFile resolves. Keep
+								// ownership briefly for adapters that dispatch the event later.
+								setTimeout(() => {
+									if (this.attentionMarkdownDeleteInFlight.get(normalizedTarget.path) === file) {
+										this.attentionMarkdownDeleteInFlight.delete(normalizedTarget.path);
+									}
+								}, 1_000);
+							}
+						}
+					}
+					if (this.app.vault.getAbstractFileByPath(normalizedTarget.path)) {
+						throw new Error(`Local file was not deleted: ${normalizedTarget.path}`);
+					}
+					await this.clearPreservedUnresolvedAttention(normalizedTarget);
+					return { status: "completed" };
+				} finally {
+					this.reconciliationController.finishRemoteDeletedMarkdownResolution(lease);
+				}
+			}
+
+			const blobSync = this.getBlobSync();
+			if (!blobSync) throw new Error("Attachment sync is not initialized.");
+			await blobSync.acceptRemoteDeletedBlob(
+				normalizedTarget.path,
+				normalizedTarget.reason,
+				async (file) => {
+					this.getCurrentRemoteDeleteAttention(normalizedTarget);
+					this.assertRemoteDeleteFingerprint(normalizedTarget);
+					this.assertDashboardLocalFileIdentity(normalizedTarget, file);
+					await this.app.fileManager.trashFile(file);
+				},
+				{
+					episodeId: normalizedTarget.episodeId,
+					remoteDeleteFingerprint: normalizedTarget.remoteDeleteFingerprint ?? undefined,
+				},
+				async (snapshot) => {
+					if (snapshot.uploads.length === 0 && snapshot.downloads.length === 0) {
+						await this.clearSavedBlobQueue();
+					} else {
+						await this.persistBlobQueueSnapshot(snapshot);
+					}
+				},
+			);
+			const queueAfterAccept = blobSync.exportQueue();
+			if (queueAfterAccept.uploads.length === 0 && queueAfterAccept.downloads.length === 0) {
+				await this.clearSavedBlobQueue();
+			} else {
+				await this.persistBlobQueueSnapshot(queueAfterAccept);
+			}
+			await this.persistPluginState();
+			return { status: "completed" };
+			},
+		);
+	}
+
+	private async clearPreservedUnresolvedAttention(
+		target: DashboardRemoteDeleteResolutionTarget,
+	): Promise<void> {
+		const current = this.collectPreservedUnresolvedEntries().find((entry) =>
+			normalizePath(entry.path) === target.path && entry.kind === target.fileKind
+		);
+		if (current) {
+			this.getCurrentRemoteDeleteAttention(target);
+		}
+		this.assertRemoteDeleteFingerprint(target);
+		if (target.fileKind === "markdown") {
+			this.diskMirror?.clearPreservedUnresolved(target.path);
+		} else {
+			this.getBlobSync()?.clearPreservedUnresolved(target.path);
+		}
+		this.preservedUnresolvedEntries = this.preservedUnresolvedEntries.filter(
+			(entry) => normalizePath(entry.path) !== target.path
+				|| entry.kind !== target.fileKind
+				|| getPreservedUnresolvedEpisodeId(entry) !== target.episodeId,
+		);
+		await this.persistPluginState();
+		this.refreshStatusBar();
+	}
+
+	private getCurrentRemoteDeleteAttention(
+		target: DashboardRemoteDeleteResolutionTarget,
+	): PreservedUnresolvedEntry {
+		const current = this.collectPreservedUnresolvedEntries().find((entry) =>
+			normalizePath(entry.path) === target.path && entry.kind === target.fileKind
+		);
+		if (!current) {
+			throw new Error(`Attention entry is no longer active for "${target.path}".`);
+		}
+		if (
+			current.reason !== target.reason
+			|| !isRemoteDeletePreservedUnresolvedEntry(current)
+			|| getPreservedUnresolvedEpisodeId(current) !== target.episodeId
+		) {
+			throw new Error(`Attention state changed for "${target.path}". Refresh the dashboard.`);
+		}
+		return current;
+	}
+
+	private assertRemoteDeleteFingerprint(
+		target: DashboardRemoteDeleteResolutionTarget,
+	): void {
+		const vaultSync = this.vaultSync;
+		if (!vaultSync) throw new Error("Sync is not initialized.");
+		if (target.remoteDeleteFingerprint === null) {
+			throw new Error(`Remote deletion is no longer authoritative for "${target.path}".`);
+		}
+		const currentFingerprint = target.fileKind === "markdown"
+			? vaultSync.getAuthoritativeMarkdownDeleteSnapshot(target.path)?.fingerprint ?? null
+			: vaultSync.getAuthoritativeBlobDeleteSnapshot(target.path)?.fingerprint ?? null;
+		if (currentFingerprint !== target.remoteDeleteFingerprint) {
+			throw new Error(`Remote deletion changed for "${target.path}". Refresh the dashboard.`);
+		}
+	}
+
+	private getDashboardLocalFileIdentity(path: string): DashboardLocalFileIdentity {
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (file === null) return { kind: "missing", mtime: null, size: null };
+		if (!(file instanceof TFile)) return { kind: "other", mtime: null, size: null };
+		return {
+			kind: "file",
+			mtime: file.stat.mtime,
+			size: file.stat.size,
+		};
+	}
+
+	private assertDashboardLocalFileIdentity(
+		target: DashboardRemoteDeleteResolutionTarget,
+		knownFile?: TFile,
+	): void {
+		const actual = knownFile
+			? {
+				kind: "file" as const,
+				mtime: knownFile.stat.mtime,
+				size: knownFile.stat.size,
+			}
+			: this.getDashboardLocalFileIdentity(target.path);
+		if (
+			actual.kind !== target.localFile.kind
+			|| actual.mtime !== target.localFile.mtime
+			|| actual.size !== target.localFile.size
+		) {
+			throw new Error(`Local file changed since the dashboard was opened: ${target.path}`);
+		}
+		if (actual.kind === "other") {
+			throw new Error(`Attention path is not a file: ${target.path}`);
+		}
 	}
 
 	private getDashboardConnectionSummary(): { label: string; tone: DashboardTone } {
@@ -1897,7 +2191,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			`  reason: ${entry.reason}`,
 			`  first seen: ${new Date(entry.firstSeenAt).toLocaleString()}`,
 			`  last seen: ${new Date(entry.lastSeenAt).toLocaleString()}`,
-			"  suggested action: inspect the local file and conflict artifacts, then edit/save to keep local content or delete it to accept the remote delete.",
+			isRemoteDeletePreservedUnresolvedEntry(entry)
+				? "  suggested action: open the dashboard, inspect the file, then choose Keep local file or Accept remote delete."
+				: "  suggested action: inspect the local file and conflict artifacts before resolving the underlying conflict.",
 		].join("\n"));
 		const structuralText = structural.map((entry, idx) => [
 			`Structural change ${idx + 1}`,

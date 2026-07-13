@@ -6,6 +6,10 @@ import type {
 	DashboardRecentChange,
 	DashboardRecentChanges,
 	DashboardFileHistoryAttempt,
+	DashboardRemoteDeleteResolution,
+	DashboardRemoteDeleteResolutionChoice,
+	DashboardRemoteDeleteResolutionResult,
+	DashboardRemoteDeleteResolutionTarget,
 	DashboardRecoveryHistoryTarget,
 	DashboardRecoveryStorageStatus,
 	DashboardTone,
@@ -40,6 +44,10 @@ export interface KaosDashboardActions {
 	showRecoveryHistory(target?: DashboardRecoveryHistoryTarget): Promise<void>;
 	exportDiagnostics(): void;
 	exportDiagnosticsWithFilenames(): void;
+	resolveRemoteDeleteAttention(
+		target: DashboardRemoteDeleteResolutionTarget,
+		choice: DashboardRemoteDeleteResolutionChoice,
+	): Promise<DashboardRemoteDeleteResolutionResult>;
 }
 
 export interface KaosDashboardViewDeps {
@@ -55,6 +63,7 @@ export class KaosDashboardView extends ItemView {
 	private loading = false;
 	private error: string | null = null;
 	private refreshTimer: number | null = null;
+	private readonly pendingAttentionEpisodes = new Set<string>();
 
 	constructor(
 		leaf: WorkspaceLeaf,
@@ -139,7 +148,7 @@ export class KaosDashboardView extends ItemView {
 		this.renderOverview(root, this.data.overview);
 		this.renderSnapshots(root, this.data);
 		this.renderConflicts(root, this.data.conflicts, this.data.settings.deviceName);
-		this.renderAttention(root, this.data.attention);
+		this.renderAttention(root, this.data.attention, this.data.attentionTotalCount);
 	}
 
 	private getDashboardMode(): KaosDashboardMode {
@@ -168,8 +177,8 @@ export class KaosDashboardView extends ItemView {
 	private renderPhoneDashboard(root: HTMLElement, data: KaosDashboardData): void {
 		this.renderMobileSummary(root, data);
 		this.renderMobileActions(root, data);
-		if (data.attention.length > 0) {
-			this.renderAttention(root, data.attention);
+		if (data.attentionTotalCount > 0) {
+			this.renderAttention(root, data.attention, data.attentionTotalCount);
 		}
 		if (data.conflicts.length > 0) {
 			this.renderConflicts(root, data.conflicts, data.settings.deviceName);
@@ -187,7 +196,7 @@ export class KaosDashboardView extends ItemView {
 		const metrics: DashboardMetric[] = [
 			{ label: "Status", value: status?.value ?? "unknown", tone: status?.tone },
 			{ label: "Connection", value: connection?.value ?? "unknown", tone: connection?.tone },
-			{ label: "Attention", value: String(data.attention.length), tone: data.attention.length > 0 ? "warn" : "ok" },
+			{ label: "Attention", value: String(data.attentionTotalCount), tone: data.attentionTotalCount > 0 ? "warn" : "ok" },
 			{ label: "Conflicts", value: String(data.conflicts.length), tone: data.conflicts.length > 0 ? "error" : "ok" },
 			{ label: "Recent changes", value: recentValue, tone: data.recentChanges.status === "error" ? "error" : undefined },
 			{
@@ -418,11 +427,21 @@ export class KaosDashboardView extends ItemView {
 		}
 	}
 
-	private renderAttention(root: HTMLElement, items: DashboardAttentionItem[]): void {
-		const section = this.section(root, `Attention (${items.length})`);
-		if (items.length === 0) {
+	private renderAttention(
+		root: HTMLElement,
+		items: DashboardAttentionItem[],
+		totalCount: number,
+	): void {
+		const section = this.section(root, `Attention (${totalCount})`);
+		if (totalCount === 0) {
 			section.createDiv({ text: "No files currently need attention.", cls: "kaos-dashboard-muted" });
 			return;
+		}
+		if (items.length < totalCount) {
+			section.createDiv({
+				text: `Showing ${items.length} representative row(s) for ${totalCount} attention item(s).`,
+				cls: "kaos-dashboard-muted",
+			});
 		}
 		const list = section.createDiv({ cls: "kaos-dashboard-list" });
 		for (const item of items) {
@@ -432,7 +451,145 @@ export class KaosDashboardView extends ItemView {
 			if (item.lastSeenAt) {
 				row.createDiv({ text: `last ${formatDateTime(item.lastSeenAt)}`, cls: "kaos-dashboard-muted" });
 			}
+			const path = item.path;
+			if (path) {
+				const actions = row.createDiv({ cls: "kaos-dashboard-row-actions kaos-dashboard-attention-actions" });
+				this.button(actions, "Open file", () => this.openPath(path));
+				const resolution = item.resolution;
+				if (resolution?.kind === "remote-delete") {
+					const actionPending = this.pendingAttentionEpisodes.has(
+						attentionEpisodeKey(path, resolution),
+					);
+					const pending = actionPending || resolution.keepLocalPending;
+					this.button(
+						actions,
+						resolution.keepLocalPending
+							? "Publishing local file…"
+							: actionPending ? "Resolving…" : "Keep local file",
+						() => this.confirmRemoteDeleteResolution(
+							path,
+							resolution,
+							"keep-local",
+						),
+						pending || !resolution.canKeepLocal,
+						resolution.keepLocalUnavailableReason ?? undefined,
+					);
+					const acceptDeleteButton = this.button(
+						actions,
+						"Accept remote delete",
+						() => this.confirmRemoteDeleteResolution(
+							path,
+							resolution,
+							"accept-remote-delete",
+						),
+						pending || !resolution.canAcceptRemoteDelete,
+						resolution.acceptRemoteDeleteUnavailableReason ?? undefined,
+					);
+					acceptDeleteButton.classList.add("mod-warning");
+				}
+			}
 		}
+	}
+
+	private confirmRemoteDeleteResolution(
+		path: string,
+		resolution: DashboardRemoteDeleteResolution,
+		choice: DashboardRemoteDeleteResolutionChoice,
+	): Promise<void> {
+		const keepingLocal = choice === "keep-local";
+		const episodeKey = attentionEpisodeKey(path, resolution);
+		if (this.pendingAttentionEpisodes.has(episodeKey)) {
+			return Promise.reject(new Error(`A resolution is already pending for "${path}".`));
+		}
+		this.pendingAttentionEpisodes.add(episodeKey);
+		this.render();
+		return new Promise((resolve, reject) => {
+			new ConfirmModal(
+				this.app,
+				keepingLocal ? "Keep local file?" : "Accept remote delete?",
+				keepingLocal
+					? `Revive "${path}" and publish this local ${resolution.fileKind} to synced devices? The remote deletion will be ignored.`
+					: `Delete the local copy of "${path}" using Obsidian's configured delete behavior? The remote deletion will be kept.`,
+				async () => {
+					try {
+						const result = await this.deps.actions.resolveRemoteDeleteAttention(
+							{ path, ...resolution },
+							choice,
+						);
+						if (result.status === "pending") {
+							this.markAttentionEpisodePending(path, resolution);
+							new Notice(result.message, 7000);
+						} else {
+							new Notice(
+								keepingLocal
+									? `Local file kept: ${path}`
+									: `Remote deletion accepted: ${path}`,
+							);
+							this.removeResolvedAttentionEpisode(path, resolution);
+						}
+						resolve();
+					} catch (err) {
+						reject(err instanceof Error ? err : new Error(String(err)));
+					} finally {
+						this.pendingAttentionEpisodes.delete(episodeKey);
+						this.render();
+					}
+				},
+				keepingLocal ? "Keep local file" : "Accept remote delete",
+				"Cancel",
+				() => {
+					this.pendingAttentionEpisodes.delete(episodeKey);
+					this.render();
+					resolve();
+				},
+				keepingLocal ? "mod-cta" : "mod-warning",
+			).open();
+		});
+	}
+
+	private removeResolvedAttentionEpisode(
+		path: string,
+		resolution: DashboardRemoteDeleteResolution,
+	): void {
+		if (!this.data) return;
+		const nextAttention = this.data.attention.filter((item) => {
+			if (item.path !== path || item.resolution?.kind !== "remote-delete") return true;
+			return item.resolution.episodeId !== resolution.episodeId;
+		});
+		if (nextAttention.length === this.data.attention.length) return;
+		this.data = {
+			...this.data,
+			attention: nextAttention,
+			attentionTotalCount: Math.max(0, this.data.attentionTotalCount - 1),
+		};
+	}
+
+	private markAttentionEpisodePending(
+		path: string,
+		resolution: DashboardRemoteDeleteResolution,
+	): void {
+		if (!this.data) return;
+		this.data = {
+			...this.data,
+			attention: this.data.attention.map((item) => {
+				if (
+					item.path !== path
+					|| item.resolution?.kind !== "remote-delete"
+					|| item.resolution.episodeId !== resolution.episodeId
+				) return item;
+				return {
+					...item,
+					resolution: {
+						...item.resolution,
+						keepLocalPending: true,
+						canKeepLocal: false,
+						canAcceptRemoteDelete: false,
+						keepLocalUnavailableReason: "The local attachment is still being published.",
+						acceptRemoteDeleteUnavailableReason: "Wait for the pending Keep local upload to finish.",
+					},
+				};
+			}),
+		};
 	}
 
 	private section(root: HTMLElement, title: string): HTMLElement {
@@ -446,16 +603,21 @@ export class KaosDashboardView extends ItemView {
 		label: string,
 		action: () => void | Promise<void>,
 		disabled = false,
+		disabledReason?: string,
 	): HTMLButtonElement {
 		const button = parent.createEl("button", { text: label });
 		button.disabled = disabled;
+		if (disabled && disabledReason) {
+			button.title = disabledReason;
+			button.setAttribute("aria-label", `${label}: ${disabledReason}`);
+		}
 		button.addEventListener("click", () => {
 			if (button.disabled) return;
 			button.disabled = true;
 			Promise.resolve(action())
 				.then(() => this.refresh(true))
 				.catch((err) => {
-					new Notice(`${label} failed. Check console.`, 5000);
+					new Notice(`${label} failed: ${formatUnknown(err)}`, 7000);
 					console.warn(`[kaos] dashboard action failed: ${label}`, err);
 				})
 				.finally(() => {
@@ -980,4 +1142,11 @@ function formatBytes(bytes: number): string {
 function formatUnknown(err: unknown): string {
 	if (err instanceof Error) return err.message;
 	return String(err);
+}
+
+function attentionEpisodeKey(
+	path: string,
+	resolution: DashboardRemoteDeleteResolution,
+): string {
+	return `${resolution.fileKind}:${path}:${resolution.episodeId}`;
 }

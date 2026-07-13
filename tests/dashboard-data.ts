@@ -47,6 +47,7 @@ function makeApp(files: FakeTFile[]) {
 
 const files = [
 	new FakeTFile("notes/a.md", { mtime: 10, size: 12 }),
+	new FakeTFile("notes/preserved.md", { mtime: 15, size: 25 }),
 	new FakeTFile("notes/a (KAOS conflict - disk from device-a 2026-06-23T14-20-40Z).md", { mtime: 20, size: 13 }),
 	new FakeTFile("notes/b (KAOS conflict - crdt from device-b 2026-06-24T09-00-00Z).md", { mtime: 30, size: 14 }),
 	new FakeTFile("assets/img.png", { mtime: 11, size: 100 }),
@@ -129,9 +130,24 @@ const baseInput: KaosDashboardCollectorInput = {
 		path: "notes/preserved.md",
 		kind: "markdown",
 		reason: "remote-delete-missing-baseline",
+		episodeId: "episode-preserved",
 		firstSeenAt: 1_777_000_000_000,
 		lastSeenAt: 1_777_000_010_000,
+	}, {
+		path: "notes/path-collision.md",
+		kind: "markdown",
+		reason: "path-collision",
+		firstSeenAt: 1_777_000_000_001,
+		lastSeenAt: 1_777_000_010_001,
 	}],
+	remoteDeleteResolutionState: {
+		markdownAvailable: true,
+		blobAvailable: true,
+		getFingerprint: (_kind, path) => path === "notes/preserved.md"
+			? "markdown-delete-fingerprint"
+			: null,
+		isKeepLocalPending: () => false,
+	},
 	frontmatterQuarantineEntries: [{
 		path: "notes/frontmatter.md",
 		firstSeenAt: 1_777_000_020_000,
@@ -228,6 +244,26 @@ console.log("\n--- Test 3: attention aggregation includes all local attention ty
 	assert(attention.some((item) => item.kind === "structural-change"), "structural change included");
 	assert(attention.some((item) => item.kind === "blocked-divergence"), "blocked divergence included");
 	assert(attention.some((item) => item.kind === "frontmatter-quarantine"), "frontmatter quarantine included");
+	const remoteDelete = attention.find((item) => item.path === "notes/preserved.md");
+	const pathCollision = attention.find((item) => item.path === "notes/path-collision.md");
+	assert(
+		remoteDelete?.resolution?.kind === "remote-delete"
+			&& remoteDelete.resolution.fileKind === "markdown"
+			&& remoteDelete.resolution.reason === "remote-delete-missing-baseline",
+		"remote-delete attention exposes explicit resolution metadata",
+	);
+	assert(remoteDelete?.resolution?.episodeId === "episode-preserved", "attention action is bound to its occurrence");
+	assert(remoteDelete?.resolution?.remoteDeleteFingerprint === "markdown-delete-fingerprint", "attention action is bound to the current remote tombstone");
+	assert(remoteDelete?.resolution?.localFile.kind === "file" && remoteDelete.resolution.localFile.mtime === 15, "attention action captures local file identity");
+	assert(remoteDelete?.resolution?.canKeepLocal === true, "Keep local is enabled only when the local file and sync engine are ready");
+	assert(remoteDelete?.resolution?.canAcceptRemoteDelete === true, "Accept remote delete is enabled for an authoritative tombstone");
+	assert(pathCollision?.resolution === null, "non-delete preserved attention is not offered delete resolution");
+	assert(
+		attention
+			.filter((item) => item.kind !== "preserved-unresolved")
+			.every((item) => item.resolution === null),
+		"non-file attention types do not expose remote-delete actions",
+	);
 }
 
 console.log("\n--- Test 4: dashboard data preserves snapshot unavailable and recent changes ---");
@@ -240,7 +276,78 @@ console.log("\n--- Test 4: dashboard data preserves snapshot unavailable and rec
 	assert(data.recentChanges.status === "ready" && data.recentChanges.lastAttempt?.status === "created", "last file history attempt preserved");
 	assert(data.recentChanges.status === "ready" && data.recentChanges.changes[0]?.previousContentHash === "oldhash", "previous content hash preserved for dashboard history navigation");
 	assert(data.actions.snapshotsAvailable === false, "snapshot action disabled state represented");
+	assert(data.attentionTotalCount === 5, "attention total includes entries hidden by collapsed/sample rows");
 	assert(data.overview.some((metric) => metric.label === "Server receipt" && metric.value === "confirmed"), "server receipt metric built");
+}
+
+console.log("\n--- Test 4b: pending attachment publication disables competing actions ---");
+{
+	const attention = collectDashboardAttention({
+		...baseInput,
+		preservedUnresolvedEntries: [{
+			...baseInput.preservedUnresolvedEntries[0]!,
+			kind: "blob",
+		}],
+		remoteDeleteResolutionState: {
+			...baseInput.remoteDeleteResolutionState!,
+			isKeepLocalPending: (kind) => kind === "blob",
+		},
+	});
+	const pending = attention.find((item) => item.path === "notes/preserved.md")?.resolution;
+	assert(pending?.keepLocalPending === true, "pending publication is exposed to the view");
+	assert(pending?.canKeepLocal === false, "pending publication disables duplicate Keep local");
+	assert(pending?.canAcceptRemoteDelete === false, "pending publication disables competing Accept");
+}
+
+console.log("\n--- Test 4c: attention sampling reports the true total ---");
+{
+	const manyEntries = Array.from({ length: 25 }, (_, index) => ({
+		path: `notes/attention-${index}.md`,
+		kind: "markdown" as const,
+		reason: "remote-delete-missing-baseline" as const,
+		episodeId: `episode-${index}`,
+		firstSeenAt: 1_777_000_000_000 + index,
+		lastSeenAt: 1_777_000_010_000 + index,
+	}));
+	const sampled = buildKaosDashboardData({
+		...baseInput,
+		preservedUnresolvedEntries: manyEntries,
+	});
+	assert(
+		sampled.attention.filter((item) => item.kind === "preserved-unresolved").length === 20,
+		"the dashboard keeps a bounded preserved-unresolved sample",
+	);
+	assert(
+		sampled.attentionTotalCount === 28,
+		"the section count includes entries outside the sample",
+	);
+}
+
+console.log("\n--- Test 4d: unavailable sync engines disable resolution actions ---");
+{
+	const attention = collectDashboardAttention({
+		...baseInput,
+		remoteDeleteResolutionState: undefined,
+	});
+	const resolution = attention.find((item) => item.path === "notes/preserved.md")?.resolution;
+	assert(resolution?.canKeepLocal === false, "Keep local is disabled without a sync engine");
+	assert(resolution?.canAcceptRemoteDelete === false, "Accept is disabled without a sync engine");
+	assert(
+		resolution?.keepLocalUnavailableReason?.includes("not initialized") === true,
+		"the disabled action explains why it is unavailable",
+	);
+}
+
+console.log("\n--- Test 4e: an already-missing local file can still accept remote delete ---");
+{
+	const attention = collectDashboardAttention({
+		...baseInput,
+		app: makeApp([]),
+	});
+	const resolution = attention.find((item) => item.path === "notes/preserved.md")?.resolution;
+	assert(resolution?.localFile.kind === "missing", "missing local identity is captured");
+	assert(resolution?.canKeepLocal === false, "a missing file cannot be kept locally");
+	assert(resolution?.canAcceptRemoteDelete === true, "a missing file can clear the accepted marker");
 }
 
 console.log("\n--- Test 5: dashboard device display marks this device ---");

@@ -2,7 +2,11 @@ import type { ReconciliationState } from "../runtime/reconciliationController";
 import type { RecoveryStorageAuditReport } from "../sync/recoverySnapshotClient";
 import type { DiskIndex } from "../sync/diskIndex";
 import type { FrontmatterQuarantineEntry } from "../sync/frontmatterQuarantine";
-import type { PreservedUnresolvedEntry } from "../sync/preservedUnresolved";
+import type {
+	PreservedUnresolvedEntry,
+	PreservedUnresolvedKind,
+	RemoteDeletePreservedUnresolvedReason,
+} from "../sync/preservedUnresolved";
 
 export type DashboardTone = "ok" | "busy" | "warn" | "error" | "muted";
 
@@ -56,7 +60,41 @@ export interface DashboardAttentionItem {
 	firstSeenAt: string | null;
 	lastSeenAt: string | null;
 	tone: DashboardTone;
+	resolution: DashboardRemoteDeleteResolution | null;
 }
+
+export interface DashboardLocalFileIdentity {
+	kind: "file" | "missing" | "other";
+	mtime: number | null;
+	size: number | null;
+}
+
+export interface DashboardRemoteDeleteResolution {
+	kind: "remote-delete";
+	fileKind: PreservedUnresolvedKind;
+	reason: RemoteDeletePreservedUnresolvedReason;
+	episodeId: string;
+	remoteDeleteFingerprint: string | null;
+	localFile: DashboardLocalFileIdentity;
+	canKeepLocal: boolean;
+	canAcceptRemoteDelete: boolean;
+	keepLocalPending: boolean;
+	keepLocalUnavailableReason: string | null;
+	acceptRemoteDeleteUnavailableReason: string | null;
+}
+
+export interface DashboardRemoteDeleteResolutionTarget
+	extends DashboardRemoteDeleteResolution {
+	path: string;
+}
+
+export type DashboardRemoteDeleteResolutionChoice =
+	| "keep-local"
+	| "accept-remote-delete";
+
+export type DashboardRemoteDeleteResolutionResult =
+	| { status: "completed" }
+	| { status: "pending"; message: string };
 
 export type DashboardSnapshotStatus =
 	| { status: "ready"; summary: DashboardSnapshotStatusSummary }
@@ -127,6 +165,7 @@ export interface KaosDashboardData {
 	recentChanges: DashboardRecentChanges;
 	conflicts: DashboardConflictArtifact[];
 	attention: DashboardAttentionItem[];
+	attentionTotalCount: number;
 	actions: DashboardActionState;
 }
 
@@ -179,6 +218,16 @@ export interface KaosDashboardCollectorInput {
 	diskMirror: DashboardDiskMirrorDebug | null;
 	blobSync: DashboardBlobSyncDebug | null;
 	preservedUnresolvedEntries: PreservedUnresolvedEntry[];
+	remoteDeleteResolutionState?: {
+		markdownAvailable: boolean;
+		blobAvailable: boolean;
+		getFingerprint(kind: PreservedUnresolvedKind, path: string): string | null;
+		isKeepLocalPending(
+			kind: PreservedUnresolvedKind,
+			path: string,
+			episodeId: string,
+		): boolean;
+	};
 	frontmatterQuarantineEntries: FrontmatterQuarantineEntry[];
 	diskIndex: DiskIndex;
 	snapshotStatus: DashboardSnapshotStatus;

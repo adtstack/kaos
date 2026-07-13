@@ -72,6 +72,38 @@ const RENAME_BATCH_MS = 50;
 
 /** Reconciliation mode determines what operations are safe. */
 export type ReconcileMode = "conservative" | "authoritative";
+
+/** Canonical metadata for one Markdown tombstone in an authoritative delete snapshot. */
+export interface MarkdownRemoteDeleteTombstoneSnapshot {
+	readonly fileId: string;
+	readonly deletedAt: number | null;
+	readonly device: string | null;
+}
+
+/**
+ * A point-in-time, authoritative view of a remotely deleted Markdown path.
+ *
+ * `fingerprint` is deterministic for the normalized path and the complete,
+ * sorted tombstone set. Callers can take a snapshot before an async operation
+ * and compare it with a fresh snapshot immediately before committing a
+ * destructive resolution.
+ */
+export interface MarkdownRemoteDeleteSnapshot {
+	readonly kind: "markdown";
+	readonly path: string;
+	readonly tombstones: readonly MarkdownRemoteDeleteTombstoneSnapshot[];
+	readonly fingerprint: string;
+}
+
+/** A point-in-time, authoritative view of a remotely deleted blob path. */
+export interface BlobRemoteDeleteSnapshot {
+	readonly kind: "blob";
+	readonly path: string;
+	readonly deletedAt: number;
+	readonly device: string | null;
+	readonly fingerprint: string;
+}
+
 type FatalAuthCode = "unauthorized" | "server_misconfigured" | "unclaimed" | "update_required";
 
 interface FatalAuthMessage {
@@ -1456,6 +1488,59 @@ export class VaultSync {
 		return this.isPathTombstoned(path) || this.getMarkdownTombstoneIds(path).length > 0;
 	}
 
+	/**
+	 * Return an authoritative Markdown delete snapshot for `path`.
+	 *
+	 * Unlike `isMarkdownTombstoned`, this deliberately treats any active
+	 * metadata entry for the path (including a duplicate-active collision) as
+	 * authoritative and returns null. This prevents a stale tombstone from
+	 * authorizing deletion or replacement of a newly revived remote document.
+	 */
+	getAuthoritativeMarkdownDeleteSnapshot(path: string): MarkdownRemoteDeleteSnapshot | null {
+		const normalizedPath = this.normPath(path);
+		const tombstones: MarkdownRemoteDeleteTombstoneSnapshot[] = [];
+		let hasActiveEntry = false;
+
+		// Read the current CRDT map directly so the snapshot is independent of
+		// path-index invalidation timing and covers every competing fileId.
+		this.meta.forEach((value: unknown, fileId: string) => {
+			const decoded = decodeFileMeta(value);
+			if (!decoded || this.normPath(decoded.path) !== normalizedPath) return;
+
+			if (!isFileMetaDeletedValue(value)) {
+				hasActiveEntry = true;
+				return;
+			}
+
+			tombstones.push({
+				fileId,
+				deletedAt: decoded.deletedAt ?? null,
+				device: decoded.device ?? null,
+			});
+		});
+
+		if (hasActiveEntry || tombstones.length === 0) return null;
+
+		tombstones.sort((a, b) => {
+			if (a.fileId < b.fileId) return -1;
+			if (a.fileId > b.fileId) return 1;
+			return 0;
+		});
+
+		const fingerprint = JSON.stringify([
+			"markdown",
+			normalizedPath,
+			tombstones.map(({ fileId, deletedAt, device }) => [fileId, deletedAt, device]),
+		]);
+
+		return {
+			kind: "markdown",
+			path: normalizedPath,
+			tombstones,
+			fingerprint,
+		};
+	}
+
 	getTextForPath(path: string): Y.Text | null {
 		path = this.normPath(path);
 		const fileId = this.getFileId(path);
@@ -1661,6 +1746,43 @@ export class VaultSync {
 	 */
 	isBlobTombstoned(path: string): boolean {
 		return this.blobTombstones.has(this.normPath(path));
+	}
+
+	/**
+	 * Return an authoritative blob delete snapshot for `path`.
+	 *
+	 * A live pathToBlob reference always wins over a stale tombstone. Invalid
+	 * tombstones are not considered sufficient authority for a destructive
+	 * resolution.
+	 */
+	getAuthoritativeBlobDeleteSnapshot(path: string): BlobRemoteDeleteSnapshot | null {
+		const normalizedPath = this.normPath(path);
+		if (this.pathToBlob.has(normalizedPath)) return null;
+
+		const tombstone = this.blobTombstones.get(normalizedPath);
+		if (
+			!tombstone
+			|| typeof tombstone.deletedAt !== "number"
+			|| !Number.isFinite(tombstone.deletedAt)
+		) {
+			return null;
+		}
+
+		const device = typeof tombstone.device === "string" ? tombstone.device : null;
+		const fingerprint = JSON.stringify([
+			"blob",
+			normalizedPath,
+			tombstone.deletedAt,
+			device,
+		]);
+
+		return {
+			kind: "blob",
+			path: normalizedPath,
+			deletedAt: tombstone.deletedAt,
+			device,
+			fingerprint,
+		};
 	}
 
 	/**

@@ -27,6 +27,9 @@ const persisted: PreservedUnresolvedEntry[] = [
 
 const registry = new PreservedUnresolvedRegistry(persisted);
 
+const initialMarkdownEpisode = registry.get("Notes/Needs Attention.md")?.episodeId;
+assert.ok(initialMarkdownEpisode, "legacy persisted entries are hydrated with an episode ID");
+
 assert.equal(registry.has("Notes/Needs Attention.md"), true);
 assert.equal(registry.paths.has("Notes/Needs Attention.md"), true);
 assert.equal(registry.has("Attachments/photo.png"), true);
@@ -43,6 +46,31 @@ assert.equal(summary.reasons["remote-delete-hash-read-failed"], 1);
 registry.record({
 	path: "Notes/Needs Attention.md",
 	kind: "markdown",
+	reason: "remote-delete-missing-baseline",
+	at: lastSeenAt + 5,
+});
+assert.equal(
+	registry.get("Notes/Needs Attention.md")?.episodeId,
+	initialMarkdownEpisode,
+	"repeated observations retain the same episode ID",
+);
+
+registry.record({
+	path: "Notes/Needs Attention.md",
+	kind: "markdown",
+	reason: "remote-delete-missing-baseline",
+	episodeId: "replacement-delete-fingerprint",
+	at: lastSeenAt + 6,
+});
+assert.equal(
+	registry.get("Notes/Needs Attention.md")?.episodeId,
+	"replacement-delete-fingerprint",
+	"an explicit new delete fingerprint starts a new episode even when the reason is unchanged",
+);
+
+registry.record({
+	path: "Notes/Needs Attention.md",
+	kind: "markdown",
 	reason: "multiple-editor-authorities",
 	at: lastSeenAt + 10,
 	localHash: "local-note-new",
@@ -50,9 +78,10 @@ registry.record({
 
 const updated = registry.get("Notes/Needs Attention.md");
 assert.ok(updated);
-assert.equal(updated.firstSeenAt, firstSeenAt);
+assert.equal(updated.firstSeenAt, lastSeenAt + 10);
 assert.equal(updated.lastSeenAt, lastSeenAt + 10);
 assert.equal(updated.reason, "multiple-editor-authorities");
+assert.notEqual(updated.episodeId, "replacement-delete-fingerprint", "a changed condition starts a new episode");
 assert.equal(updated.localHash, "local-note-new");
 assert.equal(updated.knownRemoteHash, null);
 

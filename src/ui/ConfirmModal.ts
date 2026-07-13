@@ -14,6 +14,7 @@ export class ConfirmModal extends Modal {
 		private readonly confirmText = "Confirm",
 		private readonly cancelText = "Cancel",
 		private readonly onCancel?: () => void | Promise<void>,
+		private readonly confirmClass = "mod-warning",
 	) {
 		super(app);
 	}
@@ -31,10 +32,8 @@ export class ConfirmModal extends Modal {
 			.createEl("button", { text: this.cancelText })
 			.addEventListener("click", () => this.close());
 
-		const confirmBtn = buttonRow.createEl("button", {
-			text: this.confirmText,
-			cls: "mod-warning",
-		});
+		const confirmBtn = buttonRow.createEl("button", { text: this.confirmText });
+		if (this.confirmClass) confirmBtn.addClass(this.confirmClass);
 		confirmBtn.addEventListener("click", () => {
 			this.confirmed = true;
 			this.close();

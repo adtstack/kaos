@@ -13,7 +13,13 @@ import {
 } from "./frontmatterGuard";
 import { isLocalOrigin } from "./origins";
 import { contentBaselineHash } from "./diskIndex";
-import { PreservedUnresolvedRegistry, type PreservedUnresolvedEntry, type PreservedUnresolvedReason } from "./preservedUnresolved";
+import {
+	PreservedUnresolvedRegistry,
+	getRemoteDeleteEpisodeId,
+	isRemoteDeletePreservedUnresolvedEntry,
+	type PreservedUnresolvedEntry,
+	type PreservedUnresolvedReason,
+} from "./preservedUnresolved";
 export { isLocalOrigin };
 
 /**
@@ -1058,12 +1064,10 @@ export class DiskMirror {
 							this.openWriteTimers.delete(normalized);
 						}
 						this.editorBindings.unbindByPath(normalized);
-						this.preservedUnresolved.record({
-							path: normalized,
-							kind: "markdown",
-							reason: unresolvedReason ?? "unknown",
-						});
-						this.onPreservedUnresolvedChanged?.();
+						this.recordPreservedUnresolved(
+							normalized,
+							unresolvedReason ?? "unknown",
+						);
 					}
 			} catch (err) {
 				console.error(
@@ -1240,12 +1244,49 @@ export class DiskMirror {
 		path: string,
 		reason: PreservedUnresolvedReason,
 	): void {
-		this.preservedUnresolved.record({
-			path: normalizePath(path),
+		const normalized = normalizePath(path);
+		const remoteDeleteEntry = isRemoteDeletePreservedUnresolvedEntry({
 			kind: "markdown",
 			reason,
 		});
+		const deleteFingerprint = remoteDeleteEntry
+			? this.getAuthoritativeMarkdownDeleteFingerprint(normalized)
+			: undefined;
+		if (remoteDeleteEntry && !deleteFingerprint) {
+			// The path revived while asynchronous conflict inspection was in
+			// progress; do not manufacture a stale Attention occurrence.
+			return;
+		}
+		this.preservedUnresolved.record({
+			path: normalized,
+			kind: "markdown",
+			reason,
+			episodeId: deleteFingerprint
+				? getRemoteDeleteEpisodeId("markdown", deleteFingerprint)
+				: undefined,
+		});
 		this.onPreservedUnresolvedChanged?.();
+	}
+
+	private getAuthoritativeMarkdownDeleteFingerprint(path: string): string | null {
+		const snapshotGetter = (
+			this.vaultSync as unknown as {
+				getAuthoritativeMarkdownDeleteSnapshot?: (
+					candidate: string,
+				) => { fingerprint: string } | null;
+			}
+		).getAuthoritativeMarkdownDeleteSnapshot;
+		if (typeof snapshotGetter === "function") {
+			return snapshotGetter.call(this.vaultSync, path)?.fingerprint ?? null;
+		}
+		const activeIds = this.vaultSync.getActiveFileIdsForPath?.(path) ?? [];
+		if (activeIds.length > 0) return null;
+		const deleted = typeof this.vaultSync.isPathTombstoned === "function"
+			? this.vaultSync.isPathTombstoned(path)
+			: typeof this.vaultSync.isMarkdownTombstoned === "function"
+				? this.vaultSync.isMarkdownTombstoned(path)
+				: true;
+		return deleted ? JSON.stringify(["legacy-markdown-delete", path]) : null;
 	}
 
 	getPreservedUnresolvedEntries(): PreservedUnresolvedEntry[] {

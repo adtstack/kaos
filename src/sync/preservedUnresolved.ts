@@ -16,10 +16,55 @@ export type PreservedUnresolvedReason =
 	| "path-collision"
 	| "unknown";
 
+export const REMOTE_DELETE_PRESERVED_UNRESOLVED_REASONS = [
+	"remote-delete-missing-baseline",
+	"remote-delete-read-failed",
+	"remote-delete-open-editor-read-failed",
+	"remote-delete-multiple-open-editor-authorities",
+	"remote-delete-hash-read-failed",
+	"remote-delete-stat-failed",
+] as const satisfies readonly PreservedUnresolvedReason[];
+
+export type RemoteDeletePreservedUnresolvedReason =
+	typeof REMOTE_DELETE_PRESERVED_UNRESOLVED_REASONS[number];
+
+const REMOTE_DELETE_REASON_SET = new Set<string>(
+	REMOTE_DELETE_PRESERVED_UNRESOLVED_REASONS,
+);
+
+export function isRemoteDeletePreservedUnresolvedReason(
+	reason: PreservedUnresolvedReason,
+): reason is RemoteDeletePreservedUnresolvedReason {
+	return REMOTE_DELETE_REASON_SET.has(reason);
+}
+
+export function isRemoteDeletePreservedUnresolvedEntry(
+	entry: Pick<PreservedUnresolvedEntry, "kind" | "reason">,
+): entry is Pick<PreservedUnresolvedEntry, "kind"> & {
+	reason: RemoteDeletePreservedUnresolvedReason;
+} {
+	if (!isRemoteDeletePreservedUnresolvedReason(entry.reason)) return false;
+	if (entry.kind === "markdown") {
+		return entry.reason === "remote-delete-missing-baseline"
+			|| entry.reason === "remote-delete-read-failed"
+			|| entry.reason === "remote-delete-open-editor-read-failed"
+			|| entry.reason === "remote-delete-multiple-open-editor-authorities";
+	}
+	return entry.reason === "remote-delete-missing-baseline"
+		|| entry.reason === "remote-delete-hash-read-failed"
+		|| entry.reason === "remote-delete-stat-failed";
+}
+
 export interface PreservedUnresolvedEntry {
 	path: string;
 	kind: PreservedUnresolvedKind;
 	reason: PreservedUnresolvedReason;
+	/**
+	 * Identifies one uninterrupted occurrence of an unresolved condition.
+	 * Dashboard actions use this to reject a confirmation dialog that outlived
+	 * the occurrence it was opened for.
+	 */
+	episodeId?: string;
 	firstSeenAt: number;
 	lastSeenAt: number;
 	localHash?: string | null;
@@ -50,13 +95,48 @@ function extensionFor(path: string): string | null {
 	return dot > 0 ? name.slice(dot) : null;
 }
 
+let episodeSequence = 0;
+
+export function createPreservedUnresolvedEpisodeId(at = Date.now()): string {
+	episodeSequence = (episodeSequence + 1) % Number.MAX_SAFE_INTEGER;
+	return [
+		at.toString(36),
+		episodeSequence.toString(36),
+		Math.random().toString(36).slice(2, 12),
+	].join("-");
+}
+
+export function getPreservedUnresolvedEpisodeId(
+	entry: Pick<PreservedUnresolvedEntry, "kind" | "reason" | "firstSeenAt"> & {
+		episodeId?: string;
+	},
+): string {
+	if (typeof entry.episodeId === "string" && entry.episodeId.length > 0) {
+		return entry.episodeId;
+	}
+	// Backward-compatible, stable token for plugin data written before episodeId
+	// existed. It remains stable through hydration and is persisted on next save.
+	return `legacy:${entry.kind}:${entry.reason}:${entry.firstSeenAt}`;
+}
+
+export function getRemoteDeleteEpisodeId(
+	kind: PreservedUnresolvedKind,
+	remoteDeleteFingerprint: string,
+): string {
+	return `remote-delete:${kind}:${remoteDeleteFingerprint}`;
+}
+
 export class PreservedUnresolvedRegistry {
 	private entries = new Map<string, PreservedUnresolvedEntry>();
 	readonly paths = new Set<string>();
 
 	constructor(entries: PreservedUnresolvedEntry[] = []) {
 		for (const entry of entries) {
-			this.record({ ...entry, at: entry.lastSeenAt });
+			this.record({
+				...entry,
+				episodeId: getPreservedUnresolvedEpisodeId(entry),
+				at: entry.lastSeenAt,
+			});
 			const stored = this.entries.get(normalizePath(entry.path));
 			if (stored) {
 				stored.firstSeenAt = entry.firstSeenAt;
@@ -74,15 +154,25 @@ export class PreservedUnresolvedRegistry {
 		const path = normalizePath(entry.path);
 		const at = entry.at ?? Date.now();
 		const previous = this.entries.get(path);
+		const previousEpisodeId = previous
+			? getPreservedUnresolvedEpisodeId(previous)
+			: null;
+		const continuesPreviousEpisode = previous?.kind === entry.kind
+			&& previous.reason === entry.reason
+			&& (!entry.episodeId || entry.episodeId === previousEpisodeId);
 		this.entries.set(path, {
-			...previous,
 			path,
 			kind: entry.kind,
 			reason: entry.reason,
-			firstSeenAt: previous?.firstSeenAt ?? at,
+			episodeId: continuesPreviousEpisode
+				? getPreservedUnresolvedEpisodeId(previous)
+				: entry.episodeId || createPreservedUnresolvedEpisodeId(at),
+			firstSeenAt: continuesPreviousEpisode ? previous.firstSeenAt : at,
 			lastSeenAt: at,
 			localHash: entry.localHash ?? previous?.localHash ?? null,
-			knownRemoteHash: entry.knownRemoteHash ?? previous?.knownRemoteHash ?? null,
+			knownRemoteHash: entry.knownRemoteHash
+				?? previous?.knownRemoteHash
+				?? null,
 		});
 		this.paths.add(path);
 	}

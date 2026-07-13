@@ -68,6 +68,12 @@ import {
 	buildMarkdownConflictArtifactPath,
 	isMarkdownConflictArtifactForOriginalPath,
 } from "../paths/conflictArtifactPath";
+import {
+	getPreservedUnresolvedEpisodeId,
+	isRemoteDeletePreservedUnresolvedEntry,
+	type PreservedUnresolvedEntry,
+	type RemoteDeletePreservedUnresolvedReason,
+} from "../sync/preservedUnresolved";
 
 export interface ReconciliationStats {
 	at: string;
@@ -110,6 +116,8 @@ interface MarkdownDirtyEntry {
 	coalescedOpIds: string[];
 	retryCount: number;
 	notBeforeMs?: number;
+	/** Per-path ingest generation captured when the disk event was admitted. */
+	generation?: number;
 }
 
 export type StableMarkdownReadResult =
@@ -121,7 +129,36 @@ interface ActiveMarkdownIngest {
 	path: string;
 	entry: MarkdownDirtyEntry;
 	redirectedTo: string | null;
+	generation: number;
 }
+
+export interface MarkdownRemoteDeleteResolutionLease {
+	readonly path: string;
+	readonly operation: "accept-remote-delete";
+	readonly generation: number;
+}
+
+/**
+ * Immutable identity of the Attention episode shown to the user. Callers that
+ * render `firstSeenAt`/`lastSeenAt` should pass it back so an old dashboard
+ * action cannot resolve a replacement incident with the same path/reason.
+ */
+export interface MarkdownRemoteDeleteEntryIdentity {
+	reason: RemoteDeletePreservedUnresolvedReason;
+	episodeId: string;
+	remoteDeleteFingerprint?: string;
+	localFile?: {
+		kind: "file" | "missing" | "other";
+		mtime: number | null;
+		size: number | null;
+	};
+}
+
+type InternalMarkdownResolutionLease = MarkdownRemoteDeleteResolutionLease | {
+	readonly path: string;
+	readonly operation: "keep-local";
+	readonly generation: number;
+};
 
 type OpenEditorAuthority =
 	| { kind: "none" }
@@ -369,6 +406,14 @@ export class ReconciliationController {
 	private lastReconcileStats: ReconciliationStats | null = null;
 	private dirtyMarkdownPaths = new Map<string, MarkdownDirtyEntry>();
 	private activeMarkdownIngests = new Map<string, ActiveMarkdownIngest>();
+	/**
+	 * Monotonic per-path fence. A remote-delete resolution increments the
+	 * generation so dirty work admitted before that decision cannot publish
+	 * after the user has acted on the Attention row.
+	 */
+	private markdownIngestGenerations = new Map<string, number>();
+	/** At most one Keep/Accept resolution may own a Markdown path. */
+	private markdownRemoteDeleteResolutions = new Map<string, InternalMarkdownResolutionLease>();
 	private closedOnlyDeferredImports = new Set<string>();
 	private markdownDrainPromise: Promise<void> | null = null;
 	private markdownDrainTimer: ReturnType<typeof setTimeout> | null = null;
@@ -407,7 +452,19 @@ export class ReconciliationController {
 				if (!(abstractFile instanceof TFile)) {
 					throw new Error(`ingestDiskFileNow: not a file: ${path}`);
 				}
-				await this.syncFileFromDisk(abstractFile, reason);
+				const entry: MarkdownDirtyEntry = {
+					reason,
+					primaryOpId: undefined,
+					coalescedOpIds: [],
+					retryCount: 0,
+					generation: this.getMarkdownIngestGeneration(path),
+				};
+				const active = this.beginActiveMarkdownIngest(path, entry);
+				try {
+					await this.syncFileFromDisk(abstractFile, entry, active);
+				} finally {
+					this.finishActiveMarkdownIngest(active);
+				}
 			},
 		});
 	}
@@ -481,6 +538,11 @@ export class ReconciliationController {
 		this.lastReconcileTime = 0;
 		this.lastReconcileStats = null;
 		this.dirtyMarkdownPaths.clear();
+		for (const active of this.activeMarkdownIngests.values()) {
+			this.bumpMarkdownIngestGeneration(active.path);
+		}
+		this.activeMarkdownIngests.clear();
+		this.markdownRemoteDeleteResolutions.clear();
 		this.closedOnlyDeferredImports.clear();
 		this.markdownDrainPromise = null;
 		this.lastMarkdownDirtyAt = 0;
@@ -742,8 +804,8 @@ export class ReconciliationController {
 				this.deps.shouldTombstoneIntrinsicBlobPath
 			) {
 				const cleanup = vaultSync.tombstoneIntrinsicExcludedEntries(
-					this.deps.shouldTombstoneIntrinsicMarkdownPath,
-					this.deps.shouldTombstoneIntrinsicBlobPath,
+					(path) => this.deps.shouldTombstoneIntrinsicMarkdownPath!(path),
+					(path) => this.deps.shouldTombstoneIntrinsicBlobPath!(path),
 					this.deps.getSettings().deviceName,
 				);
 				if (cleanup.markdownPaths.length > 0 || cleanup.blobPaths.length > 0) {
@@ -1645,7 +1707,15 @@ export class ReconciliationController {
 		path: string,
 		incoming: MarkdownDirtyEntry,
 	): void {
-		const previous = this.dirtyMarkdownPaths.get(path);
+		if (this.isMarkdownResolutionActive(path)) return;
+		const generation = this.getMarkdownIngestGeneration(path);
+		if (incoming.generation !== undefined && incoming.generation !== generation) return;
+		incoming = { ...incoming, generation };
+		const storedPrevious = this.dirtyMarkdownPaths.get(path);
+		const previous = storedPrevious?.generation === undefined
+			|| storedPrevious.generation === generation
+			? storedPrevious
+			: undefined;
 		if (!previous) {
 			this.dirtyMarkdownPaths.set(path, incoming);
 			return;
@@ -1661,6 +1731,7 @@ export class ReconciliationController {
 			primaryOpId: previous.primaryOpId ?? incoming.primaryOpId,
 			coalescedOpIds,
 			retryCount: Math.min(previous.retryCount, incoming.retryCount),
+			generation,
 			notBeforeMs: mergedReason === "create"
 				? undefined
 				: Math.max(previous.notBeforeMs ?? 0, incoming.notBeforeMs ?? 0) || undefined,
@@ -1692,6 +1763,13 @@ export class ReconciliationController {
 		coalescedOpIds: string[] = opId ? [opId] : [],
 		retryCount = 0,
 	): void {
+		if (this.isMarkdownResolutionActive(path)) {
+			this.deps.trace("reconcile", "markdown-dirty-dropped-during-resolution", {
+				path,
+				reason,
+			});
+			return;
+		}
 		const now = Date.now();
 		const notBeforeMs = this.getRecentEditorDirtyDeferUntil(path, reason, now) ?? undefined;
 		this.mergeDirtyMarkdownPath(path, {
@@ -1699,6 +1777,7 @@ export class ReconciliationController {
 			primaryOpId: opId,
 			coalescedOpIds: Array.from(new Set(coalescedOpIds)),
 			retryCount,
+			generation: this.getMarkdownIngestGeneration(path),
 			notBeforeMs,
 		});
 		this.lastMarkdownDirtyAt = now;
@@ -1707,6 +1786,388 @@ export class ReconciliationController {
 
 	markMarkdownDirty(file: TFile, reason: MarkdownDirtyReason, opId?: string): void {
 		this.queueDirtyMarkdownPath(file.path, reason, opId);
+	}
+
+	private getMarkdownIngestGeneration(path: string): number {
+		return this.markdownIngestGenerations.get(path) ?? 0;
+	}
+
+	private bumpMarkdownIngestGeneration(path: string): number {
+		const next = this.getMarkdownIngestGeneration(path) + 1;
+		this.markdownIngestGenerations.set(path, next);
+		return next;
+	}
+
+	private isMarkdownResolutionActive(path: string): boolean {
+		return this.markdownRemoteDeleteResolutions.has(path);
+	}
+
+	private acquireMarkdownRemoteDeleteResolution(
+		path: string,
+		operation: InternalMarkdownResolutionLease["operation"],
+	): InternalMarkdownResolutionLease {
+		if (this.markdownRemoteDeleteResolutions.has(path)) {
+			throw new Error(`Another Attention action is already running for "${path}".`);
+		}
+
+		const generation = this.bumpMarkdownIngestGeneration(path);
+		const lease = Object.freeze({ path, operation, generation }) as InternalMarkdownResolutionLease;
+		this.markdownRemoteDeleteResolutions.set(path, lease);
+		const droppedQueued = this.dirtyMarkdownPaths.delete(path);
+		this.deps.trace("reconcile", "markdown-remote-delete-resolution-began", {
+			path,
+			operation,
+			generation,
+			droppedQueued,
+			activeIngestInvalidated: Array.from(this.activeMarkdownIngests.values())
+				.some((active) => active.path === path),
+		});
+		return lease;
+	}
+
+	private releaseMarkdownRemoteDeleteResolution(
+		lease: InternalMarkdownResolutionLease,
+	): void {
+		if (this.markdownRemoteDeleteResolutions.get(lease.path) !== lease) return;
+		this.markdownRemoteDeleteResolutions.delete(lease.path);
+		this.deps.trace("reconcile", "markdown-remote-delete-resolution-finished", {
+			path: lease.path,
+			operation: lease.operation,
+			generation: lease.generation,
+		});
+	}
+
+	/** Release an Accept lease in the caller's `finally` block. */
+	finishRemoteDeletedMarkdownResolution(
+		lease: MarkdownRemoteDeleteResolutionLease,
+	): void {
+		this.releaseMarkdownRemoteDeleteResolution(lease);
+	}
+
+	private findRemoteDeletedMarkdownEntry(
+		path: string,
+		expectedReason: RemoteDeletePreservedUnresolvedReason,
+		expectedEpisode?: MarkdownRemoteDeleteEntryIdentity,
+	): PreservedUnresolvedEntry {
+		const diskMirror = this.deps.getDiskMirror();
+		if (!diskMirror) throw new Error("Sync is not initialized.");
+		const entry = diskMirror.getPreservedUnresolvedEntries()
+			.find((candidate) => candidate.path === path && candidate.kind === "markdown");
+		if (!entry) {
+			throw new Error(`Attention entry is no longer active for "${path}".`);
+		}
+		if (
+			entry.reason !== expectedReason
+			|| !isRemoteDeletePreservedUnresolvedEntry(entry)
+		) {
+			throw new Error(`Attention state changed for "${path}". Refresh the dashboard.`);
+		}
+		if (expectedEpisode && !this.isSameMarkdownRemoteDeleteEntry(entry, expectedEpisode)) {
+			throw new Error(`Attention state changed for "${path}". Refresh the dashboard.`);
+		}
+		return { ...entry };
+	}
+
+	private isSameMarkdownRemoteDeleteEntry(
+		current: PreservedUnresolvedEntry,
+		expected: MarkdownRemoteDeleteEntryIdentity,
+	): boolean {
+		return current.reason === expected.reason
+			&& getPreservedUnresolvedEpisodeId(current) === expected.episodeId;
+	}
+
+	private assertSameRemoteDeletedMarkdownEntry(
+		path: string,
+		expected: PreservedUnresolvedEntry,
+	): void {
+		const current = this.deps.getDiskMirror()?.getPreservedUnresolvedEntries()
+			.find((candidate) => candidate.path === path && candidate.kind === "markdown");
+		if (
+			!current
+			|| !isRemoteDeletePreservedUnresolvedEntry(current)
+			|| current.reason !== expected.reason
+			|| getPreservedUnresolvedEpisodeId(current)
+				!== getPreservedUnresolvedEpisodeId(expected)
+		) {
+			throw new Error(`Attention state changed for "${path}". Refresh the dashboard.`);
+		}
+	}
+
+	private assertAuthoritativeMarkdownRemoteDelete(
+		path: string,
+		expectedFingerprint?: string,
+	): void {
+		const vaultSync = this.deps.getVaultSync();
+		if (!vaultSync) throw new Error("Sync is not initialized.");
+		if (expectedFingerprint !== undefined) {
+			const snapshot = vaultSync.getAuthoritativeMarkdownDeleteSnapshot?.(path);
+			if (!snapshot || snapshot.fingerprint !== expectedFingerprint) {
+				throw new Error(`Remote deletion changed for "${path}". Refresh the dashboard.`);
+			}
+			return;
+		}
+		const activeFileIds = vaultSync.getActiveFileIdsForPath?.(path)
+			?? (vaultSync.getTextForPath(path) ? ["active"] : []);
+		// `isPathTombstoned` is the authoritative deleted-path index. The
+		// isMarkdownTombstoned fallback keeps lightweight legacy harnesses usable;
+		// production VaultSync always supplies isPathTombstoned.
+		const deletedPath = typeof vaultSync.isPathTombstoned === "function"
+			? vaultSync.isPathTombstoned(path)
+			: vaultSync.isMarkdownTombstoned(path);
+		if (
+			!deletedPath
+			|| activeFileIds.length > 0
+			|| vaultSync.getTextForPath(path) !== null
+		) {
+			throw new Error(`Remote deletion is no longer active for "${path}". Refresh the dashboard.`);
+		}
+	}
+
+	private assertEditorMatchesStableMarkdown(path: string, diskContent: string): void {
+		const editorAuthority = this.getOpenEditorAuthority(
+			this.getOpenMarkdownViewsForPath(path),
+		);
+		if (editorAuthority.kind === "multiple") {
+			throw new Error(`Multiple open editors disagree for "${path}". Close duplicates and try again.`);
+		}
+		if (editorAuthority.kind === "read-failed") {
+			throw new Error(`Could not read the open editor for "${path}". Close it and try again.`);
+		}
+		if (
+			editorAuthority.kind === "single"
+			&& editorAuthority.content !== diskContent
+		) {
+			throw new Error(`The open editor has unsaved changes for "${path}". Wait for Obsidian to save, then try again.`);
+		}
+	}
+
+	private assertExpectedMarkdownLocalFile(
+		path: string,
+		expected: MarkdownRemoteDeleteEntryIdentity["localFile"],
+		actual: TFile | null,
+		stat?: { mtime: number; size: number } | null,
+	): void {
+		if (!expected) return;
+		if (expected.kind === "other") {
+			throw new Error(`Attention path is no longer a file: ${path}`);
+		}
+		if (expected.kind === "missing") {
+			if (actual === null) return;
+			throw new Error(`Local file changed since the dashboard was opened: ${path}`);
+		}
+		if (actual === null) {
+			throw new Error(`Local file changed since the dashboard was opened: ${path}`);
+		}
+		const actualStat = stat ?? actual.stat;
+		if (
+			actualStat.mtime !== expected.mtime
+			|| actualStat.size !== expected.size
+		) {
+			throw new Error(`Local file changed since the dashboard was opened: ${path}`);
+		}
+	}
+
+	/**
+	 * Fence an Accept action before main.ts trashes the local file. The caller
+	 * must hold the returned lease across trash + marker persistence and release
+	 * it with finishRemoteDeletedMarkdownResolution() in a finally block.
+	 */
+	async beginAcceptRemoteDeletedMarkdown(
+		path: string,
+		expectedReason: RemoteDeletePreservedUnresolvedReason,
+		expectedEpisode?: MarkdownRemoteDeleteEntryIdentity,
+	): Promise<MarkdownRemoteDeleteResolutionLease> {
+		if (!this.deps.isMarkdownPathSyncable(path)) {
+			throw new Error(`File is no longer in sync scope: ${path}`);
+		}
+		const capturedEntry = this.findRemoteDeletedMarkdownEntry(
+			path,
+			expectedReason,
+			expectedEpisode,
+		);
+		this.assertAuthoritativeMarkdownRemoteDelete(
+			path,
+			expectedEpisode?.remoteDeleteFingerprint,
+		);
+
+		const abstractFile = this.deps.app.vault.getAbstractFileByPath(path);
+		if (abstractFile && !(abstractFile instanceof TFile)) {
+			throw new Error(`Attention path is not a file: ${path}`);
+		}
+		this.assertExpectedMarkdownLocalFile(
+			path,
+			expectedEpisode?.localFile,
+			abstractFile instanceof TFile ? abstractFile : null,
+		);
+		const lease = this.acquireMarkdownRemoteDeleteResolution(
+			path,
+			"accept-remote-delete",
+		) as MarkdownRemoteDeleteResolutionLease;
+		try {
+			if (abstractFile instanceof TFile) {
+				const stableRead = await this.readStableMarkdownFile(path, "modify", abstractFile);
+				if (stableRead.kind === "unstable") {
+					throw new Error(`Local file is still changing: ${path}. Wait a moment and try again.`);
+				}
+				if (stableRead.kind === "ready") {
+					if (stableRead.file.path !== path) {
+						throw new Error(`Local file changed path while resolving Attention: ${path}`);
+					}
+					this.assertEditorMatchesStableMarkdown(path, stableRead.content);
+					this.assertExpectedMarkdownLocalFile(
+						path,
+						expectedEpisode?.localFile,
+						stableRead.file,
+						stableRead.stat,
+					);
+				} else if (this.getOpenMarkdownViewsForPath(path).length > 0) {
+					throw new Error(`The open editor may contain unsaved changes for "${path}". Close it and try again.`);
+				}
+			} else if (this.getOpenMarkdownViewsForPath(path).length > 0) {
+				throw new Error(`The open editor may contain unsaved changes for "${path}". Close it and try again.`);
+			}
+
+			// This is intentionally the final check after every await and before
+			// returning authority to call trashFile().
+			this.assertSameRemoteDeletedMarkdownEntry(path, capturedEntry);
+			this.assertAuthoritativeMarkdownRemoteDelete(
+				path,
+				expectedEpisode?.remoteDeleteFingerprint,
+			);
+			if (this.markdownRemoteDeleteResolutions.get(path) !== lease) {
+				throw new Error(`Attention action expired for "${path}". Try again.`);
+			}
+			return lease;
+		} catch (err) {
+			this.releaseMarkdownRemoteDeleteResolution(lease);
+			throw err;
+		}
+	}
+
+	async keepLocalRemoteDeletedMarkdown(
+		path: string,
+		expectedReason: RemoteDeletePreservedUnresolvedReason,
+		expectedEpisode?: MarkdownRemoteDeleteEntryIdentity,
+	): Promise<void> {
+		const vaultSync = this.deps.getVaultSync();
+		const diskMirror = this.deps.getDiskMirror();
+		if (!vaultSync || !diskMirror) {
+			throw new Error("Sync is not initialized.");
+		}
+		if (!this.deps.isMarkdownPathSyncable(path)) {
+			throw new Error(`File is no longer in sync scope: ${path}`);
+		}
+
+		const entry = this.findRemoteDeletedMarkdownEntry(path, expectedReason, expectedEpisode);
+		this.assertAuthoritativeMarkdownRemoteDelete(
+			path,
+			expectedEpisode?.remoteDeleteFingerprint,
+		);
+
+		const abstractFile = this.deps.app.vault.getAbstractFileByPath(path);
+		if (!(abstractFile instanceof TFile)) {
+			throw new Error(`Local file not found: ${path}`);
+		}
+		this.assertExpectedMarkdownLocalFile(
+			path,
+			expectedEpisode?.localFile,
+			abstractFile,
+		);
+		const lease = this.acquireMarkdownRemoteDeleteResolution(path, "keep-local");
+		try {
+			this.assertSameRemoteDeletedMarkdownEntry(path, entry);
+			this.assertAuthoritativeMarkdownRemoteDelete(
+				path,
+				expectedEpisode?.remoteDeleteFingerprint,
+			);
+			const stableRead = await this.readStableMarkdownFile(path, "modify", abstractFile);
+			if (stableRead.kind === "missing") {
+				throw new Error(`Local file not found: ${path}`);
+			}
+			if (stableRead.kind === "unstable") {
+				throw new Error(`Local file is still changing: ${path}. Wait a moment and try again.`);
+			}
+			if (stableRead.file.path !== path) {
+				throw new Error(`Local file changed path while resolving Attention: ${path}`);
+			}
+			this.assertExpectedMarkdownLocalFile(
+				path,
+				expectedEpisode?.localFile,
+				stableRead.file,
+				stableRead.stat,
+			);
+			const runtimeConfig = this.deps.getRuntimeConfig();
+			if (
+				runtimeConfig.maxFileSizeBytes > 0
+				&& stableRead.content.length > runtimeConfig.maxFileSizeBytes
+			) {
+				throw new Error(`File exceeds the configured size limit: ${path}`);
+			}
+
+			this.assertEditorMatchesStableMarkdown(path, stableRead.content);
+
+			const previousText = vaultSync.getTextForPath(path);
+			const previousContent = previousText ? yTextToString(previousText) ?? "" : null;
+			if (this.deps.shouldBlockFrontmatterIngest(
+				path,
+				previousContent,
+				stableRead.content,
+				"dashboard-keep-local",
+			)) {
+				throw new Error(`Local properties are quarantined for "${path}". Review them before keeping this file.`);
+			}
+
+			// Final episode + CRDT-state fence after stable-read await and all
+			// synchronous policy hooks, immediately before ensureFile mutates Yjs.
+			this.assertSameRemoteDeletedMarkdownEntry(path, entry);
+			this.assertAuthoritativeMarkdownRemoteDelete(
+				path,
+				expectedEpisode?.remoteDeleteFingerprint,
+			);
+			if (this.markdownRemoteDeleteResolutions.get(path) !== lease) {
+				throw new Error(`Attention action expired for "${path}". Try again.`);
+			}
+
+			const opId = `op-attention-keep-local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+			const result = vaultSync.serverAckTracker.withActiveOpId(opId, () => {
+				const ytext = vaultSync.ensureFile(
+					path,
+					stableRead.content,
+					this.deps.getSettings().deviceName,
+					{
+						reviveTombstone: true,
+						reviveReason: "dashboard-keep-local",
+						opId,
+					},
+				);
+				if (!ytext) return null;
+				return applyDiffToYTextWithPostcondition(
+					ytext,
+					yTextToString(ytext) ?? "",
+					stableRead.content,
+					ORIGIN_DISK_SYNC,
+				);
+			});
+			if (!result?.finalMatchesExpected) {
+				throw new Error(`Failed to publish the local content for "${path}".`);
+			}
+
+			await this.updateDiskIndexForPath(path, stableRead.content, stableRead.stat);
+			// Do not clear a replacement Attention episode that arrived while the
+			// disk-index hash was being computed.
+			this.assertSameRemoteDeletedMarkdownEntry(path, entry);
+			diskMirror.clearPreservedUnresolved(path);
+			await this.deps.saveDiskIndex();
+			this.deps.onReconciled("dashboard-keep-local");
+			this.deps.trace("reconcile", "preserved-unresolved-kept-local", {
+				path,
+				reason: entry.reason,
+				opId,
+			});
+			this.deps.refreshStatusBar();
+		} finally {
+			this.releaseMarkdownRemoteDeleteResolution(lease);
+		}
 	}
 
 	private hasPendingLocalCreate(path: string): boolean {
@@ -1739,6 +2200,7 @@ export class ReconciliationController {
 			path,
 			entry,
 			redirectedTo: null,
+			generation: entry.generation ?? this.getMarkdownIngestGeneration(path),
 		};
 		this.activeMarkdownIngests.set(path, active);
 		return active;
@@ -1751,7 +2213,10 @@ export class ReconciliationController {
 	}
 
 	private shouldAbortActiveMarkdownIngest(active?: ActiveMarkdownIngest): boolean {
-		return !!active?.redirectedTo;
+		if (!active) return false;
+		return !!active.redirectedTo
+			|| this.isMarkdownResolutionActive(active.path)
+			|| active.generation !== this.getMarkdownIngestGeneration(active.path);
 	}
 
 	private requeueUnstableMarkdownIngest(
@@ -1852,14 +2317,20 @@ export class ReconciliationController {
 		let redirected = false;
 		if (entry) {
 			this.dirtyMarkdownPaths.delete(oldPath);
-			this.mergeDirtyEntryIntoPath(newPath, entry);
+			this.mergeDirtyEntryIntoPath(newPath, {
+				...entry,
+				generation: this.getMarkdownIngestGeneration(newPath),
+			});
 			redirected = true;
 		}
 
 		const active = this.activeMarkdownIngests.get(oldPath);
 		if (active) {
 			active.redirectedTo = newPath;
-			this.mergeDirtyEntryIntoPath(newPath, active.entry);
+			this.mergeDirtyEntryIntoPath(newPath, {
+				...active.entry,
+				generation: this.getMarkdownIngestGeneration(newPath),
+			});
 			redirected = true;
 		}
 
@@ -1995,8 +2466,23 @@ export class ReconciliationController {
 		path: string,
 		entry: MarkdownDirtyEntry,
 	): Promise<void> {
+		if (
+			this.isMarkdownResolutionActive(path)
+			|| (
+				entry.generation !== undefined
+				&& entry.generation !== this.getMarkdownIngestGeneration(path)
+			)
+		) {
+			this.deps.trace("reconcile", "markdown-ingest-cancelled-by-resolution", {
+				path,
+				reason: entry.reason,
+				phase: "before-start",
+			});
+			return;
+		}
 		const active = this.beginActiveMarkdownIngest(path, entry);
 		try {
+			if (this.shouldAbortActiveMarkdownIngest(active)) return;
 			const abstractFile = this.deps.app.vault.getAbstractFileByPath(path);
 			if (!(abstractFile instanceof TFile)) {
 				this.deps.log(`Markdown ${entry.reason}: "${path}" no longer exists, skipping`);
@@ -2040,6 +2526,7 @@ export class ReconciliationController {
 				primaryOpId: undefined,
 				coalescedOpIds: [],
 				retryCount: 0,
+				generation: this.getMarkdownIngestGeneration(file.path),
 			}
 			: entryOrReason;
 		const sourceReason = entry.reason;
@@ -2100,6 +2587,7 @@ export class ReconciliationController {
 				}
 				return;
 			}
+			if (this.shouldAbortActiveMarkdownIngest(active)) return;
 
 			// If the user modifies or creates a file that was previously
 			// preserved-unresolved, that is intentional user action. Clear the
@@ -2151,7 +2639,9 @@ export class ReconciliationController {
 					openViews,
 					sourceReason,
 					stableRead.stat,
+					() => this.shouldAbortActiveMarkdownIngest(active),
 				);
+				if (this.shouldAbortActiveMarkdownIngest(active)) return;
 				if (boundOutcome.kind === "handled") {
 					if (boundOutcome.settledContent !== undefined) {
 						await this.updateDiskIndexForPath(path, boundOutcome.settledContent, stableRead.stat);
@@ -2216,6 +2706,7 @@ export class ReconciliationController {
 				this.deps.log(
 					`syncFileFromDisk: applying diff to "${path}" (${crdtContent.length} -> ${content.length} chars)`,
 				);
+				if (this.shouldAbortActiveMarkdownIngest(active)) return;
 				vaultSync.serverAckTracker.withActiveOpId(opId, () => {
 					applyDiffToYText(existingText, crdtContent, content, ORIGIN_DISK_SYNC);
 				});
@@ -2247,6 +2738,7 @@ export class ReconciliationController {
 					await this.updateDiskIndexForPath(path, undefined, stableRead.stat);
 					return;
 				}
+				if (this.shouldAbortActiveMarkdownIngest(active)) return;
 				vaultSync.serverAckTracker.withActiveOpId(opId, () => {
 					vaultSync.ensureFile(
 						path,
@@ -2649,7 +3141,9 @@ export class ReconciliationController {
 		openViews: MarkdownView[] = this.getOpenMarkdownViewsForPath(file.path),
 		sourceReason: "create" | "modify" = "modify",
 		stableStat?: { mtime: number; size: number } | null,
+		shouldAbort: () => boolean = () => false,
 	): Promise<BoundFileSyncGapOutcome> {
+		if (shouldAbort()) return { kind: "handled" };
 		const editorBindings = this.deps.getEditorBindings();
 		const vaultSync = this.deps.getVaultSync();
 		const now = Date.now();
@@ -3067,6 +3561,7 @@ export class ReconciliationController {
 						crdtLength: crdtContent?.length ?? null,
 					},
 				});
+				if (shouldAbort()) return { kind: "handled" };
 				const recoveryResult = applyDiffToYTextWithPostcondition(
 					existingText,
 					crdtContent ?? "",
@@ -3149,6 +3644,7 @@ export class ReconciliationController {
 					path: file.path,
 					data: { reason: "bound-file-local-only-seed", action: "seed-crdt-from-disk", diskLength: content.length },
 				});
+				if (shouldAbort()) return { kind: "handled" };
 				vaultSync?.ensureFile(
 					file.path,
 					content,
@@ -3392,6 +3888,7 @@ export class ReconciliationController {
 						crdtLength: crdtContent?.length ?? null,
 					},
 				});
+				if (shouldAbort()) return { kind: "handled" };
 				const recoveryResult = applyDiffToYTextWithPostcondition(
 					existingText,
 					crdtContent ?? "",
@@ -3464,6 +3961,7 @@ export class ReconciliationController {
 					)) {
 						return { kind: "handled" };
 					}
+				if (shouldAbort()) return { kind: "handled" };
 				vaultSync?.ensureFile(
 					file.path,
 					content,
