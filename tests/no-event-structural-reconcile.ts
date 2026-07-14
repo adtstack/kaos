@@ -1,6 +1,7 @@
 import * as Y from "yjs";
 import { TFile } from "obsidian";
 import { VaultSync } from "../src/sync/vaultSync";
+import { contentBaselineHash, type DiskIndex } from "../src/sync/diskIndex";
 import { ReconciliationController } from "../src/runtime/reconciliationController";
 import type { FlightEventInput, FlightPathEventInput } from "../src/telemetry/debug/flightEvents";
 
@@ -99,6 +100,7 @@ function buildFixture(opts: {
 	oldContent: string;
 	newPath: string;
 	newContent: string;
+	previousDiskIndex?: DiskIndex;
 }) {
 	const events: CapturedEvent[] = [];
 	const flushWrites: string[] = [];
@@ -138,6 +140,7 @@ function buildFixture(opts: {
 			flushWrites.push(path);
 		},
 	};
+	let diskIndex = opts.previousDiskIndex ?? {};
 	const controller = new ReconciliationController({
 		app: app as never,
 		getSettings: () => ({ deviceName: "TestDevice" }) as never,
@@ -151,8 +154,8 @@ function buildFixture(opts: {
 		getDiskMirror: () => diskMirror as never,
 		getBlobSync: () => null,
 		getEditorBindings: () => null,
-		getDiskIndex: () => ({}),
-		setDiskIndex: () => {},
+		getDiskIndex: () => diskIndex,
+		setDiskIndex: (next) => { diskIndex = next; },
 		isMarkdownPathSyncable: () => true,
 		shouldBlockFrontmatterIngest: () => false,
 		refreshServerCapabilities: async () => {},
@@ -170,6 +173,47 @@ function buildFixture(opts: {
 	});
 
 	return { controller, vaultSync, events, eventBoundary, flushWrites, oldFileId };
+}
+
+console.log("\n--- No-event structural reconcile: baseline-backed move preserves file identity ---");
+{
+	const content = "# A\nsame\n";
+	const baselineHash = await contentBaselineHash(content);
+	const fx = buildFixture({
+		oldPath: "Old/a.md",
+		oldContent: content,
+		newPath: "New/a.md",
+		newContent: content,
+		previousDiskIndex: {
+			"Old/a.md": {
+				mtime: 1,
+				size: content.length,
+				contentHash: baselineHash,
+			},
+		},
+	});
+
+	await fx.controller.runReconciliation("authoritative");
+	const events = fx.events.slice(fx.eventBoundary);
+
+	assert(fx.vaultSync.getTextForPath("Old/a.md") === null, "old path is no longer active");
+	assert(fx.vaultSync.getTextForPath("New/a.md") !== null, "new path is active");
+	assertEq(fx.vaultSync.getFileId("New/a.md"), fx.oldFileId, "new path retains the old file ID");
+	assertEq(
+		events.filter((event) =>
+			event.kind === "reconcile.file.decision" &&
+			event.data.decision === "rename-crdt-path-to-disk" &&
+			event.data.reason === "baseline-hash-continuity"
+		).length,
+		1,
+		"baseline-backed rename decision is emitted",
+	);
+	assertEq(
+		events.filter((event) => event.kind === "crdt.file.created" && event.path === "New/a.md").length,
+		0,
+		"new path is not admitted with a new identity",
+	);
+	assertEq(fx.controller.getState().unresolvedStructuralChangeCount, 0, "safe inferred rename needs no attention");
 }
 
 console.log("\n--- No-event structural reconcile: moved markdown without evidence is unresolved ---");

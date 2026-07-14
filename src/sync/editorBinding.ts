@@ -115,6 +115,40 @@ interface PendingYTextPatch {
 	at: number;
 }
 
+export type OpenEditorMutationInvalidReason =
+	| "path-changed"
+	| "view-set-changed"
+	| "view-replaced"
+	| "cm-changed"
+	| "binding-epoch-changed"
+	| "editor-document-changed"
+	| "editor-revision-changed"
+	| "editor-read-failed";
+
+export interface OpenEditorMutationViewTicket {
+	readonly view: MarkdownView;
+	readonly leafId: string;
+	readonly cm: EditorView | null;
+	readonly cmId: string | null;
+	readonly bindingEpoch: number;
+	readonly editorRevision: number;
+	readonly editorDocument: unknown;
+	readonly editorContent: string | null;
+}
+
+export interface OpenEditorMutationTicket {
+	readonly path: string;
+	readonly views: readonly OpenEditorMutationViewTicket[];
+}
+
+export type OpenEditorMutationTicketValidation =
+	| { current: true }
+	| {
+		current: false;
+		reason: OpenEditorMutationInvalidReason;
+		leafId?: string;
+	};
+
 /**
  * Harness-only gate for pausing editor<->CRDT propagation on specific paths.
  * Supplied by the QA harness via the EditorBindingManager constructor.
@@ -159,6 +193,9 @@ export class EditorBindingManager {
 	private pendingYTextPatches = new WeakMap<Y.Text, PendingYTextPatch>();
 	private editorAuthorityShieldLeafIds = new Set<string>();
 	private lastEditorDocChangeAtByPath = new Map<string, number>();
+	private lastUserDocChangeAtByCm = new WeakMap<EditorView, number>();
+	private editorRevisionByCm = new WeakMap<EditorView, number>();
+	private bindingEpochByLeafId = new Map<string, number>();
 	private pendingReplacementCmToLeafId = new WeakMap<EditorView, string>();
 	private lastTypingAwarenessAtByLeaf = new Map<string, number>();
 	private concurrentTypingNoticeAtByPath = new Map<string, number>();
@@ -168,6 +205,7 @@ export class EditorBindingManager {
 	constructor(
 		private vaultSync: VaultSync,
 		debug: boolean,
+		private readonly isMarkdownPathSyncable: (path: string) => boolean,
 		private trace?: TraceRecord,
 		private recordFlightPathEvent?: (event: ProductFlightPathEventInput) => void,
 		private readonly bindingPropagationGate?: BindingPropagationGate,
@@ -203,6 +241,7 @@ export class EditorBindingManager {
 		const handleLiveEditorUpdate = this.handleLiveEditorUpdate.bind(this);
 		const unregisterKnownCmView = this.unregisterKnownCmView.bind(this);
 		const filterRiskyNonUserPatch = this.filterRiskyNonUserPatch.bind(this);
+		const fenceStaleUserBinding = this.fenceStaleUserBinding.bind(this);
 		return [
 			this.compartment.of([]),
 			// Guard y-codemirror document patches that would replay a local repair
@@ -210,6 +249,7 @@ export class EditorBindingManager {
 			// in the ViewPlugin below; this filter runs before the patch reaches
 			// the editor document.
 			EditorState.transactionFilter.of(filterRiskyNonUserPatch),
+			EditorState.transactionExtender.of(fenceStaleUserBinding),
 			ViewPlugin.fromClass(
 				class {
 					constructor(readonly view: EditorView) {
@@ -237,8 +277,7 @@ export class EditorBindingManager {
 		const file = view.file;
 		if (!file) return;
 
-		// Only bind .md files
-		if (!file.path.endsWith(".md")) return;
+		if (!this.canBindPath(view, "bind")) return;
 
 		const leafId = (view.leaf as unknown as { id: string }).id ?? file.path;
 		const cm = this.getCmView(view);
@@ -250,6 +289,7 @@ export class EditorBindingManager {
 		this.clearCmResolveRetry(leafId);
 		this.cmDegradedWarned = false;
 		const cmId = this.getCmId(cm);
+		this.carryCmActivityToPath(cm, file.path);
 		const existing = this.bindings.get(leafId);
 
 		if (existing && existing.path === file.path && existing.cm === cm) {
@@ -338,7 +378,7 @@ export class EditorBindingManager {
 		this.lastDeviceName = deviceName;
 		const file = view.file;
 		if (!file) return false;
-		if (!file.path.endsWith(".md")) return false;
+		if (!this.canBindPath(view, `repair:${reason}`)) return false;
 
 		const leafId = (view.leaf as unknown as { id: string }).id ?? file.path;
 		const cm = this.getCmView(view);
@@ -411,7 +451,7 @@ export class EditorBindingManager {
 		this.lastDeviceName = deviceName;
 		const file = view.file;
 		if (!file) return false;
-		if (!file.path.endsWith(".md")) return false;
+		if (!this.canBindPath(view, `heal:${reason}`)) return false;
 
 		const target = this.resolveBindingTarget(
 			view,
@@ -462,6 +502,7 @@ export class EditorBindingManager {
 		this.lastDeviceName = deviceName;
 		const file = view.file;
 		if (!file) return;
+		if (!this.canBindPath(view, `rebind:${reason}`)) return;
 		if (this.isHardTombstonedPath(file.path)) {
 			this.handleTombstonedBinding(view, `rebind:${reason}`);
 			return;
@@ -500,6 +541,7 @@ export class EditorBindingManager {
 		binding.undoManager.destroy();
 		this.bindings.delete(leafId);
 		this.cmToLeafId.delete(binding.cm);
+		this.bumpBindingEpoch(leafId);
 
 		try {
 			binding.cm.dispatch({
@@ -524,6 +566,7 @@ export class EditorBindingManager {
 			this.clearCmResolveRetry(leafId);
 			this.healthWorkInFlight.delete(leafId);
 			this.cmToLeafId.delete(binding.cm);
+			this.bumpBindingEpoch(leafId);
 			binding.undoManager.destroy();
 			this.log(`unbindAll: destroyed binding for "${binding.path}"`);
 		}
@@ -551,6 +594,7 @@ export class EditorBindingManager {
 				}
 				this.cmToLeafId.delete(binding.cm);
 				this.bindings.delete(leafId);
+				this.bumpBindingEpoch(leafId);
 				this.lastTypingAwarenessAtByLeaf.delete(leafId);
 				this.lastEditorDocChangeAtByPath.delete(path);
 				this.log(`unbindByPath: unbound "${path}" (leaf=${leafId})`);
@@ -585,6 +629,7 @@ export class EditorBindingManager {
 					this.lastEditorDocChangeAtByPath.delete(binding.path);
 				}
 				binding.path = newPath;
+				this.bumpBindingEpoch(leafId);
 				this.publishLocalActiveFile(binding);
 			}
 		}
@@ -655,6 +700,11 @@ export class EditorBindingManager {
 		for (const [leafId, binding] of snapshot) {
 			if (this.bindings.get(leafId) !== binding) continue;
 			if (this.healthWorkInFlight.has(leafId)) continue;
+			if (!this.isMarkdownPathSyncable(binding.path)) {
+				triggered += 1;
+				this.skipExcludedBinding(binding.view, binding.path, `audit:${source}`);
+				continue;
+			}
 
 			const health = this.inspectBindingHealth(binding.view, binding);
 			if (health.healthy || health.settling) continue;
@@ -677,6 +727,119 @@ export class EditorBindingManager {
 			}
 		}
 		return latest;
+	}
+
+	/**
+	 * Capture an optimistic-concurrency ticket for every visible editor of a
+	 * path. The ticket deliberately includes editors that have not completed a
+	 * Yjs binding yet, so input during the file-open transition is still part of
+	 * the mutation boundary.
+	 */
+	captureOpenEditorMutationTicket(
+		path: string,
+		views: readonly MarkdownView[],
+	): OpenEditorMutationTicket {
+		return {
+			path,
+			views: views.map((view) => {
+				const leafId =
+					(view.leaf as unknown as { id?: string }).id ?? view.file?.path ?? path;
+				const cm = this.getCmView(view);
+				if (cm) {
+					this.carryCmActivityToPath(cm, path);
+				}
+				let editorContent: string | null = null;
+				try {
+					editorContent = view.editor.getValue();
+				} catch {
+					// A ticket without a readable editor cannot authorize a later write.
+				}
+				return {
+					view,
+					leafId,
+					cm,
+					cmId: cm ? this.getCmId(cm) : null,
+					bindingEpoch: this.bindingEpochByLeafId.get(leafId) ?? 0,
+					editorRevision: cm ? (this.editorRevisionByCm.get(cm) ?? 0) : 0,
+					editorDocument: cm?.state.doc ?? null,
+					editorContent,
+				};
+			}),
+		};
+	}
+
+	validateOpenEditorMutationTicket(
+		ticket: OpenEditorMutationTicket,
+		views: readonly MarkdownView[],
+	): OpenEditorMutationTicketValidation {
+		if (views.length !== ticket.views.length) {
+			return { current: false, reason: "view-set-changed" };
+		}
+
+		const currentByLeafId = new Map<string, MarkdownView>();
+		for (const view of views) {
+			const leafId =
+				(view.leaf as unknown as { id?: string }).id ?? view.file?.path ?? ticket.path;
+			if (currentByLeafId.has(leafId)) {
+				return { current: false, reason: "view-set-changed", leafId };
+			}
+			currentByLeafId.set(leafId, view);
+		}
+
+		for (const snapshot of ticket.views) {
+			const view = currentByLeafId.get(snapshot.leafId);
+			if (!view || view !== snapshot.view) {
+				return { current: false, reason: "view-replaced", leafId: snapshot.leafId };
+			}
+			if (view.file?.path !== ticket.path) {
+				return { current: false, reason: "path-changed", leafId: snapshot.leafId };
+			}
+
+			const cm = this.getCmView(view);
+			if (cm !== snapshot.cm) {
+				return { current: false, reason: "cm-changed", leafId: snapshot.leafId };
+			}
+			if ((this.bindingEpochByLeafId.get(snapshot.leafId) ?? 0) !== snapshot.bindingEpoch) {
+				return {
+					current: false,
+					reason: "binding-epoch-changed",
+					leafId: snapshot.leafId,
+				};
+			}
+			if (cm && cm.state.doc !== snapshot.editorDocument) {
+				return {
+					current: false,
+					reason: "editor-document-changed",
+					leafId: snapshot.leafId,
+				};
+			}
+			if (cm && (this.editorRevisionByCm.get(cm) ?? 0) !== snapshot.editorRevision) {
+				return {
+					current: false,
+					reason: "editor-revision-changed",
+					leafId: snapshot.leafId,
+				};
+			}
+
+			let editorContent: string;
+			try {
+				editorContent = view.editor.getValue();
+			} catch {
+				return { current: false, reason: "editor-read-failed", leafId: snapshot.leafId };
+			}
+			if (snapshot.editorContent === null) {
+				return { current: false, reason: "editor-read-failed", leafId: snapshot.leafId };
+			}
+			if (editorContent !== snapshot.editorContent) {
+				return {
+					current: false,
+					reason: "editor-document-changed",
+					leafId: snapshot.leafId,
+				};
+			}
+		}
+
+		return { current: true };
 	}
 
 	getCollabDebugInfoForView(view: MarkdownView): CollabDebugInfo | null {
@@ -1023,6 +1186,12 @@ export class EditorBindingManager {
 		if (this.isUserTransaction(transaction)) {
 			const match = this.findBindingForState(transaction.startState);
 			if (!match) return transaction;
+			if (match.binding.view.file?.path !== match.binding.path) {
+				// The transaction extender below detaches the stale yCollab
+				// compartment in the same transaction. Do not evaluate remote
+				// typing awareness against the previous file.
+				return transaction;
+			}
 
 			const remoteTypers = this.getActiveRemoteTypersForPath(match.binding.path);
 			if (remoteTypers.length === 0) return transaction;
@@ -1064,6 +1233,37 @@ export class EditorBindingManager {
 			incomingContent,
 			validPendingPatch?.origin ?? null,
 		);
+		return { effects: this.compartment.reconfigure([]) };
+	}
+
+	private fenceStaleUserBinding(transaction: Transaction): TransactionSpec | null {
+		if (!transaction.docChanged || !this.isUserTransaction(transaction)) {
+			return null;
+		}
+		const match = this.findBindingForState(transaction.startState);
+		if (!match) return null;
+		const { leafId, binding } = match;
+		const currentPath = binding.view.file?.path ?? null;
+		if (currentPath === binding.path) return null;
+
+		this.clearScheduledHealthCheck(leafId);
+		this.clearCmResolveRetry(leafId);
+		this.healthWorkInFlight.delete(leafId);
+		this.bindings.delete(leafId);
+		this.cmToLeafId.delete(binding.cm);
+		this.pendingReplacementCmToLeafId.delete(binding.cm);
+		this.bumpBindingEpoch(leafId);
+		this.trace?.("editor", "stale-binding-detached-before-user-input", {
+			leafId,
+			boundPath: binding.path,
+			currentPath,
+			cmId: binding.cmId,
+		});
+
+		queueMicrotask(() => {
+			binding.undoManager.destroy();
+			this.bind(binding.view, this.lastDeviceName);
+		});
 		return { effects: this.compartment.reconfigure([]) };
 	}
 
@@ -1153,7 +1353,7 @@ export class EditorBindingManager {
 		binding: EditorBinding,
 		editorContent: string,
 		incomingContent: string,
-		blockedOrigin: unknown | null,
+		blockedOrigin: unknown,
 	): void {
 		if (this.bindings.get(leafId) !== binding) return;
 		this.editorAuthorityShieldLeafIds.add(leafId);
@@ -1162,6 +1362,7 @@ export class EditorBindingManager {
 		this.healthWorkInFlight.delete(leafId);
 		this.bindings.delete(leafId);
 		this.cmToLeafId.delete(binding.cm);
+		this.bumpBindingEpoch(leafId);
 		this.trace?.("editor", "editor-authority-shield-activated", {
 			leafId,
 			path: binding.path,
@@ -1184,7 +1385,7 @@ export class EditorBindingManager {
 	private applyEditorAuthorityAfterShield(
 		binding: EditorBinding,
 		fallbackEditorContent: string,
-		blockedOrigin: unknown | null,
+		blockedOrigin: unknown,
 	): void {
 		const file = binding.view.file;
 		if (!file || file.path !== binding.path) return;
@@ -1224,10 +1425,22 @@ export class EditorBindingManager {
 	}
 
 	private handleLiveEditorUpdate(update: ViewUpdate): void {
+		const userDocumentEdit = this.isUserDocumentEdit(update);
+		if (update.docChanged) {
+			this.editorRevisionByCm.set(
+				update.view,
+				(this.editorRevisionByCm.get(update.view) ?? 0) + 1,
+			);
+		}
+		if (userDocumentEdit) {
+			this.lastUserDocChangeAtByCm.set(update.view, Date.now());
+		}
+
 		const match = this.findBindingForCm(update.view);
 		if (!match) return;
-		if (this.isUserDocumentEdit(update)) {
-			match.binding.lastEditorChangeAtMs = Date.now();
+		if (userDocumentEdit) {
+			match.binding.lastEditorChangeAtMs =
+				this.lastUserDocChangeAtByCm.get(update.view) ?? Date.now();
 			match.binding.lastEditorDocChangeAtMs = match.binding.lastEditorChangeAtMs;
 			this.lastEditorDocChangeAtByPath.set(
 				match.binding.path,
@@ -1236,6 +1449,21 @@ export class EditorBindingManager {
 			this.publishLocalTypingActivity(match.leafId, match.binding, match.binding.lastEditorDocChangeAtMs);
 		}
 		this.maybeHealBinding(match.leafId, match.binding, "live-update");
+	}
+
+	private carryCmActivityToPath(cm: EditorView, path: string): void {
+		const lastUserDocChangeAt = this.lastUserDocChangeAtByCm.get(cm);
+		if (lastUserDocChangeAt == null) return;
+		const previous = this.lastEditorDocChangeAtByPath.get(path) ?? 0;
+		if (lastUserDocChangeAt > previous) {
+			this.lastEditorDocChangeAtByPath.set(path, lastUserDocChangeAt);
+		}
+	}
+
+	private bumpBindingEpoch(leafId: string): number {
+		const next = (this.bindingEpochByLeafId.get(leafId) ?? 0) + 1;
+		this.bindingEpochByLeafId.set(leafId, next);
+		return next;
 	}
 
 	private isUserDocumentEdit(update: ViewUpdate): boolean {
@@ -1561,12 +1789,14 @@ export class EditorBindingManager {
 			: null;
 		const cachedLastDocChangeAtMs =
 			this.lastEditorDocChangeAtByPath.get(filePath) ?? null;
+		const cmLastDocChangeAtMs = this.lastUserDocChangeAtByCm.get(cm) ?? null;
 		const lastEditorDocChangeAtMs =
-			existingLastDocChangeAtMs == null
-				? cachedLastDocChangeAtMs
-				: (cachedLastDocChangeAtMs == null
-					? existingLastDocChangeAtMs
-					: Math.max(existingLastDocChangeAtMs, cachedLastDocChangeAtMs));
+			[existingLastDocChangeAtMs, cachedLastDocChangeAtMs, cmLastDocChangeAtMs]
+				.filter((value): value is number => value != null)
+				.reduce<number | null>(
+					(latest, value) => latest == null ? value : Math.max(latest, value),
+					null,
+				);
 		const lastEditorChangeAtMs = Math.max(
 			boundAtMs,
 			carryExistingActivity ? existing.lastEditorChangeAtMs : 0,
@@ -1576,6 +1806,7 @@ export class EditorBindingManager {
 			this.lastEditorDocChangeAtByPath.set(filePath, lastEditorDocChangeAtMs);
 		}
 
+		this.bumpBindingEpoch(leafId);
 		this.bindings.set(leafId, {
 			view,
 			path: filePath,
@@ -1728,6 +1959,10 @@ export class EditorBindingManager {
 				return { leafId, binding };
 			}
 		}
+		for (const cm of this.knownCmViews) {
+			if (cm.state !== state) continue;
+			return this.findBindingForCm(cm);
+		}
 		return null;
 	}
 
@@ -1738,6 +1973,10 @@ export class EditorBindingManager {
 	): BindingTarget | null {
 		const file = view.file;
 		if (!file) return null;
+		if (!this.isMarkdownPathSyncable(file.path)) {
+			this.skipExcludedBinding(view, file.path, `resolve:${reason}`);
+			return null;
+		}
 
 		const existingText = this.vaultSync.getTextForPath(file.path);
 		if (existingText) {
@@ -1805,6 +2044,28 @@ export class EditorBindingManager {
 				this.vaultSync.getFileId(file.path)
 				?? this.vaultSync.getFileIdForText(ytext),
 		};
+	}
+
+	private canBindPath(view: MarkdownView, reason: string): boolean {
+		const path = view.file?.path;
+		if (!path) return false;
+		if (this.isMarkdownPathSyncable(path)) return true;
+		this.skipExcludedBinding(view, path, reason);
+		return false;
+	}
+
+	private skipExcludedBinding(view: MarkdownView, path: string, reason: string): void {
+		const leafId = (view.leaf as unknown as { id: string }).id ?? path;
+		this.clearScheduledHealthCheck(leafId);
+		this.clearCmResolveRetry(leafId);
+		this.healthWorkInFlight.delete(leafId);
+		this.unbind(view);
+		this.trace?.("editor", "binding-skipped-excluded-path", {
+			leafId,
+			path,
+			reason,
+		});
+		this.log(`binding skipped for excluded path "${path}" (reason=${reason})`);
 	}
 
 	private isHardTombstonedPath(path: string): boolean {

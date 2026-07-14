@@ -269,6 +269,7 @@ function buildFixture(initial: {
 
 	const vaultSync = {
 		getTextForPath: (p: string) => (p === path ? ytext : null),
+		isPendingRenameTarget: () => false,
 		serverAckTracker: {
 			withActiveOpId: (_opId: string | undefined, fn: () => void) => fn(),
 		},
@@ -965,6 +966,48 @@ console.log("\n--- Test 5d: create dirty entries bypass typing deferral ---");
 		eb.getLastEditorActivityForPath = original;
 		clearMarkdownDrainTimer(fix.controller);
 	}
+}
+
+// -------------------------------------------------------------------
+// Test 5e — create waits when the live editor is ahead of disk
+// -------------------------------------------------------------------
+
+console.log("\n--- Test 5e: create waits when the live editor is ahead of disk ---");
+{
+	const fix = buildFixture({
+		path: "Notes/create-editor-ahead.md",
+		// The create event captured an earlier autosave snapshot while the
+		// editor already contains the user's next input composition.
+		disk: "created partial",
+		editor: "created partial 한글",
+		crdt: "base",
+	});
+	const internals = fix.controller as never as {
+		dirtyMarkdownPaths: Map<string, { reason: MarkdownDirtyReason; notBeforeMs?: number }>;
+	};
+
+	fix.controller.markMarkdownDirty(fix.file, "create", "op-create-editor-ahead");
+	clearMarkdownDrainTimer(fix.controller);
+	await drainQueuedMarkdown(fix.controller);
+
+	const queued = internals.dirtyMarkdownPaths.get(fix.path);
+	assert(queued !== undefined, "create remains queued while the editor is ahead of disk");
+	assert(
+		queued?.notBeforeMs !== undefined && queued.notBeforeMs > Date.now(),
+		"create is retried after the editor/disk settle window",
+	);
+	assertEq(fix.ytext.toString(), "base", "stale create snapshot does not overwrite CRDT");
+	assertEq(
+		fix.captured.filter((e) => e.kind === FLIGHT_KIND.recoveryDecision).length,
+		0,
+		"editor-ahead create emits no recovery.decision",
+	);
+	assertEq(
+		fix.captured.filter((e) => e.kind === FLIGHT_KIND.recoveryApplyStart).length,
+		0,
+		"editor-ahead create emits no recovery.apply.start",
+	);
+	clearMarkdownDrainTimer(fix.controller);
 }
 
 // -------------------------------------------------------------------

@@ -12,7 +12,10 @@ import {
 import type { ReconcileMode, VaultSync } from "../sync/vaultSync";
 import type { VaultSyncSettings } from "../settings";
 import type { RuntimeConfig } from "./runtimeConfig";
-import type { EditorBindingManager } from "../sync/editorBinding";
+import type {
+	EditorBindingManager,
+	OpenEditorMutationTicket,
+} from "../sync/editorBinding";
 import type {
 	ProductFlightEventInput,
 	ProductFlightPathEventInput,
@@ -187,7 +190,7 @@ interface ReconciliationControllerDeps {
 	getEditorBindings(): EditorBindingManager | null;
 	getDiskIndex(): DiskIndex;
 	setDiskIndex(index: DiskIndex): void;
-	getBaselineText?(contentHash: string): string | null;
+	getBaselineText?(contentHash: string): Promise<string | null> | string | null;
 	recordBaselineText?(contentHash: string, text: string): void;
 	recordConflictMergeBase?(artifactPath: string, baseHash: string): void;
 	isMarkdownPathSyncable(path: string): boolean;
@@ -613,13 +616,14 @@ export class ReconciliationController {
 		diskFiles: Map<string, string>;
 		diskPresentPaths: Set<string>;
 		deviceName: string;
+		previousDiskIndex: Readonly<DiskIndex>;
 	}): Promise<{
 		blockedOldPaths: Set<string>;
 		blockedNewPaths: Set<string>;
 		renamedCount: number;
 		unresolvedCount: number;
 	}> {
-		const { vaultSync, diskFiles, diskPresentPaths, deviceName } = input;
+		const { vaultSync, diskFiles, diskPresentPaths, deviceName, previousDiskIndex } = input;
 		const activePaths = vaultSync.getActiveMarkdownPaths()
 			.filter((path) => this.deps.isMarkdownPathSyncable(path));
 		const missingCrdtPaths = activePaths.filter((path) => !diskPresentPaths.has(path));
@@ -664,6 +668,8 @@ export class ReconciliationController {
 		const structuralPlan = planNoEventStructuralRenames({
 			missingCrdtPaths: missingWithHashes,
 			extraDiskPaths: extraWithHashes,
+			mode: "authoritative",
+			previousDiskIndex,
 			renameEvidence: extraDiskPaths.flatMap((newPath) => {
 				const oldPath = getPendingRenameOldPathForTarget?.call(vaultSync, newPath);
 				if (!oldPath || !missingCrdtPaths.includes(oldPath)) return [];
@@ -793,6 +799,14 @@ export class ReconciliationController {
 				},
 			});
 			const runtimeConfig = this.deps.getRuntimeConfig();
+			// Preserve the pre-reconcile baseline evidence. Rename callbacks can
+			// move live disk-index entries while this reconciliation is running.
+			const previousDiskIndex: DiskIndex = Object.fromEntries(
+				Object.entries(this.deps.getDiskIndex()).map(([path, entry]) => [
+					path,
+					{ ...entry },
+				]),
+			);
 			// Only clean remote references after full provider sync. A stale local
 			// cache must never make a deletion decision. This is intentionally
 			// limited to intrinsic system/generated paths; user exclude patterns
@@ -930,6 +944,7 @@ export class ReconciliationController {
 					diskFiles,
 					diskPresentPaths,
 					deviceName: this.deps.getSettings().deviceName,
+					previousDiskIndex,
 				})
 				: {
 					blockedOldPaths: new Set<string>(),
@@ -1348,7 +1363,7 @@ export class ReconciliationController {
 						// Execute the planned action.
 						if (action.kind === "create-conflict-artifact") {
 							if (action.reason === "both-changed" && baselineHash !== null) {
-								const baseText = this.deps.getBaselineText?.(baselineHash) ?? null;
+								const baseText = await this.deps.getBaselineText?.(baselineHash) ?? null;
 								const mergeResult = mergeTexts3(baseText, diskContent, crdtContent);
 								if (mergeResult.kind === "clean-merge") {
 									forceReplaceYText(ytext, mergeResult.mergedText, ORIGIN_DISK_SYNC_RECOVER_BOUND);
@@ -2603,6 +2618,9 @@ export class ReconciliationController {
 			}
 			const existingText = vaultSync.getTextForPath(path);
 			const existingCrdtContent = existingText ? existingText.toJSON() : null;
+			const openEditorMutationTicket = isOpenInEditor
+				? this.captureOpenEditorMutationTicket(path, openViews)
+				: null;
 
 			const openEditorMismatchDeferUntil = this.getOpenEditorDiskMismatchDeferUntil({
 				sourceReason,
@@ -2707,6 +2725,18 @@ export class ReconciliationController {
 					`syncFileFromDisk: applying diff to "${path}" (${crdtContent.length} -> ${content.length} chars)`,
 				);
 				if (this.shouldAbortActiveMarkdownIngest(active)) return;
+				if (openEditorMutationTicket && !this.canCommitOpenEditorMutation({
+					path,
+					ticket: openEditorMutationTicket,
+					expectedCrdtContent: crdtContent,
+					stage: "open-unbound-disk-to-crdt",
+				})) {
+					this.mergeDirtyEntryIntoPath(path, {
+						...entry,
+						notBeforeMs: Date.now() + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS,
+					});
+					return;
+				}
 				vaultSync.serverAckTracker.withActiveOpId(opId, () => {
 					applyDiffToYText(existingText, crdtContent, content, ORIGIN_DISK_SYNC);
 				});
@@ -2739,6 +2769,18 @@ export class ReconciliationController {
 					return;
 				}
 				if (this.shouldAbortActiveMarkdownIngest(active)) return;
+				if (openEditorMutationTicket && !this.canCommitOpenEditorMutation({
+					path,
+					ticket: openEditorMutationTicket,
+					expectedCrdtContent: null,
+					stage: "open-unbound-disk-seed",
+				})) {
+					this.mergeDirtyEntryIntoPath(path, {
+						...entry,
+						notBeforeMs: Date.now() + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS,
+					});
+					return;
+				}
 				vaultSync.serverAckTracker.withActiveOpId(opId, () => {
 					vaultSync.ensureFile(
 						path,
@@ -2783,6 +2825,61 @@ export class ReconciliationController {
 		return views;
 	}
 
+	private captureOpenEditorMutationTicket(
+		path: string,
+		openViews: readonly MarkdownView[],
+	): OpenEditorMutationTicket | null {
+		if (openViews.length === 0) return null;
+		const editorBindings = this.deps.getEditorBindings();
+		return editorBindings?.captureOpenEditorMutationTicket?.(path, openViews) ?? null;
+	}
+
+	private canCommitOpenEditorMutation(input: {
+		path: string;
+		ticket: OpenEditorMutationTicket | null;
+		expectedCrdtContent: string | null;
+		stage: string;
+	}): boolean {
+		if (!input.ticket) return true;
+
+		const editorBindings = this.deps.getEditorBindings();
+		const currentViews = this.getOpenMarkdownViewsForPath(input.path);
+		const validation = editorBindings?.validateOpenEditorMutationTicket?.(
+			input.ticket,
+			currentViews,
+		) ?? {
+			current: false as const,
+			reason: "binding-manager-unavailable",
+			leafId: undefined,
+		};
+		const currentCrdtContent = yTextToString(
+			this.deps.getVaultSync()?.getTextForPath(input.path),
+		);
+		const crdtCurrent = currentCrdtContent === input.expectedCrdtContent;
+		if (validation.current && crdtCurrent) {
+			return true;
+		}
+
+		this.deps.trace("recovery", "open-editor-mutation-ticket-stale", {
+			path: input.path,
+			stage: input.stage,
+			reason: validation.current ? "crdt-content-changed" : validation.reason,
+			leafId: validation.current ? null : (validation.leafId ?? null),
+			expectedCrdtLength: input.expectedCrdtContent?.length ?? null,
+			currentCrdtLength: currentCrdtContent?.length ?? null,
+			openViewCount: currentViews.length,
+		});
+		return false;
+	}
+
+	private deferStaleOpenEditorMutation(stage: string): BoundFileSyncGapOutcome {
+		return {
+			kind: "deferred",
+			deferUntil: Date.now() + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS,
+			reason: `stale-open-editor-mutation-ticket:${stage}`,
+		};
+	}
+
 	private getOpenEditorAuthority(openViews: MarkdownView[]): OpenEditorAuthority {
 		if (openViews.length === 0) return { kind: "none" };
 
@@ -2809,8 +2906,6 @@ export class ReconciliationController {
 		openViews: MarkdownView[];
 		now?: number;
 	}): number | null {
-		if (input.sourceReason !== "modify") return null;
-		if (!input.cameFromDirtyQueue) return null;
 		if (input.openViews.length === 0) return null;
 
 		const authority = this.getOpenEditorAuthority(input.openViews);
@@ -2820,6 +2915,12 @@ export class ReconciliationController {
 		if (authority.kind === "multiple" || authority.kind === "read-failed") {
 			return now + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS;
 		}
+		if (input.sourceReason === "create") {
+			return authority.content === input.diskContent
+				? null
+				: now + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS;
+		}
+		if (!input.cameFromDirtyQueue) return null;
 
 		if (authority.content === input.diskContent) return null;
 		if (input.crdtContent !== null && authority.content === input.crdtContent) return null;
@@ -2931,6 +3032,7 @@ export class ReconciliationController {
 	): Promise<boolean> {
 		if (!ytext) return false;
 		const crdtContent = yTextToString(ytext) ?? "";
+		const mutationTicket = this.captureOpenEditorMutationTicket(path, openViews);
 		const viewStates = openViews.map((view) => ({
 			view,
 			editorContent: view.editor.getValue(),
@@ -3002,6 +3104,21 @@ export class ReconciliationController {
 			return true;
 		}
 
+		if (!this.canCommitOpenEditorMutation({
+			path,
+			ticket: mutationTicket,
+			expectedCrdtContent: crdtContent,
+			stage: "startup-open-editor-convergence",
+		})) {
+			this.mergeDirtyEntryIntoPath(path, {
+				reason: "modify",
+				primaryOpId: undefined,
+				coalescedOpIds: [],
+				retryCount: 0,
+				notBeforeMs: Date.now() + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS,
+			});
+			return true;
+		}
 		forceReplaceYText(ytext, editorAuthority, ORIGIN_DISK_SYNC_RECOVER_BOUND);
 		const convergenceApplied = yTextToString(ytext) === editorAuthority;
 		this.deps.trace("conflict", "open-file-reconcile-editor-wins", {
@@ -3030,6 +3147,7 @@ export class ReconciliationController {
 		diskContent: string;
 		crdtContent: string;
 		targetContent?: string;
+		canCommitTarget?: () => boolean;
 		reason: string;
 		preserveDisk: boolean;
 		preserveCrdt: boolean;
@@ -3042,6 +3160,7 @@ export class ReconciliationController {
 			diskContent,
 			crdtContent,
 			targetContent,
+			canCommitTarget,
 			reason,
 			preserveDisk,
 			preserveCrdt,
@@ -3104,6 +3223,9 @@ export class ReconciliationController {
 		}
 
 		if (targetContent !== undefined) {
+			if (canCommitTarget && !canCommitTarget()) {
+				return false;
+			}
 			const existingText = this.deps.getVaultSync()?.getTextForPath(file.path);
 			if (existingText) {
 				forceReplaceYText(existingText, targetContent, ORIGIN_DISK_SYNC_RECOVER_BOUND);
@@ -3189,6 +3311,18 @@ export class ReconciliationController {
 		}
 
 		const crdtContent = yTextToString(existingText);
+		const mutationTicket = this.captureOpenEditorMutationTicket(file.path, openViews);
+		let mutationTicketStale = false;
+		const canCommitMutation = (stage: string, expectedCrdtContent: string | null): boolean => {
+			const current = this.canCommitOpenEditorMutation({
+				path: file.path,
+				ticket: mutationTicket,
+				expectedCrdtContent,
+				stage,
+			});
+			mutationTicketStale ||= !current;
+			return current;
+		};
 		if (crdtContent === content) {
 			this.boundRecoveryLocks.delete(file.path);
 			this.deps.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, crdt-current)`);
@@ -3387,6 +3521,10 @@ export class ReconciliationController {
 					diskContent: content,
 					crdtContent: crdtContent ?? "",
 					targetContent: editorAuthority,
+					canCommitTarget: () => canCommitMutation(
+						"open-bound-planner-editor-wins",
+						crdtContent,
+					),
 					reason: `bound-file-${openBoundAction.reason}`,
 					preserveDisk: !!openBoundAction.preserveDisk,
 					preserveCrdt: !!openBoundAction.preserveCrdt,
@@ -3395,6 +3533,9 @@ export class ReconciliationController {
 					chosenSource: "editor",
 				});
 				if (!preserved) {
+					if (mutationTicketStale) {
+						return this.deferStaleOpenEditorMutation("open-bound-planner-editor-wins");
+					}
 					return { kind: "handled" };
 				}
 				this.deps.scheduleTraceStateSnapshot("bound-file-open-planner-editor-wins");
@@ -3534,17 +3675,24 @@ export class ReconciliationController {
 					"bound-file-local-only-divergence",
 					crdtContent?.length ?? 0,
 					content.length,
-					)) {
-						return { kind: "handled" };
-					}
-					if (this.shouldQuarantineRepeatedRecovery(
+				)) {
+					return { kind: "handled" };
+				}
+				if (this.shouldQuarantineRepeatedRecovery(
 					file.path,
 					"bound-file-local-only-divergence",
 					crdtContent ?? "",
 					content,
-					)) {
-						return { kind: "handled" };
-					}
+				)) {
+					return { kind: "handled" };
+				}
+				if (shouldAbort()) return { kind: "handled" };
+				if (!canCommitMutation(
+					"bound-file-local-only-divergence",
+					crdtContent,
+				)) {
+					return this.deferStaleOpenEditorMutation("bound-file-local-only-divergence");
+				}
 				// recovery.apply.start: before the actual diff application
 				this.deps.recordFlightPathEvent?.({
 					priority: "important",
@@ -3561,7 +3709,6 @@ export class ReconciliationController {
 						crdtLength: crdtContent?.length ?? null,
 					},
 				});
-				if (shouldAbort()) return { kind: "handled" };
 				const recoveryResult = applyDiffToYTextWithPostcondition(
 					existingText,
 					crdtContent ?? "",
@@ -3631,9 +3778,13 @@ export class ReconciliationController {
 					"bound-file-local-only-seed",
 					"",
 					content,
-					)) {
-						return { kind: "handled" };
-					}
+				)) {
+					return { kind: "handled" };
+				}
+				if (shouldAbort()) return { kind: "handled" };
+				if (!canCommitMutation("bound-file-local-only-seed", null)) {
+					return this.deferStaleOpenEditorMutation("bound-file-local-only-seed");
+				}
 				this.deps.recordFlightPathEvent?.({
 					priority: "important",
 					kind: PRODUCT_EVENT_KIND.recoveryApplyStart,
@@ -3644,7 +3795,6 @@ export class ReconciliationController {
 					path: file.path,
 					data: { reason: "bound-file-local-only-seed", action: "seed-crdt-from-disk", diskLength: content.length },
 				});
-				if (shouldAbort()) return { kind: "handled" };
 				vaultSync?.ensureFile(
 					file.path,
 					content,
@@ -3870,9 +4020,16 @@ export class ReconciliationController {
 					"bound-file-open-idle-disk-recovery",
 					crdtContent ?? "",
 					content,
-					)) {
-						return { kind: "handled" };
-					}
+				)) {
+					return { kind: "handled" };
+				}
+				if (shouldAbort()) return { kind: "handled" };
+				if (!canCommitMutation(
+					"bound-file-open-idle-disk-recovery",
+					crdtContent,
+				)) {
+					return this.deferStaleOpenEditorMutation("bound-file-open-idle-disk-recovery");
+				}
 				this.deps.recordFlightPathEvent?.({
 					priority: "important",
 					kind: PRODUCT_EVENT_KIND.recoveryApplyStart,
@@ -3888,7 +4045,6 @@ export class ReconciliationController {
 						crdtLength: crdtContent?.length ?? null,
 					},
 				});
-				if (shouldAbort()) return { kind: "handled" };
 				const recoveryResult = applyDiffToYTextWithPostcondition(
 					existingText,
 					crdtContent ?? "",
@@ -3958,10 +4114,13 @@ export class ReconciliationController {
 					"bound-file-open-idle-seed",
 					"",
 					content,
-					)) {
-						return { kind: "handled" };
-					}
+				)) {
+					return { kind: "handled" };
+				}
 				if (shouldAbort()) return { kind: "handled" };
+				if (!canCommitMutation("bound-file-open-idle-seed", null)) {
+					return this.deferStaleOpenEditorMutation("bound-file-open-idle-seed");
+				}
 				vaultSync?.ensureFile(
 					file.path,
 					content,
@@ -4129,6 +4288,9 @@ export class ReconciliationController {
 		if ((conflictPath !== null || conflictSkippedDedupe) && editorAuthority !== null) {
 			const existingText = vaultSync?.getTextForPath(file.path);
 			if (existingText) {
+				if (!canCommitMutation("bound-file-ambiguous-convergence", crdtContent)) {
+					return this.deferStaleOpenEditorMutation("bound-file-ambiguous-convergence");
+				}
 				forceReplaceYText(existingText, editorAuthority, ORIGIN_DISK_SYNC_RECOVER_BOUND);
 				convergenceApplied = yTextToString(existingText) === editorAuthority;
 				if (convergenceApplied) {

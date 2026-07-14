@@ -90,6 +90,31 @@ The shield is narrow:
 This is intentionally not a general conflict resolver. It is a last-second
 guard against active typing loss.
 
+## Reconciliation Compare-and-Commit
+
+Reconciliation keeps its existing disk/CRDT/editor authority rules. An open
+editor does not become the unconditional winner. Instead, any reconciliation
+branch that may replace or seed CRDT content for an open file uses an
+optimistic mutation ticket:
+
+1. Capture the visible view set, file path, CodeMirror instance/document,
+   editor revision and content, binding epoch, and decision-time CRDT content.
+2. Perform any asynchronous reads or conflict-artifact preservation required
+   by the existing policy.
+3. Immediately before mutating Y.Text, verify that the complete ticket and the
+   CRDT content are unchanged.
+4. If any part changed, do not commit the stale decision. Defer the path and
+   let reconciliation evaluate the new state again.
+
+This closes the file-open and file-create transition where the first local
+input can arrive after an authority decision but before its write. It also
+avoids restoring the older open-editor-owns-everything model, so passive open
+files and normal Yjs collaboration retain their current behavior.
+
+A create event has one additional narrow guard: if the live editor is already
+ahead of the stable disk snapshot, the create import waits for the normal
+editor/disk settle window instead of importing the stale snapshot.
+
 ## Last-Resort Escalation
 
 If the narrow recent-typing shield still allows stale state to overwrite
@@ -117,9 +142,14 @@ The policy is covered by:
   - provider-origin preserving patch is allowed
   - provider-origin destructive patch is blocked during recent typing
   - provider-origin destructive patch is allowed when the editor is idle
+  - pre-bind input and binding-epoch changes invalidate mutation tickets
 - `tests/editor-binding-health-regressions.mjs`
   - filtering does not attempt live 3-way auto-merge
   - destructive patch shielding depends on recent editor activity
   - patch capture does not store a live merge base
+- `tests/reconciliation-safety-brake.ts`
+  - editor or CRDT changes after an authority decision abort the stale commit
+- `tests/controller-recovery-orchestration.ts`
+  - create events wait when the live editor is ahead of the disk snapshot
 
 When changing this policy, update this document and those tests together.

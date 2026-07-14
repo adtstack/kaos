@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { EditorState } from "../src/headless-host/codeMirrorStateShim";
 
 const CORE_DIR = "src/headless-host/core";
 const forbiddenImportPatterns = [
@@ -37,3 +38,8 @@ console.log("\n--- headless host core boundary: core stays reusable ---");
 await walk(CORE_DIR);
 assert.ok(checked > 0, "expected at least one core file to be checked");
 console.log(`  PASS  checked ${checked} core file(s)`);
+
+console.log("\n--- headless host CodeMirror shim: editor safety extensions are available ---");
+assert.equal(typeof EditorState.transactionFilter.of, "function");
+assert.equal(typeof EditorState.transactionExtender.of, "function");
+console.log("  PASS  transaction filters and extenders can be installed during plugin boot");

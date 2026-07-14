@@ -258,6 +258,33 @@ console.log("\n--- Test 3: attention aggregation includes all local attention ty
 	assert(remoteDelete?.resolution?.canKeepLocal === true, "Keep local is enabled only when the local file and sync engine are ready");
 	assert(remoteDelete?.resolution?.canAcceptRemoteDelete === true, "Accept remote delete is enabled for an authoritative tombstone");
 	assert(pathCollision?.resolution === null, "non-delete preserved attention is not offered delete resolution");
+	const structuralChange = attention.find((item) => item.kind === "structural-change");
+	assert(
+		structuralChange?.title === "ambiguous · old.md, new.md",
+		"structural title uses the reason and path-free filenames",
+	);
+	assert(
+		structuralChange?.structuralChange?.oldPaths[0] === "old.md"
+			&& structuralChange.structuralChange.newPaths[0] === "new.md"
+			&& structuralChange.structuralChange.contentHashPrefix === "123456789abc",
+		"structural detail keeps old, new, and hash fields separate",
+	);
+	const manyStructural = collectDashboardAttention({
+		...baseInput,
+		reconciliationState: {
+			...baseInput.reconciliationState,
+			unresolvedStructuralChangeSample: [{
+				oldPaths: ["old/a.md", "old/b.md"],
+				newPaths: ["new/c.md", "new/d.md"],
+				reason: "ambiguous-duplicate-content",
+				contentHashPrefix: "abcdef123456",
+			}],
+		},
+	}).find((item) => item.kind === "structural-change");
+	assert(
+		manyStructural?.title === "ambiguous-duplicate-content · a.md, b.md, c.md, d.md",
+		"structural title shows every filename without +N truncation",
+	);
 	assert(
 		attention
 			.filter((item) => item.kind !== "preserved-unresolved")

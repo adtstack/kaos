@@ -70,8 +70,9 @@ preserved as a local-only artifact.
 **Sync behavior:** Blob conflict artifacts are **local-only**. They are
 skipped by upload/reconcile paths using both the session-local guard and
 the `"(KAOS remote conflict "` filename marker, so the local-only policy
-survives plugin restart. This differs from Markdown artifacts which sync
-normally.
+survives plugin restart. Markdown conflict artifacts follow the same
+local-only policy through create-event suppression and their durable filename
+marker.
 
 **Rationale:** Binary conflict artifacts may be large (images, PDFs) and
 uploading them could create confusion on other devices. The local device

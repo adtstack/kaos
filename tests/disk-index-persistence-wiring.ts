@@ -25,7 +25,7 @@ console.log("\n--- Test 1: DiskMirror write callback schedules disk-index persis
 		"disk write callback schedules a debounced disk-index save",
 	);
 	assert(
-		callbackSource.indexOf("this.baselineTexts[contentHash] = content") <
+		callbackSource.indexOf("this.recordBaselineText(contentHash, content)") <
 			callbackSource.indexOf('this.scheduleDiskIndexSave("disk-write-baseline")'),
 		"baseline text is recorded before persistence is scheduled",
 	);

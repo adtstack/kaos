@@ -82,7 +82,14 @@ Tradeoff: tombstones increase long-term graph size and add lookup overhead, but 
 
 ### Local plugin persistence is serialized on purpose
 
-The plugin persists multiple state domains into Obsidian `data.json` (settings, disk index, blob hash cache, transfer queue).
+The plugin persists small state domains into Obsidian `data.json` (settings, disk index, blob hash cache, transfer queue).
+Full Markdown baseline bodies are content-addressed outside `data.json`: IndexedDB in Obsidian and
+`<data-file>.d` sidecars in the headless host. This keeps `data.json` proportional to file metadata
+rather than total Markdown bytes and avoids rewriting the full vault baseline on every small update.
+
+Legacy `_baselineTexts` payloads migrate only after each body is SHA-256 verified and the external
+write succeeds. Missing or corrupt external bodies disable automatic 3-way merge for that conflict;
+the sync engine keeps the hash decision and preserves a conflict artifact instead of overwriting.
 
 Obsidian persistence requires a read/merge/write cycle. If independent async saves race, they can clobber each other.
 

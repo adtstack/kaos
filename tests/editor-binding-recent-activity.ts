@@ -2,6 +2,7 @@ import * as Y from "yjs";
 import { EditorBindingManager } from "../src/sync/editorBinding";
 import { ORIGIN_DISK_SYNC_RECOVER_BOUND } from "../src/sync/origins";
 import { PRODUCT_EVENT_KIND } from "../src/observability/productEventKinds";
+import { isMarkdownSyncable } from "../src/types";
 
 let passed = 0;
 let failed = 0;
@@ -83,6 +84,7 @@ function buildManagerFixture(options: {
 	const manager = new EditorBindingManager(
 		vaultSync as never,
 		false,
+		(p) => p.endsWith(".md"),
 		undefined,
 		(event) => {
 			flightEvents.push({ kind: event.kind, data: event.data });
@@ -714,6 +716,227 @@ console.log("\n--- Test 19: missing-origin preserving patch is allowed during re
 		true,
 		"binding remains attached for missing-origin preserving patch",
 	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 20: opening a local-only conflict note never creates a CRDT file ---");
+{
+	const path = "Notes/plan (KAOS conflict - crdt from Laptop 2026-07-13T12-00-00Z).md";
+	let ensureFileCalls = 0;
+	const vaultSync = {
+		provider: { awareness: { setLocalStateField: () => {} } },
+		getTextForPath: () => null,
+		getFileId: () => undefined,
+		getFileIdForText: () => undefined,
+		isPendingRenameTarget: () => false,
+		isMarkdownTombstoned: () => false,
+		ensureFile: () => {
+			ensureFileCalls++;
+			return null;
+		},
+	};
+	const manager = new EditorBindingManager(
+		vaultSync as never,
+		false,
+		(p) => isMarkdownSyncable(p, [], ".obsidian"),
+	);
+	const cm = {
+		dom: { isConnected: true },
+		state: { doc: { length: 4, toString: () => "copy" }, facet: () => null },
+		dispatch: () => {},
+	};
+	(manager as unknown as { getCmView: () => unknown }).getCmView = () => cm;
+	const view = {
+		file: { path },
+		leaf: { id: "conflict-leaf" },
+		containerEl: { contains: () => true },
+		editor: { getValue: () => "copy" },
+	};
+
+	manager.bind(view as never, "TestDevice");
+
+	assertEq(ensureFileCalls, 0, "conflict note open is rejected before ensureFile");
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has("conflict-leaf"),
+		false,
+		"conflict note receives no collaborative editor binding",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 21: excluded Markdown is rejected by the final binding-target guard ---");
+{
+	const path = "Private/local.md";
+	let ensureFileCalls = 0;
+	const vaultSync = {
+		getTextForPath: () => null,
+		getFileId: () => undefined,
+		getFileIdForText: () => undefined,
+		isPendingRenameTarget: () => false,
+		isMarkdownTombstoned: () => false,
+		ensureFile: () => {
+			ensureFileCalls++;
+			return null;
+		},
+	};
+	const manager = new EditorBindingManager(
+		vaultSync as never,
+		false,
+		() => false,
+	);
+	const view = {
+		file: { path },
+		leaf: { id: "excluded-leaf" },
+		editor: { getValue: () => "local" },
+	};
+
+	const target = (manager as unknown as {
+		resolveBindingTarget: (view: unknown, deviceName: string, reason: string) => unknown;
+	}).resolveBindingTarget(view, "TestDevice", "direct-guard-test");
+
+	assertEq(target, null, "excluded path has no binding target");
+	assertEq(ensureFileCalls, 0, "final binding-target guard blocks direct ensureFile access");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 22: pre-bind user input invalidates an open-editor mutation ticket ---");
+{
+	const path = "Notes/opening.md";
+	const vaultSync = {
+		provider: { awareness: { setLocalStateField: () => {} } },
+		getTextForPath: () => null,
+		getFileId: () => undefined,
+		getFileIdForText: () => undefined,
+	};
+	const manager = new EditorBindingManager(
+		vaultSync as never,
+		false,
+		(p) => p.endsWith(".md"),
+	);
+	const cmDom = { isConnected: true };
+	let editorContent = "start";
+	const cm = {
+		dom: cmDom,
+		hasFocus: true,
+		state: {
+			doc: { length: editorContent.length, toString: () => editorContent },
+			facet: () => null,
+		},
+		dispatch: () => {},
+	};
+	const view = {
+		file: { path },
+		leaf: { id: "opening-leaf" },
+		containerEl: { contains: (node: unknown) => node === cmDom },
+		editor: { getValue: () => editorContent },
+	};
+	(manager as unknown as { knownCmViews: Set<unknown> }).knownCmViews.add(cm);
+
+	const before = manager.captureOpenEditorMutationTicket(path, [view as never]);
+	editorContent = "start 한글";
+	cm.state = {
+		doc: { length: editorContent.length, toString: () => editorContent },
+		facet: () => null,
+	};
+	(manager as unknown as {
+		handleLiveEditorUpdate: (update: unknown) => void;
+	}).handleLiveEditorUpdate({
+		view: cm,
+		docChanged: true,
+		transactions: [{
+			docChanged: true,
+			annotation: () => "input.type.compose",
+			isUserEvent: (name: string) => name === "input",
+		}],
+	});
+
+	const stale = manager.validateOpenEditorMutationTicket(before, [view as never]);
+	assertEq(stale.current, false, "first input invalidates a ticket captured before binding");
+	const after = manager.captureOpenEditorMutationTicket(path, [view as never]);
+	assertEq(
+		manager.validateOpenEditorMutationTicket(after, [view as never]).current,
+		true,
+		"a fresh ticket is valid after the pre-bind input",
+	);
+	assertEq(
+		(manager.getLastEditorActivityForPath(path) ?? 0) > 0,
+		true,
+		"pre-bind input is carried to path activity when the view is resolved",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 23: binding epoch changes invalidate in-flight mutation tickets ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const ticket = manager.captureOpenEditorMutationTicket(binding.path, [binding.view as never]);
+	(manager as unknown as { bumpBindingEpoch: (leafId: string) => number })
+		.bumpBindingEpoch("leaf-1");
+	const validation = manager.validateOpenEditorMutationTicket(ticket, [binding.view as never]);
+	assertEq(validation.current, false, "a new binding epoch invalidates the previous ticket");
+	assertEq(
+		validation.current ? null : validation.reason,
+		"binding-epoch-changed",
+		"ticket reports the binding epoch change",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 24: pending replacement states resolve to the guarded binding ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	const liveDom = { isConnected: true };
+	const liveState = {
+		doc: binding.cm.state.doc,
+		facet: () => null,
+	};
+	const liveCm = {
+		dom: liveDom,
+		hasFocus: true,
+		state: liveState,
+		dispatch: () => {},
+	};
+	binding.cm.dom.isConnected = false;
+	binding.view.containerEl = { contains: (node: unknown) => node === liveDom };
+	(manager as unknown as { knownCmViews: Set<unknown> }).knownCmViews.add(liveCm);
+	(manager as unknown as { pendingReplacementCmToLeafId: WeakMap<object, string> })
+		.pendingReplacementCmToLeafId.set(liveCm, "leaf-1");
+
+	const match = (manager as unknown as {
+		findBindingForState: (state: unknown) => { leafId: string } | null;
+	}).findBindingForState(liveState);
+	assertEq(match?.leafId, "leaf-1", "transaction state lookup includes pending replacement CM views");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 25: stale path bindings detach before user input propagates ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	binding.view.file = { path: "Notes/next.md" };
+	const result = (manager as unknown as {
+		fenceStaleUserBinding: (transaction: unknown) => unknown;
+	}).fenceStaleUserBinding({
+		docChanged: true,
+		startState: binding.cm.state,
+		annotation: () => "input",
+		isUserEvent: (name: string) => name === "input",
+	});
+	assertEq(result !== null, true, "stale binding adds a same-transaction detach effect");
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has("leaf-1"),
+		false,
+		"stale path binding is removed before the editor update phase",
+	);
+	await Promise.resolve();
 	clearPendingHealthChecks(manager);
 }
 

@@ -3,6 +3,7 @@ import { HeadlessFileManager } from "./fileManager";
 import { HeadlessMetadataCache } from "./metadataCache";
 import { HeadlessPluginRegistry } from "./pluginRegistry";
 import { HeadlessPluginStorage } from "./pluginStorage";
+import { HeadlessBaselineTextRepository } from "./baselineTextRepository";
 import { HeadlessVault } from "./vault";
 import { HeadlessWorkspace } from "./workspace";
 
@@ -30,6 +31,7 @@ export class HeadlessApp {
 	settingTabs: unknown[] = [];
 	commands: unknown[] = [];
 	private readonly pluginStorageById = new Map<string, HeadlessPluginStorage>();
+	private readonly baselineTextRepositoryByScope = new Map<string, HeadlessBaselineTextRepository>();
 	private readonly pluginDataDir: string;
 	private readonly pluginDataMode: HeadlessPluginDataMode;
 
@@ -54,6 +56,19 @@ export class HeadlessApp {
 		if (storage) return storage;
 		const next = new HeadlessPluginStorage(resolve(this.pluginDataDir, `${safePluginDataName(pluginId)}.json`));
 		this.pluginStorageById.set(pluginId, next);
+		return next;
+	}
+
+	baselineTextRepositoryFor(pluginId: string, scope: string): HeadlessBaselineTextRepository {
+		const safeScope = safePluginDataName(scope);
+		const key = `${pluginId}:${safeScope}`;
+		const existing = this.baselineTextRepositoryByScope.get(key);
+		if (existing) return existing;
+		const dataFile = this.pluginStorageFor(pluginId).dataFile;
+		const next = new HeadlessBaselineTextRepository(
+			resolve(`${dataFile}.d`, "baseline-text-v1", safeScope),
+		);
+		this.baselineTextRepositoryByScope.set(key, next);
 		return next;
 	}
 }

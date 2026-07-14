@@ -2,6 +2,8 @@ import {
 	evaluatePathBindingIntegrity,
 	type PathBindingRenameEvidence,
 } from "../../sync/pathBindingIntegrity";
+import type { DiskIndex } from "../../sync/diskIndex";
+import type { ReconcileMode } from "../../sync/vaultSync";
 
 export interface StructuralPathHash {
 	path: string;
@@ -18,7 +20,7 @@ export interface PlannedStructuralRename {
 	oldPath: string;
 	newPath: string;
 	contentHash: string;
-	reason: StructuralRenameEvidence["reason"];
+	reason: StructuralRenameEvidence["reason"] | "baseline-hash-continuity";
 }
 
 export interface UnresolvedStructuralChange {
@@ -59,6 +61,8 @@ export function planNoEventStructuralRenames(input: {
 	missingCrdtPaths: StructuralPathHash[];
 	extraDiskPaths: StructuralPathHash[];
 	renameEvidence?: StructuralRenameEvidence[];
+	mode: ReconcileMode;
+	previousDiskIndex?: Readonly<DiskIndex>;
 }): NoEventStructuralPlan {
 	const oldByHash = groupByHash(input.missingCrdtPaths);
 	const newByHash = groupByHash(input.extraDiskPaths);
@@ -90,14 +94,44 @@ export function planNoEventStructuralRenames(input: {
 	}
 
 	for (const hash of [...hashes].sort()) {
-		const oldPaths = (oldByHash.get(hash) ?? []).filter((path) => !consumedOld.has(path));
-		const newPaths = (newByHash.get(hash) ?? []).filter((path) => !consumedNew.has(path));
+		const originalOldPaths = oldByHash.get(hash) ?? [];
+		const originalNewPaths = newByHash.get(hash) ?? [];
+		const oldPaths = originalOldPaths.filter((path) => !consumedOld.has(path));
+		const newPaths = originalNewPaths.filter((path) => !consumedNew.has(path));
 		if (oldPaths.length === 0 || newPaths.length === 0) continue;
 
 		if (oldPaths.length === 1 && newPaths.length === 1) {
 			const oldPath = oldPaths[0]!;
 			const newPath = newPaths[0]!;
 			if (basename(oldPath) !== basename(newPath)) {
+				continue;
+			}
+			const previousDiskIndex = input.previousDiskIndex ?? {};
+			const oldBaseline = Object.prototype.hasOwnProperty.call(previousDiskIndex, oldPath)
+				? previousDiskIndex[oldPath]?.contentHash
+				: undefined;
+			const newPathWasPreviouslyIndexed = Object.prototype.hasOwnProperty.call(
+				previousDiskIndex,
+				newPath,
+			);
+			// Hash equality proves content continuity, not file identity. Infer a
+			// rename only when the authoritative snapshot, prior local baseline,
+			// path history, candidate cardinality, and basename all agree.
+			if (
+				input.mode === "authoritative"
+				&& originalOldPaths.length === 1
+				&& originalNewPaths.length === 1
+				&& oldBaseline === hash
+				&& !newPathWasPreviouslyIndexed
+			) {
+				renames.push({
+					oldPath,
+					newPath,
+					contentHash: hash,
+					reason: "baseline-hash-continuity",
+				});
+				consumedOld.add(oldPath);
+				consumedNew.add(newPath);
 				continue;
 			}
 			const binding = evaluatePathBindingIntegrity({

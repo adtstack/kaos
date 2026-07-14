@@ -100,6 +100,7 @@ export function collectDashboardAttention(
 			title: `${entry.kind} needs attention`,
 			path: entry.path,
 			detail: entry.reason,
+			structuralChange: null,
 			firstSeenAt: new Date(entry.firstSeenAt).toISOString(),
 			lastSeenAt: new Date(entry.lastSeenAt).toISOString(),
 			tone: "warn",
@@ -126,17 +127,17 @@ export function collectDashboardAttention(
 		});
 	}
 
-	input.reconciliationState.unresolvedStructuralChangeSample.forEach((change, index) => {
+	input.reconciliationState.unresolvedStructuralChangeSample.forEach((change) => {
 		items.push({
 			kind: "structural-change",
-			title: `Structural change ${index + 1}`,
+			title: buildStructuralChangeTitle(change),
 			path: null,
-			detail: [
-				change.reason,
-				`old: ${change.oldPaths.join(", ") || "(none)"}`,
-				`new: ${change.newPaths.join(", ") || "(none)"}`,
-				`hash: ${change.contentHashPrefix}`,
-			].join(" · "),
+			detail: change.reason,
+			structuralChange: {
+				oldPaths: change.oldPaths,
+				newPaths: change.newPaths,
+				contentHashPrefix: change.contentHashPrefix,
+			},
 			firstSeenAt: null,
 			lastSeenAt: null,
 			tone: "warn",
@@ -152,6 +153,7 @@ export function collectDashboardAttention(
 			detail: input.reconciliationState.blockedDivergenceSample
 				.map((sample) => `${sample.ext ?? "(no ext)"} ${sample.hash}`)
 				.join(", "),
+			structuralChange: null,
 			firstSeenAt: null,
 			lastSeenAt: input.reconciliationState.lastBlockedDivergenceAt,
 			tone: "error",
@@ -165,6 +167,7 @@ export function collectDashboardAttention(
 			title: "Frontmatter quarantine",
 			path: entry.path,
 			detail: `${entry.direction} · ${entry.reasons.join(", ")} · x${entry.count}`,
+			structuralChange: null,
 			firstSeenAt: new Date(entry.firstSeenAt).toISOString(),
 			lastSeenAt: new Date(entry.lastSeenAt).toISOString(),
 			tone: "warn",
@@ -176,6 +179,17 @@ export function collectDashboardAttention(
 		(Date.parse(right.lastSeenAt ?? right.firstSeenAt ?? "0") || 0)
 		- (Date.parse(left.lastSeenAt ?? left.firstSeenAt ?? "0") || 0),
 	);
+}
+
+function buildStructuralChangeTitle(
+	change: KaosDashboardCollectorInput["reconciliationState"]["unresolvedStructuralChangeSample"][number],
+): string {
+	const filenames = Array.from(new Set(
+		[...change.oldPaths, ...change.newPaths]
+			.map((path) => path.split("/").pop() || path)
+			.filter(Boolean),
+	));
+	return `${change.reason} · ${filenames.join(", ") || "unknown file"}`;
 }
 
 export function getDashboardAttentionTotalCount(

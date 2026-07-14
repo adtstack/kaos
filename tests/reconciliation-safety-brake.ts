@@ -972,7 +972,7 @@ console.log("\n--- Test 4: second reconcile reads blocked paths again ---");
 	);
 }
 
-console.log("\n--- Test 5: bound recovery force-replaces when CRDT changes after authority decision ---");
+console.log("\n--- Test 5: bound recovery aborts when CRDT changes after authority decision ---");
 {
 	const path = "bound-stale-base.md";
 	const diskContent = "abcY";
@@ -1022,8 +1022,13 @@ console.log("\n--- Test 5: bound recovery force-replaces when CRDT changes after
 		getTextForPath: () => ytext,
 	};
 
+	let editorTicketCurrent = true;
 	const editorBindings = {
 		isBound: () => true,
+		captureOpenEditorMutationTicket: () => ({ path, views: [] }),
+		validateOpenEditorMutationTicket: () => editorTicketCurrent
+			? ({ current: true })
+			: ({ current: false, reason: "editor-document-changed", leafId: "leaf-1" }),
 		getBindingDebugInfoForView: () => null,
 		getCollabDebugInfoForView: () => null,
 		repair: () => true,
@@ -1072,16 +1077,32 @@ console.log("\n--- Test 5: bound recovery force-replaces when CRDT changes after
 
 	await (controller as any).syncFileFromDisk(file, "modify");
 
-	const forceTrace = traces.find((event) => event.msg === "recovery-force-replace-applied");
+	const staleTicketTrace = traces.find((event) => event.msg === "open-editor-mutation-ticket-stale");
 	const postconditionTrace = traces.find((event) => event.msg === "recovery-postcondition-observed");
-	assert(ytext.toString() === diskContent, "controller recovery lands exact disk content");
-	assert(!!forceTrace, "controller recovery traces force replace fallback");
-	assert(forceTrace?.details?.diffSkippedDueToStaleBase === true, "force replace skipped stale-base diff");
-	assert(postconditionTrace?.details?.enforced === true, "controller recovery postcondition is enforced");
+	assert(ytext.toString() === "abcZ", "newer CRDT content survives the stale recovery decision");
+	assert(!!staleTicketTrace, "controller records the stale mutation ticket");
+	assert(staleTicketTrace?.details?.reason === "crdt-content-changed", "stale ticket identifies the CRDT revision change");
+	assert(!postconditionTrace, "stale recovery never reaches the mutation postcondition");
 	assert(
-		transactionOrigins.includes(ORIGIN_DISK_SYNC_RECOVER_BOUND),
-		"force replace uses a known local repair origin",
+		!transactionOrigins.includes(ORIGIN_DISK_SYNC_RECOVER_BOUND),
+		"stale recovery emits no local repair transaction",
 	);
+	editorTicketCurrent = false;
+	const editorRevisionAccepted = (controller as any).canCommitOpenEditorMutation({
+		path,
+		ticket: { path, views: [] },
+		expectedCrdtContent: "abcZ",
+		stage: "test-editor-revision",
+	});
+	assert(editorRevisionAccepted === false, "changed editor revision also rejects the mutation ticket");
+	assert(
+		traces.some((event) =>
+			event.msg === "open-editor-mutation-ticket-stale" &&
+			event.details?.reason === "editor-document-changed"
+		),
+		"editor ticket rejection records the editor revision reason",
+	);
+	controller.reset();
 	doc.destroy();
 }
 

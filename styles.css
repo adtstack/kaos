@@ -129,6 +129,28 @@
 	border-top: 1px solid var(--background-modifier-border);
 }
 
+.kaos-dashboard-attention-help {
+	margin: 0 0 8px;
+}
+
+.kaos-dashboard-structural-fields {
+	display: grid;
+	gap: 3px;
+	margin-top: 5px;
+}
+
+.kaos-dashboard-structural-field {
+	display: grid;
+	grid-template-columns: 42px minmax(0, 1fr);
+	gap: 6px;
+}
+
+.kaos-dashboard-structural-label {
+	color: var(--text-normal);
+	font-size: 12px;
+	font-weight: 650;
+}
+
 .kaos-dashboard-row {
 	padding: 9px 0;
 	border-bottom: 1px solid var(--background-modifier-border);
@@ -136,7 +158,7 @@
 }
 
 .kaos-dashboard-recent-row {
-	padding: 9px 8px;
+	padding: 7px 8px;
 	border-radius: 6px;
 	cursor: pointer;
 }
@@ -152,10 +174,27 @@
 	word-break: break-word;
 }
 
+.kaos-dashboard-recent-main {
+	display: grid;
+	grid-template-columns: auto minmax(0, 1fr) auto;
+	align-items: center;
+	gap: 8px;
+}
+
 .kaos-dashboard-recent-path {
-	margin-top: 6px;
 	font-weight: 500;
 	color: var(--text-normal);
+}
+
+.kaos-dashboard-recent-meta {
+	margin: 3px 0 0 0;
+	padding-left: 68px;
+	word-break: break-word;
+}
+
+.kaos-dashboard-recent-actions button {
+	min-height: 28px;
+	padding: 2px 9px;
 }
 
 .kaos-dashboard-subpath {
@@ -201,19 +240,24 @@
 	margin-top: 5px;
 }
 
-.kaos-dashboard-event-line.is-change-deleted .kaos-dashboard-event-badge {
+.kaos-dashboard-event-line.is-change-deleted .kaos-dashboard-event-badge,
+.kaos-dashboard-recent-main.is-change-deleted .kaos-dashboard-event-badge {
 	border-color: var(--text-error);
 	color: var(--text-error);
 }
 
 .kaos-dashboard-event-line.is-change-created .kaos-dashboard-event-badge,
-.kaos-dashboard-event-line.is-change-restored .kaos-dashboard-event-badge {
+.kaos-dashboard-event-line.is-change-restored .kaos-dashboard-event-badge,
+.kaos-dashboard-recent-main.is-change-created .kaos-dashboard-event-badge,
+.kaos-dashboard-recent-main.is-change-restored .kaos-dashboard-event-badge {
 	border-color: var(--color-green);
 	color: var(--color-green);
 }
 
 .kaos-dashboard-event-line.is-change-renamed .kaos-dashboard-event-badge,
-.kaos-dashboard-event-line.is-change-attachment-changed .kaos-dashboard-event-badge {
+.kaos-dashboard-event-line.is-change-attachment-changed .kaos-dashboard-event-badge,
+.kaos-dashboard-recent-main.is-change-renamed .kaos-dashboard-event-badge,
+.kaos-dashboard-recent-main.is-change-attachment-changed .kaos-dashboard-event-badge {
 	border-color: var(--color-orange);
 	color: var(--color-orange);
 }
@@ -244,6 +288,14 @@
 	align-items: flex-start;
 	flex-direction: column;
 	gap: 4px;
+}
+
+.kaos-dashboard.is-phone-dashboard .kaos-dashboard-recent-main {
+	grid-template-columns: auto minmax(0, 1fr) auto;
+}
+
+.kaos-dashboard.is-phone-dashboard .kaos-dashboard-recent-meta {
+	padding-left: 0;
 }
 
 .kaos-dashboard.is-phone-dashboard .kaos-dashboard-event-time {

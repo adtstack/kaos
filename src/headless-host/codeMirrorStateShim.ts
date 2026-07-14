@@ -89,6 +89,7 @@ export const EditorSelection = {
 
 export const EditorState = {
 	transactionFilter: extensionPoint("EditorState.transactionFilter"),
+	transactionExtender: extensionPoint("EditorState.transactionExtender"),
 	readOnly: extensionPoint("EditorState.readOnly"),
 };
 

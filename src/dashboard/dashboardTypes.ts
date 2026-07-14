@@ -57,6 +57,11 @@ export interface DashboardAttentionItem {
 	title: string;
 	path: string | null;
 	detail: string;
+	structuralChange: {
+		oldPaths: string[];
+		newPaths: string[];
+		contentHashPrefix: string;
+	} | null;
 	firstSeenAt: string | null;
 	lastSeenAt: string | null;
 	tone: DashboardTone;

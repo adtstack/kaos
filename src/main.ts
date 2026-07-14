@@ -31,6 +31,7 @@ import {
 } from "./sync/frontmatterGuardCoordinator";
 import { createSocketTicketCache, isTicketEndpointUnsupported } from "./sync/socketTicket";
 import {
+	contentBaselineHash,
 	type DiskIndex,
 	moveIndexEntries,
 	waitForDiskQuiet,
@@ -40,12 +41,17 @@ import {
 	moveCachedHashes,
 } from "./sync/blobHashCache";
 import {
+	BASELINE_TEXT_STORE_VERSION,
+	applyPersistedBaselineTextFields,
+	collectReferencedBaselineHashes,
 	pruneBaselineTextStore,
 	readBaselineTextStore,
 	readConflictMergeBaseStore,
+	type BaselineTextRepository,
 	type BaselineTextStore,
 	type ConflictMergeBaseStore,
 } from "./sync/baselineTextStore";
+import { IndexedDbBaselineTextRepository } from "./sync/indexedDbBaselineTextRepository";
 import {
 	getPreservedUnresolvedEpisodeId,
 	isRemoteDeletePreservedUnresolvedEntry,
@@ -94,6 +100,7 @@ import { TraceRuntimeController } from "./runtime/traceRuntimeController";
 import { registerCommands } from "./commands";
 import { buildKaosDashboardData } from "./dashboard/dashboardData";
 import { withAttentionResolutionLock } from "./dashboard/attentionResolutionLock";
+import { mapWithConcurrency } from "./utils/concurrency";
 import {
 	KAOS_DASHBOARD_VIEW_TYPE,
 	KaosDashboardView,
@@ -135,6 +142,7 @@ type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_diskIndex?: DiskIndex;
 	_baselineTexts?: BaselineTextStore;
 	_conflictMergeBases?: ConflictMergeBaseStore;
+	_baselineTextStoreVersion?: number;
 	_blobHashCache?: BlobHashCache;
 	/**
 	 * Unix ms timestamp of the last successful saveDiskIndex() call.
@@ -249,6 +257,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private frontmatterQuarantineEntries: FrontmatterQuarantineEntry[] = [];
 	private baselineTexts: BaselineTextStore = {};
 	private conflictMergeBases: ConflictMergeBaseStore = {};
+	private baselineTextRepository: BaselineTextRepository | null = null;
+	private baselineTextsExternalized = false;
+	private readonly dirtyBaselineTextHashes = new Set<string>();
+	private readonly baselineTextDeleteCandidates = new Set<string>();
+	private baselineTextFullGcPending = false;
 
 	/**
 	 * True when startup timed out waiting for provider sync.
@@ -266,15 +279,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getBlobSync: () => this.getBlobSync(),
 			getEditorBindings: () => this.editorBindings,
 			getDiskIndex: () => this.diskIndex,
-			setDiskIndex: (index) => {
-				this.diskIndex = index;
-			},
-			getBaselineText: (contentHash) => this.baselineTexts[contentHash] ?? null,
-			recordBaselineText: (contentHash, text) => {
-				this.baselineTexts[contentHash] = text;
-			},
+			setDiskIndex: (index) => this.replaceDiskIndex(index),
+			getBaselineText: (contentHash) => this.getBaselineText(contentHash),
+			recordBaselineText: (contentHash, text) => this.recordBaselineText(contentHash, text),
 			recordConflictMergeBase: (artifactPath, baseHash) => {
+				const previousHash = this.conflictMergeBases[artifactPath];
 				this.conflictMergeBases[artifactPath] = baseHash;
+				if (previousHash && previousHash !== baseHash) this.baselineTextDeleteCandidates.add(previousHash);
 			},
 			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
 			shouldTombstoneIntrinsicMarkdownPath: (path) => this.isIntrinsicMarkdownPathExcluded(path),
@@ -431,10 +442,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerView(KAOS_DASHBOARD_VIEW_TYPE, (leaf) => new KaosDashboardView(leaf, {
 			collectData: () => this.collectDashboardData(),
-			getBaselineText: (contentHash) => this.baselineTexts[contentHash] ?? null,
+			getBaselineText: (contentHash) => this.getBaselineText(contentHash),
 			getConflictMergeBaseHash: (artifactPath) => this.conflictMergeBases[artifactPath] ?? null,
 			clearConflictMergeBase: (artifactPath) => {
+				const previousHash = this.conflictMergeBases[artifactPath];
 				delete this.conflictMergeBases[artifactPath];
+				if (previousHash) this.baselineTextDeleteCandidates.add(previousHash);
 				void this.persistPluginState();
 			},
 			actions: {
@@ -532,6 +545,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getSettings: () => this.settings,
 			getEditorBindings: () => this.editorBindings,
 			getDiskMirror: () => this.diskMirror,
+			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
 			maybeImportDeferredClosedOnlyPath: (path, reason) =>
 				this.reconciliationController.maybeImportDeferredClosedOnlyPath(path, reason),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
@@ -576,6 +590,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				settings.deviceName = `device-${Date.now().toString(36)}`;
 			}, "startup-generate-device-name");
 		}
+
+		await this.initializeBaselineTextPersistence();
 
 		// Install telemetry runtime when debug or qaDebugMode is enabled.
 		// Dynamic load keeps telemetry code out of the product bundle on normal startup.
@@ -841,6 +857,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.editorBindings = new EditorBindingManager(
 				this.vaultSync,
 				this.settings.debug,
+				(path) => this.isMarkdownPathSyncable(path),
 				(source, msg, details) => this.trace(source, msg, details),
 				(event) => this.recordFlightPathEvent(event),
 				bindingPropagationGate,
@@ -881,12 +898,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// which side actually changed from the last known stable state.
 			this.diskMirror.setDiskWriteCallback((path, contentHash, content) => {
 				const existing = this.diskIndex[path];
+				const previousHash = existing?.contentHash;
 				if (existing) {
 					existing.contentHash = contentHash;
 				} else {
 					this.diskIndex[path] = { mtime: 0, size: 0, contentHash };
 				}
-				this.baselineTexts[contentHash] = content;
+				if (previousHash && previousHash !== contentHash) {
+					this.baselineTextDeleteCandidates.add(previousHash);
+				}
+				this.recordBaselineText(contentHash, content);
 				this.scheduleDiskIndexSave("disk-write-baseline");
 				// Req 17.2: mark dirty after post-readback verification succeeds.
 				// contentHash is baselineHash-domain — NOT published as diskHash.
@@ -2430,6 +2451,145 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		void teardown;
 	}
 
+	private createBaselineTextRepository(): BaselineTextRepository {
+		const headlessHost = this.app as unknown as {
+			baselineTextRepositoryFor?: (pluginId: string, scope: string) => BaselineTextRepository;
+		};
+		if (typeof headlessHost.baselineTextRepositoryFor === "function") {
+			return headlessHost.baselineTextRepositoryFor(this.manifest.id, this.settings.vaultId);
+		}
+		return new IndexedDbBaselineTextRepository(this.settings.vaultId);
+	}
+
+	private async initializeBaselineTextPersistence(): Promise<void> {
+		const legacyTexts = { ...this.baselineTexts };
+		const wasExternalized = this.persistedState._baselineTextStoreVersion === BASELINE_TEXT_STORE_VERSION;
+		let repository: BaselineTextRepository | null = null;
+		try {
+			repository = this.createBaselineTextRepository();
+			// Force lazy backends to open before changing the data.json format marker.
+			await repository.save({});
+
+			const verifiedLegacyTexts: BaselineTextStore = {};
+			let rejectedCount = 0;
+			const verifiedEntries = await mapWithConcurrency(
+				Object.entries(legacyTexts),
+				8,
+				async ([hash, text]) => ({ hash: hash.toLowerCase(), text, actualHash: await contentBaselineHash(text) }),
+			);
+			for (const { hash, text, actualHash } of verifiedEntries) {
+				if (actualHash === hash) verifiedLegacyTexts[hash] = text;
+				else rejectedCount++;
+			}
+			if (Object.keys(verifiedLegacyTexts).length > 0) {
+				await repository.save(verifiedLegacyTexts);
+			}
+
+			this.baselineTexts = verifiedLegacyTexts;
+			this.baselineTextRepository = repository;
+			this.baselineTextsExternalized = true;
+			this.dirtyBaselineTextHashes.clear();
+			this.baselineTextFullGcPending = true;
+			await this.persistPluginState();
+			if (rejectedCount > 0) {
+				this.log(`Ignored ${rejectedCount} baseline text(s) whose content did not match their SHA-256 key.`);
+			}
+			if (!wasExternalized && Object.keys(verifiedLegacyTexts).length > 0) {
+				this.log(`Migrated ${Object.keys(verifiedLegacyTexts).length} baseline text(s) out of data.json.`);
+			}
+		} catch (err) {
+			this.baselineTextRepository = null;
+			this.baselineTexts = legacyTexts;
+			// An already-migrated vault has no safe reason to re-inflate data.json.
+			// Missing bodies simply disable automatic 3-way merge and preserve a conflict artifact.
+			this.baselineTextsExternalized = wasExternalized && Object.keys(legacyTexts).length === 0;
+			console.warn("[kaos] Baseline text storage unavailable; using safe no-base fallback:", err);
+			this.log(`Baseline text storage unavailable: ${formatUnknown(err)}`);
+		}
+	}
+
+	private async getBaselineText(contentHash: string): Promise<string | null> {
+		const hash = contentHash.toLowerCase();
+		const cached = this.baselineTexts[hash];
+		if (cached !== undefined) return cached;
+		const repository = this.baselineTextRepository;
+		if (!repository) return null;
+		try {
+			const stored = (await repository.load([hash]))[hash];
+			if (stored === undefined) return null;
+			if (await contentBaselineHash(stored) !== hash) {
+				this.log(`Ignored corrupt baseline text for hash ${hash.slice(0, 12)}.`);
+				return null;
+			}
+			this.baselineTexts[hash] = stored;
+			return stored;
+		} catch (err) {
+			this.log(`Failed to read baseline text ${hash.slice(0, 12)}: ${formatUnknown(err)}`);
+			return null;
+		}
+	}
+
+	private recordBaselineText(contentHash: string, text: string): void {
+		const hash = contentHash.toLowerCase();
+		this.baselineTexts[hash] = text;
+		this.dirtyBaselineTextHashes.add(hash);
+	}
+
+	private replaceDiskIndex(index: DiskIndex): void {
+		const nextHashes = new Set(Object.values(index).map((entry) => entry.contentHash).filter(
+			(hash): hash is string => typeof hash === "string",
+		));
+		for (const entry of Object.values(this.diskIndex)) {
+			if (entry.contentHash && !nextHashes.has(entry.contentHash)) {
+				this.baselineTextDeleteCandidates.add(entry.contentHash);
+			}
+		}
+		this.diskIndex = index;
+	}
+
+	private async flushDirtyBaselineTexts(): Promise<void> {
+		const repository = this.baselineTextRepository;
+		if (!repository || !this.baselineTextsExternalized || this.dirtyBaselineTextHashes.size === 0) return;
+		const pending: BaselineTextStore = {};
+		for (const hash of this.dirtyBaselineTextHashes) {
+			const text = this.baselineTexts[hash];
+			if (text !== undefined) pending[hash] = text;
+		}
+		if (Object.keys(pending).length === 0) {
+			this.dirtyBaselineTextHashes.clear();
+			return;
+		}
+		try {
+			await repository.save(pending);
+			for (const hash of Object.keys(pending)) this.dirtyBaselineTextHashes.delete(hash);
+		} catch (err) {
+			// Hash persistence may still proceed safely. A missing body causes no-base
+			// conflict preservation rather than an automatic merge or overwrite.
+			this.log(`Failed to persist baseline text bodies: ${formatUnknown(err)}`);
+		}
+	}
+
+	private async runBaselineTextGc(): Promise<void> {
+		const repository = this.baselineTextRepository;
+		if (!repository || !this.baselineTextsExternalized) return;
+		const referencedHashes = collectReferencedBaselineHashes(this.diskIndex, this.conflictMergeBases);
+		try {
+			if (this.baselineTextFullGcPending) {
+				await repository.retain(referencedHashes);
+				this.baselineTextFullGcPending = false;
+				this.baselineTextDeleteCandidates.clear();
+				return;
+			}
+			if (this.baselineTextDeleteCandidates.size === 0) return;
+			const staleHashes = Array.from(this.baselineTextDeleteCandidates)
+				.filter((hash) => !referencedHashes.has(hash));
+			await repository.remove(staleHashes);
+			this.baselineTextDeleteCandidates.clear();
+		} catch (err) {
+			this.log(`Failed to prune unreferenced baseline texts: ${formatUnknown(err)}`);
+		}
+	}
+
 	async loadSettings() {
 		const { settings, persistedState, migrated } = await this.settingsStore.load();
 		const data = persistedState;
@@ -2441,6 +2601,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 		this.baselineTexts = readBaselineTextStore(data?._baselineTexts);
 		this.conflictMergeBases = readConflictMergeBaseStore(data?._conflictMergeBases);
+		this.baselineTextsExternalized =
+			data?._baselineTextStoreVersion === BASELINE_TEXT_STORE_VERSION
+			&& Object.keys(this.baselineTexts).length === 0;
 		// Load lastDiskIndexPersistedAt for missing-baseline conflict tie-breaking
 		if (data && typeof data._lastDiskIndexPersistedAt === "number" && data._lastDiskIndexPersistedAt > 0) {
 			this.lastDiskIndexPersistedAt = data._lastDiskIndexPersistedAt;
@@ -2783,7 +2946,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private refreshPersistedState(): void {
 		for (const artifactPath of Object.keys(this.conflictMergeBases)) {
 			if (!(this.app.vault.getAbstractFileByPath(artifactPath) instanceof TFile)) {
+				const previousHash = this.conflictMergeBases[artifactPath];
 				delete this.conflictMergeBases[artifactPath];
+				if (previousHash) this.baselineTextDeleteCandidates.add(previousHash);
 			}
 		}
 		this.baselineTexts = pruneBaselineTextStore(
@@ -2791,14 +2956,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.diskIndex,
 			this.conflictMergeBases,
 		);
+		for (const hash of this.dirtyBaselineTextHashes) {
+			if (this.baselineTexts[hash] === undefined) this.dirtyBaselineTextHashes.delete(hash);
+		}
 		const nextState: PersistedPluginState = {
 			...this.settingsStore.withSettings(this.persistedState, this.settings),
 			_diskIndex: this.diskIndex,
-			...(Object.keys(this.baselineTexts).length > 0 && { _baselineTexts: this.baselineTexts }),
-			...(Object.keys(this.conflictMergeBases).length > 0 && { _conflictMergeBases: this.conflictMergeBases }),
 			_blobHashCache: this.blobHashCache,
 			...(this.lastDiskIndexPersistedAt > 0 && { _lastDiskIndexPersistedAt: this.lastDiskIndexPersistedAt }),
 		};
+		applyPersistedBaselineTextFields(
+			nextState,
+			this.baselineTexts,
+			this.conflictMergeBases,
+			this.baselineTextsExternalized,
+		);
 		const cachedCapabilities = this.capabilityUpdateService?.getPersistedServerCapabilitiesCache();
 		if (cachedCapabilities) {
 			nextState._serverCapabilitiesCache = cachedCapabilities;
@@ -2863,7 +3035,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const write = async () => {
 			this.refreshPersistedState();
 			mutate?.(this.persistedState);
+			await this.flushDirtyBaselineTexts();
 			await this.settingsStore.save(this.persistedState);
+			await this.runBaselineTextGc();
 		};
 
 		this.persistWriteChain = this.persistWriteChain

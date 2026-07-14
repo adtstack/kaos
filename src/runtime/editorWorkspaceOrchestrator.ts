@@ -8,6 +8,7 @@ interface EditorWorkspaceOrchestratorDeps {
 	getSettings(): VaultSyncSettings;
 	getEditorBindings(): EditorBindingManager | null;
 	getDiskMirror(): DiskMirror | null;
+	isMarkdownPathSyncable(path: string): boolean;
 	maybeImportDeferredClosedOnlyPath(path: string, reason: string): void;
 	scheduleTraceStateSnapshot(reason: string): void;
 	log(message: string): void;
@@ -48,7 +49,10 @@ export class EditorWorkspaceOrchestrator {
 
 	onActiveLeafChange(leaf: WorkspaceLeaf | null): void {
 		const view = leaf?.view instanceof MarkdownView ? leaf.view : null;
-		const nextPath = view?.file?.path ?? null;
+		const candidatePath = view?.file?.path ?? null;
+		const nextPath = candidatePath && this.deps.isMarkdownPathSyncable(candidatePath)
+			? candidatePath
+			: null;
 		this.updateActiveMarkdownPath(nextPath, "active-leaf-change");
 		this.reconcileTrackedOpenFiles("active-leaf-change");
 		if (view) {
@@ -57,7 +61,10 @@ export class EditorWorkspaceOrchestrator {
 	}
 
 	onFileOpen(filePath: string | null): void {
-		this.updateActiveMarkdownPath(filePath, "file-open-active-change");
+		this.updateActiveMarkdownPath(
+			filePath && this.deps.isMarkdownPathSyncable(filePath) ? filePath : null,
+			"file-open-active-change",
+		);
 		if (!filePath) return;
 		const view = this.deps.app.workspace.getActiveViewOfType(MarkdownView);
 		if (view && view.file?.path === filePath) {
@@ -95,6 +102,10 @@ export class EditorWorkspaceOrchestrator {
 
 		this.deps.app.workspace.iterateAllLeaves((leaf) => {
 			if (!(leaf.view instanceof MarkdownView) || !leaf.view.file) {
+				return;
+			}
+			if (!this.deps.isMarkdownPathSyncable(leaf.view.file.path)) {
+				editorBindings.unbind(leaf.view);
 				return;
 			}
 
@@ -142,10 +153,14 @@ export class EditorWorkspaceOrchestrator {
 	}
 
 	private bindView(view: MarkdownView): void {
-		this.deps.getEditorBindings()?.bind(view, this.deps.getSettings().deviceName);
-		if (view.file) {
-			this.trackOpenFile(view.file.path);
+		const bindings = this.deps.getEditorBindings();
+		const path = view.file?.path;
+		if (!path || !this.deps.isMarkdownPathSyncable(path)) {
+			bindings?.unbind(view);
+			return;
 		}
+		bindings?.bind(view, this.deps.getSettings().deviceName);
+		this.trackOpenFile(path);
 	}
 
 	private trackOpenFile(path: string): void {
@@ -161,7 +176,11 @@ export class EditorWorkspaceOrchestrator {
 	private reconcileTrackedOpenFiles(reason: string): void {
 		const currentlyOpen = new Set<string>();
 		this.deps.app.workspace.iterateAllLeaves((leaf) => {
-			if (leaf.view instanceof MarkdownView && leaf.view.file) {
+			if (
+				leaf.view instanceof MarkdownView
+				&& leaf.view.file
+				&& this.deps.isMarkdownPathSyncable(leaf.view.file.path)
+			) {
 				currentlyOpen.add(leaf.view.file.path);
 			}
 		});
@@ -178,7 +197,8 @@ export class EditorWorkspaceOrchestrator {
 
 	private getActiveMarkdownPath(): string | null {
 		const activeView = this.deps.app.workspace.getActiveViewOfType(MarkdownView);
-		return activeView?.file?.path ?? null;
+		const path = activeView?.file?.path;
+		return path && this.deps.isMarkdownPathSyncable(path) ? path : null;
 	}
 
 	private updateActiveMarkdownPath(nextPath: string | null, reason: string): void {

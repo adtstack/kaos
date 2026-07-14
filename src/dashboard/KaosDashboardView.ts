@@ -52,7 +52,7 @@ export interface KaosDashboardActions {
 
 export interface KaosDashboardViewDeps {
 	collectData(): Promise<KaosDashboardData>;
-	getBaselineText?(contentHash: string): string | null;
+	getBaselineText?(contentHash: string): Promise<string | null> | string | null;
 	getConflictMergeBaseHash?(artifactPath: string): string | null;
 	clearConflictMergeBase?(artifactPath: string): void;
 	actions: KaosDashboardActions;
@@ -354,35 +354,28 @@ export class KaosDashboardView extends ItemView {
 			event.preventDefault();
 			void this.openRecentChangeHistory(change);
 		});
-		const eventLine = row.createDiv({
-			cls: `kaos-dashboard-event-line ${changeKindClass(change.changeKind)}`,
+		const mainLine = row.createDiv({
+			cls: `kaos-dashboard-recent-main ${changeKindClass(change.changeKind)}`,
 		});
-		eventLine.createEl("span", {
+		mainLine.createEl("span", {
 			text: displayChangeKind(change.changeKind),
 			cls: "kaos-dashboard-event-badge",
 		});
-		eventLine.createEl("span", {
-			text: formatDateTime(change.createdAt),
-			cls: "kaos-dashboard-event-time",
+		mainLine.createEl("span", {
+			text: change.oldPath && change.newPath
+				? `${change.oldPath} → ${change.newPath}`
+				: change.path,
+			cls: "kaos-dashboard-path kaos-dashboard-recent-path",
 		});
-		row.createDiv({ text: change.path, cls: "kaos-dashboard-path kaos-dashboard-recent-path" });
-		const details = [
-			change.oldPath && change.newPath ? `${change.oldPath} -> ${change.newPath}` : "",
-			"file history",
-			change.size !== null ? formatBytes(change.size) : "",
-		].filter(Boolean).join(" · ");
-		if (details) {
-			row.createDiv({ text: details, cls: "kaos-dashboard-muted" });
-		}
-		if (change.device) {
-			row.createDiv({
-				text: formatDashboardDeviceName(change.device, currentDeviceName),
-				cls: "kaos-dashboard-device-line",
-			});
-		}
-		const actions = row.createDiv({ cls: "kaos-dashboard-row-actions" });
+		const actions = mainLine.createDiv({ cls: "kaos-dashboard-recent-actions" });
 		actions.addEventListener("click", (event) => event.stopPropagation());
-		this.button(actions, "Open current file", () => this.openPath(change.path));
+		this.button(actions, "Open", () => this.openPath(change.path));
+		const metadata = [
+			formatDateTime(change.createdAt),
+			change.size !== null ? formatBytes(change.size) : "",
+			change.device ? formatDashboardDeviceName(change.device, currentDeviceName) : "",
+		].filter(Boolean).join(" · ");
+		row.createDiv({ text: metadata, cls: "kaos-dashboard-muted kaos-dashboard-recent-meta" });
 	}
 
 	private async openRecentChangeHistory(change: DashboardRecentChange): Promise<void> {
@@ -443,11 +436,19 @@ export class KaosDashboardView extends ItemView {
 				cls: "kaos-dashboard-muted",
 			});
 		}
+		section.createDiv({
+			text: "Remote deletions can be resolved here. Other attention types show the safest available next step.",
+			cls: "kaos-dashboard-muted kaos-dashboard-attention-help",
+		});
 		const list = section.createDiv({ cls: "kaos-dashboard-list" });
 		for (const item of items) {
 			const row = list.createDiv({ cls: `kaos-dashboard-row ${toneClass(item.tone)}` });
 			row.createDiv({ text: item.path ?? item.title, cls: "kaos-dashboard-path" });
-			row.createDiv({ text: `${item.title} · ${item.detail}`, cls: "kaos-dashboard-muted" });
+			if (item.structuralChange) {
+				this.renderStructuralChangeDetail(row, item.structuralChange);
+			} else {
+				row.createDiv({ text: `${item.title} · ${item.detail}`, cls: "kaos-dashboard-muted" });
+			}
 			if (item.lastSeenAt) {
 				row.createDiv({ text: `last ${formatDateTime(item.lastSeenAt)}`, cls: "kaos-dashboard-muted" });
 			}
@@ -455,6 +456,7 @@ export class KaosDashboardView extends ItemView {
 			if (path) {
 				const actions = row.createDiv({ cls: "kaos-dashboard-row-actions kaos-dashboard-attention-actions" });
 				this.button(actions, "Open file", () => this.openPath(path));
+				this.button(actions, "Copy path", () => this.copyPath(path));
 				const resolution = item.resolution;
 				if (resolution?.kind === "remote-delete") {
 					const actionPending = this.pendingAttentionEpisodes.has(
@@ -486,8 +488,58 @@ export class KaosDashboardView extends ItemView {
 						resolution.acceptRemoteDeleteUnavailableReason ?? undefined,
 					);
 					acceptDeleteButton.classList.add("mod-warning");
+				} else {
+					this.button(
+						actions,
+						"Manual review required",
+						async () => undefined,
+						true,
+						this.getManualAttentionReason(item),
+					);
 				}
+			} else {
+				const actions = row.createDiv({ cls: "kaos-dashboard-row-actions kaos-dashboard-attention-actions" });
+				this.button(
+					actions,
+					"Run reconcile again",
+					async () => this.deps.actions.forceReconcile(),
+				);
+				this.button(
+					actions,
+					"No direct file action",
+					async () => undefined,
+					true,
+					"This attention item describes a structural or vault-wide condition, not one file.",
+				);
 			}
+		}
+	}
+
+	private renderStructuralChangeDetail(
+		row: HTMLElement,
+		change: NonNullable<DashboardAttentionItem["structuralChange"]>,
+	): void {
+		const fields = row.createDiv({ cls: "kaos-dashboard-structural-fields" });
+		this.renderStructuralChangeField(fields, "Old", change.oldPaths.join(", ") || "(none)");
+		this.renderStructuralChangeField(fields, "New", change.newPaths.join(", ") || "(none)");
+		this.renderStructuralChangeField(fields, "Hash", change.contentHashPrefix);
+	}
+
+	private renderStructuralChangeField(parent: HTMLElement, label: string, value: string): void {
+		const field = parent.createDiv({ cls: "kaos-dashboard-structural-field" });
+		field.createSpan({ text: `${label}:`, cls: "kaos-dashboard-structural-label" });
+		field.createSpan({ text: value, cls: "kaos-dashboard-muted" });
+	}
+
+	private getManualAttentionReason(item: DashboardAttentionItem): string {
+		switch (item.kind) {
+			case "frontmatter-quarantine":
+				return "KAOS blocked unsafe frontmatter. Inspect and correct the file before reconciling again.";
+			case "preserved-unresolved":
+				return "This is not an authoritative remote deletion, so deleting or overwriting the file automatically would be unsafe.";
+			case "structural-change":
+			case "blocked-divergence":
+				return "This condition must be reviewed and reconciled before KAOS can choose a safe file operation.";
 		}
 	}
 
@@ -654,7 +706,7 @@ export class KaosDashboardView extends ItemView {
 			this.app.vault.cachedRead(artifactFile),
 		]);
 		const baseHash = this.deps.getConflictMergeBaseHash?.(artifact.artifactPath) ?? null;
-		const baseText = baseHash ? this.deps.getBaselineText?.(baseHash) ?? null : null;
+		const baseText = baseHash ? await this.deps.getBaselineText?.(baseHash) ?? null : null;
 		new ConflictDiffModal(this.app, {
 			artifactPath: artifact.artifactPath,
 			originalPath: artifact.inferredOriginalPath,

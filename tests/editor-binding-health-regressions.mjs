@@ -240,6 +240,48 @@ console.log("\n--- Test 11: binding skips when open editor differs from CRDT ---
 	);
 }
 
+console.log("\n--- Test 12: excluded Markdown is fenced before editor binding and CRDT creation ---");
+{
+	const bindSection = sliceBetween(
+		bindingSource,
+		"bind(view: MarkdownView, deviceName: string): void {",
+		"repair(view: MarkdownView, deviceName: string, reason: string): boolean {",
+	);
+	const targetSection = sliceBetween(
+		bindingSource,
+		"private resolveBindingTarget(",
+		"private canBindPath(",
+	);
+	const workspaceBindSection = sliceBetween(
+		workspaceSource,
+		"private bindView(view: MarkdownView): void {",
+		"private trackOpenFile(path: string): void {",
+	);
+	assert(bindSection !== null, "bind section found for excluded-path fence");
+	assert(targetSection !== null, "resolveBindingTarget section found for excluded-path fence");
+	assert(workspaceBindSection !== null, "workspace bindView section found for excluded-path fence");
+	assert(
+		(bindSection?.indexOf("this.canBindPath(view, \"bind\")") ?? Infinity) <
+			(bindSection?.indexOf("this.getCmView(view)") ?? -1),
+		"bind checks syncability before resolving CodeMirror",
+	);
+	assert(
+		(targetSection?.indexOf("this.isMarkdownPathSyncable(file.path)") ?? Infinity) <
+			(targetSection?.indexOf("this.vaultSync.ensureFile(") ?? -1),
+		"binding target checks syncability before ensureFile",
+	);
+	assert(
+		(workspaceBindSection?.indexOf("this.deps.isMarkdownPathSyncable(path)") ?? Infinity) <
+			(workspaceBindSection?.indexOf("bindings?.bind(") ?? -1),
+		"workspace skips excluded views before editor binding",
+	);
+	assert(
+		(workspaceBindSection?.indexOf("this.deps.isMarkdownPathSyncable(path)") ?? Infinity) <
+			(workspaceBindSection?.indexOf("this.trackOpenFile(path)") ?? -1),
+		"workspace skips excluded views before open-file tracking",
+	);
+}
+
 console.log(`\n${"-".repeat(50)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log(`${"-".repeat(50)}\n`);

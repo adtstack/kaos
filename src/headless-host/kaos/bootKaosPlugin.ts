@@ -56,11 +56,13 @@ function dataFileExclusionPaths(vaultRoot: string, dataFile: string): string[] {
 		return [".kaos-headless-host"];
 	}
 	const normalized = rel.split(sep).join("/");
+	const baselineDataDir = `${normalized}.d`;
 	const parent = dirname(normalized).split(sep).join("/");
 	const hiddenParent = parent && parent !== "." && parent.split("/").some((part) => part.startsWith("."))
 		? parent
 		: "";
-	return [".kaos-headless-host", normalized, hiddenParent].filter((path, index, all) => path && all.indexOf(path) === index);
+	return [".kaos-headless-host", normalized, baselineDataDir, hiddenParent]
+		.filter((path, index, all) => path && all.indexOf(path) === index);
 }
 
 async function readPluginManifest(pluginDir: string): Promise<{
