@@ -82,6 +82,35 @@ for (const command of REQUIRED_CI_RUNS) {
 }
 console.log("  PASS  CI workflow runs headless build and integration gates");
 
+console.log("\n--- public snapshot PR workflow: token and branch gates stay narrow ---");
+const publicPrWorkflow = await loadWorkflow(".github/workflows/open-public-pr.yml");
+assert.deepEqual(
+	publicPrWorkflow.on?.push?.branches,
+	["automation/public-*"],
+	"public PR workflow must run only for deterministic snapshot branches",
+);
+assert.equal(publicPrWorkflow.permissions?.contents, "read", "public PR workflow may only read contents");
+assert.equal(
+	publicPrWorkflow.permissions?.["pull-requests"],
+	"write",
+	"public PR workflow needs pull-request write only",
+);
+const publicPrScript = runSteps(publicPrWorkflow, "open").join("\n");
+assert.equal(
+	publicPrWorkflow.jobs.open.steps[0].env?.ACTOR_ID,
+	"${{ github.actor_id }}",
+	"public PR workflow must bind pushes to the deploy-key registrar",
+);
+assert(publicPrScript.includes("show -s --format=%P"), "snapshot commit must have exactly one parent");
+assert(publicPrScript.includes("BASE_PREFIX"), "branch base hash must match public main");
+assert(publicPrScript.includes("TREE_PREFIX"), "branch tree hash must match the snapshot tree");
+assert(publicPrScript.includes("int@kakao.com"), "snapshot author and committer email must be approved");
+assert(publicPrScript.includes("gh pr create"), "public workflow must create the snapshot PR");
+assert(publicPrScript.includes("--draft"), "snapshot PR must start as a draft");
+assert(!publicPrScript.includes("gh pr merge"), "public workflow must never merge its own PR");
+assert(!publicPrScript.includes("gh pr review"), "public workflow must never approve its own PR");
+console.log("  PASS  public PR workflow validates one-parent branches and cannot merge them");
+
 console.log("\n--- headless host package scripts: release regression includes oracle deploy ---");
 const packageJson = JSON.parse(await readFile("package.json", "utf8"));
 assert.equal(packageJson.scripts["test:headless-host:oracle-deploy"], "node tests/headless-host-oracle-deploy.mjs");
