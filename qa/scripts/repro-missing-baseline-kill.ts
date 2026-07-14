@@ -42,7 +42,7 @@ const INITIAL = `BASELINE_${RUN_ID}\n`;
 const REMOTE_FROM_A = `REMOTE_FROM_A_${RUN_ID}\n`;
 const LOCAL_ON_B = `LOCAL_ON_B_${RUN_ID}\n`;
 
-const VAULT_B = `${process.env.HOME}/kaos-test-vault-b`;
+const VAULT_B = process.env.KAOS_TEST_VAULT_B ?? `${process.env.HOME}/kaos-test-vault-b`;
 const DATA_JSON_B = `${VAULT_B}/.obsidian/plugins/kaos/data.json`;
 const PORT_A = 9222;
 const PORT_B = 9223;

@@ -180,8 +180,7 @@ export class DiskMirror {
 	 * Per-path timestamp of the most recent successful `flushWrite`. Updated
 	 * on every `vault.modify` and `vault.create` we issue. Read by the main
 	 * vault.on("modify") handler so `disk.modify.observed` events can carry
-	 * a writerGuess (kaos-write vs external) for RCA. See spec:
-	 * .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md (R8).
+	 * a writerGuess (kaos-write vs external) for diagnostics.
 	 */
 	private lastDiskWriteOkAt = new Map<string, number>();
 	/** Supplied by the plugin; DiskMirror does not own sync-path policy. */
@@ -1181,8 +1180,7 @@ export class DiskMirror {
 	 * Per-path timestamp of the most recent successful KAOS-issued
 	 * `flushWrite`. Returns null if KAOS has never written this path in
 	 * this session. Used by main.ts to label `disk.modify.observed` events
-	 * with writer attribution. See spec:
-	 * .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md (R8).
+	 * with writer attribution.
 	 */
 	getLastDiskWriteOkAt(path: string): number | null {
 		const v = this.lastDiskWriteOkAt.get(normalizePath(path));

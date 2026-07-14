@@ -122,8 +122,8 @@ KAOS commands are available from the Obsidian command palette.
 
 ## Engineering Notes
 
-The `engineering/` directory contains design notes, failure analysis, and
-current project truth. Useful starting points:
+Selected public architecture notes live in `engineering/`. Useful starting
+points:
 
 - [Monolithic vault CRDT](./engineering/monolith.md)
 - [Filesystem bridge](./engineering/filesystem-bridge.md)
@@ -131,7 +131,6 @@ current project truth. Useful starting points:
 - [Attachment sync](./engineering/attachment-sync.md)
 - [Zero-config auth](./engineering/zero-config-auth.md)
 - [Zero-ops update pipeline](./engineering/zero-ops-update-pipeline.md)
-- [Version and release management](./engineering/version-release-management.md)
 - [Warts and limits](./engineering/warts-and-limits.md)
 
 ## Local Development

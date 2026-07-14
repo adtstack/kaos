@@ -3,9 +3,7 @@
  *
  * Validates QuorumPolicy.kind = "required" with an explicitly-backgrounded optional device.
  * Proves the mobile-background guard end-to-end on real iPad + Android hardware.
- * Manual-only: no CDP automation.
- *
- * See engineering/multi-device-witness-runbook.md for step-by-step instructions.
+ * Manual-only: no CDP automation. Follow the numbered device steps below.
  */
 
 export const SCENARIO_ID = "s12b-mobile-foregrounded-quorum";

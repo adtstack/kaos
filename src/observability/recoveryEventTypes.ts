@@ -13,9 +13,7 @@
  * ReconciliationController calls shouldBlockFrontmatterIngest. Used as the
  * `branch` discriminator on `recovery.skipped` events with
  * `data.reason === "frontmatter-ingest-blocked"`. New emission sites
- * require extending this union AND updating the spec.
- *
- * See spec: .kiro/specs/frontmatter-guard-orchestration/requirements.md R2.
+ * require extending this union and its regression coverage.
  */
 export type FrontmatterIngestBlockBranch =
 	| "disk-to-crdt-existing"

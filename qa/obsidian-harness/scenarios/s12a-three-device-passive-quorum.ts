@@ -2,9 +2,7 @@
  * s12a-three-device-passive-quorum — Manual three-device scenario
  *
  * Validates QuorumPolicy.kind = "all" across Linux + iPad foreground + Android foreground.
- * Manual-only: no CDP automation. Run via the runbook.
- *
- * See engineering/multi-device-witness-runbook.md for step-by-step instructions.
+ * Manual-only: no CDP automation. Follow the numbered device steps below.
  */
 
 export const SCENARIO_ID = "s12a-three-device-passive-quorum";

@@ -9,7 +9,7 @@
  *   - CRDT wins instead of disk (LOCAL_ON_B content is lost)
  *
  * Two-device desktop CDP reproduction.
- * Ports: A=9222 (kaos-test-vault-a), B=9223 (kaos-test-vault-b)
+ * Ports: A=9222 (test vault A), B=9223 (test vault B)
  */
 
 import { RawCdpObsidianClient as ObsidianClient } from "../controllers/obsidian-client-raw-cdp";

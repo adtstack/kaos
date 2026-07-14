@@ -113,8 +113,7 @@ export const FLIGHT_KIND = {
 	 * Distinct from `recovery.quarantined` (fingerprint-keyed) — this
 	 * fires when N consecutive bound-file-local-only-divergence
 	 * recoveries within a window all exhibit non-decreasing prevLen and
-	 * nextLen with strictly positive deltas. See spec:
-	 * .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.
+	 * nextLen with strictly positive deltas.
 	 */
 	recoveryAmplificationQuarantined: "recovery.amplification.quarantined",
 	/**
@@ -126,10 +125,6 @@ export const FLIGHT_KIND = {
 	 * enum `branch` of type `FrontmatterIngestBlockBranch`); the only
 	 * production constructor of that payload is
 	 * `ReconciliationController.recordFrontmatterIngestBlocked`.
-	 *
-	 * See specs:
-	 *   .kiro/specs/controller-recovery-orchestration/requirements.md R2.
-	 *   .kiro/specs/frontmatter-guard-orchestration/requirements.md R2.
 	 */
 	recoverySkipped: "recovery.skipped",
 
@@ -169,10 +164,6 @@ export type FlightKind = typeof FLIGHT_KIND[keyof typeof FLIGHT_KIND];
  * - "frontmatter-ingest-blocked"  shouldBlockFrontmatterIngest returned
  *                                 true at one of the six block sites.
  *                                 See FrontmatterIngestBlockBranch.
- *
- * See specs:
- *   .kiro/specs/controller-recovery-orchestration/requirements.md R2.
- *   .kiro/specs/frontmatter-guard-orchestration/requirements.md R2.
  */
 export type RecoverySkippedReason =
 	| "crdt-current-no-op"
@@ -186,9 +177,7 @@ export type RecoverySkippedReason =
  * ReconciliationController calls shouldBlockFrontmatterIngest. Used as the
  * `branch` discriminator on `recovery.skipped` events with
  * `data.reason === "frontmatter-ingest-blocked"`. New emission sites
- * require extending this union AND updating the spec.
- *
- * See spec: .kiro/specs/frontmatter-guard-orchestration/requirements.md R2.
+ * require extending this union and its regression coverage.
  */
 export type FrontmatterIngestBlockBranch =
 	| "disk-to-crdt-existing"

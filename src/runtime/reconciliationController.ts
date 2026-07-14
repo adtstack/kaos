@@ -265,8 +265,6 @@ const OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS = 1200;
  * shape — Obsidian autosave landing keystrokes faster than the y-codemirror
  * plumbing propagates them into Y.Text. Quenching that loop requires a
  * window longer than a typical human typing burst; 3000ms is conservative.
- *
- * See spec: .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R2.
  */
 const OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS = 3000;
 const BOUND_RECOVERY_LOCK_MS = 1500;
@@ -308,9 +306,6 @@ interface BindingHealthResult {
  *
  * If `binding` or `collab` themselves are null we fall back to "unhealthy"
  * because we have no evidence the binding is wired at all.
- *
- * See spec:
- * .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R7.
  */
 function classifyBindingHealth(
 	binding: { cmMatches: boolean | null; leafId?: string | null } | null | undefined,
@@ -426,8 +421,7 @@ export class ReconciliationController {
 	/**
 	 * Per-path amplification history for the monotonic-growth quarantine.
 	 * Independent of `recoveryFingerprints` — fingerprint quarantine catches
-	 * "same diff repeating," this catches "growing diff repeating." See spec:
-	 * .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.
+	 * "same diff repeating," this catches "growing diff repeating."
 	 */
 	private amplificationHistory = new Map<string, AmplificationEntry[]>();
 	private lastConflictFingerprints = new Map<string, string>();
@@ -973,8 +967,6 @@ export class ReconciliationController {
 				mode,
 				this.deps.getSettings().deviceName,
 				/**
-				 * Spec: .kiro/specs/no-event-reconcile-admission/requirements.md R2.
-				 *
 				 * Architectural decision: Option (b) — opId-factory callback.
 				 * For every authoritative-lane `seed-to-crdt` decision, mint a
 				 * shared `opId` and fire `reconcile.file.decision` BEFORE the
@@ -1678,7 +1670,6 @@ export class ReconciliationController {
 
 			try {
 				const content = await this.deps.app.vault.read(file);
-				// Spec: .kiro/specs/no-event-reconcile-admission/requirements.md R2.7.
 				// Mint a per-path `op-import-untracked-*` opId BEFORE the CRDT
 				// mutation so the resulting `crdt.file.created` envelope is
 				// causally linkable to this admission attempt.
@@ -2694,7 +2685,6 @@ export class ReconciliationController {
 				const crdtContent = existingText.toJSON();
 				if (crdtContent === content) {
 					// recovery.skipped: CRDT and disk already agree (unbound second-pass no-op).
-					// See spec: .kiro/specs/controller-recovery-orchestration/requirements.md R2.1
 					this.deps.recordFlightPathEvent?.({
 						priority: "verbose",
 						kind: PRODUCT_EVENT_KIND.recoverySkipped,
@@ -3278,7 +3268,6 @@ export class ReconciliationController {
 				lockRemainingMs: lockUntil - now,
 			});
 			// recovery.skipped: bound recovery lock active.
-			// See spec: .kiro/specs/controller-recovery-orchestration/requirements.md R2.2
 			this.deps.recordFlightPathEvent?.({
 				priority: "verbose",
 				kind: PRODUCT_EVENT_KIND.recoverySkipped,
@@ -3293,7 +3282,6 @@ export class ReconciliationController {
 				},
 			});
 			// Pauses (or quenched cycles) reset the amplification detector.
-			// See spec: .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.8.
 			this.amplificationHistory.delete(file.path);
 			return { kind: "handled" };
 		}
@@ -3327,7 +3315,6 @@ export class ReconciliationController {
 			this.boundRecoveryLocks.delete(file.path);
 			this.deps.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, crdt-current)`);
 			// recovery.skipped: CRDT and disk already agree (bound second-pass no-op).
-			// See spec: .kiro/specs/controller-recovery-orchestration/requirements.md R2.1
 			this.deps.recordFlightPathEvent?.({
 				priority: "verbose",
 				kind: PRODUCT_EVENT_KIND.recoverySkipped,
@@ -3342,7 +3329,6 @@ export class ReconciliationController {
 				},
 			});
 			// Convergence reached: amplification detector is reset.
-			// See spec: .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.8.
 			this.amplificationHistory.delete(file.path);
 			return { kind: "handled", settledContent: content };
 		}
@@ -3569,9 +3555,6 @@ export class ReconciliationController {
 				// y-codemirror.next plumbing propagates them into Y.Text.
 				// Quenching that loop requires a window longer than a typical
 				// human typing burst.
-				//
-				// See spec:
-				// .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R2.
 				const lastEditorActivityLocalOnly =
 					editorBindings?.getLastEditorActivityForPath(file.path) ?? null;
 				if (
@@ -3668,8 +3651,7 @@ export class ReconciliationController {
 				// Monotonic-growth amplification quarantine: independent of
 				// fingerprint identity. Catches typing-cadence loops where every
 				// cycle has a different (prevLen, nextLen) but the lengths grow
-				// along the same axis. See spec:
-				// .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.
+				// along the same axis.
 				if (this.shouldQuarantineAmplification(
 					file.path,
 					"bound-file-local-only-divergence",
@@ -3834,9 +3816,6 @@ export class ReconciliationController {
 			// Two operations are now distinct:
 			//   - content recovery (always run when the predicate is met)
 			//   - editor binding repair (run only when health markers fail)
-			//
-			// See spec:
-			// .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R7.
 			for (const state of localOnlyViews) {
 				const health = classifyBindingHealth(state.binding, state.collab);
 				if (health.healthy) {
@@ -3956,7 +3935,6 @@ export class ReconciliationController {
 			if (hasRecentEditorActivity) {
 				this.deps.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, disk lag)`);
 				// recovery.skipped: crdtOnly branch idle-grace bail.
-				// See spec: .kiro/specs/controller-recovery-orchestration/requirements.md R2.3
 				this.deps.recordFlightPathEvent?.({
 					priority: "verbose",
 					kind: PRODUCT_EVENT_KIND.recoverySkipped,
@@ -4337,8 +4315,6 @@ export class ReconciliationController {
 	 * The pre-existing `scheduleTraceStateSnapshot("frontmatter-ingest-blocked")`
 	 * calls in the four bound branches are intentionally retained as a
 	 * legacy diagnostic channel; this helper is additive.
-	 *
-	 * See spec: .kiro/specs/frontmatter-guard-orchestration/requirements.md R2.
 	 */
 	private recordFrontmatterIngestBlocked(
 		path: string,
@@ -4444,11 +4420,8 @@ export class ReconciliationController {
 	 *
 	 * Independent of fingerprint identity. Catches loops where every cycle
 	 * has a different `(prevLen, nextLen)` fingerprint but the lengths grow
-	 * along the same axis — the typing-cadence amplifier shape captured in
-	 * the 2026-05-27 iPad trace at pathId p:redacted.
-	 *
-	 * See spec:
-	 *   .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R3.
+	 * along the same axis — the typing-cadence amplifier shape captured in a
+	 * real mobile reproduction trace whose identifiers are intentionally omitted.
 	 */
 	private shouldQuarantineAmplification(
 		path: string,

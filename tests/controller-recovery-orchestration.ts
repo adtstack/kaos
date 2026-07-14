@@ -1,8 +1,6 @@
 /**
  * Controller-level recovery orchestration test.
  *
- * Spec: .kiro/specs/controller-recovery-orchestration/requirements.md
- *
  * Drives a localOnly three-way divergence (editor==disk, ≠ CRDT) end-to-end
  * through ReconciliationController and asserts:
  *   - the recovery.* flight-event timeline
@@ -194,8 +192,7 @@ function buildFixture(initial: {
 	// NOTE: this fixture intentionally reports an UNHEALTHY binding so the
 	// localOnly recovery branch's binding-health-conditional repair fires.
 	// Healthy-binding behavior (no repair on every recovery) is exercised
-	// by tests/controller-recovery-orchestration-amplifier.ts. See spec:
-	// .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R7.
+	// by tests/controller-recovery-orchestration-amplifier.ts.
 	const editorBindings = {
 		isBound: () => true,
 		getBindingDebugInfoForView: () => ({

@@ -476,8 +476,7 @@ export class EditorBindingManager {
 		// Emit editor.heal.applied unconditionally on heal() entry so that
 		// "no editor.heal.applied event" means "heal() was not invoked",
 		// not "heal() was invoked but happened to be a no-op". The
-		// diffApplied flag distinguishes the two cases. See spec:
-		// .kiro/specs/controller-recovery-orchestration/requirements.md R5.
+		// diffApplied flag distinguishes the two cases.
 		this.recordFlightPathEvent?.({
 			priority: "important",
 			kind: PRODUCT_EVENT_KIND.editorHealApplied,
@@ -1839,7 +1838,6 @@ export class EditorBindingManager {
 		});
 
 		// Emit editor.repair.applied only for successful repair-action applications.
-		// See spec: .kiro/specs/controller-recovery-orchestration/requirements.md R4.
 		if (action === "repair") {
 			this.recordFlightPathEvent?.({
 				priority: "important",

@@ -31,8 +31,8 @@ body:
     id: logs
     attributes:
       label: Relevant logs or error text
-      description: Paste the key failing lines from Cloudflare build logs or KAOS debug output.
-      placeholder: "Paste logs here"
+      description: Paste only the key failing lines. Remove tokens, setup links, Worker hostnames, account or vault identifiers, note names, and local filesystem paths first.
+      placeholder: "Paste redacted logs here; replace private values with <redacted>"
     validations:
       required: true
 

@@ -1,8 +1,6 @@
 /**
  * Frontmatter-guard orchestration regression test.
  *
- * Spec: .kiro/specs/frontmatter-guard-orchestration/requirements.md
- *
  * Drives ReconciliationController against an unsafe frontmatter transition
  * (stubbed shouldBlockFrontmatterIngest) and asserts the controller bails
  * without mutating CRDT state, emits a recovery.skipped flight event with
@@ -243,8 +241,7 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 			liveCmId: "stub-cm-1",
 			// Force unhealthy so the localOnly branch's binding-health-
 			// conditional repair fires. Healthy-binding skip is exercised
-			// by tests/controller-recovery-orchestration-amplifier.ts. See:
-			// .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md R7.
+			// by tests/controller-recovery-orchestration-amplifier.ts.
 			cmMatches: false,
 		}),
 		getCollabDebugInfoForView: () => ({

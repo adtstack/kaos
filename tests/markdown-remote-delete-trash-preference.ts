@@ -1,8 +1,6 @@
 /**
  * Markdown remote-delete trash-preference parity-confirm regression.
  *
- * Spec: .kiro/specs/markdown-remote-delete-trash-preference/requirements.md
- *
  * Mirrors the blob trash-preference Tests 5/6/7 in tests/blob-download-conflicts.ts
  * but asserts on the FLIGHT channel for markdown:
  *   - markdown emits `delete.disk.applied` flight events with data.deleteMode

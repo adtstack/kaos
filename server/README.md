@@ -52,33 +52,9 @@ To pick up new KAOS changes later:
 The Deploy to Cloudflare button is still the first-install path. Do not use it
 as the update path for an existing stateful Worker.
 
-Server updates are published through the main KAOS GitHub release stream. See
-[`engineering/version-release-management.md`](../engineering/version-release-management.md)
-for how plugin, server, and schema versions are bumped together.
-
-### Private release repos
-
-If your KAOS source/release repo is private, the generated deployment repo needs
-one extra secret before the update workflow can download release assets:
-
-1. Create a fine-grained GitHub token with **Contents: read** access to the
-   private repo that publishes KAOS releases.
-2. In the generated deployment repo, add it as an Actions secret named
-   `KAOS_RELEASE_TOKEN`.
-3. Run the update workflow and set `release_repo` to the private `owner/repo`.
-   If the repo variable `KAOS_RELEASE_REPO` is set, the workflow can default to
-   that value instead.
-
-The updater downloads `kaos-server.zip` through the authenticated GitHub API when
-`KAOS_RELEASE_TOKEN` is present. Public releases do not need this secret; private
-releases should set it explicitly so the workflow does not depend on repo-local
-GitHub token behavior.
-
-Fully private releases also mean the Obsidian plugin cannot anonymously fetch
-`update-manifest.json` from GitHub to show "latest version" notices. The update
-workflow still works, but private operators should treat GitHub Releases as the
-source of truth and run the workflow intentionally when a new private tag is
-published.
+Server updates are published through the main KAOS GitHub release stream. The
+release workflow validates plugin, server, and schema compatibility before it
+publishes the update manifest and server artifact.
 
 ## Optional R2 setup
 

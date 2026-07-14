@@ -1,12 +1,9 @@
 /**
  * No-event reconcile admission regression test.
  *
- * Spec: .kiro/specs/no-event-reconcile-admission/requirements.md
- *
- * Followup closed: `engineering/followups.md` "Validation gaps" entry
- *   "No-event reconcile admission" — concrete proof that a syncable file
- *   appearing on disk without the normal vault create event pipeline is
- *   admitted by reconcile rather than becoming a silent local-only file.
+ * This is concrete proof that a syncable file appearing on disk without the
+ * normal vault create event pipeline is admitted by reconcile rather than
+ * becoming a silent local-only file.
  *
  * ============================================================================
  * Architectural decision (Requirement 2.1)

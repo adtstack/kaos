@@ -1217,7 +1217,6 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 	//     missing-baseline path now uses diskMtime evidence:
 	//     if diskMtime > lastDiskIndexPersistedAt → disk wins.
 	//     Repro: qa/scripts/repro-missing-baseline-kill.ts
-	//     See also: engineering/bug-rca-ledger.md Issue #22-B cold-relaunch variant
 	// ───────────────────────────────────────────────────────────────────
 
 	// s10e-1: B edits while KAOS disabled, A makes NO changes.
@@ -2955,7 +2954,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 	/**
 	 * s12a-local-two-vault -- Phase 3 pipeline smoke test.
 	 *
-	 * Runs the s12a scenario on two local Obsidian vaults (kaos-test-vault-a + kaos-test-vault-b).
+	 * Runs the s12a scenario on two local Obsidian test vaults (A + B).
 	 * Produces real exported bundles and an offline analyzer report.
 	 * This is NOT mobile validation -- it is a pipeline smoke test.
 	 *

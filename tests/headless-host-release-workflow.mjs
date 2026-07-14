@@ -57,12 +57,21 @@ for (const command of REQUIRED_RELEASE_RUNS) {
 	assert(releaseRunSteps.includes(command), `release workflow must run: ${command}`);
 }
 const releaseScript = releaseRunSteps.join("\n");
-const uploadArgs = extractGhReleaseArgs(releaseScript, "gh release upload");
-const createArgs = extractGhReleaseArgs(releaseScript, "gh release create");
 for (const asset of HEADLESS_RELEASE_ASSETS) {
-	assert(uploadArgs.includes(asset), `gh release upload must include ${asset}`);
-	assert(createArgs.includes(asset), `gh release create must include ${asset}`);
+	assert(releaseScript.includes(asset), `release staging must include ${asset}`);
 }
+const publishScript = runSteps(releaseWorkflow, "publish").join("\n");
+assert(publishScript.includes("gh release create"), "publish job must create a new release");
+assert(publishScript.includes("--verify-tag"), "release creation must reject a missing tag");
+assert(publishScript.includes(".assets[] | [.name, .digest]"), "reruns must verify existing assets");
+assert(publishScript.includes("published assets are immutable"), "existing assets must not be overwritten");
+assert(!publishScript.includes("--clobber"), "release assets must never be clobbered");
+assert.equal(releaseWorkflow.permissions?.contents, "read", "workflow default token must be read-only");
+assert.equal(releaseWorkflow.jobs.release.permissions?.contents, "read", "build job token must be read-only");
+assert.equal(releaseWorkflow.jobs.publish.permissions?.contents, "write", "publish job alone may write releases");
+const checkout = releaseWorkflow.jobs.release.steps.find((step) =>
+	`${step?.uses ?? ""}`.startsWith("actions/checkout@"));
+assert.equal(checkout?.with?.["persist-credentials"], false, "release checkout must not persist credentials");
 console.log("  PASS  release workflow uploads every headless host asset");
 
 console.log("\n--- headless host CI workflow: headless gates stay wired ---");
@@ -96,77 +105,6 @@ assert(runner.includes("tests/headless-host-user-install.mjs"), "release regress
 assert(runner.includes("tests/headless-host-uninstall.mjs"), "release regressions must include uninstall coverage");
 console.log("  PASS  package and regression runner keep Oracle deploy gates reachable");
 
-console.log("\n--- headless host Oracle rehearsal docs: real VM gate stays explicit ---");
-const operationsDoc = await readFile("engineering/headless-host-operations.md", "utf8");
-const rehearsalDoc = await readFile("engineering/headless-host-oracle-rehearsal.md", "utf8");
-assert(operationsDoc.includes("engineering/headless-host-oracle-rehearsal.md"), "operations doc must point to the Oracle rehearsal checklist");
-for (const required of [
-	"sha256sum -c kaos-headless-host-oracle.zip.sha256",
-	"npm run prepare:headless-host-oracle-upload",
-	"node verify-headless-host-bundle.mjs --bundle-dir .",
-	"validate-headless-host-release-assets.mjs",
-	"--token-stdin",
-	"bundleVerification.ok: true",
-	"--postflight-verify-running",
-	"--require-lock",
-	"08-operational-smoke.json",
-	"09-systemctl-status.txt",
-	"10-journalctl.txt",
-	"node \"$KAOS_REHEARSAL_LOG_DIR/bundle/kaos-headless-host-oracle/run-headless-host-oracle-rehearsal.mjs\"",
-	"npm run run:headless-host-oracle-remote-rehearsal",
-	"run-headless-host-oracle-acceptance.mjs",
-	"verify-headless-host-oracle-acceptance.mjs",
-	"oracle-acceptance-config.example.json",
-	"oracle-acceptance.json",
-	"--config ./oracle-acceptance.json",
-	"--validate-local",
-	"--resume-from-summary",
-	"--release-dir .",
-	"--confirm-reboot",
-	"--dry-run",
-	"--evidence-root",
-	"--summary-file",
-	"--skip-local-prepare",
-	"--zip ./kaos-headless-host-oracle.zip",
-	"--checksum ./kaos-headless-host-oracle.zip.sha256",
-	"acceptance-summary.json",
-	"--require-full",
-	"--start-at",
-	"--phase preflight",
-	"00-remote-preflight.json",
-	"sudo -n",
-	"--identity-file",
-	"--ssh-port",
-	"--ssh-option",
-	"--skip-remote-preflight",
-	"--skip-local-prepare",
-	"--installed-runner",
-	"--wait-for-ssh",
-	"--wait-ssh-timeout-ms",
-	"--require-reboot-request",
-	"--phase reboot",
-	"11-reboot-request.json",
-	"verifiedAt",
-	"post-reboot verification happened after the recorded reboot request",
-	"--evidence-dir",
-	"--service-path",
-	"--journal-since",
-	"sudo node /opt/kaos/run-headless-host-oracle-rehearsal.mjs",
-	"--phase update",
-	"--mode install",
-	"--mode update",
-	"--verify-fetched-logs",
-	"[remote-script:<step>]",
-	"failureEvidenceFetch",
-	"failedStep",
-	"[redacted]",
-	"npm run verify:headless-host-oracle-rehearsal",
-	"failedChecks",
-]) {
-	assert(rehearsalDoc.includes(required), `Oracle rehearsal checklist must include: ${required}`);
-}
-console.log("  PASS  Oracle rehearsal checklist preserves post-reboot and sync evidence gates");
-
 async function loadWorkflow(path) {
 	const parsed = yaml.load(await readFile(path, "utf8"));
 	assert(parsed && typeof parsed === "object", `${path} must parse as a YAML object`);
@@ -179,18 +117,4 @@ function runSteps(workflow, jobName) {
 	return steps
 		.map((step) => typeof step?.run === "string" ? step.run.trim() : null)
 		.filter(Boolean);
-}
-
-function extractGhReleaseArgs(script, commandPrefix) {
-	const lines = script.split(/\r?\n/);
-	const start = lines.findIndex((line) => line.trim().startsWith(commandPrefix));
-	assert(start >= 0, `release script must contain ${commandPrefix}`);
-	const args = [];
-	for (let i = start + 1; i < lines.length; i++) {
-		const trimmed = lines[i].trim();
-		if (!trimmed) continue;
-		args.push(trimmed.replace(/\\$/, "").trim());
-		if (!trimmed.endsWith("\\")) break;
-	}
-	return args;
 }

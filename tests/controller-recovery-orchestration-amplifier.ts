@@ -1,11 +1,8 @@
 /**
  * Editor-bound localOnly amplifier guard regression.
  *
- * Spec: .kiro/specs/editor-bound-localonly-amplifier-guard/requirements.md
- *
- * Defends against the topology captured in the 2026-05-27 iPad trace
- * (~/kaos-test-vault-a/.obsidian/plugins/kaos/flight-logs/2026-05-27/
- *  boot-redacted.ndjson, pathId p:redacted).
+ * Defends against the topology captured in a real mobile reproduction trace;
+ * local paths, boot IDs, and path IDs are intentionally omitted.
  *
  * The bound-file-local-only-divergence branch ran every ~2.36s while the
  * user typed; CRDT length and disk length each grew by exactly +5 per

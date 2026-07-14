@@ -1170,8 +1170,6 @@ export class VaultSync {
 		 * Optional admission-opId factory invoked at each authoritative-lane
 		 * `seed-to-crdt` decision point BEFORE the CRDT mutation runs.
 		 *
-		 * Spec: .kiro/specs/no-event-reconcile-admission/requirements.md R2 (Option b).
-		 *
 		 * ## Contract
 		 *
 		 * 1. **Optionality.** When the parameter is omitted, `reconcileVault`
