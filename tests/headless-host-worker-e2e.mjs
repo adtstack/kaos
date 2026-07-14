@@ -14,6 +14,11 @@ import {
 } from "./helpers/headless-host-vault-plugin.mjs";
 
 const WRANGLER_BIN = resolve("server/node_modules/.bin/wrangler");
+const CI_TIMEOUT_SCALE = process.env.CI === "true" ? 2 : 1;
+
+function e2eTimeout(ms) {
+	return ms * CI_TIMEOUT_SCALE;
+}
 
 async function main() {
 	assert.ok(existsSync(WRANGLER_BIN), "server/node_modules/.bin/wrangler is required");
@@ -92,52 +97,52 @@ async function main() {
 		hostB = startHeadlessHost(vaultB, dataB);
 		children.push(hostA.child, hostB.child);
 		await Promise.all([
-			hostA.waitFor('"kind":"poller-started"', 25_000),
-			hostB.waitFor('"kind":"poller-started"', 25_000),
+			hostA.waitFor('"kind":"poller-started"', e2eTimeout(25_000)),
+			hostB.waitFor('"kind":"poller-started"', e2eTimeout(25_000)),
 		]);
 		console.log("  PASS  both headless hosts started");
 
 		console.log("\n--- headless host worker e2e: A create materializes on B ---");
 		await writeVaultFile(vaultA, "notes/shared.md", "hello from A\n");
-		await waitForFileContent(vaultB, "notes/shared.md", "hello from A\n", 30_000);
+		await waitForFileContent(vaultB, "notes/shared.md", "hello from A\n", e2eTimeout(30_000));
 		console.log("  PASS  create synced A -> B");
 
 		console.log("\n--- headless host worker e2e: B modify materializes on A ---");
 		await writeVaultFile(vaultB, "notes/shared.md", "hello from B\nsecond line\n");
-		await waitForFileContent(vaultA, "notes/shared.md", "hello from B\nsecond line\n", 30_000);
+		await waitForFileContent(vaultA, "notes/shared.md", "hello from B\nsecond line\n", e2eTimeout(30_000));
 		console.log("  PASS  modify synced B -> A");
 
 		console.log("\n--- headless host worker e2e: B rename materializes on A ---");
 		await rename(join(vaultB, "notes", "shared.md"), join(vaultB, "notes", "renamed.md"));
-		await waitForFileContent(vaultA, "notes/renamed.md", "hello from B\nsecond line\n", 30_000);
-		await waitForMissing(vaultA, "notes/shared.md", 30_000);
+		await waitForFileContent(vaultA, "notes/renamed.md", "hello from B\nsecond line\n", e2eTimeout(30_000));
+		await waitForMissing(vaultA, "notes/shared.md", e2eTimeout(30_000));
 		console.log("  PASS  rename synced B -> A");
 
 		console.log("\n--- headless host worker e2e: A delete removes clean copy on B ---");
 		await rm(join(vaultA, "notes", "renamed.md"));
-		await waitForMissing(vaultB, "notes/renamed.md", 30_000);
+		await waitForMissing(vaultB, "notes/renamed.md", e2eTimeout(30_000));
 		console.log("  PASS  delete synced A -> B");
 
 		console.log("\n--- headless host worker e2e: restart keeps Markdown baseline usable ---");
 		await writeVaultFile(vaultA, "notes/restart.md", "before restart\n");
-		await waitForFileContent(vaultB, "notes/restart.md", "before restart\n", 30_000);
+		await waitForFileContent(vaultB, "notes/restart.md", "before restart\n", e2eTimeout(30_000));
 		await stopChild(hostA.child);
 		await stopChild(hostB.child);
 		hostA = startHeadlessHost(vaultA, dataA);
 		hostB = startHeadlessHost(vaultB, dataB);
 		children.push(hostA.child, hostB.child);
 		await Promise.all([
-			hostA.waitFor('"kind":"poller-started"', 25_000),
-			hostB.waitFor('"kind":"poller-started"', 25_000),
+			hostA.waitFor('"kind":"poller-started"', e2eTimeout(25_000)),
+			hostB.waitFor('"kind":"poller-started"', e2eTimeout(25_000)),
 		]);
 		await sleep(3_000);
 		await writeVaultFile(vaultB, "notes/restart.md", "after restart\n");
-		await waitForFileContent(vaultA, "notes/restart.md", "after restart\n", 30_000);
+		await waitForFileContent(vaultA, "notes/restart.md", "after restart\n", e2eTimeout(30_000));
 		console.log("  PASS  restarted hosts continue syncing Markdown");
 
 		console.log("\n--- headless host worker e2e: offline divergence creates conflict artifact ---");
 		await writeVaultFile(vaultA, "notes/conflict.md", "conflict base\n");
-		await waitForFileContent(vaultB, "notes/conflict.md", "conflict base\n", 30_000);
+		await waitForFileContent(vaultB, "notes/conflict.md", "conflict base\n", e2eTimeout(30_000));
 		await sleep(2_000);
 		await stopChild(hostB.child);
 		await writeVaultFile(vaultA, "notes/conflict.md", "remote side\n");
@@ -145,26 +150,26 @@ async function main() {
 		await writeVaultFile(vaultB, "notes/conflict.md", "local side\n");
 		hostB = startHeadlessHost(vaultB, dataB);
 		children.push(hostB.child);
-		await hostB.waitFor('"kind":"poller-started"', 25_000);
-		const conflictArtifact = await waitForConflictArtifact(vaultB, "notes/conflict.md", ["remote side\n", "local side\n"], 45_000);
+		await hostB.waitFor('"kind":"poller-started"', e2eTimeout(25_000));
+		const conflictArtifact = await waitForConflictArtifact(vaultB, "notes/conflict.md", ["remote side\n", "local side\n"], e2eTimeout(45_000));
 		assert.match(conflictArtifact.path, /notes\/conflict \(KAOS conflict/);
 		console.log(`  PASS  conflict artifact created at ${conflictArtifact.path}`);
 
 		console.log("\n--- headless host worker e2e: A attachment uploads to R2 and downloads on B ---");
 		const aBytes = Buffer.from([0, 1, 2, 3, 250, 251, 252, 253]);
 		await writeVaultBinary(vaultA, "attachments/sample.bin", aBytes);
-		await waitForBinaryContent(vaultB, "attachments/sample.bin", aBytes, 45_000);
+		await waitForBinaryContent(vaultB, "attachments/sample.bin", aBytes, e2eTimeout(45_000));
 		console.log("  PASS  attachment upload/download synced A -> B");
 
 		console.log("\n--- headless host worker e2e: B attachment modify downloads on A ---");
 		const bBytes = Buffer.from([9, 8, 7, 6, 5, 4]);
 		await writeVaultBinary(vaultB, "attachments/sample.bin", bBytes);
-		await waitForBinaryContent(vaultA, "attachments/sample.bin", bBytes, 45_000);
+		await waitForBinaryContent(vaultA, "attachments/sample.bin", bBytes, e2eTimeout(45_000));
 		console.log("  PASS  attachment modify synced B -> A");
 
 		console.log("\n--- headless host worker e2e: A attachment delete removes clean copy on B ---");
 		await rm(join(vaultA, "attachments", "sample.bin"));
-		await waitForMissing(vaultB, "attachments/sample.bin", 45_000);
+		await waitForMissing(vaultB, "attachments/sample.bin", e2eTimeout(45_000));
 		console.log("  PASS  attachment delete synced A -> B");
 	} catch (err) {
 		dumpChildOutput("wrangler", wranglerOutput);
@@ -247,11 +252,11 @@ async function runNoR2GracefulSmoke() {
 		hostB = startHeadlessHost(vaultB, dataB);
 		children.push(hostA.child, hostB.child);
 		await Promise.all([
-			hostA.waitFor('"kind":"poller-started"', 25_000),
-			hostB.waitFor('"kind":"poller-started"', 25_000),
+			hostA.waitFor('"kind":"poller-started"', e2eTimeout(25_000)),
+			hostB.waitFor('"kind":"poller-started"', e2eTimeout(25_000)),
 		]);
 		await writeVaultFile(vaultA, "notes/no-r2.md", "markdown without R2\n");
-		await waitForFileContent(vaultB, "notes/no-r2.md", "markdown without R2\n", 30_000);
+		await waitForFileContent(vaultB, "notes/no-r2.md", "markdown without R2\n", e2eTimeout(30_000));
 		console.log("  PASS  no-R2 graceful Markdown sync works with attachments disabled");
 	} catch (err) {
 		dumpChildOutput("no-R2 wrangler", wranglerOutput);
@@ -326,7 +331,7 @@ KAOS_ENABLE_ATTACHMENT_SYNC=false
 		console.log("\n--- headless host worker e2e: operational smoke script checks running primary ---");
 		primary = startHeadlessHost(primaryVault, primaryData);
 		children.push(primary.child);
-		await primary.waitFor('"kind":"poller-started"', 25_000);
+		await primary.waitFor('"kind":"poller-started"', e2eTimeout(25_000));
 		const smoke = spawnSync(process.execPath, [
 			"scripts/smoke-headless-host-sync.mjs",
 			"--binary",
@@ -342,12 +347,12 @@ KAOS_ENABLE_ATTACHMENT_SYNC=false
 			"--token-file",
 			tokenFile,
 			"--timeout-ms",
-			"30000",
+			String(e2eTimeout(30_000)),
 			"--require-lock",
 		], {
 			encoding: "utf8",
 			env: withoutKaosEnv(process.env),
-			timeout: 60_000,
+			timeout: e2eTimeout(60_000),
 		});
 		assert.equal(smoke.status, 0, smoke.stderr || smoke.stdout);
 		assert.equal(smoke.stdout.includes(token), false, "smoke output should not leak token material");
@@ -478,7 +483,7 @@ async function waitForWorker(host, output) {
 		} catch {
 			return false;
 		}
-	}, 20_000);
+	}, e2eTimeout(20_000));
 }
 
 async function resolveAuthToken(host, defaultEnvToken) {
