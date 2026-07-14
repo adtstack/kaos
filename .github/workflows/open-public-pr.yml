@@ -1,0 +1,103 @@
+name: Open Public Snapshot PR
+
+on:
+  push:
+    branches:
+      - "automation/public-*"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: open-public-pr-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  open:
+    if: github.repository == 'adtstack/kaos'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate the snapshot branch and open its draft PR
+        shell: bash
+        env:
+          ACTOR_ID: ${{ github.actor_id }}
+          BRANCH: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.sha }}
+          TARGET_REPOSITORY: adtstack/kaos
+        run: |
+          set -euo pipefail
+          if [[ "${ACTOR_ID}" != "79931672" ]]; then
+            echo "::error::Only the account that registered the publisher deploy key may trigger this workflow."
+            exit 1
+          fi
+          if [[ ! "${BRANCH}" =~ ^automation/public-(sync|release)-([0-9]+\.[0-9]+\.[0-9]+)-([0-9a-f]{10})-([0-9a-f]{10})$ ]]; then
+            echo "::error::Unexpected public snapshot branch: ${BRANCH}"
+            exit 1
+          fi
+          PUBLICATION="${BASH_REMATCH[1]}"
+          VERSION="${BASH_REMATCH[2]}"
+          BASE_PREFIX="${BASH_REMATCH[3]}"
+          TREE_PREFIX="${BASH_REMATCH[4]}"
+
+          REPOSITORY="${RUNNER_TEMP}/public-pr-check"
+          git init --quiet "${REPOSITORY}"
+          git -C "${REPOSITORY}" remote add origin "https://github.com/${TARGET_REPOSITORY}.git"
+          git -C "${REPOSITORY}" fetch --quiet --no-tags --depth=2 origin \
+            "refs/heads/main:refs/remotes/origin/main" \
+            "refs/heads/${BRANCH}:refs/remotes/origin/snapshot"
+          if [[ "$(git -C "${REPOSITORY}" rev-parse refs/remotes/origin/snapshot)" != "${HEAD_SHA}" ]]; then
+            echo "::error::The pushed branch no longer matches the triggering commit."
+            exit 1
+          fi
+          MAIN_SHA="$(git -C "${REPOSITORY}" rev-parse refs/remotes/origin/main)"
+          SNAPSHOT_TREE="$(git -C "${REPOSITORY}" rev-parse 'refs/remotes/origin/snapshot^{tree}')"
+          if [[ "${MAIN_SHA:0:10}" != "${BASE_PREFIX}" || "${SNAPSHOT_TREE:0:10}" != "${TREE_PREFIX}" ]]; then
+            echo "::error::The snapshot branch name does not match its base commit and tree."
+            exit 1
+          fi
+          SNAPSHOT_PARENTS="$(git -C "${REPOSITORY}" show -s --format=%P refs/remotes/origin/snapshot)"
+          if [[ "${SNAPSHOT_PARENTS}" != "${MAIN_SHA}" ]]; then
+            echo "::error::The snapshot branch must have current public main as its only parent."
+            exit 1
+          fi
+          AUTHOR_EMAIL="$(git -C "${REPOSITORY}" show -s --format=%ae refs/remotes/origin/snapshot)"
+          COMMITTER_EMAIL="$(git -C "${REPOSITORY}" show -s --format=%ce refs/remotes/origin/snapshot)"
+          if [[ "${AUTHOR_EMAIL}" != "int@kakao.com" || "${COMMITTER_EMAIL}" != "int@kakao.com" ]]; then
+            echo "::error::The snapshot commit must use the approved public email identity."
+            exit 1
+          fi
+
+          PR_URL="$(gh pr list --repo "${TARGET_REPOSITORY}" --base main --head "${BRANCH}" \
+            --state open --json url --jq '.[0].url // empty')"
+          if [[ -z "${PR_URL}" ]]; then
+            BODY_FILE="${RUNNER_TEMP}/public-pr-body.md"
+            {
+              echo "This PR contains the policy-approved public snapshot for version \`${VERSION}\`."
+              echo
+              echo "- Publication mode: \`${PUBLICATION}\`"
+              echo "- Public commit: \`${HEAD_SHA}\`"
+              echo
+              if [[ "${PUBLICATION}" == "release" ]]; then
+                echo "After review, merge, and green CI, run **Tag Public Release** for \`${VERSION}\`."
+              else
+                echo "This same-version source sync does not move or create a release tag."
+              fi
+            } > "${BODY_FILE}"
+            if [[ "${PUBLICATION}" == "release" ]]; then
+              TITLE="Release ${VERSION}"
+            else
+              TITLE="chore(public): sync ${VERSION}"
+            fi
+            PR_URL="$(gh pr create --repo "${TARGET_REPOSITORY}" --base main --head "${BRANCH}" \
+              --title "${TITLE}" --body-file "${BODY_FILE}" --draft)"
+          fi
+
+          {
+            echo "### Public snapshot pull request"
+            echo
+            echo "- Pull request: ${PR_URL}"
+            echo "- Snapshot: \`${HEAD_SHA}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
