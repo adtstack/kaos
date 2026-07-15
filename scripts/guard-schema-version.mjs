@@ -18,7 +18,7 @@
 
 import { readFileSync, existsSync } from "node:fs";
 
-const EXPECTED_SCHEMA_VERSION = 3;
+const EXPECTED_SCHEMA_VERSION = 4;
 let failures = 0;
 
 function fail(msg) {

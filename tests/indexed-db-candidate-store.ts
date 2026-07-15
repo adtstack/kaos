@@ -9,6 +9,7 @@ import * as Y from "yjs";
 import {
 	IndexedDbCandidateStore,
 	buildCandidateStoreKey,
+	getOrCreateLocalDeviceIdentity,
 	getOrCreateLocalDeviceId,
 	sha256Hex,
 } from "../src/sync/indexedDbCandidateStore";
@@ -338,6 +339,62 @@ console.log("\n--- Test 7: localDeviceId is stable once created ---");
 	assert(first === "uuid-1", "first localDeviceId is generated");
 	assert(second === first, "second localDeviceId reuses stored value");
 	assert(created === 1, "random UUID called only once");
+}
+
+console.log("\n--- Test 7b: local identity reports the device-local first-run boundary ---");
+{
+	const fake = new FakeIndexedDBFactory();
+	const first = await getOrCreateLocalDeviceIdentity(
+		fake as unknown as IDBFactory,
+		() => "identity-status-id",
+		"ack-test-7b",
+	);
+	const second = await getOrCreateLocalDeviceIdentity(
+		fake as unknown as IDBFactory,
+		() => "should-not-be-used",
+		"ack-test-7b",
+	);
+	assert(
+		first.localDeviceId === "identity-status-id" && first.status === "created",
+		"first transaction reports a newly-created local identity",
+	);
+	assert(
+		second.localDeviceId === first.localDeviceId && second.status === "existing",
+		"later transactions report an existing local identity",
+	);
+}
+
+console.log("\n--- Test 7c: corrupt identity metadata never becomes a fresh device ---");
+{
+	for (const [index, corrupt] of [null, "", 42, { localDeviceId: "foreign" }].entries()) {
+		const fake = new FakeIndexedDBFactory();
+		const dbName = `ack-test-7c-${index}`;
+		fake.putRaw(dbName, "metadata", "localDeviceId", corrupt);
+		let rejected = false;
+		try {
+			await getOrCreateLocalDeviceIdentity(
+				fake as unknown as IDBFactory,
+				() => "must-not-replace-corrupt-metadata",
+				dbName,
+			);
+		} catch {
+			rejected = true;
+		}
+		assert(rejected, `corrupt localDeviceId metadata (${String(corrupt)}) rejects`);
+	}
+
+	const invalidGenerated = new FakeIndexedDBFactory();
+	let rejectedGenerated = false;
+	try {
+		await getOrCreateLocalDeviceIdentity(
+			invalidGenerated as unknown as IDBFactory,
+			() => "",
+			"ack-test-7c-invalid-generated",
+		);
+	} catch {
+		rejectedGenerated = true;
+	}
+	assert(rejectedGenerated, "an invalid generated localDeviceId rejects without authority");
 }
 
 console.log("\n--- Test 8: save rejects mismatched or invalid scope ---");

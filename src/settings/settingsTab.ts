@@ -278,7 +278,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						? "Waiting for the GitHub update workflow and Cloudflare redeploy to finish."
 						: updateState.serverUpdateAvailable
 							? updateState.migrationRequired
-								? "A migration-sensitive server update is available. Use the guided update path."
+								? "Plugin-first migration: sync pauses until you create and commit updater v2, then explicitly allow the server migration."
 								: updateState.updateRepoUrl
 									? "A guided server update is available."
 									: "A server update is available. Add your deployment repo URL to enable guided updates."
@@ -356,6 +356,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				void this.host.refreshRecoveryStorageStatus("settings-refresh").then(() => this.display());
 			});
 			const updateActionUrl = updateState.updateActionUrl;
+			const bootstrapUrl = updateState.updateBootstrapUrl;
 			if (updateState.serverUpdateAvailable && updateState.migrationRequired) {
 				if (updateState.releaseNotesUrl) {
 					updateActions.createEl("button", { text: "Open release notes" }).addEventListener("click", () => {
@@ -367,8 +368,13 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						window.open(updateState.upgradeGuideUrl ?? "", "_blank", "noopener");
 					});
 				}
+				if (bootstrapUrl) {
+					updateActions.createEl("button", { text: "1. Create updater v2" }).addEventListener("click", () => {
+						window.open(bootstrapUrl, "_blank", "noopener");
+					});
+				}
 				if (updateActionUrl) {
-					updateActions.createEl("button", { text: "Open guided update" }).addEventListener("click", () => {
+					updateActions.createEl("button", { text: "2. After commit, run migration" }).addEventListener("click", () => {
 						window.open(updateActionUrl, "_blank", "noopener");
 					});
 				}
@@ -392,8 +398,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					window.open(updateActionUrl, "_blank", "noopener");
 				});
 			}
-			const bootstrapUrl = updateState.updateBootstrapUrl;
-			if (bootstrapUrl) {
+			if (bootstrapUrl && !updateState.migrationRequired) {
 				updateActions.createEl("button", { text: "Initialize updater" }).addEventListener("click", () => {
 					window.open(bootstrapUrl, "_blank", "noopener");
 				});
@@ -553,8 +558,8 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Pause while another device is typing")
-			.setDesc("Warn and block local keystrokes when another device recently typed in the same note.")
+			.setName("Warn while another device is typing")
+			.setDesc("Show a warning when another device recently typed in the same note. Your edits are never blocked.")
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.host.settings.remoteTypingGuardEnabled)
@@ -637,11 +642,11 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 			new Setting(advancedBody)
 				.setName("Edits from other apps")
-				.setDesc("Closed files only is safest: open notes keep editor authority while Git, scripts, or other editors are changing files.")
+				.setDesc("Open notes always keep visible editor authority. The broader option considers external changes only when the open editor agrees with them.")
 				.addDropdown((dropdown) =>
 					dropdown
 						.addOption("closed-only", "Closed files only")
-						.addOption("always", "Always import")
+						.addOption("always", "Include open files safely")
 						.addOption("never", "Never import")
 						.setValue(this.host.settings.externalEditPolicy)
 						.onChange(async (value) => {

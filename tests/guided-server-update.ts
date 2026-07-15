@@ -1,17 +1,24 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
 	GUIDED_SERVER_UPDATE_TIMEOUT_MS,
 	GUIDED_SERVER_UPDATE_USER_ACTION_GRACE_MS,
 	evaluateGuidedServerUpdateState,
 	readPersistedGuidedServerUpdateState,
 } from "../src/runtime/guidedServerUpdate";
+import {
+	buildGithubOpsBootstrapWorkflowYaml,
+	CapabilityUpdateService,
+	GITHUB_OPS_WORKFLOW_FILENAME,
+	GITHUB_OPS_WORKFLOW_PATH,
+} from "../src/runtime/capabilityUpdateService";
 
 const startedAt = 1_000_000;
 const pending = {
 	status: "waiting-for-user" as const,
 	targetVersion: "0.5.0",
 	startedAt,
-	updateActionUrl: "https://github.com/example/kaos/actions/workflows/kaos-ops.yml",
+	updateActionUrl: "https://github.com/example/kaos/actions/workflows/kaos-ops-v2.yml",
 };
 
 assert.deepEqual(readPersistedGuidedServerUpdateState(pending), pending, "valid state is accepted");
@@ -50,5 +57,88 @@ const timedOut = evaluateGuidedServerUpdateState(
 );
 assert.equal(timedOut.status, "timed-out", "timeout is reported when target never appears");
 assert.equal(timedOut.changed, true, "timeout transition is persisted");
+
+const workflowCases = [
+	{
+		label: "bootstrap workflow",
+		source: buildGithubOpsBootstrapWorkflowYaml(),
+		envExpression: "${{ github.event.inputs.allow_migration_update }}",
+	},
+	{
+		label: "legacy server template",
+		source: readFileSync("server/.github/workflows/kaos-ops.yml", "utf8"),
+		envExpression: "${{ github.event.inputs.allow_migration_update }}",
+	},
+	{
+		label: "versioned migration server template",
+		source: readFileSync("server/.github/workflows/kaos-ops-v2.yml", "utf8"),
+		envExpression: "${{ github.event.inputs.allow_migration_update }}",
+	},
+	{
+		label: "reusable public workflow",
+		source: readFileSync(".github/workflows/kaos-ops-reusable.yml", "utf8"),
+		envExpression: "${{ inputs.allow_migration_update }}",
+	},
+];
+
+for (const workflow of workflowCases) {
+	assert.match(
+		workflow.source,
+		/allow_migration_update:\s*[\s\S]*?default:\s*false/,
+		`${workflow.label} exposes a fail-closed migration confirmation`,
+	);
+	assert.ok(
+		workflow.source.includes(
+			`KAOS_ALLOW_MIGRATION_UPDATE: ${workflow.envExpression}`,
+		),
+		`${workflow.label} passes the explicit confirmation to the updater`,
+	);
+}
+
+const updateService = new CapabilityUpdateService({
+	getSettings: () => ({
+		updateRepoUrl: "https://github.com/example/deployment",
+		updateRepoBranch: "main",
+	}),
+} as any);
+assert.equal(
+	updateService.buildServerUpdateUrl(),
+	`https://github.com/example/deployment/actions/workflows/${GITHUB_OPS_WORKFLOW_FILENAME}`,
+	"GitHub update action targets the collision-free v2 workflow",
+);
+const bootstrapUrl = updateService.buildGithubUpdaterBootstrapUrl();
+assert.ok(bootstrapUrl, "GitHub updater bootstrap URL is available");
+const parsedBootstrapUrl = new URL(bootstrapUrl!);
+assert.equal(
+	parsedBootstrapUrl.searchParams.get("filename"),
+	GITHUB_OPS_WORKFLOW_PATH,
+	"bootstrap creates the versioned workflow without replacing legacy kaos-ops.yml",
+);
+assert.match(
+	parsedBootstrapUrl.searchParams.get("value") ?? "",
+	/^name: KAOS Server Ops v2/m,
+	"bootstrap content is the migration-capable v2 workflow",
+);
+
+const settingsSource = readFileSync("src/settings/settingsTab.ts", "utf8");
+const migrationUiStart = settingsSource.indexOf(
+	"if (updateState.serverUpdateAvailable && updateState.migrationRequired)",
+);
+const migrationUiEnd = settingsSource.indexOf(
+	"} else if (updateActionUrl && updateState.guidedServerUpdateAvailable)",
+	migrationUiStart,
+);
+const migrationUi = settingsSource.slice(migrationUiStart, migrationUiEnd);
+assert.ok(
+	migrationUi.indexOf("1. Create updater v2") >= 0
+		&& migrationUi.indexOf("1. Create updater v2")
+			< migrationUi.indexOf("2. After commit, run migration"),
+	"migration settings present workflow creation before execution",
+);
+assert.match(
+	settingsSource,
+	/Plugin-first migration: sync pauses until you create and commit updater v2/,
+	"migration settings explain the intentional compatibility pause",
+);
 
 console.log("guided server update state tests passed");

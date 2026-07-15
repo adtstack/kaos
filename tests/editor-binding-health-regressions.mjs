@@ -143,17 +143,31 @@ console.log("\n--- Test 8: applyBinding refuses divergent editor content ---");
 	);
 }
 
-console.log("\n--- Test 9: destructive provider patches only shield during recent editor activity ---");
+console.log("\n--- Test 9: authority shield is limited to fresh named local repairs ---");
 {
 	const section = sliceBetween(
 		bindingSource,
 		"private filterRiskyNonUserPatch(transaction: Transaction):",
 		"private createYTextOriginCaptureExtension(",
 	);
+	const shieldPredicate = sliceBetween(
+		bindingSource,
+		"private shouldShieldYTextPatch(input: {",
+		"private incomingContentPreservesEditorContent(",
+	);
 	assert(section !== null, "filterRiskyNonUserPatch section found");
+	assert(shieldPredicate !== null, "shouldShieldYTextPatch section found");
 	assert(
 		section?.includes("this.shouldShieldYTextPatch({"),
 		"filterRiskyNonUserPatch checks whether incoming content preserves editor content",
+	);
+	assert(
+		section?.includes("Date.now() - pendingPatch.at <= 1000"),
+		"filterRiskyNonUserPatch accepts only a fresh captured origin",
+	);
+	assert(
+		shieldPredicate?.includes("!EDITOR_AUTHORITY_SHIELD_ORIGINS.has(input.origin)"),
+		"shield predicate rejects provider/object/null/unknown and explicit restore origins",
 	);
 	assert(
 		!section?.includes("this.planEditorYTextMerge({"),
@@ -167,6 +181,38 @@ console.log("\n--- Test 9: destructive provider patches only shield during recen
 		(section?.indexOf("this.shouldShieldYTextPatch({") ?? Infinity) <
 			(section?.indexOf("this.hasRecentUserDocumentEdit(binding, RECENT_EDITOR_PATCH_SHIELD_MS)") ?? -1),
 		"preservation check runs before recent-activity shielding",
+	);
+}
+
+console.log("\n--- Test 9a: remote typing awareness is advisory only ---");
+{
+	const section = sliceBetween(
+		bindingSource,
+		"private filterRiskyNonUserPatch(transaction: Transaction):",
+		"private createYTextOriginCaptureExtension(",
+	);
+	const warningSection = sliceBetween(
+		bindingSource,
+		"private warnConcurrentTyping(",
+		"/**\n\t * Get the CM6 EditorView",
+	);
+	assert(section !== null, "filterRiskyNonUserPatch section found for typing advisory check");
+	assert(warningSection !== null, "warnConcurrentTyping section found");
+	assert(
+		section?.includes("this.warnConcurrentTyping(match.binding.path, remoteTypers)"),
+		"active remote typing emits an advisory warning",
+	);
+	assert(
+		!section?.includes("return [];"),
+		"filter never cancels a user transaction",
+	);
+	assert(
+		warningSection?.includes('"concurrent-typing-warning"'),
+		"remote typing advisory emits a warning trace",
+	);
+	assert(
+		!warningSection?.includes('"concurrent-typing-blocked"'),
+		"remote typing advisory emits no blocked trace",
 	);
 }
 

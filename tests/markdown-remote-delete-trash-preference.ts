@@ -15,9 +15,9 @@
  * timers, observer cleanups, write queue).
  *
  *   Scenario A: trashFile available, trash preferred, called with system === true
- *   Scenario B: trashFile missing, hard-delete fallback
- *   Scenario C: trashFile throws, trashFile attempted FIRST (system === true),
- *               hard-delete fallback, ordering trash-attempted-before-delete
+ *   Scenario B: trashFile missing, recoverable vault.trash fallback
+ *   Scenario C: both trash mechanisms fail, disk is preserved and quarantined;
+ *               irreversible Vault.delete is never called
  *   Scenario D: preserve-revive — no trash, no delete; ensureFile(..., reviveTombstone:true)
  *   Scenario E: preserve-unresolved — no trash, no delete, no ensureFile;
  *               path enters preservedUnresolved registry
@@ -90,7 +90,7 @@ interface EnsureFileCall {
 }
 
 interface CallOrderEntry {
-	op: "trash" | "delete";
+	op: "file-manager-trash" | "vault-trash" | "delete";
 	path: string;
 }
 
@@ -102,6 +102,7 @@ interface Fixture {
 	flightEvents: CapturedFlightEvent[];
 	traces: CapturedTrace[];
 	trashCalls: TrashCall[];
+	vaultTrashCalls: TrashCall[];
 	deleteCalls: string[];
 	callOrder: CallOrderEntry[];
 	ensureFileCalls: EnsureFileCall[];
@@ -116,10 +117,12 @@ interface FixtureOptions {
 	 *   "available" — fileManager.trashFile present and succeeds.
 	 *   "missing"   — fileManager is undefined (no trash channel on host).
 	 *   "throws"    — fileManager.trashFile present but throws on call.
+	 *   "partial-replace-throws" — trashFile removes the original, installs a
+	 *                 same-path replacement, then throws.
 	 *   "preserve"  — same as "available"; included for clarity in
 	 *                 preserve-* scenarios where neither path runs.
 	 */
-	trashAdapter: "available" | "missing" | "throws" | "preserve";
+	trashAdapter: "available" | "missing" | "throws" | "partial-replace-throws" | "preserve";
 }
 
 function buildFixture(opts: FixtureOptions): Fixture {
@@ -138,9 +141,11 @@ function buildFixture(opts: FixtureOptions): Fixture {
 	const flightEvents: CapturedFlightEvent[] = [];
 	const traces: CapturedTrace[] = [];
 	const trashCalls: TrashCall[] = [];
+	const vaultTrashCalls: TrashCall[] = [];
 	const deleteCalls: string[] = [];
 	const callOrder: CallOrderEntry[] = [];
 	const ensureFileCalls: EnsureFileCall[] = [];
+	let tombstoned = true;
 
 	// Real Y.Doc + Y.Text per fixture (Requirement 1.8 — fixture realism).
 	const doc = new Y.Doc();
@@ -148,11 +153,19 @@ function buildFixture(opts: FixtureOptions): Fixture {
 	ytext.insert(0, opts.diskContent);
 
 	const vaultSync = {
-		getTextForPath: (p: string): Y.Text | null => (p === opts.path ? ytext : null),
+		getTextForPath: (p: string): Y.Text | null => (!tombstoned && p === opts.path ? ytext : null),
 		ensureFile: (path: string, content: string, deviceName: string, options?: Record<string, unknown>) => {
 			ensureFileCalls.push({ path, content, deviceName, options });
+			ytext.delete(0, ytext.length);
+			ytext.insert(0, content);
+			tombstoned = false;
 			return ytext;
 		},
+		getAuthoritativeMarkdownDeleteSnapshot: () => tombstoned
+			? { fingerprint: `markdown-delete:${opts.path}` }
+			: null,
+		getActiveFileIdsForPath: () => tombstoned ? [] : ["active-file"],
+		isPathTombstoned: () => tombstoned,
 		// Properties handleRemoteDelete touches indirectly via meta-observer
 		// path; not exercised by direct invocation, but provided for shape
 		// compatibility.
@@ -177,7 +190,7 @@ function buildFixture(opts: FixtureOptions): Fixture {
 				return {
 					trashFile: async (f: TFile, system?: boolean) => {
 						trashCalls.push({ path: (f as { path: string }).path, system });
-						callOrder.push({ op: "trash", path: (f as { path: string }).path });
+						callOrder.push({ op: "file-manager-trash", path: (f as { path: string }).path });
 						files.delete((f as { path: string }).path);
 					},
 				};
@@ -185,8 +198,27 @@ function buildFixture(opts: FixtureOptions): Fixture {
 				return {
 					trashFile: async (f: TFile, system?: boolean) => {
 						trashCalls.push({ path: (f as { path: string }).path, system });
-						callOrder.push({ op: "trash", path: (f as { path: string }).path });
+						callOrder.push({ op: "file-manager-trash", path: (f as { path: string }).path });
 						throw new Error("trash not supported");
+					},
+				};
+			case "partial-replace-throws":
+				return {
+					trashFile: async (f: TFile, system?: boolean) => {
+						trashCalls.push({ path: (f as { path: string }).path, system });
+						callOrder.push({ op: "file-manager-trash", path: (f as { path: string }).path });
+						files.delete((f as { path: string }).path);
+						const replacement = new TFile() as TFile & {
+							path: string;
+							stat: { mtime: number; size: number };
+						};
+						replacement.path = opts.path;
+						replacement.stat = {
+							mtime: file.stat.mtime + 1,
+							size: opts.diskContent.length,
+						};
+						files.set(opts.path, replacement);
+						throw new Error("trash finalized after same-path replacement appeared");
 					},
 				};
 		}
@@ -207,6 +239,18 @@ function buildFixture(opts: FixtureOptions): Fixture {
 				callOrder.push({ op: "delete", path: f.path });
 				files.delete(f.path);
 			},
+			...(opts.trashAdapter === "missing"
+			|| opts.trashAdapter === "throws"
+			|| opts.trashAdapter === "partial-replace-throws" ? {
+				trash: async (f: TFile & { path: string }, system?: boolean) => {
+					vaultTrashCalls.push({ path: f.path, system });
+					callOrder.push({ op: "vault-trash", path: f.path });
+					if (opts.trashAdapter === "throws") {
+						throw new Error("vault trash not supported");
+					}
+					files.delete(f.path);
+				},
+			} : {}),
 			adapter: {
 				stat: async (p: string) => files.get(p)?.stat ?? null,
 			},
@@ -248,6 +292,7 @@ function buildFixture(opts: FixtureOptions): Fixture {
 		flightEvents,
 		traces,
 		trashCalls,
+		vaultTrashCalls,
 		deleteCalls,
 		callOrder,
 		ensureFileCalls,
@@ -293,10 +338,10 @@ console.log("\n--- Scenario A: markdown remote delete prefers trashFile ---");
 }
 
 // -------------------------------------------------------------------
-// Scenario B — trashFile missing, hard-delete fallback
+// Scenario B — trashFile missing, vault.trash fallback
 // -------------------------------------------------------------------
 
-console.log("\n--- Scenario B: markdown remote delete falls back when trash unavailable ---");
+console.log("\n--- Scenario B: markdown remote delete falls back to vault.trash ---");
 {
 	const path = "Notes/scenario-b.md";
 	const baseline = "scenario-b clean baseline";
@@ -310,25 +355,27 @@ console.log("\n--- Scenario B: markdown remote delete falls back when trash unav
 	}).handleRemoteDelete(path, { baselineText: baseline });
 
 	assertEq(fix.trashCalls.length, 0, "trashFile not called when adapter missing");
-	assertEq(fix.deleteCalls.length, 1, "markdown remote delete falls back to vault.delete");
-	assertEq(fix.deleteCalls[0], path, "vault.delete called with correct path");
+	assertEq(fix.vaultTrashCalls.length, 1, "markdown remote delete falls back to recoverable vault.trash");
+	assertEq(fix.vaultTrashCalls[0]?.path, path, "vault.trash called with correct path");
+	assertEq(fix.vaultTrashCalls[0]?.system, false, "vault.trash uses the local recoverable trash");
+	assertEq(fix.deleteCalls.length, 0, "vault.delete is never used when fileManager trash is unavailable");
 
 	const appliedEvents = fix.flightEvents.filter((e) => e.kind === "delete.disk.applied");
 	const preservedEvents = fix.flightEvents.filter((e) => e.kind === "delete.preserved");
 	assertEq(appliedEvents.length, 1, "exactly one delete.disk.applied event");
 	assertEq(preservedEvents.length, 0, "no delete.preserved events on missing-trash fallback");
 
-	assertEq(appliedEvents[0]?.data?.deleteMode, "delete", "markdown remote delete reports deleteMode 'delete' on flight event");
+	assertEq(appliedEvents[0]?.data?.deleteMode, "trash", "vault.trash fallback still reports recoverable trash mode");
 	assertEq(appliedEvents[0]?.data?.reason, "tombstone-applied", "applied event reason is tombstone-applied");
 
-	assert(!fix.fileExists(path), "file no longer exists in vault after fallback delete");
+	assert(!fix.fileExists(path), "file no longer exists in vault after vault.trash");
 }
 
 // -------------------------------------------------------------------
-// Scenario C — trashFile throws, attempted then hard-delete fallback
+// Scenario C — all recoverable trash mechanisms fail; preserve/quarantine
 // -------------------------------------------------------------------
 
-console.log("\n--- Scenario C: markdown remote delete falls back when trashFile throws ---");
+console.log("\n--- Scenario C: markdown remote delete preserves when all trash fails ---");
 {
 	const path = "Notes/scenario-c.md";
 	const baseline = "scenario-c clean baseline";
@@ -342,29 +389,64 @@ console.log("\n--- Scenario C: markdown remote delete falls back when trashFile 
 	assertEq(fix.trashCalls.length, 1, "markdown remote delete attempts trashFile before fallback");
 	assertEq(fix.trashCalls[0]?.path, path, "trashFile attempted for scenario C path");
 	assertEq(fix.trashCalls[0]?.system, true, "trashFile attempt uses system === true even when it throws");
-	assertEq(fix.deleteCalls.length, 1, "vault.delete called as fallback after trashFile throw");
-	assertEq(fix.deleteCalls[0], path, "fallback vault.delete called with correct path");
+	assertEq(fix.vaultTrashCalls.length, 1, "vault.trash is attempted after trashFile throws");
+	assertEq(fix.vaultTrashCalls[0]?.path, path, "vault.trash fallback targets the same file");
+	assertEq(fix.deleteCalls.length, 0, "irreversible vault.delete is never called after trash failures");
 
-	// Temporal ordering: trash attempted before vault.delete.
-	const trashIdx = fix.callOrder.findIndex((c) => c.op === "trash");
-	const deleteIdx = fix.callOrder.findIndex((c) => c.op === "delete");
-	assert(trashIdx >= 0 && deleteIdx > trashIdx, "trashFile attempted strictly before vault.delete");
+	// Temporal ordering: system trash is attempted before local vault trash.
+	const trashIdx = fix.callOrder.findIndex((c) => c.op === "file-manager-trash");
+	const vaultTrashIdx = fix.callOrder.findIndex((c) => c.op === "vault-trash");
+	assert(trashIdx >= 0 && vaultTrashIdx > trashIdx, "trashFile is attempted strictly before vault.trash");
 
 	const observedEvents = fix.flightEvents.filter((e) => e.kind === "delete.remote.observed");
 	const appliedEvents = fix.flightEvents.filter((e) => e.kind === "delete.disk.applied");
 	const preservedEvents = fix.flightEvents.filter((e) => e.kind === "delete.preserved");
 	assertEq(observedEvents.length, 1, "exactly one delete.remote.observed event");
-	assertEq(appliedEvents.length, 1, "exactly one delete.disk.applied event");
-	assertEq(preservedEvents.length, 0, "trash throw does not promote to delete.preserved");
+	assertEq(appliedEvents.length, 0, "failed trash emits no false delete.disk.applied event");
+	assertEq(preservedEvents.length, 1, "failed trash emits one delete.preserved event");
+	assertEq(preservedEvents[0]?.data?.reason, "remote-delete-trash-failed", "preserved event identifies trash failure");
+	assert(fix.mirror.isPreservedUnresolved(path), "failed trash quarantines the path");
+	assert(fix.fileExists(path), "failed recoverable trash leaves the live file intact");
+}
 
-	assertEq(appliedEvents[0]?.data?.deleteMode, "delete", "markdown remote delete reports deleteMode 'delete' after trash throw");
-	assertEq(appliedEvents[0]?.data?.reason, "tombstone-applied", "applied event reason is tombstone-applied");
+console.log("\n--- Scenario C2: partial trash failure cannot delete a same-path replacement ---");
+{
+	const path = "Notes/scenario-c2.md";
+	const baseline = "scenario-c2 clean baseline";
+	const fix = buildFixture({
+		path,
+		diskContent: baseline,
+		trashAdapter: "partial-replace-throws",
+	});
 
-	const observedIdx = fix.flightEvents.findIndex((e) => e.kind === "delete.remote.observed");
-	const appliedIdx = fix.flightEvents.findIndex((e) => e.kind === "delete.disk.applied");
-	assert(observedIdx >= 0 && appliedIdx > observedIdx, "delete.remote.observed precedes delete.disk.applied even when trash throws");
+	await (fix.mirror as unknown as {
+		handleRemoteDelete: (p: string, opts?: { baselineText?: string | null }) => Promise<void>;
+	}).handleRemoteDelete(path, { baselineText: baseline });
 
-	assert(!fix.fileExists(path), "file no longer exists in vault after fallback delete");
+	assertEq(fix.trashCalls.length, 1, "system trash is attempted for the original TFile once");
+	assertEq(
+		fix.vaultTrashCalls.length,
+		0,
+		"vault.trash fallback is fenced after a same-path replacement appears",
+	);
+	assertEq(fix.deleteCalls.length, 0, "hard delete remains forbidden in the partial-success race");
+	assert(fix.fileExists(path), "same-path replacement survives the failed original trash");
+	assert(
+		fix.mirror.isPreservedUnresolved(path),
+		"same-path replacement is quarantined instead of being deleted",
+	);
+	assert(
+		fix.traces.some((event) =>
+			event.msg === "remote-delete-cancelled-stale"
+			&& event.details?.phase === "trash-fallback-stale"
+		),
+		"stale fallback cancellation is traced",
+	);
+	assertEq(
+		fix.flightEvents.filter((event) => event.kind === "delete.disk.applied").length,
+		0,
+		"replacement race emits no false delete.disk.applied event",
+	);
 }
 
 // -------------------------------------------------------------------

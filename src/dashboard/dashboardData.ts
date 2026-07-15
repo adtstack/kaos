@@ -17,6 +17,7 @@ import type {
 	KaosDashboardCollectorInput,
 	KaosDashboardData,
 } from "./dashboardTypes";
+import { cloneBlobRef } from "../types";
 
 const ATTENTION_SAMPLE_LIMIT = 20;
 type DashboardServerReceipt = DashboardVaultSyncDebug["serverReceipt"];
@@ -95,6 +96,19 @@ export function collectDashboardAttention(
 			remoteDeleteFingerprint,
 			localFile.kind,
 		);
+		const legacyMissingBlob = entry.kind === "blob"
+			&& entry.reason === "legacy-upgrade-missing-local-blob";
+		const legacyRemoteRef = legacyMissingBlob
+			? cloneBlobRef(input.remoteDeleteResolutionState?.getBlobRef(entry.path) ?? undefined)
+				?? null
+			: null;
+		const legacyUnavailableReason = !engineAvailable
+			? "Attachment sync is not initialized."
+			: localFile.kind === "other"
+				? "The local path is no longer a file vacancy."
+				: localFile.kind === "file"
+					? "A local file now exists. Run reconcile to settle it first."
+					: null;
 		items.push({
 			kind: "preserved-unresolved",
 			title: `${entry.kind} needs attention`,
@@ -123,6 +137,17 @@ export function collectDashboardAttention(
 				acceptRemoteDeleteUnavailableReason: keepLocalPending
 					? "Wait for the pending Keep local upload to finish."
 					: commonUnavailableReason,
+			} : legacyMissingBlob ? {
+				kind: "legacy-missing-blob",
+				fileKind: "blob",
+				reason: "legacy-upgrade-missing-local-blob",
+				episodeId,
+				remoteRef: legacyRemoteRef,
+				localFile,
+				canDownloadRemote: legacyUnavailableReason === null
+					&& legacyRemoteRef !== null,
+				canKeepLocalAbsent: legacyUnavailableReason === null,
+				unavailableReason: legacyUnavailableReason,
 			} : null,
 		});
 	}

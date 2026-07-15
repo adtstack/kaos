@@ -94,4 +94,54 @@ registry.clear();
 assert.equal(registry.getSummary().totalCount, 0);
 assert.equal(registry.paths.size, 0);
 
+const renameSourcePath = "Notes/Before Rename.md";
+const renameTargetPath = "Notes/After Rename.md";
+const renameSource: PreservedUnresolvedEntry = {
+	path: renameSourcePath,
+	kind: "markdown",
+	reason: "conflict-winner-flush-deferred",
+	episodeId: "episode-follow-the-file",
+	firstSeenAt: firstSeenAt + 20,
+	lastSeenAt: lastSeenAt + 20,
+	localHash: "rename-local-hash",
+	knownRemoteHash: "rename-remote-hash",
+};
+const renameRegistry = new PreservedUnresolvedRegistry([renameSource]);
+const moved = renameRegistry.move(renameSourcePath, renameTargetPath);
+assert.deepEqual(moved, {
+	kind: "moved",
+	entry: { ...renameSource, path: renameTargetPath },
+});
+assert.equal(renameRegistry.has(renameSourcePath), false);
+assert.equal(renameRegistry.paths.has(renameSourcePath), false);
+assert.deepEqual(
+	renameRegistry.get(renameTargetPath),
+	{ ...renameSource, path: renameTargetPath },
+	"a rename preserves the complete unresolved episode and changes only its path",
+);
+
+const collisionSource: PreservedUnresolvedEntry = {
+	...renameSource,
+	path: "Notes/Collision Source.md",
+	episodeId: "source-episode",
+};
+const collisionTarget: PreservedUnresolvedEntry = {
+	...renameSource,
+	path: "Notes/Collision Target.md",
+	reason: "three-way-preserve-failed",
+	episodeId: "target-episode",
+	firstSeenAt: firstSeenAt + 30,
+	lastSeenAt: lastSeenAt + 30,
+	localHash: "target-local-hash",
+	knownRemoteHash: null,
+};
+const collisionRegistry = new PreservedUnresolvedRegistry([
+	collisionSource,
+	collisionTarget,
+]);
+const collision = collisionRegistry.move(collisionSource.path, collisionTarget.path);
+assert.equal(collision.kind, "collision");
+assert.deepEqual(collisionRegistry.get(collisionSource.path), collisionSource);
+assert.deepEqual(collisionRegistry.get(collisionTarget.path), collisionTarget);
+
 console.log("preserved-unresolved registry tests passed");

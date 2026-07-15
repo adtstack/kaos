@@ -77,16 +77,16 @@ console.log("\n--- Test 5: external edits default to closed files only ---");
 	);
 }
 
-console.log("\n--- Test 6: remote typing guard is enabled by default ---");
+console.log("\n--- Test 6: remote typing advisory is enabled by default ---");
 {
 	assert(
 		DEFAULT_SETTINGS.remoteTypingGuardEnabled,
-		"default settings pause local edits during active remote typing",
+		"default settings warn about active remote typing",
 	);
 	const { settings } = readVaultSyncSettings(undefined);
 	assert(
 		settings.remoteTypingGuardEnabled,
-		"loaded empty settings inherit the remote typing guard",
+		"loaded empty settings inherit the remote typing advisory",
 	);
 }
 

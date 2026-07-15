@@ -40,7 +40,9 @@ function makeFixture(
 ) {
 	const files = new Map<string, StoredFile>();
 	let clock = 1;
+	let blobSourceClock = 1;
 	let blobRef: { hash: string; size: number } | undefined = options.initialBlobRef;
+	let blobSourceVersion = blobRef ? `1:${blobSourceClock++}` : undefined;
 	let tombstoned = blobRef === undefined;
 	let setBlobRefCalls = 0;
 	let deleteBlobRefCalls = 0;
@@ -79,7 +81,7 @@ function makeFixture(
 					error.code = "EEXIST";
 					throw error;
 				}
-				put(candidate, data);
+				return put(candidate, data);
 			},
 			createFolder: async () => {},
 			adapter: {
@@ -96,6 +98,10 @@ function makeFixture(
 			candidate === path && tombstoned,
 		getBlobRef: (candidate: string) =>
 			candidate === path ? blobRef : undefined,
+		getBlobSourceVersion: (candidate: string) =>
+			candidate === path && blobRef && !tombstoned
+				? blobSourceVersion
+				: undefined,
 		getAuthoritativeBlobDeleteSnapshot: (candidate: string) =>
 			candidate === path && tombstoned && !blobRef
 				? { fingerprint: "blob-delete-fingerprint" }
@@ -108,12 +114,14 @@ function makeFixture(
 			assert.equal(candidate, path);
 			setBlobRefCalls++;
 			blobRef = { hash, size };
+			blobSourceVersion = `1:${blobSourceClock++}`;
 			tombstoned = false;
 		},
 		deleteBlobRef: () => {
 			deleteBlobRefCalls++;
 			if (blobRef) {
 				blobRef = undefined;
+				blobSourceVersion = undefined;
 				tombstoned = true;
 			}
 		},
@@ -144,6 +152,8 @@ function makeFixture(
 		() => { markerChangedCalls++; },
 	);
 	// Tests drive queue items deterministically instead of starting drain loops.
+	(manager as any).uploadGateOpen = true;
+	(manager as any).downloadGateOpen = true;
 	(manager as any).kickUploadDrain = () => {};
 	(manager as any).kickDownloadDrain = () => {};
 
@@ -166,6 +176,7 @@ function makeFixture(
 		get createCalls() { return createCalls; },
 		setRemoteBlobRef(ref: { hash: string; size: number } | undefined) {
 			blobRef = ref;
+			blobSourceVersion = ref ? `1:${blobSourceClock++}` : undefined;
 			tombstoned = ref === undefined;
 		},
 	};
@@ -295,6 +306,52 @@ console.log("\n--- Blob Attention resolution safety ---");
 		"successful setBlobRef clears Attention marker",
 	);
 	assert.equal(restored.markerChangedCalls, 1, "marker persistence callback runs after commit");
+}
+
+// setBlobRef can synchronously notify observers. A replacement Attention
+// occurrence installed re-entrantly must not be cleared by the older
+// Keep-local commit that happened to share the same path.
+{
+	const fixture = makeFixture();
+	fixture.manager.keepLocalRemoteDeletedBlob(
+		fixture.path,
+		"remote-delete-missing-baseline",
+		{
+			episodeId: "blob-attention-episode",
+			remoteDeleteFingerprint: "blob-delete-fingerprint",
+		},
+	);
+	const manager = fixture.manager as any;
+	const item = manager.uploadQueue.get(fixture.path);
+	const originalSetBlobRef = manager.vaultSync.setBlobRef.bind(manager.vaultSync);
+	manager.vaultSync.setBlobRef = (...args: unknown[]) => {
+		originalSetBlobRef(...args);
+		manager.preservedUnresolved.record({
+			path: fixture.path,
+			kind: "blob",
+			reason: "remote-delete-missing-baseline",
+			episodeId: "newer-blob-attention-episode",
+		});
+	};
+	manager.blobClient = {
+		exists: async () => [],
+		upload: async () => {},
+	};
+
+	await manager.processUpload(item);
+	const currentEntry = fixture.manager.getPreservedUnresolvedEntries()
+		.find((entry) => entry.path === fixture.path);
+	assert.equal(fixture.setBlobRefCalls, 1, "Keep-local publishes the verified ref once");
+	assert.equal(
+		currentEntry?.episodeId,
+		"newer-blob-attention-episode",
+		"re-entrant replacement Attention episode is not cleared by the older commit",
+	);
+	assert.equal(
+		fixture.markerChangedCalls,
+		0,
+		"older Keep-local commit does not persist a false resolution for the replacement episode",
+	);
 }
 
 // A permanently failed explicit Keep-local upload remains actionable.
@@ -431,10 +488,25 @@ console.log("\n--- Blob Attention resolution safety ---");
 {
 	const fixture = makeFixture();
 	const order: string[] = [];
+	assert.equal(
+		fixture.manager.isAcceptingRemoteDelete(fixture.path),
+		false,
+		"Accept ownership is inactive before the Dashboard action begins",
+	);
 	await fixture.manager.acceptRemoteDeletedBlob(
 		fixture.path,
 		"remote-delete-missing-baseline",
 		async (file) => {
+			assert.equal(
+				fixture.manager.isAcceptingRemoteDelete(file.path),
+				true,
+				"the exact caller-owned trash event is identifiable while Accept runs",
+			);
+			assert.equal(
+				fixture.manager.isAcceptingRemoteDelete("assets/unrelated.png"),
+				false,
+				"Accept ownership never suppresses an unrelated local delete",
+			);
 			order.push("trash");
 			fixture.files.delete(file.path);
 		},
@@ -449,6 +521,11 @@ console.log("\n--- Blob Attention resolution safety ---");
 		},
 	);
 	assert.deepEqual(order, ["persist-fence", "trash"], "queue fence is durable before trash");
+	assert.equal(
+		fixture.manager.isAcceptingRemoteDelete(fixture.path),
+		false,
+		"Accept ownership retires after the Dashboard action settles",
+	);
 }
 
 // The local delete event owned by Accept must not tombstone a remote revival
@@ -605,13 +682,17 @@ console.log("\n--- Blob Attention resolution safety ---");
 }
 
 // A newer ref received during an active download is a distinct rerun target;
-// it must not mutate the hash being verified by the old byte stream.
+// it must not mutate the hash being verified by the old byte stream. Neither
+// attempt may overwrite an existing local attachment. Once H2 is authoritative,
+// H1 must leave no disk artifact; only H2 may be preserved as the candidate.
 {
 	const fixture = makeFixture();
 	const firstBytes = bytes("first remote version");
 	const secondBytes = bytes("second remote version");
+	const initialLocalHash = await sha256Hex(fixture.content);
 	const firstHash = await sha256Hex(firstBytes);
 	const secondHash = await sha256Hex(secondBytes);
+	fixture.setRemoteBlobRef({ hash: firstHash, size: firstBytes.byteLength });
 	const firstDownloadStarted = deferred<void>();
 	const releaseFirstDownload = deferred<ArrayBuffer>();
 	const manager = fixture.manager as any;
@@ -638,6 +719,7 @@ console.log("\n--- Blob Attention resolution safety ---");
 	manager.downloadQueue.set(fixture.path, item);
 	const firstAttempt = manager.processDownload(item);
 	await firstDownloadStarted.promise;
+	fixture.setRemoteBlobRef({ hash: secondHash, size: secondBytes.byteLength });
 	manager.enqueueDownload(fixture.path, secondHash, secondBytes.byteLength);
 	assert.equal(item.hash, firstHash, "active attempt hash remains immutable");
 	assert.equal(item.nextHash, secondHash, "new ref is retained as the rerun target");
@@ -647,36 +729,60 @@ console.log("\n--- Blob Attention resolution safety ---");
 	assert.equal(item.status, "pending", "newer hash remains queued");
 	assert.equal(
 		manager.hashCache[fixture.path]?.hash,
-		firstHash,
-		"old bytes are cached only under their verified hash",
+		initialLocalHash,
+		"the target cache remains tied to the verified local attachment",
+	);
+	assert.equal(
+		new TextDecoder().decode(fixture.files.get(fixture.path)?.data),
+		"local attachment",
+		"the superseded first attempt does not overwrite the local attachment",
+	);
+	assert.equal(
+		Array.from(fixture.files.keys()).filter((path) =>
+			path.includes("KAOS remote conflict")
+		).length,
+		0,
+		"superseded H1 leaves no conflict artifact",
 	);
 	item.status = "processing";
 	await manager.processDownload(item);
 	assert.equal(
 		new TextDecoder().decode(fixture.files.get(fixture.path)?.data),
-		"second remote version",
-		"the rerun downloads and writes the newer bytes",
+		"local attachment",
+		"the rerun also leaves the local attachment untouched",
+	);
+	const conflictContents = Array.from(fixture.files.entries())
+		.filter(([path]) => path.includes("KAOS remote conflict"))
+		.map(([, stored]) => new TextDecoder().decode(stored.data));
+	assert.deepEqual(
+		new Set(conflictContents),
+		new Set(["second remote version"]),
+		"only the authoritative H2 candidate is preserved",
 	);
 }
 
-// If a download already crossed its pre-write fence, Accept waits for that
-// filesystem promise and deletes its final result instead of clearing the
-// marker while a late write can still recreate the attachment.
+// If a conflict-artifact write already crossed its pre-write fence, Accept
+// waits for that filesystem promise before deleting the original attachment
+// and clearing the marker.
 {
 	const fixture = makeFixture();
 	const remote = bytes("remote write already started");
 	const remoteHash = await sha256Hex(remote);
-	const modifyStarted = deferred<void>();
-	const releaseModify = deferred<void>();
+	const artifactStarted = deferred<void>();
+	const releaseArtifact = deferred<void>();
 	const manager = fixture.manager as any;
+	fixture.setRemoteBlobRef({ hash: remoteHash, size: remote.byteLength });
 	manager.blobClient = { download: async () => remote };
-	manager.app.vault.modifyBinary = async (
-		file: StoredFile["file"],
+	const createBinary = manager.app.vault.createBinary;
+	manager.app.vault.createBinary = async (
+		candidate: string,
 		data: ArrayBuffer,
 	) => {
-		modifyStarted.resolve();
-		await releaseModify.promise;
-		fixture.put(file.path, data);
+		if (candidate.includes("KAOS remote conflict")) {
+			artifactStarted.resolve();
+			await releaseArtifact.promise;
+		}
+		return createBinary(candidate, data);
 	};
 	const item = {
 		path: fixture.path,
@@ -694,7 +800,9 @@ console.log("\n--- Blob Attention resolution safety ---");
 		manager.inflightDownloads.delete(fixture.path);
 		manager.notifyTransferSettled(fixture.path);
 	});
-	await modifyStarted.promise;
+	await artifactStarted.promise;
+	fixture.setRemoteBlobRef(undefined);
+	let acceptingResolved = false;
 	const accepting = fixture.manager.acceptRemoteDeletedBlob(
 		fixture.path,
 		"remote-delete-missing-baseline",
@@ -703,17 +811,26 @@ console.log("\n--- Blob Attention resolution safety ---");
 			episodeId: "blob-attention-episode",
 			remoteDeleteFingerprint: "blob-delete-fingerprint",
 		},
-	);
+	).then(() => { acceptingResolved = true; });
 	await Promise.resolve();
+	assert.equal(acceptingResolved, false, "Accept waits for the artifact write");
 	assert.equal(
 		fixture.files.has(fixture.path),
 		true,
-		"Accept waits while the already-started write owns the path",
+		"Accept preserves the original while the artifact write is pending",
 	);
-	releaseModify.resolve();
+	releaseArtifact.resolve();
 	await processing;
 	await accepting;
-	assert.equal(fixture.files.has(fixture.path), false, "Accept deletes the late write result");
+	assert.equal(fixture.files.has(fixture.path), false, "Accept deletes the original after the write settles");
+	const conflict = Array.from(fixture.files.entries()).find(
+		([path]) => path.includes("KAOS remote conflict"),
+	);
+	assert.equal(
+		new TextDecoder().decode(conflict?.[1].data),
+		"remote write already started",
+		"the in-flight remote candidate remains preserved as an artifact",
+	);
 	assert.equal(
 		fixture.manager.isPreservedUnresolved(fixture.path),
 		false,
@@ -722,22 +839,26 @@ console.log("\n--- Blob Attention resolution safety ---");
 }
 
 // Manager teardown is an async barrier: a replacement manager cannot start
-// while an old filesystem write is still capable of completing.
+// while an old conflict-artifact write is still capable of completing.
 {
 	const fixture = makeFixture();
 	const remote = bytes("write settling during destroy");
 	const remoteHash = await sha256Hex(remote);
-	const modifyStarted = deferred<void>();
-	const releaseModify = deferred<void>();
+	const artifactStarted = deferred<void>();
+	const releaseArtifact = deferred<void>();
 	const manager = fixture.manager as any;
+	fixture.setRemoteBlobRef({ hash: remoteHash, size: remote.byteLength });
 	manager.blobClient = { download: async () => remote };
-	manager.app.vault.modifyBinary = async (
-		file: StoredFile["file"],
+	const createBinary = manager.app.vault.createBinary;
+	manager.app.vault.createBinary = async (
+		candidate: string,
 		data: ArrayBuffer,
 	) => {
-		modifyStarted.resolve();
-		await releaseModify.promise;
-		fixture.put(file.path, data);
+		if (candidate.includes("KAOS remote conflict")) {
+			artifactStarted.resolve();
+			await releaseArtifact.promise;
+		}
+		return createBinary(candidate, data);
 	};
 	const item = {
 		path: fixture.path,
@@ -756,18 +877,26 @@ console.log("\n--- Blob Attention resolution safety ---");
 		manager.notifyTransferSettled(fixture.path);
 	});
 	manager.activeTransferPromises.add(processing);
-	await modifyStarted.promise;
+	await artifactStarted.promise;
 	let destroyResolved = false;
 	const destroying = fixture.manager.destroy().then(() => { destroyResolved = true; });
 	await Promise.resolve();
 	assert.equal(destroyResolved, false, "destroy waits for the old filesystem write");
-	releaseModify.resolve();
+	releaseArtifact.resolve();
 	await destroying;
 	assert.equal(destroyResolved, true, "destroy resolves after the write settles");
 	assert.equal(
 		new TextDecoder().decode(fixture.files.get(fixture.path)?.data),
+		"local attachment",
+		"the old manager never overwrites the local attachment",
+	);
+	const conflict = Array.from(fixture.files.entries()).find(
+		([path]) => path.includes("KAOS remote conflict"),
+	);
+	assert.equal(
+		new TextDecoder().decode(conflict?.[1].data),
 		"write settling during destroy",
-		"the last old-manager write completes before teardown returns",
+		"the last old-manager artifact write completes before teardown returns",
 	);
 }
 

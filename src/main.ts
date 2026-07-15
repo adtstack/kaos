@@ -6,16 +6,40 @@ import {
 	type VaultSyncSettings,
 } from "./settings";
 import { SettingsStore } from "./settings/settingsStore";
-import { VaultSync, type ReconcileMode } from "./sync/vaultSync";
+import {
+	VaultSync,
+	type BlobDeleteCommitResult,
+	type CausalBlobRenameResult,
+	type ReconcileMode,
+} from "./sync/vaultSync";
 import { SCHEMA_VERSION } from "./sync/vaultSync";
 import { EditorBindingManager } from "./sync/editorBinding";
 import { DiskMirror } from "./sync/diskMirror";
-import { type BlobQueueSnapshot, type BlobSyncManager } from "./sync/blobSync";
+import {
+	moveSettledBlobRefs,
+	type BlobQueueSnapshot,
+	type BlobSettlementStage,
+	type BlobSettlementStageCache,
+	type BlobSettledRefCache,
+	type BlobSettledSourceVersionCache,
+	type BlobSyncManager,
+} from "./sync/blobSync";
 import {
 	type ServerCapabilities,
 } from "./sync/serverCapabilities";
-import { isMarkdownSyncable, isBlobSyncable } from "./types";
+import {
+	cloneBlobRef,
+	isBlobSyncable,
+	isMarkdownSyncable,
+	sameBlobRef,
+	type BlobRef,
+} from "./types";
 import { planCategoryRenameAction } from "./sync/policy/renameAdmissionPolicy";
+import {
+	planBlobDeleteCommit,
+	planMarkdownDeleteCommit,
+	planRenameEventCommit,
+} from "./sync/policy/vaultEventCommitPolicy";
 import { classifySyncPath } from "./paths/pathCategory";
 import type { TraceSink, ProductFlightPathEventInput } from "./observability/traceSink";
 import { NoopTraceSink } from "./observability/noopTraceSink";
@@ -39,6 +63,7 @@ import {
 import {
 	type BlobHashCache,
 	moveCachedHashes,
+	removeCachedHash,
 } from "./sync/blobHashCache";
 import {
 	BASELINE_TEXT_STORE_VERSION,
@@ -53,10 +78,48 @@ import {
 } from "./sync/baselineTextStore";
 import { IndexedDbBaselineTextRepository } from "./sync/indexedDbBaselineTextRepository";
 import {
+	buildBlobSettledRefStoreKey,
+	IndexedDbBlobSettledRefStore,
+} from "./sync/indexedDbBlobSettledRefStore";
+import {
+	BlobAuthorityScopeGuard,
+	buildBlobAuthorityScopeIdentity,
+	canonicalizeBlobAuthorityScope,
+	type BlobAuthorityEnsureToken,
+	type BlobAuthorityScopeToken,
+} from "./sync/blobAuthorityScopeGuard";
+import {
+	collectLegacyMissingBlobPaths,
+	LEGACY_MISSING_BLOB_ATTENTION_REASON,
+	type LocalDeviceIdentityStatus,
+} from "./sync/blobSettledRefMigration";
+import {
 	getPreservedUnresolvedEpisodeId,
 	isRemoteDeletePreservedUnresolvedEntry,
+	PreservedUnresolvedRegistry,
 	type PreservedUnresolvedEntry,
+	type PreservedUnresolvedReason,
 } from "./sync/preservedUnresolved";
+import {
+	PendingBlobIntentJournal,
+	pendingBlobIntentsOverlap,
+	type PendingBlobIntent,
+	type PendingBlobIntentScope,
+	type PendingBlobMutationBase,
+} from "./sync/pendingBlobIntentJournal";
+import {
+	commitPendingBlobIntentWithWriteAhead,
+	type PendingBlobIntentCommitOutcome,
+} from "./sync/pendingBlobIntentCommit";
+import {
+	buildPendingBlobIntentStoreKey,
+	IndexedDbPendingBlobIntentStore,
+} from "./sync/indexedDbPendingBlobIntentStore";
+import {
+	createPersistedBlobQueueSnapshot,
+	readPersistedBlobQueueSnapshot,
+	type PersistedBlobQueueSnapshot,
+} from "./sync/persistedBlobQueue";
 import {
 	SnapshotService,
 } from "./snapshots/snapshotService";
@@ -106,6 +169,8 @@ import {
 	KaosDashboardView,
 } from "./dashboard/KaosDashboardView";
 import type {
+	DashboardLegacyMissingBlobResolutionChoice,
+	DashboardLegacyMissingBlobResolutionTarget,
 	DashboardRemoteDeleteResolutionChoice,
 	DashboardRemoteDeleteResolutionResult,
 	DashboardRemoteDeleteResolutionTarget,
@@ -126,6 +191,7 @@ import { runSchemaMigrationToV2 } from "./migrations/schemaV2";
 import type { TelemetryRuntimeHandle } from "./telemetry/installTelemetryRuntime";
 import type { EngineControlPort, DiskIngestPort } from "./runtime/engineControlPort";
 import type { BindingPropagationGate } from "./sync/editorBinding";
+import { getOrCreateLocalDeviceIdentity } from "./sync/indexedDbCandidateStore";
 
 // Build-time constant injected by esbuild.
 //   production build (main.js):          define __KAOS_QA_HARNESS_ENABLED__ = false
@@ -138,12 +204,33 @@ const RECOVERY_SNAPSHOT_INTERVAL_MS = 60 * 60 * 1000;
 const CRDT_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const DISK_INDEX_SAVE_DEBOUNCE_MS = 500;
 
+type PendingBlobReplayPrecondition = {
+	kind: "precondition-changed";
+	disposition: "remove-intent" | "retain-intent";
+	path: string;
+	observedOccupant?: object;
+	admitObservedFile?: boolean;
+};
+
+type PendingBlobReplayMutation = {
+	kind: "mutation";
+	sourcePath: string;
+	result: BlobDeleteCommitResult | CausalBlobRenameResult;
+};
+
+type PendingBlobReplayApplyResult =
+	| PendingBlobReplayPrecondition
+	| PendingBlobReplayMutation;
+
 type PersistedPluginState = Partial<VaultSyncSettings> & {
 	_diskIndex?: DiskIndex;
 	_baselineTexts?: BaselineTextStore;
 	_conflictMergeBases?: ConflictMergeBaseStore;
 	_baselineTextStoreVersion?: number;
 	_blobHashCache?: BlobHashCache;
+	/** Legacy unscoped cache; ignored because data.json may be copied cross-device. */
+	_blobSettledRefs?: BlobSettledRefCache;
+	_blobSettledRefsByDevice?: Record<string, BlobSettledRefCache>;
 	/**
 	 * Unix ms timestamp of the last successful saveDiskIndex() call.
 	 * Semantically: "the last time KAOS durably persisted its disk-index
@@ -154,12 +241,13 @@ type PersistedPluginState = Partial<VaultSyncSettings> & {
 	 * See: src/sync/closedFileConflict.ts ClosedFileConflictInput.lastDiskIndexPersistedAt
 	 */
 	_lastDiskIndexPersistedAt?: number;
-	_blobQueue?: BlobQueueSnapshot;
+	_blobQueue?: PersistedBlobQueueSnapshot;
 	_serverCapabilitiesCache?: PersistedServerCapabilitiesCache;
 	_updateManifestCache?: PersistedUpdateManifestCache;
 	_guidedServerUpdate?: PersistedGuidedServerUpdateState;
 	_frontmatterQuarantine?: FrontmatterQuarantineEntry[];
 	_preservedUnresolved?: PreservedUnresolvedEntry[];
+	_pendingBlobIntents?: PendingBlobIntent[];
 };
 
 export default class VaultCrdtSyncPlugin extends Plugin {
@@ -232,9 +320,44 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	/** Persisted blob hash cache: {path -> {mtime, size, hash}}. */
 	private blobHashCache: BlobHashCache = {};
+	/** Last exact disk/ref settlement per attachment path. */
+	private blobSettledRefs: BlobSettledRefCache = {};
+	/** Exact CRDT item episode paired with each settled attachment ref. */
+	private blobSettledSourceVersions: BlobSettledSourceVersionCache = {};
+	/** Durable pre-commit settlement/retirement fences. */
+	private blobSettlementStages: BlobSettlementStageCache = {};
+	private blobSettledRefStore: IndexedDbBlobSettledRefStore | null = null;
+	private blobSettledRefStoreKey: string | null = null;
+	private blobSettledRefPersistChain: Promise<void> = Promise.resolve();
+	private blobSettledRefPersistenceHealthy = false;
+	private readonly blobAuthorityScopeGuard = new BlobAuthorityScopeGuard();
+	/** Exact identity+epoch authority captured when each VaultSync was constructed. */
+	private readonly vaultSyncBlobAuthorityTokens = new WeakMap<
+		VaultSync,
+		BlobAuthorityScopeToken
+	>();
+	private blobAuthorityResetInProgress = false;
+	/** Device-local v4 upgrade fence; paths remain blocked until explicit resolution. */
+	private legacyMissingBlobPaths = new Set<string>();
+	/** Corrupt authority is never auto-healed; only explicit nuclear reset unlatches it. */
+	private readonly corruptBlobSettledRefStoreKeys = new Set<string>();
 
 	/** Persisted blob queue snapshot for crash resilience. */
 	private savedBlobQueue: BlobQueueSnapshot | null = null;
+	/** Local attachment deletes/renames waiting for authoritative provider state. */
+	private readonly pendingBlobIntents = new PendingBlobIntentJournal();
+	private readonly blobIntentSessionId = randomBase64Url(16);
+	private blobIntentLocalDeviceId: string | null = null;
+	private blobLocalDeviceIdentityStatus: LocalDeviceIdentityStatus = "unknown";
+	private pendingBlobIntentStore: IndexedDbPendingBlobIntentStore | null = null;
+	private pendingBlobIntentStoreKey: string | null = null;
+	private pendingBlobIntentPersistChain: Promise<void> = Promise.resolve();
+	private pendingBlobIntentPersistenceHealthy = false;
+	private readonly corruptPendingBlobIntentStoreKeys = new Set<string>();
+	private pendingBlobIntentReplayChain: Promise<void> = Promise.resolve();
+	private readonly replayedCommittedBlobIntentIds = new Set<string>();
+	/** Exact in-session destination identity for pending rename postconditions. */
+	private readonly pendingBlobRenameFiles = new Map<string, TFile>();
 	private preservedUnresolvedEntries: PreservedUnresolvedEntry[] = [];
 	/** Canonical kind:path locks spanning the full dashboard resolution action. */
 	private attentionResolutionInFlight = new Set<string>();
@@ -269,6 +392,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * provider sync event, even if connection generation did not change.
 	 */
 	private awaitingFirstProviderSyncAfterStartup = false;
+	/** Uploads require both local Yjs persistence and a provider-synced room. */
+	private blobLocalPersistenceReady = false;
+	private blobProviderReady = false;
 	private createReconciliationController(): ReconciliationController {
 		this.reconciliationController = new ReconciliationController({
 			app: this.app,
@@ -294,7 +420,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.shouldBlockFrontmatterIngest(path, previousContent, nextContent, reason),
 			refreshServerCapabilities: (reason) => this.refreshServerCapabilities(reason),
 			validateOpenEditorBindings: (reason) => this.editorWorkspace?.validateOpenBindings(reason),
+			replayPendingBlobIntents: (reason) => this.replayPendingBlobIntents(reason),
 			onReconciled: (reason) => this.editorWorkspace?.onReconciled(reason),
+			onBlobReconciled: (mode, reconciledVaultSync) => {
+				if (
+					mode === "authoritative"
+					&& this.isVaultSyncBoundToCurrentBlobScope(reconciledVaultSync)
+					&& !this.blobAuthorityResetInProgress
+					&& this.app.workspace.layoutReady
+					&& reconciledVaultSync.idbError !== true
+					&& this.blobLocalPersistenceReady
+					&& this.blobProviderReady
+					&& this.pendingBlobIntentPersistenceHealthy
+					&& this.blobSettledRefPersistenceHealthy
+				) {
+					this.attachmentOrchestrator?.markUploadAuthorityReady(
+						"authoritative-reconcile",
+					);
+				}
+			},
 			getAwaitingFirstProviderSyncAfterStartup: () => this.awaitingFirstProviderSyncAfterStartup,
 			setAwaitingFirstProviderSyncAfterStartup: (value) => {
 				this.awaitingFirstProviderSyncAfterStartup = value;
@@ -357,6 +501,2136 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private getBlobSync(): BlobSyncManager | null {
 		return this.attachmentOrchestrator?.manager ?? null;
+	}
+
+	private getBlobIntentScope(): PendingBlobIntentScope {
+		const runtime = this.getRuntimeConfig();
+		return canonicalizeBlobAuthorityScope({
+			host: runtime.host,
+			vaultId: runtime.vaultId,
+			localDeviceId: this.blobIntentLocalDeviceId ?? "",
+		});
+	}
+
+	private activateBlobAuthorityScope(
+		reason: string,
+		scope = this.getBlobIntentScope(),
+		options: { force?: boolean; detachStores?: boolean } = {},
+	): { scope: PendingBlobIntentScope; token: BlobAuthorityScopeToken; changed: boolean } {
+		const activation = this.blobAuthorityScopeGuard.activate(scope, {
+			force: options.force,
+		});
+		if (!activation.changed) return activation;
+
+		// The guard advances its epoch before any authority below is touched. A
+		// delayed completion from the prior scope is stale from this point onward.
+		this.pendingBlobIntentPersistenceHealthy = false;
+		this.blobSettledRefPersistenceHealthy = false;
+		this.blobLocalPersistenceReady = false;
+		this.blobProviderReady = false;
+		for (const path of Object.keys(this.blobSettledRefs)) {
+			delete this.blobSettledRefs[path];
+		}
+		for (const path of Object.keys(this.blobSettledSourceVersions)) {
+			delete this.blobSettledSourceVersions[path];
+		}
+		for (const path of Object.keys(this.blobSettlementStages)) {
+			delete this.blobSettlementStages[path];
+		}
+		// BlobSyncManager captures the prior object by reference. Clearing it above
+		// revokes that manager; the new object belongs only to the new scope.
+		this.blobSettledRefs = {};
+		this.blobSettledSourceVersions = {};
+		this.blobSettlementStages = {};
+		this.legacyMissingBlobPaths.clear();
+		this.pendingBlobRenameFiles.clear();
+		this.replayedCommittedBlobIntentIds.clear();
+		this.savedBlobQueue = null;
+		this.attachmentOrchestrator?.hydrateSavedQueue(null);
+		const blobSync = this.getBlobSync();
+		for (const entry of blobSync?.getPreservedUnresolvedEntries() ?? []) {
+			if (
+				entry.kind === "blob"
+				&& entry.reason === LEGACY_MISSING_BLOB_ATTENTION_REASON
+			) blobSync?.clearPreservedUnresolved(entry.path);
+		}
+		this.preservedUnresolvedEntries = this.preservedUnresolvedEntries.filter((entry) =>
+			entry.kind !== "blob"
+			|| entry.reason !== LEGACY_MISSING_BLOB_ATTENTION_REASON
+		);
+		delete this.persistedState._blobQueue;
+		if (options.detachStores !== false) {
+			this.pendingBlobIntentStore = null;
+			this.pendingBlobIntentStoreKey = null;
+			this.blobSettledRefStore = null;
+			this.blobSettledRefStoreKey = null;
+		}
+		this.attachmentOrchestrator?.resetBlobRuntimeAuthority(
+			`blob-authority-scope-change:${reason}`,
+		);
+		this.trace("blob", "blob-authority-scope-activated", {
+			reason,
+			epoch: activation.token.epoch,
+			configured: activation.token.identity !== null,
+		});
+		return activation;
+	}
+
+	private isCurrentBlobAuthority(
+		token: BlobAuthorityScopeToken,
+	): boolean {
+		return this.blobAuthorityScopeGuard.isCurrent(token, this.getBlobIntentScope());
+	}
+
+	private isVaultSyncBoundToCurrentBlobScope(vaultSync: VaultSync): boolean {
+		const token = this.vaultSyncBlobAuthorityTokens.get(vaultSync);
+		return this.vaultSync === vaultSync
+			&& !!token
+			&& this.blobAuthorityScopeGuard.isCurrent(
+				token,
+				this.getBlobIntentScope(),
+			);
+	}
+
+	private captureBlobRuntimeAuthority(
+		vaultSync: VaultSync,
+		scope: PendingBlobIntentScope,
+	): BlobAuthorityScopeToken | null {
+		const token = this.vaultSyncBlobAuthorityTokens.get(vaultSync);
+		if (
+			!token
+			|| this.vaultSync !== vaultSync
+			|| this.blobAuthorityResetInProgress
+			|| !this.blobAuthorityScopeGuard.isCurrent(token, scope)
+		) return null;
+		return { ...token };
+	}
+
+	private isBlobRuntimeAuthorityCurrent(
+		vaultSync: VaultSync,
+		scope: PendingBlobIntentScope,
+		token: BlobAuthorityScopeToken,
+	): boolean {
+		const bound = this.vaultSyncBlobAuthorityTokens.get(vaultSync);
+		return this.vaultSync === vaultSync
+			&& !this.blobAuthorityResetInProgress
+			&& !!bound
+			&& bound.identity === token.identity
+			&& bound.epoch === token.epoch
+			&& this.blobAuthorityScopeGuard.isCurrent(token, scope);
+	}
+
+	private isCurrentPendingBlobEnsure(
+		token: BlobAuthorityEnsureToken,
+		scope: PendingBlobIntentScope,
+		key: string,
+		store: IndexedDbPendingBlobIntentStore,
+	): boolean {
+		return this.blobAuthorityScopeGuard.isCurrentEnsure(token, scope, key, store);
+	}
+
+	private isCurrentSettledBlobEnsure(
+		token: BlobAuthorityEnsureToken,
+		scope: PendingBlobIntentScope,
+		key: string,
+		store: IndexedDbBlobSettledRefStore,
+	): boolean {
+		return this.blobAuthorityScopeGuard.isCurrentEnsure(token, scope, key, store);
+	}
+
+	private async waitForStablePendingBlobIntentTail(
+		token: BlobAuthorityScopeToken,
+	): Promise<boolean> {
+		for (;;) {
+			const tail = this.pendingBlobIntentPersistChain;
+			try {
+				await tail;
+			} catch {
+				// A later write may recover the serialized lane.
+			}
+			if (!this.isCurrentBlobAuthority(token)) return false;
+			if (tail === this.pendingBlobIntentPersistChain) return true;
+		}
+	}
+
+	private async waitForStableBlobSettledRefTail(
+		token: BlobAuthorityScopeToken,
+	): Promise<boolean> {
+		for (;;) {
+			const tail = this.blobSettledRefPersistChain;
+			try {
+				await tail;
+			} catch {
+				// A later write may recover the serialized lane.
+			}
+			if (!this.isCurrentBlobAuthority(token)) return false;
+			if (tail === this.blobSettledRefPersistChain) return true;
+		}
+	}
+
+	private isCurrentPendingBlobWrite(
+		token: BlobAuthorityScopeToken,
+		key: string,
+		store: IndexedDbPendingBlobIntentStore,
+		write: Promise<void>,
+		ensureToken?: BlobAuthorityEnsureToken,
+	): boolean {
+		const currentScope = this.getBlobIntentScope();
+		return this.blobAuthorityScopeGuard.isCurrent(token, currentScope)
+			&& !!currentScope.host
+			&& !!currentScope.vaultId
+			&& !!currentScope.localDeviceId
+			&& buildPendingBlobIntentStoreKey(currentScope) === key
+			&& this.pendingBlobIntentStoreKey === key
+			&& this.pendingBlobIntentStore === store
+			&& this.pendingBlobIntentPersistChain === write
+			&& (!ensureToken
+				|| this.isCurrentPendingBlobEnsure(ensureToken, currentScope, key, store));
+	}
+
+	private enqueuePendingBlobIntentSnapshot(
+		scope: PendingBlobIntentScope,
+		key: string,
+		store: IndexedDbPendingBlobIntentStore,
+		snapshot: PendingBlobIntent[],
+		ensureToken?: BlobAuthorityEnsureToken,
+	): Promise<void> {
+		const token = ensureToken ?? this.blobAuthorityScopeGuard.capture();
+		if (
+			this.blobAuthorityResetInProgress
+			|| !this.blobAuthorityScopeGuard.isCurrent(token, scope)
+			|| this.pendingBlobIntentStoreKey !== key
+			|| this.pendingBlobIntentStore !== store
+		) {
+			return Promise.reject(new Error(
+				"Pending attachment intent store is not current for the active scope",
+			));
+		}
+
+		// A queued write closes authority immediately. Only the latest current tail
+		// may reopen it; an earlier success cannot overtake a later pending write.
+		this.pendingBlobIntentPersistenceHealthy = false;
+		const write = this.pendingBlobIntentPersistChain
+			.catch(() => undefined)
+			.then(() => store.save(snapshot));
+		this.pendingBlobIntentPersistChain = write;
+		void write.then(
+			() => {
+				if (!this.isCurrentPendingBlobWrite(token, key, store, write, ensureToken)) return;
+				this.pendingBlobIntentPersistenceHealthy =
+					!this.corruptPendingBlobIntentStoreKeys.has(key);
+			},
+			(err) => {
+				if (!this.isCurrentPendingBlobWrite(token, key, store, write, ensureToken)) return;
+				this.pendingBlobIntentPersistenceHealthy = false;
+				this.log(`Failed to persist pending attachment intent: ${formatUnknown(err)}`);
+				this.attachmentOrchestrator?.revokeUploadAuthority(
+					"intent-journal-write-failed",
+				);
+			},
+		);
+		return write;
+	}
+
+	private async ensurePendingBlobIntentPersistence(): Promise<boolean> {
+		const activation = this.activateBlobAuthorityScope(
+			"ensure-pending-intent",
+			this.getBlobIntentScope(),
+		);
+		const scope = activation.scope;
+		if (
+			this.blobAuthorityResetInProgress
+			|| !scope.host
+			|| !scope.vaultId
+			|| !scope.localDeviceId
+		) {
+			this.pendingBlobIntentPersistenceHealthy = false;
+			return false;
+		}
+		const key = buildPendingBlobIntentStoreKey(scope);
+		if (this.corruptPendingBlobIntentStoreKeys.has(key)) {
+			this.pendingBlobIntentPersistenceHealthy = false;
+			this.attachmentOrchestrator?.revokeUploadAuthority(
+				"intent-journal-corrupt-latched",
+			);
+			return false;
+		}
+		if (
+			this.pendingBlobIntentStore
+			&& this.pendingBlobIntentStoreKey === key
+			&& this.pendingBlobIntentPersistenceHealthy
+		) return true;
+
+		// Detach before awaiting. This invalidates callbacks belonging to a failed
+		// same-scope store without discarding its serialized tail.
+		this.pendingBlobIntentPersistenceHealthy = false;
+		this.pendingBlobIntentStore = null;
+		this.pendingBlobIntentStoreKey = null;
+		let store: IndexedDbPendingBlobIntentStore;
+		try {
+			store = new IndexedDbPendingBlobIntentStore(scope);
+		} catch (err) {
+			if (!this.blobAuthorityScopeGuard.isCurrent(activation.token, scope)) return false;
+			this.log(`Local attachment intent journal unavailable: ${formatUnknown(err)}`);
+			this.attachmentOrchestrator?.revokeUploadAuthority(
+				"intent-journal-unavailable",
+			);
+			return false;
+		}
+		const ensureToken = this.blobAuthorityScopeGuard.beginEnsure(
+			"pending",
+			scope,
+			key,
+			store,
+		);
+
+		if (!await this.waitForStablePendingBlobIntentTail(ensureToken)) return false;
+		if (!this.isCurrentPendingBlobEnsure(ensureToken, scope, key, store)) return false;
+		const loadTail = this.pendingBlobIntentPersistChain;
+		try {
+			const loaded = await store.loadWithStatus();
+			if (
+				this.pendingBlobIntentPersistChain !== loadTail
+				|| !this.isCurrentPendingBlobEnsure(ensureToken, scope, key, store)
+			) return false;
+			if (loaded.status === "corrupt") {
+				this.corruptPendingBlobIntentStoreKeys.add(key);
+				this.log("Local attachment intent journal is corrupt; attachment transfers remain paused");
+				this.attachmentOrchestrator?.revokeUploadAuthority(
+					"intent-journal-corrupt",
+				);
+				return false;
+			}
+
+			const inMemory = this.pendingBlobIntents.getEntries(scope);
+			const merged = new Map(loaded.entries.map((entry) => [entry.id, entry]));
+			for (const entry of inMemory) merged.set(entry.id, entry);
+			const entries = Array.from(merged.values());
+			const foreignEntries = this.pendingBlobIntents.getEntries().filter((entry) =>
+				buildPendingBlobIntentStoreKey(entry.scope) !== key
+			);
+			this.pendingBlobIntents.hydrate([...foreignEntries, ...entries]);
+			this.pendingBlobIntentStore = store;
+			this.pendingBlobIntentStoreKey = key;
+
+			if (loaded.status === "missing" || inMemory.length > 0) {
+				const write = this.enqueuePendingBlobIntentSnapshot(
+					scope,
+					key,
+					store,
+					entries,
+					ensureToken,
+				);
+				try {
+					await write;
+				} catch {
+					if (!this.isCurrentPendingBlobEnsure(ensureToken, scope, key, store)) return false;
+					if (!await this.waitForStablePendingBlobIntentTail(ensureToken)) return false;
+					return this.pendingBlobIntentStore === store
+						&& this.pendingBlobIntentStoreKey === key
+						&& this.pendingBlobIntentPersistenceHealthy;
+				}
+				if (!this.isCurrentPendingBlobEnsure(ensureToken, scope, key, store)) return false;
+				if (!await this.waitForStablePendingBlobIntentTail(ensureToken)) return false;
+				return this.pendingBlobIntentStore === store
+					&& this.pendingBlobIntentStoreKey === key
+					&& this.pendingBlobIntentPersistenceHealthy;
+			}
+
+			this.pendingBlobIntentPersistenceHealthy = true;
+			return true;
+		} catch (err) {
+			if (
+				this.pendingBlobIntentPersistChain !== loadTail
+				|| !this.isCurrentPendingBlobEnsure(ensureToken, scope, key, store)
+			) return false;
+			this.pendingBlobIntentPersistenceHealthy = false;
+			this.pendingBlobIntentStore = null;
+			this.pendingBlobIntentStoreKey = null;
+			this.log(`Local attachment intent journal unavailable: ${formatUnknown(err)}`);
+			this.attachmentOrchestrator?.revokeUploadAuthority(
+				"intent-journal-unavailable",
+			);
+			return false;
+		}
+	}
+
+	private enqueuePendingBlobIntentPersistence(): Promise<void> {
+		const activation = this.activateBlobAuthorityScope(
+			"enqueue-pending-intent",
+			this.getBlobIntentScope(),
+		);
+		const scope = activation.scope;
+		const key = scope.host && scope.vaultId && scope.localDeviceId
+			? buildPendingBlobIntentStoreKey(scope)
+			: null;
+		if (this.blobAuthorityResetInProgress) {
+			return Promise.reject(new Error("Blob authority reset is in progress"));
+		}
+		if (key && this.corruptPendingBlobIntentStoreKeys.has(key)) {
+			this.pendingBlobIntentPersistenceHealthy = false;
+			this.attachmentOrchestrator?.revokeUploadAuthority(
+				"intent-journal-corrupt-latched",
+			);
+			return Promise.reject(
+				new Error("Pending attachment intent store is corrupt for the active scope"),
+			);
+		}
+		const store = key && this.pendingBlobIntentStoreKey === key
+			? this.pendingBlobIntentStore
+			: null;
+		if (!key || !store) {
+			this.pendingBlobIntentPersistenceHealthy = false;
+			return Promise.reject(
+				new Error("Pending attachment intent store is not initialized for the active scope"),
+			);
+		}
+
+		return this.enqueuePendingBlobIntentSnapshot(
+			scope,
+			key,
+			store,
+			this.pendingBlobIntents.getEntries(scope),
+		);
+	}
+
+	private persistPendingBlobIntents(): void {
+		const activation = this.activateBlobAuthorityScope(
+			"persist-pending-intent",
+			this.getBlobIntentScope(),
+		);
+		const scope = activation.scope;
+		const token = activation.token;
+		const key = scope.host && scope.vaultId && scope.localDeviceId
+			? buildPendingBlobIntentStoreKey(scope)
+			: null;
+		if (!key || this.pendingBlobIntentStoreKey !== key || !this.pendingBlobIntentStore) {
+			this.pendingBlobIntentPersistenceHealthy = false;
+			this.attachmentOrchestrator?.revokeUploadAuthority(
+				"intent-journal-scope-not-ready",
+			);
+			void this.ensurePendingBlobIntentPersistence().then((ready) => {
+				if (
+					ready
+					&& this.isCurrentBlobAuthority(token)
+					&& this.pendingBlobIntentStoreKey === key
+				) void this.enqueuePendingBlobIntentPersistence().catch(() => undefined);
+			});
+			return;
+		}
+		void this.enqueuePendingBlobIntentPersistence().catch(() => undefined);
+	}
+
+	private async flushPendingBlobIntentPersistence(): Promise<boolean> {
+		for (;;) {
+			const tail = this.pendingBlobIntentPersistChain;
+			try {
+				await tail;
+			} catch {
+				if (tail !== this.pendingBlobIntentPersistChain) continue;
+				return false;
+			}
+			if (tail === this.pendingBlobIntentPersistChain) {
+				return this.pendingBlobIntentPersistenceHealthy;
+			}
+		}
+	}
+
+	private isCurrentBlobSettledRefWrite(
+		token: BlobAuthorityScopeToken,
+		key: string,
+		store: IndexedDbBlobSettledRefStore,
+		write: Promise<void>,
+		ensureToken?: BlobAuthorityEnsureToken,
+	): boolean {
+		const currentScope = this.getBlobIntentScope();
+		return this.blobAuthorityScopeGuard.isCurrent(token, currentScope)
+			&& !!currentScope.host
+			&& !!currentScope.vaultId
+			&& !!currentScope.localDeviceId
+			&& buildBlobSettledRefStoreKey(currentScope) === key
+			&& this.blobSettledRefStoreKey === key
+			&& this.blobSettledRefStore === store
+			&& this.blobSettledRefPersistChain === write
+			&& (!ensureToken
+				|| this.isCurrentSettledBlobEnsure(ensureToken, currentScope, key, store));
+	}
+
+	private enqueueBlobSettledRefSnapshot(
+		scope: PendingBlobIntentScope,
+		key: string,
+		store: IndexedDbBlobSettledRefStore,
+		snapshot: BlobSettledRefCache,
+		sourceVersions: BlobSettledSourceVersionCache,
+		stages: BlobSettlementStageCache,
+		legacyMissingPaths: string[],
+		ensureToken?: BlobAuthorityEnsureToken,
+	): Promise<void> {
+		const token = ensureToken ?? this.blobAuthorityScopeGuard.capture();
+		if (
+			this.blobAuthorityResetInProgress
+			|| !this.blobAuthorityScopeGuard.isCurrent(token, scope)
+			|| this.blobSettledRefStoreKey !== key
+			|| this.blobSettledRefStore !== store
+		) {
+			return Promise.reject(new Error(
+				"Blob settlement store is not current for the active scope",
+			));
+		}
+
+		this.blobSettledRefPersistenceHealthy = false;
+		const write = this.blobSettledRefPersistChain
+			.catch(() => undefined)
+			.then(() => store.save(snapshot, {
+				legacyMissingPaths,
+				sourceVersions,
+				stages,
+			}));
+		this.blobSettledRefPersistChain = write;
+		void write.then(
+			() => {
+				if (!this.isCurrentBlobSettledRefWrite(token, key, store, write, ensureToken)) return;
+				this.blobSettledRefPersistenceHealthy =
+					!this.corruptBlobSettledRefStoreKeys.has(key);
+			},
+			(err) => {
+				if (!this.isCurrentBlobSettledRefWrite(token, key, store, write, ensureToken)) return;
+				this.blobSettledRefPersistenceHealthy = false;
+				this.log(`Failed to persist settled attachment refs: ${formatUnknown(err)}`);
+				this.attachmentOrchestrator?.revokeUploadAuthority(
+					"settled-ref-journal-write-failed",
+				);
+			},
+		);
+		return write;
+	}
+
+	private async ensureBlobSettledRefPersistence(): Promise<boolean> {
+		const activation = this.activateBlobAuthorityScope(
+			"ensure-settled-ref",
+			this.getBlobIntentScope(),
+		);
+		const scope = activation.scope;
+		if (
+			this.blobAuthorityResetInProgress
+			|| !scope.host
+			|| !scope.vaultId
+			|| !scope.localDeviceId
+		) {
+			this.blobSettledRefPersistenceHealthy = false;
+			return false;
+		}
+		const key = buildBlobSettledRefStoreKey(scope);
+		if (this.corruptBlobSettledRefStoreKeys.has(key)) {
+			this.blobSettledRefPersistenceHealthy = false;
+			this.attachmentOrchestrator?.revokeUploadAuthority(
+				"settled-ref-journal-corrupt-latched",
+			);
+			return false;
+		}
+		if (
+			this.blobSettledRefStore
+			&& this.blobSettledRefStoreKey === key
+			&& this.blobSettledRefPersistenceHealthy
+		) return true;
+
+		this.blobSettledRefPersistenceHealthy = false;
+		this.blobSettledRefStore = null;
+		this.blobSettledRefStoreKey = null;
+		let store: IndexedDbBlobSettledRefStore;
+		try {
+			store = new IndexedDbBlobSettledRefStore(scope);
+		} catch (err) {
+			if (!this.blobAuthorityScopeGuard.isCurrent(activation.token, scope)) return false;
+			this.log(`Local attachment settlement journal unavailable: ${formatUnknown(err)}`);
+			this.attachmentOrchestrator?.revokeUploadAuthority(
+				"settled-ref-journal-unavailable",
+			);
+			return false;
+		}
+		const ensureToken = this.blobAuthorityScopeGuard.beginEnsure(
+			"settled",
+			scope,
+			key,
+			store,
+		);
+
+		if (!await this.waitForStableBlobSettledRefTail(ensureToken)) return false;
+		if (!this.isCurrentSettledBlobEnsure(ensureToken, scope, key, store)) return false;
+		const loadTail = this.blobSettledRefPersistChain;
+		try {
+			const loaded = await store.loadWithStatus();
+			if (
+				this.blobSettledRefPersistChain !== loadTail
+				|| !this.isCurrentSettledBlobEnsure(ensureToken, scope, key, store)
+			) return false;
+			if (loaded.status === "corrupt") {
+				this.corruptBlobSettledRefStoreKeys.add(key);
+				this.log("Local attachment settlement journal is corrupt; attachment transfers remain paused");
+				this.attachmentOrchestrator?.revokeUploadAuthority(
+					"settled-ref-journal-corrupt",
+				);
+				return false;
+			}
+
+			// The stable-tail check above makes the durable snapshot authoritative.
+			// Never merge by key presence: an absent key is a meaningful settlement
+			// retirement/stage removal and an old loaded value must not resurrect it.
+			const nextSettledRefs = { ...loaded.cache };
+			const nextSourceVersions = { ...loaded.sourceVersions };
+			const nextStages = { ...loaded.stages };
+			const legacyMissingPaths = loaded.migrationStatus === "initialized"
+				? loaded.legacyMissingPaths
+				: collectLegacyMissingBlobPaths({
+					identityStatus: this.blobLocalDeviceIdentityStatus,
+					hashCache: this.blobHashCache,
+					isPathPresent: (path) =>
+						this.app.vault.getAbstractFileByPath(path) !== null,
+					isPathSyncable: (path) => this.isBlobPathSyncable(path),
+				});
+
+			for (const path of Object.keys(this.blobSettledRefs)) {
+				delete this.blobSettledRefs[path];
+			}
+			for (const path of Object.keys(this.blobSettledSourceVersions)) {
+				delete this.blobSettledSourceVersions[path];
+			}
+			for (const path of Object.keys(this.blobSettlementStages)) {
+				delete this.blobSettlementStages[path];
+			}
+			Object.assign(this.blobSettledRefs, nextSettledRefs);
+			Object.assign(this.blobSettledSourceVersions, nextSourceVersions);
+			Object.assign(this.blobSettlementStages, nextStages);
+			this.legacyMissingBlobPaths = new Set([
+				...legacyMissingPaths,
+				...Object.entries(nextStages)
+					.filter(([, stage]) => stage.kind !== "retire")
+					.map(([path]) => path),
+			]);
+			this.blobSettledRefStore = store;
+			this.blobSettledRefStoreKey = key;
+			const attentionChanged = this.hydrateLegacyMissingBlobAttention();
+
+			if (
+				loaded.status === "missing"
+				|| loaded.migrationStatus === "uninitialized"
+			) {
+				const write = this.enqueueBlobSettledRefSnapshot(
+					scope,
+					key,
+					store,
+					{ ...this.blobSettledRefs },
+					{ ...this.blobSettledSourceVersions },
+					{ ...this.blobSettlementStages },
+					Array.from(this.legacyMissingBlobPaths),
+					ensureToken,
+				);
+				try {
+					await write;
+				} catch {
+					if (!this.isCurrentSettledBlobEnsure(ensureToken, scope, key, store)) return false;
+					if (!await this.waitForStableBlobSettledRefTail(ensureToken)) return false;
+					return this.blobSettledRefStore === store
+						&& this.blobSettledRefStoreKey === key
+						&& this.blobSettledRefPersistenceHealthy;
+				}
+				if (!this.isCurrentSettledBlobEnsure(ensureToken, scope, key, store)) return false;
+				if (!await this.waitForStableBlobSettledRefTail(ensureToken)) return false;
+				if (attentionChanged) void this.persistPluginState();
+				return this.blobSettledRefStore === store
+					&& this.blobSettledRefStoreKey === key
+					&& this.blobSettledRefPersistenceHealthy;
+			}
+
+			this.blobSettledRefPersistenceHealthy = true;
+			if (attentionChanged) void this.persistPluginState();
+			return true;
+		} catch (err) {
+			if (
+				this.blobSettledRefPersistChain !== loadTail
+				|| !this.isCurrentSettledBlobEnsure(ensureToken, scope, key, store)
+			) return false;
+			this.blobSettledRefPersistenceHealthy = false;
+			this.blobSettledRefStore = null;
+			this.blobSettledRefStoreKey = null;
+			this.log(`Local attachment settlement journal unavailable: ${formatUnknown(err)}`);
+			this.attachmentOrchestrator?.revokeUploadAuthority(
+				"settled-ref-journal-unavailable",
+			);
+			return false;
+		}
+	}
+
+	private enqueueBlobSettledRefPersistence(): Promise<void> {
+		const activation = this.activateBlobAuthorityScope(
+			"enqueue-settled-ref",
+			this.getBlobIntentScope(),
+		);
+		const scope = activation.scope;
+		const key = scope.host && scope.vaultId && scope.localDeviceId
+			? buildBlobSettledRefStoreKey(scope)
+			: null;
+		if (this.blobAuthorityResetInProgress) {
+			return Promise.reject(new Error("Blob authority reset is in progress"));
+		}
+		if (key && this.corruptBlobSettledRefStoreKeys.has(key)) {
+			this.blobSettledRefPersistenceHealthy = false;
+			this.attachmentOrchestrator?.revokeUploadAuthority(
+				"settled-ref-journal-corrupt-latched",
+			);
+			return Promise.reject(
+				new Error("Blob settlement store is corrupt for the active scope"),
+			);
+		}
+		const store = key && this.blobSettledRefStoreKey === key
+			? this.blobSettledRefStore
+			: null;
+		if (!key || !store) {
+			this.blobSettledRefPersistenceHealthy = false;
+			return Promise.reject(
+				new Error("Blob settlement store is not initialized for the active scope"),
+			);
+		}
+
+		return this.enqueueBlobSettledRefSnapshot(
+			scope,
+			key,
+			store,
+			{ ...this.blobSettledRefs },
+			{ ...this.blobSettledSourceVersions },
+			{ ...this.blobSettlementStages },
+			Array.from(this.legacyMissingBlobPaths),
+		);
+	}
+
+	private hydrateLegacyMissingBlobAttention(): boolean {
+		if (this.legacyMissingBlobPaths.size === 0) return false;
+		const markdownEntries = this.preservedUnresolvedEntries.filter(
+			(entry) => entry.kind === "markdown",
+		);
+		const registry = new PreservedUnresolvedRegistry(
+			this.preservedUnresolvedEntries.filter((entry) => entry.kind === "blob"),
+		);
+		let changed = false;
+		for (const path of this.legacyMissingBlobPaths) {
+			const existing = registry.get(path);
+			if (existing?.reason === LEGACY_MISSING_BLOB_ATTENTION_REASON) continue;
+			registry.record({
+				path,
+				kind: "blob",
+				reason: LEGACY_MISSING_BLOB_ATTENTION_REASON,
+			});
+			changed = true;
+		}
+		if (changed) {
+			this.preservedUnresolvedEntries = [...markdownEntries, ...registry.getEntries()];
+		}
+		return changed;
+	}
+
+	private persistBlobSettledRefs(): void {
+		const token = this.blobAuthorityScopeGuard.capture();
+		const previousTail = this.blobSettledRefPersistChain;
+		void this.enqueueBlobSettledRefPersistence().catch((err) => {
+			if (!this.isCurrentBlobAuthority(token)) return;
+			// An appended write reports its own failure only if it remains the
+			// latest exact tail. This outer path is solely for early enqueue failure.
+			if (this.blobSettledRefPersistChain !== previousTail) return;
+			this.log(`Failed to queue settled attachment refs: ${formatUnknown(err)}`);
+			this.attachmentOrchestrator?.revokeUploadAuthority(
+				"settled-ref-journal-scope-not-ready",
+			);
+		});
+	}
+
+	private handleBlobSettledRefsChanged(
+		path: string | undefined,
+		ref: BlobRef | undefined,
+		scope: PendingBlobIntentScope,
+		vaultSync: VaultSync,
+		token: BlobAuthorityScopeToken,
+	): void {
+		if (!this.isBlobRuntimeAuthorityCurrent(vaultSync, scope, token)) return;
+		// A fresh exact settlement is trusted device-local authority. It is the
+		// only implicit way to retire an upgrade quarantine; merely clearing the
+		// data.json Attention marker is insufficient.
+		if (path && ref && sameBlobRef(this.blobSettledRefs[path], ref)) {
+			this.legacyMissingBlobPaths.delete(normalizePath(path));
+		}
+		this.persistBlobSettledRefs();
+	}
+
+	private assertBlobSettlementCallbackAuthority(
+		scope: PendingBlobIntentScope,
+		vaultSync: VaultSync,
+	): void {
+		if (
+			buildBlobAuthorityScopeIdentity(scope)
+				!== this.blobAuthorityScopeGuard.currentIdentity
+			|| !this.isVaultSyncBoundToCurrentBlobScope(vaultSync)
+			|| this.blobAuthorityResetInProgress
+		) {
+			throw new Error("Attachment settlement authority changed");
+		}
+	}
+
+	private async stageBlobSettlement(
+		path: string,
+		stage: BlobSettlementStage,
+		scope: PendingBlobIntentScope,
+		vaultSync: VaultSync,
+	): Promise<void> {
+		this.assertBlobSettlementCallbackAuthority(scope, vaultSync);
+		const normalized = normalizePath(path);
+		const current = this.blobSettlementStages[normalized];
+		if (
+			current
+			&& (
+				current.stageId !== stage.stageId
+				|| current.kind !== stage.kind
+				|| !sameBlobRef(current.ref, stage.ref)
+				|| current.sourceVersion !== stage.sourceVersion
+			)
+		) {
+			throw new Error(`Attachment settlement is already unresolved for "${normalized}"`);
+		}
+		this.blobSettlementStages[normalized] = stage.ref
+			? { ...stage, ref: cloneBlobRef(stage.ref)! }
+			: { ...stage };
+		await this.enqueueBlobSettledRefPersistence();
+		this.assertBlobSettlementCallbackAuthority(scope, vaultSync);
+		if (this.blobSettlementStages[normalized]?.stageId !== stage.stageId) {
+			throw new Error(`Attachment settlement stage changed for "${normalized}"`);
+		}
+	}
+
+	private async finalizeBlobSettlement(
+		path: string,
+		stageId: string,
+		ref: BlobRef,
+		sourceVersion: string,
+		scope: PendingBlobIntentScope,
+		vaultSync: VaultSync,
+	): Promise<void> {
+		this.assertBlobSettlementCallbackAuthority(scope, vaultSync);
+		const normalized = normalizePath(path);
+		const staged = this.blobSettlementStages[normalized];
+		if (
+			staged?.stageId !== stageId
+			|| staged.kind === "retire"
+			|| !sameBlobRef(staged.ref, ref)
+		) {
+			throw new Error(`Attachment settlement stage changed for "${normalized}"`);
+		}
+		if (
+			staged.sourceVersion !== undefined
+			&& staged.sourceVersion !== sourceVersion
+		) {
+			throw new Error(`Attachment settlement episode changed for "${normalized}"`);
+		}
+		if (
+			!sameBlobRef(vaultSync.getBlobRef(normalized), ref)
+			|| vaultSync.getBlobSourceVersion(normalized) !== sourceVersion
+		) {
+			throw new Error(`Attachment source changed before settlement for "${normalized}"`);
+		}
+		this.blobSettledRefs[normalized] = cloneBlobRef(ref)!;
+		this.blobSettledSourceVersions[normalized] = sourceVersion;
+		delete this.blobSettlementStages[normalized];
+		this.legacyMissingBlobPaths.delete(normalized);
+		await this.enqueueBlobSettledRefPersistence();
+		this.assertBlobSettlementCallbackAuthority(scope, vaultSync);
+	}
+
+	private async retireBlobSettlement(
+		path: string,
+		stageId: string,
+		scope: PendingBlobIntentScope,
+		vaultSync: VaultSync,
+	): Promise<void> {
+		this.assertBlobSettlementCallbackAuthority(scope, vaultSync);
+		const normalized = normalizePath(path);
+		const staged = this.blobSettlementStages[normalized];
+		if (staged?.stageId !== stageId || staged.kind !== "retire") {
+			throw new Error(`Attachment retirement stage changed for "${normalized}"`);
+		}
+		delete this.blobSettledRefs[normalized];
+		delete this.blobSettledSourceVersions[normalized];
+		// The durable retire stage is the compact absence provenance. Keep it
+		// after the old settlement is removed so a server snapshot rollback or a
+		// byte-identical new CRDT episode cannot be mistaken for first bootstrap.
+		this.legacyMissingBlobPaths.delete(normalized);
+		await this.enqueueBlobSettledRefPersistence();
+		this.assertBlobSettlementCallbackAuthority(scope, vaultSync);
+	}
+
+	private async abortBlobSettlementStage(
+		path: string,
+		stageId: string,
+		scope: PendingBlobIntentScope,
+		vaultSync: VaultSync,
+	): Promise<void> {
+		this.assertBlobSettlementCallbackAuthority(scope, vaultSync);
+		const normalized = normalizePath(path);
+		if (this.blobSettlementStages[normalized]?.stageId !== stageId) return;
+		delete this.blobSettlementStages[normalized];
+		await this.enqueueBlobSettledRefPersistence();
+		this.assertBlobSettlementCallbackAuthority(scope, vaultSync);
+	}
+
+	private async setLegacyMissingBlobQuarantine(
+		path: string,
+		quarantined: boolean,
+	): Promise<void> {
+		const normalized = normalizePath(path);
+		const wasQuarantined = this.legacyMissingBlobPaths.has(normalized);
+		if (wasQuarantined === quarantined) return;
+		if (!this.blobSettledRefPersistenceHealthy || !this.blobSettledRefStore) {
+			throw new Error("Local attachment settlement journal is unavailable.");
+		}
+		if (quarantined) this.legacyMissingBlobPaths.add(normalized);
+		else this.legacyMissingBlobPaths.delete(normalized);
+		try {
+			await this.enqueueBlobSettledRefPersistence();
+		} catch (err) {
+			if (wasQuarantined) this.legacyMissingBlobPaths.add(normalized);
+			else this.legacyMissingBlobPaths.delete(normalized);
+			throw err;
+		}
+	}
+
+	private async clearBlobSettlementFenceForExplicitResolution(
+		path: string,
+		vaultSync: VaultSync,
+	): Promise<void> {
+		if (!this.isVaultSyncBoundToCurrentBlobScope(vaultSync)) {
+			throw new Error("Attachment authority changed. Refresh the dashboard.");
+		}
+		const normalized = normalizePath(path);
+		delete this.blobSettlementStages[normalized];
+		delete this.blobSettledRefs[normalized];
+		delete this.blobSettledSourceVersions[normalized];
+		await this.enqueueBlobSettledRefPersistence();
+		if (!this.isVaultSyncBoundToCurrentBlobScope(vaultSync)) {
+			throw new Error("Attachment authority changed. Refresh the dashboard.");
+		}
+	}
+
+	private async flushBlobSettledRefPersistence(): Promise<boolean> {
+		for (;;) {
+			const tail = this.blobSettledRefPersistChain;
+			try {
+				await tail;
+			} catch {
+				if (tail !== this.blobSettledRefPersistChain) continue;
+				return false;
+			}
+			if (tail === this.blobSettledRefPersistChain) {
+				return this.blobSettledRefPersistenceHealthy;
+			}
+		}
+	}
+
+	private captureBlobMutationBase(path: string): PendingBlobMutationBase {
+		const normalized = normalizePath(path);
+		if (this.blobSettlementStages[normalized]) {
+			return {
+				known: false,
+				ref: undefined,
+				sourceVersionKnown: false,
+			};
+		}
+		const settledRef = cloneBlobRef(this.blobSettledRefs[normalized]);
+		if (settledRef) {
+			const currentRef = cloneBlobRef(this.vaultSync?.getBlobRef(normalized));
+			const settledSourceVersion = this.blobSettledSourceVersions[normalized];
+			const currentSourceVersion = this.vaultSync?.getBlobSourceVersion(normalized);
+			return {
+				known: true,
+				ref: settledRef,
+				sourceVersionKnown: sameBlobRef(currentRef, settledRef)
+					&& settledSourceVersion !== undefined
+					&& currentSourceVersion === settledSourceVersion,
+				expectedSourceVersion: sameBlobRef(currentRef, settledRef)
+					&& currentSourceVersion === settledSourceVersion
+					? settledSourceVersion
+					: undefined,
+			};
+		}
+		if (
+			this.vaultSync?.providerSynced
+			&& this.blobProviderReady
+			&& this.blobLocalPersistenceReady
+			&& !this.vaultSync.getBlobRef(normalized)
+		) {
+			return {
+				known: true,
+				ref: undefined,
+				sourceVersionKnown: true,
+			};
+		}
+		return {
+			known: false,
+			ref: undefined,
+			sourceVersionKnown: false,
+		};
+	}
+
+	private schedulePendingBlobIntentReplay(reason: string): void {
+		void this.replayPendingBlobIntents(reason).catch((err) => {
+			this.log(`Pending attachment intent replay failed: ${formatUnknown(err)}`);
+		});
+	}
+
+	private recordPendingBlobDelete(path: string, reason: string): void {
+		const scope = this.getBlobIntentScope();
+		if (!scope.host || !scope.vaultId || !scope.localDeviceId) {
+			this.pendingBlobIntentPersistenceHealthy = false;
+			this.getBlobSync()?.fenceLocalMutationIntent(path, reason);
+			this.recordPersistedBlobUnresolved(
+				path,
+				"local-blob-mutation-remote-conflict",
+			);
+			this.attachmentOrchestrator?.revokeUploadAuthority(
+				"intent-journal-scope-unavailable",
+			);
+			return;
+		}
+		const base = this.captureBlobMutationBase(path);
+		this.getBlobSync()?.fenceLocalMutationIntent(path, reason);
+		const intent = this.pendingBlobIntents.recordDelete(path, scope, base);
+		this.prunePendingBlobRenameFiles();
+		this.trace("blob", "local-blob-delete-intent-journaled", {
+			path: intent.kind === "delete" ? intent.path : normalizePath(path),
+			reason,
+			pendingCount: this.pendingBlobIntents.size,
+		});
+		this.persistPendingBlobIntents();
+		this.schedulePendingBlobIntentReplay(`record-delete:${reason}`);
+	}
+
+	private recordPendingBlobRename(
+		oldPath: string,
+		newPath: string,
+		reason: string,
+		file: TFile,
+	): void {
+		const scope = this.getBlobIntentScope();
+		if (!scope.host || !scope.vaultId || !scope.localDeviceId) {
+			this.pendingBlobIntentPersistenceHealthy = false;
+			this.getBlobSync()?.fenceLocalMutationIntent(oldPath, reason);
+			this.getBlobSync()?.fenceLocalMutationIntent(newPath, reason);
+			this.recordPersistedBlobUnresolved(
+				oldPath,
+				"local-blob-mutation-remote-conflict",
+			);
+			this.recordPersistedBlobUnresolved(
+				newPath,
+				"local-blob-mutation-remote-conflict",
+			);
+			this.attachmentOrchestrator?.revokeUploadAuthority(
+				"intent-journal-scope-unavailable",
+			);
+			return;
+		}
+		const base = this.captureBlobMutationBase(oldPath);
+		this.getBlobSync()?.fenceLocalMutationIntent(oldPath, reason);
+		if (normalizePath(oldPath) !== normalizePath(newPath)) {
+			this.getBlobSync()?.fenceLocalMutationIntent(newPath, reason);
+		}
+		const normalizedOld = normalizePath(oldPath);
+		const chainedIntent = this.pendingBlobIntents.getEntries(scope).find(
+			(entry) => entry.kind === "rename"
+				&& entry.committedAt === undefined
+				&& entry.commitAttemptId === undefined
+				&& entry.newPath === normalizedOld,
+		);
+		if (
+			chainedIntent?.kind === "rename"
+			&& this.pendingBlobRenameFiles.get(chainedIntent.id) !== file
+		) {
+			// A path-only A->B, B->C chain is not sufficient under TFile ABA.
+			// Retire A and record B->C as a separate intent when the exact file
+			// identity does not continue across both events.
+			this.pendingBlobIntents.recordDelete(normalizedOld, scope, base);
+			this.prunePendingBlobRenameFiles();
+		}
+		const intent = this.pendingBlobIntents.recordRename(
+			oldPath,
+			newPath,
+			scope,
+			base,
+		);
+		this.prunePendingBlobRenameFiles();
+		if (intent) this.pendingBlobRenameFiles.set(intent.id, file);
+		this.trace("blob", "local-blob-rename-intent-journaled", {
+			oldPath: normalizePath(oldPath),
+			newPath: normalizePath(newPath),
+			reason,
+			coalesced: intent === null,
+			pendingCount: this.pendingBlobIntents.size,
+		});
+		this.persistPendingBlobIntents();
+		this.schedulePendingBlobIntentReplay(`record-rename:${reason}`);
+	}
+
+	private prunePendingBlobRenameFiles(): void {
+		const liveIntentIds = new Set(
+			this.pendingBlobIntents.getEntries().map((entry) => entry.id),
+		);
+		for (const id of this.pendingBlobRenameFiles.keys()) {
+			if (!liveIntentIds.has(id)) this.pendingBlobRenameFiles.delete(id);
+		}
+		for (const id of this.replayedCommittedBlobIntentIds) {
+			if (!liveIntentIds.has(id)) this.replayedCommittedBlobIntentIds.delete(id);
+		}
+	}
+
+	private invalidateBlobPathAuthority(path: string): void {
+		const normalized = normalizePath(path);
+		removeCachedHash(this.blobHashCache, normalized);
+		delete this.blobSettledRefs[normalized];
+		delete this.blobSettledSourceVersions[normalized];
+	}
+
+	private recordPersistedBlobUnresolved(
+		path: string,
+		reason: PreservedUnresolvedReason,
+	): void {
+		const markdownEntries = this.preservedUnresolvedEntries.filter(
+			(entry) => entry.kind === "markdown",
+		);
+		const registry = new PreservedUnresolvedRegistry(
+			this.preservedUnresolvedEntries.filter((entry) => entry.kind === "blob"),
+		);
+		registry.record({ path, kind: "blob", reason });
+		this.preservedUnresolvedEntries = [...markdownEntries, ...registry.getEntries()];
+		this.persistPreservedUnresolvedState();
+	}
+
+	private commitLocalBlobDelete(path: string, reason: string): void {
+		if (!this.getRuntimeConfig().enableAttachmentSync) return;
+		this.recordPendingBlobDelete(path, reason);
+	}
+
+	private commitLocalBlobRename(oldPath: string, file: TFile, reason: string): void {
+		if (!this.getRuntimeConfig().enableAttachmentSync) return;
+		this.recordPendingBlobRename(oldPath, file.path, reason, file);
+	}
+
+	private pendingBlobMutationBase(intent: PendingBlobIntent): PendingBlobMutationBase {
+		return {
+			known: intent.baseRefKnown,
+			ref: intent.baseRefKnown
+				? cloneBlobRef(intent.expectedSourceRef)
+				: undefined,
+			sourceVersionKnown: intent.sourceVersionKnown === true,
+			expectedSourceVersion: intent.sourceVersionKnown
+				? intent.expectedSourceVersion
+				: undefined,
+		};
+	}
+
+	private hasOtherUnconfirmedBlobIntentFence(
+		intent: PendingBlobIntent,
+		scope: PendingBlobIntentScope,
+	): boolean {
+		return this.pendingBlobIntents.getEntries(scope).some((candidate) => {
+			if (
+				candidate.id === intent.id
+				|| (
+					candidate.commitAttemptId === undefined
+					&& candidate.committedAt === undefined
+				)
+			) return false;
+			return pendingBlobIntentsOverlap(intent, candidate);
+		});
+	}
+
+	private hasOtherPendingBlobIntentOverlap(
+		intent: PendingBlobIntent,
+		scope: PendingBlobIntentScope,
+	): boolean {
+		return this.pendingBlobIntents.getEntries(scope).some((candidate) => {
+			if (candidate.id === intent.id) return false;
+			return pendingBlobIntentsOverlap(intent, candidate);
+		});
+	}
+
+	private pendingBlobIntentHasSettlementStage(intent: PendingBlobIntent): boolean {
+		const paths = intent.kind === "delete"
+			? [intent.path]
+			: [intent.oldPath, intent.newPath];
+		return paths.some((path) => !!this.blobSettlementStages[normalizePath(path)]);
+	}
+
+	private isPendingBlobIntentReceiptConfirmed(
+		intent: PendingBlobIntent,
+		vaultSync: VaultSync,
+	): boolean {
+		if (
+			intent.committedAt === undefined
+			|| vaultSync.serverAppliedLocalState !== true
+			|| !this.hasPendingBlobIntentCommitPostcondition(intent, vaultSync)
+		) return false;
+		if (
+			intent.receiptCandidateId
+			&& vaultSync.lastConfirmedReceiptCandidateId === intent.receiptCandidateId
+		) return true;
+		return (vaultSync.lastServerReceiptEchoAt ?? 0) > intent.committedAt;
+	}
+
+	private async prepareCommittedBlobIntentForRemoval(
+		intent: PendingBlobIntent,
+		vaultSync: VaultSync,
+	): Promise<boolean> {
+		if (!this.hasPendingBlobIntentCommitPostcondition(intent, vaultSync)) return false;
+		const sourcePath = normalizePath(
+			intent.kind === "delete" ? intent.path : intent.oldPath,
+		);
+		const expectedRef = cloneBlobRef(intent.expectedSourceRef);
+		let changed = false;
+		const currentStage = this.blobSettlementStages[sourcePath];
+		if (
+			currentStage
+			&& (
+				currentStage.kind !== "retire"
+				|| !sameBlobRef(currentStage.ref, expectedRef)
+				|| currentStage.sourceVersion !== intent.expectedSourceVersion
+			)
+		) return false;
+		if (!currentStage) {
+			this.blobSettlementStages[sourcePath] = {
+				stageId: `committed:${intent.id}`,
+				kind: "retire",
+				...(expectedRef ? { ref: expectedRef } : {}),
+				...(intent.expectedSourceVersion
+					? { sourceVersion: intent.expectedSourceVersion }
+					: {}),
+				stagedAt: intent.committedAt ?? Date.now(),
+			};
+			changed = true;
+		}
+		if (this.blobSettledRefs[sourcePath]) {
+			delete this.blobSettledRefs[sourcePath];
+			changed = true;
+		}
+		if (this.blobSettledSourceVersions[sourcePath]) {
+			delete this.blobSettledSourceVersions[sourcePath];
+			changed = true;
+		}
+
+		if (intent.kind === "rename") {
+			const destinationPath = normalizePath(intent.newPath);
+			const destinationRef = cloneBlobRef(vaultSync.getBlobRef(destinationPath));
+			if (destinationRef) {
+				const destinationSourceVersion =
+					vaultSync.getBlobSourceVersion(destinationPath);
+				if (!destinationSourceVersion) return false;
+				const destinationSettled =
+					sameBlobRef(this.blobSettledRefs[destinationPath], destinationRef)
+					&& this.blobSettledSourceVersions[destinationPath]
+						=== destinationSourceVersion
+					&& !this.blobSettlementStages[destinationPath];
+				if (!destinationSettled) {
+					const existing = this.blobSettlementStages[destinationPath];
+					if (!existing) {
+						this.blobSettlementStages[destinationPath] = {
+							stageId: `rename:${intent.id}`,
+							kind: "rename",
+							ref: destinationRef,
+							sourceVersion: destinationSourceVersion,
+							stagedAt: intent.committedAt ?? Date.now(),
+						};
+						changed = true;
+					} else if (
+						existing.kind !== "rename"
+						|| !sameBlobRef(existing.ref, destinationRef)
+						|| existing.sourceVersion !== destinationSourceVersion
+					) {
+						return false;
+					}
+					this.legacyMissingBlobPaths.add(destinationPath);
+					const blobSync = this.getBlobSync();
+					if (blobSync) {
+						blobSync.recordPreservedUnresolved(
+							destinationPath,
+							LEGACY_MISSING_BLOB_ATTENTION_REASON,
+						);
+					} else {
+						this.recordPersistedBlobUnresolved(
+							destinationPath,
+							LEGACY_MISSING_BLOB_ATTENTION_REASON,
+						);
+					}
+					changed = true;
+				}
+			}
+		}
+
+		if (changed) await this.enqueueBlobSettledRefPersistence();
+		return intent.kind === "delete"
+			|| !vaultSync.getBlobRef(intent.newPath)
+			|| (
+				sameBlobRef(
+					this.blobSettledRefs[normalizePath(intent.newPath)],
+					vaultSync.getBlobRef(intent.newPath),
+				)
+				&& this.blobSettledSourceVersions[normalizePath(intent.newPath)]
+					=== vaultSync.getBlobSourceVersion(intent.newPath)
+				&& !this.blobSettlementStages[normalizePath(intent.newPath)]
+			);
+	}
+
+	private hasPendingBlobIntentCommitPostcondition(
+		intent: PendingBlobIntent,
+		vaultSync: VaultSync,
+	): boolean {
+		const sourcePath = intent.kind === "delete" ? intent.path : intent.oldPath;
+		if (vaultSync.getBlobRef(sourcePath)) return false;
+		const snapshot = vaultSync.getAuthoritativeBlobDeleteSnapshot(sourcePath);
+		if (intent.commitDeleteFingerprint) {
+			return snapshot?.fingerprint === intent.commitDeleteFingerprint;
+		}
+		const expectedRef = cloneBlobRef(intent.expectedSourceRef);
+		if (!expectedRef) return true;
+		return !!snapshot && sameBlobRef(snapshot.deletedRef, expectedRef);
+	}
+
+	private recordCommittedBlobIntentConflict(
+		intent: PendingBlobIntent,
+		preferRemoteDeleteResolution: boolean,
+	): void {
+		const path = intent.kind === "delete" ? intent.path : intent.oldPath;
+		const reason: PreservedUnresolvedReason = preferRemoteDeleteResolution
+			? "remote-delete-local-conflict"
+			: "local-blob-mutation-remote-conflict";
+		const blobSync = this.getBlobSync();
+		if (blobSync) {
+			blobSync.recordPreservedUnresolved(path, reason);
+		} else {
+			this.recordPersistedBlobUnresolved(path, reason);
+		}
+	}
+
+	private clearResolvedLocalBlobMutationConflict(intent: PendingBlobIntent): void {
+		const paths = intent.kind === "delete"
+			? [intent.path]
+			: [intent.oldPath, intent.newPath];
+		const blobSync = this.getBlobSync();
+		for (const path of paths) {
+			const normalized = normalizePath(path);
+			const liveEntry = blobSync?.getPreservedUnresolvedEntries().find((entry) =>
+				entry.kind === "blob"
+				&& normalizePath(entry.path) === normalized
+				&& entry.reason === "local-blob-mutation-remote-conflict"
+			);
+			if (liveEntry) blobSync?.clearPreservedUnresolved(normalized);
+		}
+		const before = this.preservedUnresolvedEntries.length;
+		this.preservedUnresolvedEntries = this.preservedUnresolvedEntries.filter((entry) =>
+			entry.kind !== "blob"
+			|| entry.reason !== "local-blob-mutation-remote-conflict"
+			|| !paths.some((path) => normalizePath(path) === normalizePath(entry.path))
+		);
+		if (this.preservedUnresolvedEntries.length !== before) {
+			this.persistPreservedUnresolvedState();
+		}
+	}
+
+	private applyPendingBlobDelete(
+		intent: Extract<PendingBlobIntent, { kind: "delete" }>,
+		vaultSync: VaultSync,
+	): BlobDeleteCommitResult {
+		const base = this.pendingBlobMutationBase(intent);
+		const blobSync = this.getBlobSync();
+		const result = blobSync
+			? blobSync.handleFileDelete(intent.path, this.settings.deviceName, base)
+			: vaultSync.deleteBlobRefIfCurrent(intent.path, base, this.settings.deviceName);
+		if (!blobSync) {
+			if (
+				result.kind === "unknown-source"
+				|| (result.kind === "source-conflict" && result.mutationApplied !== true)
+			) {
+				this.recordPersistedBlobUnresolved(
+					intent.path,
+					"local-blob-mutation-remote-conflict",
+				);
+			} else {
+				removeCachedHash(this.blobHashCache, normalizePath(intent.path));
+				const normalizedPath = normalizePath(intent.path);
+				delete this.blobSettledRefs[normalizedPath];
+				delete this.blobSettledSourceVersions[normalizedPath];
+				if (result.kind === "source-conflict") {
+					this.recordPersistedBlobUnresolved(
+						intent.path,
+						"local-blob-mutation-remote-conflict",
+					);
+				}
+			}
+		}
+		return result;
+	}
+
+	private applyPendingBlobRename(
+		intent: Extract<PendingBlobIntent, { kind: "rename" }>,
+		file: TFile,
+		vaultSync: VaultSync,
+	): CausalBlobRenameResult {
+		const base = this.pendingBlobMutationBase(intent);
+		const blobSync = this.getBlobSync();
+		const result = blobSync
+			? blobSync.handleFileRename(
+				intent.oldPath,
+				file,
+				this.settings.deviceName,
+				base,
+			)
+			: vaultSync.renameBlobRefWithTombstoneIfCurrent(
+				intent.oldPath,
+				intent.newPath,
+				base,
+				this.settings.deviceName,
+			);
+		if (!blobSync) {
+			if (
+				result.kind === "unknown-source"
+				|| (result.kind === "source-conflict" && result.mutationApplied !== true)
+			) {
+				this.recordPersistedBlobUnresolved(
+					intent.oldPath,
+					"local-blob-mutation-remote-conflict",
+				);
+				this.recordPersistedBlobUnresolved(
+					intent.newPath,
+					"local-blob-mutation-remote-conflict",
+				);
+			} else if (result.kind === "source-conflict") {
+				removeCachedHash(this.blobHashCache, normalizePath(intent.oldPath));
+				delete this.blobSettledRefs[normalizePath(intent.oldPath)];
+				delete this.blobSettledSourceVersions[normalizePath(intent.oldPath)];
+				this.recordPersistedBlobUnresolved(
+					intent.oldPath,
+					"local-blob-mutation-remote-conflict",
+				);
+				this.recordPersistedBlobUnresolved(
+					intent.newPath,
+					"local-blob-mutation-remote-conflict",
+				);
+			} else if (result.kind === "destination-conflict") {
+				removeCachedHash(this.blobHashCache, normalizePath(intent.oldPath));
+				delete this.blobSettledRefs[normalizePath(intent.oldPath)];
+				delete this.blobSettledSourceVersions[normalizePath(intent.oldPath)];
+				this.recordPersistedBlobUnresolved(intent.oldPath, "path-collision");
+				this.recordPersistedBlobUnresolved(intent.newPath, "path-collision");
+			} else if (result.kind === "moved") {
+				const rename = new Map([[intent.oldPath, intent.newPath]]);
+				moveCachedHashes(this.blobHashCache, rename);
+				moveSettledBlobRefs(this.blobSettledRefs, rename);
+				delete this.blobSettledSourceVersions[normalizePath(intent.oldPath)];
+				const destinationSourceVersion =
+					vaultSync.getBlobSourceVersion(normalizePath(intent.newPath));
+				if (destinationSourceVersion && this.blobSettledRefs[normalizePath(intent.newPath)]) {
+					this.blobSettledSourceVersions[normalizePath(intent.newPath)] =
+						destinationSourceVersion;
+				}
+			} else if (result.kind === "already-absent" || result.kind === "missing-source") {
+				removeCachedHash(this.blobHashCache, normalizePath(intent.oldPath));
+				delete this.blobSettledRefs[normalizePath(intent.oldPath)];
+				delete this.blobSettledSourceVersions[normalizePath(intent.oldPath)];
+			}
+		}
+		return result;
+	}
+
+	private isPendingBlobMutationConflict(
+		result: BlobDeleteCommitResult | CausalBlobRenameResult,
+	): boolean {
+		return result.kind === "unknown-source"
+			|| (result.kind === "source-conflict" && result.mutationApplied === false);
+	}
+
+	/**
+	 * Cross one destructive CRDT linearization point only after the exact
+	 * attempted episode is durable. If the process dies after `apply()`, the
+	 * persisted attempted/committed state can fence ABA replay on restart.
+	 */
+	private commitReadyPendingBlobIntent(
+		intent: PendingBlobIntent,
+		scope: PendingBlobIntentScope,
+		scopeToken: BlobAuthorityScopeToken,
+		vaultSync: VaultSync,
+		apply: () => PendingBlobReplayApplyResult,
+	): Promise<PendingBlobIntentCommitOutcome<PendingBlobReplayApplyResult>> {
+		const commitAttemptId = randomBase64Url(16);
+		const attemptedAt = Date.now();
+		return commitPendingBlobIntentWithWriteAhead({
+			markAttempted: () => this.pendingBlobIntents.markCommitAttempted(
+				intent.id,
+				commitAttemptId,
+				attemptedAt,
+				this.blobIntentSessionId,
+			),
+			persistAttempted: async () => {
+				await this.enqueuePendingBlobIntentPersistence();
+				if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) {
+					throw new Error("Attachment intent authority changed after write-ahead");
+				}
+				if (!await this.flushPendingBlobIntentPersistence()) {
+					throw new Error("Attachment intent write-ahead did not become stable");
+				}
+				if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) {
+					throw new Error("Attachment intent authority changed while stabilizing write-ahead");
+				}
+				if (!await this.flushBlobSettledRefPersistence()) {
+					throw new Error("Attachment settlement authority did not become stable");
+				}
+				if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) {
+					throw new Error("Attachment intent authority changed before CAS");
+				}
+			},
+			isAttemptCurrent: () => {
+				if (
+					this.blobAuthorityResetInProgress
+					|| !this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)
+					|| !this.getRuntimeConfig().enableAttachmentSync
+					|| !vaultSync.providerSynced
+					|| !this.blobProviderReady
+					|| !this.blobLocalPersistenceReady
+					|| !this.pendingBlobIntentPersistenceHealthy
+					|| !this.blobSettledRefPersistenceHealthy
+				) return false;
+				const current = this.pendingBlobIntents.getEntries(scope).find(
+					(candidate) => candidate.id === intent.id,
+				);
+					return current?.commitAttemptId === commitAttemptId
+						&& current.committedAt === undefined
+						&& !this.pendingBlobIntentHasSettlementStage(intent)
+						&& !this.hasOtherPendingBlobIntentOverlap(intent, scope);
+			},
+			apply,
+			isApplyCurrent: () => {
+				if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return false;
+				const current = this.pendingBlobIntents.getEntries(scope).find(
+					(candidate) => candidate.id === intent.id,
+				);
+				return current?.commitAttemptId === commitAttemptId
+					&& current.committedAt === undefined;
+			},
+			isKnownNoMutation: (result) => result.kind === "precondition-changed"
+				|| this.isPendingBlobMutationConflict(result.result),
+			clearAttempt: () => this.pendingBlobIntents.clearCommitAttempt(
+				intent.id,
+				commitAttemptId,
+			),
+			markCommitted: (result) => {
+				if (result.kind !== "mutation") return false;
+				const commitDeleteFingerprint =
+					vaultSync.getAuthoritativeBlobDeleteSnapshot(result.sourcePath)?.fingerprint;
+				return this.pendingBlobIntents.markCommittedFromAttempt(
+					intent.id,
+					commitAttemptId,
+					Date.now(),
+					this.blobIntentSessionId,
+					vaultSync.serverReceiptCandidateId,
+					commitDeleteFingerprint,
+				);
+			},
+			// Capture the phase-two snapshot synchronously before receipt flushing
+			// can yield to a settings/scope transition.
+			persistFinal: () => {
+				const pendingWrite = this.enqueuePendingBlobIntentPersistence();
+				const settledWrite = this.enqueueBlobSettledRefPersistence();
+				return Promise.all([pendingWrite, settledWrite]).then(() => undefined);
+			},
+			flushReceipt: async () => {
+				await vaultSync.flushReceiptPersistence();
+				if (vaultSync.candidatePersistenceHealthy !== true) {
+					throw new Error("Server receipt candidate persistence is unavailable");
+				}
+			},
+		});
+	}
+
+	private async finishPendingBlobIntentCommit(
+		intent: PendingBlobIntent,
+		outcome: PendingBlobIntentCommitOutcome<PendingBlobReplayApplyResult>,
+		scopeToken: BlobAuthorityScopeToken,
+		vaultSync: VaultSync,
+	): Promise<"continue" | "stop"> {
+		if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return "stop";
+
+		if (outcome.kind === "committed") {
+			if (outcome.receiptError !== undefined) {
+				this.log(
+					`Attachment intent receipt persistence will retry: ${formatUnknown(outcome.receiptError)}`,
+				);
+			}
+			return "continue";
+		}
+
+		if (outcome.kind === "known-no-mutation") {
+			const result = outcome.result;
+			if (
+				result.kind !== "precondition-changed"
+				|| result.disposition === "retain-intent"
+			) return "continue";
+			if (
+				!result.observedOccupant
+				|| this.app.vault.getAbstractFileByPath(result.path) !== result.observedOccupant
+			) {
+				// The evidence that made this intent stale changed while its exact
+				// attempted fence was being cleared. Keep the now-ready intent; a
+				// later replay will evaluate the new disk episode from scratch.
+				return "continue";
+			}
+
+			// The exact attempted fence was already cleared durably. Retire the
+			// now-stale ready episode in a second durable snapshot; if that write
+			// fails, restore the ready entry in memory so authority stays fenced.
+			if (!this.pendingBlobIntents.remove(intent.id)) return "stop";
+			this.pendingBlobRenameFiles.delete(intent.id);
+			this.replayedCommittedBlobIntentIds.delete(intent.id);
+			try {
+				await this.enqueuePendingBlobIntentPersistence();
+			} catch (error) {
+				const current = this.pendingBlobIntents.getEntries();
+				if (!current.some((candidate) => candidate.id === intent.id)) {
+					this.pendingBlobIntents.hydrate([...current, intent]);
+				}
+				if (this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) {
+					this.recordCommittedBlobIntentConflict(intent, false);
+					this.log(
+						`Failed to retire stale attachment intent: ${formatUnknown(error)}`,
+					);
+				}
+				return "stop";
+			}
+			if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return "stop";
+			removeCachedHash(this.blobHashCache, normalizePath(result.path));
+			const occupantStillMatches =
+				this.app.vault.getAbstractFileByPath(result.path) === result.observedOccupant;
+			if (
+				!occupantStillMatches
+				&& !this.pendingBlobIntents.hasPath(result.path, intent.scope)
+			) {
+				// The observed replacement/recreated source disappeared while the
+				// removal snapshot was in flight, before its delete event necessarily
+				// reached this synchronous journal. Restore the original ready fence.
+				const current = this.pendingBlobIntents.getEntries();
+				if (!current.some((candidate) => candidate.id === intent.id)) {
+					this.pendingBlobIntents.hydrate([...current, intent]);
+				}
+				try {
+					await this.enqueuePendingBlobIntentPersistence();
+				} catch (error) {
+					this.recordCommittedBlobIntentConflict(intent, false);
+					this.log(
+						`Failed to restore raced attachment intent: ${formatUnknown(error)}`,
+					);
+				}
+				return "stop";
+			}
+			if (
+				result.admitObservedFile
+				&& result.observedOccupant instanceof TFile
+				&& occupantStillMatches
+				&& this.isBlobPathSyncable(result.observedOccupant.path)
+			) {
+				this.getBlobSync()?.admitReplacementAfterStaleDelete(result.observedOccupant);
+			}
+			return "continue";
+		}
+
+		if (outcome.kind === "stale-after-attempt") return "stop";
+		if (outcome.kind === "not-started") {
+			const current = this.pendingBlobIntents.getEntries(intent.scope).find(
+				(candidate) => candidate.id === intent.id,
+			);
+			if (current?.commitAttemptId !== undefined || current?.committedAt !== undefined) {
+				this.recordCommittedBlobIntentConflict(current, false);
+			}
+			return "stop";
+		}
+
+		// A failed write-ahead, ambiguous apply, or failed phase-two write closes
+		// authority immediately. Ambiguous/committed phases remain fenced; a
+		// proven no-mutation clear may be ready but cannot replay while unhealthy.
+		this.recordCommittedBlobIntentConflict(intent, false);
+		this.attachmentOrchestrator?.revokeUploadAuthority(
+			"blob-intent-commit-not-durable",
+		);
+		const error = "error" in outcome ? outcome.error : undefined;
+		this.log(
+			`Attachment intent commit stopped at ${outcome.kind}${
+				error === undefined ? "" : `: ${formatUnknown(error)}`
+			}`,
+		);
+		if (
+			outcome.kind === "commit-persist-failed"
+			&& outcome.receiptError !== undefined
+		) {
+			this.log(
+				`Attachment intent receipt persistence also failed: ${formatUnknown(outcome.receiptError)}`,
+			);
+		}
+		return "stop";
+	}
+
+	private shouldDiscoverInactiveBlobDeletes(reason: string): boolean {
+		return reason === "reconcile-authoritative"
+			|| reason.startsWith("engine-reconcile:");
+	}
+
+	private async discoverInactiveBlobDeleteIntents(
+		scope: PendingBlobIntentScope,
+		reason: string,
+		scopeToken: BlobAuthorityScopeToken,
+		vaultSync: VaultSync,
+	): Promise<number> {
+		if (!this.app.workspace.layoutReady) return 0;
+		const blobSync = this.getBlobSync();
+		let retirementAttentionChanged = false;
+		for (const [rawPath, stage] of Object.entries(this.blobSettlementStages)) {
+			if (stage.kind !== "retire") continue;
+			const path = normalizePath(rawPath);
+			const liveRevival = !!vaultSync.getBlobRef(path)
+				&& !vaultSync.isBlobTombstoned(path);
+			if (liveRevival && !this.legacyMissingBlobPaths.has(path)) {
+				this.legacyMissingBlobPaths.add(path);
+				if (blobSync) {
+					blobSync.recordPreservedUnresolved(
+						path,
+						LEGACY_MISSING_BLOB_ATTENTION_REASON,
+					);
+				} else {
+					this.recordPersistedBlobUnresolved(
+						path,
+						LEGACY_MISSING_BLOB_ATTENTION_REASON,
+					);
+				}
+				retirementAttentionChanged = true;
+			} else if (!liveRevival && this.legacyMissingBlobPaths.delete(path)) {
+				const entry = blobSync?.getPreservedUnresolvedEntries().find(
+					(candidate) => candidate.kind === "blob"
+						&& normalizePath(candidate.path) === path
+						&& candidate.reason === LEGACY_MISSING_BLOB_ATTENTION_REASON,
+				);
+				if (entry) blobSync?.clearPreservedUnresolved(path);
+				retirementAttentionChanged = true;
+			}
+		}
+		if (retirementAttentionChanged) {
+			await this.enqueueBlobSettledRefPersistence();
+			if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return 0;
+		}
+		const candidates = Object.entries(this.blobSettledRefs)
+			.map(([path, ref]) => ({
+				path: normalizePath(path),
+				ref: cloneBlobRef(ref),
+				sourceVersion: this.blobSettledSourceVersions[normalizePath(path)],
+			}))
+			.filter((candidate): candidate is {
+				path: string;
+				ref: NonNullable<typeof candidate.ref>;
+				sourceVersion: string | undefined;
+			} =>
+				!!candidate.ref
+				&& this.isBlobPathSyncable(candidate.path)
+				&& !this.blobSettlementStages[candidate.path]
+				&& !this.pendingBlobIntents.hasPath(candidate.path, scope)
+				&& !blobSync?.isPreservedUnresolved(candidate.path)
+				&& !blobSync?.isPathOperationInFlight(candidate.path)
+				&& this.app.vault.getAbstractFileByPath(candidate.path) === null
+			);
+		if (candidates.length === 0) return 0;
+
+		const statPath = async (path: string): Promise<"present" | "missing" | "error"> => {
+			try {
+				return await this.app.vault.adapter.stat(path) ? "present" : "missing";
+			} catch {
+				return "error";
+			}
+		};
+		const first = await mapWithConcurrency(candidates, 8, async (candidate) => ({
+			candidate,
+			status: await statPath(candidate.path),
+		}));
+		if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return 0;
+		const missing = first
+			.filter(({ status }) => status === "missing")
+			.map(({ candidate }) => candidate);
+		if (missing.length === 0) return 0;
+		await new Promise((resolve) => setTimeout(resolve, 75));
+		if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return 0;
+		const confirmed = await mapWithConcurrency(missing, 8, async (candidate) => ({
+			candidate,
+			status: await statPath(candidate.path),
+		}));
+		if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return 0;
+
+		let recorded = 0;
+		let settlementStateChanged = false;
+		for (const { candidate, status } of confirmed) {
+			const currentBlobSync = this.getBlobSync();
+			const currentRef = cloneBlobRef(vaultSync.getBlobRef(candidate.path));
+			const currentSourceVersion = vaultSync.getBlobSourceVersion(candidate.path);
+			if (
+				status !== "missing"
+					|| this.app.vault.getAbstractFileByPath(candidate.path) !== null
+					|| currentBlobSync?.isPathOperationInFlight(candidate.path)
+					|| this.pendingBlobIntents.hasPath(candidate.path, scope)
+					|| this.blobSettlementStages[candidate.path]
+					|| !sameBlobRef(this.blobSettledRefs[candidate.path], candidate.ref)
+			) continue;
+
+			if (!currentRef || vaultSync.isBlobTombstoned(candidate.path)) {
+				delete this.blobSettledRefs[candidate.path];
+				delete this.blobSettledSourceVersions[candidate.path];
+				settlementStateChanged = true;
+				continue;
+			}
+
+			if (
+				!candidate.sourceVersion
+				|| candidate.sourceVersion !== currentSourceVersion
+				|| !sameBlobRef(currentRef, candidate.ref)
+			) {
+				const stage: BlobSettlementStage = {
+					stageId: randomBase64Url(16),
+					kind: "retire",
+					ref: cloneBlobRef(candidate.ref)!,
+					...(candidate.sourceVersion
+						? { sourceVersion: candidate.sourceVersion }
+						: {}),
+					stagedAt: Date.now(),
+				};
+				this.blobSettlementStages[candidate.path] = stage;
+				this.legacyMissingBlobPaths.add(candidate.path);
+				if (currentBlobSync) {
+					currentBlobSync.recordPreservedUnresolved(
+						candidate.path,
+						LEGACY_MISSING_BLOB_ATTENTION_REASON,
+					);
+				} else {
+					this.recordPersistedBlobUnresolved(
+						candidate.path,
+						LEGACY_MISSING_BLOB_ATTENTION_REASON,
+					);
+				}
+				settlementStateChanged = true;
+				continue;
+			}
+			this.pendingBlobIntents.recordDelete(
+				candidate.path,
+				scope,
+				{
+					known: true,
+					ref: candidate.ref,
+					sourceVersionKnown: true,
+					expectedSourceVersion: candidate.sourceVersion,
+				},
+			);
+			currentBlobSync?.fenceLocalMutationIntent(
+				candidate.path,
+				`inactive-delete-discovery:${reason}`,
+			);
+				recorded++;
+		}
+		if (settlementStateChanged) {
+			await this.enqueueBlobSettledRefPersistence();
+			if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return recorded;
+		}
+		if (recorded > 0) {
+			this.trace("blob", "inactive-blob-deletes-journaled", {
+				reason,
+				recorded,
+				candidateCount: candidates.length,
+			});
+			try {
+				await this.enqueuePendingBlobIntentPersistence();
+			} catch (err) {
+				if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return recorded;
+				throw err;
+			}
+		}
+		return recorded;
+	}
+
+	/**
+	 * Apply locally journaled attachment intent only after provider sync, and
+	 * only when the current disk postcondition still proves the same action.
+	 * The journal is durable so closing Obsidian during startup cannot lose a
+	 * delete/rename and later resurrect the remote path.
+	 */
+	private replayPendingBlobIntents(reason: string): Promise<void> {
+		const run = this.pendingBlobIntentReplayChain
+			.catch(() => undefined)
+			.then(() => this.replayPendingBlobIntentsOnce(reason));
+		this.pendingBlobIntentReplayChain = run;
+		return run;
+	}
+
+	private isCurrentBlobReplayAuthority(
+		token: BlobAuthorityScopeToken,
+		vaultSync: VaultSync,
+	): boolean {
+		return this.isCurrentBlobAuthority(token)
+			&& this.isVaultSyncBoundToCurrentBlobScope(vaultSync);
+	}
+
+	private async replayPendingBlobIntentsOnce(reason: string): Promise<void> {
+		if (!this.getRuntimeConfig().enableAttachmentSync) return;
+		const activation = this.activateBlobAuthorityScope(
+			`replay:${reason}`,
+			this.getBlobIntentScope(),
+		);
+		const scope = activation.scope;
+		const scopeToken = activation.token;
+		if (!scope.host || !scope.vaultId || !scope.localDeviceId) return;
+		const vaultSync = this.vaultSync;
+		if (
+			!vaultSync?.providerSynced
+			|| !this.blobProviderReady
+			|| !this.blobLocalPersistenceReady
+			|| !this.blobSettledRefPersistenceHealthy
+		) return;
+		if (this.shouldDiscoverInactiveBlobDeletes(reason)) {
+			await this.discoverInactiveBlobDeleteIntents(
+				scope,
+				reason,
+				scopeToken,
+				vaultSync,
+			);
+			if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return;
+		}
+		if (this.pendingBlobIntents.getEntries(scope).length === 0) return;
+
+		// Recording a vault event cannot block Obsidian's synchronous event
+		// dispatch. Wait for the stable local-only IndexedDB tail before applying
+		// any matching CRDT mutation, so a replayed intent was durable first.
+		if (!await this.flushPendingBlobIntentPersistence()) return;
+		if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return;
+		if (!await this.flushBlobSettledRefPersistence()) return;
+		if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return;
+		if (
+			!this.getRuntimeConfig().enableAttachmentSync
+			|| !vaultSync.providerSynced
+			|| !this.blobProviderReady
+			|| !this.blobLocalPersistenceReady
+			|| !this.blobSettledRefPersistenceHealthy
+		) return;
+
+		let changed = false;
+		let replayed = false;
+		for (const intent of this.pendingBlobIntents.getEntries(scope)) {
+			// A durable attempted episode may have crossed its CRDT linearization
+			// point immediately before process death. Fence it before *any* occupant,
+			// receipt, removal, or CAS logic so an H1 revival cannot borrow its base.
+			if (intent.commitAttemptId !== undefined) {
+				this.recordCommittedBlobIntentConflict(intent, false);
+				continue;
+			}
+			if (
+				intent.committedAt === undefined
+				&& this.pendingBlobIntentHasSettlementStage(intent)
+			) {
+				this.recordCommittedBlobIntentConflict(intent, false);
+				continue;
+			}
+			if (
+				intent.committedAt === undefined
+				&& this.hasOtherUnconfirmedBlobIntentFence(intent, scope)
+			) {
+				// A later same-path event cannot bypass an older operation whose CAS
+				// outcome is still unconfirmed. Rename episodes own both namespaces.
+				this.recordCommittedBlobIntentConflict(intent, false);
+				continue;
+			}
+
+			if (intent.kind === "delete") {
+				const occupant = this.app.vault.getAbstractFileByPath(intent.path);
+				if (occupant !== null && intent.committedAt !== undefined) {
+					this.recordCommittedBlobIntentConflict(
+						intent,
+						this.hasPendingBlobIntentCommitPostcondition(intent, vaultSync),
+					);
+					continue;
+				}
+				if (this.isPendingBlobIntentReceiptConfirmed(intent, vaultSync)) {
+					if (!await this.prepareCommittedBlobIntentForRemoval(intent, vaultSync)) {
+						this.recordCommittedBlobIntentConflict(intent, false);
+						continue;
+					}
+					this.clearResolvedLocalBlobMutationConflict(intent);
+					changed = this.pendingBlobIntents.remove(intent.id) || changed;
+					continue;
+				}
+				if (intent.committedAt !== undefined) {
+					if (this.hasPendingBlobIntentCommitPostcondition(intent, vaultSync)) {
+						this.replayedCommittedBlobIntentIds.add(intent.id);
+					} else {
+						this.recordCommittedBlobIntentConflict(intent, false);
+					}
+					continue;
+				}
+
+				const outcome = await this.commitReadyPendingBlobIntent(
+					intent,
+					scope,
+					scopeToken,
+					vaultSync,
+					() => {
+						// The write-ahead await creates a real race window. Re-read the
+						// exact disk postcondition here, immediately before the CAS.
+						const currentOccupant = this.app.vault.getAbstractFileByPath(intent.path);
+						if (currentOccupant instanceof TFile) {
+							return {
+								kind: "precondition-changed",
+								disposition: "remove-intent",
+								path: intent.path,
+								observedOccupant: currentOccupant,
+								admitObservedFile: true,
+							};
+						}
+						if (currentOccupant !== null) {
+							this.getBlobSync()?.recordPreservedUnresolved(
+								intent.path,
+								"path-collision",
+							);
+							if (!this.getBlobSync()) {
+								this.recordPersistedBlobUnresolved(intent.path, "path-collision");
+							}
+							return {
+								kind: "precondition-changed",
+								disposition: "retain-intent",
+								path: intent.path,
+							};
+						}
+						return {
+							kind: "mutation",
+							sourcePath: intent.path,
+							result: this.applyPendingBlobDelete(intent, vaultSync),
+						};
+					},
+				);
+				if (
+					await this.finishPendingBlobIntentCommit(
+						intent,
+						outcome,
+						scopeToken,
+						vaultSync,
+					) === "stop"
+				) return;
+				// Both attempted->ready and attempted->committed final snapshots
+				// include every earlier in-loop removal.
+				changed = false;
+				replayed = true;
+				continue;
+			}
+
+			const oldOccupant = this.app.vault.getAbstractFileByPath(intent.oldPath);
+			if (oldOccupant !== null && intent.committedAt !== undefined) {
+				this.recordCommittedBlobIntentConflict(
+					intent,
+					this.hasPendingBlobIntentCommitPostcondition(intent, vaultSync),
+				);
+				continue;
+			}
+			if (this.isPendingBlobIntentReceiptConfirmed(intent, vaultSync)) {
+				if (!await this.prepareCommittedBlobIntentForRemoval(intent, vaultSync)) {
+					this.recordCommittedBlobIntentConflict(intent, false);
+					continue;
+				}
+				this.clearResolvedLocalBlobMutationConflict(intent);
+				changed = this.pendingBlobIntents.remove(intent.id) || changed;
+				this.pendingBlobRenameFiles.delete(intent.id);
+				continue;
+			}
+			if (intent.committedAt !== undefined) {
+				if (this.hasPendingBlobIntentCommitPostcondition(intent, vaultSync)) {
+					this.replayedCommittedBlobIntentIds.add(intent.id);
+				} else {
+					this.recordCommittedBlobIntentConflict(intent, false);
+				}
+				continue;
+			}
+
+			const expectedRenameFile = this.pendingBlobRenameFiles.get(intent.id);
+			const outcome = await this.commitReadyPendingBlobIntent(
+				intent,
+				scope,
+				scopeToken,
+				vaultSync,
+				() => {
+					const currentOldOccupant = this.app.vault.getAbstractFileByPath(intent.oldPath);
+					if (currentOldOccupant !== null) {
+						return {
+							kind: "precondition-changed",
+							disposition: "remove-intent",
+							path: intent.oldPath,
+							observedOccupant: currentOldOccupant,
+						};
+					}
+					const currentNewOccupant = this.app.vault.getAbstractFileByPath(intent.newPath);
+					if (
+						expectedRenameFile === currentNewOccupant
+						&& currentNewOccupant instanceof TFile
+						&& this.isBlobPathSyncable(currentNewOccupant.path)
+					) {
+						return {
+							kind: "mutation",
+							sourcePath: intent.oldPath,
+							result: this.applyPendingBlobRename(
+								intent,
+								currentNewOccupant,
+								vaultSync,
+							),
+						};
+					}
+					// A TFile identity cannot survive restart. Tombstone only the absent
+					// source; reconciliation treats any destination as a fresh upload.
+					return {
+						kind: "mutation",
+						sourcePath: intent.oldPath,
+						result: this.applyPendingBlobDelete({
+							...intent,
+							kind: "delete",
+							path: intent.oldPath,
+						}, vaultSync),
+					};
+				},
+			);
+			if (
+				await this.finishPendingBlobIntentCommit(
+					intent,
+					outcome,
+					scopeToken,
+					vaultSync,
+				) === "stop"
+			) return;
+			changed = false;
+			replayed = true;
+		}
+
+		if (changed) {
+			try {
+				await this.enqueuePendingBlobIntentPersistence();
+			} catch {
+				return;
+			}
+		}
+		if (changed || replayed) {
+			if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return;
+			if (!await this.flushPendingBlobIntentPersistence()) return;
+			if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return;
+			if (!await this.flushBlobSettledRefPersistence()) return;
+			if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return;
+			this.trace("blob", "pending-blob-intents-replayed", {
+				reason,
+				remainingCount: this.pendingBlobIntents.getEntries(scope).length,
+			});
+		}
 	}
 
 	private async openDashboard(): Promise<void> {
@@ -500,6 +2774,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				},
 				resolveRemoteDeleteAttention: (target, choice) =>
 					this.resolveRemoteDeleteAttention(target, choice),
+				resolveLegacyMissingBlobAttention: (target, choice) =>
+					this.resolveLegacyMissingBlobAttention(target, choice),
 			},
 		}));
 		this.addRibbonIcon("layout-dashboard", "Open dashboard", () => {
@@ -527,6 +2803,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			updateSettings: (mutator, reason) => this.updateSettings(mutator, reason),
 			openExternalUrl: (url) => window.open(url, "_blank", "noopener"),
 		});
+		try {
+			const identity = await getOrCreateLocalDeviceIdentity();
+			this.blobIntentLocalDeviceId = identity.localDeviceId;
+			this.blobLocalDeviceIdentityStatus = identity.status;
+		} catch (err) {
+			this.log(`Local attachment authority ID unavailable: ${formatUnknown(err)}`);
+		}
 		await this.loadSettings();
 		this.applyRuntimeSettings("load-settings");
 			const isFrontmatterGuardEnabled = () => this.settings.frontmatterGuardEnabled;
@@ -590,6 +2873,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				settings.deviceName = `device-${Date.now().toString(36)}`;
 			}, "startup-generate-device-name");
 		}
+		await this.ensurePendingBlobIntentPersistence();
+		await this.ensureBlobSettledRefPersistence();
 
 		await this.initializeBaselineTextPersistence();
 
@@ -681,11 +2966,55 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getServerSupportsAttachments: () => this.serverSupportsAttachments,
 			getTraceHttpContext: () => this.getTraceHttpContext(),
 			getBlobHashCache: () => this.blobHashCache,
+			getBlobSettledRefs: () => this.blobSettledRefs,
+			getBlobSettledSourceVersions: () => this.blobSettledSourceVersions,
+			getBlobSettlementStages: () => this.blobSettlementStages,
+			captureBlobRuntimeAuthority: (vaultSync, scope) =>
+				this.captureBlobRuntimeAuthority(vaultSync, scope),
+			isBlobRuntimeAuthorityCurrent: (vaultSync, scope, token) =>
+				this.isBlobRuntimeAuthorityCurrent(vaultSync, scope, token),
+			isUploadAuthoritySourceReady: (vaultSync, scope, token) =>
+				this.isBlobRuntimeAuthorityCurrent(vaultSync, scope, token)
+				&& this.app.workspace.layoutReady
+				&& vaultSync.idbError !== true
+				&& this.blobLocalPersistenceReady
+				&& this.blobProviderReady
+				&& this.pendingBlobIntentPersistenceHealthy
+				&& this.blobSettledRefPersistenceHealthy,
+			onBlobSettledRefsChanged: (path, ref, scope, vaultSync, token) =>
+				this.handleBlobSettledRefsChanged(path, ref, scope, vaultSync, token),
+			stageBlobSettlement: (path, stage, scope, vaultSync) =>
+				this.stageBlobSettlement(path, stage, scope, vaultSync),
+			finalizeBlobSettlement: (
+				path,
+				stageId,
+				ref,
+				sourceVersion,
+				scope,
+				vaultSync,
+			) => this.finalizeBlobSettlement(
+				path,
+				stageId,
+				ref,
+				sourceVersion,
+				scope,
+				vaultSync,
+			),
+			retireBlobSettlement: (path, stageId, scope, vaultSync) =>
+				this.retireBlobSettlement(path, stageId, scope, vaultSync),
+			abortBlobSettlementStage: (path, stageId, scope, vaultSync) =>
+				this.abortBlobSettlementStage(path, stageId, scope, vaultSync),
 			getExcludePatterns: () => this.excludePatterns,
-			persistBlobQueue: (snapshot) => this.persistBlobQueueSnapshot(snapshot),
-			clearPersistedBlobQueue: () => this.clearSavedBlobQueue(),
+			getBlobQueuePersistenceScope: () => this.getBlobIntentScope(),
+			persistBlobQueue: (snapshot, scope, token) =>
+				this.persistBlobQueueSnapshot(snapshot, scope, token),
+			clearPersistedBlobQueue: (scope, token) =>
+				this.clearSavedBlobQueue(scope, token),
 			getPreservedUnresolvedEntries: () => this.preservedUnresolvedEntries,
 			onPreservedUnresolvedChanged: () => this.persistPreservedUnresolvedState(),
+			hasPendingBlobIntentForPath: (path) =>
+				this.pendingBlobIntents.hasPath(path, this.getBlobIntentScope()),
+			replayPendingBlobIntents: (reason) => this.replayPendingBlobIntents(reason),
 			trace: (source, msg, details) => this.trace(source, msg, details),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
 			refreshStatusBar: () => this.refreshStatusBar(),
@@ -762,7 +3091,24 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private async initSync(): Promise<void> {
 		const initSyncStartedAt = Date.now();
+		const initEntryAuthority = this.blobAuthorityScopeGuard.capture();
+		let initBlobRuntimeAuthority: {
+			vaultSync: VaultSync;
+			scope: PendingBlobIntentScope;
+			token: BlobAuthorityScopeToken;
+		} | null = null;
+		const isCurrentInitBlobAuthority = (): boolean => {
+			const authority = initBlobRuntimeAuthority;
+			return !!authority && this.isBlobRuntimeAuthorityCurrent(
+				authority.vaultSync,
+				authority.scope,
+				authority.token,
+			);
+		};
 		await this.attachmentOrchestrator?.destroy();
+		if (!this.isCurrentBlobAuthority(initEntryAuthority)) return;
+		this.blobLocalPersistenceReady = false;
+		this.blobProviderReady = false;
 		this.trace("trace", "startup-init-sync-start", {
 			hostConfigured: !!this.settings.host,
 			tokenConfigured: !!this.settings.token,
@@ -771,6 +3117,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		try {
 			this.idbDegradedHandled = false;
 			this.applyRuntimeSettings("init-sync");
+			const initPersistenceAuthority = this.blobAuthorityScopeGuard.capture();
+			await this.ensurePendingBlobIntentPersistence();
+			if (!this.isCurrentBlobAuthority(initPersistenceAuthority)) return;
+			await this.ensureBlobSettledRefPersistence();
+			if (!this.isCurrentBlobAuthority(initPersistenceAuthority)) return;
 			if (this.enforceCompatibilityGuard("init-sync-preflight")) {
 				return;
 			}
@@ -839,6 +3190,22 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				};
 			})(),
 			});
+			this.vaultSyncBlobAuthorityTokens.set(
+				this.vaultSync,
+				this.blobAuthorityScopeGuard.capture(),
+			);
+			const vaultSync = this.vaultSync;
+			const blobRuntimeScope = this.getBlobIntentScope();
+			const blobRuntimeToken = this.captureBlobRuntimeAuthority(
+				vaultSync,
+				blobRuntimeScope,
+			);
+			if (!blobRuntimeToken) return;
+			initBlobRuntimeAuthority = {
+				vaultSync,
+				scope: { ...blobRuntimeScope },
+				token: { ...blobRuntimeToken },
+			};
 
 			// 2. EditorBindingManager
 			const bindingPropagationGate: BindingPropagationGate = {
@@ -891,12 +3258,24 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				() => this.persistPreservedUnresolvedState(),
 			);
 			this.diskMirror.setMarkdownPathSyncabilityPredicate((path) => this.isMarkdownPathSyncable(path));
+			this.diskMirror.setDiskBaselineHashProvider(
+				(path) => this.diskIndex[path]?.contentHash ?? null,
+			);
+			this.diskMirror.setDiskBaselineTextProvider(async (path) => {
+				const expectedHash = this.diskIndex[path]?.contentHash?.toLowerCase() ?? null;
+				if (!expectedHash) return null;
+				const text = await this.getBaselineText(expectedHash);
+				return this.diskIndex[path]?.contentHash?.toLowerCase() === expectedHash
+					? text
+					: null;
+			});
 			this.diskMirror.startMapObservers();
 			this.diskMirror.setFlightEventHandler((event) => this.recordFlightPathEvent(event as import("./telemetry/debug/flightEvents").FlightPathEventInput));
 			// Track SHA-256 baseline hash after every successful flushWrite.
 			// Used by decideClosedFileConflict on startup/re-enable to determine
 			// which side actually changed from the last known stable state.
 			this.diskMirror.setDiskWriteCallback((path, contentHash, content) => {
+				this.reconciliationController.noteDiskBaselineSettlement(path, content);
 				const existing = this.diskIndex[path];
 				const previousHash = existing?.contentHash;
 				if (existing) {
@@ -949,7 +3328,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.connectionController.start();
 
 			// Wire provider flight events
-			this.vaultSync.provider.on("status", (event: { status: string }) => {
+			vaultSync.provider.on("status", (event: { status: string }) => {
+				if (!isCurrentInitBlobAuthority()) return;
 				if (event.status === "connected") {
 					this.recordFlightEvent({
 						priority: "important",
@@ -958,10 +3338,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						scope: "connection",
 						source: "connectionController",
 						layer: "provider",
-						connectionGeneration: this.vaultSync?.connectionGeneration,
+						connectionGeneration: vaultSync.connectionGeneration,
 						data: { wsStatus: event.status },
 					});
 				} else if (event.status === "disconnected") {
+					this.blobProviderReady = false;
+					this.attachmentOrchestrator?.revokeUploadAuthority(
+						"provider-disconnected",
+					);
 					this.recordFlightEvent({
 						priority: "important",
 						kind: "provider.disconnected",
@@ -969,13 +3353,31 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						scope: "connection",
 						source: "connectionController",
 						layer: "provider",
-						connectionGeneration: this.vaultSync?.connectionGeneration,
+						connectionGeneration: vaultSync.connectionGeneration,
 						data: { wsStatus: event.status },
 					});
 				}
 			});
-			this.vaultSync.provider.on("sync", (synced: boolean) => {
+			vaultSync.provider.on("sync", (synced: boolean) => {
+				if (!isCurrentInitBlobAuthority()) return;
 				if (synced) {
+					const schemaError = vaultSync.checkSchemaVersion();
+					if (schemaError) {
+						this.blobProviderReady = false;
+						this.attachmentOrchestrator?.revokeUploadAuthority(
+							"provider-schema-incompatible",
+						);
+						vaultSync.provider.disconnect();
+						new Notice(`KAOS: ${schemaError}`);
+						this.updateStatusBar("error");
+						return;
+					}
+					// Y.Map scalar conflict resolution is not numeric-max. Reassert
+					// the v4 floor after the authoritative room update has merged.
+					vaultSync.markCurrentSchema(this.settings.deviceName);
+					// Opening uploads still waits for the authoritative reconciliation
+					// callback; this flag only records that the Y.Doc source is ready.
+					this.blobProviderReady = true;
 					this.recordFlightEvent({
 						priority: "important",
 						kind: "provider.sync.complete",
@@ -983,12 +3385,27 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						scope: "connection",
 						source: "connectionController",
 						layer: "provider",
-						connectionGeneration: this.vaultSync?.connectionGeneration,
+						connectionGeneration: vaultSync.connectionGeneration,
 					});
 				}
 			});
-			this.statusInterval = setInterval(() => {
+			const statusInterval = setInterval(() => {
+				if (!isCurrentInitBlobAuthority()) return;
+				if (
+					vaultSync.localReady
+					&& !vaultSync.idbError
+					&& !this.blobLocalPersistenceReady
+				) {
+					this.blobLocalPersistenceReady = true;
+					this.log("IndexedDB became ready after the startup wait");
+					if (this.blobProviderReady) {
+						// The first authoritative pass may have run without local IDB.
+						// Re-run once with both authority sources before opening uploads.
+						void this.runReconciliation("authoritative");
+					}
+				}
 				this.refreshStatusBar();
+				this.schedulePendingBlobIntentReplay("status-tick");
 				if (this.reconciliationController.isReconciled && this.editorBindings) {
 					const touched = this.editorWorkspace?.auditBindings("status-tick") ?? 0;
 					if (touched > 0) {
@@ -1008,8 +3425,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					void this.refreshServerCapabilities("background-poll");
 				}
 			}, 3000);
+			this.statusInterval = statusInterval;
 			this.register(() => {
-				if (this.statusInterval) clearInterval(this.statusInterval);
+				clearInterval(statusInterval);
+				if (this.statusInterval === statusInterval) this.statusInterval = null;
 			});
 			this.startSnapshotMaintenanceTimers();
 
@@ -1039,7 +3458,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 
 			// 8. Rename batch callback → update editor bindings + disk mirror observers + disk index + blob hash cache
-			this.vaultSync.onRenameBatchFlushed((renames) => {
+			vaultSync.onRenameBatchFlushed((renames) => {
+				if (!isCurrentInitBlobAuthority()) return;
 				this.editorWorkspace?.onRenameBatchFlushed(renames);
 
 				// Move disk index entries
@@ -1047,6 +3467,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 				// Move blob hash cache entries
 				moveCachedHashes(this.blobHashCache, renames);
+				moveSettledBlobRefs(this.blobSettledRefs, renames);
 
 				// Redirect any pending dirty creates or modifies from oldPath → newPath.
 				// Two race classes this handles:
@@ -1078,8 +3499,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 							data: { bug: "excluded-destination-reached-applyRenameBatch" },
 						});
 						this.reconciliationController.dropDirtyPath(newPath);
-						if (this.vaultSync?.getFileId(newPath)) {
-							this.vaultSync.handleDelete(newPath);
+					if (vaultSync.getFileId(newPath)) {
+						vaultSync.handleDelete(newPath);
 						}
 					}
 				}
@@ -1091,14 +3512,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			this.updateStatusBar("loading");
 			this.log("Waiting for IndexedDB persistence...");
-			const localLoaded = await this.vaultSync.waitForLocalPersistence();
+			const localLoaded = await vaultSync.waitForLocalPersistence();
+			if (!isCurrentInitBlobAuthority()) return;
+			if (localLoaded) this.blobLocalPersistenceReady = true;
 			this.log(`IndexedDB: ${localLoaded ? "loaded" : "timed out"}`);
-			await this.vaultSync.initializeServerAckTracking(this.settings, this.manifest.version, {
+			await vaultSync.initializeServerAckTracking(this.settings, this.manifest.version, {
 				localYjsPersistenceLoaded: localLoaded,
 			});
+			if (!isCurrentInitBlobAuthority()) return;
 
 			// Schema version check — refuse to run if a newer plugin wrote this data
-			const schemaError = this.vaultSync.checkSchemaVersion();
+			const schemaError = vaultSync.checkSchemaVersion();
 			if (schemaError) {
 				console.error(`[kaos] ${schemaError}`);
 				new Notice(`KAOS: ${schemaError}`);
@@ -1106,13 +3530,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				return;
 			}
 
-			// Mark schema v3 if room is still at v2 (lazy, no metadata migration).
-			this.vaultSync.markSchemaV3(this.settings.deviceName);
+			// Mark the room's current schema before allowing older clients to rejoin.
+			vaultSync.markCurrentSchema(this.settings.deviceName);
 
 			// Check for fatal auth error before waiting for provider
-			if (this.vaultSync.fatalAuthError) {
+			if (vaultSync.fatalAuthError) {
 				this.log("Fatal auth error during startup");
-				if (this.vaultSync.fatalAuthCode === "update_required") {
+				if (vaultSync.fatalAuthCode === "update_required") {
 					this.updateStatusBar("error");
 					this.showFatalSyncNotice();
 					return;
@@ -1120,32 +3544,45 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.updateStatusBar("unauthorized");
 				this.showFatalSyncNotice();
 				// Still reconcile with whatever we have locally
-				const mode = this.vaultSync.getSafeReconcileMode();
+				const mode = vaultSync.getSafeReconcileMode();
 				await this.runReconciliation(mode);
 				return;
 			}
 
 			this.updateStatusBar("syncing");
 			this.log("Waiting for provider sync...");
-			const providerSynced = await this.vaultSync.waitForProviderSync();
+			const providerSynced = await vaultSync.waitForProviderSync();
+			if (!isCurrentInitBlobAuthority()) return;
+			if (providerSynced) this.blobProviderReady = true;
 			this.log(`Provider: ${providerSynced ? "synced" : "timed out (offline)"}`);
 			this.awaitingFirstProviderSyncAfterStartup = !providerSynced;
 			this.log(
 				`Startup sync gate: awaitingFirstProviderSyncAfterStartup=${this.awaitingFirstProviderSyncAfterStartup} ` +
-				`(gen=${this.vaultSync.connectionGeneration})`,
+				`(gen=${vaultSync.connectionGeneration})`,
 			);
 
-			if (this.vaultSync.fatalAuthError) {
-				this.updateStatusBar(this.vaultSync.fatalAuthCode === "update_required" ? "error" : "unauthorized");
+			if (vaultSync.fatalAuthError) {
+				this.updateStatusBar(vaultSync.fatalAuthCode === "update_required" ? "error" : "unauthorized");
 				this.showFatalSyncNotice();
 				return;
 			}
+			if (providerSynced) {
+				const postSyncSchemaError = vaultSync.checkSchemaVersion();
+				if (postSyncSchemaError) {
+					vaultSync.provider.disconnect();
+					new Notice(`KAOS: ${postSyncSchemaError}`);
+					this.updateStatusBar("error");
+					return;
+				}
+				vaultSync.markCurrentSchema(this.settings.deviceName);
+			}
 
-			const mode = this.vaultSync.getSafeReconcileMode();
+			const mode = vaultSync.getSafeReconcileMode();
 			this.log(`Reconciliation mode: ${mode}`);
 
 			await this.runReconciliation(mode);
-			this.reconciliationController.lastGeneration = this.vaultSync.connectionGeneration;
+			if (!isCurrentInitBlobAuthority()) return;
+			this.reconciliationController.lastGeneration = vaultSync.connectionGeneration;
 			if (providerSynced) {
 				this.awaitingFirstProviderSyncAfterStartup = false;
 			}
@@ -1166,6 +3603,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				void this.snapshotService?.triggerRecoverySnapshot();
 			}
 		} catch (err) {
+			if (initBlobRuntimeAuthority && !isCurrentInitBlobAuthority()) return;
 			console.error("[kaos] Failed to initialize sync:", err);
 			new Notice(`KAOS: failed to initialize — ${formatUnknown(err)}`);
 			this.updateStatusBar("error");
@@ -1297,7 +3735,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("modify", (file) => {
-				if (!this.reconciliationController.isReconciled) return;
+				if (!this.reconciliationController.isReconciled) {
+					if (file instanceof TFile && this.isMarkdownPathSyncable(file.path)) {
+						this.reconciliationController.noteMarkdownDiskMutation(file.path);
+					}
+					return;
+				}
 				if (!(file instanceof TFile)) return;
 
 				if (this.isMarkdownPathSyncable(file.path)) {
@@ -1361,14 +3804,106 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// Blob renames still go through the batch (blob exclusion is separate).
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
-				if (!this.reconciliationController.isReconciled) return;
 				if (!(file instanceof TFile)) return;
+				if (this.attachmentOrchestrator?.consumeRemoteOverwriteBackupRename(file, oldPath)) {
+					this.log(
+						`Consumed operation-owned attachment backup rename: "${oldPath}" -> "${file.path}"`,
+					);
+					return;
+				}
+				const configDir = this.getRuntimeConfig().vaultConfigDir;
+				const oldCategory = classifySyncPath({
+					path: oldPath,
+					excludePatterns: this.excludePatterns,
+					configDir,
+				});
+				const newCategory = classifySyncPath({
+					path: file.path,
+					excludePatterns: this.excludePatterns,
+					configDir,
+				});
+				const currentTarget = this.app.vault.getAbstractFileByPath(file.path);
+				const currentOldPath = this.app.vault.getAbstractFileByPath(oldPath);
+				const renameCommit = planRenameEventCommit({
+					targetMatchesEventFile: currentTarget === file,
+					oldPathIsMissing: currentOldPath === null,
+				});
+				if (renameCommit.kind === "quarantine-path-collision") {
+					if (oldCategory.kind === "markdown") {
+						this.reconciliationController.noteMarkdownDiskMutation(oldPath);
+						this.diskMirror?.recordPreservedUnresolved(oldPath, "path-collision");
+					} else if (oldCategory.kind === "blob") {
+						this.getBlobSync()?.recordPreservedUnresolved(oldPath, "path-collision");
+					}
+					if (newCategory.kind === "markdown") {
+						this.reconciliationController.noteMarkdownDiskMutation(file.path);
+						this.diskMirror?.recordPreservedUnresolved(file.path, "path-collision");
+					} else if (newCategory.kind === "blob") {
+						this.getBlobSync()?.recordPreservedUnresolved(file.path, "path-collision");
+					}
+					this.trace("reconcile", "rename-event-commit-blocked-path-collision", {
+						oldPath,
+						newPath: file.path,
+						reason: renameCommit.reason,
+						oldCategory: oldCategory.kind,
+						newCategory: newCategory.kind,
+						targetMatchesEventFile: currentTarget === file,
+						oldPathIsMissing: currentOldPath === null,
+					});
+					this.log(
+						`Rename event fenced (${renameCommit.reason}): ` +
+						`"${oldPath}" -> "${file.path}"`,
+					);
+					return;
+				}
+				const ownershipRedirect =
+					oldCategory.kind === "markdown" || newCategory.kind === "markdown"
+						? this.reconciliationController.redirectPendingDirtyPath(oldPath, file.path)
+						: { kind: "missing" as const };
+				if (ownershipRedirect.kind === "collision") {
+					this.reconciliationController.noteMarkdownDiskMutation(oldPath);
+					this.reconciliationController.noteMarkdownDiskMutation(file.path);
+					this.trace("reconcile", "rename-event-commit-blocked-attention-collision", {
+						oldPath,
+						newPath: file.path,
+						sourceEpisodeId: ownershipRedirect.source.episodeId ?? null,
+						targetEpisodeId: ownershipRedirect.target.episodeId ?? null,
+					});
+					this.log(
+						`Rename admission fenced by unresolved episode collision: `
+						+ `"${oldPath}" -> "${file.path}"`,
+					);
+					return;
+				}
+				if (!this.reconciliationController.isReconciled) {
+					this.reconciliationController.noteMarkdownDiskMutation(oldPath);
+					this.reconciliationController.noteMarkdownDiskMutation(file.path);
+					if (
+						oldCategory.kind === "blob"
+						&& this.getRuntimeConfig().enableAttachmentSync
+					) {
+						if (newCategory.kind === "blob") {
+							this.recordPendingBlobRename(oldPath, file.path, "pre-reconcile-rename", file);
+						} else {
+							this.recordPendingBlobDelete(oldPath, "pre-reconcile-rename-left-scope");
+						}
+					}
+					return;
+				}
+				this.reconciliationController.noteMarkdownDiskMutation(oldPath);
+				this.reconciliationController.noteMarkdownDiskMutation(file.path);
+				if (this.diskMirror?.consumeRemoteRename(oldPath, file.path, file)) {
+					const remoteRename = new Map([[oldPath, file.path]]);
+					this.editorWorkspace?.onRenameBatchFlushed(remoteRename);
+					moveIndexEntries(this.diskIndex, remoteRename);
+					moveCachedHashes(this.blobHashCache, remoteRename);
+					moveSettledBlobRefs(this.blobSettledRefs, remoteRename);
+					this.scheduleDiskIndexSave("remote-rename");
+					this.log(`Consumed remote rename event: "${oldPath}" -> "${file.path}"`);
+					return;
+				}
 
 				// Classify both paths using canonical path identity.
-				const configDir = this.getRuntimeConfig().vaultConfigDir;
-				const oldCategory = classifySyncPath({ path: oldPath, excludePatterns: this.excludePatterns, configDir });
-				const newCategory = classifySyncPath({ path: file.path, excludePatterns: this.excludePatterns, configDir });
-
 				// Skip entirely if both are excluded.
 				if (oldCategory.kind === "excluded" && newCategory.kind === "excluded") return;
 
@@ -1406,39 +3941,50 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						break;
 
 					case "queue-blob-rename":
-						this.vaultSync?.queueRename(action.oldPath, action.newPath);
-						this.log(`Rename queued (blob): "${oldPath}" -> "${file.path}"`);
+						this.commitLocalBlobRename(action.oldPath, file, "vault-rename-event");
+						this.log(`Rename committed (blob tombstone+ref): "${oldPath}" -> "${file.path}"`);
 						break;
 
 					case "tombstone-markdown":
 						for (const p of action.dropDirty) this.reconciliationController.dropDirtyPath(p);
 						this.vaultSync?.handleDelete(action.oldPath, this.settings.deviceName, renameOpId);
+						if (newCategory.kind === "blob") {
+							this.getBlobSync()?.handleFileChange(file);
+						}
 						this.log(`Rename admission: tombstoning markdown "${oldPath}"`);
 						break;
 
 					case "admit-markdown":
 						for (const p of action.dropDirty) this.reconciliationController.dropDirtyPath(p);
+						if (oldCategory.kind === "blob") {
+							this.commitLocalBlobDelete(oldPath, "blob-renamed-to-markdown");
+						}
 						this.reconciliationController.markMarkdownDirty(file, "create", renameOpId);
 						this.log(`Rename admission: admitting markdown "${file.path}"`);
 						break;
 
 					case "admit-blob-via-event":
-						// Blob admission: Obsidian will fire a create event for the new
-						// path, handled by blobSync.handleFileChange. No explicit action.
 						for (const p of action.dropDirty) this.reconciliationController.dropDirtyPath(p);
-						this.log(`Rename admission: blob "${file.path}" will be admitted via create event`);
+						this.getBlobSync()?.handleFileChange(file);
+						this.log(`Rename admission: admitted blob "${file.path}" explicitly`);
 						break;
 
 					case "defer-blob-to-events":
-						// Blob leaves sync scope. Obsidian delete event for old path
-						// will be handled by blobSync. Just clean dirty state.
 						for (const p of action.dropDirty) this.reconciliationController.dropDirtyPath(p);
-						this.log(`Rename admission: blob "${oldPath}" leaving scope, deferred to events`);
+						this.commitLocalBlobDelete(action.oldPath, "blob-rename-left-sync-scope");
+						this.log(`Rename admission: tombstoned blob "${oldPath}" leaving scope`);
 						break;
 
 					case "same-identity":
-						// NFC/NFD or separator variant rename. Same sync identity.
-						// No CRDT mutation needed — not a real rename from sync perspective.
+						if (oldCategory.kind === "blob" && newCategory.kind === "blob") {
+							this.commitLocalBlobRename(action.oldPath, file, "canonical-blob-rename");
+						} else if (
+							oldCategory.kind === "markdown"
+							&& newCategory.kind === "markdown"
+							&& action.oldPath !== action.newPath
+						) {
+							this.vaultSync?.queueRename(action.oldPath, action.newPath);
+						}
 						this.log(`Rename admission: same identity (canonical equivalent): "${oldPath}" -> "${file.path}"`);
 						break;
 
@@ -1450,12 +3996,35 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("delete", (file) => {
-				if (!this.reconciliationController.isReconciled) return;
+				if (!this.reconciliationController.isReconciled) {
+					if (file instanceof TFile) {
+						if (this.isMarkdownPathSyncable(file.path)) {
+							this.reconciliationController.noteMarkdownDiskMutation(file.path);
+							this.reconciliationController.dropDirtyPath(file.path);
+						} else if (
+							this.getRuntimeConfig().enableAttachmentSync
+							&& this.isBlobPathSyncable(file.path)
+						) {
+							this.recordPendingBlobDelete(file.path, "pre-reconcile-delete");
+						}
+					}
+					return;
+				}
 				if (!(file instanceof TFile)) return;
 
 				if (this.isMarkdownPathSyncable(file.path)) {
+					this.reconciliationController.noteMarkdownDiskMutation(file.path);
 					const opId = this.newOpId();
-					if (this.diskMirror?.consumeDeleteSuppression(file.path)) {
+					const currentOccupant = this.app.vault.getAbstractFileByPath(file.path);
+					const deleteCommit = planMarkdownDeleteCommit(
+						currentOccupant === null
+							? "missing"
+							: (currentOccupant instanceof TFile ? "file" : "non-file"),
+					);
+					const deleteSuppressionConsumed =
+						this.diskMirror?.consumeDeleteSuppression(file.path) ?? false;
+					if (deleteSuppressionConsumed && deleteCommit.kind === "commit-delete") {
+						this.reconciliationController.dropDirtyPath(file.path);
 						this.log(`Suppressed delete event for "${file.path}"`);
 						this.traceSink.recordPath({
 							kind: "disk.event.suppressed",
@@ -1471,10 +4040,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						});
 						return;
 					}
+					if (deleteSuppressionConsumed) {
+						this.traceSink.recordPath({
+							kind: "disk.event.not_suppressed",
+							scope: "file",
+							severity: "warn",
+							priority: "critical",
+							opId,
+							path: file.path,
+							data: {
+								reason: "delete-path-reoccupied",
+								decision: "admit-live-occupant",
+							},
+						});
+					}
 					const attentionDelete = this.attentionMarkdownDeleteInFlight.get(
 						normalizePath(file.path),
 					);
-					if (attentionDelete === file) {
+					if (attentionDelete === file && deleteCommit.kind === "commit-delete") {
+						this.reconciliationController.dropDirtyPath(file.path);
 						this.attentionMarkdownDeleteInFlight.delete(normalizePath(file.path));
 						this.editorWorkspace?.onMarkdownDeleted(file.path);
 						this.traceSink.recordPath({
@@ -1492,6 +4076,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						this.log(`Accepted remote delete locally: "${file.path}"`);
 						return;
 					}
+					if (attentionDelete === file) {
+						this.attentionMarkdownDeleteInFlight.delete(normalizePath(file.path));
+					}
 					this.traceSink.recordPath({
 						kind: "disk.delete.observed",
 						scope: "file",
@@ -1500,6 +4087,31 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						opId,
 						path: file.path,
 					});
+					this.reconciliationController.dropDirtyPath(file.path);
+					if (
+						deleteCommit.kind === "admit-replacement" &&
+						currentOccupant instanceof TFile
+					) {
+						this.reconciliationController.noteMarkdownDiskMutation(file.path);
+						this.reconciliationController.markMarkdownDirty(currentOccupant, "create", opId);
+						this.trace("reconcile", "markdown-delete-commit-blocked-file-recreated", {
+							path: file.path,
+							deletedEventFileStillCurrent: currentOccupant === file,
+							replacementSize: currentOccupant.stat?.size ?? null,
+						});
+						this.log(`Delete event fenced; admitted same-path replacement: "${file.path}"`);
+						return;
+					}
+					if (deleteCommit.kind === "quarantine-path-collision") {
+						this.editorWorkspace?.onMarkdownDeleted(file.path);
+						this.diskMirror?.recordPreservedUnresolved(file.path, "path-collision");
+						this.trace("reconcile", "markdown-delete-commit-blocked-path-collision", {
+							path: file.path,
+							occupantKind: "non-file",
+						});
+						this.log(`Delete event fenced; path collision quarantined: "${file.path}"`);
+						return;
+					}
 					this.editorWorkspace?.onMarkdownDeleted(file.path);
 					this.diskMirror?.clearPreservedUnresolved(file.path);
 
@@ -1510,18 +4122,57 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					);
 					this.log(`Delete: "${file.path}"`);
 					} else {
+						if (!this.isBlobPathSyncable(file.path)) return;
 						const blobSync = this.getBlobSync();
-						if (blobSync && this.isBlobPathSyncable(file.path) && !blobSync.isSuppressed(file.path)) {
-							blobSync.handleFileDelete(file.path, this.settings.deviceName);
-							this.log(`Delete (blob): "${file.path}"`);
+						const currentOccupant = this.app.vault.getAbstractFileByPath(file.path);
+						const deleteCommit = planBlobDeleteCommit(
+							currentOccupant === null
+								? "missing"
+								: (currentOccupant instanceof TFile ? "file" : "non-file"),
+						);
+						if (
+							deleteCommit.kind === "admit-replacement"
+							&& currentOccupant instanceof TFile
+						) {
+							removeCachedHash(this.blobHashCache, normalizePath(file.path));
+							blobSync?.admitReplacementAfterStaleDelete(currentOccupant);
+							this.persistPendingBlobIntents();
+							this.log(`Blob delete event fenced; admitted same-path replacement: "${file.path}"`);
+							return;
 						}
+						if (deleteCommit.kind === "quarantine-path-collision") {
+							if (blobSync) {
+								blobSync.recordPreservedUnresolved(file.path, "path-collision");
+							} else {
+								this.recordPersistedBlobUnresolved(file.path, "path-collision");
+							}
+							this.log(`Blob delete event fenced; path collision quarantined: "${file.path}"`);
+							return;
+						}
+						if (blobSync?.isAcceptingRemoteDelete(file.path)) {
+							this.log(`Accepted remote blob delete locally: "${file.path}"`);
+							return;
+						}
+						// Path TTL suppression belongs to create/modify loop prevention. It
+						// cannot prove ownership of a delete event: a user can immediately
+						// delete a freshly downloaded file while the token is still live. All
+						// operation-owned attachment removals use exact rename/Attention tickets,
+						// so every ordinary missing-path delete must publish local intent.
+						this.commitLocalBlobDelete(file.path, "vault-delete-event");
+						this.log(`Delete (blob): "${file.path}"`);
 					}
 			}),
 		);
 
 		this.registerEvent(
 			this.app.vault.on("create", (file) => {
-				if (!this.reconciliationController.isReconciled) return;
+				if (!this.reconciliationController.isReconciled) {
+					if (file instanceof TFile && this.isMarkdownPathSyncable(file.path)) {
+						this.reconciliationController.dropDirtyPath(file.path);
+						this.reconciliationController.noteMarkdownDiskMutation(file.path);
+					}
+					return;
+				}
 				if (!(file instanceof TFile)) return;
 
 				if (this.isMarkdownPathSyncable(file.path)) {
@@ -1599,6 +4250,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.editorBindings = null;
 		this.diskMirror = null;
 		this.awaitingFirstProviderSyncAfterStartup = false;
+		this.blobLocalPersistenceReady = false;
+		this.blobProviderReady = false;
 		this.editorWorkspace?.reset();
 		this.idbDegradedHandled = false;
 
@@ -1651,27 +4304,99 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			`clear the local cache, then re-seed everything from your current disk files. ` +
 			`Other connected devices will also see the reset. This cannot be undone. Continue?`,
 			async () => {
-				this.log("Nuclear reset: starting");
-				new Notice("Nuclear reset in progress...");
-
-				// Clear CRDT maps before teardown so deletions propagate while connected.
-				const counts = this.vaultSync!.clearAllMaps();
-				this.log(
-					`Nuclear reset: cleared ${counts.pathCount} paths, ` +
-					`${counts.idCount} texts, ${counts.metaCount} meta, ` +
-					`${counts.blobCount} blob paths`,
-				);
-
-				await new Promise((r) => setTimeout(r, 500));
-
-				const vaultId = this.settings.vaultId;
-				await this.teardownSync();
-
+				this.blobAuthorityResetInProgress = true;
 				try {
-					await VaultSync.deleteIdb(vaultId);
-					this.log("Nuclear reset: IDB deleted");
-				} catch (err) {
-					console.error("[kaos] Failed to delete IDB:", err);
+					const resetActivation = this.activateBlobAuthorityScope(
+						"nuclear-reset",
+						this.getBlobIntentScope(),
+						{ force: true, detachStores: false },
+					);
+					this.log("Nuclear reset: starting");
+					new Notice("Nuclear reset in progress...");
+
+					// Clear CRDT maps only after the forced epoch has synchronously made
+					// every older blob load/save/replay completion stale.
+					const counts = this.vaultSync!.clearAllMaps();
+					this.log(
+						`Nuclear reset: cleared ${counts.pathCount} paths, ` +
+						`${counts.idCount} texts, ${counts.metaCount} meta, ` +
+						`${counts.blobCount} blob paths`,
+					);
+
+					await new Promise((r) => setTimeout(r, 500));
+					if (!this.isCurrentBlobAuthority(resetActivation.token)) return;
+
+					const vaultId = this.settings.vaultId;
+					await this.teardownSync();
+					if (!this.isCurrentBlobAuthority(resetActivation.token)) return;
+
+					// Never replace either global tail. Wait until the exact old lanes are
+					// stable, then clear their records. Their callbacks retain the previous
+					// epoch and therefore cannot reopen health after this reset.
+					if (!await this.waitForStablePendingBlobIntentTail(resetActivation.token)) return;
+					if (!await this.waitForStableBlobSettledRefTail(resetActivation.token)) return;
+					const resetScope = resetActivation.scope;
+					const pendingIntentStoreKey = resetScope.host
+						&& resetScope.vaultId
+						&& resetScope.localDeviceId
+						? buildPendingBlobIntentStoreKey(resetScope)
+						: null;
+					const settledRefStoreKey = resetScope.host
+						&& resetScope.vaultId
+						&& resetScope.localDeviceId
+						? buildBlobSettledRefStoreKey(resetScope)
+						: null;
+
+					if (this.pendingBlobIntentStore) {
+						await this.pendingBlobIntentStore.clear();
+					} else if (pendingIntentStoreKey) {
+						await new IndexedDbPendingBlobIntentStore(resetScope).clear();
+					}
+					if (!this.isCurrentBlobAuthority(resetActivation.token)) return;
+					if (this.blobSettledRefStore) {
+						await this.blobSettledRefStore.clear();
+					} else if (settledRefStoreKey) {
+						await new IndexedDbBlobSettledRefStore(resetScope).clear();
+					}
+					if (!this.isCurrentBlobAuthority(resetActivation.token)) return;
+
+					if (pendingIntentStoreKey) {
+						this.corruptPendingBlobIntentStoreKeys.delete(pendingIntentStoreKey);
+					}
+					if (settledRefStoreKey) {
+						this.corruptBlobSettledRefStoreKeys.delete(settledRefStoreKey);
+					}
+					this.pendingBlobIntentStore = null;
+					this.pendingBlobIntentStoreKey = null;
+					this.blobSettledRefStore = null;
+					this.blobSettledRefStoreKey = null;
+					this.pendingBlobIntentPersistenceHealthy = false;
+					this.blobSettledRefPersistenceHealthy = false;
+					this.pendingBlobIntents.clear();
+					this.pendingBlobRenameFiles.clear();
+					this.replayedCommittedBlobIntentIds.clear();
+					this.legacyMissingBlobPaths.clear();
+					this.savedBlobQueue = null;
+					this.preservedUnresolvedEntries = [];
+					this.attachmentOrchestrator?.hydrateSavedQueue(null);
+					await this.persistPluginState((state) => {
+						delete state._blobSettledRefs;
+						delete state._blobSettledRefsByDevice;
+						delete state._blobQueue;
+						delete state._pendingBlobIntents;
+						delete state._preservedUnresolved;
+					});
+					if (!this.isCurrentBlobAuthority(resetActivation.token)) return;
+
+					try {
+						await VaultSync.deleteIdb(vaultId);
+						this.log("Nuclear reset: IDB deleted");
+					} catch (err) {
+						console.error("[kaos] Failed to delete IDB:", err);
+					}
+					if (!this.isCurrentBlobAuthority(resetActivation.token)) return;
+				} finally {
+					this.blobAuthorityResetInProgress = false;
 				}
 
 				this.log("Nuclear reset: reinitializing (will re-seed from disk)");
@@ -1829,6 +4554,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (this.vaultSync?.idbError) {
 			return "error";
 		}
+		if (
+			this.settings.enableAttachmentSync
+			&& !!this.settings.host
+			&& (
+				!this.pendingBlobIntentPersistenceHealthy
+				|| !this.blobSettledRefPersistenceHealthy
+			)
+		) return "error";
 
 		return this.syncStatusFromConnectionState(this.connectionController?.getState() ?? { kind: "disconnected" });
 	}
@@ -1903,6 +4636,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					: vaultSync?.getAuthoritativeBlobDeleteSnapshot(path)?.fingerprint ?? null,
 				isKeepLocalPending: (kind, path, episodeId) => kind === "blob"
 					&& blobSync?.isKeepLocalRemoteDeletePending(path, episodeId) === true,
+				getBlobRef: (path) => cloneBlobRef(vaultSync?.getBlobRef(path)) ?? null,
 			},
 			frontmatterQuarantineEntries: this.frontmatterQuarantineEntries,
 			diskIndex: this.diskIndex,
@@ -1912,6 +4646,155 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			openFileCount: this.editorWorkspace?.openFileCount ?? 0,
 			snapshotsAvailable: this.serverSupportsSnapshots,
 		});
+	}
+
+	private async resolveLegacyMissingBlobAttention(
+		target: DashboardLegacyMissingBlobResolutionTarget,
+		choice: DashboardLegacyMissingBlobResolutionChoice,
+	): Promise<DashboardRemoteDeleteResolutionResult> {
+		const normalizedTarget: DashboardLegacyMissingBlobResolutionTarget = {
+			...target,
+			path: normalizePath(target.path),
+		};
+		return withAttentionResolutionLock(
+			this.attentionResolutionInFlight,
+			`blob:${normalizedTarget.path}`,
+			normalizedTarget.path,
+			async () => {
+				this.getCurrentLegacyMissingBlobAttention(normalizedTarget);
+				this.assertDashboardLocalFileIdentity(normalizedTarget);
+				if (normalizedTarget.localFile.kind !== "missing") {
+					throw new Error(`Local attachment path is no longer absent: ${normalizedTarget.path}`);
+				}
+				const vaultSync = this.vaultSync;
+				const blobSync = this.getBlobSync();
+				if (!vaultSync || !blobSync) {
+					throw new Error("Attachment sync is not initialized.");
+				}
+				if (
+					!vaultSync.providerSynced
+					|| !this.blobProviderReady
+					|| !this.blobLocalPersistenceReady
+					|| !this.blobSettledRefPersistenceHealthy
+				) {
+					throw new Error("Attachment authority is still initializing. Try again after sync is ready.");
+				}
+				const currentRef = cloneBlobRef(vaultSync.getBlobRef(normalizedTarget.path));
+				if (
+					vaultSync.isBlobTombstoned(normalizedTarget.path)
+						? normalizedTarget.remoteRef !== null
+						: !sameBlobRef(currentRef, normalizedTarget.remoteRef ?? undefined)
+				) {
+					throw new Error(`Remote attachment changed for "${normalizedTarget.path}". Refresh the dashboard.`);
+				}
+
+				if (choice === "download-remote") {
+					if (!currentRef || normalizedTarget.remoteRef === null) {
+						throw new Error(`Remote attachment no longer exists: ${normalizedTarget.path}`);
+					}
+					await this.clearBlobSettlementFenceForExplicitResolution(
+						normalizedTarget.path,
+						vaultSync,
+					);
+					blobSync.acceptLegacyMissingRemoteBlob(
+						normalizedTarget.path,
+						normalizedTarget.episodeId,
+						currentRef,
+					);
+					const queueScope = this.attachmentOrchestrator?.getQueuePersistenceScope(blobSync);
+					if (!queueScope) throw new Error("Attachment queue authority scope is unavailable.");
+					await this.persistBlobQueueSnapshot(blobSync.exportQueue(), queueScope);
+					await this.persistPluginState();
+					return { status: "completed" };
+				}
+
+				if (!currentRef) {
+					await this.clearBlobSettlementFenceForExplicitResolution(
+						normalizedTarget.path,
+						vaultSync,
+					);
+					await this.setLegacyMissingBlobQuarantine(normalizedTarget.path, false);
+					blobSync.clearPreservedUnresolved(normalizedTarget.path);
+					await this.persistPluginState();
+					return { status: "completed" };
+				}
+				const scope = this.getBlobIntentScope();
+				if (
+					!scope.host
+					|| !scope.vaultId
+					|| !scope.localDeviceId
+					|| !this.pendingBlobIntentPersistenceHealthy
+				) {
+					throw new Error("Local attachment intent journal is unavailable.");
+				}
+				if (this.pendingBlobIntents.hasPath(normalizedTarget.path, scope)) {
+					throw new Error(`Another local attachment mutation is already pending: ${normalizedTarget.path}`);
+				}
+				const before = this.pendingBlobIntents.getEntries();
+				const expectedSourceVersion = this.vaultSync?.getBlobSourceVersion(
+					normalizedTarget.path,
+				);
+				if (!expectedSourceVersion) {
+					throw new Error("Exact attachment source episode is unavailable.");
+				}
+				const intent = this.pendingBlobIntents.recordDelete(
+					normalizedTarget.path,
+					scope,
+					{
+						known: true,
+						ref: currentRef,
+						sourceVersionKnown: true,
+						expectedSourceVersion,
+					},
+				);
+				try {
+					await this.enqueuePendingBlobIntentPersistence();
+				} catch (err) {
+					this.pendingBlobIntents.hydrate(before);
+					throw err;
+				}
+				// The exact delete intent is durable before the retirement fence is
+				// cleared. A crash between these steps therefore cannot turn the user's
+				// explicit Keep absence choice into a first-time remote download.
+				await this.clearBlobSettlementFenceForExplicitResolution(
+					normalizedTarget.path,
+					vaultSync,
+				);
+				await this.replayPendingBlobIntents("legacy-upgrade-keep-local-absence");
+				const committed = this.pendingBlobIntents.getEntries(scope).find(
+					(candidate) => candidate.id === intent.id,
+				)?.committedAt !== undefined;
+				if (!committed) {
+					throw new Error(
+						`The exact remote attachment could not be deleted safely: ${normalizedTarget.path}`,
+					);
+				}
+				await this.setLegacyMissingBlobQuarantine(normalizedTarget.path, false);
+				blobSync.clearPreservedUnresolved(normalizedTarget.path);
+				await this.persistPluginState();
+				return {
+					status: "pending",
+					message: `Keeping local absence; the exact delete is waiting for a durable server receipt: ${normalizedTarget.path}`,
+				};
+			},
+		);
+	}
+
+	private getCurrentLegacyMissingBlobAttention(
+		target: DashboardLegacyMissingBlobResolutionTarget,
+	): PreservedUnresolvedEntry {
+		const current = this.collectPreservedUnresolvedEntries().find((entry) =>
+			entry.kind === "blob" && normalizePath(entry.path) === target.path
+		);
+		if (
+			!current
+			|| current.reason !== LEGACY_MISSING_BLOB_ATTENTION_REASON
+			|| getPreservedUnresolvedEpisodeId(current) !== target.episodeId
+			|| !this.legacyMissingBlobPaths.has(target.path)
+		) {
+			throw new Error(`Attention state changed for "${target.path}". Refresh the dashboard.`);
+		}
+		return current;
 	}
 
 	private async resolveRemoteDeleteAttention(
@@ -1931,6 +4814,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.getCurrentRemoteDeleteAttention(normalizedTarget);
 			this.assertRemoteDeleteFingerprint(normalizedTarget);
 			this.assertDashboardLocalFileIdentity(normalizedTarget);
+			const committedBlobIntentResolution = normalizedTarget.fileKind === "blob"
+				? this.captureCommittedBlobIntentResolution(normalizedTarget)
+				: null;
 
 			if (choice === "keep-local") {
 				if (normalizedTarget.fileKind === "markdown") {
@@ -1950,10 +4836,23 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 				const blobSync = this.getBlobSync();
 				if (!blobSync) throw new Error("Attachment sync is not initialized.");
+				const blobQueuePersistenceScope =
+					this.attachmentOrchestrator?.getQueuePersistenceScope(blobSync);
+				if (!blobQueuePersistenceScope) {
+					throw new Error("Attachment queue authority scope is unavailable.");
+				}
 				if (blobSync.isKeepLocalRemoteDeletePending(
 					normalizedTarget.path,
 					normalizedTarget.episodeId,
 				)) {
+					await this.persistBlobQueueSnapshot(
+						blobSync.exportQueue(),
+						blobQueuePersistenceScope,
+					);
+					await this.supersedeCommittedBlobIntentsForResolution(
+						committedBlobIntentResolution,
+						normalizedTarget,
+					);
 					return {
 						status: "pending",
 						message: `The local attachment is already being published: ${normalizedTarget.path}`,
@@ -1967,16 +4866,23 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						remoteDeleteFingerprint: normalizedTarget.remoteDeleteFingerprint ?? undefined,
 					},
 				);
-				await this.persistBlobQueueSnapshot(blobSync.exportQueue());
-				if (!blobSync.isPreservedUnresolved(normalizedTarget.path)) {
-					return { status: "completed" };
-				}
-				if (!blobSync.isKeepLocalRemoteDeletePending(
+				await this.persistBlobQueueSnapshot(
+					blobSync.exportQueue(),
+					blobQueuePersistenceScope,
+				);
+				const completed = !blobSync.isPreservedUnresolved(normalizedTarget.path);
+				const pending = blobSync.isKeepLocalRemoteDeletePending(
 					normalizedTarget.path,
 					normalizedTarget.episodeId,
-				)) {
+				);
+				if (!completed && !pending) {
 					throw new Error(`The local attachment could not be queued: ${normalizedTarget.path}`);
 				}
+				await this.supersedeCommittedBlobIntentsForResolution(
+					committedBlobIntentResolution,
+					normalizedTarget,
+				);
+				if (completed) return { status: "completed" };
 				return {
 					status: "pending",
 					message: `Publishing local attachment; Attention will clear after upload succeeds: ${normalizedTarget.path}`,
@@ -2031,6 +4937,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			const blobSync = this.getBlobSync();
 			if (!blobSync) throw new Error("Attachment sync is not initialized.");
+			const blobQueuePersistenceScope =
+				this.attachmentOrchestrator?.getQueuePersistenceScope(blobSync);
+			if (!blobQueuePersistenceScope) {
+				throw new Error("Attachment queue authority scope is unavailable.");
+			}
 			await blobSync.acceptRemoteDeletedBlob(
 				normalizedTarget.path,
 				normalizedTarget.reason,
@@ -2048,7 +4959,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					if (snapshot.uploads.length === 0 && snapshot.downloads.length === 0) {
 						await this.clearSavedBlobQueue();
 					} else {
-						await this.persistBlobQueueSnapshot(snapshot);
+						await this.persistBlobQueueSnapshot(
+							snapshot,
+							blobQueuePersistenceScope,
+						);
 					}
 				},
 			);
@@ -2056,12 +4970,95 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			if (queueAfterAccept.uploads.length === 0 && queueAfterAccept.downloads.length === 0) {
 				await this.clearSavedBlobQueue();
 			} else {
-				await this.persistBlobQueueSnapshot(queueAfterAccept);
+				await this.persistBlobQueueSnapshot(
+					queueAfterAccept,
+					blobQueuePersistenceScope,
+				);
 			}
+			await this.supersedeCommittedBlobIntentsForResolution(
+				committedBlobIntentResolution,
+				normalizedTarget,
+			);
 			await this.persistPluginState();
 			return { status: "completed" };
 			},
 		);
+	}
+
+	private captureCommittedBlobIntentResolution(
+		target: DashboardRemoteDeleteResolutionTarget,
+	): {
+		path: string;
+		episodeId: string;
+		remoteDeleteFingerprint: string;
+		intentIds: string[];
+	} | null {
+		const remoteDeleteFingerprint = target.remoteDeleteFingerprint;
+		if (!remoteDeleteFingerprint) return null;
+		const scope = this.getBlobIntentScope();
+		const normalized = normalizePath(target.path);
+		const intentIds = this.pendingBlobIntents.getEntries(scope).filter((intent) =>
+			intent.committedAt !== undefined
+			&& normalizePath(intent.kind === "delete" ? intent.path : intent.oldPath)
+				=== normalized
+			&& intent.commitDeleteFingerprint === remoteDeleteFingerprint
+		).map((intent) => intent.id);
+		return intentIds.length > 0 ? {
+			path: normalized,
+			episodeId: target.episodeId,
+			remoteDeleteFingerprint,
+			intentIds,
+		} : null;
+	}
+
+	private async supersedeCommittedBlobIntentsForResolution(
+		token: {
+			path: string;
+			episodeId: string;
+			remoteDeleteFingerprint: string;
+			intentIds: string[];
+		} | null,
+		target: DashboardRemoteDeleteResolutionTarget,
+	): Promise<void> {
+		if (!token) return;
+		if (
+			token.path !== normalizePath(target.path)
+			|| token.episodeId !== target.episodeId
+			|| token.remoteDeleteFingerprint !== target.remoteDeleteFingerprint
+		) {
+			throw new Error(`Attention state changed for "${target.path}". Refresh the dashboard.`);
+		}
+		const ids = new Set(token.intentIds);
+		const removable = this.pendingBlobIntents.getEntries().filter((intent) =>
+			ids.has(intent.id)
+			&& intent.committedAt !== undefined
+			&& intent.commitDeleteFingerprint === token.remoteDeleteFingerprint
+			&& normalizePath(intent.kind === "delete" ? intent.path : intent.oldPath)
+				=== token.path
+		);
+		if (removable.length === 0) return;
+		for (const intent of removable) {
+			this.pendingBlobIntents.remove(intent.id);
+			this.pendingBlobRenameFiles.delete(intent.id);
+			this.replayedCommittedBlobIntentIds.delete(intent.id);
+		}
+		try {
+			await this.enqueuePendingBlobIntentPersistence();
+		} catch (err) {
+			const current = this.pendingBlobIntents.getEntries();
+			const currentIds = new Set(current.map((intent) => intent.id));
+			this.pendingBlobIntents.hydrate([
+				...current,
+				...removable.filter((intent) => !currentIds.has(intent.id)),
+			]);
+			throw err;
+		}
+		this.trace("blob", "committed-blob-intents-superseded-by-explicit-resolution", {
+			path: token.path,
+			episodeId: token.episodeId,
+			remoteDeleteFingerprint: token.remoteDeleteFingerprint,
+			count: removable.length,
+		});
 	}
 
 	private async clearPreservedUnresolvedAttention(
@@ -2135,7 +5132,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private assertDashboardLocalFileIdentity(
-		target: DashboardRemoteDeleteResolutionTarget,
+		target: Pick<DashboardRemoteDeleteResolutionTarget, "path" | "localFile">,
 		knownFile?: TFile,
 	): void {
 		const actual = knownFile
@@ -2595,6 +5592,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const data = persistedState;
 		this.persistedState = persistedState;
 		this.settings = settings;
+		// Prime the authority identity before reading any scope-owned state. This is
+		// intentionally guard-only: the first applyRuntimeSettings() call must not
+		// mistake startup hydration for a live scope transition and erase a valid
+		// same-scope transfer queue that was just restored from data.json.
+		this.runtimeConfig = buildRuntimeConfig(this.settings, this.app.vault.configDir);
+		this.blobAuthorityScopeGuard.activate(this.getBlobIntentScope());
 		// Load disk index from plugin data (stored under _diskIndex key)
 		if (data && typeof data._diskIndex === "object" && data._diskIndex !== null) {
 			this.diskIndex = data._diskIndex;
@@ -2612,10 +5615,28 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (data && typeof data._blobHashCache === "object" && data._blobHashCache !== null) {
 			this.blobHashCache = data._blobHashCache;
 		}
-		// Load persisted blob queue
-		if (data && typeof data._blobQueue === "object" && data._blobQueue !== null) {
-			this.savedBlobQueue = data._blobQueue;
+		// Settled attachment refs are causal authority and therefore live only in
+		// device-local IndexedDB. Ignore every legacy data.json representation.
+		// data.json may be synced or restored from another device. Only execute a
+		// queue created by this exact host/vault/local-device authority scope.
+		this.savedBlobQueue = null;
+		let scrubbedBlobQueue = false;
+		if (data?._blobQueue !== undefined) {
+			const queue = readPersistedBlobQueueSnapshot(
+				data._blobQueue,
+				this.getBlobIntentScope(),
+			);
+			if (queue) {
+				this.savedBlobQueue = queue;
+			} else {
+				delete this.persistedState._blobQueue;
+				scrubbedBlobQueue = true;
+				this.log("Ignored a legacy, foreign-scope, or malformed attachment transfer queue");
+			}
 		}
+		// Pending attachment mutations are device-local IndexedDB authority.
+		// Never hydrate this legacy data.json field because external settings sync
+		// can copy or roll it back across devices.
 		if (Array.isArray(data?._preservedUnresolved)) {
 			this.preservedUnresolvedEntries = data._preservedUnresolved.filter(
 				(entry): entry is PreservedUnresolvedEntry => {
@@ -2639,7 +5660,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		);
 		this.frontmatterQuarantineEntries = readPersistedFrontmatterQuarantine(data?._frontmatterQuarantine);
 		this.refreshPersistedState();
-		if (migrated) {
+		if (migrated || scrubbedBlobQueue) {
 			await this.persistPluginState();
 		}
 	}
@@ -2661,6 +5682,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private applyRuntimeSettings(reason: string): void {
 		this.runtimeConfig = buildRuntimeConfig(this.settings, this.app.vault.configDir);
+		this.activateBlobAuthorityScope(`runtime-settings:${reason}`);
 		this.excludePatterns = this.runtimeConfig.excludePatterns;
 		this.maxFileSize = this.runtimeConfig.maxFileSizeBytes;
 		this.applyCursorVisibility();
@@ -2924,11 +5946,22 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.diskIndexSaveTimer = null;
 	}
 
-	private async persistBlobQueueSnapshot(snapshot: BlobQueueSnapshot): Promise<void> {
-		// Only write if there's actually something to persist
-		if (snapshot.uploads.length === 0 && snapshot.downloads.length === 0) return;
+	private async persistBlobQueueSnapshot(
+		snapshot: BlobQueueSnapshot,
+		scope: PendingBlobIntentScope,
+		token: BlobAuthorityScopeToken = this.blobAuthorityScopeGuard.capture(),
+	): Promise<void> {
+		if (!this.blobAuthorityScopeGuard.isCurrent(token, scope)) return;
 		await this.persistPluginState((state) => {
-			state._blobQueue = snapshot;
+			if (!this.blobAuthorityScopeGuard.isCurrent(token, scope)) return;
+			if (snapshot.uploads.length === 0 && snapshot.downloads.length === 0) {
+				delete state._blobQueue;
+			} else {
+				state._blobQueue = createPersistedBlobQueueSnapshot(
+					snapshot,
+					scope,
+				);
+			}
 		});
 	}
 
@@ -2936,9 +5969,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * Clear the persisted blob queue once all transfers are done.
 	 * Only writes if there was previously a saved queue.
 	 */
-	private async clearSavedBlobQueue(): Promise<void> {
-		if (!this.persistedState._blobQueue) return;
+	private async clearSavedBlobQueue(
+		scope: PendingBlobIntentScope = this.getBlobIntentScope(),
+		token: BlobAuthorityScopeToken = this.blobAuthorityScopeGuard.capture(),
+	): Promise<void> {
+		if (!this.blobAuthorityScopeGuard.isCurrent(token, scope)) return;
 		await this.persistPluginState((state) => {
+			if (!this.blobAuthorityScopeGuard.isCurrent(token, scope)) return;
 			delete state._blobQueue;
 		});
 	}
@@ -2965,6 +6002,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			_blobHashCache: this.blobHashCache,
 			...(this.lastDiskIndexPersistedAt > 0 && { _lastDiskIndexPersistedAt: this.lastDiskIndexPersistedAt }),
 		};
+		delete nextState._blobSettledRefs;
+		delete nextState._blobSettledRefsByDevice;
 		applyPersistedBaselineTextFields(
 			nextState,
 			this.baselineTexts,
@@ -3000,6 +6039,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		} else {
 			delete nextState._preservedUnresolved;
 		}
+		delete nextState._pendingBlobIntents;
 		this.persistedState = nextState;
 	}
 
@@ -3139,7 +6179,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (err) {
 			this.vaultSync.reportIndexedDbError(err, "runtime");
 		}
-		if (!this.vaultSync.idbError || this.idbDegradedHandled) return;
+		if (!this.vaultSync.idbError) return;
+		this.blobLocalPersistenceReady = false;
+		this.attachmentOrchestrator?.revokeUploadAuthority("idb-degraded");
+		if (this.idbDegradedHandled) return;
 
 		this.idbDegradedHandled = true;
 		const kind = this.vaultSync.idbErrorDetails?.kind ?? "unknown";

@@ -3,6 +3,7 @@ import { TFile } from "obsidian";
 import { VaultSync } from "../src/sync/vaultSync";
 import { contentBaselineHash, type DiskIndex } from "../src/sync/diskIndex";
 import { ReconciliationController } from "../src/runtime/reconciliationController";
+import type { PreservedUnresolvedEntry } from "../src/sync/preservedUnresolved";
 import type { FlightEventInput, FlightPathEventInput } from "../src/telemetry/debug/flightEvents";
 
 let passed = 0;
@@ -104,6 +105,8 @@ function buildFixture(opts: {
 }) {
 	const events: CapturedEvent[] = [];
 	const flushWrites: string[] = [];
+	const attemptedFlushWrites: string[] = [];
+	const preservedUnresolved = new Map<string, PreservedUnresolvedEntry>();
 	const recordFlightPathEvent = (event: FlightPathEventInput): void => {
 		events.push(asPathEvent(event));
 	};
@@ -137,7 +140,27 @@ function buildFixture(opts: {
 	};
 	const diskMirror = {
 		flushWrite: async (path: string) => {
+			attemptedFlushWrites.push(path);
+			if (preservedUnresolved.has(path)) {
+				return { kind: "blocked" as const, path, reason: "preserved-unresolved" as const };
+			}
 			flushWrites.push(path);
+		},
+		getPreservedUnresolvedEntries: () =>
+			[...preservedUnresolved.values()].map((entry) => ({ ...entry })),
+		isPreservedUnresolved: (path: string) => preservedUnresolved.has(path),
+		recordPreservedUnresolved: (path: string) => {
+			const previous = preservedUnresolved.get(path);
+			preservedUnresolved.set(path, {
+				path,
+				kind: "markdown",
+				reason: "path-collision",
+				episodeId: previous?.episodeId ?? `no-event:${path}`,
+				firstSeenAt: previous?.firstSeenAt ?? 1,
+				lastSeenAt: (previous?.lastSeenAt ?? 0) + 1,
+				localHash: previous?.localHash ?? null,
+				knownRemoteHash: previous?.knownRemoteHash ?? null,
+			});
 		},
 	};
 	let diskIndex = opts.previousDiskIndex ?? {};
@@ -172,10 +195,20 @@ function buildFixture(opts: {
 		recordFlightPathEvent,
 	});
 
-	return { controller, vaultSync, events, eventBoundary, flushWrites, oldFileId };
+	return {
+		controller,
+		vaultSync,
+		events,
+		eventBoundary,
+		flushWrites,
+		attemptedFlushWrites,
+		preservedUnresolved,
+		diskMirror,
+		oldFileId,
+	};
 }
 
-console.log("\n--- No-event structural reconcile: baseline-backed move preserves file identity ---");
+console.log("\n--- No-event structural reconcile: baseline continuity stays observation-only ---");
 {
 	const content = "# A\nsame\n";
 	const baselineHash = await contentBaselineHash(content);
@@ -196,24 +229,53 @@ console.log("\n--- No-event structural reconcile: baseline-backed move preserves
 	await fx.controller.runReconciliation("authoritative");
 	const events = fx.events.slice(fx.eventBoundary);
 
-	assert(fx.vaultSync.getTextForPath("Old/a.md") === null, "old path is no longer active");
-	assert(fx.vaultSync.getTextForPath("New/a.md") !== null, "new path is active");
-	assertEq(fx.vaultSync.getFileId("New/a.md"), fx.oldFileId, "new path retains the old file ID");
+	assert(fx.vaultSync.getTextForPath("Old/a.md") !== null, "old CRDT identity is not moved by an async scan");
+	assert(fx.vaultSync.getTextForPath("New/a.md") === null, "new disk path is not assigned the old identity");
+	assertEq(fx.vaultSync.getFileId("Old/a.md"), fx.oldFileId, "old path retains its original file ID");
 	assertEq(
 		events.filter((event) =>
 			event.kind === "reconcile.file.decision" &&
-			event.data.decision === "rename-crdt-path-to-disk" &&
-			event.data.reason === "baseline-hash-continuity"
+			event.data.decision === "rename-crdt-path-to-disk"
 		).length,
-		1,
-		"baseline-backed rename decision is emitted",
+		0,
+		"baseline hash continuity never authorizes an automatic identity move",
 	);
 	assertEq(
 		events.filter((event) => event.kind === "crdt.file.created" && event.path === "New/a.md").length,
 		0,
 		"new path is not admitted with a new identity",
 	);
-	assertEq(fx.controller.getState().unresolvedStructuralChangeCount, 0, "safe inferred rename needs no attention");
+	assertEq(fx.flushWrites.length, 0, "old path is not recreated while the pair is unresolved");
+	assert(
+		fx.preservedUnresolved.has("Old/a.md") && fx.preservedUnresolved.has("New/a.md"),
+		"no-event collision durably quarantines both old and new paths",
+	);
+	assertEq(
+		events.filter((event) =>
+			event.kind === "reconcile.file.decision" &&
+			event.data.decision === "unresolved-ambiguous-structural-change"
+		).length,
+		1,
+		"baseline-backed candidate is surfaced as unresolved",
+	);
+	assertEq(fx.controller.getState().unresolvedStructuralChangeCount, 2, "both paths require explicit resolution");
+
+	const providerFlush = await fx.diskMirror.flushWrite("Old/a.md");
+	assert(
+		providerFlush?.kind === "blocked" && providerFlush.reason === "preserved-unresolved",
+		"a later provider flush is hard-blocked by the durable old-path marker",
+	);
+	assertEq(fx.flushWrites.length, 0, "blocked provider flush cannot recreate the old path");
+	(fx.controller as unknown as { lastReconcileTime: number }).lastReconcileTime = 0;
+	await fx.controller.runReconciliation("authoritative");
+	assert(fx.vaultSync.getTextForPath("Old/a.md") !== null, "later reconcile retains the old CRDT candidate");
+	assert(fx.vaultSync.getTextForPath("New/a.md") === null, "later reconcile cannot seed the quarantined new path");
+	assertEq(fx.flushWrites.length, 0, "later reconcile cannot recreate either quarantined path");
+	assertEq(fx.attemptedFlushWrites.length, 1, "later reconcile does not even enqueue another quarantined flush");
+	assert(
+		fx.preservedUnresolved.has("Old/a.md") && fx.preservedUnresolved.has("New/a.md"),
+		"later reconcile retains both collision episodes",
+	);
 }
 
 console.log("\n--- No-event structural reconcile: moved markdown without evidence is unresolved ---");

@@ -6,6 +6,7 @@ const HOST = process.env.KAOS_TEST_HOST || "http://127.0.0.1:8787";
 const TOKEN = process.env.SYNC_TOKEN || "";
 const BASE_VAULT_ID = process.env.KAOS_TEST_VAULT_ID || "kaos-provider-manual-connect";
 const ROOM_ID = `${BASE_VAULT_ID}-manual-connect`;
+const SCHEMA_VERSION = 4;
 
 if (!TOKEN) {
 	throw new Error("SYNC_TOKEN is required for provider manual-connect smoke test");
@@ -118,7 +119,7 @@ async function withProvider(label, callback) {
 		prefix: `/vault/sync/${encodeURIComponent(ROOM_ID)}`,
 		params: {
 			token: TOKEN,
-			schemaVersion: "2",
+			schemaVersion: String(SCHEMA_VERSION),
 		},
 		WebSocketPolyfill: globalThis.WebSocket ?? WebSocket,
 		connect: false,
@@ -232,7 +233,7 @@ async function main() {
 		const baselineEchoCount = getSvEchoes().length;
 		const sys = ydoc.getMap("sys");
 		sys.set("initialized", true);
-		sys.set("schemaVersion", 2);
+		sys.set("schemaVersion", SCHEMA_VERSION);
 		const text = ydoc.getText("manual-connect");
 		text.insert(0, "manual connect smoke");
 		writtenCandidateSv = Y.encodeStateVector(ydoc);

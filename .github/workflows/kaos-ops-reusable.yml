@@ -14,6 +14,11 @@ on:
         required: false
         type: string
         default: "adtstack/kaos"
+      allow_migration_update:
+        description: "Explicitly allow a release marked migration-required"
+        required: false
+        type: boolean
+        default: false
     secrets:
       release_token:
         required: false
@@ -44,6 +49,7 @@ jobs:
           KAOS_RELEASE_REPO: ${{ inputs.release_repo }}
           KAOS_RELEASE_VERSION: ${{ inputs.version }}
           KAOS_RELEASE_TOKEN: ${{ secrets.release_token }}
+          KAOS_ALLOW_MIGRATION_UPDATE: ${{ inputs.allow_migration_update }}
         run: node scripts/update-from-release.mjs
 
       - name: Revert last KAOS update commit

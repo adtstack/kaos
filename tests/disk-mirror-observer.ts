@@ -35,6 +35,8 @@
 import * as Y from "yjs";
 import { MarkdownView, TFile } from "obsidian";
 import { DiskMirror } from "../src/sync/diskMirror";
+import { contentBaselineHash } from "../src/sync/diskIndex";
+import type { MetaChangeBatch } from "../src/sync/fileMeta";
 import {
 	ORIGIN_DISK_SYNC,
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
@@ -67,6 +69,21 @@ function makeHarness(options: {
 	openEditorContent?: string | (() => string);
 	initialDiskContent?: string;
 	onRead?: () => void | Promise<void>;
+	onGetAbstractFile?: (path: string, file: TFile | null, callCount: number) => void;
+	onBeforeProcess?: () => void | Promise<void>;
+	onAfterProcess?: () => void | Promise<void>;
+	onBeforeCreate?: () => void | Promise<void>;
+	onAfterCreate?: () => void | Promise<void>;
+	onBeforeRename?: () => void | Promise<void>;
+	onAfterRename?: () => void | Promise<void>;
+	onBeforeTrash?: () => void | Promise<void>;
+	onAfterTrash?: () => void | Promise<void>;
+	trashBehavior?: "success" | "throw" | "missing";
+	ensureFileBehavior?: "settle" | "throw" | "null" | "mismatch";
+	onAfterEnsureFileSettle?: () => void;
+	supportsAtomicProcess?: boolean;
+	baselineHashProvider?: (path: string) => string | null | undefined;
+	baselineTextProvider?: (path: string) => Promise<string | null> | string | null;
 	isMarkdownPathSyncable?: (path: string) => boolean;
 } = {}) {
 	const doc = new Y.Doc();
@@ -74,6 +91,15 @@ function makeHarness(options: {
 	const ytext = doc.getText("content");
 	const fakeProvider = { __kind: "fake-provider" };
 	const diskFiles = new Map<string, string>();
+	let metaChangeObserver: ((batch: MetaChangeBatch) => void) | null = null;
+	let authoritativeDeleteFingerprint: string | null = null;
+	const deleteCalls: string[] = [];
+	let trashAttempts = 0;
+	let hardDeleteCalls = 0;
+	let ensureFileCalls = 0;
+	let processCalls = 0;
+	let modifyCalls = 0;
+	let abstractFileLookups = 0;
 	if (options.initialDiskContent !== undefined) {
 		diskFiles.set(FILE_PATH, options.initialDiskContent);
 	}
@@ -87,16 +113,49 @@ function makeHarness(options: {
 		provider: fakeProvider,
 		ydoc: doc,
 		meta,
-		getTextForPath: (path: string) => (path === FILE_PATH ? ytext : null),
+		getTextForPath: (path: string) => (
+			authoritativeDeleteFingerprint === null && meta.get(FILE_ID)?.path === path
+				? ytext
+				: null
+		),
 		getFileIdForText: (text: Y.Text) => (text === ytext ? FILE_ID : null),
-		idToText: { entries: () => new Map([[FILE_ID, ytext]]).entries() },
+		idToText: new Map([[FILE_ID, ytext]]),
 		isFileMetaDeleted: (m: { deleted?: boolean } | undefined) => Boolean(m?.deleted),
-		// v3: semantic change subscription used by DiskMirror.startMapObservers()
-		observeMetaChanges: (_cb: unknown) => () => { /* no-op unsubscribe in tests */ },
+		getAuthoritativeMarkdownDeleteSnapshot: () => authoritativeDeleteFingerprint === null
+			? null
+			: { fingerprint: authoritativeDeleteFingerprint },
+		getActiveFileIdsForPath: () => authoritativeDeleteFingerprint === null ? [FILE_ID] : [],
+		isPathTombstoned: () => authoritativeDeleteFingerprint !== null,
+		ensureFile: (path: string, content: string) => {
+			ensureFileCalls++;
+			if (options.ensureFileBehavior === "throw") {
+				throw new Error("deterministic ensureFile failure");
+			}
+			if (options.ensureFileBehavior === "null") return null;
+			doc.transact(() => {
+				ytext.delete(0, ytext.length);
+				ytext.insert(
+					0,
+					options.ensureFileBehavior === "mismatch" ? `${content}MISMATCH` : content,
+				);
+			});
+			authoritativeDeleteFingerprint = null;
+			options.onAfterEnsureFileSettle?.();
+			return ytext;
+		},
+		// v3: semantic change subscription used by DiskMirror.startMapObservers().
+		observeMetaChanges: (cb: (batch: MetaChangeBatch) => void) => {
+			metaChangeObserver = cb;
+			return () => {
+				if (metaChangeObserver === cb) metaChangeObserver = null;
+			};
+		},
 	};
 
 	const fakeEditorBindings = {
 		getLastEditorActivityForPath: () => null,
+		unbindByPath: () => {},
+		updatePathsAfterRename: () => {},
 	};
 
 	const openView = options.openEditorContent === undefined
@@ -110,10 +169,28 @@ function makeHarness(options: {
 				},
 			},
 		});
-	const existingFile = Object.assign(new TFile(), {
-		path: FILE_PATH,
-		stat: { size: options.initialDiskContent?.length ?? 0 },
+	const makeDiskFileIdentity = (path: string, contentLength: number) => Object.assign(new TFile(), {
+		path,
+		stat: { ctime: 1, mtime: 1, size: contentLength },
 	});
+	const diskFileIdentities = new Map<string, TFile>();
+	const nonFilePathOccupants = new Map<string, { path: string }>();
+	let currentDiskFile = makeDiskFileIdentity(FILE_PATH, options.initialDiskContent?.length ?? 0);
+	if (options.initialDiskContent !== undefined) diskFileIdentities.set(FILE_PATH, currentDiskFile);
+	const getDiskFileIdentity = (path: string): TFile | null => {
+		const nonFile = nonFilePathOccupants.get(path);
+		if (nonFile) return nonFile as unknown as TFile;
+		if (!diskFiles.has(path)) {
+			diskFileIdentities.delete(path);
+			return null;
+		}
+		let file = diskFileIdentities.get(path);
+		if (!file) {
+			file = makeDiskFileIdentity(path, diskFiles.get(path)?.length ?? 0);
+			diskFileIdentities.set(path, file);
+		}
+		return file;
+	};
 	const fakeApp = {
 		workspace: {
 			getActiveViewOfType: () => openView,
@@ -122,27 +199,141 @@ function makeHarness(options: {
 			},
 		},
 		vault: {
-			getAbstractFileByPath: (path: string) => diskFiles.has(path) ? existingFile : null,
+			getAbstractFileByPath: (path: string) => {
+				const file = getDiskFileIdentity(path);
+				abstractFileLookups++;
+				options.onGetAbstractFile?.(path, file, abstractFileLookups);
+				return file;
+			},
 			read: async (file: { path: string }) => {
 				const content = diskFiles.get(file.path) ?? "";
 				await options.onRead?.();
 				return content;
 			},
 			modify: async (file: { path: string }, content: string) => {
+				modifyCalls++;
 				diskFiles.set(file.path, content);
 			},
+			...(options.supportsAtomicProcess === false ? {} : {
+				process: async (
+					file: { path: string },
+					update: (latestContent: string) => string,
+				) => {
+					processCalls++;
+					await options.onBeforeProcess?.();
+					const nextContent = update(diskFiles.get(file.path) ?? "");
+					diskFiles.set(file.path, nextContent);
+					await options.onAfterProcess?.();
+					return nextContent;
+				},
+			}),
 			create: async (path: string, content: string) => {
+				await options.onBeforeCreate?.();
+				if (diskFiles.has(path)) throw new Error(`File already exists: ${path}`);
 				diskFiles.set(path, content);
+				const file = makeDiskFileIdentity(path, content.length);
+				diskFileIdentities.set(path, file);
+				if (path === FILE_PATH) currentDiskFile = file;
+				await options.onAfterCreate?.();
+				return file;
+			},
+			delete: async (_file: { path: string }) => {
+				hardDeleteCalls++;
 			},
 			createFolder: async () => {},
 		},
+		fileManager: {
+			renameFile: async (file: { path: string }, newPath: string) => {
+				await options.onBeforeRename?.();
+				const oldPath = file.path;
+				if (!diskFiles.has(oldPath)) throw new Error(`File not found: ${oldPath}`);
+				if (diskFiles.has(newPath)) throw new Error(`File already exists: ${newPath}`);
+				const content = diskFiles.get(oldPath) ?? "";
+				diskFiles.delete(oldPath);
+				diskFileIdentities.delete(oldPath);
+				diskFiles.set(newPath, content);
+				Object.assign(file, { path: newPath, stat: { size: content.length } });
+				diskFileIdentities.set(newPath, file as TFile);
+				await options.onAfterRename?.();
+			},
+			...(options.trashBehavior === "missing" ? {} : {
+				trashFile: async (file: { path: string }) => {
+					trashAttempts++;
+					await options.onBeforeTrash?.();
+					if (options.trashBehavior === "throw") {
+						throw new Error("deterministic trash failure");
+					}
+					deleteCalls.push(file.path);
+					diskFiles.delete(file.path);
+					diskFileIdentities.delete(file.path);
+					await options.onAfterTrash?.();
+				},
+			}),
+		},
 	};
-
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const mirror = new DiskMirror(fakeApp as any, fakeVaultSync as any, fakeEditorBindings as any, false);
 	mirror.setMarkdownPathSyncabilityPredicate(options.isMarkdownPathSyncable ?? (() => true));
+	if (options.baselineHashProvider) {
+		mirror.setDiskBaselineHashProvider(options.baselineHashProvider);
+	}
+	if (options.baselineTextProvider) {
+		mirror.setDiskBaselineTextProvider(options.baselineTextProvider);
+	}
 
-	return { doc, ytext, fakeProvider, meta, mirror, diskFiles };
+	return {
+		doc,
+		ytext,
+		fakeProvider,
+		meta,
+		mirror,
+		diskFiles,
+		deleteCalls,
+		getTrashAttempts: () => trashAttempts,
+		getHardDeleteCalls: () => hardDeleteCalls,
+		getEnsureFileCalls: () => ensureFileCalls,
+		getProcessCalls: () => processCalls,
+		getModifyCalls: () => modifyCalls,
+		getCurrentDiskFile: () => diskFiles.has(FILE_PATH) ? currentDiskFile : null,
+		getDiskFileAt: (path: string) => getDiskFileIdentity(path),
+		renameDiskFile: async (oldPath: string, newPath: string) => {
+			const file = getDiskFileIdentity(oldPath);
+			if (!file) throw new Error(`File not found: ${oldPath}`);
+			await fakeApp.fileManager.renameFile(file, newPath);
+		},
+		replaceDiskFileIdentity: (content: string) => {
+			// Model delete + recreate at the same path. The bytes can be identical,
+			// but Obsidian exposes a new TFile object for the new filesystem entry.
+			diskFiles.set(FILE_PATH, content);
+			currentDiskFile = makeDiskFileIdentity(FILE_PATH, content.length);
+			diskFileIdentities.set(FILE_PATH, currentDiskFile);
+		},
+		replaceDiskFileIdentityAt: (path: string, content: string) => {
+			// Same ABA model for rename destinations and arbitrary vault paths.
+			diskFiles.set(path, content);
+			const replacement = makeDiskFileIdentity(path, content.length);
+			diskFileIdentities.set(path, replacement);
+			if (path === FILE_PATH) currentDiskFile = replacement;
+			return replacement;
+		},
+		advanceDiskFileRevision: () => {
+			const file = getDiskFileIdentity(FILE_PATH);
+			if (!file) throw new Error("File not found while advancing revision");
+			file.stat.mtime = (file.stat.mtime ?? 0) + 1;
+			file.stat.size = diskFiles.get(FILE_PATH)?.length ?? 0;
+		},
+		occupyPathWithNonFile: () => {
+			nonFilePathOccupants.set(FILE_PATH, { path: FILE_PATH });
+		},
+		hasNonFilePathOccupant: () => nonFilePathOccupants.has(FILE_PATH),
+		setAuthoritativeDeleteFingerprint: (fingerprint: string | null) => {
+			authoritativeDeleteFingerprint = fingerprint;
+		},
+		emitMetaChanges: (batch: MetaChangeBatch) => {
+			if (!metaChangeObserver) throw new Error("metadata observer is not started");
+			metaChangeObserver(batch);
+		},
+	};
 }
 
 // ── Test 2b: excluded remote paths never enter the write queue ───────────────
@@ -410,6 +601,1696 @@ console.log("\n--- Test 9: flush retries when CRDT changes during async read ---
 	);
 
 	doc.destroy();
+}
+
+// ── Test 10: atomic process rejects a disk edit during write preparation ──────
+
+console.log("\n--- Test 10: atomic process preserves a disk edit made during write preparation ---");
+{
+	let mutateBeforeProcess: (() => void) | null = null;
+	const fixture = makeHarness({
+		initialDiskContent: "DISK_BEFORE\n",
+		onBeforeProcess: () => mutateBeforeProcess?.(),
+	});
+	mutateBeforeProcess = () => {
+		fixture.diskFiles.set(FILE_PATH, "EXTERNAL_DURING_PREP\n");
+	};
+	fixture.ytext.insert(0, "REMOTE_CRDT\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true);
+
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"atomic write reports a stale disk snapshot instead of overwriting it",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === "EXTERNAL_DURING_PREP\n",
+		"atomic write preserves the external edit that landed before commit",
+	);
+	assert(fixture.getProcessCalls() === 1, "existing-file write uses Vault.process when available");
+	assert(fixture.getModifyCalls() === 0, "atomic existing-file write does not fall back to Vault.modify");
+
+	fixture.doc.destroy();
+}
+
+// ── Test 11: hosts without atomic process never attempt a racy modify ─────────
+
+console.log("\n--- Test 11: missing atomic process defers without Vault.modify ---");
+{
+	let fixture!: ReturnType<typeof makeHarness>;
+	let readCount = 0;
+	fixture = makeHarness({
+		initialDiskContent: "DISK_BEFORE\n",
+		supportsAtomicProcess: false,
+		onRead: () => {
+			readCount++;
+			if (readCount === 1) {
+				fixture.diskFiles.set(FILE_PATH, "EXTERNAL_AFTER_FIRST_READ\n");
+			}
+		},
+	});
+	fixture.ytext.insert(0, "REMOTE_CRDT\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true);
+
+	assert(readCount === 1, "unsupported host stops after the planning read");
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"unsupported host reports a conservative deferral",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === "EXTERNAL_AFTER_FIRST_READ\n",
+		"unsupported host preserves the external edit",
+	);
+	assert(fixture.getProcessCalls() === 0, "unavailable Vault.process is never called");
+	assert(fixture.getModifyCalls() === 0, "racy Vault.modify fallback is never used");
+
+	fixture.doc.destroy();
+}
+
+// ── Test 12: caller-provided disk authority snapshot is a CAS precondition ───
+
+console.log("\n--- Test 12: expectedDiskContent rejects a stale reconciliation plan ---");
+{
+	const fixture = makeHarness({ initialDiskContent: "DISK_NEWER_THAN_PLAN\n" });
+	fixture.ytext.insert(0, "CRDT_FROM_STALE_PLAN\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: "DISK_SEEN_BY_PLANNER\n",
+	});
+
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"stale caller snapshot is rejected with an explicit disk-changed deferral",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === "DISK_NEWER_THAN_PLAN\n",
+		"stale reconciliation plan cannot overwrite newer disk content",
+	);
+	assert(fixture.getProcessCalls() === 0, "snapshot mismatch is rejected before atomic commit");
+	assert(fixture.getModifyCalls() === 0, "snapshot mismatch performs no fallback modify");
+
+	fixture.doc.destroy();
+}
+
+// ── Test 12b: file identity closes identical-content ABA ───────────────
+
+console.log("\n--- Test 12b: restore identity CAS rejects identical-bytes delete/recreate ABA ---");
+{
+	const reviewedDiskContent = "DISK_REVIEWED_BEFORE_RESTORE\n";
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: reviewedDiskContent,
+		onBeforeProcess: () => {
+			// The path disappears and is recreated with byte-for-byte identical
+			// content after restore preparation but before the atomic callback.
+			fixture.replaceDiskFileIdentity(reviewedDiskContent);
+		},
+	});
+	const reviewedDiskFile = fixture.getCurrentDiskFile();
+	if (!reviewedDiskFile) throw new Error("fixture must expose the reviewed file identity");
+	fixture.ytext.insert(0, "SNAPSHOT_VERSION\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: reviewedDiskContent,
+		expectedDiskFile: reviewedDiskFile,
+	});
+
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"new TFile identity invalidates restore even when the replacement bytes are identical",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === reviewedDiskContent,
+		"snapshot bytes never overwrite the identically-valued replacement file",
+	);
+	assert(
+		fixture.getProcessCalls() === 1,
+		"identity is rechecked inside the atomic process boundary",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 12b2: restore revision CAS rejects same-TFile ABA before queued flush ---");
+{
+	const reviewedDiskContent = "DISK_REVIEWED_REVISION\n";
+	const fixture = makeHarness({ initialDiskContent: reviewedDiskContent });
+	const reviewedDiskFile = fixture.getCurrentDiskFile();
+	if (!reviewedDiskFile) throw new Error("fixture must expose the reviewed file identity");
+	const reviewedRevision = {
+		ctime: reviewedDiskFile.stat.ctime,
+		mtime: reviewedDiskFile.stat.mtime,
+		size: reviewedDiskFile.stat.size,
+	};
+	fixture.ytext.insert(0, "SNAPSHOT_REVISION_VERSION\n");
+
+	// flushWrite enters a per-path Promise chain. A same-TFile local save can
+	// advance stat before that queued work begins even if its final bytes equal
+	// the reviewed content.
+	const writePromise = fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: reviewedDiskContent,
+		expectedDiskFile: reviewedDiskFile,
+		expectedDiskRevision: reviewedRevision,
+	});
+	fixture.advanceDiskFileRevision();
+	const result = await writePromise;
+
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"new same-TFile stat episode invalidates restore before the queued write",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === reviewedDiskContent,
+		"snapshot bytes cannot overwrite a same-bytes local save episode",
+	);
+	assert(fixture.getProcessCalls() === 0, "revision mismatch is rejected before Vault.process");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 12b3: unchanged restore rechecks revision after final readback ---");
+{
+	const reviewedDiskContent = "ALREADY_RESTORED\n";
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: reviewedDiskContent,
+		onGetAbstractFile: (_path, _file, callCount) => {
+			if (callCount === 6) {
+				// This runs after isSettledDiskSnapshotCurrent's last identity/stat
+				// read, but before settleUnchangedWrite resumes from awaiting it.
+				queueMicrotask(() => fixture.advanceDiskFileRevision());
+			}
+		},
+	});
+	fixture.ytext.insert(0, reviewedDiskContent);
+	const reviewedDiskFile = fixture.getCurrentDiskFile();
+	if (!reviewedDiskFile) throw new Error("fixture must expose the reviewed file identity");
+	const reviewedRevision = {
+		ctime: reviewedDiskFile.stat.ctime,
+		mtime: reviewedDiskFile.stat.mtime,
+		size: reviewedDiskFile.stat.size,
+	};
+	let baselineCalls = 0;
+	fixture.mirror.setDiskWriteCallback(() => { baselineCalls++; });
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: reviewedDiskContent,
+		expectedDiskFile: reviewedDiskFile,
+		expectedDiskRevision: reviewedRevision,
+		recordBaseline: true,
+	});
+
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"same-TFile save after readback is not reported as unchanged settlement",
+	);
+	assert(baselineCalls === 0, "stale unchanged episode never advances the durable baseline");
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === reviewedDiskContent,
+		"unchanged revision race leaves disk bytes untouched",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 12c: ordinary write pins the initially-read TFile identity ---");
+{
+	const reviewedDiskContent = "ORDINARY_DISK_BEFORE_WRITE\n";
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: reviewedDiskContent,
+		onBeforeProcess: () => {
+			// No expectedDiskFile option is supplied. DiskMirror must still pin the
+			// TFile it actually read and reject a same-bytes replacement at commit.
+			fixture.replaceDiskFileIdentity(reviewedDiskContent);
+		},
+	});
+	fixture.ytext.insert(0, "REMOTE_ORDINARY_WRITE\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true);
+
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"ordinary flush rejects same-bytes TFile replacement without caller identity options",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === reviewedDiskContent,
+		"ordinary flush never overwrites the replacement filesystem entry",
+	);
+	assert(fixture.getProcessCalls() === 1, "ordinary identity is fenced inside Vault.process");
+
+	fixture.doc.destroy();
+}
+
+// ── Test 13: revival invalidates an in-flight remote delete ───────────────────
+
+console.log("\n--- Test 13: remote revival cancels an older in-flight delete ---");
+{
+	let releaseFirstRead!: () => void;
+	let signalFirstRead!: () => void;
+	const firstReadStarted = new Promise<void>((resolve) => {
+		signalFirstRead = resolve;
+	});
+	const firstReadReleased = new Promise<void>((resolve) => {
+		releaseFirstRead = resolve;
+	});
+	let readCount = 0;
+	const fixture = makeHarness({
+		initialDiskContent: "CLEAN_BASELINE\n",
+		onRead: async () => {
+			readCount++;
+			if (readCount === 1) {
+				signalFirstRead();
+				await firstReadReleased;
+			}
+		},
+	});
+	fixture.ytext.insert(0, "CLEAN_BASELINE\n");
+	fixture.mirror.startMapObservers();
+	fixture.setAuthoritativeDeleteFingerprint("delete-episode-1");
+
+	const deletePromise = (
+		fixture.mirror as unknown as {
+			handleRemoteDelete: (
+				path: string,
+				options: { baselineText?: string | null },
+			) => Promise<void>;
+		}
+	).handleRemoteDelete(FILE_PATH, { baselineText: "CLEAN_BASELINE\n" });
+
+	await firstReadStarted;
+	fixture.setAuthoritativeDeleteFingerprint(null);
+	fixture.emitMetaChanges({
+		origin: fixture.fakeProvider,
+		isLocal: false,
+		changes: [{ kind: "revived", fileId: FILE_ID, path: FILE_PATH }],
+	});
+	releaseFirstRead();
+	await deletePromise;
+
+	assert(fixture.deleteCalls.length === 0, "revival prevents the older delete handler from deleting disk");
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === "CLEAN_BASELINE\n",
+		"revival leaves the local file intact",
+	);
+	assert(
+		debounceTimerCount(fixture.mirror) === 1,
+		"older delete handler does not clear the revival write that replaced it",
+	);
+
+	clearTimers(fixture.mirror);
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 13b: remote tombstone serializes with an in-flight write ---");
+{
+	let releaseProcess!: () => void;
+	let signalProcess!: () => void;
+	const processStarted = new Promise<void>((resolve) => { signalProcess = resolve; });
+	const processReleased = new Promise<void>((resolve) => { releaseProcess = resolve; });
+	const fixture = makeHarness({
+		initialDiskContent: "CLEAN_BASELINE\n",
+		onBeforeProcess: async () => {
+			signalProcess();
+			await processReleased;
+		},
+	});
+	fixture.ytext.insert(0, "REMOTE_WRITE_BEFORE_DELETE\n");
+
+	const writePromise = fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: "CLEAN_BASELINE\n",
+	});
+	await processStarted;
+	fixture.setAuthoritativeDeleteFingerprint("delete-during-write");
+	const deletePromise = (
+		fixture.mirror as unknown as {
+			handleRemoteDelete: (
+				path: string,
+				options: { baselineText?: string | null },
+			) => Promise<void>;
+		}
+	).handleRemoteDelete(FILE_PATH, { baselineText: "CLEAN_BASELINE\n" });
+	await Promise.resolve();
+	releaseProcess();
+
+	const writeResult = await writePromise;
+	await deletePromise;
+	assert(
+		writeResult.kind === "deferred" && writeResult.reason === "disk-changed-during-write",
+		"tombstone aborts the write at the atomic commit fence",
+	);
+	assert(fixture.deleteCalls.length === 1, "serialized delete runs after the aborted writer releases the path");
+	assert(!fixture.diskFiles.has(FILE_PATH), "queued writer cannot resurrect the remotely deleted note");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 13c: remote edit+delete compares disk with the durable baseline, not tombstoned Y.Text ---");
+{
+	const cleanDiskBaseline = "CLEAN_DISK_A\n";
+	const tombstonedRemoteText = "REMOTE_EDIT_B_THEN_DELETE\n";
+	const durableBaselineHash = await contentBaselineHash(cleanDiskBaseline);
+	const fixture = makeHarness({
+		initialDiskContent: cleanDiskBaseline,
+		baselineHashProvider: () => durableBaselineHash,
+		baselineTextProvider: () => cleanDiskBaseline,
+	});
+	fixture.ytext.insert(0, tombstonedRemoteText);
+	fixture.setAuthoritativeDeleteFingerprint("remote-edit-delete-episode");
+
+	await (
+		fixture.mirror as unknown as {
+			handleRemoteDelete: (
+				path: string,
+				options?: { baselineText?: string | null },
+			) => Promise<void>;
+		}
+	).handleRemoteDelete(FILE_PATH);
+
+	assert(fixture.deleteCalls.length === 1, "clean disk is deleted even when tombstoned Y.Text already contains B");
+	assert(!fixture.diskFiles.has(FILE_PATH), "stale clean A is not revived over the remote B+delete intent");
+	assert(!fixture.mirror.isPreservedUnresolved(FILE_PATH), "verified durable equality needs no unresolved marker");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 13d: same-bytes delete/recreate during final delete read is preserved ---");
+{
+	const cleanDiskBaseline = "CLEAN_DISK_IDENTITY_A\n";
+	let readCount = 0;
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: cleanDiskBaseline,
+		onRead: () => {
+			readCount++;
+			if (readCount === 2) {
+				fixture.replaceDiskFileIdentity(cleanDiskBaseline);
+			}
+		},
+	});
+	fixture.ytext.insert(0, cleanDiskBaseline);
+	fixture.setAuthoritativeDeleteFingerprint("remote-delete-disk-aba");
+
+	await (
+		fixture.mirror as unknown as {
+			handleRemoteDelete: (
+				path: string,
+				options: { baselineText?: string | null },
+			) => Promise<void>;
+		}
+	).handleRemoteDelete(FILE_PATH, { baselineText: cleanDiskBaseline });
+
+	assert(readCount === 2, "delete path reaches its final compare read");
+	assert(fixture.deleteCalls.length === 0, "replacement TFile is never passed to trash/delete");
+	assert(fixture.diskFiles.get(FILE_PATH) === cleanDiskBaseline, "same-bytes replacement survives the stale delete");
+	assert(fixture.mirror.isPreservedUnresolved(FILE_PATH), "disk ABA is quarantined for explicit resolution");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 13d2: same-bytes replacement between delete reads is preserved ---");
+{
+	const cleanDiskBaseline = "CLEAN_DISK_BETWEEN_READ_ABA\n";
+	let readCount = 0;
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: cleanDiskBaseline,
+		onRead: () => {
+			readCount++;
+			if (readCount === 1) {
+				fixture.replaceDiskFileIdentity(cleanDiskBaseline);
+			}
+		},
+	});
+	fixture.ytext.insert(0, cleanDiskBaseline);
+	fixture.setAuthoritativeDeleteFingerprint("remote-delete-between-read-aba");
+
+	await (
+		fixture.mirror as unknown as {
+			handleRemoteDelete: (
+				path: string,
+				options: { baselineText?: string | null },
+			) => Promise<void>;
+		}
+	).handleRemoteDelete(FILE_PATH, { baselineText: cleanDiskBaseline });
+
+	assert(readCount === 1, "identity replacement is rejected before adopting a new final-read target");
+	assert(fixture.deleteCalls.length === 0, "same-bytes replacement between reads is never trashed");
+	assert(fixture.diskFiles.get(FILE_PATH) === cleanDiskBaseline, "between-read replacement survives");
+	assert(fixture.mirror.isPreservedUnresolved(FILE_PATH), "between-read ABA is quarantined");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 13e: failed recoverable trash keeps disk and quarantine ---");
+{
+	const cleanDiskBaseline = "CLEAN_DISK_TRASH_FAILURE\n";
+	const fixture = makeHarness({
+		initialDiskContent: cleanDiskBaseline,
+		trashBehavior: "throw",
+	});
+	fixture.ytext.insert(0, cleanDiskBaseline);
+	fixture.setAuthoritativeDeleteFingerprint("remote-delete-trash-failure");
+
+	await (
+		fixture.mirror as unknown as {
+			handleRemoteDelete: (
+				path: string,
+				options: { baselineText?: string | null },
+			) => Promise<void>;
+		}
+	).handleRemoteDelete(FILE_PATH, { baselineText: cleanDiskBaseline });
+
+	assert(fixture.getTrashAttempts() === 1, "recoverable trash is attempted once");
+	assert(fixture.getHardDeleteCalls() === 0, "trash failure never falls back to irreversible Vault.delete");
+	assert(fixture.diskFiles.get(FILE_PATH) === cleanDiskBaseline, "trash failure preserves disk bytes");
+	assert(fixture.mirror.isPreservedUnresolved(FILE_PATH), "trash failure records a durable quarantine marker");
+	assert(
+		fixture.mirror.getPreservedUnresolvedEntries()[0]?.reason === "remote-delete-trash-failed",
+		"trash failure marker records the recoverable-delete failure reason",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 13f: successful trash resolves marker only after trash settles ---");
+{
+	const cleanDiskBaseline = "CLEAN_DISK_TRASH_SUCCESS\n";
+	let markerPresentInsideTrash = false;
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: cleanDiskBaseline,
+		onAfterTrash: () => {
+			markerPresentInsideTrash = fixture.mirror.isPreservedUnresolved(FILE_PATH);
+		},
+	});
+	fixture.ytext.insert(0, cleanDiskBaseline);
+	fixture.setAuthoritativeDeleteFingerprint("remote-delete-trash-success");
+	fixture.mirror.recordPreservedUnresolved(FILE_PATH, "remote-delete-missing-baseline");
+
+	await (
+		fixture.mirror as unknown as {
+			handleRemoteDelete: (
+				path: string,
+				options: { baselineText?: string | null },
+			) => Promise<void>;
+		}
+	).handleRemoteDelete(FILE_PATH, { baselineText: cleanDiskBaseline });
+
+	assert(markerPresentInsideTrash, "marker remains present until recoverable trash promise settles");
+	assert(fixture.deleteCalls.length === 1, "successful remote delete uses recoverable trash");
+	assert(!fixture.diskFiles.has(FILE_PATH), "successful trash removes the live vault path");
+	assert(!fixture.mirror.isPreservedUnresolved(FILE_PATH), "exact current tombstone clears prior marker after trash");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 13g: failed dirty revival keeps the exact prior marker ---");
+{
+	const baseline = "REVIVE_BASELINE\n";
+	const localDirty = "LOCAL_DIRTY_TO_PRESERVE\n";
+	const fixture = makeHarness({
+		initialDiskContent: localDirty,
+		ensureFileBehavior: "throw",
+	});
+	fixture.ytext.insert(0, baseline);
+	fixture.setAuthoritativeDeleteFingerprint("remote-delete-revive-failure");
+	fixture.mirror.recordPreservedUnresolved(FILE_PATH, "remote-delete-missing-baseline");
+	const before = fixture.mirror.getPreservedUnresolvedEntries()[0];
+
+	await (
+		fixture.mirror as unknown as {
+			handleRemoteDelete: (
+				path: string,
+				options: { baselineText?: string | null },
+			) => Promise<void>;
+		}
+	).handleRemoteDelete(FILE_PATH, { baselineText: baseline });
+
+	const after = fixture.mirror.getPreservedUnresolvedEntries()[0];
+	assert(fixture.getEnsureFileCalls() === 1, "dirty preservation attempts one tombstone revival");
+	assert(fixture.diskFiles.get(FILE_PATH) === localDirty, "revive failure preserves local disk authority");
+	assert(fixture.mirror.isPreservedUnresolved(FILE_PATH), "revive failure keeps the path quarantined");
+	assert(
+		before?.episodeId === after?.episodeId && before?.reason === after?.reason,
+		"revive failure does not replace or clear the prior unresolved episode",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 13g2: dirty revival rejects a disk authority that changed after inspection ---");
+{
+	const baseline = "REVIVE_STALE_BASELINE\n";
+	const firstLocalDirty = "LOCAL_DIRTY_FIRST_READ\n";
+	const newerLocalDirty = "LOCAL_DIRTY_AFTER_READ\n";
+	let readCount = 0;
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: firstLocalDirty,
+		onRead: () => {
+			readCount++;
+			if (readCount === 1) fixture.diskFiles.set(FILE_PATH, newerLocalDirty);
+		},
+	});
+	fixture.ytext.insert(0, baseline);
+	fixture.setAuthoritativeDeleteFingerprint("remote-delete-stale-dirty-revive");
+
+	await (
+		fixture.mirror as unknown as {
+			handleRemoteDelete: (
+				path: string,
+				options: { baselineText?: string | null },
+			) => Promise<void>;
+		}
+	).handleRemoteDelete(FILE_PATH, { baselineText: baseline });
+
+	assert(readCount === 2, "dirty preservation re-reads disk immediately before revival");
+	assert(fixture.getEnsureFileCalls() === 0, "stale dirty snapshot never reaches ensureFile");
+	assert(fixture.diskFiles.get(FILE_PATH) === newerLocalDirty, "newer local disk edit remains authoritative");
+	assert(fixture.ytext.toString() === baseline, "stale first-read content is not revived into CRDT");
+	assert(fixture.mirror.isPreservedUnresolved(FILE_PATH), "changed dirty authority is quarantined");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 13h: exact dirty revival clears marker only after CRDT settles ---");
+{
+	const baseline = "REVIVE_EXACT_BASELINE\n";
+	const localDirty = "LOCAL_DIRTY_EXACT_WINNER\n";
+	let markerPresentDuringEnsure = false;
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: localDirty,
+		onAfterEnsureFileSettle: () => {
+			markerPresentDuringEnsure = fixture.mirror.isPreservedUnresolved(FILE_PATH);
+		},
+	});
+	fixture.ytext.insert(0, baseline);
+	fixture.setAuthoritativeDeleteFingerprint("remote-delete-revive-success");
+	fixture.mirror.recordPreservedUnresolved(FILE_PATH, "remote-delete-missing-baseline");
+
+	await (
+		fixture.mirror as unknown as {
+			handleRemoteDelete: (
+				path: string,
+				options: { baselineText?: string | null },
+			) => Promise<void>;
+		}
+	).handleRemoteDelete(FILE_PATH, { baselineText: baseline });
+
+	assert(markerPresentDuringEnsure, "marker remains present while ensureFile settles active CRDT state");
+	assert(fixture.ytext.toString() === localDirty, "active Y.Text exposes the exact preserved disk bytes");
+	assert(!fixture.mirror.isPreservedUnresolved(FILE_PATH), "exact active revival clears the prior marker last");
+	assert(fixture.diskFiles.get(FILE_PATH) === localDirty, "exact revival leaves local disk bytes untouched");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 13i: non-file path occupant after trash keeps quarantine ---");
+{
+	const cleanDiskBaseline = "CLEAN_BEFORE_FOLDER_COLLISION\n";
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: cleanDiskBaseline,
+		onAfterTrash: () => {
+			// Model a folder/other TAbstractFile taking the same path while the
+			// recoverable trash promise is in flight.
+			fixture.occupyPathWithNonFile();
+		},
+	});
+	fixture.ytext.insert(0, cleanDiskBaseline);
+	fixture.setAuthoritativeDeleteFingerprint("remote-delete-non-file-collision");
+	fixture.mirror.recordPreservedUnresolved(FILE_PATH, "remote-delete-missing-baseline");
+
+	await (
+		fixture.mirror as unknown as {
+			handleRemoteDelete: (
+				path: string,
+				options: { baselineText?: string | null },
+			) => Promise<void>;
+		}
+	).handleRemoteDelete(FILE_PATH, { baselineText: cleanDiskBaseline });
+
+	assert(fixture.deleteCalls.length === 1, "original file reaches recoverable trash");
+	assert(fixture.hasNonFilePathOccupant(), "non-file winner remains at the path");
+	assert(fixture.mirror.isPreservedUnresolved(FILE_PATH), "non-file path collision keeps quarantine");
+
+	fixture.doc.destroy();
+}
+
+// ── Test 14: durable baseline rejects edits that predate flush startup ─────────
+
+console.log("\n--- Test 14: durable baseline preserves a disk edit made before flush starts ---");
+{
+	const durableBaselineHash = await contentBaselineHash("LAST_CLEAN_BASELINE\n");
+	const fixture = makeHarness({
+		initialDiskContent: "LOCAL_EDIT_BEFORE_FLUSH\n",
+		baselineHashProvider: () => durableBaselineHash,
+	});
+	fixture.ytext.insert(0, "REMOTE_CRDT\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true);
+
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"pre-existing local edit is rejected against the durable clean baseline",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === "LOCAL_EDIT_BEFORE_FLUSH\n",
+		"provider flush cannot adopt and overwrite a dirty disk snapshot",
+	);
+	assert(fixture.getProcessCalls() === 0, "dirty durable-baseline mismatch never reaches atomic commit");
+	assert(fixture.getModifyCalls() === 0, "dirty durable-baseline mismatch never reaches fallback modify");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 14b: missing production baseline defers conservatively ---");
+{
+	const fixture = makeHarness({
+		initialDiskContent: "UNCLASSIFIED_DISK\n",
+		baselineHashProvider: () => null,
+	});
+	fixture.ytext.insert(0, "REMOTE_CRDT\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true);
+
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"configured production guard defers when no durable baseline exists",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === "UNCLASSIFIED_DISK\n",
+		"missing baseline preserves unclassified local disk content",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 14c: clean production baseline still permits a remote write ---");
+{
+	const cleanDiskContent = "LAST_CLEAN_BASELINE\n";
+	const durableBaselineHash = await contentBaselineHash(cleanDiskContent);
+	const fixture = makeHarness({
+		initialDiskContent: cleanDiskContent,
+		baselineHashProvider: () => durableBaselineHash,
+	});
+	fixture.ytext.insert(0, "REMOTE_CRDT\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true);
+
+	assert(result.kind === "written", "matching durable baseline permits the planned remote write");
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === "REMOTE_CRDT\n",
+		"clean production disk is updated to the remote CRDT content",
+	);
+	assert(fixture.getProcessCalls() === 1, "clean production update commits through Vault.process");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 14d: unchanged equality repairs a missing durable baseline ---");
+{
+	const settledContent = "LOCAL_AUTOSAVE_SETTLED\n";
+	let durableBaselineHash: string | null = null;
+	const fixture = makeHarness({
+		initialDiskContent: settledContent,
+		baselineHashProvider: () => durableBaselineHash,
+	});
+	fixture.mirror.setDiskWriteCallback((_path, hash) => {
+		durableBaselineHash = hash;
+	});
+	fixture.ytext.insert(0, settledContent);
+
+	const equalityResult = await fixture.mirror.flushWrite(FILE_PATH, true);
+	const expectedSettledHash = await contentBaselineHash(settledContent);
+	assert(equalityResult.kind === "unchanged", "equal disk/CRDT is observed without a write");
+	assert(
+		durableBaselineHash === expectedSettledHash,
+		"unchanged equality publishes the clean durable baseline",
+	);
+
+	fixture.ytext.delete(0, fixture.ytext.length);
+	fixture.ytext.insert(0, "REMOTE_AFTER_LOCAL_AUTOSAVE\n");
+	const remoteResult = await fixture.mirror.flushWrite(FILE_PATH, true);
+	assert(remoteResult.kind === "written", "repaired baseline permits the next remote update");
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === "REMOTE_AFTER_LOCAL_AUTOSAVE\n",
+		"remote update reaches disk after equality settlement",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 14e: expected existing file cannot be recreated after local deletion ---");
+{
+	const fixture = makeHarness();
+	fixture.ytext.insert(0, "REMOTE_FROM_STALE_EXISTING_PLAN\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: "DISK_SEEN_BY_PLANNER\n",
+	});
+
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"an expected existing snapshot becoming missing is a stale plan",
+	);
+	assert(!fixture.diskFiles.has(FILE_PATH), "stale existing-file plan does not recreate a local deletion");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 14f: prior baseline plus missing disk needs explicit create authority ---");
+{
+	const previousHash = await contentBaselineHash("PREVIOUSLY_EXISTED\n");
+	const fixture = makeHarness({ baselineHashProvider: () => previousHash });
+	fixture.ytext.insert(0, "ACTIVE_CRDT\n");
+
+	const unplannedResult = await fixture.mirror.flushWrite(FILE_PATH, true);
+	assert(
+		unplannedResult.kind === "deferred" && unplannedResult.reason === "disk-changed-during-write",
+		"missing file with a prior baseline is treated as a local deletion",
+	);
+	assert(!fixture.diskFiles.has(FILE_PATH), "ordinary provider flush does not resurrect the deletion");
+
+	const authorizedResult = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		allowCreateIfMissing: true,
+	});
+	assert(authorizedResult.kind === "written" && authorizedResult.isCreate, "explicit undelete authority permits create");
+	assert(fixture.diskFiles.get(FILE_PATH) === "ACTIVE_CRDT\n", "authorized create writes the active CRDT snapshot");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 14g: semantic remote revival grants one create authority ---");
+{
+	const previousHash = await contentBaselineHash("DELETED_BASELINE\n");
+	const fixture = makeHarness({ baselineHashProvider: () => previousHash });
+	fixture.ytext.insert(0, "REVIVED_REMOTE_CONTENT\n");
+	fixture.mirror.startMapObservers();
+	fixture.emitMetaChanges({
+		origin: fixture.fakeProvider,
+		isLocal: false,
+		changes: [{ kind: "revived", fileId: FILE_ID, path: FILE_PATH }],
+	});
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true);
+	assert(result.kind === "written" && result.isCreate, "semantic revival authorizes the missing-file create");
+	assert(fixture.diskFiles.get(FILE_PATH) === "REVIVED_REMOTE_CONTENT\n", "revival recreates the remote file");
+
+	clearTimers(fixture.mirror);
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 14h: expected-missing restore cannot overwrite a file that appeared ---");
+{
+	const appearedContent = "LOCAL_FILE_APPEARED\n";
+	const previousHash = await contentBaselineHash(appearedContent);
+	const fixture = makeHarness({
+		initialDiskContent: appearedContent,
+		baselineHashProvider: () => previousHash,
+	});
+	fixture.ytext.insert(0, "SNAPSHOT_RESTORE_CONTENT\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		allowCreateIfMissing: true,
+	});
+
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"expected-missing create authority expires when a file appears",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === appearedContent,
+		"restore create cannot overwrite the newly appeared local file",
+	);
+	assert(fixture.getProcessCalls() === 0, "expected-missing mismatch is rejected before atomic modify");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 14i: explicit expected-missing create rejects an identical race winner ---");
+{
+	const plannedContent = "SAME_CONTENT_WON_CREATE_RACE\n";
+	let baselineHash: string | null = null;
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		baselineHashProvider: () => baselineHash,
+		onBeforeCreate: () => {
+			fixture.diskFiles.set(FILE_PATH, plannedContent);
+		},
+	});
+	fixture.mirror.setDiskWriteCallback((_path, hash) => { baselineHash = hash; });
+	fixture.ytext.insert(0, plannedContent);
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		allowCreateIfMissing: true,
+	});
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"explicit expected-missing CAS rejects any appeared file, even with identical bytes",
+	);
+	assert(baselineHash === null, "stale restore authority never publishes the race winner as its baseline");
+	assert(fixture.diskFiles.get(FILE_PATH) === plannedContent, "identical local winner remains untouched");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 14j: different file winning the final create race is preserved ---");
+{
+	const localWinner = "DIFFERENT_LOCAL_CREATE\n";
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		onBeforeCreate: () => {
+			fixture.diskFiles.set(FILE_PATH, localWinner);
+		},
+	});
+	fixture.ytext.insert(0, "REMOTE_CREATE_PLAN\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		allowCreateIfMissing: true,
+	});
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"different no-clobber winner becomes an explicit stale-disk deferral",
+	);
+	assert(fixture.diskFiles.get(FILE_PATH) === localWinner, "different local create is never overwritten");
+	assert(!fixture.mirror.isSuppressed(FILE_PATH), "failed create-race suppression is cleared immediately");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 14k: remote create authority is consumed by an existing target ---");
+{
+	const existingContent = "EXISTING_TARGET\n";
+	const baselineHash = await contentBaselineHash(existingContent);
+	const fixture = makeHarness({
+		initialDiskContent: existingContent,
+		baselineHashProvider: () => baselineHash,
+	});
+	fixture.ytext.insert(0, existingContent);
+	fixture.mirror.startMapObservers();
+	fixture.emitMetaChanges({
+		origin: fixture.fakeProvider,
+		isLocal: false,
+		changes: [{ kind: "revived", fileId: FILE_ID, path: FILE_PATH }],
+	});
+
+	const observedExisting = await fixture.mirror.flushWrite(FILE_PATH, true);
+	assert(observedExisting.kind === "unchanged", "revival observes the already-existing target");
+	fixture.diskFiles.delete(FILE_PATH);
+	fixture.ytext.delete(0, fixture.ytext.length);
+	fixture.ytext.insert(0, "LATER_REMOTE_UPDATE\n");
+	const afterLocalDelete = await fixture.mirror.flushWrite(FILE_PATH, true);
+	assert(
+		afterLocalDelete.kind === "deferred" && afterLocalDelete.reason === "disk-changed-during-write",
+		"consumed revival authority cannot recreate a later local deletion",
+	);
+	assert(!fixture.diskFiles.has(FILE_PATH), "later provider content does not resurrect the locally deleted target");
+
+	clearTimers(fixture.mirror);
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 14l: post-process disk change blocks baseline settlement ---");
+{
+	const expectedDiskContent = "DISK_BEFORE_PROCESS\n";
+	const externalAfterCommit = "EXTERNAL_AFTER_PROCESS_COMMIT\n";
+	let baselinePublished = false;
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: expectedDiskContent,
+		onAfterProcess: () => {
+			fixture.diskFiles.set(FILE_PATH, externalAfterCommit);
+		},
+	});
+	fixture.mirror.setDiskWriteCallback(() => { baselinePublished = true; });
+	fixture.ytext.insert(0, "REMOTE_WRITE_C1\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent,
+	});
+
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"post-process disk edit prevents a written/unchanged settlement",
+	);
+	assert(fixture.diskFiles.get(FILE_PATH) === externalAfterCommit, "post-commit external bytes remain authoritative on disk");
+	assert(!baselinePublished, "stale committed content is never published as the durable baseline");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 14m: post-create same-bytes ABA blocks baseline settlement ---");
+{
+	const createdContent = "REMOTE_CREATE_C1\n";
+	let baselinePublished = false;
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		onAfterCreate: () => {
+			fixture.replaceDiskFileIdentity(createdContent);
+		},
+	});
+	fixture.mirror.setDiskWriteCallback(() => { baselinePublished = true; });
+	fixture.ytext.insert(0, createdContent);
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		allowCreateIfMissing: true,
+	});
+
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"same-bytes replacement after create invalidates the create settlement",
+	);
+	assert(fixture.diskFiles.get(FILE_PATH) === createdContent, "replacement create bytes remain untouched");
+	assert(!baselinePublished, "replaced create identity is not promoted to a clean baseline");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 14n: unchanged same-bytes ABA blocks baseline settlement ---");
+{
+	const unchangedContent = "UNCHANGED_BEFORE_ABA\n";
+	let readCount = 0;
+	let baselinePublished = false;
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: unchangedContent,
+		onRead: () => {
+			readCount++;
+			if (readCount === 1) fixture.replaceDiskFileIdentity(unchangedContent);
+		},
+	});
+	fixture.mirror.setDiskWriteCallback(() => { baselinePublished = true; });
+	fixture.ytext.insert(0, unchangedContent);
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true);
+
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"unchanged observation requires the same exact file identity after hashing",
+	);
+	assert(!baselinePublished, "unchanged ABA cannot publish a baseline");
+	assert(fixture.diskFiles.get(FILE_PATH) === unchangedContent, "unchanged replacement remains untouched");
+
+	fixture.doc.destroy();
+}
+
+// ── Test 15: settled result is the committed snapshot, not later live CRDT ────
+
+console.log("\n--- Test 15: CRDT C2 after commit prevents C1 settlement ---");
+{
+	const committedContent = "COMMITTED_C1\n";
+	const laterCrdtContent = "LATER_C2\n";
+	let baselinePublished = false;
+	let advanceCrdtAfterCommit: (() => void) | null = null;
+	const fixture = makeHarness({
+		initialDiskContent: "DISK_BASELINE\n",
+		onAfterProcess: () => advanceCrdtAfterCommit?.(),
+	});
+	advanceCrdtAfterCommit = () => {
+		fixture.ytext.delete(0, fixture.ytext.length);
+		fixture.ytext.insert(0, laterCrdtContent);
+	};
+	fixture.mirror.setDiskWriteCallback(() => { baselinePublished = true; });
+	fixture.ytext.insert(0, committedContent);
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true);
+
+	assert(fixture.diskFiles.get(FILE_PATH) === committedContent, "disk commit contains C1");
+	assert(fixture.ytext.toJSON() === laterCrdtContent, "CRDT has already advanced to C2");
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"C1 is not reported settled after the exact Y.Text snapshot advances to C2",
+	);
+	assert(!baselinePublished, "C1 is not promoted as baseline after CRDT advances to C2");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 15b: unchanged result also carries its verified snapshot ---");
+{
+	const unchangedContent = "ALREADY_SETTLED\n";
+	const expectedHash = await contentBaselineHash(unchangedContent);
+	const fixture = makeHarness({ initialDiskContent: unchangedContent });
+	fixture.ytext.insert(0, unchangedContent);
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true);
+
+	assert(
+		result.kind === "unchanged"
+			&& result.content === unchangedContent
+			&& result.contentHash === expectedHash,
+		"unchanged result reports the disk snapshot that was verified equal",
+	);
+
+	fixture.doc.destroy();
+}
+
+// ── Test 16: remote rename collision preserves both local files ─────────────
+
+console.log("\n--- Test 16: remote rename collision preserves both local files ---");
+{
+	const targetPath = "notes/already-exists.md";
+	const sourceContent = "SOURCE_LOCAL_WORK\n";
+	const targetContent = "TARGET_LOCAL_WORK\n";
+	const fixture = makeHarness({ initialDiskContent: sourceContent });
+	fixture.diskFiles.set(targetPath, targetContent);
+	fixture.meta.set(FILE_ID, { path: targetPath, deleted: false });
+
+	await (fixture.mirror as unknown as {
+		handleRemoteRename: (fileId: string, oldPath: string, newPath: string) => Promise<void>;
+	}).handleRemoteRename(FILE_ID, FILE_PATH, targetPath);
+
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === sourceContent,
+		"remote rename collision never deletes the source-side local work",
+	);
+	assert(
+		fixture.diskFiles.get(targetPath) === targetContent,
+		"remote rename collision never overwrites the target-side local work",
+	);
+	assert(
+		fixture.mirror.isPreservedUnresolved(FILE_PATH) &&
+			fixture.mirror.isPreservedUnresolved(targetPath),
+		"both collision paths are quarantined for explicit resolution",
+	);
+	assert(
+		debounceTimerCount(fixture.mirror) === 0 && writeQueueSize(fixture.mirror) === 0,
+		"a physical source/target collision leaves no automatic write queued",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 16b: old-missing target is accepted only on exact fileId content ---");
+{
+	const targetPath = "notes/preexisting-target.md";
+	const remoteContent = "REMOTE_FILEID_CONTENT\n";
+	const independentTargetContent = "INDEPENDENT_LOCAL_TARGET\n";
+	const fixture = makeHarness({ initialDiskContent: remoteContent });
+	fixture.ytext.insert(0, remoteContent);
+	fixture.diskFiles.delete(FILE_PATH);
+	fixture.diskFiles.set(targetPath, independentTargetContent);
+	fixture.meta.set(FILE_ID, { path: targetPath, deleted: false });
+
+	await (fixture.mirror as unknown as {
+		handleRemoteRename: (fileId: string, oldPath: string, newPath: string) => Promise<void>;
+	}).handleRemoteRename(FILE_ID, FILE_PATH, targetPath);
+
+	assert(
+		fixture.diskFiles.get(targetPath) === independentTargetContent,
+		"an unrelated pre-existing target is never treated as a settled rename or overwritten",
+	);
+	assert(
+		fixture.mirror.isPreservedUnresolved(FILE_PATH) &&
+			fixture.mirror.isPreservedUnresolved(targetPath),
+		"old-missing target mismatch quarantines both path namespaces",
+	);
+	assert(
+		debounceTimerCount(fixture.mirror) === 0 && writeQueueSize(fixture.mirror) === 0,
+		"target mismatch queues no blind CRDT write",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 16c: exact old-missing target settles without a blind rewrite ---");
+{
+	const targetPath = "notes/already-settled.md";
+	const remoteContent = "EXACT_REMOTE_CONTENT\n";
+	const fixture = makeHarness({ initialDiskContent: remoteContent });
+	fixture.ytext.insert(0, remoteContent);
+	fixture.diskFiles.delete(FILE_PATH);
+	fixture.diskFiles.set(targetPath, remoteContent);
+	fixture.meta.set(FILE_ID, { path: targetPath, deleted: false });
+
+	await (fixture.mirror as unknown as {
+		handleRemoteRename: (fileId: string, oldPath: string, newPath: string) => Promise<void>;
+	}).handleRemoteRename(FILE_ID, FILE_PATH, targetPath);
+
+	assert(
+		fixture.diskFiles.get(targetPath) === remoteContent,
+		"an exact target remains unchanged",
+	);
+	assert(
+		!fixture.mirror.isPreservedUnresolved(FILE_PATH) &&
+			!fixture.mirror.isPreservedUnresolved(targetPath),
+		"an exact stable fileId target is accepted as settled",
+	);
+	assert(
+		debounceTimerCount(fixture.mirror) === 0 && writeQueueSize(fixture.mirror) === 0,
+		"already-settled target does not receive a redundant write",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 16d: target appearance at rename commit preserves both sides ---");
+{
+	const targetPath = "notes/appears-at-commit.md";
+	const sourceContent = "SOURCE_MUST_SURVIVE\n";
+	const targetContent = "TARGET_APPEARED_DURING_RENAME\n";
+	let fixture: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: sourceContent,
+		onBeforeRename: () => {
+			fixture.diskFiles.set(targetPath, targetContent);
+		},
+	});
+	fixture.ytext.insert(0, sourceContent);
+	fixture.meta.set(FILE_ID, { path: targetPath, deleted: false });
+
+	await (fixture.mirror as unknown as {
+		handleRemoteRename: (fileId: string, oldPath: string, newPath: string) => Promise<void>;
+	}).handleRemoteRename(FILE_ID, FILE_PATH, targetPath);
+
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === sourceContent,
+		"a source remains intact when the target appears at the physical rename boundary",
+	);
+	assert(
+		fixture.diskFiles.get(targetPath) === targetContent,
+		"a target appearing at commit is not clobbered",
+	);
+	assert(
+		fixture.mirror.isPreservedUnresolved(FILE_PATH) &&
+			fixture.mirror.isPreservedUnresolved(targetPath),
+		"the commit-time collision quarantines both sides",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 16e: destination lock serializes concurrent create with rename ---");
+{
+	const targetPath = "notes/concurrent-create.md";
+	const sourceContent = "REMOTE_RENAME_SOURCE\n";
+	let releaseRename!: () => void;
+	let reportRenameEntered!: () => void;
+	const renameEntered = new Promise<void>((resolve) => { reportRenameEntered = resolve; });
+	const renameGate = new Promise<void>((resolve) => { releaseRename = resolve; });
+	const fixture = makeHarness({
+		initialDiskContent: sourceContent,
+		onBeforeRename: async () => {
+			reportRenameEntered();
+			await renameGate;
+		},
+	});
+	fixture.ytext.insert(0, sourceContent);
+	fixture.meta.set(FILE_ID, { path: targetPath, deleted: false });
+
+	const renamePromise = (fixture.mirror as unknown as {
+		handleRemoteRename: (fileId: string, oldPath: string, newPath: string) => Promise<void>;
+	}).handleRemoteRename(FILE_ID, FILE_PATH, targetPath);
+	await renameEntered;
+	let createSettled = false;
+	const concurrentCreate = fixture.mirror.flushWrite(targetPath, true, {
+		allowCreateIfMissing: true,
+	}).finally(() => { createSettled = true; });
+	await Promise.resolve();
+	await Promise.resolve();
+
+	assert(!createSettled, "a concurrent destination create waits behind the dual-path rename lock");
+	releaseRename();
+	await renamePromise;
+	const createResult = await concurrentCreate;
+
+	assert(
+		fixture.diskFiles.get(targetPath) === sourceContent && !fixture.diskFiles.has(FILE_PATH),
+		"the physical rename wins without duplicate or overwritten content",
+	);
+	assert(
+		createResult.kind === "deferred" && createResult.reason === "disk-changed-during-write",
+		"the queued expected-missing create rechecks the destination and defers",
+	);
+
+	clearTimers(fixture.mirror);
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 16f: newer metadata intent after disk commit retires stale old-path work ---");
+{
+	const targetPath = "notes/first-remote-target.md";
+	const newerTargetPath = "notes/newer-remote-target.md";
+	const sourceContent = "SOURCE_FOR_MOVING_INTENT\n";
+	let fixture: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: sourceContent,
+		onAfterRename: () => {
+			fixture.meta.set(FILE_ID, { path: newerTargetPath, deleted: false });
+		},
+	});
+	fixture.ytext.insert(0, sourceContent);
+	fixture.meta.set(FILE_ID, { path: targetPath, deleted: false });
+	fixture.mirror.scheduleWrite(FILE_PATH);
+
+	await (fixture.mirror as unknown as {
+		handleRemoteRename: (fileId: string, oldPath: string, newPath: string) => Promise<void>;
+	}).handleRemoteRename(FILE_ID, FILE_PATH, targetPath);
+
+	assert(
+		fixture.diskFiles.get(targetPath) === sourceContent && !fixture.diskFiles.has(FILE_PATH),
+		"the committed physical move is preserved when a newer metadata intent arrives",
+	);
+	assert(
+		debounceTimerCount(fixture.mirror) === 0 && writeQueueSize(fixture.mirror) === 0,
+		"stale old-path work is retired instead of recreating the source",
+	);
+	assert(
+		fixture.mirror.isPreservedUnresolved(targetPath),
+		"the intermediate physical target is quarantined for the newer intent to reconcile",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 16g: remote rename carries an unresolved episode to the new path ---");
+{
+	const targetPath = "notes/remote-renamed-unresolved.md";
+	const sourceContent = "REMOTE_RENAME_PRESERVED_WORK\n";
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: sourceContent,
+		// Obsidian emits the local vault rename event before renameFile settles.
+		// Model ReconciliationController's callback so the remote handler sees an
+		// already-moved target marker when it resumes.
+		onAfterRename: () => {
+			fixture.mirror.redirectPreservedUnresolved(FILE_PATH, targetPath);
+		},
+	});
+	fixture.ytext.insert(0, sourceContent);
+	fixture.mirror.scheduleWrite(FILE_PATH);
+	fixture.mirror.recordPreservedUnresolved(
+		FILE_PATH,
+		"conflict-winner-flush-deferred",
+	);
+	const sourceEntry = fixture.mirror.getPreservedUnresolvedEntries()
+		.find((entry) => entry.path === FILE_PATH);
+	fixture.meta.set(FILE_ID, { path: targetPath, deleted: false });
+
+	await (fixture.mirror as unknown as {
+		handleRemoteRename: (fileId: string, oldPath: string, newPath: string) => Promise<void>;
+	}).handleRemoteRename(FILE_ID, FILE_PATH, targetPath);
+
+	const targetEntry = fixture.mirror.getPreservedUnresolvedEntries()
+		.find((entry) => entry.path === targetPath);
+	assert(!fixture.mirror.isPreservedUnresolved(FILE_PATH), "remote rename removes the old-path marker");
+	assert(
+		!!sourceEntry && !!targetEntry &&
+			targetEntry.episodeId === sourceEntry.episodeId &&
+			targetEntry.reason === sourceEntry.reason &&
+			targetEntry.firstSeenAt === sourceEntry.firstSeenAt &&
+			targetEntry.lastSeenAt === sourceEntry.lastSeenAt &&
+			targetEntry.localHash === sourceEntry.localHash &&
+			targetEntry.knownRemoteHash === sourceEntry.knownRemoteHash,
+		"remote rename preserves the complete unresolved episode at the new path",
+	);
+	assert(
+		fixture.diskFiles.get(targetPath) === sourceContent && !fixture.diskFiles.has(FILE_PATH),
+		"remote rename still commits the physical file move",
+	);
+	assert(
+		debounceTimerCount(fixture.mirror) === 0 && writeQueueSize(fixture.mirror) === 0,
+		"the moved marker retires old work and blocks target write admission",
+	);
+	const blocked = await fixture.mirror.flushWrite(targetPath, true);
+	assert(
+		blocked.kind === "blocked" && blocked.reason === "preserved-unresolved",
+		"a direct post-rename target flush remains blocked",
+	);
+	assert(
+		fixture.getProcessCalls() === 0 && fixture.getModifyCalls() === 0,
+		"the blocked post-rename flush performs no disk write",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 16h: local rename carries an unresolved episode through the public redirect ---");
+{
+	const targetPath = "notes/local-renamed-unresolved.md";
+	const sourceContent = "LOCAL_RENAME_PRESERVED_WORK\n";
+	const fixture = makeHarness({ initialDiskContent: sourceContent });
+	fixture.ytext.insert(0, sourceContent);
+	fixture.mirror.scheduleWrite(FILE_PATH);
+	fixture.mirror.recordPreservedUnresolved(
+		FILE_PATH,
+		"three-way-preserve-failed",
+	);
+	const sourceEntry = fixture.mirror.getPreservedUnresolvedEntries()
+		.find((entry) => entry.path === FILE_PATH);
+	await fixture.renameDiskFile(FILE_PATH, targetPath);
+	const redirect = fixture.mirror.redirectPreservedUnresolved(FILE_PATH, targetPath);
+	fixture.meta.set(FILE_ID, { path: targetPath, deleted: false });
+
+	const targetEntry = fixture.mirror.getPreservedUnresolvedEntries()
+		.find((entry) => entry.path === targetPath);
+	assert(redirect.kind === "moved", "the public local-rename hook moves the unresolved marker");
+	assert(!fixture.mirror.isPreservedUnresolved(FILE_PATH), "local rename removes the old-path marker");
+	assert(
+		!!sourceEntry && !!targetEntry &&
+			targetEntry.episodeId === sourceEntry.episodeId &&
+			targetEntry.reason === sourceEntry.reason &&
+			targetEntry.firstSeenAt === sourceEntry.firstSeenAt &&
+			targetEntry.lastSeenAt === sourceEntry.lastSeenAt,
+		"local rename preserves the unresolved episode and timestamps",
+	);
+	assert(
+		debounceTimerCount(fixture.mirror) === 0 && writeQueueSize(fixture.mirror) === 0,
+		"local marker redirect leaves no automatic write queued",
+	);
+	const blocked = await fixture.mirror.flushWrite(targetPath, true);
+	assert(
+		blocked.kind === "blocked" && blocked.reason === "preserved-unresolved",
+		"a direct flush at the locally renamed path remains blocked",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 16i: a different target episode quarantines both rename namespaces ---");
+{
+	const targetPath = "notes/target-owned-by-another-episode.md";
+	const sourceContent = "SOURCE_EPISODE_WORK\n";
+	const fixture = makeHarness({ initialDiskContent: sourceContent });
+	fixture.ytext.insert(0, sourceContent);
+	fixture.mirror.recordPreservedUnresolved(
+		FILE_PATH,
+		"conflict-winner-flush-deferred",
+	);
+	fixture.mirror.recordPreservedUnresolved(
+		targetPath,
+		"three-way-preserve-failed",
+	);
+	fixture.meta.set(FILE_ID, { path: targetPath, deleted: false });
+
+	await (fixture.mirror as unknown as {
+		handleRemoteRename: (fileId: string, oldPath: string, newPath: string) => Promise<void>;
+	}).handleRemoteRename(FILE_ID, FILE_PATH, targetPath);
+
+	const entries = fixture.mirror.getPreservedUnresolvedEntries();
+	assert(
+		entries.find((entry) => entry.path === FILE_PATH)?.reason === "path-collision" &&
+			entries.find((entry) => entry.path === targetPath)?.reason === "path-collision",
+		"different source and target episodes become a two-path collision quarantine",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === sourceContent && !fixture.diskFiles.has(targetPath),
+		"episode collision prevents the physical rename",
+	);
+	assert(
+		debounceTimerCount(fixture.mirror) === 0 && writeQueueSize(fixture.mirror) === 0,
+		"episode collision queues no target write",
+	);
+	const blocked = await fixture.mirror.flushWrite(targetPath, true);
+	assert(
+		blocked.kind === "blocked" && blocked.reason === "preserved-unresolved",
+		"the target collision quarantine blocks direct create/flush",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 16j: local redirect converts different episodes to a path collision ---");
+{
+	const targetPath = "notes/local-target-owned-by-another-episode.md";
+	const sourceContent = "LOCAL_SOURCE_EPISODE_WORK\n";
+	const fixture = makeHarness({ initialDiskContent: sourceContent });
+	fixture.ytext.insert(0, sourceContent);
+	fixture.mirror.recordPreservedUnresolved(
+		FILE_PATH,
+		"conflict-winner-flush-deferred",
+	);
+	fixture.mirror.recordPreservedUnresolved(
+		targetPath,
+		"three-way-preserve-failed",
+	);
+	await fixture.renameDiskFile(FILE_PATH, targetPath);
+	const redirect = fixture.mirror.redirectPreservedUnresolved(FILE_PATH, targetPath);
+	fixture.meta.set(FILE_ID, { path: targetPath, deleted: false });
+
+	const entries = fixture.mirror.getPreservedUnresolvedEntries();
+	assert(redirect.kind === "collision", "the public local-rename hook reports an episode collision");
+	assert(
+		entries.find((entry) => entry.path === FILE_PATH)?.reason === "path-collision" &&
+			entries.find((entry) => entry.path === targetPath)?.reason === "path-collision",
+		"the public redirect quarantines both old and new namespaces",
+	);
+	assert(
+		debounceTimerCount(fixture.mirror) === 0 && writeQueueSize(fixture.mirror) === 0,
+		"local episode collision leaves no automatic write queued",
+	);
+	const blocked = await fixture.mirror.flushWrite(targetPath, true);
+	assert(
+		blocked.kind === "blocked" && blocked.reason === "preserved-unresolved",
+		"local target collision remains blocked from a direct flush",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 16k: same-bytes source replacement aborts remote rename ---");
+{
+	const targetPath = "notes/source-aba-target.md";
+	const sourceContent = "SOURCE_SAME_BYTES_ABA\n";
+	let readCalls = 0;
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: sourceContent,
+		onRead: () => {
+			readCalls++;
+			if (readCalls === 1) {
+				fixture.replaceDiskFileIdentityAt(FILE_PATH, sourceContent);
+			}
+		},
+	});
+	fixture.ytext.insert(0, sourceContent);
+	fixture.meta.set(FILE_ID, { path: targetPath, deleted: false });
+
+	await (fixture.mirror as unknown as {
+		handleRemoteRename: (fileId: string, oldPath: string, newPath: string) => Promise<void>;
+	}).handleRemoteRename(FILE_ID, FILE_PATH, targetPath);
+
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === sourceContent && !fixture.diskFiles.has(targetPath),
+		"a replacement source with identical bytes is not moved by an older remote rename plan",
+	);
+	assert(
+		fixture.mirror.isPreservedUnresolved(FILE_PATH) &&
+			fixture.mirror.isPreservedUnresolved(targetPath),
+		"source identity ABA quarantines both rename namespaces",
+	);
+	assert(
+		debounceTimerCount(fixture.mirror) === 0 && writeQueueSize(fixture.mirror) === 0,
+		"source identity ABA queues no target rewrite",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 16l: same-bytes target replacement after rename is not settled ---");
+{
+	const targetPath = "notes/target-aba-after-rename.md";
+	const sourceContent = "TARGET_SAME_BYTES_ABA\n";
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: sourceContent,
+		onAfterRename: () => {
+			fixture.replaceDiskFileIdentityAt(targetPath, sourceContent);
+		},
+	});
+	fixture.ytext.insert(0, sourceContent);
+	fixture.meta.set(FILE_ID, { path: targetPath, deleted: false });
+
+	await (fixture.mirror as unknown as {
+		handleRemoteRename: (fileId: string, oldPath: string, newPath: string) => Promise<void>;
+	}).handleRemoteRename(FILE_ID, FILE_PATH, targetPath);
+
+	assert(
+		!fixture.diskFiles.has(FILE_PATH) && fixture.diskFiles.get(targetPath) === sourceContent,
+		"the replacement target survives the completed physical move",
+	);
+	assert(
+		fixture.mirror.isPreservedUnresolved(FILE_PATH) &&
+			fixture.mirror.isPreservedUnresolved(targetPath),
+		"post-rename target identity ABA is quarantined instead of accepted as settled",
+	);
+	assert(
+		debounceTimerCount(fixture.mirror) === 0 && writeQueueSize(fixture.mirror) === 0,
+		"post-rename target identity ABA queues no blind CRDT write",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 16m: only the exact in-flight remote rename event consumes its token ---");
+{
+	const targetPath = "notes/exact-remote-rename-event.md";
+	const sourceContent = "EXACT_REMOTE_RENAME_EVENT\n";
+	let fixture!: ReturnType<typeof makeHarness>;
+	let exactEventConsumed = false;
+	fixture = makeHarness({
+		initialDiskContent: sourceContent,
+		onAfterRename: () => {
+			const movedFile = fixture.getDiskFileAt(targetPath);
+			if (!movedFile) throw new Error("renamed target identity missing");
+			exactEventConsumed = fixture.mirror.consumeRemoteRename(
+				FILE_PATH,
+				targetPath,
+				movedFile,
+			);
+		},
+	});
+	fixture.ytext.insert(0, sourceContent);
+	fixture.meta.set(FILE_ID, { path: targetPath, deleted: false });
+
+	await (fixture.mirror as unknown as {
+		handleRemoteRename: (fileId: string, oldPath: string, newPath: string) => Promise<void>;
+	}).handleRemoteRename(FILE_ID, FILE_PATH, targetPath);
+
+	const movedFile = fixture.getDiskFileAt(targetPath);
+	assert(exactEventConsumed, "the matching old path, new path, and TFile identity consume the token");
+	assert(
+		!!movedFile && !fixture.mirror.consumeRemoteRename(FILE_PATH, targetPath, movedFile),
+		"the exact remote rename token is consume-once",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 16n: a missing remote event leaves no token for a later local rename ---");
+{
+	const targetPath = "notes/stale-token-target.md";
+	const sourceContent = "REMOTE_RENAME_WITHOUT_EVENT\n";
+	const fixture = makeHarness({ initialDiskContent: sourceContent });
+	fixture.ytext.insert(0, sourceContent);
+	fixture.meta.set(FILE_ID, { path: targetPath, deleted: false });
+
+	await (fixture.mirror as unknown as {
+		handleRemoteRename: (fileId: string, oldPath: string, newPath: string) => Promise<void>;
+	}).handleRemoteRename(FILE_ID, FILE_PATH, targetPath);
+
+	const movedFile = fixture.getDiskFileAt(targetPath);
+	const unrelatedLocalFile = Object.assign(new TFile(), {
+		path: targetPath,
+		stat: { size: sourceContent.length },
+	});
+	assert(
+		!!movedFile && !fixture.mirror.consumeRemoteRename(FILE_PATH, targetPath, movedFile),
+		"an unobserved remote rename token is retired when renameFile settles",
+	);
+	assert(
+		!fixture.mirror.consumeRemoteRename(
+			"notes/unrelated-local-source.md",
+			targetPath,
+			unrelatedLocalFile,
+		),
+		"a later local rename into the same target is never swallowed as remote",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 17: preserved-unresolved hard-blocks a follow-up remote flush ---");
+{
+	const diskContent = "VISIBLE_DISK_CANDIDATE_D\n";
+	const crdtContent = "COMPETING_CRDT_CANDIDATE_C\n";
+	const fixture = makeHarness({ initialDiskContent: diskContent });
+	fixture.ytext.insert(0, crdtContent);
+	fixture.mirror.recordPreservedUnresolved(
+		FILE_PATH,
+		"conflict-winner-flush-deferred",
+	);
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true);
+
+	assert(
+		result.kind === "blocked" && result.reason === "preserved-unresolved",
+		"the real DiskMirror rejects the post-close/provider flush while Attention is unresolved",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === diskContent,
+		"the blocked follow-up flush leaves the original disk candidate byte-for-byte intact",
+	);
+	assert(
+		fixture.ytext.toString() === crdtContent,
+		"the blocked follow-up flush leaves the competing CRDT candidate intact",
+	);
+	assert(
+		fixture.getProcessCalls() === 0 && fixture.getModifyCalls() === 0,
+		"the hard block happens before any Vault write primitive",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 17b: a conflict discovered during disk read aborts before process ---");
+{
+	const diskContent = "DISK_DURING_READ_D\n";
+	const crdtContent = "CRDT_DURING_READ_C\n";
+	let fixture: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: diskContent,
+		onRead: () => {
+			fixture.mirror.recordPreservedUnresolved(
+				FILE_PATH,
+				"conflict-winner-flush-deferred",
+			);
+		},
+	});
+	fixture.ytext.insert(0, crdtContent);
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: diskContent,
+	});
+
+	assert(
+		result.kind === "blocked" && result.reason === "preserved-unresolved",
+		"a marker arriving during the initial read is caught by the post-read fence",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === diskContent && fixture.ytext.toString() === crdtContent,
+		"post-read blocking preserves both candidates",
+	);
+	assert(fixture.getProcessCalls() === 0, "post-read blocking never enters Vault.process");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 17c: a conflict discovered at Vault.process entry aborts atomically ---");
+{
+	const diskContent = "DISK_AT_PROCESS_D\n";
+	const crdtContent = "CRDT_AT_PROCESS_C\n";
+	let fixture: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: diskContent,
+		onBeforeProcess: () => {
+			fixture.mirror.recordPreservedUnresolved(
+				FILE_PATH,
+				"conflict-winner-flush-deferred",
+			);
+		},
+	});
+	fixture.ytext.insert(0, crdtContent);
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: diskContent,
+	});
+
+	assert(
+		result.kind === "blocked" && result.reason === "preserved-unresolved",
+		"a marker arriving at process entry is rejected inside the atomic transform",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === diskContent && fixture.ytext.toString() === crdtContent,
+		"atomic-process blocking preserves both candidates",
+	);
+	assert(fixture.getProcessCalls() === 1, "the process callback runs once and aborts before commit");
+
+	fixture.doc.destroy();
 }
 
 // ── Summary ───────────────────────────────────────────────────────────────────

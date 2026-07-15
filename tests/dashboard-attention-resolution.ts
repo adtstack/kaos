@@ -56,7 +56,9 @@ function makeMarkdownFixture(options: FixtureOptions = {}) {
 
 	const vaultSync = {
 		isMarkdownTombstoned: (candidate: string) => candidate === path && tombstoned,
-		getTextForPath: () => null,
+		// A tombstoned path has no active text, but ensureFile publishes the
+		// revived Y.Text as the current path authority before baseline commit.
+		getTextForPath: () => tombstoned ? null : ytext,
 		serverAckTracker: {
 			withActiveOpId: (_opId: string | undefined, work: () => unknown) => work(),
 		},
@@ -167,6 +169,14 @@ assert.equal(
 	}),
 	true,
 	"valid blob remote-delete reason is actionable",
+);
+assert.equal(
+	isRemoteDeletePreservedUnresolvedEntry({
+		kind: "blob",
+		reason: "remote-delete-trash-failed",
+	}),
+	true,
+	"visible-backup failure remains actionable for blobs",
 );
 
 {
@@ -281,6 +291,7 @@ assert.equal(
 	manager.onPreservedUnresolvedChanged = () => { changed++; };
 	manager.trace = () => {};
 	manager.uploadQueue = new Map();
+	manager.settlementStages = {};
 	manager.kickUploadDrain = () => { kicked++; };
 
 	manager.keepLocalRemoteDeletedBlob(path, "remote-delete-missing-baseline");

@@ -52,6 +52,7 @@ const files = [
 	new FakeTFile("notes/b (KAOS conflict - crdt from device-b 2026-06-24T09-00-00Z).md", { mtime: 30, size: 14 }),
 	new FakeTFile("assets/img.png", { mtime: 11, size: 100 }),
 	new FakeTFile("assets/img (KAOS remote conflict 2026-06-23T15-00-00Z).png", { mtime: 21, size: 101 }),
+	new FakeTFile("assets/img (KAOS local backup 2026-06-25T08-30-00Z 0123456789abcdef).png", { mtime: 31, size: 102 }),
 ];
 
 const baseInput: KaosDashboardCollectorInput = {
@@ -147,6 +148,7 @@ const baseInput: KaosDashboardCollectorInput = {
 			? "markdown-delete-fingerprint"
 			: null,
 		isKeepLocalPending: () => false,
+		getBlobRef: () => null,
 	},
 	frontmatterQuarantineEntries: [{
 		path: "notes/frontmatter.md",
@@ -221,9 +223,10 @@ const baseInput: KaosDashboardCollectorInput = {
 console.log("\n--- Test 1: conflict artifacts are collected and sorted ---");
 {
 	const conflicts = collectDashboardConflictArtifacts(baseInput);
-	assert(conflicts.length === 3, "three conflict artifacts collected");
-	assert(conflicts[0]?.artifactPath.includes("2026-06-24T09-00-00Z") ?? false, "newest conflict first");
+	assert(conflicts.length === 4, "four conflict artifacts collected");
+	assert(conflicts[0]?.artifactPath.includes("2026-06-25T08-30-00Z") ?? false, "newest conflict first");
 	assert(conflicts.some((item) => item.kind === "blob" && item.source === "remote"), "blob conflict included");
+	assert(conflicts.some((item) => item.kind === "blob" && item.source === "local"), "local blob backup included");
 }
 
 console.log("\n--- Test 2: original existence and disk index flags are computed ---");
@@ -290,6 +293,36 @@ console.log("\n--- Test 3: attention aggregation includes all local attention ty
 			.filter((item) => item.kind !== "preserved-unresolved")
 			.every((item) => item.resolution === null),
 		"non-file attention types do not expose remote-delete actions",
+	);
+}
+
+console.log("\n--- Test 3b: legacy missing blob migration exposes explicit safe choices ---");
+{
+	const remoteRef = { hash: "a".repeat(64), size: 42 };
+	const attention = collectDashboardAttention({
+		...baseInput,
+		preservedUnresolvedEntries: [{
+			path: "assets/deleted.png",
+			kind: "blob",
+			reason: "legacy-upgrade-missing-local-blob",
+			episodeId: "legacy-upgrade-episode",
+			firstSeenAt: 1_777_000_000_000,
+			lastSeenAt: 1_777_000_010_000,
+		}],
+		remoteDeleteResolutionState: {
+			...baseInput.remoteDeleteResolutionState!,
+			getBlobRef: (path) => path === "assets/deleted.png" ? remoteRef : null,
+		},
+	});
+	const migration = attention.find((item) => item.path === "assets/deleted.png");
+	assert(
+		migration?.resolution?.kind === "legacy-missing-blob"
+			&& migration.resolution.episodeId === "legacy-upgrade-episode"
+			&& migration.resolution.remoteRef?.hash === remoteRef.hash
+			&& migration.resolution.localFile.kind === "missing"
+			&& migration.resolution.canDownloadRemote
+			&& migration.resolution.canKeepLocalAbsent,
+		"the missing path is visible with exact-ref Download and Keep-absence actions",
 	);
 }
 

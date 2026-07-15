@@ -1,6 +1,7 @@
 import {
 	buildBlobConflictArtifactCopyPath,
 	buildBlobConflictArtifactPath,
+	buildBlobLocalBackupArtifactPath,
 	buildMarkdownConflictArtifactCopyPath,
 	buildMarkdownConflictArtifactPath,
 	isBaseBlobConflictArtifactPath,
@@ -11,6 +12,8 @@ import {
 	parseConflictArtifactPath,
 	parseMarkdownConflictArtifactPath,
 } from "../src/paths/conflictArtifactPath";
+import { classifySyncPath } from "../src/paths/pathCategory";
+import { isBlobSyncable } from "../src/types";
 
 let passed = 0;
 let failed = 0;
@@ -148,6 +151,83 @@ console.log("\n--- Test 10: blob artifact builder preserves blobSync filename fo
 	assert(
 		!isBaseBlobConflictArtifactPath(buildBlobConflictArtifactCopyPath(path, 2)),
 		"base blob predicate preserves blobSync copy-suffix boundary",
+	);
+	assert(
+		classifySyncPath({ path, excludePatterns: [], configDir: ".obsidian" }).kind === "excluded",
+		"remote blob artifact is excluded by category classification",
+	);
+}
+
+console.log("\n--- Test 11: local blob backup parses as a local-only artifact ---");
+{
+	const path = buildBlobLocalBackupArtifactPath(
+		"assets/img.png",
+		"0123456789abcdef",
+		new Date("2026-06-23T14:20:40.123Z"),
+	);
+	assert(
+		path === "assets/img (KAOS local backup 2026-06-23T14-20-40Z 0123456789abcdef).png",
+		"local backup path includes timestamp and exact 16-hex operation id",
+	);
+	const parsed = parseBlobConflictArtifactPath(path);
+	assert(parsed?.kind === "blob", "local backup parses as a blob artifact");
+	assert(parsed?.source === "local", "local backup source is local");
+	assert(parsed?.timestamp === "2026-06-23T14:20:40Z", "local backup timestamp is normalized");
+	assert(parsed?.inferredOriginalPath === "assets/img.png", "local backup original path is inferred");
+	assert(parsed?.copyIndex === null, "operation id is not exposed as a copy index");
+	assert(isBlobConflictArtifactPath(path), "local backup matches the durable blob artifact predicate");
+	assert(isBaseBlobConflictArtifactPath(path), "local backup matches the base blob artifact predicate");
+	assert(
+		!isBlobSyncable(path, [], ".obsidian"),
+		"local backup is excluded from attachment synchronization",
+	);
+	const category = classifySyncPath({ path, excludePatterns: [], configDir: ".obsidian" });
+	assert(category.kind === "excluded", "local backup is excluded by category classification");
+	assert(
+		category.kind === "excluded" && category.reason === "local-safety-artifact",
+		"local backup exclusion has the local safety artifact reason",
+	);
+}
+
+console.log("\n--- Test 12: local backup operation id is strict lowercase 16-hex ---");
+{
+	let shortRejected = false;
+	try {
+		buildBlobLocalBackupArtifactPath("assets/img.png", "0123456789abcde");
+	} catch {
+		shortRejected = true;
+	}
+	assert(shortRejected, "15-hex operation id is rejected");
+
+	let uppercaseRejected = false;
+	try {
+		buildBlobLocalBackupArtifactPath("assets/img.png", "0123456789abcdeF");
+	} catch {
+		uppercaseRejected = true;
+	}
+	assert(uppercaseRejected, "uppercase operation id is rejected");
+	assert(
+		parseBlobConflictArtifactPath(
+			"assets/img (KAOS local backup 2026-06-23T14-20-40Z 0123456789abcdeF).png",
+		) === null,
+		"parser rejects a non-canonical uppercase operation id",
+	);
+}
+
+console.log("\n--- Test 13: local backup builder respects the filename length cap ---");
+{
+	const path = buildBlobLocalBackupArtifactPath(
+		`assets/${"x".repeat(400)}.png`,
+		"fedcba9876543210",
+		new Date("2026-06-23T14:20:40.123Z"),
+	);
+	const filename = path.slice(path.lastIndexOf("/") + 1);
+	assert(filename.length <= 255, "local backup filename is at most 255 characters");
+	assert(path.endsWith(".png"), "local backup preserves the original extension");
+	assert(isBlobConflictArtifactPath(path), "capped local backup remains parseable");
+	assert(
+		parseBlobConflictArtifactPath(path)?.originalPathConfidence === "possibly-truncated",
+		"capped local backup reports possibly-truncated original identity",
 	);
 }
 

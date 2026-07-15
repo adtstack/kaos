@@ -13,7 +13,10 @@
 
 import { canonicalizeVaultPath, type CanonicalPath } from "./canonicalPath";
 import { isExcluded } from "../sync/exclude";
-import { isMarkdownConflictArtifactPath } from "./conflictArtifactPath";
+import {
+	isBlobConflictArtifactPath,
+	isMarkdownConflictArtifactPath,
+} from "./conflictArtifactPath";
 
 export type PathSyncCategory =
 	| { kind: "markdown"; path: CanonicalPath }
@@ -25,12 +28,13 @@ export type PathSyncCategory =
  *
  * Uses the same rules as existing isMarkdownSyncable / isBlobSyncable:
  *   1. Excluded paths (config dir, .trash, user patterns) are always excluded.
- *   2. KAOS markdown conflict artifacts are excluded local-only safety copies.
+ *   2. KAOS markdown/blob conflict and local-backup artifacts are excluded
+ *      local-only safety copies.
  *   3. .md files that are not excluded are markdown.
  *   4. Non-.md files that are not excluded are blob.
  *
- * This matches the existing isBlobSyncable contract:
- *   isBlobSyncable = !path.endsWith(".md") && !isExcluded(...)
+ * This matches the existing isMarkdownSyncable/isBlobSyncable contracts,
+ * including their durable local-safety-artifact filename exclusions.
  */
 export function classifySyncPath(input: {
 	path: string;
@@ -49,15 +53,15 @@ export function classifySyncPath(input: {
 	if (isMarkdownConflictArtifactPath(canonical.normalizedPath)) {
 		return { kind: "excluded", path: canonical, reason: "excluded-by-pattern" };
 	}
+	if (isBlobConflictArtifactPath(canonical.normalizedPath)) {
+		return { kind: "excluded", path: canonical, reason: "local-safety-artifact" };
+	}
 
 	// Extension check on normalized path (same as isMarkdownSyncable).
 	if (canonical.normalizedPath.endsWith(".md")) {
 		return { kind: "markdown", path: canonical };
 	}
 
-	// Non-.md, non-excluded = blob-syncable.
-	// This is the same contract as isBlobSyncable in src/types.ts:
-	//   if (path.endsWith(".md")) return false;
-	//   return !isExcluded(path, excludePatterns, configDir);
+	// Non-.md, non-excluded, non-artifact = blob-syncable.
 	return { kind: "blob", path: canonical };
 }

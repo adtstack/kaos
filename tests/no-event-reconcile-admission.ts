@@ -84,15 +84,16 @@
  *   | `result.createdOnDisk` post-result            | `runReconciliation`     | `write-crdt-to-disk`                                                             | CRDT-to-disk write; not admission per se.                       |
  *   | `result.seededToCrdt` callback (Option (b))   | seed-loop callback      | `seed-disk-to-crdt`                                                              | Authoritative-mode admission (Scenario A); positive.            |
  *   | `result.updatedOnDisk` per-path branch        | `runReconciliation`     | `preserve-conflict` / `apply-remote-to-disk` / `import-disk-to-crdt` / `no-op`   | Closed-file conflict family; not admission per se.              |
- *   | `importUntrackedFiles` preserved skip         | `importUntrackedFiles`  | (no `reconcile.file.decision`; legacy free-form trace)                           | Preserved-unresolved guard (Scenario D); refusal via free-form. |
+ *   | preserved-unresolved full-reconcile filter   | `runReconciliation`     | (durable Attention quarantine; never enters the untracked admission queue)       | Preserved-unresolved guard (Scenario D).                        |
  *   | `importUntrackedFiles` admission              | `importUntrackedFiles`  | (no `reconcile.file.decision`; emits `crdt.file.created` only)                   | Conservative-lane admission (Scenarios C, E); positive.         |
  *
  *   Conclusion: NO admission/refusal branch reachable from `runReconciliation`
  *   or `importUntrackedFiles` is missing a `reconcile.file.decision` event
- *   today, AND the existing free-form `import-untracked-skipped-preserved-unresolved`
- *   trace covers the preserved-unresolved skip (Scenario D). The existing
- *   eight `reconcile.file.decision` discriminators plus the legacy trace
- *   plus `recovery.skipped` cover every branch this spec asserts on. No new
+ *   today. A preserved-unresolved path is filtered before it can become an
+ *   admission candidate (Scenario D), while `importUntrackedFiles` retains a
+ *   defense-in-depth guard for stale queues. The existing eight
+ *   `reconcile.file.decision` discriminators plus `recovery.skipped` cover
+ *   every branch this spec asserts on. No new
  *   `FlightKind` was required for this spec; later specs may bump
  *   `FLIGHT_TAXONOMY_VERSION`.
  *
@@ -748,22 +749,20 @@ console.log("\n--- Scenario D: preserved-unresolved guard blocks admission ---")
 		"Scenario D: precondition path is not in CRDT",
 	);
 
-	// 6.2 — drive runReconciliation("conservative") to populate untrackedFiles
-	// naturally (NOT pre-seeded), THEN invoke importUntrackedFiles().
+	// 6.2 — durable Attention quarantine excludes the path from the natural
+	// untracked admission queue. It must not rely on a later import-time skip.
 	await fx.controller.runReconciliation("conservative");
 	const untracked = (
 		fx.controller as unknown as { untrackedFiles: string[] }
 	).untrackedFiles;
 	assert(
-		untracked.includes(fx.path),
-		`Scenario D: runReconciliation populated untrackedFiles naturally (not pre-seeded; got: ${JSON.stringify(untracked)})`,
+		!untracked.includes(fx.path),
+		`Scenario D: preserved path never enters untrackedFiles (got: ${JSON.stringify(untracked)})`,
 	);
 
 	const eventsBeforeImport = fx.events.length;
-	const tracesBeforeImport = fx.traces.length;
 	await fx.controller.importUntrackedFiles();
 	const eventsDuringD = fx.events.slice(eventsBeforeImport);
-	const tracesDuringD = fx.traces.slice(tracesBeforeImport);
 
 	// 6.3 — zero crdt.file.created for the test path during Scenario D
 	const createdInD = eventsDuringD.filter(
@@ -775,19 +774,7 @@ console.log("\n--- Scenario D: preserved-unresolved guard blocks admission ---")
 		"Scenario D: zero crdt.file.created for preserved-unresolved path",
 	);
 
-	// 6.4 — exactly one import-untracked-skipped-preserved-unresolved trace
-	const skipTrace = tracesDuringD.find(
-		(t) =>
-			t.source === "reconcile" &&
-			t.msg === "import-untracked-skipped-preserved-unresolved" &&
-			(t.details?.path as string) === fx.path,
-	);
-	assert(
-		!!skipTrace,
-		"Scenario D: import-untracked-skipped-preserved-unresolved trace fires for test path",
-	);
-
-	// 6.5 — Y.Text still null AND isPreservedUnresolved still true
+	// 6.4 — Y.Text still null AND isPreservedUnresolved still true
 	assert(
 		fx.vaultSync.getTextForPath(fx.path) === null,
 		"Scenario D: Y.Text remains null after skip",

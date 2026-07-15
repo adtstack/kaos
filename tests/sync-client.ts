@@ -11,7 +11,7 @@ import WebSocket from "ws";
 const HOST = process.env.KAOS_TEST_HOST || "http://127.0.0.1:8787";
 const TOKEN = process.env.SYNC_TOKEN || "dev-sync-token";
 const VAULT_ID = process.env.KAOS_TEST_VAULT_ID || "kaos-smoke-test";
-const SCHEMA_VERSION = process.env.KAOS_TEST_SCHEMA_VERSION || "2";
+const SCHEMA_VERSION = process.env.KAOS_TEST_SCHEMA_VERSION || "4";
 const ROOM_ID = VAULT_ID;
 
 const targetPath = process.argv[2] || "hi.md";
