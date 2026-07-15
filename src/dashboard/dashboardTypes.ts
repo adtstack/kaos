@@ -7,6 +7,7 @@ import type {
 	PreservedUnresolvedKind,
 	RemoteDeletePreservedUnresolvedReason,
 } from "../sync/preservedUnresolved";
+import type { BlobRef } from "../types";
 
 export type DashboardTone = "ok" | "busy" | "warn" | "error" | "muted";
 
@@ -42,7 +43,7 @@ export interface DashboardConflictArtifact {
 	originalExists: boolean;
 	originalPathConfidence: "candidate" | "possibly-truncated";
 	kind: "markdown" | "blob";
-	source: "disk" | "crdt" | "editor" | "remote" | null;
+	source: "disk" | "crdt" | "editor" | "remote" | "local" | null;
 	deviceName: string | null;
 	timestamp: string;
 	copyIndex: number | null;
@@ -65,7 +66,7 @@ export interface DashboardAttentionItem {
 	firstSeenAt: string | null;
 	lastSeenAt: string | null;
 	tone: DashboardTone;
-	resolution: DashboardRemoteDeleteResolution | null;
+	resolution: DashboardAttentionResolution | null;
 }
 
 export interface DashboardLocalFileIdentity {
@@ -88,6 +89,22 @@ export interface DashboardRemoteDeleteResolution {
 	acceptRemoteDeleteUnavailableReason: string | null;
 }
 
+export interface DashboardLegacyMissingBlobResolution {
+	kind: "legacy-missing-blob";
+	fileKind: "blob";
+	reason: "legacy-upgrade-missing-local-blob";
+	episodeId: string;
+	remoteRef: BlobRef | null;
+	localFile: DashboardLocalFileIdentity;
+	canDownloadRemote: boolean;
+	canKeepLocalAbsent: boolean;
+	unavailableReason: string | null;
+}
+
+export type DashboardAttentionResolution =
+	| DashboardRemoteDeleteResolution
+	| DashboardLegacyMissingBlobResolution;
+
 export interface DashboardRemoteDeleteResolutionTarget
 	extends DashboardRemoteDeleteResolution {
 	path: string;
@@ -100,6 +117,15 @@ export type DashboardRemoteDeleteResolutionChoice =
 export type DashboardRemoteDeleteResolutionResult =
 	| { status: "completed" }
 	| { status: "pending"; message: string };
+
+export interface DashboardLegacyMissingBlobResolutionTarget
+	extends DashboardLegacyMissingBlobResolution {
+	path: string;
+}
+
+export type DashboardLegacyMissingBlobResolutionChoice =
+	| "download-remote"
+	| "keep-local-absent";
 
 export type DashboardSnapshotStatus =
 	| { status: "ready"; summary: DashboardSnapshotStatusSummary }
@@ -232,6 +258,7 @@ export interface KaosDashboardCollectorInput {
 			path: string,
 			episodeId: string,
 		): boolean;
+		getBlobRef(path: string): BlobRef | null;
 	};
 	frontmatterQuarantineEntries: FrontmatterQuarantineEntry[];
 	diskIndex: DiskIndex;

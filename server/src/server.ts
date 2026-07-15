@@ -31,7 +31,7 @@ import {
 	TraceRateLimiter,
 	type TraceEntry as StoredTraceEntry,
 } from "./traceStore";
-import { trySendSvEcho, type SvEchoSendResult } from "./svEcho";
+import { trySendSvEchoStateVector, type SvEchoSendResult } from "./svEcho";
 import { isUpdateBearingSyncMessage } from "./syncMessageClassifier";
 import { bytesToHex } from "./hex";
 import { sha256Hex } from "./hex";
@@ -274,7 +274,12 @@ export class VaultSyncServer extends YServer {
 		// handles retry via immediate checkpoint fallback on the next save.
 		const coordinator = this.getPersistenceCoordinator();
 		const result = await coordinator.enqueueSave();
-		if (!result.success) {
+		if (result.success) {
+			const persistedStateVector = coordinator.getLastPersistedStateVector();
+			if (persistedStateVector) {
+				this.broadcastPersistedSvEcho(persistedStateVector);
+			}
+		} else {
 			console.error(`${LOG_PREFIX} save failed (health: degraded, pendingPersistence: true):`, result.error);
 		}
 		await this.flushRecoveryDirtyMarks();
@@ -290,17 +295,21 @@ export class VaultSyncServer extends YServer {
 			roomId: this.getRoomId(),
 			clientKind,
 		}));
-		this.recordSvEchoResult(trySendSvEcho(connection, this.document, "baseline"));
+		const persistedStateVector = this.getPersistenceCoordinator().getLastPersistedStateVector();
+		if (persistedStateVector) {
+			this.recordSvEchoResult(
+				trySendSvEchoStateVector(connection, persistedStateVector, "baseline"),
+			);
+		}
 	}
 
 	handleMessage(connection: Connection, message: WSMessage): void {
-		const shouldEcho = isUpdateBearingSyncMessage(message);
-		const svBefore = shouldEcho ? Y.encodeStateVector(this.document) : null;
+		const shouldTraceUpdate = isUpdateBearingSyncMessage(message);
+		const svBefore = shouldTraceUpdate ? Y.encodeStateVector(this.document) : null;
 		super.handleMessage(connection, message);
-		if (shouldEcho) {
+		if (shouldTraceUpdate) {
 			const svAfter = Y.encodeStateVector(this.document);
 			const docChanged = svBefore !== null && !equalBytes(svBefore, svAfter);
-			this.recordSvEchoResult(trySendSvEcho(connection, this.document, "postApply"));
 			// Fire-and-forget trace: do not block message processing.
 			void this.recordTrace(
 				"server.ydoc.update_observed",
@@ -640,6 +649,14 @@ export class VaultSyncServer extends YServer {
 		if (result.failure === "not_open") this.svEchoCounters.failureNotOpen++;
 		if (result.failure === "oversize") this.svEchoCounters.failureOversize++;
 		if (result.failure === "send_failed") this.svEchoCounters.failureSendFailed++;
+	}
+
+	private broadcastPersistedSvEcho(persistedStateVector: Uint8Array): void {
+		for (const connection of this.getConnections()) {
+			this.recordSvEchoResult(
+				trySendSvEchoStateVector(connection, persistedStateVector, "postApply"),
+			);
+		}
 	}
 
 	private async ensureDocumentLoaded(): Promise<void> {

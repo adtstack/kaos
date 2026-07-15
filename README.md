@@ -91,10 +91,18 @@ the deployment repository so the same Worker identity, Durable Object bindings,
 and state history are preserved.
 
 1. One-time setup: initialize the updater from KAOS settings and commit the
-   generated workflow.
+   generated `.github/workflows/kaos-ops-v2.yml` workflow. The versioned name
+   lets existing deployments add the migration-capable updater without
+   replacing their older workflow.
 2. Update: when KAOS reports a new server version, click **Update server** in
    KAOS settings. KAOS opens the GitHub workflow; run it with `update`, then
    KAOS watches the Worker until `/api/capabilities` reports the new version.
+   If KAOS marks the release as migration-required, update the plugin first;
+   sync intentionally pauses until the server is compatible. Take a current
+   snapshot and review the release notes, then click **1. Create updater v2**
+   in KAOS settings and commit the generated workflow. Next click
+   **2. After commit, run migration** and explicitly enable
+   `allow_migration_update` for that run. Leave it disabled for normal releases.
 3. Roll back: run the same workflow with `revert`.
 
 Publishing a new KAOS release does not automatically mutate the generated

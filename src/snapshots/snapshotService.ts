@@ -1,4 +1,4 @@
-import { App, Notice, TFile, normalizePath } from "obsidian";
+import { App, MarkdownView, Notice, TFile, normalizePath } from "obsidian";
 import { BlobSyncManager } from "../sync/blobSync";
 import { DiskMirror } from "../sync/diskMirror";
 import {
@@ -11,17 +11,22 @@ import {
 	requestPrune,
 	restoreFromSnapshot,
 	normalizeSnapshotUnchanged,
+	captureBlobRestoreAuthority,
+	captureMarkdownRestoreAuthority,
+	isBlobRestoreAuthorityCurrent,
+	isMarkdownRestoreAuthorityCurrent,
 	type SnapshotIndex,
 } from "../sync/snapshotClient";
 import {
 	cleanupFileHistoryStorage,
 	downloadFileHistoryContent,
 	getFileHistoryStorageStatus,
-	getLiveHashForFileVersion,
+	getLiveContentForFileVersion,
 	listFileHistoryManifests,
 	repairFileHistoryStorage,
 	requestFileHistoryPointMaybe,
 	restoreRecoveryVersionToLiveDoc,
+	sha256Hex,
 	type FileHistoryManifestIndex,
 	type FileHistoryPointResult,
 } from "../sync/recoverySnapshotClient";
@@ -40,6 +45,15 @@ import type {
 	DashboardSnapshotStatus,
 } from "../dashboard/dashboardTypes";
 import { DashboardSnapshotCache } from "./dashboardSnapshotCache";
+import {
+	captureRestoreDiskRevision,
+	commitWithCurrentRestoreDiskAuthority,
+	findIncoherentMarkdownRestoreReviewPaths,
+	quarantineUnsettledMarkdownRestore,
+	settleRestoredMarkdownPath,
+	type RestoreDiskPrecondition,
+	type RestoreDiskSettlement,
+} from "./restoreDiskSettlement";
 
 const RECOVERY_SNAPSHOT_PENDING_RETRY_MS = 5 * 60 * 1000;
 const RECOVERY_HISTORY_RECENT_POINT_LIMIT = 10;
@@ -54,6 +68,12 @@ interface SnapshotServiceDeps {
 	getServerSupportsSnapshots(): boolean;
 	log(message: string): void;
 	onEditorsNeedReconcile(reason: string): void;
+}
+
+interface RestoreEditorAuthorityEntry {
+	view: MarkdownView;
+	file: TFile;
+	content: string;
 }
 
 export class SnapshotService {
@@ -615,6 +635,295 @@ export class SnapshotService {
 	}
 
 	/**
+	 * Capture and back up the disk state the user is about to replace. The
+	 * captured bytes later become the compare-and-swap precondition for the
+	 * explicit restore write.
+	 */
+	private async prepareMarkdownRestore(
+		paths: string[],
+		backupDir: string,
+		reviewedPreconditions?: ReadonlyMap<string, RestoreDiskPrecondition>,
+	): Promise<{
+		preconditions: Map<string, RestoreDiskPrecondition>;
+		backedUp: number;
+	}> {
+		const preconditions = new Map<string, RestoreDiskPrecondition>();
+		let backedUp = 0;
+
+		for (const requestedPath of paths) {
+			const path = normalizePath(requestedPath);
+			const reviewed = reviewedPreconditions?.get(path);
+			if (reviewedPreconditions && !reviewed) {
+				throw new Error(`Restore not started: disk authority for "${path}" was not reviewed.`);
+			}
+			if (reviewed) {
+				preconditions.set(path, reviewed);
+				if (reviewed.kind === "missing") continue;
+				await this.writeMarkdownRestoreBackup(path, reviewed.content, backupDir);
+				backedUp++;
+				continue;
+			}
+			const file = this.deps.app.vault.getAbstractFileByPath(path);
+			if (!file) {
+				preconditions.set(path, { kind: "missing" });
+				continue;
+			}
+			if (!(file instanceof TFile)) {
+				throw new Error(`Restore not started: "${path}" is not a file.`);
+			}
+
+			const revision = captureRestoreDiskRevision(file);
+			let current: string;
+			try {
+				current = await this.deps.app.vault.read(file);
+			} catch (err) {
+				throw new Error(
+					`Restore not started: could not read "${path}" for its safety backup (${formatUnknown(err)}).`,
+				);
+			}
+
+			await this.writeMarkdownRestoreBackup(path, current, backupDir);
+
+			preconditions.set(path, {
+				kind: "present",
+				content: current,
+				fileIdentity: file,
+				revision,
+			});
+			backedUp++;
+		}
+
+		return { preconditions, backedUp };
+	}
+
+	private async writeMarkdownRestoreBackup(
+		path: string,
+		content: string,
+		backupDir: string,
+	): Promise<void> {
+		const backupPath = normalizePath(`${backupDir}/${path}`);
+		const parentDir = backupPath.substring(0, backupPath.lastIndexOf("/"));
+		try {
+			if (parentDir && !this.deps.app.vault.getAbstractFileByPath(parentDir)) {
+				await this.deps.app.vault.createFolder(parentDir);
+			}
+			await this.deps.app.vault.create(backupPath, content);
+		} catch (err) {
+			throw new Error(
+				`Restore not started: could not back up "${path}" (${formatUnknown(err)}).`,
+			);
+		}
+	}
+
+	/** Capture exact disk authority for the state rendered in the snapshot diff. */
+	private async captureMarkdownRestoreDiskAuthority(
+		paths: readonly string[],
+	): Promise<Map<string, RestoreDiskPrecondition>> {
+		const captured = new Map<string, RestoreDiskPrecondition>();
+		for (const requestedPath of paths) {
+			const path = normalizePath(requestedPath);
+			if (captured.has(path)) continue;
+			const file = this.deps.app.vault.getAbstractFileByPath(path);
+			if (file === null) {
+				captured.set(path, { kind: "missing" });
+				continue;
+			}
+			if (!(file instanceof TFile)) {
+				throw new Error(`Snapshot diff not opened: "${path}" is not a file.`);
+			}
+			const revision = captureRestoreDiskRevision(file);
+			let content: string;
+			try {
+				content = await this.deps.app.vault.read(file);
+			} catch (err) {
+				throw new Error(
+					`Snapshot diff not opened: could not read "${path}" (${formatUnknown(err)}).`,
+				);
+			}
+			if (
+				file.path !== path
+				|| this.deps.app.vault.getAbstractFileByPath(path) !== file
+			) {
+				throw new Error(`Snapshot diff not opened: disk authority changed for "${path}".`);
+			}
+			captured.set(path, {
+				kind: "present",
+				content,
+				fileIdentity: file,
+				revision,
+			});
+		}
+
+		const finalCheck = await commitWithCurrentRestoreDiskAuthority(
+			this.deps.app.vault,
+			captured,
+			() => undefined,
+		);
+		if (finalCheck.kind === "stale") {
+			throw new Error(
+				`Snapshot diff not opened because disk authority changed: ${finalCheck.paths.join(", ")}.`,
+			);
+		}
+		return captured;
+	}
+
+	private getOpenMarkdownViewsForRestorePath(path: string): MarkdownView[] {
+		const views: MarkdownView[] = [];
+		const activeView = (this.deps.app.workspace as {
+			getActiveViewOfType?: <T>(type: abstract new (...args: never[]) => T) => T | null;
+		}).getActiveViewOfType?.(MarkdownView) ?? null;
+		if (activeView?.file?.path === path) views.push(activeView);
+
+		const workspace = this.deps.app.workspace as {
+			iterateAllLeaves?: (callback: (leaf: { view?: unknown }) => void) => void;
+		};
+		workspace.iterateAllLeaves?.((leaf) => {
+			if (
+				leaf.view instanceof MarkdownView
+				&& leaf.view.file?.path === path
+				&& !views.includes(leaf.view)
+			) {
+				views.push(leaf.view);
+			}
+		});
+		return views;
+	}
+
+	/**
+	 * Capture exact open-editor identities and bytes before asynchronous backup
+	 * work. The returned fence also rejects newly opened/closed/replaced views.
+	 */
+	private captureOpenEditorRestoreAuthority(
+		paths: readonly string[],
+	): Map<string, RestoreEditorAuthorityEntry[]> {
+		const captured = new Map<string, RestoreEditorAuthorityEntry[]>();
+		for (const requestedPath of paths) {
+			const path = normalizePath(requestedPath);
+			if (captured.has(path)) continue;
+			const entries: RestoreEditorAuthorityEntry[] = [];
+			for (const view of this.getOpenMarkdownViewsForRestorePath(path)) {
+				if (!view.file) {
+					throw new Error(`Restore not started: editor authority for "${path}" is unavailable.`);
+				}
+				let content: string;
+				try {
+					content = view.editor.getValue();
+				} catch (err) {
+					throw new Error(
+						`Restore not started: could not read the open editor for "${path}" (${formatUnknown(err)}).`,
+					);
+				}
+				entries.push({ view, file: view.file, content });
+			}
+			captured.set(path, entries);
+		}
+		return captured;
+	}
+
+	private isOpenEditorRestoreAuthorityCurrent(
+		captured: ReadonlyMap<string, readonly RestoreEditorAuthorityEntry[]>,
+	): boolean {
+		for (const [path, expectedEntries] of captured) {
+			const currentViews = this.getOpenMarkdownViewsForRestorePath(path);
+			if (currentViews.length !== expectedEntries.length) return false;
+			for (const expected of expectedEntries) {
+				if (!currentViews.includes(expected.view)) return false;
+				if (expected.view.file !== expected.file || expected.file.path !== path) return false;
+				try {
+					if (expected.view.editor.getValue() !== expected.content) return false;
+				} catch {
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	private captureOpenEditorRestoreFence(paths: readonly string[]): () => boolean {
+		const captured = this.captureOpenEditorRestoreAuthority(paths);
+		return () => this.isOpenEditorRestoreAuthorityCurrent(captured);
+	}
+
+	private selectRestoreAuthority<T>(
+		captured: ReadonlyMap<string, T>,
+		paths: readonly string[],
+	): Map<string, T> {
+		const selected = new Map<string, T>();
+		for (const requestedPath of paths) {
+			const path = normalizePath(requestedPath);
+			if (selected.has(path)) continue;
+			const authority = captured.get(path);
+			if (authority !== undefined) selected.set(path, authority);
+		}
+		return selected;
+	}
+
+	private captureRestoredMarkdownContents(
+		vaultSync: VaultSync,
+		paths: string[],
+	): Map<string, string> {
+		const contents = new Map<string, string>();
+		for (const requestedPath of paths) {
+			const path = normalizePath(requestedPath);
+			const restoredText = vaultSync.getTextForPath(path);
+			if (restoredText) contents.set(path, restoredText.toJSON());
+		}
+		return contents;
+	}
+
+	private async settleMarkdownRestores(
+		paths: string[],
+		preconditions: Map<string, RestoreDiskPrecondition>,
+		restoredContents: Map<string, string>,
+		diskMirror: DiskMirror | null,
+	): Promise<Array<{ path: string; detail: string }>> {
+		const failures: Array<{ path: string; detail: string }> = [];
+
+		for (const requestedPath of paths) {
+			const path = normalizePath(requestedPath);
+			const precondition = preconditions.get(path);
+			const restoredContent = restoredContents.get(path);
+			if (!precondition || restoredContent === undefined) {
+				const detail = !precondition
+					? "missing pre-restore disk snapshot"
+					: "restored CRDT text is unavailable";
+				failures.push({ path, detail });
+				quarantineUnsettledMarkdownRestore(diskMirror, path);
+				this.deps.log(`Restore disk settlement incomplete for "${path}": ${detail}`);
+				continue;
+			}
+
+			const settlement = await settleRestoredMarkdownPath(
+				diskMirror,
+				path,
+				precondition,
+				restoredContent,
+			);
+			if (settlement.kind === "settled") continue;
+
+			const detail = this.describeRestoreDiskSettlement(settlement);
+			failures.push({ path, detail });
+			this.deps.log(`Restore disk settlement incomplete for "${path}": ${detail}`);
+		}
+
+		return failures;
+	}
+
+	private describeRestoreDiskSettlement(
+		settlement: Extract<RestoreDiskSettlement, { kind: "not-settled" }>,
+	): string {
+		const result = settlement.result;
+		let resultDetail = "no-result";
+		if (result?.kind === "deferred") resultDetail = `deferred:${result.reason}`;
+		else if (result?.kind === "blocked") resultDetail = `blocked:${result.reason}`;
+		else if (result?.kind === "failed") resultDetail = `failed:${result.error}`;
+		else if (result) resultDetail = result.kind;
+		return [settlement.reason, resultDetail, settlement.error]
+			.filter((part): part is string => !!part)
+			.join(", ");
+	}
+
+	/**
 	 * Download a snapshot, compute diff against current CRDT, and show the restore UI.
 	 */
 	private async showSnapshotDiff(snapshot: SnapshotIndex): Promise<void> {
@@ -629,7 +938,7 @@ export class SnapshotService {
 				snapshot,
 				this.deps.getTraceHttpContext(),
 			);
-			const diff = diffSnapshot(snapshotDoc, vaultSync.ydoc);
+			const initialDiff = diffSnapshot(snapshotDoc, vaultSync.ydoc);
 
 			let destroyed = false;
 			const cleanup = () => {
@@ -638,6 +947,83 @@ export class SnapshotService {
 					snapshotDoc.destroy();
 				}
 			};
+			const reviewedMarkdownPaths = [
+				...initialDiff.deletedSinceSnapshot.map(({ path }) => path),
+				...initialDiff.contentChanged.map(({ path }) => path),
+			];
+			const reviewedBlobPaths = [
+				...initialDiff.blobsDeletedSinceSnapshot.map(({ path }) => path),
+				...initialDiff.blobsChanged.map(({ path }) => path),
+			];
+			let reviewedDiskAuthority: Map<string, RestoreDiskPrecondition>;
+			let reviewedBlobAuthority: ReturnType<typeof captureBlobRestoreAuthority>;
+			let reviewedMarkdownAuthority: ReturnType<typeof captureMarkdownRestoreAuthority>;
+			let reviewedOpenEditorAuthority: Map<string, RestoreEditorAuthorityEntry[]>;
+			try {
+				reviewedBlobAuthority = captureBlobRestoreAuthority(
+					vaultSync.ydoc,
+					reviewedBlobPaths,
+				);
+				reviewedMarkdownAuthority = captureMarkdownRestoreAuthority(
+					vaultSync.ydoc,
+					reviewedMarkdownPaths,
+				);
+				reviewedOpenEditorAuthority = this.captureOpenEditorRestoreAuthority(
+					reviewedMarkdownPaths,
+				);
+				reviewedDiskAuthority = await this.captureMarkdownRestoreDiskAuthority(
+					reviewedMarkdownPaths,
+				);
+				if (
+					this.deps.getVaultSync() !== vaultSync
+					|| !isBlobRestoreAuthorityCurrent(vaultSync.ydoc, reviewedBlobAuthority)
+					|| !isMarkdownRestoreAuthorityCurrent(vaultSync.ydoc, reviewedMarkdownAuthority)
+					|| !this.isOpenEditorRestoreAuthorityCurrent(reviewedOpenEditorAuthority)
+				) {
+					throw new Error("Live authority changed while the snapshot diff was opening. Reload it and review again.");
+				}
+			} catch (err) {
+				cleanup();
+				throw err;
+			}
+			// Disk capture above yields to the event loop. Recompute the actual UI
+			// diff only after every captured authority has passed its final check,
+			// then reject any newly selectable path that was not part of that exact
+			// capture. No await exists between this recomputation and modal creation.
+			const diff = diffSnapshot(snapshotDoc, vaultSync.ydoc);
+			const finalSelectableMarkdownPaths = [
+				...diff.deletedSinceSnapshot.map(({ path }) => normalizePath(path)),
+				...diff.contentChanged.map(({ path }) => normalizePath(path)),
+			];
+			const finalSelectableBlobPaths = [
+				...diff.blobsDeletedSinceSnapshot.map(({ path }) => normalizePath(path)),
+				...diff.blobsChanged.map(({ path }) => normalizePath(path)),
+			];
+			if (
+				finalSelectableMarkdownPaths.some((path) =>
+					!reviewedMarkdownAuthority.has(path)
+					|| !reviewedOpenEditorAuthority.has(path)
+					|| !reviewedDiskAuthority.has(path)
+				)
+				|| finalSelectableBlobPaths.some((path) => !reviewedBlobAuthority.has(path))
+			) {
+				cleanup();
+				throw new Error("Live state changed while the snapshot diff was opening. Reload it and review again.");
+			}
+			const incoherentMarkdownPaths = findIncoherentMarkdownRestoreReviewPaths(
+				finalSelectableMarkdownPaths,
+				reviewedMarkdownAuthority,
+				reviewedDiskAuthority,
+				reviewedOpenEditorAuthority,
+			);
+			if (incoherentMarkdownPaths.length > 0) {
+				cleanup();
+				throw new Error(
+					"Snapshot diff not opened because its CRDT view does not match "
+					+ `the current disk/open-editor authority: ${incoherentMarkdownPaths.join(", ")}. `
+					+ "Let sync settle or resolve the visible divergence, then reload the snapshot.",
+				);
+			}
 
 			new SnapshotDiffModal(
 				this.deps.app,
@@ -645,66 +1031,204 @@ export class SnapshotService {
 				diff,
 				async (markdownPaths, blobPaths) => {
 					const liveVaultSync = this.deps.getVaultSync();
-					if (!liveVaultSync) return;
+					if (!liveVaultSync || liveVaultSync !== vaultSync) {
+						new Notice("Restore not started: sync is no longer initialized.", 8000);
+						cleanup();
+						return;
+					}
 
-					const backupDir = normalizePath(
-						`${this.deps.app.vault.configDir}/plugins/kaos/restore-backups/${new Date().toISOString().replace(/[:.]/g, "-")}`,
-					);
-					let backedUp = 0;
-					for (const path of markdownPaths) {
-						try {
-							const file = this.deps.app.vault.getAbstractFileByPath(path);
-							if (file instanceof TFile) {
-								const content = await this.deps.app.vault.read(file);
-								const backupPath = `${backupDir}/${path}`;
-								const parentDir = backupPath.substring(0, backupPath.lastIndexOf("/"));
-								if (parentDir && !this.deps.app.vault.getAbstractFileByPath(parentDir)) {
-									await this.deps.app.vault.createFolder(parentDir);
-								}
-								await this.deps.app.vault.create(backupPath, content);
-								backedUp++;
+					try {
+						const normalizedMarkdownPaths = [...new Set(markdownPaths.map(normalizePath))];
+						const normalizedBlobPaths = [...new Set(blobPaths.map(normalizePath))];
+						const restoreDiskMirror = normalizedMarkdownPaths.length > 0
+							? this.deps.getDiskMirror()
+							: null;
+						if (normalizedMarkdownPaths.length > 0 && !restoreDiskMirror) {
+							new Notice(
+								"Restore not started: the disk writer is unavailable. Reconnect sync and retry.",
+								8000,
+							);
+							return;
+						}
+						const expectedBlobAuthority = this.selectRestoreAuthority(
+							reviewedBlobAuthority,
+							blobPaths,
+						);
+						const expectedMarkdownAuthority = this.selectRestoreAuthority(
+							reviewedMarkdownAuthority,
+							markdownPaths,
+						);
+						const expectedOpenEditorAuthority = this.selectRestoreAuthority(
+							reviewedOpenEditorAuthority,
+							markdownPaths,
+						);
+						const expectedDiskAuthority = this.selectRestoreAuthority(
+							reviewedDiskAuthority,
+							markdownPaths,
+						);
+						if (
+							expectedBlobAuthority.size !== normalizedBlobPaths.length
+							|| expectedMarkdownAuthority.size !== normalizedMarkdownPaths.length
+							|| expectedOpenEditorAuthority.size !== normalizedMarkdownPaths.length
+							|| expectedDiskAuthority.size !== normalizedMarkdownPaths.length
+						) {
+							throw new Error("Restore selection no longer matches the reviewed snapshot diff.");
+						}
+						const isOpenEditorAuthorityCurrent = () =>
+							this.isOpenEditorRestoreAuthorityCurrent(expectedOpenEditorAuthority);
+						const diskReviewCheck = await commitWithCurrentRestoreDiskAuthority(
+							this.deps.app.vault,
+							expectedDiskAuthority,
+							() => undefined,
+						);
+						if (diskReviewCheck.kind === "stale") {
+							const changedPaths = diskReviewCheck.paths.join(", ");
+							new Notice(
+								`Restore was not applied because disk changed after the diff was shown: ${changedPaths}. ` +
+								"Reload the snapshot diff and review again.",
+								12000,
+							);
+							return;
+						}
+						if (
+							this.deps.getVaultSync() !== liveVaultSync
+							|| !isBlobRestoreAuthorityCurrent(liveVaultSync.ydoc, expectedBlobAuthority)
+							|| !isMarkdownRestoreAuthorityCurrent(liveVaultSync.ydoc, expectedMarkdownAuthority)
+							|| !isOpenEditorAuthorityCurrent()
+						) {
+							new Notice(
+								"Restore was not applied because live file/editor/attachment authority changed after the diff was shown. Reload it and review again.",
+								12000,
+							);
+							return;
+						}
+						const backupDir = normalizePath(
+							`${this.deps.app.vault.configDir}/plugins/kaos/restore-backups/${new Date().toISOString().replace(/[:.]/g, "-")}`,
+						);
+						const preparation = await this.prepareMarkdownRestore(
+							markdownPaths,
+							backupDir,
+							expectedDiskAuthority,
+						);
+						if (preparation.backedUp > 0) {
+							this.deps.log(
+								`Pre-restore backup: ${preparation.backedUp} files saved to ${backupDir}`,
+							);
+						}
+
+						const restoreAttempt = await commitWithCurrentRestoreDiskAuthority(
+							this.deps.app.vault,
+							preparation.preconditions,
+							(isDiskIdentityCurrent) => restoreFromSnapshot(
+								snapshotDoc,
+								liveVaultSync.ydoc,
+								{
+									markdownPaths,
+									blobPaths,
+									device: this.deps.getSettings().deviceName,
+									expectedBlobAuthority,
+									expectedMarkdownAuthority,
+									canCommitMarkdownRestore: () =>
+										this.deps.getVaultSync() === liveVaultSync
+										&& (
+											normalizedMarkdownPaths.length === 0
+											|| this.deps.getDiskMirror() === restoreDiskMirror
+										)
+										&& isBlobRestoreAuthorityCurrent(
+											liveVaultSync.ydoc,
+											expectedBlobAuthority,
+										)
+										&& isMarkdownRestoreAuthorityCurrent(
+											liveVaultSync.ydoc,
+											expectedMarkdownAuthority,
+										)
+										&& isOpenEditorAuthorityCurrent(),
+									isMarkdownRestoreDiskAuthorityCurrent: isDiskIdentityCurrent,
+								},
+							),
+						);
+						if (restoreAttempt.kind === "stale") {
+							const changedPaths = restoreAttempt.paths.join(", ");
+							const message =
+								`Restore was not applied because disk authority changed after backup: ${changedPaths}. `
+								+ "Reload the snapshot diff and review again.";
+							this.deps.log(`Restore from snapshot ${snapshot.snapshotId}: ${message}`);
+							new Notice(message, 12000);
+							return;
+						}
+						const result = restoreAttempt.value;
+						if (result.markdownRejected.length > 0) {
+							const detail = result.markdownRejected
+								.map(({ path, reason }) => `${path} (${reason})`)
+								.join(", ");
+							const message =
+								`Restore was not applied because live file/editor/disk authority changed: ${detail}. ` +
+								"Reload the snapshot diff and review again.";
+							this.deps.log(`Restore from snapshot ${snapshot.snapshotId}: ${message}`);
+							new Notice(message, 12000);
+							return;
+						}
+						if (result.blobRejected.length > 0) {
+							const detail = result.blobRejected
+								.map(({ path, reason }) => `${path} (${reason})`)
+								.join(", ");
+							const message =
+								`Restore was not applied because live attachment authority changed: ${detail}. ` +
+								"Reload the snapshot diff and review again.";
+							this.deps.log(`Restore from snapshot ${snapshot.snapshotId}: ${message}`);
+							new Notice(message, 12000);
+							return;
+						}
+						const restoredContents = this.captureRestoredMarkdownContents(
+							liveVaultSync,
+							markdownPaths,
+						);
+						const diskFailures = await this.settleMarkdownRestores(
+							markdownPaths,
+							preparation.preconditions,
+							restoredContents,
+							restoreDiskMirror,
+						);
+
+						if (blobPaths.length > 0) {
+							const queued = this.deps.getBlobSync()?.prioritizeDownloads(blobPaths) ?? 0;
+							if (queued > 0) {
+								this.deps.log(`Restore: queued ${queued} blob downloads`);
 							}
-						} catch (err) {
-							// Non-fatal: file might not exist on disk (undelete case).
-							this.deps.log(`Backup skipped for "${path}": ${formatUnknown(err)}`);
 						}
-					}
-					if (backedUp > 0) {
-						this.deps.log(`Pre-restore backup: ${backedUp} files saved to ${backupDir}`);
-					}
 
-					const result = restoreFromSnapshot(snapshotDoc, liveVaultSync.ydoc, {
-						markdownPaths,
-						blobPaths,
-						device: this.deps.getSettings().deviceName,
-					});
+						this.deps.onEditorsNeedReconcile("snapshot-restore");
 
-					for (const path of markdownPaths) {
-						await this.deps.getDiskMirror()?.flushWrite(path, true);
-					}
-
-					if (blobPaths.length > 0) {
-						const queued = this.deps.getBlobSync()?.prioritizeDownloads(blobPaths) ?? 0;
-						if (queued > 0) {
-							this.deps.log(`Restore: queued ${queued} blob downloads`);
+						if (diskFailures.length > 0) {
+							const failedPaths = diskFailures.map(({ path }) => path).join(", ");
+							const msg =
+								`Restore changed the synced state, but disk settlement was not verified for ` +
+								`${diskFailures.length} file(s): ${failedPaths}. ` +
+								"The restore is not complete; review the preserved disk files and retry.";
+							new Notice(msg, 12000);
+							this.deps.log(`Restore from snapshot ${snapshot.snapshotId}: ${msg}`);
+							return;
 						}
+
+						const parts: string[] = [];
+						if (result.markdownRestored > 0) parts.push(`${result.markdownRestored} files restored`);
+						if (result.markdownUndeleted > 0) parts.push(`${result.markdownUndeleted} files undeleted`);
+						if (result.blobsRestored > 0) parts.push(`${result.blobsRestored} attachments restored`);
+						if (preparation.backedUp > 0) parts.push(`backup in ${backupDir}`);
+
+						const msg = parts.length > 0
+							? `Restore complete: ${parts.join(", ")}.`
+							: "No changes were applied.";
+						new Notice(msg, 8000);
+						this.deps.log(`Restore from snapshot ${snapshot.snapshotId}: ${msg}`);
+					} catch (err) {
+						const msg = `Restore failed: ${formatUnknown(err)}`;
+						console.error(`[kaos] ${msg}`, err);
+						this.deps.log(msg);
+						new Notice(msg, 12000);
+					} finally {
+						cleanup();
 					}
-
-					this.deps.onEditorsNeedReconcile("snapshot-restore");
-
-					const parts: string[] = [];
-					if (result.markdownRestored > 0) parts.push(`${result.markdownRestored} files restored`);
-					if (result.markdownUndeleted > 0) parts.push(`${result.markdownUndeleted} files undeleted`);
-					if (result.blobsRestored > 0) parts.push(`${result.blobsRestored} attachments restored`);
-					if (backedUp > 0) parts.push(`backup in ${backupDir}`);
-
-					const msg = parts.length > 0
-						? `Restore complete: ${parts.join(", ")}.`
-						: "No changes were applied.";
-					new Notice(msg, 8000);
-					this.deps.log(`Restore from snapshot ${snapshot.snapshotId}: ${msg}`);
-
-					cleanup();
 				},
 				cleanup,
 			).open();
@@ -758,6 +1282,14 @@ export class SnapshotService {
 	): Promise<void> {
 		const vaultSync = this.deps.getVaultSync();
 		if (!vaultSync) return;
+		const restoreDiskMirror = this.deps.getDiskMirror();
+		if (!restoreDiskMirror) {
+			new Notice(
+				"History restore not started: the disk writer is unavailable. Reconnect sync and retry.",
+				8000,
+			);
+			return;
+		}
 		const hash = item.entry.contentHash;
 		if (!hash) {
 			new Notice("This history entry has no restorable content.");
@@ -765,14 +1297,23 @@ export class SnapshotService {
 		}
 
 		const path = item.entry.path;
-		const expectedCurrentHash = await getLiveHashForFileVersion(vaultSync.ydoc, item.entry.fileId, path);
+		const expectedMarkdownAuthority = captureMarkdownRestoreAuthority(vaultSync.ydoc, [path]);
+		const isOpenEditorAuthorityCurrent = this.captureOpenEditorRestoreFence([path]);
+		const expectedCurrentContent = getLiveContentForFileVersion(
+			vaultSync.ydoc,
+			item.entry.fileId,
+			path,
+		);
+		const expectedCurrentHash = expectedCurrentContent === null
+			? null
+			: await sha256Hex(expectedCurrentContent);
 		const content = await downloadFileHistoryContent(
 			this.deps.getSettings(),
 			hash,
 			this.deps.getTraceHttpContext(),
 		);
-		const currentHash = await getLiveHashForFileVersion(vaultSync.ydoc, item.entry.fileId, path);
-		if (currentHash !== expectedCurrentHash) {
+		const currentContent = getLiveContentForFileVersion(vaultSync.ydoc, item.entry.fileId, path);
+		if (currentContent !== expectedCurrentContent) {
 			new Notice("File changed while history was open. Reload file history and review again.", 8000);
 			return;
 		}
@@ -780,39 +1321,62 @@ export class SnapshotService {
 		const backupDir = normalizePath(
 			`${this.deps.app.vault.configDir}/plugins/kaos/restore-backups/${new Date().toISOString().replace(/[:.]/g, "-")}`,
 		);
-		let backedUp = false;
-		try {
-			const file = this.deps.app.vault.getAbstractFileByPath(path);
-			if (file instanceof TFile) {
-				const current = await this.deps.app.vault.read(file);
-				const backupPath = `${backupDir}/${path}`;
-				const parentDir = backupPath.substring(0, backupPath.lastIndexOf("/"));
-				if (parentDir && !this.deps.app.vault.getAbstractFileByPath(parentDir)) {
-					await this.deps.app.vault.createFolder(parentDir);
-				}
-				await this.deps.app.vault.create(backupPath, current);
-				backedUp = true;
-			}
-		} catch (err) {
-			this.deps.log(`Recovery restore backup skipped for "${path}": ${formatUnknown(err)}`);
-		}
+		const preparation = await this.prepareMarkdownRestore([path], backupDir);
 
-		const result = await restoreRecoveryVersionToLiveDoc(vaultSync.ydoc, {
-			fileId: item.entry.fileId,
-			path,
-			content,
-			expectedCurrentHash,
-			device: this.deps.getSettings().deviceName,
-		});
+		const restoreAttempt = await commitWithCurrentRestoreDiskAuthority(
+			this.deps.app.vault,
+			preparation.preconditions,
+			(isDiskIdentityCurrent) => restoreRecoveryVersionToLiveDoc(vaultSync.ydoc, {
+				fileId: item.entry.fileId,
+				path,
+				content,
+				expectedCurrentHash,
+				expectedCurrentContent,
+				device: this.deps.getSettings().deviceName,
+				canCommitRestore: () =>
+					this.deps.getVaultSync() === vaultSync
+						&& this.deps.getDiskMirror() === restoreDiskMirror
+						&& isMarkdownRestoreAuthorityCurrent(vaultSync.ydoc, expectedMarkdownAuthority)
+						&& isOpenEditorAuthorityCurrent(),
+				isDiskRestoreAuthorityCurrent: isDiskIdentityCurrent,
+			}),
+		);
+		if (restoreAttempt.kind === "stale") {
+			new Notice(
+				"The disk file changed after its safety backup. Reload file history and review again.",
+				8000,
+			);
+			return;
+		}
+		const result = await restoreAttempt.value;
 		if (!result.restored) {
-			new Notice("File changed while history was open. Reload file history and review again.", 8000);
+			new Notice(
+				result.reason === "file-identity-moved"
+					? "The file was renamed or its identity moved. Restore it from its current path instead."
+					: "File changed while history was open. Reload file history and review again.",
+				8000,
+			);
 			return;
 		}
 
-		await this.deps.getDiskMirror()?.flushWrite(path, true);
+		const restoredContents = new Map([[normalizePath(path), content]]);
+		const diskFailures = await this.settleMarkdownRestores(
+			[path],
+			preparation.preconditions,
+			restoredContents,
+			restoreDiskMirror,
+		);
 		this.deps.onEditorsNeedReconcile("recovery-history-restore");
+		if (diskFailures.length > 0) {
+			const detail = diskFailures[0]?.detail ?? "unknown disk settlement failure";
+			const message =
+				`The history version changed the synced state for ${path}, but its disk write ` +
+				`was not safely verified (${detail}). Review the preserved disk file and retry.`;
+			this.deps.log(`Recovery history restore incomplete from ${item.manifest.manifestId}: ${message}`);
+			throw new Error(message);
+		}
 		new Notice(
-			`Restored ${path}` + (backedUp ? ` (backup in ${backupDir})` : ""),
+			`Restored ${path}` + (preparation.backedUp > 0 ? ` (backup in ${backupDir})` : ""),
 			8000,
 		);
 		this.deps.log(`Recovery history restore from ${item.manifest.manifestId}: ${path}`);

@@ -2,15 +2,22 @@ import * as Y from "yjs";
 import YSyncProvider from "y-partyserver/provider";
 import { IndexeddbPersistence } from "y-indexeddb";
 import { normalizePath } from "obsidian";
-import { type FileMeta, type BlobRef, type BlobMeta, type BlobTombstone } from "../types";
+import {
+	blobRefFingerprint,
+	cloneBlobRef,
+	createCausalBlobRef,
+	isSha256Hex,
+	sameBlobRef,
+	type BlobRef,
+	type BlobMeta,
+	type BlobTombstone,
+} from "../types";
 import {
 	decodeFileMeta,
 	getMetaPath,
-	getMetaMtime,
 	isFileMetaDeletedValue,
 	ensureNestedMetaEntry,
 	createNestedActiveMeta,
-	createNestedDeletedMeta,
 	buildMetaSnapshot,
 	computeMetaSemanticChanges,
 	computeMetaShapeStats,
@@ -43,6 +50,50 @@ import type { CandidateStore, ScopeKey, ScopeMetadata } from "./candidateStore";
 import { FLIGHT_KIND } from "../telemetry/debug/flightEvents";
 import type { FlightPathEventInput } from "../telemetry/debug/flightEvents";
 import { TICKET_REFRESH_BUFFER_MS, patchTicketInUrl } from "./socketTicket";
+import type { PendingBlobMutationBase } from "./pendingBlobIntentJournal";
+
+export interface BlobRefCommitGuard {
+	/** Exact authoritative ref that must still occupy the path at commit. */
+	expectedCurrentRef: BlobRef | undefined;
+	/** Exact Y.Map item episode for expectedCurrentRef. */
+	expectedCurrentSourceVersion?: string;
+	/** Settled disk/ref authority on which the local content was based. */
+	causalBaseRef: BlobRef | undefined;
+}
+
+export interface BlobRefCommitResult {
+	ref: BlobRef;
+	/** Exact Y.Map item episode created by this guarded commit. */
+	sourceVersion: string;
+}
+
+export type BlobRenameResult =
+	| { kind: "missing-source" }
+	| { kind: "same-path"; ref: BlobRef }
+	| { kind: "moved"; ref: BlobRef }
+	| { kind: "destination-conflict"; sourceRef: BlobRef; destinationRef: BlobRef };
+
+export type BlobDeleteCommitResult =
+	| { kind: "deleted"; ref: BlobRef }
+	| { kind: "already-absent" }
+	| { kind: "unknown-source"; currentRef: BlobRef | undefined }
+	| {
+		kind: "source-conflict";
+		expectedRef: BlobRef | undefined;
+		currentRef: BlobRef | undefined;
+		/** True when our transaction mutated before a synchronous re-entrant revival. */
+		mutationApplied?: boolean;
+	};
+
+export type CausalBlobRenameResult = BlobRenameResult
+	| { kind: "already-absent" }
+	| { kind: "unknown-source"; currentRef: BlobRef | undefined }
+	| {
+		kind: "source-conflict";
+		expectedRef: BlobRef | undefined;
+		currentRef: BlobRef | undefined;
+		mutationApplied?: boolean;
+	};
 
 type ProviderWithTerminableSocket = {
 	ws?: {
@@ -101,6 +152,7 @@ export interface BlobRemoteDeleteSnapshot {
 	readonly path: string;
 	readonly deletedAt: number;
 	readonly device: string | null;
+	readonly deletedRef: BlobRef | undefined;
 	readonly fingerprint: string;
 }
 
@@ -387,6 +439,11 @@ export class VaultSync {
 
 		// Start both persistence and provider in parallel.
 		this.persistence = new IndexeddbPersistence(idbName, this.ydoc);
+		// Latch local authority from construction time. Waiting code is installed
+		// later in plugin startup, and a fast IndexedDB can emit `synced` before
+		// that waiter exists. The monotonic latch prevents that lost-event race and
+		// also records a late success after the bounded startup wait timed out.
+		this.persistence.on("synced", () => this.markLocalPersistenceReady());
 
 		// Catch IndexedDB open/write failures (unavailable, quota, permissions).
 		// y-indexeddb's internal _db promise rejects if IDB can't open.
@@ -506,8 +563,9 @@ export class VaultSync {
 			.on("custom-message", handleFatalAuthPayload);
 		(this.provider as unknown as { on: (event: string, cb: (payload: string) => void) => void })
 			.on("custom-message", (payload: string) => {
-				// SV echoes are Level 3 receipt signals only. They are not durable;
-				// ServerAckTracker's state-vector dominance check remains the truth gate.
+				// The server emits SV echoes only from its last successfully persisted
+				// state. ServerAckTracker's dominance check is still the truth gate for
+				// whether that durable state contains this client's exact candidate.
 				handleSvEchoCustomMessage(payload, this._svEchoCounters, (sv) => {
 					this.serverAckTracker.recordServerSvEcho(sv);
 				});
@@ -532,32 +590,45 @@ export class VaultSync {
 		if (this._idbError) return Promise.resolve(false);
 
 		return new Promise((resolve) => {
+			let settled = false;
+			const finish = (value: boolean) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timeout);
+				this.persistence.off("synced", onSynced);
+				resolve(value);
+			};
 			const timeout = setTimeout(() => {
 				this.log("IndexedDB persistence timed out — proceeding without cache");
-				resolve(false);
+				finish(false);
 			}, LOCAL_PERSISTENCE_TIMEOUT_MS);
 
-			// Resolve on successful sync
-			this.persistence.once("synced", () => {
-				clearTimeout(timeout);
-				this._localReady = true;
-				this._pathIndexesDirty = true;
-				this.log(
-					`IndexedDB loaded (pathToId: ${this.pathToId.size}, ` +
-					`initialized: ${this.isInitialized})`,
-				);
-				resolve(true);
-			});
+			const onSynced = () => {
+				this.markLocalPersistenceReady();
+				finish(true);
+			};
+			this.persistence.on("synced", onSynced);
+			// Close the event-between-check-and-listener window.
+			if (this._localReady) finish(true);
 
 			// Also resolve (false) if IDB errors out after we started waiting
 			(this.persistence as unknown as { _db: Promise<IDBDatabase> })._db
 				.catch(() => {
-					clearTimeout(timeout);
 					this.captureIndexedDbError(new Error("IndexedDB failed during waitForLocalPersistence"), "wait");
 					this.log("IndexedDB errored during wait — proceeding without cache");
-					resolve(false);
+					finish(false);
 				});
 		});
+	}
+
+	private markLocalPersistenceReady(): void {
+		if (this._localReady) return;
+		this._localReady = true;
+		this._pathIndexesDirty = true;
+		this.log(
+			`IndexedDB loaded (pathToId: ${this.pathToId.size}, ` +
+			`initialized: ${this.isInitialized})`,
+		);
 	}
 
 	waitForProviderSync(): Promise<boolean> {
@@ -713,22 +784,21 @@ export class VaultSync {
 	}
 
 	/**
-	 * Write the schema v3 marker if not already at v3+.
-	 * This does NOT convert metadata — it only signals that this room
-	 * may contain nested metadata and must only be accessed by v3-aware clients.
-	 * Safe to call concurrently from multiple v3 clients (idempotent small write).
+	 * Write the current schema marker if the room is older. Schema v4 is a
+	 * safety boundary: older clients do not understand causal blob authority.
+	 * Safe to call concurrently from multiple current clients.
 	 */
-	markSchemaV3(device?: string): void {
+	markCurrentSchema(device?: string): void {
 		const current = this.currentSchemaVersion();
-		if (current >= 3) return;
+		if (current >= SCHEMA_VERSION) return;
 
 		this.ydoc.transact(() => {
-			this.sys.set("schemaVersion", 3);
+			this.sys.set("schemaVersion", SCHEMA_VERSION);
 			this.sys.set("schemaUpdatedAt", Date.now());
 			if (device) this.sys.set("schemaUpdatedBy", device);
 		}, ORIGIN_SEED);
 
-		this.log(`schema: marked v3 (was ${current})`);
+		this.log(`schema: marked v${SCHEMA_VERSION} (was ${current})`);
 	}
 
 	/**
@@ -1225,6 +1295,8 @@ export class VaultSync {
 		mintAdmissionOpId?: (path: string) => { opId: string; emitDecision: () => void },
 		/** Product-owned path predicate; VaultSync itself remains policy-neutral. */
 		isPathSyncable: (path: string) => boolean = () => true,
+		/** Final synchronous freshness fence for a disk-only seed snapshot. */
+		canSeedSnapshot: (path: string, content: string) => boolean = () => true,
 	): ReconcileResult {
 		const createdOnDisk: string[] = [];
 		const updatedOnDisk: string[] = [];
@@ -1307,6 +1379,11 @@ export class VaultSync {
 						// Presence is known, but content wasn't read this pass. Skip seeding
 						// to avoid accidentally creating empty/incorrect files.
 						this.log(`reconcile: "${path}" present on disk but content not loaded, skipping seed`);
+						continue;
+					}
+					if (!canSeedSnapshot(path, content)) {
+						this.log(`reconcile: "${path}" seed snapshot became stale, deferring`);
+						untracked.push(path);
 						continue;
 					}
 					// Spec R2 / Option (b): when an admission-opId factory is
@@ -1617,15 +1694,16 @@ export class VaultSync {
 			}
 		});
 
-		const blobPaths: string[] = [];
-		this.pathToBlob.forEach((_ref, rawPath) => {
+		const blobEntries: Array<{ path: string; deletedRef: BlobRef }> = [];
+		this.pathToBlob.forEach((ref, rawPath) => {
 			const path = this.normPath(rawPath);
 			if (!this.isBlobTombstoned(path) && shouldTombstoneBlobPath(path)) {
-				blobPaths.push(path);
+				const deletedRef = cloneBlobRef(ref);
+				if (deletedRef) blobEntries.push({ path, deletedRef });
 			}
 		});
 
-		if (markdownEntries.length === 0 && blobPaths.length === 0) {
+		if (markdownEntries.length === 0 && blobEntries.length === 0) {
 			return { markdownPaths: [], blobPaths: [] };
 		}
 
@@ -1636,11 +1714,12 @@ export class VaultSync {
 				}
 				this.setMetaDeleted(fileId, path, device);
 			}
-			for (const path of blobPaths) {
+			for (const { path, deletedRef } of blobEntries) {
 				this.pathToBlob.delete(path);
 				this.blobTombstones.set(path, {
 					deletedAt: Date.now(),
 					device,
+					deletedRef,
 				});
 			}
 		}, ORIGIN_SEED);
@@ -1648,9 +1727,9 @@ export class VaultSync {
 		this._pathIndexesDirty = markdownEntries.length > 0;
 		const uniqueMarkdownPaths = [...new Set(markdownEntries.map(({ path }) => path))];
 		this.log(
-			`tombstoneIntrinsicExcludedEntries: markdown=${uniqueMarkdownPaths.length}, blobs=${blobPaths.length}`,
+			`tombstoneIntrinsicExcludedEntries: markdown=${uniqueMarkdownPaths.length}, blobs=${blobEntries.length}`,
 		);
-		return { markdownPaths: uniqueMarkdownPaths, blobPaths };
+		return { markdownPaths: uniqueMarkdownPaths, blobPaths: blobEntries.map(({ path }) => path) };
 	}
 
 	getPathBindingCollisionCount(): number {
@@ -1678,11 +1757,32 @@ export class VaultSync {
 		size: number,
 		mime: string,
 		device?: string,
-	): void {
+		guard?: BlobRefCommitGuard,
+	): BlobRefCommitResult | null {
 		path = this.normPath(path);
+		let committedRef: BlobRef | null = null;
+		let committedSourceVersion: string | undefined;
 
 		this.ydoc.transact(() => {
-			this.pathToBlob.set(path, { hash, size });
+			const currentRef = this.pathToBlob.get(path);
+			if (guard && !sameBlobRef(currentRef, guard.expectedCurrentRef)) return;
+			if (
+				guard?.expectedCurrentRef
+				&& (
+					!guard.expectedCurrentSourceVersion
+					|| this.getBlobSourceVersion(path) !== guard.expectedCurrentSourceVersion
+				)
+			) return;
+			const nextRef = createCausalBlobRef(
+				hash,
+				size,
+				guard ? guard.causalBaseRef : currentRef,
+			);
+			this.pathToBlob.set(
+				path,
+				nextRef,
+			);
+			committedSourceVersion = this.getBlobSourceVersion(path);
 			// Only set blobMeta if this content hash is new
 			if (!this.blobMeta.has(hash)) {
 				this.blobMeta.set(hash, {
@@ -1696,9 +1796,24 @@ export class VaultSync {
 			if (this.blobTombstones.has(path)) {
 				this.blobTombstones.delete(path);
 			}
+			committedRef = cloneBlobRef(nextRef) ?? null;
 		}, ORIGIN_SEED);
 
+		if (!committedRef) {
+			this.log(`setBlobRef: rejected stale authority for "${path}"`);
+			return null;
+		}
+		if (!committedSourceVersion) {
+			// The CRDT mutation already linearized. Throwing keeps the caller's
+			// durable pre-commit stage intact; returning null would incorrectly
+			// describe this as a safe no-mutation guard rejection.
+			throw new Error(`setBlobRef: committed source episode unavailable for "${path}"`);
+		}
 		this.log(`setBlobRef: "${path}" hash=${hash.slice(0, 12)}… (${size} bytes)`);
+		return {
+			ref: committedRef,
+			sourceVersion: committedSourceVersion,
+		};
 	}
 
 	/**
@@ -1706,6 +1821,33 @@ export class VaultSync {
 	 */
 	getBlobRef(path: string): BlobRef | undefined {
 		return this.pathToBlob.get(this.normPath(path));
+	}
+
+	/**
+	 * Return the exact CRDT item episode currently owning a live blob path.
+	 * Y.Map replaces its Item (client, clock) on every set, even when the value
+	 * returns to byte-identical H1 after a delete. This closes the hash ABA gap
+	 * without treating unrelated document edits as source-authority changes.
+	 *
+	 * `_map` is a pinned Yjs 13.6.x structural invariant. Keep the cast isolated
+	 * here and fail closed if the runtime shape ever changes.
+	 */
+	getBlobSourceVersion(path: string): string | undefined {
+		const normalized = this.normPath(path);
+		if (!this.pathToBlob.has(normalized)) return undefined;
+		const item = (this.pathToBlob as unknown as {
+			_map?: Map<string, { id?: { client?: unknown; clock?: unknown } }>;
+		})._map?.get(normalized);
+		const client = item?.id?.client;
+		const clock = item?.id?.clock;
+		return Number.isSafeInteger(client)
+			&& typeof client === "number"
+			&& client >= 0
+			&& Number.isSafeInteger(clock)
+			&& typeof clock === "number"
+			&& clock >= 0
+			? `${client}:${clock}`
+			: undefined;
 	}
 
 	/**
@@ -1720,10 +1862,69 @@ export class VaultSync {
 	 * a tombstone to prevent resurrection from stale disk scans.
 	 * Does NOT delete the R2 blob (content-addressed = may be shared).
 	 */
+	deleteBlobRefIfCurrent(
+		path: string,
+		base: PendingBlobMutationBase,
+		device?: string,
+	): BlobDeleteCommitResult {
+		path = this.normPath(path);
+		const currentRef = cloneBlobRef(this.pathToBlob.get(path));
+		if (!currentRef) return { kind: "already-absent" };
+		if (!base.known) {
+			return { kind: "unknown-source", currentRef };
+		}
+		const expectedRef = cloneBlobRef(base.ref);
+		if (!base.sourceVersionKnown || !base.expectedSourceVersion) {
+			return { kind: "unknown-source", currentRef };
+		}
+		const expectedSourceVersion = base.expectedSourceVersion;
+		if (
+			!sameBlobRef(currentRef, expectedRef)
+			|| this.getBlobSourceVersion(path) !== expectedSourceVersion
+		) {
+			return {
+				kind: "source-conflict",
+				expectedRef,
+				currentRef,
+				mutationApplied: false,
+			};
+		}
+
+		let mutationApplied = false;
+		this.ydoc.transact(() => {
+			// The equality check and mutation share one synchronous turn. Recheck
+			// inside the transaction so a nested observer cannot lend this delete a
+			// different source ref.
+			if (
+				!sameBlobRef(this.pathToBlob.get(path), expectedRef)
+				|| this.getBlobSourceVersion(path) !== expectedSourceVersion
+			) return;
+			this.pathToBlob.delete(path);
+			this.blobTombstones.set(path, {
+				deletedAt: Date.now(),
+				device,
+				deletedRef: currentRef,
+			});
+			mutationApplied = true;
+		}, ORIGIN_SEED);
+
+		if (!mutationApplied || this.pathToBlob.has(path)) {
+			return {
+				kind: "source-conflict",
+				expectedRef,
+				currentRef: cloneBlobRef(this.pathToBlob.get(path)),
+				mutationApplied,
+			};
+		}
+		this.log(`deleteBlobRef: "${path}" causally tombstoned`);
+		return { kind: "deleted", ref: currentRef };
+	}
+
 	deleteBlobRef(path: string, device?: string): void {
 		path = this.normPath(path);
 
-		if (!this.pathToBlob.has(path)) {
+		const deletedRef = cloneBlobRef(this.pathToBlob.get(path));
+		if (!deletedRef) {
 			this.log(`deleteBlobRef: "${path}" not in CRDT, ignoring`);
 			return;
 		}
@@ -1733,6 +1934,7 @@ export class VaultSync {
 			this.blobTombstones.set(path, {
 				deletedAt: Date.now(),
 				device,
+				deletedRef,
 			});
 		}, ORIGIN_SEED);
 
@@ -1743,7 +1945,9 @@ export class VaultSync {
 	 * Check if a path is blob-tombstoned (deleted).
 	 */
 	isBlobTombstoned(path: string): boolean {
-		return this.blobTombstones.has(this.normPath(path));
+		const normalized = this.normPath(path);
+		return !this.pathToBlob.has(normalized)
+			&& this.blobTombstones.has(normalized);
 	}
 
 	/**
@@ -1767,11 +1971,19 @@ export class VaultSync {
 		}
 
 		const device = typeof tombstone.device === "string" ? tombstone.device : null;
+		const candidateDeletedRef = cloneBlobRef(tombstone.deletedRef);
+		const deletedRef = candidateDeletedRef
+			&& isSha256Hex(candidateDeletedRef.hash)
+			&& Number.isFinite(candidateDeletedRef.size)
+			&& candidateDeletedRef.size >= 0
+			? candidateDeletedRef
+			: undefined;
 		const fingerprint = JSON.stringify([
 			"blob",
 			normalizedPath,
 			tombstone.deletedAt,
 			device,
+			blobRefFingerprint(deletedRef),
 		]);
 
 		return {
@@ -1779,31 +1991,129 @@ export class VaultSync {
 			path: normalizedPath,
 			deletedAt: tombstone.deletedAt,
 			device,
+			deletedRef,
 			fingerprint,
 		};
 	}
 
 	/**
-	 * Rename a blob path. Moves the entry in pathToBlob.
-	 * Called from the rename batch flush for non-markdown files.
+	 * Rename a blob with a self-contained delete episode at the old path.
+	 * Receivers can therefore retire their old disk replica without relying on
+	 * transaction oldValue or a separate rename event. A different live ref at
+	 * the destination always wins; it is never overwritten by the source ref.
 	 */
-	renameBlobRef(oldPath: string, newPath: string): void {
+	renameBlobRefWithTombstoneIfCurrent(
+		oldPath: string,
+		newPath: string,
+		base: PendingBlobMutationBase,
+		device?: string,
+	): CausalBlobRenameResult {
+		oldPath = this.normPath(oldPath);
+		newPath = this.normPath(newPath);
+		const currentRef = cloneBlobRef(this.pathToBlob.get(oldPath));
+		if (!currentRef) return { kind: "already-absent" };
+		if (!base.known) {
+			return { kind: "unknown-source", currentRef };
+		}
+		const expectedRef = cloneBlobRef(base.ref);
+		if (!base.sourceVersionKnown || !base.expectedSourceVersion) {
+			return { kind: "unknown-source", currentRef };
+		}
+		const expectedSourceVersion = base.expectedSourceVersion;
+		if (
+			!sameBlobRef(currentRef, expectedRef)
+			|| this.getBlobSourceVersion(oldPath) !== expectedSourceVersion
+		) {
+			return {
+				kind: "source-conflict",
+				expectedRef,
+				currentRef,
+				mutationApplied: false,
+			};
+		}
+		if (oldPath === newPath) return { kind: "same-path", ref: currentRef };
+
+		const destinationRef = cloneBlobRef(this.pathToBlob.get(newPath));
+		const destinationConflict = !!destinationRef
+			&& !sameBlobRef(destinationRef, currentRef);
+		let mutationApplied = false;
+		this.ydoc.transact(() => {
+			if (
+				!sameBlobRef(this.pathToBlob.get(oldPath), expectedRef)
+				|| this.getBlobSourceVersion(oldPath) !== expectedSourceVersion
+			) return;
+			this.pathToBlob.delete(oldPath);
+			this.blobTombstones.set(oldPath, {
+				deletedAt: Date.now(),
+				device,
+				deletedRef: currentRef,
+			});
+			if (!destinationConflict) {
+				this.pathToBlob.set(newPath, currentRef);
+				this.blobTombstones.delete(newPath);
+			}
+			mutationApplied = true;
+		}, ORIGIN_SEED);
+
+		if (!mutationApplied || this.pathToBlob.has(oldPath)) {
+			return {
+				kind: "source-conflict",
+				expectedRef,
+				currentRef: cloneBlobRef(this.pathToBlob.get(oldPath)),
+				mutationApplied,
+			};
+		}
+		return destinationConflict
+			? {
+				kind: "destination-conflict",
+				sourceRef: currentRef,
+				destinationRef,
+			}
+			: { kind: "moved", ref: currentRef };
+	}
+
+	renameBlobRefWithTombstone(
+		oldPath: string,
+		newPath: string,
+		device?: string,
+	): BlobRenameResult {
 		oldPath = this.normPath(oldPath);
 		newPath = this.normPath(newPath);
 
-		const ref = this.pathToBlob.get(oldPath);
-		if (!ref) return;
+		const ref = cloneBlobRef(this.pathToBlob.get(oldPath));
+		if (!ref) return { kind: "missing-source" };
+		if (oldPath === newPath) return { kind: "same-path", ref };
+		const destinationRef = cloneBlobRef(this.pathToBlob.get(newPath));
+		const destinationConflict = !!destinationRef
+			&& !sameBlobRef(destinationRef, ref);
 
 		this.ydoc.transact(() => {
 			this.pathToBlob.delete(oldPath);
-			this.pathToBlob.set(newPath, ref);
-			// Clear any tombstone at the new path
-			if (this.blobTombstones.has(newPath)) {
-				this.blobTombstones.delete(newPath);
+			this.blobTombstones.set(oldPath, {
+				deletedAt: Date.now(),
+				device,
+				deletedRef: ref,
+			});
+			if (!destinationConflict) {
+				this.pathToBlob.set(newPath, ref);
+				if (this.blobTombstones.has(newPath)) {
+					this.blobTombstones.delete(newPath);
+				}
 			}
 		}, ORIGIN_SEED);
 
-		this.log(`renameBlobRef: "${oldPath}" -> "${newPath}"`);
+		this.log(
+			destinationConflict
+				? `renameBlobRef: tombstoned "${oldPath}"; preserved conflicting destination "${newPath}"`
+				: `renameBlobRef: "${oldPath}" -> "${newPath}" with source tombstone`,
+		);
+		return destinationConflict
+			? {
+				kind: "destination-conflict",
+				sourceRef: ref,
+					destinationRef,
+			}
+			: { kind: "moved", ref };
 	}
 
 	// -------------------------------------------------------------------
@@ -1937,14 +2247,28 @@ export class VaultSync {
 					renamedIds.push({ oldPath, newPath, fileId });
 				}
 
-				const blobRef = this.pathToBlob.get(oldPath);
+				const blobRef = cloneBlobRef(this.pathToBlob.get(oldPath));
 				if (blobRef) {
+					const destinationRef = cloneBlobRef(this.pathToBlob.get(newPath));
+					const destinationConflict = !!destinationRef
+						&& !sameBlobRef(destinationRef, blobRef);
 					this.pathToBlob.delete(oldPath);
-					this.pathToBlob.set(newPath, blobRef);
-					if (this.blobTombstones.has(newPath)) {
-						this.blobTombstones.delete(newPath);
+					this.blobTombstones.set(oldPath, {
+						deletedAt: Date.now(),
+						device,
+						deletedRef: blobRef,
+					});
+					if (!destinationConflict) {
+						this.pathToBlob.set(newPath, blobRef);
+						if (this.blobTombstones.has(newPath)) {
+							this.blobTombstones.delete(newPath);
+						}
 					}
-					this.log(`renameBatch: blob "${oldPath}" -> "${newPath}"`);
+					this.log(
+						destinationConflict
+							? `renameBatch: blob source tombstoned; destination conflict preserved "${newPath}"`
+							: `renameBatch: blob "${oldPath}" -> "${newPath}" with source tombstone`,
+					);
 				}
 			}
 		}, ORIGIN_SEED);

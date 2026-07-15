@@ -15,6 +15,7 @@ import {
 
 const rootDir = resolve(".");
 const artifactPath = resolve(rootDir, "dist/release-assets/kaos-server.zip");
+const updateManifestPath = resolve(rootDir, "dist/release-assets/update-manifest.json");
 const tempDir = mkdtempSync(join(tmpdir(), "kaos-server-update-test-"));
 const repoDir = join(tempDir, "repo");
 
@@ -160,6 +161,20 @@ function testAutoR2BindingHelpers() {
 }
 
 try {
+	const updateManifest = JSON.parse(readFileSync(updateManifestPath, "utf8"));
+	if (
+		updateManifest.migrationRequired !== true
+		|| updateManifest.upgradeOrder !== "plugin-first"
+		|| updateManifest.autoUpdateEligible !== false
+	) {
+		throw new Error(
+			`Migration release manifest is not plugin-first and fail-closed: ${JSON.stringify(updateManifest)}`,
+		);
+	}
+	if (!String(updateManifest.upgradeGuideUrl).endsWith("#guided-server-update")) {
+		throw new Error(`Migration release guide URL is invalid: ${String(updateManifest.upgradeGuideUrl)}`);
+	}
+
 	testAutoR2BindingHelpers();
 	cpSync(resolve(rootDir, "server"), repoDir, { recursive: true });
 
@@ -195,10 +210,25 @@ try {
 	run("git", ["add", "-A"]);
 	run("git", ["commit", "-qm", "simulate older deployed server"]);
 
+	const migrationGuardOutput = runExpectFailure("node", ["scripts/update-from-release.mjs"], {
+		env: {
+			...process.env,
+			KAOS_RELEASE_FILE: artifactPath,
+		},
+	});
+	if (!migrationGuardOutput.includes("migration-required")) {
+		throw new Error(`Expected migration-required update guard, got:\n${migrationGuardOutput}`);
+	}
+	const afterMigrationGuardVersion = read("src/version.ts");
+	if (!afterMigrationGuardVersion.includes('SERVER_VERSION = "0.1.9"')) {
+		throw new Error("Migration guard test failed: rejected update still modified src/version.ts");
+	}
+
 	run("node", ["scripts/update-from-release.mjs"], {
 		env: {
 			...process.env,
 			KAOS_RELEASE_FILE: artifactPath,
+			KAOS_ALLOW_MIGRATION_UPDATE: "true",
 		},
 	});
 

@@ -12,7 +12,15 @@
 import * as Y from "yjs";
 import { gunzipSync } from "fflate";
 import type { VaultSyncSettings } from "../settings";
-import type { FileMeta, BlobRef } from "../types";
+import {
+	cloneBlobRef,
+	createCausalBlobRef,
+	getBlobRefPriorHashes,
+	sameBlobRef,
+	type FileMeta,
+	type BlobRef,
+	type BlobTombstone,
+} from "../types";
 import { appendTraceParams, type TraceHttpContext } from "../observability/traceContext";
 import { obsidianRequest } from "../utils/http";
 import { yTextToString } from "../utils/format";
@@ -500,6 +508,74 @@ export interface RestoreOptions {
 	blobPaths?: string[];
 	/** Device name for metadata. */
 	device?: string;
+	/**
+	 * Exact live Markdown state captured before any asynchronous backup work.
+	 * When supplied, every selected Markdown path must still have the same
+	 * active file identity, Y.Text identity, and content immediately before the
+	 * restore transaction begins.
+	 */
+	expectedMarkdownAuthority?: ReadonlyMap<string, MarkdownRestoreAuthority>;
+	/**
+	 * Exact live attachment references and tombstones captured when the user
+	 * confirmed the snapshot diff. Plain-object identity is intentional here:
+	 * an equal-value Y.Map replacement is still a new authority episode and must
+	 * not be overwritten by a decision made against the previous entry.
+	 */
+	expectedBlobAuthority?: ReadonlyMap<string, BlobRestoreAuthority>;
+	/**
+	 * Optional synchronous final fence for authority outside the Y.Doc (for
+	 * example, open editor buffers). It is called after all CRDT checks and
+	 * immediately before the restore transaction.
+	 */
+	canCommitMarkdownRestore?: () => boolean;
+	/**
+	 * Final synchronous disk-identity fence. SnapshotService validates reviewed
+	 * disk bytes before entering this synchronous boundary, then supplies this
+	 * callback so exact TFile/missing-path authority is checked last, immediately
+	 * before the restore transaction.
+	 */
+	isMarkdownRestoreDiskAuthorityCurrent?: () => boolean;
+}
+
+export interface MarkdownRestoreAuthority {
+	path: string;
+	fileId: string | null;
+	text: Y.Text | null;
+	content: string | null;
+}
+
+export interface BlobRestoreAuthority {
+	path: string;
+	refPresent: boolean;
+	ref: BlobRef | undefined;
+	refValue: BlobRef | undefined;
+	tombstonePresent: boolean;
+	tombstone: BlobTombstone | undefined;
+	tombstoneValue: BlobTombstone | undefined;
+}
+
+export type MarkdownRestoreRejectionReason =
+	| "authority-precondition-missing"
+	| "live-file-identity-changed"
+	| "live-text-identity-changed"
+	| "live-content-changed"
+	| "editor-authority-changed"
+	| "disk-authority-changed"
+	| "snapshot-file-id-active-at-different-path";
+
+export interface MarkdownRestoreRejection {
+	path: string;
+	reason: MarkdownRestoreRejectionReason;
+}
+
+export type BlobRestoreRejectionReason =
+	| "authority-precondition-missing"
+	| "live-blob-ref-changed"
+	| "live-blob-tombstone-changed";
+
+export interface BlobRestoreRejection {
+	path: string;
+	reason: BlobRestoreRejectionReason;
 }
 
 export interface RestoreResult {
@@ -509,6 +585,168 @@ export interface RestoreResult {
 	markdownUndeleted: number;
 	/** Number of blob references restored. */
 	blobsRestored: number;
+	/** Selected attachment paths rejected by their final CRDT authority fence. */
+	blobRejected: BlobRestoreRejection[];
+	/**
+	 * Selected Markdown paths rejected by the final authority fence. Any
+	 * rejection makes the restore all-or-nothing: no Markdown or blob changes
+	 * are applied by this call.
+	 */
+	markdownRejected: MarkdownRestoreRejection[];
+}
+
+/**
+ * Capture the exact live CRDT authority for selected paths. Callers that do
+ * asynchronous preparation before restore should retain this map and pass it
+ * back through `expectedMarkdownAuthority`.
+ */
+export function captureMarkdownRestoreAuthority(
+	liveDoc: Y.Doc,
+	paths: readonly string[],
+): Map<string, MarkdownRestoreAuthority> {
+	const livePaths = collectActiveMarkdownPaths(liveDoc);
+	const liveIdToText = liveDoc.getMap<Y.Text>("idToText");
+	const captured = new Map<string, MarkdownRestoreAuthority>();
+
+	for (const requestedPath of paths) {
+		const path = normalizeVaultPath(requestedPath);
+		if (captured.has(path)) continue;
+		const fileId = livePaths.get(path) ?? null;
+		const text = fileId ? (liveIdToText.get(fileId) ?? null) : null;
+		captured.set(path, {
+			path,
+			fileId,
+			text,
+			content: text?.toJSON() ?? null,
+		});
+	}
+
+	return captured;
+}
+
+/** Capture exact selected attachment authority before any asynchronous work. */
+export function captureBlobRestoreAuthority(
+	liveDoc: Y.Doc,
+	paths: readonly string[],
+): Map<string, BlobRestoreAuthority> {
+	const livePathToBlob = liveDoc.getMap<BlobRef>("pathToBlob");
+	const liveBlobTombstones = liveDoc.getMap<BlobTombstone>("blobTombstones");
+	const captured = new Map<string, BlobRestoreAuthority>();
+
+	for (const requestedPath of paths) {
+		const path = normalizeVaultPath(requestedPath);
+		if (captured.has(path)) continue;
+		captured.set(path, {
+			path,
+			refPresent: livePathToBlob.has(path),
+			ref: livePathToBlob.get(path),
+			refValue: cloneBlobRef(livePathToBlob.get(path)),
+			tombstonePresent: liveBlobTombstones.has(path),
+			tombstone: liveBlobTombstones.get(path),
+			tombstoneValue: cloneBlobTombstone(liveBlobTombstones.get(path)),
+		});
+	}
+
+	return captured;
+}
+
+function validateBlobRestoreAuthority(
+	liveDoc: Y.Doc,
+	path: string,
+	expected: BlobRestoreAuthority | undefined,
+): BlobRestoreRejectionReason | null {
+	if (!expected || expected.path !== path) return "authority-precondition-missing";
+	const livePathToBlob = liveDoc.getMap<BlobRef>("pathToBlob");
+	const currentRef = livePathToBlob.get(path);
+	if (
+		livePathToBlob.has(path) !== expected.refPresent
+		|| currentRef !== expected.ref
+		|| !sameBlobRef(currentRef, expected.refValue)
+	) {
+		return "live-blob-ref-changed";
+	}
+
+	const liveBlobTombstones = liveDoc.getMap<BlobTombstone>("blobTombstones");
+	const currentTombstone = liveBlobTombstones.get(path);
+	if (
+		liveBlobTombstones.has(path) !== expected.tombstonePresent
+		|| currentTombstone !== expected.tombstone
+		|| !sameBlobTombstone(currentTombstone, expected.tombstoneValue)
+	) {
+		return "live-blob-tombstone-changed";
+	}
+	return null;
+}
+
+function cloneBlobTombstone(tombstone: BlobTombstone | undefined): BlobTombstone | undefined {
+	return tombstone
+		? {
+			deletedAt: tombstone.deletedAt,
+			device: tombstone.device,
+			deletedRef: cloneBlobRef(tombstone.deletedRef),
+		}
+		: undefined;
+}
+
+function sameBlobTombstone(
+	left: BlobTombstone | undefined,
+	right: BlobTombstone | undefined,
+): boolean {
+	return left === undefined
+		? right === undefined
+		: right !== undefined
+			&& left.deletedAt === right.deletedAt
+			&& left.device === right.device
+			&& sameBlobRef(left.deletedRef, right.deletedRef);
+}
+
+export function isBlobRestoreAuthorityCurrent(
+	liveDoc: Y.Doc,
+	expectedAuthority: ReadonlyMap<string, BlobRestoreAuthority>,
+): boolean {
+	for (const [path, expected] of expectedAuthority) {
+		if (validateBlobRestoreAuthority(liveDoc, path, expected)) return false;
+	}
+	return true;
+}
+
+function findActivePathsForFileId(
+	livePaths: ReadonlyMap<string, string>,
+	fileId: string,
+): string[] {
+	const paths: string[] = [];
+	for (const [path, activeFileId] of livePaths) {
+		if (activeFileId === fileId) paths.push(path);
+	}
+	return paths;
+}
+
+function validateMarkdownRestoreAuthority(
+	liveDoc: Y.Doc,
+	path: string,
+	expected: MarkdownRestoreAuthority | undefined,
+): MarkdownRestoreRejectionReason | null {
+	if (!expected) return "authority-precondition-missing";
+	const livePaths = collectActiveMarkdownPaths(liveDoc);
+	const currentFileId = livePaths.get(path) ?? null;
+	if (currentFileId !== expected.fileId) return "live-file-identity-changed";
+
+	const currentText = currentFileId
+		? (liveDoc.getMap<Y.Text>("idToText").get(currentFileId) ?? null)
+		: null;
+	if (currentText !== expected.text) return "live-text-identity-changed";
+	if ((currentText?.toJSON() ?? null) !== expected.content) return "live-content-changed";
+	return null;
+}
+
+export function isMarkdownRestoreAuthorityCurrent(
+	liveDoc: Y.Doc,
+	expectedAuthority: ReadonlyMap<string, MarkdownRestoreAuthority>,
+): boolean {
+	for (const [path, expected] of expectedAuthority) {
+		if (validateMarkdownRestoreAuthority(liveDoc, path, expected)) return false;
+	}
+	return true;
 }
 
 /**
@@ -542,7 +780,93 @@ export function restoreFromSnapshot(
 		markdownRestored: 0,
 		markdownUndeleted: 0,
 		blobsRestored: 0,
+		blobRejected: [],
+		markdownRejected: [],
 	};
+
+	const requestedMarkdownPaths = [...new Set(
+		(options.markdownPaths ?? []).map((path) => normalizeVaultPath(path)),
+	)];
+	for (const path of requestedMarkdownPaths) {
+		const snapFileId = snapshotPaths.get(path);
+		if (!snapFileId) continue;
+
+		// A snapshot file ID may still be the live identity of a renamed file.
+		// Reusing it to undelete the historical path would clear that live file's
+		// text and move its metadata back to the old path.
+		const activeSnapshotIdPaths = findActivePathsForFileId(livePaths, snapFileId);
+		if (activeSnapshotIdPaths.some((activePath) => activePath !== path)) {
+			result.markdownRejected.push({
+				path,
+				reason: "snapshot-file-id-active-at-different-path",
+			});
+			continue;
+		}
+
+		if (options.expectedMarkdownAuthority) {
+			const rejection = validateMarkdownRestoreAuthority(
+				liveDoc,
+				path,
+				options.expectedMarkdownAuthority.get(path),
+			);
+			if (rejection) result.markdownRejected.push({ path, reason: rejection });
+		}
+	}
+
+	const requestedBlobPaths = [...new Set(
+		(options.blobPaths ?? []).map((path) => normalizeVaultPath(path)),
+	)];
+	for (const path of requestedBlobPaths) {
+		if (!snapPathToBlob.has(path)) continue;
+		if (options.expectedBlobAuthority) {
+			const rejection = validateBlobRestoreAuthority(
+				liveDoc,
+				path,
+				options.expectedBlobAuthority.get(path),
+			);
+			if (rejection) result.blobRejected.push({ path, reason: rejection });
+		}
+	}
+
+	if (
+		result.markdownRejected.length === 0
+		&& requestedMarkdownPaths.length > 0
+		&& options.canCommitMarkdownRestore
+	) {
+		let canCommit = false;
+		try {
+			canCommit = options.canCommitMarkdownRestore();
+		} catch {
+			canCommit = false;
+		}
+		if (!canCommit) {
+			for (const path of requestedMarkdownPaths) {
+				result.markdownRejected.push({ path, reason: "editor-authority-changed" });
+			}
+		}
+	}
+
+	if (
+		result.markdownRejected.length === 0
+		&& requestedMarkdownPaths.length > 0
+		&& options.isMarkdownRestoreDiskAuthorityCurrent
+	) {
+		let diskAuthorityCurrent = false;
+		try {
+			diskAuthorityCurrent = options.isMarkdownRestoreDiskAuthorityCurrent();
+		} catch {
+			diskAuthorityCurrent = false;
+		}
+		if (!diskAuthorityCurrent) {
+			for (const path of requestedMarkdownPaths) {
+				result.markdownRejected.push({ path, reason: "disk-authority-changed" });
+			}
+		}
+	}
+
+	// Authority rejection is deliberately all-or-nothing so a stale Markdown
+	// selection cannot be accompanied by an otherwise-successful blob restore.
+	if (result.markdownRejected.length > 0 || result.blobRejected.length > 0) return result;
 
 	liveDoc.transact(() => {
 		// Restore markdown files
@@ -637,7 +961,16 @@ export function restoreFromSnapshot(
 			const snapRef = snapPathToBlob.get(path);
 			if (!snapRef) continue;
 
-			livePathToBlob.set(path, snapRef);
+			const liveRef = livePathToBlob.get(path);
+			livePathToBlob.set(
+				path,
+				createCausalBlobRef(
+					snapRef.hash,
+					snapRef.size,
+					liveRef,
+					getBlobRefPriorHashes(snapRef),
+				),
+			);
 
 			// Clear any tombstone at this path
 			if (liveBlobTombstones.has(path)) {

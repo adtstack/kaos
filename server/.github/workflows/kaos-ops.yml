@@ -20,6 +20,11 @@ on:
         required: false
         default: "adtstack/kaos"
         type: string
+      allow_migration_update:
+        description: "Explicitly allow a release marked migration-required"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -47,6 +52,7 @@ jobs:
           KAOS_RELEASE_REPO: ${{ vars.KAOS_RELEASE_REPO != '' && vars.KAOS_RELEASE_REPO || github.event.inputs.release_repo }}
           KAOS_RELEASE_VERSION: ${{ github.event.inputs.version }}
           KAOS_RELEASE_TOKEN: ${{ secrets.KAOS_RELEASE_TOKEN }}
+          KAOS_ALLOW_MIGRATION_UPDATE: ${{ github.event.inputs.allow_migration_update }}
         run: node scripts/update-from-release.mjs
 
       - name: Revert last KAOS update commit

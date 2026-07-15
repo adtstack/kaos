@@ -98,9 +98,21 @@ export function planOpenBoundFileReconcile(
 			diskMtime,
 			lastDiskIndexPersistedAt,
 		});
-		// Open/bound files have a visible editor authority. Without this
-		// override, missing-baseline autosave/external-edit streams can demote
-		// every growing disk version into a conflict artifact.
+		// A missing baseline cannot prove that the disk copy is newer. If the
+		// visible editor still agrees with CRDT, importing a different disk
+		// snapshot would visibly roll the note back. Keep the visible side and
+		// preserve the disk copy for explicit recovery instead.
+		if (editorAuthority.relation === "crdt" || editorAuthority.relation === "both") {
+			return {
+				kind: "editor-wins-preserve",
+				reason: "missing-baseline",
+				preserveDisk: true,
+				missingBaselinePolicy: "open-bound-visible-authority",
+			};
+		}
+
+		// The editor itself carries the disk version, so disk remains the only
+		// visible authority. Preserve the previous CRDT side before importing.
 		return {
 			kind: "import-disk-to-crdt",
 			reason: "missing-baseline",

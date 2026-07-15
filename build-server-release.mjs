@@ -111,9 +111,9 @@ const updateManifest = {
 	latestPluginSchemaVersion: pluginSchemaVersion,
 	latestServerMinSchemaVersion: serverMinSchemaVersion,
 	latestServerMaxSchemaVersion: serverMaxSchemaVersion,
-	upgradeOrder: "either",
+	upgradeOrder: migrationRequired ? "plugin-first" : "either",
 	releaseNotesUrl: `https://github.com/${releaseRepo}/releases/tag/${rootPackage.version}`,
-	upgradeGuideUrl: `https://github.com/${releaseRepo}#updating-your-server`,
+	upgradeGuideUrl: `https://github.com/${releaseRepo}#guided-server-update`,
 };
 
 const serverZipManifest = {

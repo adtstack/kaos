@@ -58,17 +58,23 @@ const UPDATE_MANIFEST_URLS = [
 ] as const;
 const UPDATE_MANIFEST_CACHE_MS = 24 * 60 * 60 * 1000;
 export const CAPABILITY_REFRESH_INTERVAL_MS = 30_000;
-const GITHUB_OPS_WORKFLOW_PATH = ".github/workflows/kaos-ops.yml";
+export const GITHUB_OPS_WORKFLOW_FILENAME = "kaos-ops-v2.yml";
+export const GITHUB_OPS_WORKFLOW_PATH = `.github/workflows/${GITHUB_OPS_WORKFLOW_FILENAME}`;
 
-function buildGithubOpsBootstrapWorkflowYaml(): string {
+export function buildGithubOpsBootstrapWorkflowYaml(): string {
 	return [
-		"name: KAOS Server Ops",
+		"name: KAOS Server Ops v2",
 		"on:",
 		"  workflow_dispatch:",
 		"    inputs:",
 		"      action: { type: choice, required: true, default: update, options: [update, revert] }",
 		"      version: { type: string, required: false }",
 		"      release_repo: { type: string, required: false, default: adtstack/kaos }",
+		"      allow_migration_update:",
+		"        description: \"Explicitly allow a release marked migration-required\"",
+		"        type: boolean",
+		"        required: false",
+		"        default: false",
 		"permissions:",
 		"  contents: write",
 		"jobs:",
@@ -91,6 +97,7 @@ function buildGithubOpsBootstrapWorkflowYaml(): string {
 		"          KAOS_RELEASE_REPO: ${{ vars.KAOS_RELEASE_REPO != '' && vars.KAOS_RELEASE_REPO || github.event.inputs.release_repo }}",
 		"          KAOS_RELEASE_VERSION: ${{ github.event.inputs.version }}",
 		"          KAOS_RELEASE_TOKEN: ${{ secrets.KAOS_RELEASE_TOKEN }}",
+		"          KAOS_ALLOW_MIGRATION_UPDATE: ${{ github.event.inputs.allow_migration_update }}",
 		"        run: node scripts/update-from-release.mjs",
 		"      - name: Revert last KAOS update commit",
 		"        if: ${{ github.event.inputs.action == 'revert' }}",
@@ -332,6 +339,7 @@ export class CapabilityUpdateService {
 	async beginGuidedServerUpdate(now = Date.now()): Promise<boolean> {
 		const updateState = this.getUpdateState(now);
 		if (!updateState.guidedServerUpdateAvailable || !updateState.latestServerVersion || !updateState.updateActionUrl) {
+			// eslint-disable-next-line obsidianmd/ui/sentence-case -- KAOS is the product acronym.
 			new Notice("KAOS: guided server update is not available for the current settings or release.", 8000);
 			return false;
 		}
@@ -442,7 +450,7 @@ export class CapabilityUpdateService {
 		const normalizedRepoUrl = repoUrl.replace(/\/+$/, "").replace(/\.git$/, "");
 		const branch = settings.updateRepoBranch.trim() || this.serverCapabilities?.updateRepoBranch || "main";
 		if (provider === "github") {
-			return `${normalizedRepoUrl}/actions/workflows/kaos-ops.yml`;
+			return `${normalizedRepoUrl}/actions/workflows/${GITHUB_OPS_WORKFLOW_FILENAME}`;
 		}
 		if (provider === "gitlab") {
 			return `${normalizedRepoUrl}/-/pipelines/new?ref=${encodeURIComponent(branch)}`;
@@ -792,6 +800,7 @@ export class CapabilityUpdateService {
 				new Notice(`KAOS: server updated to ${previous?.targetVersion ?? "the target version"}.`, 8000);
 			} else if (result.status === "timed-out") {
 				this.deps.log(`Guided server update timed out: target=${previous?.targetVersion ?? "unknown"}`);
+				// eslint-disable-next-line obsidianmd/ui/sentence-case -- KAOS is the product acronym.
 				new Notice("KAOS: still waiting for the server update. Open the update action again if needed.", 10000);
 			}
 		}

@@ -6,6 +6,8 @@ const HOST = process.env.KAOS_TEST_HOST || "http://127.0.0.1:8787";
 const TOKEN = process.env.SYNC_TOKEN || "";
 const BASE_VAULT_ID = process.env.KAOS_TEST_VAULT_ID || "kaos-schema-guard";
 const ROOM_ID = `${BASE_VAULT_ID}-schema-guard`;
+const CURRENT_SCHEMA_VERSION = 4;
+const STALE_SCHEMA_VERSION = CURRENT_SCHEMA_VERSION - 1;
 
 if (!TOKEN) {
 	throw new Error("SYNC_TOKEN is required for schema-guard test");
@@ -233,22 +235,22 @@ async function expectAllowed(schemaVersion) {
 async function main() {
 	try {
 		console.log(`Schema guard integration room: ${ROOM_ID}`);
-		await seedRoomSchema(2);
-		console.log("Seeded room with sys.schemaVersion=2");
+		await seedRoomSchema(CURRENT_SCHEMA_VERSION);
+		console.log(`Seeded room with sys.schemaVersion=${CURRENT_SCHEMA_VERSION}`);
 
 		await expectRejected("stale client schema", buildWsUrl({
 			includeSchema: true,
-			schemaVersion: 1,
+			schemaVersion: STALE_SCHEMA_VERSION,
 		}));
-		console.log("Rejected stale schemaVersion=1 client as expected");
+		console.log(`Rejected stale schemaVersion=${STALE_SCHEMA_VERSION} client as expected`);
 
 		await expectRejected("missing schema (legacy default)", buildWsUrl({
 			includeSchema: false,
 		}));
 		console.log("Rejected missing schema client (legacy default v1) as expected");
 
-		await expectAllowed(2);
-		console.log("Accepted compatible schemaVersion=2 client");
+		await expectAllowed(CURRENT_SCHEMA_VERSION);
+		console.log(`Accepted compatible schemaVersion=${CURRENT_SCHEMA_VERSION} client`);
 		process.exit(0);
 	} finally {
 		// Teardown handled by safeDestroy inside sub-calls

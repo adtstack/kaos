@@ -36,7 +36,7 @@ export interface VaultSyncSettings {
 	/**
 	 * How to handle external disk modifications (git pull, other editors).
 	 *   "closed-only" — import only for files not open in an editor (default)
-	 *   "always"      — always import into CRDT, including open editor files
+	 *   "always"      — consider open files too, without overriding visible editor authority
 	 *   "never"       — never import (CRDT is sole source of truth)
 	 */
 	externalEditPolicy: ExternalEditPolicy;
@@ -52,7 +52,7 @@ export interface VaultSyncSettings {
 	attachmentConcurrency: number;
 	/** Show remote cursors and selections in the editor. */
 	showRemoteCursors: boolean;
-	/** Pause local typing when another device is actively typing in the same note. */
+	/** Show an advisory notice when another device recently typed in the same note. */
 	remoteTypingGuardEnabled: boolean;
 	/** Enable QA flight recorder tracing. */
 	qaTraceEnabled: boolean;

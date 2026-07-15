@@ -57,6 +57,7 @@ const ENV_AUTH: AuthState = { mode: "env", claimed: true, envToken: "test-secret
 const CLAIM_AUTH: AuthState = { mode: "claim", claimed: true, tokenHash: "a".repeat(64) };
 const VAULT_ID = "test-vault-abc";
 const OTHER_VAULT_ID = "other-vault-xyz";
+const CURRENT_SCHEMA_VERSION = SERVER_MAX_SCHEMA_VERSION;
 
 /**
  * Trap env: KAOS_SYNC and KAOS_CONFIG throw if any method is called.
@@ -202,7 +203,7 @@ console.log("\n--- WS route: valid ticket passes auth gate (does not produce 401
 	};
 
 	const { ticket } = await createTicket(ENV_AUTH, VAULT_ID);
-	const wsUrl = `https://example.test/vault/sync/${VAULT_ID}?ticket=${encodeURIComponent(ticket)}&schemaVersion=2`;
+	const wsUrl = `https://example.test/vault/sync/${VAULT_ID}?ticket=${encodeURIComponent(ticket)}&schemaVersion=${CURRENT_SCHEMA_VERSION}`;
 	const req = new Request(wsUrl, {
 		headers: { Upgrade: "websocket", Connection: "Upgrade" },
 	});
@@ -230,7 +231,7 @@ console.log("\n--- WS route: expired ticket rejected before DO wake ---");
 	// Send as plain HTTP (no Upgrade header) — avoids WebSocketPair which is
 	// unavailable in Node.js.  The auth gate fires before any WS-specific code.
 	const req = new Request(
-		`https://example.test/vault/sync/${VAULT_ID}?ticket=${encodeURIComponent(ticket)}&schemaVersion=2`,
+		`https://example.test/vault/sync/${VAULT_ID}?ticket=${encodeURIComponent(ticket)}&schemaVersion=${CURRENT_SCHEMA_VERSION}`,
 	);
 
 	let doTouched = false;
@@ -252,7 +253,7 @@ console.log("\n--- WS route: tampered ticket rejected before DO wake ---");
 	const idx = 5;
 	const tampered = `${payload}.${sig!.slice(0, idx)}${sig![idx] === "a" ? "b" : "a"}${sig!.slice(idx + 1)}`;
 	const req = new Request(
-		`https://example.test/vault/sync/${VAULT_ID}?ticket=${encodeURIComponent(tampered)}&schemaVersion=2`,
+		`https://example.test/vault/sync/${VAULT_ID}?ticket=${encodeURIComponent(tampered)}&schemaVersion=${CURRENT_SCHEMA_VERSION}`,
 	);
 
 	let doTouched = false;
@@ -271,7 +272,7 @@ console.log("\n--- WS route: ticket for wrong vaultId rejected before DO wake --
 	const trapEnv = makeTrapEnv();
 	const { ticket } = await createTicket(ENV_AUTH, OTHER_VAULT_ID);
 	const req = new Request(
-		`https://example.test/vault/sync/${VAULT_ID}?ticket=${encodeURIComponent(ticket)}&schemaVersion=2`,
+		`https://example.test/vault/sync/${VAULT_ID}?ticket=${encodeURIComponent(ticket)}&schemaVersion=${CURRENT_SCHEMA_VERSION}`,
 	);
 
 	let doTouched = false;
@@ -295,7 +296,7 @@ console.log("\n--- WS route: legacy ?token= still accepted (migration path) ---"
 		KAOS_CONFIG: {} as unknown as Env["KAOS_CONFIG"],
 	};
 
-	const wsUrl = `https://example.test/vault/sync/${VAULT_ID}?token=${encodeURIComponent(ENV_AUTH.envToken)}&schemaVersion=2`;
+	const wsUrl = `https://example.test/vault/sync/${VAULT_ID}?token=${encodeURIComponent(ENV_AUTH.envToken)}&schemaVersion=${CURRENT_SCHEMA_VERSION}`;
 	const req = new Request(wsUrl, {
 		headers: { Upgrade: "websocket", Connection: "Upgrade" },
 	});
@@ -317,7 +318,7 @@ console.log("\n--- WS route: no ticket and no token → rejected before DO wake 
 {
 	const trapEnv = makeTrapEnv();
 	const req = new Request(
-		`https://example.test/vault/sync/${VAULT_ID}?schemaVersion=2`,
+		`https://example.test/vault/sync/${VAULT_ID}?schemaVersion=${CURRENT_SCHEMA_VERSION}`,
 	);
 
 	let doTouched = false;
@@ -434,7 +435,7 @@ console.log("\n--- WS route: legacy ?token= rejected when KAOS_DISABLE_LEGACY_WS
 {
 	const trapEnv = makeTrapEnv({ KAOS_DISABLE_LEGACY_WS_TOKEN: "true" });
 	const req = new Request(
-		`https://example.test/vault/sync/${VAULT_ID}?token=${encodeURIComponent(ENV_AUTH.envToken)}&schemaVersion=2`,
+		`https://example.test/vault/sync/${VAULT_ID}?token=${encodeURIComponent(ENV_AUTH.envToken)}&schemaVersion=${CURRENT_SCHEMA_VERSION}`,
 	);
 
 	let doTouched = false;
@@ -459,7 +460,7 @@ console.log("\n--- WS route: legacy warning logged on successful legacy auth ---
 		KAOS_CONFIG: {} as unknown as Env["KAOS_CONFIG"],
 	};
 	const req = new Request(
-		`https://example.test/vault/sync/${VAULT_ID}?token=${encodeURIComponent(ENV_AUTH.envToken)}&schemaVersion=2`,
+		`https://example.test/vault/sync/${VAULT_ID}?token=${encodeURIComponent(ENV_AUTH.envToken)}&schemaVersion=${CURRENT_SCHEMA_VERSION}`,
 	);
 
 	const warnMessages: string[] = [];
@@ -520,13 +521,13 @@ console.log("\n--- isTicketEndpointUnsupported: 401/403/500/network → false --
 
 console.log("\n--- patchTicketInUrl: replaces ticket, removes token, preserves other params ---");
 {
-	const original = "wss://example.test/vault/sync/vaultA?_pk=abc123&ticket=OLD_TICKET&schemaVersion=2&device=mydevice";
+	const original = `wss://example.test/vault/sync/vaultA?_pk=abc123&ticket=OLD_TICKET&schemaVersion=${CURRENT_SCHEMA_VERSION}&device=mydevice`;
 	const patched = patchTicketInUrl(original, "NEW_TICKET");
 	const u = new URL(patched);
 
 	assertEqual(u.searchParams.get("ticket"), "NEW_TICKET", "ticket param updated to new value");
 	assert(!u.searchParams.has("token"), "token param absent after patch");
-	assertEqual(u.searchParams.get("schemaVersion"), "2", "schemaVersion preserved");
+	assertEqual(u.searchParams.get("schemaVersion"), String(CURRENT_SCHEMA_VERSION), "schemaVersion preserved");
 	assertEqual(u.searchParams.get("device"), "mydevice", "device param preserved");
 	assertEqual(u.searchParams.get("_pk"), "abc123", "connection id _pk preserved");
 }
@@ -534,18 +535,18 @@ console.log("\n--- patchTicketInUrl: replaces ticket, removes token, preserves o
 console.log("\n--- patchTicketInUrl: removes legacy ?token= when patching to ticket auth ---");
 {
 	// Simulate a URL that was built with the legacy token (old server, then upgraded).
-	const withToken = "wss://example.test/vault/sync/vaultA?_pk=xyz&token=MY_SECRET_TOKEN&schemaVersion=2";
+	const withToken = `wss://example.test/vault/sync/vaultA?_pk=xyz&token=MY_SECRET_TOKEN&schemaVersion=${CURRENT_SCHEMA_VERSION}`;
 	const patched = patchTicketInUrl(withToken, "FRESH_TICKET");
 	const u = new URL(patched);
 
 	assertEqual(u.searchParams.get("ticket"), "FRESH_TICKET", "ticket inserted");
 	assert(!u.searchParams.has("token"), "token stripped when ticket applied");
-	assertEqual(u.searchParams.get("schemaVersion"), "2", "schemaVersion preserved");
+	assertEqual(u.searchParams.get("schemaVersion"), String(CURRENT_SCHEMA_VERSION), "schemaVersion preserved");
 }
 
 console.log("\n--- patchTicketInUrl: handles URL with no prior ticket ---");
 {
-	const bare = "wss://example.test/vault/sync/vaultA?_pk=001&schemaVersion=2";
+	const bare = `wss://example.test/vault/sync/vaultA?_pk=001&schemaVersion=${CURRENT_SCHEMA_VERSION}`;
 	const patched = patchTicketInUrl(bare, "FIRST_TICKET");
 	const u = new URL(patched);
 

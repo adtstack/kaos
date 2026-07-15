@@ -1,5 +1,11 @@
 import { TFile } from "obsidian";
 import { BlobSyncManager } from "../src/sync/blobSync";
+import { AttachmentOrchestrator } from "../src/runtime/attachmentOrchestrator";
+import {
+	createCausalBlobRef,
+	getBlobRefPriorHashes,
+	type BlobRef,
+} from "../src/types";
 
 let passed = 0;
 let failed = 0;
@@ -23,6 +29,20 @@ function text(buffer: ArrayBuffer): string {
 	return new TextDecoder().decode(buffer);
 }
 
+function normalizedHashes(value: unknown): string[] {
+	if (typeof value === "string") return [value];
+	if (!Array.isArray(value)) return [];
+	return [...new Set(value.filter((hash): hash is string => typeof hash === "string"))]
+		.sort();
+}
+
+function hasExactlyHashes(value: unknown, expected: string[]): boolean {
+	const actual = normalizedHashes(value);
+	const normalizedExpected = [...new Set(expected)].sort();
+	return actual.length === normalizedExpected.length
+		&& actual.every((hash, index) => hash === normalizedExpected[index]);
+}
+
 async function sha256Hex(buffer: ArrayBuffer): Promise<string> {
 	const digest = await crypto.subtle.digest("SHA-256", buffer);
 	return Array.from(new Uint8Array(digest), (byte) =>
@@ -30,15 +50,63 @@ async function sha256Hex(buffer: ArrayBuffer): Promise<string> {
 	).join("");
 }
 
+function deferred<T>() {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+		resolve = resolvePromise;
+		reject = rejectPromise;
+	});
+	return { promise, resolve, reject };
+}
+
 interface StoredFile {
 	file: TFile & { path: string; stat: { mtime: number; size: number } };
 	data: ArrayBuffer;
 }
 
-function makeHarness(isBlobPathSyncable: (path: string) => boolean = () => true) {
+function makeHarness(
+	isBlobPathSyncable: (path: string) => boolean = () => true,
+	settledRefs: Record<string, BlobRef> = {},
+) {
 	let clock = 1;
+	let sourceClock = 1;
+	let modifyCalls = 0;
 	const files = new Map<string, StoredFile>();
+	const trashedFiles = new Map<string, StoredFile>();
 	const traces: Array<{ source: string; msg: string; details?: Record<string, unknown> }> = [];
+	const sourceVersionByRef = new WeakMap<object, string>();
+	const settledSourceVersions: Record<string, string> = {};
+	for (const [path, ref] of Object.entries(settledRefs)) {
+		const sourceVersion = `1:${sourceClock++}`;
+		sourceVersionByRef.set(ref, sourceVersion);
+		settledSourceVersions[path] = sourceVersion;
+	}
+	const defaultBlobRefs = new Map<string, BlobRef>(Object.entries(settledRefs));
+
+	const decorateVaultSync = (candidate: any): any => {
+		const vaultSync = candidate ?? {};
+		if (typeof vaultSync.getBlobSourceVersion !== "function") {
+			vaultSync.getBlobSourceVersion = (path: string) => {
+				const ref = typeof vaultSync.getBlobRef === "function"
+					? vaultSync.getBlobRef(path)
+					: vaultSync.pathToBlob?.get?.(path);
+				if (!ref || vaultSync.isBlobTombstoned?.(path)) return undefined;
+				let sourceVersion = sourceVersionByRef.get(ref);
+				if (!sourceVersion) {
+					sourceVersion = `1:${sourceClock++}`;
+					sourceVersionByRef.set(ref, sourceVersion);
+				}
+				return sourceVersion;
+			};
+		}
+		return vaultSync;
+	};
+	const defaultVaultSync = decorateVaultSync({
+		getBlobRef: (path: string) => defaultBlobRefs.get(path),
+		isBlobTombstoned: () => false,
+		pathToBlob: defaultBlobRefs,
+	});
 
 	function put(path: string, data: ArrayBuffer): StoredFile {
 		const existing = files.get(path);
@@ -53,8 +121,21 @@ function makeHarness(isBlobPathSyncable: (path: string) => boolean = () => true)
 		return stored;
 	}
 
+	function replace(path: string, data: ArrayBuffer): StoredFile {
+		const file = new TFile() as TFile & {
+			path: string;
+			stat: { mtime: number; size: number };
+		};
+		file.path = path;
+		file.stat = { mtime: clock++, size: data.byteLength };
+		const stored = { file, data };
+		files.set(path, stored);
+		return stored;
+	}
+
 	const app = {
 		vault: {
+			getFiles: () => Array.from(files.values(), ({ file }) => file),
 			getAbstractFileByPath: (path: string) => files.get(path)?.file ?? null,
 			readBinary: async (file: TFile & { path: string }) => {
 				const stored = files.get(file.path);
@@ -62,6 +143,7 @@ function makeHarness(isBlobPathSyncable: (path: string) => boolean = () => true)
 				return stored.data;
 			},
 			modifyBinary: async (file: TFile & { path: string }, data: ArrayBuffer) => {
+				modifyCalls++;
 				put(file.path, data);
 			},
 			createBinary: async (path: string, data: ArrayBuffer) => {
@@ -70,7 +152,29 @@ function makeHarness(isBlobPathSyncable: (path: string) => boolean = () => true)
 					error.code = "EEXIST";
 					throw error;
 				}
-				put(path, data);
+				return put(path, data).file;
+			},
+			rename: async (file: TFile & { path: string }, newPath: string) => {
+				const oldPath = file.path;
+				const stored = files.get(oldPath);
+				if (!stored || stored.file !== file) throw new Error("missing source");
+				if (files.has(newPath)) {
+					const error = new Error("exists") as Error & { code?: string };
+					error.code = "EEXIST";
+					throw error;
+				}
+				files.delete(oldPath);
+				file.path = newPath;
+				files.set(newPath, stored);
+			},
+			trash: async (file: TFile & { path: string }) => {
+				const oldPath = file.path;
+				const stored = files.get(oldPath);
+				if (!stored || stored.file !== file) throw new Error("missing source");
+				files.delete(oldPath);
+				const trashPath = `.trash/${oldPath}`;
+				file.path = trashPath;
+				trashedFiles.set(trashPath, stored);
 			},
 			createFolder: async () => {},
 			adapter: {
@@ -82,7 +186,7 @@ function makeHarness(isBlobPathSyncable: (path: string) => boolean = () => true)
 
 	const manager = new BlobSyncManager(
 		app,
-		{} as any,
+		defaultVaultSync as any,
 		{
 			host: "https://worker.example",
 			token: "token",
@@ -96,9 +200,32 @@ function makeHarness(isBlobPathSyncable: (path: string) => boolean = () => true)
 		[],
 		undefined,
 		isBlobPathSyncable,
+		settledRefs,
+		undefined,
+		settledSourceVersions,
 	);
+	let activeVaultSync = defaultVaultSync;
+	Object.defineProperty(manager as any, "vaultSync", {
+		configurable: true,
+		get: () => activeVaultSync,
+		set: (next) => { activeVaultSync = decorateVaultSync(next); },
+	});
+	(manager as any).__defaultBlobRefs = defaultBlobRefs;
+	// This fixture represents a manager whose startup authority gate is open.
+	// Dedicated startup-gate regressions intentionally construct a closed one.
+	(manager as any).uploadGateOpen = true;
+	(manager as any).downloadGateOpen = true;
 
-	return { app, manager, files, put, traces };
+	return {
+		app,
+		manager,
+		files,
+		trashedFiles,
+		put,
+		replace,
+		traces,
+		getModifyCalls: () => modifyCalls,
+	};
 }
 
 async function runDownload(
@@ -106,32 +233,76 @@ async function runDownload(
 	path: string,
 	data: ArrayBuffer,
 	onDownload?: () => void,
+	acceptableLocalHashes?: string | string[],
 ): Promise<string> {
 	const hash = await sha256Hex(data);
+	const defaultBlobRefs = (manager as any).__defaultBlobRefs as
+		| Map<string, BlobRef>
+		| undefined;
+	if (defaultBlobRefs && (manager as any).vaultSync.pathToBlob === defaultBlobRefs) {
+		const priorHashes = normalizedHashes(acceptableLocalHashes);
+		defaultBlobRefs.set(path, priorHashes.length > 0
+			? { hash, size: data.byteLength, priorHashes }
+			: { hash, size: data.byteLength });
+	}
 	(manager as any).blobClient = {
 		download: async () => {
 			onDownload?.();
 			return data;
 		},
 	};
-	await (manager as any).processDownload({
+	(manager as any).enqueueDownload(
 		path,
 		hash,
-		sizeBytes: data.byteLength,
-		retries: 0,
-		status: "processing",
-		readyAt: 0,
-	});
+		data.byteLength,
+		0,
+		normalizedHashes(acceptableLocalHashes),
+	);
+	const item = (manager as any).downloadQueue.get(path);
+	item.status = "processing";
+	await (manager as any).processDownload(item);
 	return hash;
+}
+
+function findVisibleLocalBackupPath(
+	files: Map<string, StoredFile>,
+	targetPath?: string,
+): string | undefined {
+	const targetName = targetPath?.split("/").pop()?.replace(/\.[^/.]+$/, "");
+	return Array.from(files.keys()).find((candidate) => {
+		if (!candidate.includes("(KAOS local backup ")) return false;
+		if (targetName && !candidate.split("/").pop()?.startsWith(`${targetName} (`)) {
+			return false;
+		}
+		return / \(KAOS local backup \d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z [0-9a-f]{16}\)(?:\.[^/.]+)?$/.test(candidate);
+	});
+}
+
+function installRemoteDeleteAuthority(
+	manager: BlobSyncManager,
+	path: string,
+	deletedRef: BlobRef | undefined,
+	fingerprint = `delete:${path}:${deletedRef?.hash ?? "legacy"}`,
+): void {
+	(manager as any).vaultSync = {
+		getAuthoritativeBlobDeleteSnapshot: (candidate: string) =>
+			candidate === path ? { fingerprint, deletedRef } : null,
+		getBlobRef: () => undefined,
+		isBlobTombstoned: (candidate: string) => candidate === path,
+		pathToBlob: new Map(),
+		blobTombstones: new Map([[path, true]]),
+	};
 }
 
 console.log("\n--- Test 1: existing attachment changed during download is quarantined ---");
 {
-	const { manager, files, put, traces } = makeHarness();
-	put("img.png", bytes("local-old"));
+	const { manager, files, put, traces, getModifyCalls } = makeHarness();
+	const localOld = bytes("local-old");
+	const localOldHash = await sha256Hex(localOld);
+	put("img.png", localOld);
 	await runDownload(manager, "img.png", bytes("remote"), () => {
 		put("img.png", bytes("local-new"));
-	});
+	}, localOldHash);
 
 	const conflict = Array.from(files.keys()).find((path) =>
 		path.startsWith("img (KAOS remote conflict") && path.endsWith(".png")
@@ -139,6 +310,8 @@ console.log("\n--- Test 1: existing attachment changed during download is quaran
 	assert(text(files.get("img.png")!.data) === "local-new", "local changed attachment is preserved");
 	assert(!!conflict, "remote bytes are written to a conflict artifact");
 	assert(conflict ? text(files.get(conflict)!.data) === "remote" : false, "conflict artifact contains remote bytes");
+	assert(getModifyCalls() === 0, "hash-to-commit local edit race never reaches modifyBinary");
+	assert(manager.isPreservedUnresolved("img.png"), "hash-to-commit race records durable Attention");
 	assert(
 		traces.some((event) =>
 			event.msg === "download-conflict-quarantined" &&
@@ -148,22 +321,849 @@ console.log("\n--- Test 1: existing attachment changed during download is quaran
 	);
 }
 
-console.log("\n--- Test 2: unchanged existing attachment can be overwritten ---");
+console.log("\n--- Test 1b: same-bytes TFile ABA during hash is quarantined ---");
 {
-	const { manager, files, put, traces } = makeHarness();
+	const { app, manager, files, put, replace, getModifyCalls } = makeHarness();
+	const local = bytes("same local bytes");
+	const localHash = await sha256Hex(local);
+	put("img.png", local);
+	const originalReadBinary = app.vault.readBinary;
+	let replaced = false;
+	app.vault.readBinary = async (file: TFile & { path: string }) => {
+		const data = await originalReadBinary(file);
+		if (file.path === "img.png" && !replaced) {
+			replaced = true;
+			replace("img.png", local);
+		}
+		return data;
+	};
+
+	await runDownload(
+		manager,
+		"img.png",
+		bytes("remote candidate"),
+		undefined,
+		localHash,
+	);
+
+	const conflict = Array.from(files.keys()).find((path) => path.includes("KAOS remote conflict"));
+	assert(replaced, "test replaces the target TFile while its original bytes are hashed");
+	assert(text(files.get("img.png")!.data) === "same local bytes", "same-bytes replacement remains untouched");
+	assert(!!conflict, "remote candidate is preserved after same-bytes identity ABA");
+	assert(getModifyCalls() === 0, "same-bytes TFile ABA never reaches modifyBinary");
+	assert(manager.isPreservedUnresolved("img.png"), "same-bytes TFile ABA records durable Attention");
+}
+
+console.log("\n--- Test 2: stable differing attachment is preserved, never overwritten ---");
+{
+	const { manager, files, put, traces, getModifyCalls } = makeHarness();
 	put("img.png", bytes("local-old"));
 	await runDownload(manager, "img.png", bytes("remote"));
 
 	const conflict = Array.from(files.keys()).find((path) => path.includes("KAOS remote conflict"));
-	assert(text(files.get("img.png")!.data) === "remote", "unchanged attachment is overwritten by remote bytes");
-	assert(!conflict, "no conflict artifact is created for unchanged overwrite");
+	assert(text(files.get("img.png")!.data) === "local-old", "stable local attachment is never overwritten by remote bytes");
+	assert(!!conflict, "differing remote bytes are preserved in a conflict artifact");
+	assert(conflict ? text(files.get(conflict)!.data) === "remote" : false, "artifact contains the remote candidate");
+	assert(getModifyCalls() === 0, "existing-file download never calls modifyBinary");
+	assert(manager.isPreservedUnresolved("img.png"), "existing mismatch records durable Attention");
 	assert(
 		traces.some((event) =>
-			event.msg === "download-overwrite-decision" &&
-			event.details?.action === "overwrite-existing"
+			event.msg === "download-conflict-quarantined" &&
+			event.details?.action === "preserve-local-and-remote-artifact"
 		),
-		"normal overwrite decision is traced",
+		"non-overwrite decision is traced",
 	);
+}
+
+console.log("\n--- Test 2b: exact existing remote hash settles without a write ---");
+{
+	const { manager, files, put, getModifyCalls } = makeHarness();
+	const remote = bytes("already remote");
+	let downloads = 0;
+	put("img.png", remote);
+	await runDownload(manager, "img.png", remote, () => { downloads++; });
+
+	assert(downloads === 0, "exact existing bytes settle before a redundant network download");
+	assert(getModifyCalls() === 0, "exact existing bytes require no modifyBinary call");
+	assert(
+		!Array.from(files.keys()).some((path) => path.includes("KAOS remote conflict")),
+		"exact equality creates no conflict artifact",
+	);
+	assert(!manager.isPreservedUnresolved("img.png"), "exact equality creates no Attention marker");
+}
+
+console.log("\n--- Test 2c: repeated remote candidate dedupes the conflict artifact ---");
+{
+	const { manager, files, put } = makeHarness();
+	put("img.png", bytes("local stays"));
+	const remote = bytes("same remote candidate");
+	await runDownload(manager, "img.png", remote);
+	await runDownload(manager, "img.png", remote);
+
+	const conflicts = Array.from(files.keys()).filter((path) => path.includes("KAOS remote conflict"));
+	assert(conflicts.length === 1, "identical repeated remote bytes reuse one conflict artifact");
+	assert(text(files.get("img.png")!.data) === "local stays", "artifact dedupe never changes the local target");
+	assert(manager.isPreservedUnresolved("img.png"), "artifact dedupe retains one Attention condition");
+}
+
+console.log("\n--- Test 2d: exact prior-ref provenance admits a clean H1 -> H2 update ---");
+{
+	const path = "proven-clean.png";
+	const h1 = bytes("clean H1");
+	const h2 = bytes("remote H2");
+	const h1Hash = await sha256Hex(h1);
+	const h2Hash = await sha256Hex(h2);
+	const h1Ref: BlobRef = { hash: h1Hash, size: h1.byteLength };
+	const h2Ref = createCausalBlobRef(h2Hash, h2.byteLength, h1Ref);
+	const { manager, files, put, getModifyCalls } = makeHarness(
+		undefined,
+		{ [path]: h1Ref },
+	);
+	put(path, h1);
+	(manager as any).vaultSync = {
+		getBlobRef: () => h2Ref,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, h2Ref]]),
+	};
+
+	await runDownload(manager, path, h2, undefined, getBlobRefPriorHashes(h2Ref));
+
+	assert(text(files.get(path)!.data) === "remote H2", "the exact proven H1 replica advances to H2");
+	assert(getModifyCalls() === 0, "a clean provenance-backed update never clobbers with modifyBinary");
+	assert(
+		!Array.from(files.keys()).some((candidate) => candidate.includes("KAOS remote conflict")),
+		"a clean provenance-backed update creates no conflict artifact",
+	);
+	assert(!manager.isPreservedUnresolved(path), "a clean provenance-backed update creates no Attention marker");
+}
+
+console.log("\n--- Test 2e: prior-ref provenance never admits a different local hash ---");
+{
+	const path = "provenance-mismatch.png";
+	const h1 = bytes("expected H1");
+	const h1Hash = await sha256Hex(h1);
+	const local = bytes("independent local edit");
+	const h2 = bytes("remote H2");
+	const h2Hash = await sha256Hex(h2);
+	const h1Ref: BlobRef = { hash: h1Hash, size: h1.byteLength };
+	const h2Ref = createCausalBlobRef(h2Hash, h2.byteLength, h1Ref);
+	const { manager, files, put, getModifyCalls } = makeHarness(
+		undefined,
+		{ [path]: h1Ref },
+	);
+	put(path, local);
+	(manager as any).vaultSync = {
+		getBlobRef: () => h2Ref,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, h2Ref]]),
+	};
+
+	await runDownload(manager, path, h2, undefined, getBlobRefPriorHashes(h2Ref));
+
+	const conflict = Array.from(files.values()).find((stored) => text(stored.data) === "remote H2");
+	assert(text(files.get(path)!.data) === "independent local edit", "a non-H1 local attachment remains untouched");
+	assert(!!conflict && conflict.file.path !== path, "the rejected H2 candidate is preserved as an artifact");
+	assert(getModifyCalls() === 0, "provenance mismatch never reaches modifyBinary");
+	assert(manager.isPreservedUnresolved(path), "provenance mismatch records durable Attention");
+}
+
+console.log("\n--- Test 2f: H1 -> H2 -> H3 supersede accepts either contiguous disk state ---");
+{
+	const h1 = bytes("chain H1");
+	const h2 = bytes("chain H2");
+	const h3 = bytes("chain H3");
+	const h1Hash = await sha256Hex(h1);
+	const h2Hash = await sha256Hex(h2);
+	const h3Hash = await sha256Hex(h3);
+	const h1Ref: BlobRef = { hash: h1Hash, size: h1.byteLength };
+	const h2Ref = createCausalBlobRef(h2Hash, h2.byteLength, h1Ref);
+	const h3Ref = createCausalBlobRef(h3Hash, h3.byteLength, h2Ref);
+
+	for (const diskState of [
+		{ label: "H1 not yet advanced", data: h1, settledRef: h1Ref },
+		{ label: "H2 already advanced", data: h2, settledRef: h2Ref },
+	]) {
+		const path = `contiguous-${diskState.label.startsWith("H1") ? "h1" : "h2"}.png`;
+		const { manager, files, put, getModifyCalls } = makeHarness(
+			undefined,
+			{ [path]: diskState.settledRef },
+		);
+		put(path, diskState.data);
+		let currentRef: BlobRef = h2Ref;
+		(manager as any).vaultSync = {
+			getBlobRef: () => currentRef,
+			isBlobTombstoned: () => false,
+			pathToBlob: new Map([[path, h3Ref]]),
+		};
+		(manager as any).kickDownloadDrain = () => {};
+		(manager as any).enqueueDownload(
+			path,
+			h2Hash,
+			h2.byteLength,
+			0,
+			getBlobRefPriorHashes(h2Ref),
+		);
+		const item: any = (manager as any).downloadQueue.get(path);
+		item.status = "processing";
+
+		// The H3 ref is self-contained: it carries both H2 and H1 even when the H2
+		// transfer is superseded before this device settles it to disk.
+		currentRef = h3Ref;
+		(manager as any).enqueueDownload(
+			path,
+			h3Hash,
+			h3.byteLength,
+			0,
+			getBlobRefPriorHashes(h3Ref),
+		);
+		assert(item.nextHash === h3Hash, `${diskState.label}: H3 becomes the immutable rerun target`);
+		assert(
+			hasExactlyHashes(item.nextAcceptableLocalHashes, [h1Hash, h2Hash]),
+			`${diskState.label}: supersede carries both contiguous H1 and H2 provenance`,
+		);
+
+		(manager as any).prepareDownloadRerun(item);
+		assert(
+			hasExactlyHashes(item.acceptableLocalHashes, [h1Hash, h2Hash]),
+			`${diskState.label}: rerun promotes the complete provenance set`,
+		);
+		(manager as any).blobClient = { download: async () => h3 };
+		item.status = "processing";
+		await (manager as any).processDownload(item);
+
+		assert(text(files.get(path)!.data) === "chain H3", `${diskState.label}: clean contiguous state advances to H3`);
+		assert(getModifyCalls() === 0, `${diskState.label}: H3 never clobbers with modifyBinary`);
+		assert(
+			!Array.from(files.keys()).some((candidate) => candidate.includes("KAOS remote conflict")),
+			`${diskState.label}: contiguous provenance creates no conflict artifact`,
+		);
+	}
+}
+
+console.log("\n--- Test 2g: discontinuous supersede provenance fails closed ---");
+{
+	const path = "broken-lineage.png";
+	const h1 = bytes("lineage H1");
+	const h2 = bytes("lineage H2");
+	const h3 = bytes("lineage H3");
+	const h1Hash = await sha256Hex(h1);
+	const h2Hash = await sha256Hex(h2);
+	const h3Hash = await sha256Hex(h3);
+	const unrelatedHash = await sha256Hex(bytes("unrelated predecessor"));
+	const h1Ref: BlobRef = { hash: h1Hash, size: h1.byteLength };
+	const h2Ref = createCausalBlobRef(h2Hash, h2.byteLength, h1Ref);
+	const brokenH3Ref: BlobRef = {
+		hash: h3Hash,
+		size: h3.byteLength,
+		priorHashes: [unrelatedHash],
+	};
+	const { manager, files, put, getModifyCalls } = makeHarness(
+		undefined,
+		{ [path]: h1Ref },
+	);
+	put(path, h1);
+	let currentRef: BlobRef = h2Ref;
+	(manager as any).vaultSync = {
+		getBlobRef: () => currentRef,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, brokenH3Ref]]),
+	};
+	(manager as any).kickDownloadDrain = () => {};
+	(manager as any).enqueueDownload(
+		path,
+		h2Hash,
+		h2.byteLength,
+		0,
+		getBlobRefPriorHashes(h2Ref),
+	);
+	const item: any = (manager as any).downloadQueue.get(path);
+	item.status = "processing";
+
+	currentRef = brokenH3Ref;
+	(manager as any).enqueueDownload(
+		path,
+		h3Hash,
+		h3.byteLength,
+		0,
+		getBlobRefPriorHashes(brokenH3Ref),
+	);
+	assert(
+		!normalizedHashes(item.nextAcceptableLocalHashes).includes(h1Hash)
+			&& !normalizedHashes(item.nextAcceptableLocalHashes).includes(h2Hash),
+		"a non-H2 predecessor does not carry the trusted H1 -> H2 chain into H3",
+	);
+	(manager as any).prepareDownloadRerun(item);
+	assert(
+		!normalizedHashes(item.acceptableLocalHashes).includes(h1Hash)
+			&& !normalizedHashes(item.acceptableLocalHashes).includes(h2Hash),
+		"the discontinuous rerun promotes no stale trusted predecessor",
+	);
+	(manager as any).blobClient = { download: async () => h3 };
+	item.status = "processing";
+	await (manager as any).processDownload(item);
+
+	assert(text(files.get(path)!.data) === "lineage H1", "discontinuous lineage preserves the local file");
+	assert(getModifyCalls() === 0, "discontinuous lineage never reaches modifyBinary");
+	assert(manager.isPreservedUnresolved(path), "discontinuous lineage records durable Attention");
+	assert(
+		Array.from(files.values()).some((stored) => stored.file.path !== path && text(stored.data) === "lineage H3"),
+		"discontinuous lineage preserves H3 in a conflict artifact",
+	);
+}
+
+console.log("\n--- Test 2h: queue export/import preserves effective provenance ---");
+{
+	const path = "persisted-lineage.png";
+	const h1 = bytes("persist H1");
+	const h2 = bytes("persist H2");
+	const h3 = bytes("persist H3");
+	const h1Hash = await sha256Hex(h1);
+	const h2Hash = await sha256Hex(h2);
+	const h3Hash = await sha256Hex(h3);
+	const h1Ref: BlobRef = { hash: h1Hash, size: h1.byteLength };
+	const h2Ref = createCausalBlobRef(h2Hash, h2.byteLength, h1Ref);
+	const h3Ref = createCausalBlobRef(h3Hash, h3.byteLength, h2Ref);
+	let currentRef: BlobRef = h2Ref;
+	const { manager } = makeHarness(undefined, { [path]: h1Ref });
+	(manager as any).vaultSync = {
+		getBlobRef: () => currentRef,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, h3Ref]]),
+	};
+	(manager as any).kickDownloadDrain = () => {};
+	(manager as any).enqueueDownload(
+		path,
+		h2Hash,
+		h2.byteLength,
+		0,
+		getBlobRefPriorHashes(h2Ref),
+	);
+	const queued: any = (manager as any).downloadQueue.get(path);
+	queued.status = "processing";
+	currentRef = h3Ref;
+	(manager as any).enqueueDownload(
+		path,
+		h3Hash,
+		h3.byteLength,
+		0,
+		getBlobRefPriorHashes(h3Ref),
+	);
+
+	const exported: any = (manager as any).exportQueue();
+	const persisted = exported.downloads.find((entry: any) => entry.path === path);
+	assert(persisted?.hash === h3Hash, "queue export persists the latest H3 target");
+	assert(
+		hasExactlyHashes(persisted?.acceptableLocalHashes, [h1Hash, h2Hash]),
+		"queue export persists both effective contiguous predecessor hashes",
+	);
+
+	const { manager: restoredManager } = makeHarness(undefined, { [path]: h1Ref });
+	(restoredManager as any).vaultSync = {
+		getBlobRef: () => h3Ref,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, h3Ref]]),
+	};
+	restoredManager.closeDownloadGate("inspect-imported-queue");
+	(restoredManager as any).importQueue(exported);
+	const restored: any = (restoredManager as any).downloadQueue.get(path);
+	assert(restored?.hash === h3Hash && restored?.status === "pending", "queue import restores H3 as pending");
+	assert(
+		hasExactlyHashes(restored?.acceptableLocalHashes, [h1Hash, h2Hash]),
+		"queue import restores the exact effective provenance set",
+	);
+
+	const unrelatedHash = await sha256Hex(bytes("persisted unrelated"));
+	const intersectionPath = "persisted-intersection.png";
+	const { manager: intersectionManager } = makeHarness();
+	(intersectionManager as any).vaultSync = {
+		getBlobRef: () => h3Ref,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[intersectionPath, h3Ref]]),
+	};
+	intersectionManager.closeDownloadGate("inspect-imported-intersection");
+	(intersectionManager as any).importQueue({
+		uploads: [],
+		downloads: [{
+			path: intersectionPath,
+			hash: h3Hash,
+			sizeBytes: h3.byteLength,
+			acceptableLocalHashes: [h1Hash, unrelatedHash],
+		}],
+	});
+	const intersected: any = (intersectionManager as any).downloadQueue.get(intersectionPath);
+	assert(
+		hasExactlyHashes(intersected?.acceptableLocalHashes, [h1Hash]),
+		"queue import intersects persisted authority with the current ref lineage",
+	);
+}
+
+console.log("\n--- Test 2i: causal refs retain sequential history without merging offline forks ---");
+{
+	const h1Hash = await sha256Hex(bytes("causal H1"));
+	const h2Hash = await sha256Hex(bytes("causal H2"));
+	const h3Hash = await sha256Hex(bytes("causal H3"));
+	const haHash = await sha256Hex(bytes("offline fork A"));
+	const hbHash = await sha256Hex(bytes("offline fork B"));
+	const h1Ref: BlobRef = { hash: h1Hash, size: 1 };
+	const h2Ref = createCausalBlobRef(h2Hash, 2, h1Ref);
+	const h3Ref = createCausalBlobRef(h3Hash, 3, h2Ref);
+	const haRef = createCausalBlobRef(haHash, 4, h1Ref);
+	const hbRef = createCausalBlobRef(hbHash, 5, h1Ref);
+
+	assert(hasExactlyHashes(getBlobRefPriorHashes(h2Ref), [h1Hash]), "H2 carries H1 as its causal predecessor");
+	assert(
+		hasExactlyHashes(getBlobRefPriorHashes(h3Ref), [h2Hash, h1Hash]),
+		"H3 carries the complete bounded H2 -> H1 sequence",
+	);
+	assert(
+		getBlobRefPriorHashes(haRef).includes(h1Hash)
+			&& !getBlobRefPriorHashes(haRef).includes(hbHash),
+		"offline fork A contains its base but never invents fork B",
+	);
+	assert(
+		getBlobRefPriorHashes(hbRef).includes(h1Hash)
+			&& !getBlobRefPriorHashes(hbRef).includes(haHash),
+		"offline fork B contains its base but never invents fork A",
+	);
+}
+
+console.log("\n--- Test 2j: same target hash with changed lineage rejects the stale download commit ---");
+{
+	const path = "same-hash-new-lineage.png";
+	const h1 = bytes("same-hash H1");
+	const h2 = bytes("same-hash H2");
+	const h1Hash = await sha256Hex(h1);
+	const h2Hash = await sha256Hex(h2);
+	const forkHash = await sha256Hex(bytes("new causal fork"));
+	const h1Ref: BlobRef = { hash: h1Hash, size: h1.byteLength };
+	const originalTarget = createCausalBlobRef(h2Hash, h2.byteLength, h1Ref);
+	const replacementTarget: BlobRef = {
+		hash: h2Hash,
+		size: h2.byteLength,
+		priorHashes: [forkHash],
+	};
+	const { manager, files, put, getModifyCalls } = makeHarness(
+		undefined,
+		{ [path]: h1Ref },
+	);
+	put(path, h1);
+	let currentRef = originalTarget;
+	(manager as any).vaultSync = {
+		getBlobRef: () => currentRef,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, replacementTarget]]),
+	};
+
+	await runDownload(
+		manager,
+		path,
+		h2,
+		() => { currentRef = replacementTarget; },
+		getBlobRefPriorHashes(originalTarget),
+	);
+
+	assert(text(files.get(path)!.data) === "same-hash H1", "changed same-hash lineage leaves the local target untouched");
+	assert(getModifyCalls() === 0, "changed same-hash lineage rejects the stale target write");
+	assert(
+		!Array.from(files.keys()).some((candidate) => candidate.includes("KAOS remote conflict")),
+		"a superseded same-hash attempt retires without publishing a stale artifact",
+	);
+}
+
+console.log("\n--- Test 2k: malformed or oversized causal lineage fails closed ---");
+{
+	const h1 = bytes("bounded H1");
+	const h2 = bytes("bounded H2");
+	const h1Hash = await sha256Hex(h1);
+	const h2Hash = await sha256Hex(h2);
+	const oversized = [h1Hash];
+	for (let index = 0; index < 16; index++) {
+		oversized.push(await sha256Hex(bytes(`excess lineage ${index}`)));
+	}
+
+	for (const variant of [
+		{ label: "malformed", priorHashes: ["not-a-sha256-hash"] },
+		{ label: "17-entry", priorHashes: oversized },
+	]) {
+		const path = `fail-closed-${variant.label}.png`;
+		const targetRef: BlobRef = {
+			hash: h2Hash,
+			size: h2.byteLength,
+			priorHashes: variant.priorHashes,
+		};
+		const h1Ref: BlobRef = { hash: h1Hash, size: h1.byteLength };
+		const { manager, files, put, getModifyCalls } = makeHarness(
+			undefined,
+			{ [path]: h1Ref },
+		);
+		put(path, h1);
+		(manager as any).vaultSync = {
+			getBlobRef: () => targetRef,
+			isBlobTombstoned: () => false,
+			pathToBlob: new Map([[path, targetRef]]),
+		};
+
+		await runDownload(manager, path, h2, undefined, variant.priorHashes);
+
+		assert(text(files.get(path)!.data) === "bounded H1", `${variant.label}: invalid lineage preserves the local target`);
+		assert(getModifyCalls() === 0, `${variant.label}: invalid lineage grants no overwrite authority`);
+		assert(manager.isPreservedUnresolved(path), `${variant.label}: invalid lineage records durable Attention`);
+	}
+}
+
+console.log("\n--- Test 2l: upload rejects a current ref that diverged from the settled base ---");
+{
+	const path = "upload-diverged-base.png";
+	const base = bytes("upload base H1");
+	const remote = bytes("remote fork HA");
+	const local = bytes("local fork HB");
+	const baseHash = await sha256Hex(base);
+	const remoteHash = await sha256Hex(remote);
+	const baseRef: BlobRef = { hash: baseHash, size: base.byteLength };
+	const remoteRef = createCausalBlobRef(remoteHash, remote.byteLength, baseRef);
+	const { manager, files, put } = makeHarness(undefined, { [path]: baseRef });
+	put(path, local);
+	let setBlobRefCalls = 0;
+	(manager as any).vaultSync = {
+		getBlobRef: () => remoteRef,
+		setBlobRef: () => { setBlobRefCalls++; },
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, remoteRef]]),
+	};
+	(manager as any).kickUploadDrain = () => {};
+	(manager as any).kickDownloadDrain = () => {};
+	(manager as any).enqueueUpload(path, 0, local.byteLength);
+	const uploadItem: any = (manager as any).uploadQueue.get(path);
+	uploadItem.status = "processing";
+	await (manager as any).processUpload(uploadItem);
+
+	assert(setBlobRefCalls === 0, "a local fork never publishes over a ref that diverged from its settled base");
+	const downloadItem: any = (manager as any).downloadQueue.get(path);
+	assert(downloadItem?.hash === remoteHash, "stale upload authority schedules the authoritative remote ref");
+	(manager as any).blobClient = { download: async () => remote };
+	downloadItem.status = "processing";
+	await (manager as any).processDownload(downloadItem);
+	assert(text(files.get(path)!.data) === "local fork HB", "remote recovery preserves the divergent local attachment");
+	assert(manager.isPreservedUnresolved(path), "remote recovery quarantines the offline fork conflict");
+}
+
+console.log("\n--- Test 2m: upload succeeds only against its exact settled base ref ---");
+{
+	const path = "upload-settled-base.png";
+	const h1 = bytes("guarded upload H1");
+	const h2 = bytes("guarded upload H2");
+	const h1Hash = await sha256Hex(h1);
+	const h2Hash = await sha256Hex(h2);
+	const h1Ref: BlobRef = { hash: h1Hash, size: h1.byteLength };
+	const settledRefs: Record<string, BlobRef> = { [path]: h1Ref };
+	const { manager, put } = makeHarness(undefined, settledRefs);
+	put(path, h2);
+	let currentRef: BlobRef = h1Ref;
+	let setBlobRefCalls = 0;
+	(manager as any).vaultSync = {
+		getBlobRef: () => currentRef,
+		setBlobRef: (
+			_path: string,
+			hash: string,
+			size: number,
+			_mime: string,
+			_device: unknown,
+			guard: { expectedCurrentRef?: BlobRef; causalBaseRef?: BlobRef },
+		) => {
+			if (JSON.stringify(guard.expectedCurrentRef) !== JSON.stringify(currentRef)) return null;
+			setBlobRefCalls++;
+			currentRef = createCausalBlobRef(hash, size, guard.causalBaseRef);
+			return currentRef;
+		},
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, h1Ref]]),
+	};
+	(manager as any).blobClient = {
+		exists: async (hashes: string[]) => hashes,
+		upload: async () => { throw new Error("deduplicated guarded upload should not PUT"); },
+	};
+	(manager as any).kickUploadDrain = () => {};
+	(manager as any).enqueueUpload(path, 0, h2.byteLength);
+	const item: any = (manager as any).uploadQueue.get(path);
+	item.status = "processing";
+	await (manager as any).processUpload(item);
+
+	assert(setBlobRefCalls === 1, "the exact current==settled base admits one guarded setBlobRef");
+	assert(currentRef.hash === h2Hash, "guarded upload publishes the local H2 hash");
+	assert(
+		hasExactlyHashes(getBlobRefPriorHashes(currentRef), [h1Hash]),
+		"guarded upload mints H2 with only its settled H1 causal base",
+	);
+	assert(
+		settledRefs[path]?.hash === h2Hash,
+		"successful guarded upload advances the durable settled ref",
+	);
+}
+
+console.log("\n--- Test 2n: an intentional H2 -> H1 disk revert is not mistaken for a lagging replica ---");
+{
+	const path = "intentional-local-revert.png";
+	const h1 = bytes("historical H1 restored intentionally by the user");
+	const h2 = bytes("last KAOS-settled H2");
+	const h3 = bytes("authoritative remote H3");
+	const h1Hash = await sha256Hex(h1);
+	const h2Hash = await sha256Hex(h2);
+	const h3Hash = await sha256Hex(h3);
+	const h1Ref: BlobRef = { hash: h1Hash, size: h1.byteLength };
+	const h2Ref = createCausalBlobRef(h2Hash, h2.byteLength, h1Ref);
+	const h3Ref = createCausalBlobRef(h3Hash, h3.byteLength, h2Ref);
+	const settledRefs: Record<string, BlobRef> = { [path]: h2Ref };
+	const { manager, files, put, getModifyCalls } = makeHarness(
+		undefined,
+		settledRefs,
+	);
+	// Disk intentionally moved backward after KAOS last settled H2. H1 remains
+	// in H3's history, but history membership alone is not overwrite authority.
+	put(path, h1);
+	(manager as any).vaultSync = {
+		getBlobRef: () => h3Ref,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, h3Ref]]),
+	};
+
+	assert(
+		hasExactlyHashes(getBlobRefPriorHashes(h3Ref), [h2Hash, h1Hash]),
+		"test authority carries both H2 and historical H1 in the H3 lineage",
+	);
+	await runDownload(
+		manager,
+		path,
+		h3,
+		undefined,
+		getBlobRefPriorHashes(h3Ref),
+	);
+
+	const remoteArtifact = Array.from(files.values()).find(
+		(stored) => stored.file.path !== path && text(stored.data) === text(h3),
+	);
+	assert(
+		text(files.get(path)!.data) === text(h1),
+		"the intentional local H1 revert remains canonical",
+	);
+	assert(
+		!findVisibleLocalBackupPath(files, path),
+		"historical H1 is never moved aside as a clean lagging replica",
+	);
+	assert(!!remoteArtifact, "authoritative H3 is preserved in a remote conflict artifact");
+	assert(getModifyCalls() === 0, "the reverted disk epoch is never overwritten with modifyBinary");
+	assert(manager.isPreservedUnresolved(path), "the H1/H3 conflict records durable Attention");
+	assert(
+		settledRefs[path]?.hash === h2Hash,
+		"conflict handling does not rewrite the durable H2 settlement proof",
+	);
+}
+
+console.log("\n--- Test 2o: a missing settled replica is never recreated by a fresh download ---");
+for (const remoteState of ["same", "advanced"] as const) {
+	const path = `offline-${remoteState}-delete.png`;
+	const h1 = bytes(`settled H1 for ${remoteState}`);
+	const h2 = bytes(`remote H2 for ${remoteState}`);
+	const h1Hash = await sha256Hex(h1);
+	const h2Hash = await sha256Hex(h2);
+	const h1Ref: BlobRef = { hash: h1Hash, size: h1.byteLength };
+	const remoteRef = remoteState === "same"
+		? h1Ref
+		: createCausalBlobRef(h2Hash, h2.byteLength, h1Ref);
+	const remoteBytes = remoteState === "same" ? h1 : h2;
+	const settledRefs: Record<string, BlobRef> = { [path]: h1Ref };
+	const { manager, files, traces } = makeHarness(undefined, settledRefs);
+	let networkDownloads = 0;
+	(manager as any).vaultSync = {
+		getBlobRef: () => remoteRef,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, remoteRef]]),
+	};
+	(manager as any).blobClient = {
+		download: async () => {
+			networkDownloads++;
+			return remoteBytes;
+		},
+	};
+	(manager as any).enqueueDownload(
+		path,
+		remoteRef.hash,
+		remoteRef.size,
+		0,
+		getBlobRefPriorHashes(remoteRef),
+	);
+	const item: any = (manager as any).downloadQueue.get(path);
+	item.status = "processing";
+	await (manager as any).processDownload(item);
+
+	assert(networkDownloads === 0, `${remoteState}: missing settled path performs no network download`);
+	assert(!files.has(path), `${remoteState}: missing settled path is not recreated`);
+	assert(!(manager as any).downloadQueue.has(path), `${remoteState}: blocked download item is discarded`);
+	assert(settledRefs[path]?.hash === h1Hash, `${remoteState}: causal settlement remains intact for intent replay`);
+	assert(
+		traces.some((event) =>
+			event.msg === "download-deferred-missing-settled-replica"
+			&& event.details?.path === path
+		),
+		`${remoteState}: missing-settled final admission fence is traced`,
+	);
+	await manager.destroy();
+}
+
+console.log("\n--- Test 2p: imported and prefetched queues cannot bypass the missing-settled fence ---");
+for (const source of ["imported", "prefetch"] as const) {
+	const path = `${source}-offline-delete.png`;
+	const remote = bytes(`${source} remote bytes`);
+	const remoteHash = await sha256Hex(remote);
+	const remoteRef: BlobRef = { hash: remoteHash, size: remote.byteLength };
+	const settledRefs: Record<string, BlobRef> = { [path]: remoteRef };
+	const { manager, files } = makeHarness(undefined, settledRefs);
+	let networkDownloads = 0;
+	(manager as any).vaultSync = {
+		getBlobRef: () => remoteRef,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, remoteRef]]),
+	};
+	(manager as any).blobClient = {
+		download: async () => {
+			networkDownloads++;
+			return remote;
+		},
+	};
+
+	if (source === "imported") {
+		manager.closeDownloadGate("inspect-imported-offline-delete");
+		manager.importQueue({
+			uploads: [],
+			downloads: [{ path, hash: remoteHash, sizeBytes: remote.byteLength }],
+		});
+		(manager as any).downloadGateOpen = true;
+	} else {
+		// Prevent the public prefetch API from starting its drain before the test
+		// can inspect and execute the exact queued item deterministically.
+		(manager as any).downloadDraining = true;
+		assert(manager.prioritizeDownloads([path]) === 1, "prefetch queues the remote candidate");
+		(manager as any).downloadDraining = false;
+	}
+
+	const item: any = (manager as any).downloadQueue.get(path);
+	assert(!!item, `${source}: candidate reaches the shared download queue`);
+	item.status = "processing";
+	await (manager as any).processDownload(item);
+	assert(networkDownloads === 0, `${source}: shared final fence runs before network I/O`);
+	assert(!files.has(path), `${source}: shared final fence prevents canonical recreation`);
+	assert(settledRefs[path]?.hash === remoteHash, `${source}: settled proof is retained`);
+	await manager.destroy();
+}
+
+console.log("\n--- Test 2q: a non-file occupant with a settled ref also blocks download creation ---");
+{
+	const path = "offline-delete-path-collision.png";
+	const remote = bytes("remote path collision bytes");
+	const remoteHash = await sha256Hex(remote);
+	const remoteRef: BlobRef = { hash: remoteHash, size: remote.byteLength };
+	const settledRefs: Record<string, BlobRef> = { [path]: remoteRef };
+	const { app, manager, files, traces } = makeHarness(undefined, settledRefs);
+	const originalGetAbstractFileByPath = app.vault.getAbstractFileByPath;
+	app.vault.getAbstractFileByPath = (candidate: string) =>
+		candidate === path ? { path: candidate } : originalGetAbstractFileByPath(candidate);
+	let networkDownloads = 0;
+	(manager as any).vaultSync = {
+		getBlobRef: () => remoteRef,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, remoteRef]]),
+	};
+	(manager as any).blobClient = {
+		download: async () => {
+			networkDownloads++;
+			return remote;
+		},
+	};
+	(manager as any).enqueueDownload(path, remoteHash, remote.byteLength, 0, []);
+	const item: any = (manager as any).downloadQueue.get(path);
+	item.status = "processing";
+	await (manager as any).processDownload(item);
+
+	assert(networkDownloads === 0, "non-file settled occupant blocks network I/O");
+	assert(!files.has(path), "non-file settled occupant is never replaced by a file");
+	assert(
+		traces.some((event) =>
+			event.msg === "download-deferred-missing-settled-replica"
+			&& event.details?.occupantKind === "non-file"
+		),
+		"non-file settled occupant is traced distinctly",
+	);
+	await manager.destroy();
+}
+
+console.log("\n--- Test 2r: a new device without a settlement may still download a missing remote file ---");
+{
+	const path = "new-device-remote.png";
+	const remote = bytes("new device remote bytes");
+	const remoteHash = await sha256Hex(remote);
+	const remoteRef: BlobRef = { hash: remoteHash, size: remote.byteLength };
+	const { manager, files } = makeHarness();
+	(manager as any).vaultSync = {
+		getBlobRef: () => remoteRef,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, remoteRef]]),
+	};
+	await runDownload(manager, path, remote);
+	assert(text(files.get(path)!.data) === text(remote), "missing path without a settlement downloads normally");
+	await manager.destroy();
+}
+
+console.log("\n--- Test 2s: reconcile distinguishes physical presence from transfer eligibility ---");
+{
+	const path = "oversized-existing.png";
+	const local = bytes("physically present but over the configured transfer limit");
+	const remote = bytes("remote should not be scheduled over the existing path");
+	const remoteHash = await sha256Hex(remote);
+	const remoteRef: BlobRef = { hash: remoteHash, size: remote.byteLength };
+	const { app, manager, put } = makeHarness();
+	const stored = put(path, local);
+	app.vault.getFiles = () => [stored.file];
+	(manager as any).maxSize = 1;
+	(manager as any).vaultSync = {
+		getBlobRef: () => remoteRef,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, remoteRef]]),
+	};
+	manager.closeDownloadGate("inspect-oversized-presence");
+	const result = manager.reconcile("authoritative", []);
+	assert(result.downloadQueued === 0, "oversized existing TFile is not classified as disk-missing");
+	assert(manager.pendingDownloads === 0, "oversized existing TFile queues no remote create");
+	await manager.destroy();
+}
+
+console.log("\n--- Test 2t: reconcile defers a missing settled path but admits first-time remote paths ---");
+for (const hasSettlement of [true, false]) {
+	const path = hasSettlement ? "reconcile-offline-delete.png" : "reconcile-first-download.png";
+	const remote = bytes(`reconcile remote ${hasSettlement}`);
+	const remoteHash = await sha256Hex(remote);
+	const remoteRef: BlobRef = { hash: remoteHash, size: remote.byteLength };
+	const settledRefs: Record<string, BlobRef> = hasSettlement ? { [path]: remoteRef } : {};
+	const { app, manager, traces } = makeHarness(undefined, settledRefs);
+	app.vault.getFiles = () => [];
+	(manager as any).vaultSync = {
+		getBlobRef: () => remoteRef,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, remoteRef]]),
+	};
+	manager.closeDownloadGate("inspect-reconcile-missing-path");
+	const result = manager.reconcile("authoritative", []);
+	assert(
+		result.downloadQueued === (hasSettlement ? 0 : 1),
+		hasSettlement
+			? "reconcile does not queue an offline-deleted settled path"
+			: "reconcile queues a first-time remote path without local settlement",
+	);
+	assert(
+		hasSettlement === traces.some((event) =>
+			event.msg === "reconcile-download-deferred-missing-settled-replica"
+		),
+		`${hasSettlement ? "settled" : "first-time"}: reconcile defer trace matches policy`,
+	);
+	await manager.destroy();
 }
 
 console.log("\n--- Test 3: create race mismatch is quarantined instead of overwritten ---");
@@ -230,242 +1230,745 @@ console.log("\n--- Test 4: create race same hash is skipped ---");
 	);
 }
 
-// ── Test 5: blob remote delete prefers trashFile ────────────────────────────
-
-console.log("\n--- Test 5: blob remote delete prefers trashFile ---");
+console.log("\n--- Test 4b: superseded missing-target download writes only the latest ref ---");
 {
-	const { app, manager, files, put, traces } = makeHarness();
-	const existing = put("attachment.png", bytes("local data"));
-	const trashedPaths: string[] = [];
-	const deletedPaths: string[] = [];
-
-	// Seed hash cache so knownHash matches — file is clean, delete should proceed
-	const knownHash = "deadbeef1234";
-	(manager as any).hashCache["attachment.png"] = {
-		mtime: existing.file.stat.mtime,
-		size: existing.file.stat.size,
-		hash: knownHash,
+	const { manager, files } = makeHarness();
+	const first = bytes("remote H1");
+	const second = bytes("remote H2");
+	const firstHash = await sha256Hex(first);
+	const secondHash = await sha256Hex(second);
+	let remoteRef = { hash: firstHash, size: first.byteLength };
+	(manager as any).vaultSync = {
+		getBlobRef: () => remoteRef,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map(),
 	};
-
-	// Add trashFile to the app mock
-	(app as any).fileManager = {
-		trashFile: async (file: TFile & { path: string }, system?: boolean) => {
-			trashedPaths.push(file.path);
-			files.delete(file.path);
+	(manager as any).kickDownloadDrain = () => {};
+	const firstStarted = deferred<void>();
+	const releaseFirst = deferred<ArrayBuffer>();
+	(manager as any).blobClient = {
+		download: async (hash: string) => {
+			if (hash === firstHash) {
+				firstStarted.resolve();
+				return releaseFirst.promise;
+			}
+			assert(hash === secondHash, "rerun requests the authoritative H2 hash");
+			return second;
 		},
 	};
-	(app as any).vault.delete = async (file: TFile & { path: string }) => {
-		deletedPaths.push(file.path);
-		files.delete(file.path);
+	const item = {
+		path: "latest-only.png",
+		hash: firstHash,
+		sizeBytes: first.byteLength,
+		retries: 0,
+		status: "processing" as const,
+		readyAt: 0,
+		generation: 0,
+		rerunResets: 0,
 	};
+	(manager as any).downloadQueue.set(item.path, item);
+	const firstAttempt = (manager as any).processDownload(item);
+	await firstStarted.promise;
+	remoteRef = { hash: secondHash, size: second.byteLength };
+	(manager as any).enqueueDownload(item.path, secondHash, second.byteLength);
+	releaseFirst.resolve(first);
+	await firstAttempt;
 
-	await (manager as any).handleRemoteDelete("attachment.png", knownHash);
-
-	assert(trashedPaths.includes("attachment.png"), "blob remote delete uses trashFile");
-	assert(deletedPaths.length === 0, "blob remote delete does not use hard delete when trash is available");
-	assert(!files.has("attachment.png"), "blob remote delete removes file from vault");
+	assert(!files.has(item.path), "superseded H1 creates no target file");
 	assert(
-		traces.some((event) =>
-			event.msg === "remote-delete-applied" &&
-			event.details?.deleteMode === "trash"
-		),
-		"blob remote delete traces deleteMode as 'trash'",
+		!Array.from(files.keys()).some((path) => path.includes("KAOS remote conflict")),
+		"superseded H1 creates no conflict artifact",
+	);
+	assert(item.hash === secondHash && item.status === "pending", "H2 remains as the runnable attempt");
+	item.status = "processing";
+	await (manager as any).processDownload(item);
+	assert(text(files.get(item.path)!.data) === "remote H2", "the missing target is created directly from H2");
+	assert(
+		!Array.from(files.keys()).some((path) => path.includes("KAOS remote conflict")),
+		"latest-only creation needs no conflict artifact",
 	);
 }
 
-// ── Test 6: blob remote delete falls back to hard delete ────────────────────
-
-console.log("\n--- Test 6: blob remote delete falls back when trash unavailable ---");
+console.log("\n--- Test 4c: H2 arriving inside createBinary retires operation-owned H1 ---");
 {
-	const { app, manager, files, put, traces } = makeHarness();
-	const existing = put("attachment2.png", bytes("local data 2"));
-	const deletedPaths: string[] = [];
-
-	// Seed hash cache so knownHash matches — file is clean, delete should proceed
-	const knownHash = "deadbeef5678";
-	(manager as any).hashCache["attachment2.png"] = {
-		mtime: existing.file.stat.mtime,
-		size: existing.file.stat.size,
-		hash: knownHash,
+	const { app, manager, files } = makeHarness();
+	const path = "create-await-race.png";
+	const first = bytes("create H1");
+	const second = bytes("create H2");
+	const firstHash = await sha256Hex(first);
+	const secondHash = await sha256Hex(second);
+	let remoteRef = { hash: firstHash, size: first.byteLength };
+	(manager as any).vaultSync = {
+		getBlobRef: () => remoteRef,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map(),
 	};
-
-	// No fileManager.trashFile — simulate unavailable trash
-	(app as any).fileManager = undefined;
-	(app as any).vault.delete = async (file: TFile & { path: string }) => {
-		deletedPaths.push(file.path);
-		files.delete(file.path);
+	(manager as any).kickDownloadDrain = () => {};
+	const createStarted = deferred<void>();
+	const releaseCreate = deferred<void>();
+	const originalCreateBinary = app.vault.createBinary;
+	let blocked = false;
+	app.vault.createBinary = async (candidate: string, data: ArrayBuffer) => {
+		if (candidate === path && !blocked) {
+			blocked = true;
+			createStarted.resolve();
+			await releaseCreate.promise;
+		}
+		return originalCreateBinary(candidate, data);
 	};
+	(manager as any).blobClient = {
+		download: async (hash: string) => hash === firstHash ? first : second,
+	};
+	const item = {
+		path,
+		hash: firstHash,
+		sizeBytes: first.byteLength,
+		retries: 0,
+		status: "processing" as const,
+		readyAt: 0,
+		generation: 0,
+		rerunResets: 0,
+	};
+	(manager as any).downloadQueue.set(path, item);
+	const firstAttempt = (manager as any).processDownload(item);
+	await createStarted.promise;
+	remoteRef = { hash: secondHash, size: second.byteLength };
+	(manager as any).enqueueDownload(path, secondHash, second.byteLength);
+	releaseCreate.resolve();
+	await firstAttempt;
 
-	await (manager as any).handleRemoteDelete("attachment2.png", knownHash);
-
-	assert(deletedPaths.includes("attachment2.png"), "blob remote delete falls back to hard delete");
-	assert(!files.has("attachment2.png"), "file is removed from vault");
+	const backupPath = findVisibleLocalBackupPath(files, path);
+	assert(!files.has(path), "operation-owned H1 leaves the canonical path before H2 runs");
 	assert(
-		traces.some((event) =>
-			event.msg === "remote-delete-applied" &&
-			event.details?.deleteMode === "delete"
-		),
-		"blob remote delete traces deleteMode as 'delete'",
+		!!backupPath && text(files.get(backupPath)!.data) === "create H1",
+		"operation-owned H1 remains visible in a UUID local safety backup",
+	);
+	assert(item.hash === secondHash && item.status === "pending", "H2 survives the post-create cleanup fence");
+	item.status = "processing";
+	await (manager as any).processDownload(item);
+	assert(text(files.get(path)!.data) === "create H2", "the final target contains only H2");
+	if (backupPath) {
+		manager.handleFileChange(files.get(backupPath)!.file);
+	}
+	assert(
+		!(manager as any).uploadQueue.has(backupPath),
+		"the superseded H1 local safety backup is never uploaded",
+	);
+	assert(
+		!Array.from(files.keys()).some((candidate) => candidate.includes("KAOS remote conflict")),
+		"the create-await race leaves no stale conflict artifact",
 	);
 }
 
-// ── Test 7: blob remote delete with trash failure falls back ────────────────
-
-console.log("\n--- Test 7: blob remote delete falls back when trashFile throws ---");
+console.log("\n--- Test 4d: H2 arriving inside artifact write is not fenced by H1 quarantine ---");
 {
-	const { app, manager, files, put, traces } = makeHarness();
-	const existing = put("attachment3.png", bytes("local data 3"));
-	const deletedPaths: string[] = [];
-
-	// Seed hash cache so knownHash matches — file is clean, delete should proceed
-	const knownHash = "deadbeef9abc";
-	(manager as any).hashCache["attachment3.png"] = {
-		mtime: existing.file.stat.mtime,
-		size: existing.file.stat.size,
-		hash: knownHash,
+	const { app, manager, files, put } = makeHarness();
+	const path = "artifact-await-race.png";
+	put(path, bytes("local winner"));
+	const first = bytes("artifact H1");
+	const second = bytes("artifact H2");
+	const firstHash = await sha256Hex(first);
+	const secondHash = await sha256Hex(second);
+	let remoteRef = { hash: firstHash, size: first.byteLength };
+	(manager as any).vaultSync = {
+		getBlobRef: () => remoteRef,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map(),
 	};
-
-	(app as any).fileManager = {
-		trashFile: async () => {
-			throw new Error("trash not supported");
-		},
+	(manager as any).kickDownloadDrain = () => {};
+	const artifactStarted = deferred<void>();
+	const releaseArtifact = deferred<void>();
+	const originalCreateBinary = app.vault.createBinary;
+	let blocked = false;
+	app.vault.createBinary = async (candidate: string, data: ArrayBuffer) => {
+		if (candidate.includes("KAOS remote conflict") && !blocked) {
+			blocked = true;
+			artifactStarted.resolve();
+			await releaseArtifact.promise;
+		}
+		return originalCreateBinary(candidate, data);
 	};
-	(app as any).vault.delete = async (file: TFile & { path: string }) => {
-		deletedPaths.push(file.path);
-		files.delete(file.path);
+	(manager as any).blobClient = {
+		download: async (hash: string) => hash === firstHash ? first : second,
 	};
+	const item = {
+		path,
+		hash: firstHash,
+		sizeBytes: first.byteLength,
+		retries: 0,
+		status: "processing" as const,
+		readyAt: 0,
+		generation: 0,
+		rerunResets: 0,
+	};
+	(manager as any).downloadQueue.set(path, item);
+	const firstAttempt = (manager as any).processDownload(item);
+	await artifactStarted.promise;
+	remoteRef = { hash: secondHash, size: second.byteLength };
+	(manager as any).enqueueDownload(path, secondHash, second.byteLength);
+	releaseArtifact.resolve();
+	await firstAttempt;
 
-	await (manager as any).handleRemoteDelete("attachment3.png", knownHash);
-
-	assert(deletedPaths.includes("attachment3.png"), "falls back to hard delete when trash throws");
+	assert(!manager.isPreservedUnresolved(path), "superseded H1 does not quarantine or fence H2");
+	assert(item.hash === secondHash && item.status === "pending", "H2 remains runnable after H1 artifact settles");
+	item.status = "processing";
+	await (manager as any).processDownload(item);
+	assert(text(files.get(path)!.data) === "local winner", "neither remote attempt overwrites the local file");
+	assert(manager.isPreservedUnresolved(path), "the authoritative H2 conflict records Attention");
 	assert(
-		traces.some((event) =>
-			event.msg === "remote-delete-applied" &&
-			event.details?.deleteMode === "delete"
-		),
-		"traces fallback deleteMode as 'delete'",
+		Array.from(files.values()).some((stored) => text(stored.data) === "artifact H2"),
+		"the authoritative H2 candidate is preserved after the rerun",
 	);
 }
 
-// ── Test 8: blob remote delete suppresses path before deletion ──────────────
-
-console.log("\n--- Test 8: blob remote delete suppresses path before deletion ---");
-{
-	const { app, manager, files, put, traces } = makeHarness();
-	const existing = put("suppressed.png", bytes("suppress me"));
-
-	// Seed hash cache so knownHash matches — file is clean, delete should proceed
-	const knownHash = "deadbeefdef0";
-	(manager as any).hashCache["suppressed.png"] = {
-		mtime: existing.file.stat.mtime,
-		size: existing.file.stat.size,
-		hash: knownHash,
+console.log("\n--- Test 4e: superseded-download backup ticket cannot borrow a post-hash disk epoch ---");
+for (const replacementMode of ["same-file", "tfile-aba"] as const) {
+	const { app, manager, files, put, replace } = makeHarness();
+	const path = `download-backup-ticket-${replacementMode}.png`;
+	const first = bytes(`H1-${replacementMode}`);
+	const second = bytes(`local-H2-${replacementMode}`);
+	const firstHash = await sha256Hex(first);
+	const initial = put(path, first);
+	let renameCalls = 0;
+	const originalRename = app.vault.rename;
+	app.vault.rename = async (file: TFile & { path: string }, newPath: string) => {
+		renameCalls++;
+		await originalRename(file, newPath);
 	};
 
-	(app as any).vault.delete = async (file: TFile & { path: string }) => {
-		// Check suppression is active before deletion completes
+	const originalReadAndHash = (manager as any).readAndHashExactExistingFile.bind(manager);
+	let armPostResolutionRace = true;
+	(manager as any).readAndHashExactExistingFile = async (...args: unknown[]) => {
+		const snapshot = await originalReadAndHash(...args);
+		if (armPostResolutionRace) {
+			armPostResolutionRace = false;
+			queueMicrotask(() => {
+				if (replacementMode === "same-file") put(path, second);
+				else replace(path, second);
+			});
+		}
+		return snapshot;
+	};
+
+	const retired = await (manager as any).trashExactDownloadedReplica(
+		initial.file,
+		path,
+		firstHash,
+	);
+	assert(!retired, `${replacementMode}: stale H1 cleanup refuses the newer disk epoch`);
+	assert(renameCalls === 1, `${replacementMode}: the exact old H1 epoch moves once to a visible backup`);
+	assert(
+		text(files.get(path)!.data) === text(second),
+		`${replacementMode}: post-hash local bytes remain intact`,
+	);
+	const backupPath = findVisibleLocalBackupPath(files, path);
+	assert(
+		!!backupPath && text(files.get(backupPath)!.data) === text(first),
+		`${replacementMode}: the exact old H1 bytes remain visible beside the newer canonical epoch`,
+	);
+}
+
+console.log("\n--- Test 4f: same-TFile writes survive a clean remote overwrite in a visible local backup ---");
+{
+	const path = "same-tfile-overwrite.png";
+	const h1 = bytes("clean overwrite H1");
+	const h2 = bytes("authoritative overwrite H2");
+	const duringWrite = bytes("external write while rename promise is pending");
+	const lateWrite = bytes("external write long after overwrite settlement");
+	const h1Hash = await sha256Hex(h1);
+	const h2Hash = await sha256Hex(h2);
+	const h1Ref: BlobRef = { hash: h1Hash, size: h1.byteLength };
+	const h2Ref = createCausalBlobRef(h2Hash, h2.byteLength, h1Ref);
+	const { app, manager, files, put } = makeHarness(undefined, { [path]: h1Ref });
+	const original = put(path, h1);
+	(manager as any).vaultSync = {
+		getBlobRef: () => h2Ref,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, h2Ref]]),
+	};
+	const renameStarted = deferred<string>();
+	const releaseRename = deferred<void>();
+	const originalRename = app.vault.rename;
+	app.vault.rename = async (file: TFile & { path: string }, newPath: string) => {
+		await originalRename(file, newPath);
+		renameStarted.resolve(newPath);
+		await releaseRename.promise;
+	};
+
+	const downloading = runDownload(
+		manager,
+		path,
+		h2,
+		undefined,
+		getBlobRefPriorHashes(h2Ref),
+	);
+	const backupPath = await renameStarted.promise;
+	put(backupPath, duringWrite);
+	releaseRename.resolve();
+	await downloading;
+
+	assert(
+		files.get(backupPath)?.file === original.file,
+		"the exact predecessor TFile is moved to the UUID local safety backup",
+	);
+	assert(text(files.get(path)!.data) === text(h2), "the canonical target advances to authoritative H2");
+	assert(
+		text(files.get(backupPath)!.data) === text(duringWrite),
+		"a same-TFile write during the overwrite remains visible in the local backup",
+	);
+	assert(
+		manager.consumeRemoteOverwriteBackupRename(original.file, path),
+		"the operation-owned rename event is consumed without treating the backup as a user rename",
+	);
+
+	put(backupPath, lateWrite);
+	manager.handleFileChange(original.file);
+	assert(
+		text(files.get(backupPath)!.data) === text(lateWrite),
+		"a same-TFile write long after settlement remains visible at the backup path",
+	);
+	assert(
+		!(manager as any).uploadQueue.has(backupPath) && manager.pendingUploads === 0,
+		"the UUID local safety backup is permanently excluded from blob upload",
+	);
+}
+
+// ── Test 5: clean remote delete keeps a visible local safety backup ──────
+
+console.log("\n--- Test 5: clean remote delete moves the exact TFile to a visible UUID backup ---");
+{
+	const path = "attachment.png";
+	const clean = bytes("clean deleted replica");
+	const duringWrite = bytes("external write during delete rename");
+	const lateWrite = bytes("external write long after delete settlement");
+	const cleanHash = await sha256Hex(clean);
+	const deletedRef: BlobRef = { hash: cleanHash, size: clean.byteLength };
+	const { app, manager, files, put, traces } = makeHarness();
+	const original = put(path, clean);
+	installRemoteDeleteAuthority(manager, path, deletedRef);
+	let hardDeleteCalls = 0;
+	(app as any).vault.delete = async () => { hardDeleteCalls++; };
+	const originalRename = app.vault.rename;
+	app.vault.rename = async (file: TFile & { path: string }, newPath: string) => {
+		await originalRename(file, newPath);
+		// Model an editor that still owns the same TFile/file descriptor and writes
+		// after KAOS has moved it, but before the rename promise settles.
+		put(newPath, duringWrite);
+	};
+
+	await (manager as any).handleRemoteDelete(path);
+	const backupPath = findVisibleLocalBackupPath(files, path);
+
+	assert(!files.has(path), "the canonical path is absent after the authoritative delete");
+	assert(!!backupPath, "the deleted replica remains visible at a UUID KAOS local backup path");
+	assert(
+		!!backupPath && files.get(backupPath)?.file === original.file,
+		"remote delete moves the exact original TFile instead of destroying it",
+	);
+	assert(
+		!!backupPath && text(files.get(backupPath)!.data) === text(duringWrite),
+		"a same-TFile write during delete settlement remains visible in the backup",
+	);
+	assert(hardDeleteCalls === 0, "automatic remote delete never calls hard delete");
+	assert(
+		traces.some((event) =>
+			event.msg === "remote-delete-applied"
+			&& event.details?.deleteMode === "visible-local-backup"
+			&& event.details?.backupPath === backupPath
+		),
+		"remote delete traces the visible local backup path",
+	);
+
+	if (backupPath) {
 		assert(
-			(manager as any).isSuppressed("suppressed.png"),
-			"path is suppressed before delete executes",
+			manager.consumeRemoteOverwriteBackupRename(original.file, path),
+			"the operation-owned delete rename event is consumed exactly once",
 		);
-		files.delete(file.path);
+		put(backupPath, lateWrite);
+		manager.handleFileChange(original.file);
+		assert(
+			text(files.get(backupPath)!.data) === text(lateWrite),
+			"a same-TFile write long after delete settlement remains visible",
+		);
+	}
+	assert(
+		!backupPath || !(manager as any).uploadQueue.has(backupPath),
+		"the remote-delete local safety backup is never uploaded",
+	);
+}
+
+console.log("\n--- Test 5b: prior Attention clears only after the visible backup rename settles ---");
+{
+	const path = "attention-delete.png";
+	const clean = bytes("clean local data");
+	const cleanHash = await sha256Hex(clean);
+	const deletedRef: BlobRef = { hash: cleanHash, size: clean.byteLength };
+	const { app, manager, files, put } = makeHarness();
+	put(path, clean);
+	installRemoteDeleteAuthority(manager, path, deletedRef);
+	manager.recordPreservedUnresolved(path, "remote-delete-missing-baseline");
+	const originalRename = app.vault.rename;
+	let markerPresentInsideRename = false;
+	app.vault.rename = async (file: TFile & { path: string }, newPath: string) => {
+		markerPresentInsideRename = manager.isPreservedUnresolved(path);
+		await originalRename(file, newPath);
 	};
 
-	await (manager as any).handleRemoteDelete("suppressed.png", knownHash);
-	assert(!files.has("suppressed.png"), "file is deleted after suppression");
+	await (manager as any).handleRemoteDelete(path);
+
+	assert(markerPresentInsideRename, "the prior marker remains while the no-clobber rename is dispatched");
+	assert(!files.has(path), "successful backup settlement leaves the canonical path absent");
+	assert(!!findVisibleLocalBackupPath(files, path), "successful delete retains its visible safety backup");
+	assert(!manager.isPreservedUnresolved(path), "the exact prior marker clears only after backup settlement");
+}
+
+console.log("\n--- Test 5c: H1 delete handler cannot borrow a newer T2 episode ---");
+{
+	const { app, manager, files, put, traces } = makeHarness();
+	const path = "episode-fence.png";
+	const h1 = bytes("local H1");
+	const localH1 = put(path, h1);
+	const hashH1 = await sha256Hex(localH1.data);
+	const deletedRef: BlobRef = { hash: hashH1, size: h1.byteLength };
+	let fingerprint = "delete-T1";
+	(manager as any).vaultSync = {
+		getAuthoritativeBlobDeleteSnapshot: () => ({ fingerprint, deletedRef }),
+		getBlobRef: () => undefined,
+		isBlobTombstoned: () => true,
+		pathToBlob: new Map(),
+		blobTombstones: new Map(),
+	};
+	let renameCalls = 0;
+	const originalRename = app.vault.rename;
+	app.vault.rename = async (file: TFile & { path: string }, newPath: string) => {
+		renameCalls++;
+		await originalRename(file, newPath);
+	};
+	const runtime = manager as any;
+	runtime.inflightDownloads.add(path);
+	const deletingT1 = runtime.handleRemoteDelete(path);
+	// The first handler has captured {H1,T1} and is now waiting. Simulate a
+	// revival to H2 followed by a distinct T2 delete before that wait settles.
+	fingerprint = "delete-T2";
+	runtime.inflightDownloads.delete(path);
+	runtime.notifyTransferSettled(path);
+	await deletingT1;
+
+	assert(renameCalls === 0, "the H1 handler does not move local H1 under T2 authority");
+	assert(files.has(path), "local H1 remains canonical when the delete episode changes while waiting");
+	assert(
+		traces.some((event) =>
+			event.msg === "remote-delete-resolution-stale" &&
+			event.details?.reason === "delete-episode-changed-while-waiting-for-transfers"
+		),
+		"episode mismatch is traced before any filesystem rename",
+	);
+}
+
+console.log("\n--- Test 5d: stale delete preserves both a same-path replacement and old-TFile backup ---");
+{
+	const { app, manager, files, put, replace } = makeHarness();
+	const path = "delete-aba.png";
+	const oldBytes = bytes("old clean bytes");
+	const original = put(path, oldBytes);
+	const knownHash = await sha256Hex(original.data);
+	installRemoteDeleteAuthority(
+		manager,
+		path,
+		{ hash: knownHash, size: oldBytes.byteLength },
+		"delete-T1",
+	);
+	(manager as any).kickUploadDrain = () => {};
+	let replacement: StoredFile | undefined;
+	const originalRename = app.vault.rename;
+	app.vault.rename = async (file: TFile & { path: string }, newPath: string) => {
+		await originalRename(file, newPath);
+		replacement = replace(path, bytes("new winner"));
+		manager.admitReplacementAfterStaleDelete(replacement.file);
+	};
+
+	await (manager as any).handleRemoteDelete(path);
+	const backupPath = findVisibleLocalBackupPath(files, path);
+	assert(files.get(path)?.file === replacement?.file, "the same-path replacement remains the canonical winner");
+	assert(
+		!!backupPath && files.get(backupPath)?.file === original.file,
+		"the superseded delete epoch remains visible as the old-TFile backup",
+	);
+	assert(manager.pendingUploads === 1, "the same-path replacement receives a fresh upload admission");
+	assert(
+		!backupPath || !(manager as any).uploadQueue.has(backupPath),
+		"the old-TFile local backup is never admitted for upload",
+	);
+	await manager.destroy();
+}
+
+// ── Test 6: remote delete preserves when safety rename is unavailable ───────
+
+console.log("\n--- Test 6: clean remote delete preserves canonical file when rename is unavailable ---");
+{
+	const path = "attachment2.png";
+	const clean = bytes("local data 2");
+	const cleanHash = await sha256Hex(clean);
+	const { app, manager, files, put, traces } = makeHarness();
+	put(path, clean);
+	installRemoteDeleteAuthority(manager, path, { hash: cleanHash, size: clean.byteLength });
+	(app as any).vault.rename = undefined;
+	let hardDeleteCalls = 0;
+	(app as any).vault.delete = async () => { hardDeleteCalls++; };
+
+	await (manager as any).handleRemoteDelete(path);
+
+	assert(hardDeleteCalls === 0, "rename-unavailable delete never falls back to hard delete");
+	assert(files.has(path), "rename-unavailable delete preserves the canonical original");
+	assert(manager.isPreservedUnresolved(path), "rename-unavailable delete records Attention");
+	assert(
+		traces.some((event) => event.msg === "remote-delete-backup-failed"),
+		"rename-unavailable delete traces visible-backup failure",
+	);
+}
+
+// ── Test 7: remote delete preserves when safety rename rejects ───────────
+
+console.log("\n--- Test 7: clean remote delete preserves canonical file when rename rejects ---");
+{
+	const path = "attachment3.png";
+	const clean = bytes("local data 3");
+	const cleanHash = await sha256Hex(clean);
+	const { app, manager, files, put, traces } = makeHarness();
+	put(path, clean);
+	installRemoteDeleteAuthority(manager, path, { hash: cleanHash, size: clean.byteLength });
+	app.vault.rename = async () => { throw new Error("rename not supported"); };
+	let hardDeleteCalls = 0;
+	(app as any).vault.delete = async () => { hardDeleteCalls++; };
+
+	await (manager as any).handleRemoteDelete(path);
+
+	assert(hardDeleteCalls === 0, "rename rejection never falls back to hard delete");
+	assert(files.has(path), "rename rejection preserves the original attachment");
+	assert(manager.isPreservedUnresolved(path), "rename rejection records durable Attention");
+	assert(
+		traces.some((event) => event.msg === "remote-delete-backup-failed"),
+		"rename rejection traces visible-backup failure",
+	);
+}
+
+// ── Test 8: operation-owned rename event is consumed ───────────────────
+
+console.log("\n--- Test 8: clean remote delete consumes its operation-owned rename event ---");
+{
+	const path = "rename-event.png";
+	const clean = bytes("rename me safely");
+	const cleanHash = await sha256Hex(clean);
+	const { app, manager, files, put } = makeHarness();
+	put(path, clean);
+	installRemoteDeleteAuthority(manager, path, { hash: cleanHash, size: clean.byteLength });
+	const originalRename = app.vault.rename;
+	let renameConsumed = false;
+	app.vault.rename = async (file: TFile & { path: string }, newPath: string) => {
+		await originalRename(file, newPath);
+		renameConsumed = manager.consumeRemoteOverwriteBackupRename(file, path);
+	};
+
+	await (manager as any).handleRemoteDelete(path);
+
+	assert(renameConsumed, "the exact operation-owned old-path rename event is consumed");
+	assert(!files.has(path), "consuming the rename event does not recreate the canonical target");
+	assert(!!findVisibleLocalBackupPath(files, path), "the consumed rename still leaves a visible local backup");
 }
 
 // ── Test 9: blob remote delete preserves locally modified file ──────────────
 
-console.log("\n--- Test 9: blob remote delete preserves locally modified file ---");
+console.log("\n--- Test 9: blob remote delete preserves an independent local fork ---");
 {
+	const path = "locally-modified.png";
+	const remoteBase = bytes("remote version before delete");
+	const localFork = bytes("independent local version");
+	const remoteHash = await sha256Hex(remoteBase);
 	const { app, manager, files, put, traces } = makeHarness();
-	const existing = put("locally-modified.png", bytes("local version"));
+	put(path, localFork);
+	installRemoteDeleteAuthority(manager, path, { hash: remoteHash, size: remoteBase.byteLength });
+	app.vault.rename = async () => { throw new Error("should not move a local fork"); };
 
-	// Seed the hash cache with the KNOWN hash (the hash at last sync)
-	const knownHash = "aabbccdd00112233445566778899aabbccddeeff0011223344556677889900aa";
-	// The file was modified locally — stat doesn't match any cache entry (cache is empty),
-	// so getCachedHash will return null → localDirty = true
-	(app as any).vault.delete = async () => {
-		throw new Error("should not delete locally modified file");
-	};
+	await (manager as any).handleRemoteDelete(path);
 
-	await (manager as any).handleRemoteDelete("locally-modified.png", knownHash);
-
-	assert(files.has("locally-modified.png"), "locally modified file is preserved");
+	assert(text(files.get(path)!.data) === text(localFork), "the independent local fork remains canonical");
+	assert(!findVisibleLocalBackupPath(files, path), "a local conflict is not mislabeled as a clean-delete backup");
+	assert(manager.isPreservedUnresolved(path), "the local fork records durable Attention");
 	assert(
 		traces.some((event) =>
-			event.msg === "remote-delete-conflict-preserved" &&
-			event.details?.reason === "local-file-modified-since-last-sync"
+			event.msg === "remote-delete-conflict-preserved"
+			&& event.details?.reason === "remote-delete-local-conflict"
 		),
-		"blob remote delete traces conflict preservation",
+		"blob remote delete traces the causal local-conflict reason",
 	);
 }
 
-// ── Test 10: blob remote delete proceeds when hash matches ──────────────────
+// ── Test 10: deleted ref lineage admits a clean settled predecessor ─────────
 
-console.log("\n--- Test 10: blob remote delete proceeds when hash matches known ---");
+console.log("\n--- Test 10: remote delete admits an exact settled predecessor covered by deletedRef ---");
 {
-	const { app, manager, files, put, traces } = makeHarness();
-	const existing = put("unchanged.png", bytes("same content"));
+	const path = "settled-predecessor.png";
+	const h1 = bytes("settled H1");
+	const h2 = bytes("remote H2 before delete");
+	const h1Hash = await sha256Hex(h1);
+	const h2Hash = await sha256Hex(h2);
+	const h1Ref: BlobRef = { hash: h1Hash, size: h1.byteLength };
+	const deletedRef = createCausalBlobRef(h2Hash, h2.byteLength, h1Ref);
+	const { manager, files, put, traces } = makeHarness(undefined, { [path]: h1Ref });
+	put(path, h1);
+	installRemoteDeleteAuthority(manager, path, deletedRef);
 
-	// Seed the hash cache so getCachedHash returns the known hash
-	const knownHash = "known-hash-matching";
-	const stat = existing.file.stat;
-	(manager as any).hashCache["unchanged.png"] = {
-		mtime: stat.mtime,
-		size: stat.size,
-		hash: knownHash,
-	};
+	await (manager as any).handleRemoteDelete(path);
 
-	const deletedPaths: string[] = [];
-	(app as any).vault.delete = async (file: TFile & { path: string }) => {
-		deletedPaths.push(file.path);
-		files.delete(file.path);
-	};
-
-	await (manager as any).handleRemoteDelete("unchanged.png", knownHash);
-
-	assert(!files.has("unchanged.png"), "unmodified file is deleted");
-	assert(deletedPaths.includes("unchanged.png"), "delete was called for unmodified file");
+	const backupPath = findVisibleLocalBackupPath(files, path);
+	assert(!files.has(path), "covered settled predecessor leaves the canonical path absent");
+	assert(
+		!!backupPath && text(files.get(backupPath)!.data) === text(h1),
+		"covered settled predecessor remains visible in its local safety backup",
+	);
 	assert(
 		traces.some((event) => event.msg === "remote-delete-applied"),
-		"blob remote delete traces remote-delete-applied for unmodified file",
+		"covered settled predecessor records an applied remote delete",
 	);
 }
 
-// ── Test 11: blob remote delete preserves when knownHash is null ────────────
+// ── Test 11: legacy delete authority without deletedRef fails closed ──────────
 
-console.log("\n--- Test 11: blob remote delete preserves when no known hash baseline ---");
+console.log("\n--- Test 11: blob remote delete preserves when deletedRef is missing ---");
 {
+	const path = "no-baseline.png";
+	const local = bytes("mystery content");
 	const { app, manager, files, put, traces } = makeHarness();
-	const existing = put("no-baseline.png", bytes("mystery content"));
+	put(path, local);
+	installRemoteDeleteAuthority(manager, path, undefined, "legacy-delete-no-ref");
+	app.vault.rename = async () => { throw new Error("should not move without deletedRef authority"); };
 
-	// Track whether tombstone was cleared (it should NOT be for unknown baseline)
-	let tombstoneCleared = false;
-	(manager as any).vaultSync = {
-		isBlobTombstoned: () => true,
-		blobTombstones: {
-			delete: () => { tombstoneCleared = true; },
-		},
-	};
+	await (manager as any).handleRemoteDelete(path);
 
-	(app as any).vault.delete = async () => { throw new Error("should not delete when knownHash is null"); };
-	(app as any).fileManager = {
-		trashFile: async () => { throw new Error("should not trash when knownHash is null"); },
-	};
-
-	await (manager as any).handleRemoteDelete("no-baseline.png", null);
-
-	assert(files.has("no-baseline.png"), "file preserved when no known hash baseline");
+	assert(text(files.get(path)!.data) === text(local), "file remains canonical without deletedRef authority");
+	assert(manager.isPreservedUnresolved(path), "missing deletedRef records durable Attention");
 	assert(
 		traces.some((event) =>
-			event.msg === "remote-delete-conflict-preserved" &&
-			event.details?.reason === "no-known-hash-baseline"
+			event.msg === "remote-delete-conflict-preserved"
+			&& event.details?.reason === "remote-delete-missing-baseline"
 		),
-		"blob remote delete traces no-known-hash-baseline preservation",
+		"blob remote delete traces missing-baseline preservation",
 	);
-	assert(!tombstoneCleared, "blob tombstone NOT cleared for unknown-baseline (no auto-resurrection)");
+}
+
+console.log("\n--- Test 11b: ref-less retirement permanently fences legacy absence ---");
+{
+	const path = "legacy-missing-delete.png";
+	const { manager, files } = makeHarness();
+	installRemoteDeleteAuthority(manager, path, undefined, "legacy-delete-missing-disk");
+
+	await (manager as any).handleRemoteDelete(path);
+	const stage = (manager as any).settlementStages[path];
+	assert(
+		stage?.kind === "retire" && stage.ref === undefined,
+		"missing legacy tombstone leaves a permanent ref-less retire fence",
+	);
+
+	const revived = bytes("rolled-back remote bytes");
+	const revivedHash = await sha256Hex(revived);
+	const revivedRef: BlobRef = { hash: revivedHash, size: revived.byteLength };
+	let downloads = 0;
+	(manager as any).vaultSync = {
+		getBlobRef: () => revivedRef,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, revivedRef]]),
+	};
+	(manager as any).blobClient = {
+		download: async () => { downloads++; return revived; },
+	};
+	manager.reconcile("authoritative", []);
+	await Promise.resolve();
+	assert(downloads === 0, "snapshot rollback cannot download through a ref-less retire fence");
+	assert(!files.has(path), "snapshot rollback cannot recreate the retired path");
+}
+
+console.log("\n--- Test 11b.1: absent-path retirement persistence failure remains retryable ---");
+{
+	const path = "legacy-missing-delete-retry.png";
+	const { manager } = makeHarness();
+	installRemoteDeleteAuthority(manager, path, undefined, "legacy-delete-retry");
+	(manager as any).settlementPersistence = {
+		stage: async () => { throw new Error("simulated settlement persistence failure"); },
+		finalize: async () => undefined,
+		retire: async () => undefined,
+		abort: async () => undefined,
+	};
+
+	let rejected = false;
+	try {
+		await (manager as any).handleRemoteDelete(path);
+	} catch {
+		rejected = true;
+	}
+	assert(rejected, "absent-path retirement reports durable persistence failure");
+	assert(
+		!(manager as any).remoteDeleteInFlight.has(path),
+		"failed absent-path retirement releases its in-flight episode",
+	);
+
+	(manager as any).settlementPersistence = undefined;
+	await (manager as any).handleRemoteDelete(path);
+	assert(
+		(manager as any).settlementStages[path]?.kind === "retire",
+		"the same tombstone can retry and establish permanent absence provenance",
+	);
+}
+
+console.log("\n--- Test 11c: explicit legacy delete persists retirement before trash ---");
+{
+	const path = "legacy-explicit-delete.png";
+	const { manager, files, put } = makeHarness();
+	put(path, bytes("local legacy file"));
+	installRemoteDeleteAuthority(manager, path, undefined, "legacy-explicit-delete");
+	manager.recordPreservedUnresolved(path, "remote-delete-missing-baseline");
+
+	let deleteCalls = 0;
+	(manager as any).settlementPersistence = {
+		stage: async () => { throw new Error("durable stage unavailable"); },
+		finalize: async () => undefined,
+		retire: async () => undefined,
+		abort: async () => undefined,
+	};
+	let rejected = false;
+	try {
+		await manager.acceptRemoteDeletedBlob(
+			path,
+			"remote-delete-missing-baseline",
+			async () => { deleteCalls++; files.delete(path); },
+		);
+	} catch {
+		rejected = true;
+	}
+	assert(rejected, "explicit delete fails closed when retirement cannot be persisted");
+	assert(deleteCalls === 0, "local trash is never called before durable retirement");
+	assert(files.has(path), "the local file remains when retirement persistence fails");
+	assert(manager.isPreservedUnresolved(path), "Attention remains after rejected explicit delete");
+
+	(manager as any).settlementPersistence = undefined;
+	await manager.acceptRemoteDeletedBlob(
+		path,
+		"remote-delete-missing-baseline",
+		async () => {
+			const staged = (manager as any).settlementStages[path];
+			assert(
+				staged?.kind === "retire" && staged.ref === undefined,
+				"ref-less retirement is durable in memory before local trash starts",
+			);
+			deleteCalls++;
+			files.delete(path);
+		},
+	);
+	assert(!files.has(path), "explicitly accepted legacy deletion removes the canonical file");
+	assert(!manager.isPreservedUnresolved(path), "Attention clears only after retirement finalizes");
+	assert(
+		(manager as any).settlementStages[path]?.kind === "retire",
+		"explicit legacy deletion retains permanent absence provenance",
+	);
 }
 
 // ── Test 12: rerunResets cap prevents infinite retry loops ───────────────────
@@ -516,6 +2019,7 @@ console.log("\n--- Test 12: rerunResets cap triggers permanent failure ---");
 console.log("\n--- Test 13: rerunResets below cap allows fresh restart ---");
 {
 	const { manager, traces } = makeHarness();
+	manager.closeDownloadGate("inspect-retry-reset");
 
 	const item = {
 		path: "restartable.png",
@@ -658,6 +2162,664 @@ console.log("\n--- Test 15: destroy during in-flight does not resurrect ---");
 	await manager.destroy();
 }
 
+console.log("\n--- Test 15b: disconnect authority revocation fences an in-flight download ---");
+{
+	const { manager, files } = makeHarness();
+	const path = "late-authority.png";
+	const remoteData = bytes("stale remote candidate");
+	const remoteHash = await sha256Hex(remoteData);
+	const started = deferred<void>();
+	const response = deferred<ArrayBuffer>();
+
+	(manager as any).blobClient = {
+		download: async () => {
+			started.resolve();
+			return response.promise;
+		},
+	};
+	(manager as any).enqueueDownload(path, remoteHash, remoteData.byteLength, 0, []);
+	const item = (manager as any).downloadQueue.get(path);
+	item.status = "processing";
+	const processing = (manager as any).processDownload(item);
+	await started.promise;
+
+	manager.closeDownloadGate("test-provider-disconnect");
+	response.resolve(remoteData);
+	await processing;
+
+	assert(
+		!files.has(path),
+		"a response verified after download authority revocation never creates the canonical path",
+	);
+	assert(
+		(manager as any).downloadQueue.size === 0,
+		"the stale in-flight target is discarded and must be replanned after authoritative reconcile",
+	);
+}
+
+console.log("\n--- Test 15b.1: retirement compensates a no-clobber create already in flight ---");
+{
+	const path = "retiring-overwrite.png";
+	const h1 = bytes("settled local H1");
+	const h2 = bytes("remote H2 created before retirement");
+	const h1Hash = await sha256Hex(h1);
+	const h2Hash = await sha256Hex(h2);
+	const h1Ref: BlobRef = { hash: h1Hash, size: h1.byteLength };
+	const h2Ref = createCausalBlobRef(h2Hash, h2.byteLength, h1Ref);
+	const { app, manager, files, put } = makeHarness(undefined, { [path]: h1Ref });
+	put(path, h1);
+	(manager as any).vaultSync = {
+		getBlobRef: () => h2Ref,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map([[path, h2Ref]]),
+	};
+	(manager as any).blobClient = { download: async () => h2 };
+
+	const canonicalCreateStarted = deferred<void>();
+	const releaseCanonicalCreate = deferred<void>();
+	const originalCreateBinary = app.vault.createBinary;
+	let delayFirstCanonicalCreate = true;
+	app.vault.createBinary = async (candidate: string, data: ArrayBuffer) => {
+		const created = await originalCreateBinary(candidate, data);
+		if (candidate === path && delayFirstCanonicalCreate) {
+			delayFirstCanonicalCreate = false;
+			canonicalCreateStarted.resolve();
+			await releaseCanonicalCreate.promise;
+		}
+		return created;
+	};
+
+	manager.closeDownloadGate("stage-retirement-race");
+	(manager as any).enqueueDownload(
+		path,
+		h2Hash,
+		h2.byteLength,
+		0,
+		getBlobRefPriorHashes(h2Ref),
+	);
+	manager.openDownloadGate("start-retirement-race");
+	await canonicalCreateStarted.promise;
+	assert(
+		manager.isPathOperationInFlight(path),
+		"the vacancy scanner sees the no-clobber replacement as operation-owned",
+	);
+
+	let destroySettled = false;
+	const destroying = manager.destroy().then(() => { destroySettled = true; });
+	await Promise.resolve();
+	assert(
+		!destroySettled,
+		"manager retirement waits for the already-dispatched canonical create",
+	);
+	releaseCanonicalCreate.resolve();
+	await destroying;
+
+	assert(
+		text(files.get(path)!.data) === text(h1),
+		"retirement restores the clean H1 predecessor instead of leaving stale H2 canonical",
+	);
+	const backupContents = Array.from(files.entries())
+		.filter(([candidate]) => candidate.includes("(KAOS local backup "))
+		.map(([, stored]) => text(stored.data));
+	assert(
+		backupContents.includes(text(h1)) && backupContents.includes(text(h2)),
+		"both the predecessor and retired remote candidate remain visible in UUID backups",
+	);
+	assert(
+		!manager.isPathOperationInFlight(path),
+		"operation ownership retires only after compensation settles",
+	);
+}
+
+console.log("\n--- Test 15c: destroy waits for observer-owned remote delete work ---");
+{
+	const { app, manager, files, put } = makeHarness();
+	const path = "remote-delete-during-stop.png";
+	const clean = bytes("clean remote replica");
+	const cleanHash = await sha256Hex(clean);
+	put(path, clean);
+	installRemoteDeleteAuthority(manager, path, {
+		hash: cleanHash,
+		size: clean.byteLength,
+	});
+
+	const renameStarted = deferred<void>();
+	const allowRename = deferred<void>();
+	const originalRename = app.vault.rename;
+	let ticketConsumed = false;
+	app.vault.rename = async (file: TFile & { path: string }, newPath: string) => {
+		renameStarted.resolve();
+		await allowRename.promise;
+		await originalRename(file, newPath);
+		// Simulate the synchronous Obsidian rename event while the manager is in
+		// its retiring lifecycle but before the observer-owned task resolves.
+		ticketConsumed = manager.consumeRemoteOverwriteBackupRename(file, path);
+	};
+
+	(manager as any).scheduleRemoteDelete(path);
+	await renameStarted.promise;
+	assert(
+		manager.isPathOperationInFlight(path),
+		"the vacancy scanner sees observer-owned remote delete work in flight",
+	);
+	let destroySettled = false;
+	const destroying = manager.destroy().then(() => {
+		destroySettled = true;
+	});
+	await Promise.resolve();
+	assert(
+		!destroySettled,
+		"destroy remains pending while an operation-owned backup rename is unresolved",
+	);
+
+	allowRename.resolve();
+	await destroying;
+	assert(ticketConsumed, "the exact backup rename ticket remains consumable until the task settles");
+	assert(
+		files.has(path),
+		"authority revocation during the rename restores a no-clobber canonical copy",
+	);
+	assert(
+		(manager as any).activeRemoteDeletePromises.size === 0,
+		"observer-owned remote delete tasks are drained before manager cleanup completes",
+	);
+}
+
+console.log("\n--- Test 15c.1: stale cached tombstones wait for provider authority ---");
+{
+	const { manager, files, put } = makeHarness();
+	const path = "stale-idb-tombstone.png";
+	const clean = bytes("local canonical survives stale IDB");
+	const cleanHash = await sha256Hex(clean);
+	put(path, clean);
+	installRemoteDeleteAuthority(manager, path, {
+		hash: cleanHash,
+		size: clean.byteLength,
+	}, "stale-idb-delete");
+
+	manager.closeDownloadGate("provider-not-yet-synced");
+	(manager as any).scheduleRemoteDelete(path);
+	await Promise.resolve();
+	assert(
+		files.has(path) && !findVisibleLocalBackupPath(files, path),
+		"a tombstone seen only in local IDB cannot move the canonical file",
+	);
+	assert(
+		(manager as any).deferredRemoteDeletePaths.has(path),
+		"the path is deferred for authoritative provider re-evaluation",
+	);
+
+	// The provider's authoritative room revived the path before its first sync.
+	(manager as any).vaultSync.getAuthoritativeBlobDeleteSnapshot = () => null;
+	manager.openDownloadGate("provider-authoritative-reconcile");
+	await Promise.resolve();
+	await Promise.resolve();
+	assert(
+		files.has(path) && !findVisibleLocalBackupPath(files, path),
+		"opening the gate rechecks current CRDT authority and drops the stale delete",
+	);
+}
+
+console.log("\n--- Test 15d: orchestrator gates both directions on provider authority ---");
+{
+	let uploadOpen = false;
+	let downloadOpen = false;
+	let uploadCloseCount = 0;
+	let downloadCloseCount = 0;
+	const fakeManager = {
+		get isUploadGateOpen() { return uploadOpen; },
+		get isDownloadGateOpen() { return downloadOpen; },
+		pendingUploads: 0,
+		pendingDownloads: 0,
+		openUploadGate: () => { uploadOpen = true; },
+		openDownloadGate: () => { downloadOpen = true; },
+		closeUploadGate: () => { uploadOpen = false; uploadCloseCount++; },
+		closeDownloadGate: () => { downloadOpen = false; downloadCloseCount++; },
+	} as unknown as BlobSyncManager;
+	const orchestrator = new AttachmentOrchestrator({
+		app: {
+			workspace: {
+				layoutReady: true,
+				onLayoutReady: () => undefined,
+			},
+		} as any,
+		getVaultSync: () => null,
+		getRuntimeConfig: () => ({}) as any,
+		getServerSupportsAttachments: () => true,
+		getTraceHttpContext: () => undefined,
+		getBlobHashCache: () => ({}),
+		getBlobSettledRefs: () => ({}),
+		getBlobSettledSourceVersions: () => ({}),
+		getBlobSettlementStages: () => ({}),
+		captureBlobRuntimeAuthority: () => ({ identity: "test", epoch: 1 }),
+		isBlobRuntimeAuthorityCurrent: () => true,
+		isUploadAuthoritySourceReady: () => true,
+		onBlobSettledRefsChanged: () => undefined,
+		stageBlobSettlement: async () => undefined,
+		finalizeBlobSettlement: async () => undefined,
+		retireBlobSettlement: async () => undefined,
+		abortBlobSettlementStage: async () => undefined,
+		getExcludePatterns: () => [],
+		persistBlobQueue: async () => undefined,
+		clearPersistedBlobQueue: async () => undefined,
+		getPreservedUnresolvedEntries: () => [],
+		onPreservedUnresolvedChanged: () => undefined,
+		hasPendingBlobIntentForPath: () => false,
+		replayPendingBlobIntents: async () => undefined,
+		trace: () => undefined,
+		scheduleTraceStateSnapshot: () => undefined,
+		refreshStatusBar: () => undefined,
+		log: () => undefined,
+	} as any);
+	(orchestrator as any).blobSync = fakeManager;
+	(orchestrator as any).blobRuntimeAuthorities.set(fakeManager, {
+		scope: { host: "test", vaultId: "test", localDeviceId: "test" },
+		vaultSync: {},
+		token: { identity: "test", epoch: 1 },
+	});
+
+	orchestrator.markStartupReady("test-startup");
+	assert(!uploadOpen && !downloadOpen, "startup/layout readiness alone opens neither transfer gate");
+	orchestrator.markUploadAuthorityReady("test-provider-sync");
+	assert(uploadOpen && downloadOpen, "authoritative provider reconcile opens both transfer gates");
+	orchestrator.revokeUploadAuthority("test-provider-disconnect");
+	assert(
+		!uploadOpen && !downloadOpen && uploadCloseCount === 1 && downloadCloseCount === 1,
+		"provider disconnect revokes both upload and download authority",
+	);
+
+	(orchestrator as any).blobSync = null;
+	const retiredFile = new TFile();
+	const retiring = {
+		consumeRemoteOverwriteBackupRename: (file: TFile, oldPath: string) =>
+			file === retiredFile && oldPath === "retiring.png",
+	} as BlobSyncManager;
+	(orchestrator as any).retiringBlobSyncs.add(retiring);
+	assert(
+		orchestrator.consumeRemoteOverwriteBackupRename(retiredFile, "retiring.png"),
+		"operation-owned rename tickets remain visible through a retiring manager",
+	);
+}
+
+console.log("\n--- Test 15d.1: stop retirement blocks refresh until persistence and cleanup drain ---");
+{
+	const persistGate = deferred<void>();
+	const destroyGate = deferred<void>();
+	const retiredScope = {
+		host: "https://old.example.test",
+		vaultId: "old-vault",
+		localDeviceId: "device-a",
+	};
+	let persistedRetirementScope: typeof retiredScope | null = null;
+	let destroyStarted = 0;
+	let replacementStarts = 0;
+	const fakeManager = {
+		get isUploadGateOpen() { return true; },
+		get isDownloadGateOpen() { return true; },
+		closeUploadGate: () => undefined,
+		closeDownloadGate: () => undefined,
+		exportQueue: () => ({ uploads: [{}], downloads: [] }),
+		destroy: async () => {
+			destroyStarted++;
+			await destroyGate.promise;
+		},
+	} as unknown as BlobSyncManager;
+	const orchestrator = new AttachmentOrchestrator({
+		app: {
+			workspace: {
+				layoutReady: true,
+				onLayoutReady: () => undefined,
+			},
+		} as any,
+		getVaultSync: () => ({}) as any,
+		getRuntimeConfig: () => ({ enableAttachmentSync: true }) as any,
+		getServerSupportsAttachments: () => true,
+		getTraceHttpContext: () => undefined,
+		getBlobHashCache: () => ({}),
+		getBlobSettledRefs: () => ({}),
+		getBlobSettledSourceVersions: () => ({}),
+		getBlobSettlementStages: () => ({}),
+		captureBlobRuntimeAuthority: () => ({ identity: "test", epoch: 1 }),
+		isBlobRuntimeAuthorityCurrent: () => true,
+		isUploadAuthoritySourceReady: () => true,
+		onBlobSettledRefsChanged: () => undefined,
+		stageBlobSettlement: async () => undefined,
+		finalizeBlobSettlement: async () => undefined,
+		retireBlobSettlement: async () => undefined,
+		abortBlobSettlementStage: async () => undefined,
+		getExcludePatterns: () => [],
+		getBlobQueuePersistenceScope: () => ({ ...retiredScope }),
+		persistBlobQueue: async (_snapshot: unknown, scope: typeof retiredScope) => {
+			persistedRetirementScope = { ...scope };
+			await persistGate.promise;
+		},
+		clearPersistedBlobQueue: async () => undefined,
+		getPreservedUnresolvedEntries: () => [],
+		onPreservedUnresolvedChanged: () => undefined,
+		hasPendingBlobIntentForPath: () => false,
+		replayPendingBlobIntents: async () => undefined,
+		trace: () => undefined,
+		scheduleTraceStateSnapshot: () => undefined,
+		refreshStatusBar: () => undefined,
+		log: () => undefined,
+	} as any);
+	(orchestrator as any).blobSync = fakeManager;
+	(orchestrator as any).blobQueuePersistenceScopes.set(fakeManager, { ...retiredScope });
+	(orchestrator as any).blobRuntimeAuthorities.set(fakeManager, {
+		scope: { ...retiredScope },
+		vaultSync: {},
+		token: { identity: "test", epoch: 1 },
+	});
+	(orchestrator as any).start = () => { replacementStarts++; };
+
+	const stopping = orchestrator.stop("idb-degraded-test");
+	await Promise.resolve();
+	assert(destroyStarted === 1, "retirement marks the old manager destroyed before queue persistence waits");
+	assert(
+		JSON.stringify(persistedRetirementScope) === JSON.stringify(retiredScope),
+		"retirement persists with the manager's captured authority scope",
+	);
+	const refreshing = orchestrator.refresh("capability-race-test");
+	await Promise.resolve();
+	assert(replacementStarts === 0, "refresh cannot start a replacement while queue persistence is pending");
+	persistGate.resolve();
+	await Promise.resolve();
+	await Promise.resolve();
+	assert(replacementStarts === 0, "refresh still waits for in-flight manager cleanup after persistence");
+	destroyGate.resolve();
+	await Promise.all([stopping, refreshing]);
+	assert(replacementStarts === 1, "refresh starts exactly one replacement after full retirement");
+	assert(
+		(orchestrator as any).retiringBlobSyncs.size === 0
+			&& (orchestrator as any).retiringBlobSyncTasks.size === 0,
+		"retirement registries are empty before replacement authority can proceed",
+	);
+}
+
+console.log("\n--- Test 15d.1a: setup-link scope changes cannot relabel a retiring queue ---");
+{
+	const oldScope = {
+		host: "https://old.example.test",
+		vaultId: "old-vault",
+		localDeviceId: "device-a",
+	};
+	const newScope = {
+		host: "https://new.example.test",
+		vaultId: "new-vault",
+		localDeviceId: "device-a",
+	};
+	let currentScope = { ...oldScope };
+	let runtimeConfig = {
+		enableAttachmentSync: true,
+		host: oldScope.host,
+		token: "token",
+		vaultId: oldScope.vaultId,
+		maxAttachmentSizeKB: 1024,
+		attachmentConcurrency: 1,
+		debug: false,
+	};
+	const persistedScopes: Array<typeof oldScope> = [];
+	const observedMap = {
+		observe: () => undefined,
+		unobserve: () => undefined,
+		get: () => undefined,
+	};
+	const app = {
+		workspace: {
+			layoutReady: true,
+			onLayoutReady: () => undefined,
+		},
+		vault: {
+			configDir: ".obsidian",
+			getFiles: () => [],
+			getAbstractFileByPath: () => null,
+			adapter: { stat: async () => null },
+		},
+	} as any;
+	const vaultSync = {
+		pathToBlob: observedMap,
+		blobTombstones: observedMap,
+		getBlobRef: () => undefined,
+		isBlobTombstoned: () => false,
+	} as any;
+	const orchestrator = new AttachmentOrchestrator({
+		app,
+		getVaultSync: () => vaultSync,
+		getRuntimeConfig: () => runtimeConfig as any,
+		getServerSupportsAttachments: () => true,
+		getTraceHttpContext: () => undefined,
+		getBlobHashCache: () => ({}),
+		getBlobSettledRefs: () => ({}),
+		getBlobSettledSourceVersions: () => ({}),
+		getBlobSettlementStages: () => ({}),
+		captureBlobRuntimeAuthority: () => ({ identity: "test", epoch: 1 }),
+		isBlobRuntimeAuthorityCurrent: () => true,
+		isUploadAuthoritySourceReady: () => false,
+		onBlobSettledRefsChanged: () => undefined,
+		stageBlobSettlement: async () => undefined,
+		finalizeBlobSettlement: async () => undefined,
+		retireBlobSettlement: async () => undefined,
+		abortBlobSettlementStage: async () => undefined,
+		getExcludePatterns: () => [],
+		getBlobQueuePersistenceScope: () => ({ ...currentScope }),
+		persistBlobQueue: async (_snapshot, scope) => {
+			persistedScopes.push({ ...scope });
+		},
+		clearPersistedBlobQueue: async () => undefined,
+		getPreservedUnresolvedEntries: () => [],
+		onPreservedUnresolvedChanged: () => undefined,
+		hasPendingBlobIntentForPath: () => false,
+		replayPendingBlobIntents: async () => undefined,
+		trace: () => undefined,
+		scheduleTraceStateSnapshot: () => undefined,
+		refreshStatusBar: () => undefined,
+		log: () => undefined,
+	} as any);
+	orchestrator.start("old-scope", false);
+	const oldManager = orchestrator.manager!;
+	(oldManager as any).exportQueue = () => ({
+		uploads: [{ path: "assets/from-old-vault.png" }],
+		downloads: [],
+	});
+
+	// Setup-link writes new settings before initSync retires the old manager.
+	currentScope = { ...newScope };
+	runtimeConfig = {
+		...runtimeConfig,
+		host: newScope.host,
+		vaultId: newScope.vaultId,
+	};
+	await orchestrator.stop("setup-link-host-vault-change");
+	assert(
+		JSON.stringify(persistedScopes) === JSON.stringify([oldScope]),
+		"old manager queue keeps its original host/vault/device scope after settings change",
+	);
+
+	await orchestrator.refresh("setup-link-restart");
+	const replacement = orchestrator.manager;
+	assert(
+		replacement !== null
+			&& replacement !== oldManager
+			&& JSON.stringify(orchestrator.getQueuePersistenceScope(replacement))
+				=== JSON.stringify(newScope),
+		"refresh captures the new scope only for the replacement manager",
+	);
+	await orchestrator.destroy();
+}
+
+console.log("\n--- Test 15d.2: destroy joins a fire-and-forget stop retirement ---");
+{
+	const destroyGate = deferred<void>();
+	let managerDestroyCalls = 0;
+	let orchestratorDestroyed = false;
+	const fakeManager = {
+		closeUploadGate: () => undefined,
+		closeDownloadGate: () => undefined,
+		exportQueue: () => ({ uploads: [], downloads: [] }),
+		destroy: async () => {
+			managerDestroyCalls++;
+			await destroyGate.promise;
+		},
+	} as unknown as BlobSyncManager;
+	const orchestrator = new AttachmentOrchestrator({
+		app: {
+			workspace: {
+				layoutReady: true,
+				onLayoutReady: () => undefined,
+			},
+		} as any,
+		getVaultSync: () => ({}) as any,
+		getRuntimeConfig: () => ({ enableAttachmentSync: true }) as any,
+		getServerSupportsAttachments: () => true,
+		getTraceHttpContext: () => undefined,
+		getBlobHashCache: () => ({}),
+		getBlobSettledRefs: () => ({}),
+		getBlobSettledSourceVersions: () => ({}),
+		getBlobSettlementStages: () => ({}),
+		captureBlobRuntimeAuthority: () => ({ identity: "test", epoch: 1 }),
+		isBlobRuntimeAuthorityCurrent: () => true,
+		isUploadAuthoritySourceReady: () => true,
+		onBlobSettledRefsChanged: () => undefined,
+		stageBlobSettlement: async () => undefined,
+		finalizeBlobSettlement: async () => undefined,
+		retireBlobSettlement: async () => undefined,
+		abortBlobSettlementStage: async () => undefined,
+		getExcludePatterns: () => [],
+		persistBlobQueue: async () => undefined,
+		clearPersistedBlobQueue: async () => undefined,
+		getPreservedUnresolvedEntries: () => [],
+		onPreservedUnresolvedChanged: () => undefined,
+		hasPendingBlobIntentForPath: () => false,
+		replayPendingBlobIntents: async () => undefined,
+		trace: () => undefined,
+		scheduleTraceStateSnapshot: () => undefined,
+		refreshStatusBar: () => undefined,
+		log: () => undefined,
+	} as any);
+	(orchestrator as any).blobSync = fakeManager;
+	const stopping = orchestrator.stop("fire-and-forget-test");
+	const destroying = orchestrator.destroy().then(() => { orchestratorDestroyed = true; });
+	await Promise.resolve();
+	assert(managerDestroyCalls === 1, "concurrent stop/destroy retires the manager exactly once");
+	assert(!orchestratorDestroyed, "orchestrator destroy waits for the already-retiring manager");
+	destroyGate.resolve();
+	await Promise.all([stopping, destroying]);
+	assert(orchestratorDestroyed, "orchestrator destroy completes only after old manager cleanup");
+}
+
+console.log("\n--- Test 15d.3: pre-layout authority reruns replay + inventory before gates open ---");
+{
+	let layoutCallback: (() => void) | undefined;
+	let uploadOpen = false;
+	let downloadOpen = false;
+	const order: string[] = [];
+	const reconciled = deferred<void>();
+	const fakeManager = {
+		get isUploadGateOpen() { return uploadOpen; },
+		get isDownloadGateOpen() { return downloadOpen; },
+		pendingUploads: 0,
+		pendingDownloads: 0,
+		setInventoryGateReady: (ready: boolean) => {
+			if (ready) order.push("inventory-ready");
+		},
+		reconcile: () => {
+			order.push("reconcile");
+			reconciled.resolve();
+			return { uploadQueued: 0, downloadQueued: 0, skipped: 0 };
+		},
+		openUploadGate: () => { order.push("upload-open"); uploadOpen = true; },
+		openDownloadGate: () => { order.push("download-open"); downloadOpen = true; },
+		closeUploadGate: () => { uploadOpen = false; },
+		closeDownloadGate: () => { downloadOpen = false; },
+	} as unknown as BlobSyncManager;
+	const orchestrator = new AttachmentOrchestrator({
+		app: {
+			workspace: {
+				layoutReady: false,
+				onLayoutReady: (callback: () => void) => { layoutCallback = callback; },
+			},
+		} as any,
+		getVaultSync: () => null,
+		getRuntimeConfig: () => ({}) as any,
+		getServerSupportsAttachments: () => true,
+		getTraceHttpContext: () => undefined,
+		getBlobHashCache: () => ({}),
+		getBlobSettledRefs: () => ({}),
+		getBlobSettledSourceVersions: () => ({}),
+		getBlobSettlementStages: () => ({}),
+		captureBlobRuntimeAuthority: () => ({ identity: "test", epoch: 1 }),
+		isBlobRuntimeAuthorityCurrent: () => true,
+		isUploadAuthoritySourceReady: () => true,
+		onBlobSettledRefsChanged: () => undefined,
+		stageBlobSettlement: async () => undefined,
+		finalizeBlobSettlement: async () => undefined,
+		retireBlobSettlement: async () => undefined,
+		abortBlobSettlementStage: async () => undefined,
+		getExcludePatterns: () => [],
+		persistBlobQueue: async () => undefined,
+		clearPersistedBlobQueue: async () => undefined,
+		getPreservedUnresolvedEntries: () => [],
+		onPreservedUnresolvedChanged: () => undefined,
+		hasPendingBlobIntentForPath: () => false,
+		replayPendingBlobIntents: async () => { order.push("replay"); },
+		trace: () => undefined,
+		scheduleTraceStateSnapshot: () => undefined,
+		refreshStatusBar: () => undefined,
+		log: () => undefined,
+	} as any);
+	(orchestrator as any).blobSync = fakeManager;
+	(orchestrator as any).blobRuntimeAuthorities.set(fakeManager, {
+		scope: { host: "test", vaultId: "test", localDeviceId: "test" },
+		vaultSync: {},
+		token: { identity: "test", epoch: 1 },
+	});
+
+	orchestrator.markStartupReady("pre-layout-startup");
+	orchestrator.markUploadAuthorityReady("pre-layout-authoritative-pass");
+	assert(
+		order.length === 0 && !uploadOpen && !downloadOpen,
+		"pre-layout authority performs no inventory and opens neither transfer gate",
+	);
+	layoutCallback?.();
+	await reconciled.promise;
+	await Promise.resolve();
+	assert(
+		order.slice(0, 3).join(",") === "inventory-ready,replay,reconcile",
+		"layout readiness opens inventory, then replays journal before authoritative scan",
+	);
+	assert(
+		uploadOpen && downloadOpen
+			&& order.indexOf("upload-open") > order.indexOf("reconcile")
+			&& order.indexOf("download-open") > order.indexOf("reconcile"),
+		"both transfer gates open only after the post-layout authority barrier",
+	);
+}
+
+console.log("\n--- Test 15d.4: manager inventory itself is a pre-layout no-op ---");
+{
+	const { manager, put } = makeHarness();
+	put("pre-layout-local.png", bytes("local file not yet safe to inventory"));
+	(manager as any).vaultSync = {
+		getBlobRef: () => undefined,
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map(),
+	};
+	manager.closeUploadGate("pre-layout-test");
+	manager.setInventoryGateReady(false, "pre-layout-test");
+	const deferredResult = manager.reconcile("authoritative", []);
+	assert(
+		deferredResult.uploadQueued === 0 && manager.pendingUploads === 0,
+		"pre-layout reconcile neither scans nor queues a provisional local upload",
+	);
+	manager.setInventoryGateReady(true, "layout-ready-test");
+	const readyResult = manager.reconcile("authoritative", []);
+	assert(
+		readyResult.uploadQueued === 1 && manager.pendingUploads === 1,
+		"the same file is inventoried only after layout authority is explicit",
+	);
+	await manager.destroy();
+}
+
 // ── Test 16: kickUploadDrain does not start duplicate drain loops ────────────
 
 console.log("\n--- Test 16: concurrent kickUploadDrain does not duplicate drain ---");
@@ -692,6 +2854,7 @@ console.log("\n--- Test 16: concurrent kickUploadDrain does not duplicate drain 
 console.log("\n--- Test 17: importQueue preserves rerunResets near cap ---");
 {
 	const { manager } = makeHarness();
+	(manager as any).__defaultBlobRefs.set("at-cap.png", { hash: "xyz", size: 200 });
 
 	// Prevent drain from starting during import (we just want to check state)
 	(manager as any).uploadDraining = true;
@@ -788,15 +2951,12 @@ console.log("\n--- Test 19: Multi-pass: unknown-baseline preserved blob is NOT r
 	// This is the critical system-level test for blob paths.
 	// Scenario:
 	// 1. Local blob file exists (image.png).
-	// 2. Remote tombstone arrives with knownHash === null (unknown baseline).
+	// 2. A legacy remote tombstone arrives without self-contained deletedRef.
 	// 3. Handler preserves file as unresolved, does NOT clear tombstone.
 	// 4. reconcile() runs (next pass) — sees local file + tombstoned path.
 	// 5. Assert: file is NOT queued for upload, tombstone is NOT cleared.
-	// 6. handleFileChange() fires for the same path without user modification.
-	//    (e.g., filesystem watcher spurious event)
-	//    Wait — actually handleFileChange clears the guard intentionally, because
-	//    a vault modify event means the USER edited the file. So this scenario
-	//    specifically tests reconcile()'s own scan, not handleFileChange.
+	// 6. A later watcher modify event still cannot clear remote-delete Attention;
+	//    resolving that tombstone requires an explicit dashboard action.
 
 	const { manager, put, traces } = makeHarness();
 
@@ -805,18 +2965,21 @@ console.log("\n--- Test 19: Multi-pass: unknown-baseline preserved blob is NOT r
 
 	// Simulate: the vaultSync has this path tombstoned
 	const vaultSync = {
-		pathToBlob: new Map([["attachments/preserved.png", { hash: "remote-hash-old", size: 100 }]]),
+		pathToBlob: new Map(),
+		getAuthoritativeBlobDeleteSnapshot: (path: string) =>
+			path === "attachments/preserved.png"
+				? { fingerprint: "legacy-delete-without-ref" }
+				: null,
 		isBlobTombstoned: (path: string) => path === "attachments/preserved.png",
 		blobTombstones: new Map([["attachments/preserved.png", true]]),
-		getBlobRef: () => null,
+		getBlobRef: () => undefined,
 		setBlobRef: () => { throw new Error("setBlobRef should not be called"); },
 		deleteBlobRef: () => {},
 	};
 	(manager as any).vaultSync = vaultSync;
 
-	// Step 2–3: Remote tombstone with unknown baseline
-	// Call handleRemoteDelete with knownHash = null
-	await (manager as any).handleRemoteDelete("attachments/preserved.png", null);
+	// Step 2–3: legacy tombstone with no deletedRef baseline.
+	await (manager as any).handleRemoteDelete("attachments/preserved.png");
 
 	// Verify: path is in preservedUnresolvedPaths
 	assert(
@@ -865,8 +3028,8 @@ console.log("\n--- Test 19: Multi-pass: unknown-baseline preserved blob is NOT r
 		"blob tombstone still present after reconcile",
 	);
 
-	// Step 6: Now simulate user explicitly modifying the file (handleFileChange)
-	// This should clear the guard and allow future uploads
+	// Step 6: A watcher modify event cannot implicitly resolve remote-delete
+	// authority; only explicit dashboard Keep-local/Accept-remote may do that.
 	(manager as any).preservedUnresolvedPaths.add("attachments/preserved.png"); // re-add for clarity
 	const fakeFile = new TFile() as TFile & { path: string; stat: { mtime: number; size: number } };
 	fakeFile.path = "attachments/preserved.png";
@@ -875,8 +3038,8 @@ console.log("\n--- Test 19: Multi-pass: unknown-baseline preserved blob is NOT r
 	// Suppress the debounce timer to avoid async issues
 	manager.handleFileChange(fakeFile);
 	assert(
-		!(manager as any).preservedUnresolvedPaths.has("attachments/preserved.png"),
-		"preserved-unresolved cleared after user modify event (handleFileChange)",
+		(manager as any).preservedUnresolvedPaths.has("attachments/preserved.png"),
+		"remote-delete Attention survives an ordinary watcher modify event",
 	);
 
 	await manager.destroy();
@@ -885,14 +3048,16 @@ console.log("\n--- Test 19: Multi-pass: unknown-baseline preserved blob is NOT r
 console.log("\n--- Test 20: Multi-pass: stat-failure during blob remote-delete becomes preserve-unresolved ---");
 {
 	const { manager, put, traces } = makeHarness();
-
-	put("attachments/stat-fails.png", bytes("file data"));
+	const path = "attachments/stat-fails.png";
+	const data = bytes("file data");
+	const hash = await sha256Hex(data);
+	put(path, data);
+	installRemoteDeleteAuthority(manager, path, { hash, size: data.byteLength });
 
 	// Override stat to throw
 	(manager as any).app.vault.adapter.stat = async () => { throw new Error("EBUSY"); };
 
-	// Call handleRemoteDelete with a known hash (so it enters the stat path)
-	await (manager as any).handleRemoteDelete("attachments/stat-fails.png", "known-hash-abc123");
+	await (manager as any).handleRemoteDelete(path);
 
 	// File should NOT be deleted (check that delete was not called)
 	const deleteTrace = traces.find((t) => t.msg === "remote-delete-applied");
@@ -904,7 +3069,7 @@ console.log("\n--- Test 20: Multi-pass: stat-failure during blob remote-delete b
 	);
 	assert(!!preserveTrace, "preserve trace emitted with stat-failed reason");
 	assert(
-		(manager as any).preservedUnresolvedPaths.has("attachments/stat-fails.png"),
+		(manager as any).preservedUnresolvedPaths.has(path),
 		"blob path recorded as preserved-unresolved after stat failure",
 	);
 }
@@ -942,6 +3107,161 @@ console.log("\n--- Test 21: processUpload skips preserved-unresolved paths (queu
 		(t) => t.source === "blob" && t.msg === "upload-skipped-preserved-unresolved",
 	);
 	assert(!!skipTrace, "trace emitted for skipped preserved-unresolved upload");
+}
+
+console.log("\n--- Test 22: upload commit rejects same-TFile mutation and TFile ABA ---");
+for (const replacementMode of ["same-file", "tfile-aba"] as const) {
+	const { manager, put, replace } = makeHarness();
+	const path = `upload-${replacementMode}.png`;
+	const first = bytes(`C1-${replacementMode}`);
+	const second = bytes(`C2-${replacementMode}`);
+	const firstHash = await sha256Hex(first);
+	const secondHash = await sha256Hex(second);
+	put(path, first);
+	let currentRef: { hash: string; size: number } | undefined;
+	const committed: Array<{ hash: string; size: number }> = [];
+	(manager as any).vaultSync = {
+		getBlobRef: () => currentRef,
+		setBlobRef: (_path: string, hash: string, size: number) => {
+			committed.push({ hash, size });
+			currentRef = { hash, size };
+		},
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map(),
+	};
+	(manager as any).kickUploadDrain = () => {};
+	const firstUploadStarted = deferred<void>();
+	const releaseFirstUpload = deferred<void>();
+	(manager as any).blobClient = {
+		exists: async () => [],
+		upload: async (hash: string) => {
+			if (hash === firstHash) {
+				firstUploadStarted.resolve();
+				await releaseFirstUpload.promise;
+				return;
+			}
+			assert(hash === secondHash, `${replacementMode}: rerun uploads C2`);
+		},
+	};
+	(manager as any).enqueueUpload(path, 0, first.byteLength);
+	const item = (manager as any).uploadQueue.get(path);
+	item.status = "processing";
+	const firstAttempt = (manager as any).processUpload(item);
+	await firstUploadStarted.promise;
+	if (replacementMode === "same-file") put(path, second);
+	else replace(path, second);
+	(manager as any).enqueueUpload(path, 0, second.byteLength);
+	releaseFirstUpload.resolve();
+	await firstAttempt;
+
+	assert(committed.length === 0, `${replacementMode}: stale C1 ref is never published`);
+	assert(item.status === "pending", `${replacementMode}: C2 remains queued after stale settlement`);
+	item.status = "processing";
+	await (manager as any).processUpload(item);
+	assert(
+		committed.length === 1 && committed[0]?.hash === secondHash,
+		`${replacementMode}: only the fresh C2 ref is published`,
+	);
+	assert(
+		committed[0]?.size === second.byteLength,
+		`${replacementMode}: C2 commit uses the freshly verified size`,
+	);
+}
+
+console.log("\n--- Test 23: promise-reaction edits before settled-base publication fail closed ---");
+for (const replacementMode of ["same-file", "tfile-aba"] as const) {
+	const { manager, files, put, replace } = makeHarness();
+	const path = `upload-microtask-${replacementMode}.png`;
+	const first = bytes(`C1-${replacementMode}`);
+	const second = bytes(`C2-${replacementMode}`);
+	const firstHash = await sha256Hex(first);
+	const initial = put(path, first);
+	(manager as any).hashCache[path] = {
+		mtime: initial.file.stat.mtime,
+		size: initial.file.stat.size,
+		hash: firstHash,
+	};
+
+	let currentRef: { hash: string; size: number } | undefined;
+	const commits: Array<{ hash: string; diskContent: string }> = [];
+	(manager as any).vaultSync = {
+		getBlobRef: () => currentRef,
+		setBlobRef: (_path: string, hash: string, size: number) => {
+			commits.push({
+				hash,
+				diskContent: text(files.get(path)!.data),
+			});
+			currentRef = { hash, size };
+		},
+		isBlobTombstoned: () => false,
+		pathToBlob: new Map(),
+	};
+	(manager as any).blobClient = {
+		exists: async (hashes: string[]) => hashes,
+		upload: async () => { throw new Error("deduplicated upload should not PUT"); },
+	};
+	(manager as any).kickUploadDrain = () => {};
+	(manager as any).enqueueUpload(path, 0, first.byteLength);
+	const item = (manager as any).uploadQueue.get(path);
+	item.status = "processing";
+
+	const originalReadAndHash = (manager as any).readAndHashExactExistingFile.bind(manager);
+	let armPostResolutionRace = true;
+	(manager as any).readAndHashExactExistingFile = async (...args: unknown[]) => {
+		const snapshot = await originalReadAndHash(...args);
+		if (armPostResolutionRace) {
+			armPostResolutionRace = false;
+			queueMicrotask(() => {
+				if (replacementMode === "same-file") put(path, second);
+				else replace(path, second);
+				// Model the vault change event that advances the in-flight queue item.
+				(manager as any).enqueueUpload(path, 0, second.byteLength);
+			});
+		}
+		return snapshot;
+	};
+
+	await (manager as any).processUpload(item);
+	assert(
+		commits.length === 1
+			&& commits[0]?.hash === firstHash
+			&& commits[0]?.diskContent === text(first),
+		`${replacementMode}: H1 commits only while the exact C1 disk epoch is current`,
+	);
+	assert(
+		item.status === "pending" && item.needsRerun === false,
+		`${replacementMode}: post-commit C2 queue advance is retained as a rerun`,
+	);
+
+	(manager as any).readAndHashExactExistingFile = originalReadAndHash;
+	item.status = "processing";
+	await (manager as any).processUpload(item);
+	assert(
+		commits.length === 1,
+		`${replacementMode}: C2 captured before H1 settlement is never auto-published`,
+	);
+	const recovery: any = (manager as any).downloadQueue.get(path);
+	assert(
+		recovery?.hash === firstHash,
+		`${replacementMode}: unknown C2 base schedules the authoritative H1 recovery`,
+	);
+	(manager as any).blobClient = { download: async () => first };
+	recovery.status = "processing";
+	await (manager as any).processDownload(recovery);
+	assert(
+		text(files.get(path)!.data) === text(second),
+		`${replacementMode}: fail-closed recovery preserves the exact C2 disk epoch`,
+	);
+	assert(
+		Array.from(files.values()).some(
+			(stored) => stored.file.path !== path && text(stored.data) === text(first),
+		),
+		`${replacementMode}: fail-closed recovery preserves authoritative H1 in a conflict artifact`,
+	);
+	assert(
+		manager.isPreservedUnresolved(path),
+		`${replacementMode}: pre-settlement C2 is surfaced as durable Attention`,
+	);
 }
 
 // ── Test 24: excluded remote tombstones do not delete local tool files ──────

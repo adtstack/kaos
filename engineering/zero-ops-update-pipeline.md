@@ -35,14 +35,19 @@ Users install via Deploy to Cloudflare. We keep this path because onboarding spe
 Because workflows are stripped during deploy clone, KAOS bootstraps them using a GitHub deep-link:
 
 - Plugin collects the generated repo URL.
-- Plugin opens a pre-filled GitHub file creation URL for `.github/workflows/kaos-ops.yml`.
+- Plugin opens a pre-filled GitHub file creation URL for
+  `.github/workflows/kaos-ops-v2.yml`.
 - User clicks **Commit changes** once.
+
+The versioned filename also gives existing deployments a collision-free path
+to add the migration-capable workflow while retaining their older
+`kaos-ops.yml`.
 
 This gives the repo an update entrypoint without terminal or PAT setup.
 
 ### Phase 3: repo-local execution
 
-`kaos-ops.yml` is generated as a self-contained dispatch workflow inside the
+`kaos-ops-v2.yml` is generated as a self-contained dispatch workflow inside the
 deployment repo:
 
 - update action: pull release artifact and apply
@@ -63,9 +68,15 @@ the updater. That token needs GitHub Contents: read access to the release repo.
 
 ## Safety valves
 
-### 1) Migration gate (hard stop)
+### 1) Migration gate (explicit opt-in)
 
-Updater reads `kaos-server-manifest.json`. If `migrationRequired: true`, automatic update aborts with a clear error and manual migration instruction.
+Updater reads `kaos-server-manifest.json`. If `migrationRequired: true`, the
+update stops before changing files unless the operator explicitly enables the
+workflow's `allow_migration_update` input. That confirmation is passed to the
+updater as `KAOS_ALLOW_MIGRATION_UPDATE=true`; the default remains fail-closed.
+For an incompatible schema release, the plugin is updated first and pauses sync
+until the v2 workflow updates the server. This order ensures the operator has
+the migration-capable workflow before the old server updater is invoked.
 
 ### 2) Wrangler drift warning
 
@@ -101,4 +112,7 @@ Deploy is an install primitive, not an in-place update primitive. Re-deploy can 
 - One-time: initialize updater from plugin settings.
 - Normal update: click **Update server** in KAOS settings, run the opened workflow with `update`, then let KAOS watch the Worker version.
 - Rollback: run workflow with `revert`.
-- Migration-required release: workflow fails safely with explicit guidance.
+- Migration-required release: update the plugin first (sync pauses), review the
+  release notes and take a current snapshot, create and commit updater v2, then
+  explicitly enable `allow_migration_update` for that workflow run. Without the
+  opt-in, the workflow fails safely before changing files.

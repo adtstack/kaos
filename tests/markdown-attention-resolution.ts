@@ -29,13 +29,16 @@ interface FixtureOptions {
 		ready: StableMarkdownReadResult,
 	) => Promise<StableMarkdownReadResult>;
 	editorContent?: string;
-	onRecordBaselineText?: () => void;
+	onBaselineDiskRead?: () => void;
+	failBaselineDiskRead?: boolean;
+	saveDiskIndex?: () => Promise<void>;
 }
 
 function makeFixture(options: FixtureOptions = {}) {
 	const path = "notes/attention-fence.md";
 	const content = "local preserved content\n";
 	const file = new FakeTFile(path, { mtime: 41, size: content.length });
+	let activeFile: TFile = file;
 	const doc = new Y.Doc();
 	const ytext = doc.getText("attention");
 	let deletedPath = true;
@@ -53,6 +56,7 @@ function makeFixture(options: FixtureOptions = {}) {
 	};
 	let ensureCalls = 0;
 	let clearCalls = 0;
+	let baselineRecordCalls = 0;
 	let diskPort: DiskIngestPort | null = null;
 	let diskIndex = {};
 	const openView = options.editorContent === undefined
@@ -70,7 +74,7 @@ function makeFixture(options: FixtureOptions = {}) {
 				? { fingerprint: deleteFingerprint }
 				: null,
 		getActiveFileIdsForPath: (candidate: string) => candidate === path ? [...activeFileIds] : [],
-		getTextForPath: () => null,
+		getTextForPath: (candidate: string) => candidate === path && !deletedPath ? ytext : null,
 		getFileIdForText: () => undefined,
 		isPendingRenameTarget: () => false,
 		serverAckTracker: {
@@ -102,8 +106,12 @@ function makeFixture(options: FixtureOptions = {}) {
 	const controller = new ReconciliationController({
 		app: {
 			vault: {
-				getAbstractFileByPath: (candidate: string) => candidate === path ? file : null,
-				read: async () => content,
+				getAbstractFileByPath: (candidate: string) => candidate === path ? activeFile : null,
+				read: async () => {
+					options.onBaselineDiskRead?.();
+					if (options.failBaselineDiskRead) throw new Error("baseline disk read failed");
+					return content;
+				},
 				adapter: { stat: async () => file.stat },
 			},
 			workspace: {
@@ -124,7 +132,9 @@ function makeFixture(options: FixtureOptions = {}) {
 		getEditorBindings: () => null,
 		getDiskIndex: () => diskIndex,
 		setDiskIndex: (next) => { diskIndex = next; },
-		recordBaselineText: () => options.onRecordBaselineText?.(),
+		recordBaselineText: () => {
+			baselineRecordCalls++;
+		},
 		isMarkdownPathSyncable: () => true,
 		shouldBlockFrontmatterIngest: () => false,
 		refreshServerCapabilities: async () => {},
@@ -135,7 +145,7 @@ function makeFixture(options: FixtureOptions = {}) {
 			: Promise.resolve(ready),
 		getAwaitingFirstProviderSyncAfterStartup: () => false,
 		setAwaitingFirstProviderSyncAfterStartup: () => {},
-		saveDiskIndex: async () => {},
+		saveDiskIndex: options.saveDiskIndex ?? (async () => {}),
 		refreshStatusBar: () => {},
 		trace: () => {},
 		scheduleTraceStateSnapshot: () => {},
@@ -152,6 +162,16 @@ function makeFixture(options: FixtureOptions = {}) {
 		get diskPort() { return diskPort; },
 		get ensureCalls() { return ensureCalls; },
 		get clearCalls() { return clearCalls; },
+		get baselineRecordCalls() { return baselineRecordCalls; },
+		get diskIndex() { return diskIndex; },
+		get ytext() { return ytext; },
+		replaceActiveFileSameBytes() {
+			activeFile = new FakeTFile(path, { mtime: 41, size: content.length });
+		},
+		replaceCrdtContent(next: string) {
+			ytext.delete(0, ytext.length);
+			ytext.insert(0, next);
+		},
 		setDeletedPath(value: boolean) { deletedPath = value; },
 		setDeleteFingerprint(value: string) { deleteFingerprint = value; },
 		setActiveFileIds(value: string[]) { activeFileIds = [...value]; },
@@ -160,6 +180,14 @@ function makeFixture(options: FixtureOptions = {}) {
 		},
 		get attentionEpisodeId() { return entry?.episodeId ?? null; },
 	};
+}
+
+async function ignoreResolutionFailure(work: Promise<void>): Promise<void> {
+	try {
+		await work;
+	} catch {
+		// Failing closed is an acceptable public outcome for a stale settlement.
+	}
 }
 
 const expectedEpisode = {
@@ -248,7 +276,7 @@ console.log("\n--- Markdown Attention resolution fencing ---");
 {
 	let fixture!: ReturnType<typeof makeFixture>;
 	fixture = makeFixture({
-		onRecordBaselineText: () => {
+		onBaselineDiskRead: () => {
 			fixture.replaceAttentionEpisode("episode-2");
 		},
 	});
@@ -258,11 +286,92 @@ console.log("\n--- Markdown Attention resolution fencing ---");
 			"remote-delete-missing-baseline",
 			expectedEpisode,
 		),
-		/Attention state changed/,
+		/Attention state changed|Local state changed before the baseline settled/,
 	);
 	assert.equal(fixture.ensureCalls, 1, "Keep-local published before the second delete arrived");
 	assert.equal(fixture.clearCalls, 0, "the replacement marker is not cleared");
 	assert.equal(fixture.attentionEpisodeId, "episode-2", "the replacement episode remains actionable");
+	fixture.doc.destroy();
+}
+
+// Reviving the CRDT is not enough to resolve Attention. The exact disk TFile
+// reviewed by the action must still own the path after the baseline read.
+{
+	let fixture!: ReturnType<typeof makeFixture>;
+	fixture = makeFixture({
+		onBaselineDiskRead: () => { fixture.replaceActiveFileSameBytes(); },
+	});
+	await ignoreResolutionFailure(
+		fixture.controller.keepLocalRemoteDeletedMarkdown(
+			fixture.path,
+			"remote-delete-missing-baseline",
+			expectedEpisode,
+		),
+	);
+	assert.equal(fixture.ensureCalls, 1, "TFile ABA occurs after keep-local publishes the reviewed bytes");
+	assert.equal(fixture.clearCalls, 0, "same-path/same-bytes TFile ABA retains the marker");
+	assert.equal(fixture.attentionEpisodeId, "episode-1", "TFile ABA leaves the exact episode actionable");
+	assert.equal(fixture.baselineRecordCalls, 0, "TFile ABA cannot publish a settled baseline");
+	fixture.doc.destroy();
+}
+
+// A failed durable save makes updateDiskIndexForPath return false even though
+// its in-memory bookkeeping ran. Attention must remain until a later exact
+// settlement can prove durability.
+{
+	const fixture = makeFixture({
+		saveDiskIndex: async () => { throw new Error("disk-index save failed"); },
+	});
+	await ignoreResolutionFailure(
+		fixture.controller.keepLocalRemoteDeletedMarkdown(
+			fixture.path,
+			"remote-delete-missing-baseline",
+			expectedEpisode,
+		),
+	);
+	assert.equal(fixture.ensureCalls, 1, "save-failure scenario reaches keep-local publication");
+	assert.equal(fixture.clearCalls, 0, "failed disk-index save retains the marker");
+	assert.equal(fixture.attentionEpisodeId, "episode-1", "save failure leaves the episode actionable");
+	fixture.doc.destroy();
+}
+
+// A baseline read failure is also an unresolved settlement, never permission
+// to clear the episode whose local bytes could not be re-verified.
+{
+	const fixture = makeFixture({ failBaselineDiskRead: true });
+	await ignoreResolutionFailure(
+		fixture.controller.keepLocalRemoteDeletedMarkdown(
+			fixture.path,
+			"remote-delete-missing-baseline",
+			expectedEpisode,
+		),
+	);
+	assert.equal(fixture.ensureCalls, 1, "read-failure scenario reaches keep-local publication");
+	assert.equal(fixture.clearCalls, 0, "failed baseline read retains the marker");
+	assert.equal(fixture.attentionEpisodeId, "episode-1", "read failure leaves the episode actionable");
+	assert.equal(fixture.baselineRecordCalls, 0, "failed baseline read publishes no baseline");
+	fixture.doc.destroy();
+}
+
+// A provider transaction can advance the just-revived Y.Text while baseline
+// settlement is awaiting disk I/O. The local baseline must not authorize
+// clearing Attention for that different CRDT state.
+{
+	const providerContent = "new provider content during baseline read\n";
+	let fixture!: ReturnType<typeof makeFixture>;
+	fixture = makeFixture({
+		onBaselineDiskRead: () => { fixture.replaceCrdtContent(providerContent); },
+	});
+	await ignoreResolutionFailure(
+		fixture.controller.keepLocalRemoteDeletedMarkdown(
+			fixture.path,
+			"remote-delete-missing-baseline",
+			expectedEpisode,
+		),
+	);
+	assert.equal(fixture.ytext.toString(), providerContent, "provider update wins the baseline-read interleaving");
+	assert.equal(fixture.clearCalls, 0, "CRDT advance during baseline settlement retains the marker");
+	assert.equal(fixture.attentionEpisodeId, "episode-1", "CRDT advance leaves the episode actionable");
 	fixture.doc.destroy();
 }
 

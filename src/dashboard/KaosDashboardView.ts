@@ -6,6 +6,9 @@ import type {
 	DashboardRecentChange,
 	DashboardRecentChanges,
 	DashboardFileHistoryAttempt,
+	DashboardLegacyMissingBlobResolution,
+	DashboardLegacyMissingBlobResolutionChoice,
+	DashboardLegacyMissingBlobResolutionTarget,
 	DashboardRemoteDeleteResolution,
 	DashboardRemoteDeleteResolutionChoice,
 	DashboardRemoteDeleteResolutionResult,
@@ -31,6 +34,12 @@ import {
 	type ThreeWayMergeSegment,
 } from "../utils/threeWayMerge";
 import { ConfirmModal } from "../ui/ConfirmModal";
+import {
+	captureConflictResolutionSnapshot,
+	resolveConflictArtifactWithCas,
+	type ConflictResolutionChoice,
+	type ConflictResolutionSnapshot,
+} from "./conflictResolution";
 
 export const KAOS_DASHBOARD_VIEW_TYPE = "kaos-dashboard";
 
@@ -47,6 +56,10 @@ export interface KaosDashboardActions {
 	resolveRemoteDeleteAttention(
 		target: DashboardRemoteDeleteResolutionTarget,
 		choice: DashboardRemoteDeleteResolutionChoice,
+	): Promise<DashboardRemoteDeleteResolutionResult>;
+	resolveLegacyMissingBlobAttention(
+		target: DashboardLegacyMissingBlobResolutionTarget,
+		choice: DashboardLegacyMissingBlobResolutionChoice,
 	): Promise<DashboardRemoteDeleteResolutionResult>;
 }
 
@@ -488,6 +501,36 @@ export class KaosDashboardView extends ItemView {
 						resolution.acceptRemoteDeleteUnavailableReason ?? undefined,
 					);
 					acceptDeleteButton.classList.add("mod-warning");
+				} else if (resolution?.kind === "legacy-missing-blob") {
+					const pending = this.pendingAttentionEpisodes.has(
+						attentionEpisodeKey(path, resolution),
+					);
+					this.button(
+						actions,
+						pending ? "Resolving…" : "Download remote file",
+						() => this.confirmLegacyMissingBlobResolution(
+							path,
+							resolution,
+							"download-remote",
+						),
+						pending || !resolution.canDownloadRemote,
+						resolution.unavailableReason
+							?? (resolution.remoteRef === null
+								? "The remote attachment no longer exists."
+								: undefined),
+					);
+					const keepAbsentButton = this.button(
+						actions,
+						"Keep local absence",
+						() => this.confirmLegacyMissingBlobResolution(
+							path,
+							resolution,
+							"keep-local-absent",
+						),
+						pending || !resolution.canKeepLocalAbsent,
+						resolution.unavailableReason ?? undefined,
+					);
+					keepAbsentButton.classList.add("mod-warning");
 				} else {
 					this.button(
 						actions,
@@ -599,6 +642,71 @@ export class KaosDashboardView extends ItemView {
 		});
 	}
 
+	private confirmLegacyMissingBlobResolution(
+		path: string,
+		resolution: DashboardLegacyMissingBlobResolution,
+		choice: DashboardLegacyMissingBlobResolutionChoice,
+	): Promise<void> {
+		const episodeKey = attentionEpisodeKey(path, resolution);
+		if (this.pendingAttentionEpisodes.has(episodeKey)) {
+			return Promise.reject(new Error(`A resolution is already pending for "${path}".`));
+		}
+		this.pendingAttentionEpisodes.add(episodeKey);
+		this.render();
+		const downloading = choice === "download-remote";
+		return new Promise((resolve, reject) => {
+			new ConfirmModal(
+				this.app,
+				downloading ? "Download remote attachment?" : "Keep the local deletion?",
+				downloading
+					? `Restore "${path}" from the exact remote version currently shown?`
+					: `Keep "${path}" absent and delete only the exact remote version currently shown? Other devices will observe the deletion.`,
+				async () => {
+					try {
+						const result = await this.deps.actions.resolveLegacyMissingBlobAttention(
+							{ path, ...resolution },
+							choice,
+						);
+						new Notice(result.status === "pending"
+							? result.message
+							: downloading
+								? `Remote attachment queued: ${path}`
+								: `Local absence kept: ${path}`,
+							7_000,
+						);
+						this.removeResolvedLegacyMissingEpisode(path, resolution);
+						resolve();
+					} catch (err) {
+						reject(err instanceof Error ? err : new Error(String(err)));
+					} finally {
+						this.pendingAttentionEpisodes.delete(episodeKey);
+						this.render();
+					}
+				},
+				downloading ? "mod-cta" : "mod-warning",
+			).open();
+		});
+	}
+
+	private removeResolvedLegacyMissingEpisode(
+		path: string,
+		resolution: DashboardLegacyMissingBlobResolution,
+	): void {
+		if (!this.data) return;
+		const nextAttention = this.data.attention.filter((item) => {
+			if (item.path !== path || item.resolution?.kind !== "legacy-missing-blob") {
+				return true;
+			}
+			return item.resolution.episodeId !== resolution.episodeId;
+		});
+		if (nextAttention.length === this.data.attention.length) return;
+		this.data = {
+			...this.data,
+			attention: nextAttention,
+			attentionTotalCount: Math.max(0, this.data.attentionTotalCount - 1),
+		};
+	}
+
 	private removeResolvedAttentionEpisode(
 		path: string,
 		resolution: DashboardRemoteDeleteResolution,
@@ -702,9 +810,17 @@ export class KaosDashboardView extends ItemView {
 			return;
 		}
 		const [originalText, artifactText] = await Promise.all([
-			this.app.vault.cachedRead(originalFile),
-			this.app.vault.cachedRead(artifactFile),
+			this.app.vault.read(originalFile),
+			this.app.vault.read(artifactFile),
 		]);
+		const resolutionSnapshot = captureConflictResolutionSnapshot({
+			artifactPath: artifact.artifactPath,
+			originalPath: artifact.inferredOriginalPath,
+			artifactFile,
+			originalFile,
+			artifactText,
+			originalText,
+		});
 		const baseHash = this.deps.getConflictMergeBaseHash?.(artifact.artifactPath) ?? null;
 		const baseText = baseHash ? await this.deps.getBaselineText?.(baseHash) ?? null : null;
 		new ConflictDiffModal(this.app, {
@@ -714,27 +830,19 @@ export class KaosDashboardView extends ItemView {
 			artifactText,
 			baseHash,
 			baseText,
-			onResolve: (choice) => this.resolveConflictArtifact(artifact, choice),
+			onResolve: (choice) => this.resolveConflictArtifact(resolutionSnapshot, choice),
 		}).open();
 	}
 
 	private async resolveConflictArtifact(
-		artifact: DashboardConflictArtifact,
+		snapshot: ConflictResolutionSnapshot,
 		choice: ConflictResolutionChoice,
 	): Promise<void> {
-		const artifactFile = this.app.vault.getAbstractFileByPath(artifact.artifactPath);
-		const originalFile = this.app.vault.getAbstractFileByPath(artifact.inferredOriginalPath);
-		if (!(artifactFile instanceof TFile) || !(originalFile instanceof TFile)) {
-			throw new Error("Both the conflict note and original note are required.");
-		}
-		if (choice.kind === "artifact") {
-			const artifactText = await this.app.vault.cachedRead(artifactFile);
-			await this.app.vault.modify(originalFile, artifactText);
-		} else if (choice.kind === "merged") {
-			await this.app.vault.modify(originalFile, choice.mergedText);
-		}
-		await this.app.vault.delete(artifactFile);
-		this.deps.clearConflictMergeBase?.(artifact.artifactPath);
+		await resolveConflictArtifactWithCas(this.app.vault, snapshot, choice);
+		// The artifact is intentionally retained because Obsidian exposes no
+		// identity-aware conditional delete. Keep its merge base as well so a later
+		// review still has the exact three-way context; normal persisted-state GC
+		// removes it after the user deletes the artifact manually.
 		await this.refresh(true);
 	}
 
@@ -743,11 +851,6 @@ export class KaosDashboardView extends ItemView {
 		new Notice("Path copied.");
 	}
 }
-
-type ConflictResolutionChoice =
-	| { kind: "original" }
-	| { kind: "artifact" }
-	| { kind: "merged"; mergedText: string };
 
 interface ConflictDiffModalData {
 	artifactPath: string;
@@ -1044,10 +1147,10 @@ class ConflictDiffModal extends Modal {
 			this.app,
 			useMerged ? "Apply merged result?" : useArtifact ? "Use conflict artifact?" : "Keep original note?",
 			useMerged
-				? `Replace "${this.data.originalPath}" with the merged result, then delete "${this.data.artifactPath}"?`
+				? `Replace "${this.data.originalPath}" with the merged result? "${this.data.artifactPath}" will be retained for review.`
 				: useArtifact
-				? `Replace "${this.data.originalPath}" with the conflict artifact content, then delete "${this.data.artifactPath}"?`
-				: `Keep "${this.data.originalPath}" as-is and delete "${this.data.artifactPath}"?`,
+				? `Replace "${this.data.originalPath}" with the conflict artifact content? "${this.data.artifactPath}" will be retained for review.`
+				: `Keep "${this.data.originalPath}" as-is? "${this.data.artifactPath}" will be retained for review.`,
 			() => this.applyResolution(choice),
 			useMerged ? "Apply merged" : useArtifact ? "Use artifact" : "Keep original",
 			"Cancel",
@@ -1059,10 +1162,10 @@ class ConflictDiffModal extends Modal {
 			await this.data.onResolve(choice);
 			new Notice(
 				choice.kind === "merged"
-					? "Conflict resolved using merged result."
+					? "Conflict resolved using merged result. Artifact retained for review."
 					: choice.kind === "artifact"
-						? "Conflict resolved using artifact."
-						: "Conflict artifact deleted.",
+						? "Conflict resolved using artifact. Artifact retained for review."
+						: "Original kept. Conflict artifact retained for review.",
 			);
 			this.close();
 		} catch (err) {
@@ -1198,7 +1301,7 @@ function formatUnknown(err: unknown): string {
 
 function attentionEpisodeKey(
 	path: string,
-	resolution: DashboardRemoteDeleteResolution,
+	resolution: Pick<DashboardRemoteDeleteResolution, "fileKind" | "episodeId">,
 ): string {
 	return `${resolution.fileKind}:${path}:${resolution.episodeId}`;
 }

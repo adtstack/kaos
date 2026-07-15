@@ -1,7 +1,14 @@
 import * as Y from "yjs";
 import { EditorBindingManager } from "../src/sync/editorBinding";
-import { ORIGIN_DISK_SYNC_RECOVER_BOUND } from "../src/sync/origins";
+import {
+	ORIGIN_DISK_SYNC_RECOVER_BOUND,
+	ORIGIN_RESTORE,
+} from "../src/sync/origins";
 import { PRODUCT_EVENT_KIND } from "../src/observability/productEventKinds";
+import {
+	buildTypingAwareness,
+	KAOS_TYPING_AWARENESS_FIELD,
+} from "../src/sync/remoteTypingGuard";
 import { isMarkdownSyncable } from "../src/types";
 
 let passed = 0;
@@ -45,8 +52,11 @@ function buildManagerFixture(options: {
 	const facetText = doc.getText("facet");
 	facetText.insert(0, "old server text");
 
+	const awarenessStates = new Map<number, Record<string, unknown>>([[1, {}]]);
 	const providerAwareness = {
 		provider: true,
+		clientID: 1,
+		getStates: () => awarenessStates,
 		setLocalStateField: () => {},
 	};
 	const vaultSync = {
@@ -109,7 +119,7 @@ function buildManagerFixture(options: {
 	};
 
 	(manager as unknown as { bindings: Map<string, unknown> }).bindings.set("leaf-1", binding);
-	return { manager, binding, flightEvents };
+	return { manager, binding, flightEvents, awarenessStates };
 }
 
 function installLiveCmReplacement(manager: unknown, binding: {
@@ -451,6 +461,8 @@ console.log("\n--- Test 13: local repair patches are blocked during recent user 
 		leafId,
 		at: Date.now(),
 	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "stale repair content");
 
 	const transaction = {
 		docChanged: true,
@@ -484,6 +496,106 @@ console.log("\n--- Test 13: local repair patches are blocked during recent user 
 		"shield does not masquerade as editor.heal.applied",
 	);
 	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 13a: provider advance in the shield microtask gap is never overwritten ---");
+{
+	const { manager, binding, flightEvents } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	const leafId = "leaf-1";
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "local repair C2");
+	(manager as unknown as {
+		pendingYTextPatches: WeakMap<Y.Text, unknown>;
+	}).pendingYTextPatches.set(binding.ytext, {
+		origin: ORIGIN_DISK_SYNC_RECOVER_BOUND,
+		path: binding.path,
+		leafId,
+		at: Date.now(),
+	});
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "local repair C2" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+
+	(manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+	// Deterministic microtask-gap injection: a provider update advances the same
+	// Y.Text after shield activation but before its queued editor writeback.
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "provider C3");
+	await Promise.resolve();
+
+	assertEq(binding.ytext.toString(), "provider C3", "newer provider content survives the shield gap");
+	assertEq(
+		flightEvents.some((event) => event.kind === PRODUCT_EVENT_KIND.editorAuthorityShieldApplied),
+		false,
+		"stale shield snapshot emits no applied event",
+	);
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has(leafId),
+		false,
+		"stale shield remains detached when current CRDT and editor differ",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 13b: same-bytes Y.Text replacement in the shield gap is never overwritten ---");
+{
+	const { manager, binding, flightEvents } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	const leafId = "leaf-1";
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "local repair C2");
+	(manager as unknown as {
+		pendingYTextPatches: WeakMap<Y.Text, unknown>;
+	}).pendingYTextPatches.set(binding.ytext, {
+		origin: ORIGIN_DISK_SYNC_RECOVER_BOUND,
+		path: binding.path,
+		leafId,
+		at: Date.now(),
+	});
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "local repair C2" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+
+	(manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+	const replacementDoc = new Y.Doc();
+	const replacement = replacementDoc.getText("replacement");
+	replacement.insert(0, "local repair C2");
+	(manager as unknown as {
+		vaultSync: { getTextForPath: (path: string) => Y.Text | null };
+	}).vaultSync.getTextForPath = (path) => path === binding.path ? replacement : null;
+	await Promise.resolve();
+
+	assertEq(replacement.toString(), "local repair C2", "replacement Y.Text keeps its same bytes unchanged");
+	assertEq(binding.ytext.toString(), "local repair C2", "retired Y.Text is not used for editor writeback");
+	assertEq(
+		flightEvents.some((event) => event.kind === PRODUCT_EVENT_KIND.editorAuthorityShieldApplied),
+		false,
+		"Y.Text identity replacement emits no applied event",
+	);
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has(leafId),
+		false,
+		"identity replacement is left detached for a fresh authority review",
+	);
+	clearPendingHealthChecks(manager);
+	replacementDoc.destroy();
 }
 
 console.log("\n--- Test 14: provider-origin patches that preserve editor content are allowed ---");
@@ -523,7 +635,7 @@ console.log("\n--- Test 14: provider-origin patches that preserve editor content
 	clearPendingHealthChecks(manager);
 }
 
-console.log("\n--- Test 15: provider-origin patches that erase recent typing are blocked ---");
+console.log("\n--- Test 15: destructive provider-origin patches are never shielded ---");
 {
 	const { manager, binding, flightEvents } = buildManagerFixture({
 		lastEditorChangeAgeMs: 100,
@@ -552,19 +664,16 @@ console.log("\n--- Test 15: provider-origin patches that erase recent typing are
 		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
 	}).filterRiskyNonUserPatch(transaction);
 
-	assertEq(result !== transaction, true, "destructive provider-origin patch is replaced with a shield transaction");
+	assertEq(result, transaction, "destructive provider-origin patch remains a normal Yjs transaction");
 	assertEq(
 		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has(leafId),
-		false,
-		"binding is detached before the provider patch can erase recent typing",
+		true,
+		"binding remains attached for a destructive provider-origin update",
 	);
-
-	await Promise.resolve();
-	assertEq(binding.ytext.toString(), "typing now", "recent editor content is written back to CRDT after provider shield");
 	assertEq(
 		flightEvents.some((event) => event.kind === PRODUCT_EVENT_KIND.editorAuthorityShieldApplied),
-		true,
-		"provider shield emits editor.authority_shield.applied",
+		false,
+		"provider-origin update never emits editor.authority_shield.applied",
 	);
 	clearPendingHealthChecks(manager);
 }
@@ -612,7 +721,7 @@ console.log("\n--- Test 16: provider-origin patches that erase idle open editor 
 	clearPendingHealthChecks(manager);
 }
 
-console.log("\n--- Test 17: destructive patch without origin capture is blocked during recent typing ---");
+console.log("\n--- Test 17: destructive patch without origin capture is never shielded ---");
 {
 	const { manager, binding, flightEvents } = buildManagerFixture({
 		lastEditorChangeAgeMs: 100,
@@ -631,27 +740,21 @@ console.log("\n--- Test 17: destructive patch without origin capture is blocked 
 		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
 	}).filterRiskyNonUserPatch(transaction);
 
-	assertEq(result !== transaction, true, "missing-origin destructive patch is shielded during recent typing");
+	assertEq(result, transaction, "missing-origin destructive patch remains a normal Yjs transaction");
 	assertEq(
 		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has(leafId),
-		false,
-		"binding is detached before a missing-origin patch can erase recent typing",
-	);
-
-	await Promise.resolve();
-	assertEq(binding.ytext.toString(), "typing now", "editor authority is restored after missing-origin shield");
-	assertEq(
-		flightEvents.some((event) =>
-			event.kind === PRODUCT_EVENT_KIND.editorAuthorityShieldApplied &&
-			event.data?.blockedOrigin === null
-		),
 		true,
-		"missing-origin shield records blockedOrigin=null",
+		"binding remains attached when origin capture is missing",
+	);
+	assertEq(
+		flightEvents.some((event) => event.kind === PRODUCT_EVENT_KIND.editorAuthorityShieldApplied),
+		false,
+		"missing-origin update never emits editor.authority_shield.applied",
 	);
 	clearPendingHealthChecks(manager);
 }
 
-console.log("\n--- Test 18: stale origin capture still falls back to recent-typing shield ---");
+console.log("\n--- Test 18: stale local origin capture is never shielded ---");
 {
 	const { manager, binding, flightEvents } = buildManagerFixture({
 		lastEditorChangeAgeMs: 100,
@@ -678,16 +781,16 @@ console.log("\n--- Test 18: stale origin capture still falls back to recent-typi
 		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
 	}).filterRiskyNonUserPatch(transaction);
 
-	assertEq(result !== transaction, true, "stale-origin destructive patch is shielded during recent typing");
-	await Promise.resolve();
-	assertEq(binding.ytext.toString(), "typing now", "editor authority is restored after stale-origin fallback shield");
+	assertEq(result, transaction, "stale local-origin patch remains a normal Yjs transaction");
 	assertEq(
-		flightEvents.some((event) =>
-			event.kind === PRODUCT_EVENT_KIND.editorAuthorityShieldApplied &&
-			event.data?.blockedOrigin === null
-		),
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has(leafId),
 		true,
-		"stale-origin fallback records blockedOrigin=null",
+		"binding remains attached for stale origin capture",
+	);
+	assertEq(
+		flightEvents.some((event) => event.kind === PRODUCT_EVENT_KIND.editorAuthorityShieldApplied),
+		false,
+		"stale-origin update never emits editor.authority_shield.applied",
 	);
 	clearPendingHealthChecks(manager);
 }
@@ -715,6 +818,136 @@ console.log("\n--- Test 19: missing-origin preserving patch is allowed during re
 		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has("leaf-1"),
 		true,
 		"binding remains attached for missing-origin preserving patch",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a: unknown string origin is never treated as a local repair ---");
+{
+	const { manager, binding, flightEvents } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	const leafId = "leaf-1";
+	(manager as unknown as {
+		pendingYTextPatches: WeakMap<Y.Text, unknown>;
+	}).pendingYTextPatches.set(binding.ytext, {
+		origin: "unknown-string-origin",
+		path: binding.path,
+		leafId,
+		at: Date.now(),
+	});
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "typing" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+
+	const result = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+
+	assertEq(result, transaction, "unknown string origin remains a normal Yjs transaction");
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has(leafId),
+		true,
+		"binding remains attached for an unknown string origin",
+	);
+	assertEq(
+		flightEvents.some((event) => event.kind === PRODUCT_EVENT_KIND.editorAuthorityShieldApplied),
+		false,
+		"unknown string origin never emits editor.authority_shield.applied",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a2: explicit snapshot restore is never undone by the authority shield ---");
+{
+	const { manager, binding, flightEvents } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	const leafId = "leaf-1";
+	(manager as unknown as {
+		pendingYTextPatches: WeakMap<Y.Text, unknown>;
+	}).pendingYTextPatches.set(binding.ytext, {
+		origin: ORIGIN_RESTORE,
+		path: binding.path,
+		leafId,
+		at: Date.now(),
+	});
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "restored snapshot" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+
+	const result = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+
+	assertEq(result, transaction, "snapshot restore patch remains authoritative during recent typing");
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has(leafId),
+		true,
+		"snapshot restore does not detach the editor binding",
+	);
+	assertEq(
+		flightEvents.some((event) => event.kind === PRODUCT_EVENT_KIND.editorAuthorityShieldApplied),
+		false,
+		"snapshot restore never emits editor.authority_shield.applied",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19b: remote typing awareness never cancels normal or IME input ---");
+{
+	const { manager, binding, awarenessStates } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	let warningCalls = 0;
+	(manager as unknown as {
+		warnConcurrentTyping: () => void;
+	}).warnConcurrentTyping = () => {
+		warningCalls++;
+	};
+	awarenessStates.set(2, {
+		[KAOS_TYPING_AWARENESS_FIELD]: buildTypingAwareness(
+			binding.path,
+			"Phone",
+			Date.now(),
+		),
+	});
+
+	for (const userEvent of ["input.type", "input.type.compose"]) {
+		const transaction = {
+			docChanged: true,
+			startState: binding.cm.state,
+			newDoc: { toString: () => "typing now!" },
+			annotation: () => userEvent,
+			isUserEvent: (event: string) =>
+				userEvent === event || userEvent.startsWith(`${event}.`),
+		};
+		const result = (manager as unknown as {
+			filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+		}).filterRiskyNonUserPatch(transaction);
+		assertEq(result, transaction, `${userEvent} passes through during remote typing awareness`);
+	}
+
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has("leaf-1"),
+		true,
+		"remote typing awareness does not detach the editor binding",
+	);
+	assertEq(
+		warningCalls,
+		2,
+		"normal and IME input both request a non-blocking advisory warning",
 	);
 	clearPendingHealthChecks(manager);
 }

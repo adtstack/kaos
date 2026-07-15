@@ -15,12 +15,15 @@ const MARKDOWN_CONFLICT_ARTIFACT_NAME_RE =
 const BLOB_CONFLICT_ARTIFACT_NAME_RE =
 	/^(.+) \(KAOS remote conflict (\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)\)(?: (\d+))?(\.[^/.]+)?$/;
 
+const BLOB_LOCAL_BACKUP_ARTIFACT_NAME_RE =
+	/^(.+) \(KAOS local backup (\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z) ([0-9a-f]{16})\)(\.[^/.]+)?$/;
+
 const BASE_BLOB_CONFLICT_ARTIFACT_NAME_RE =
-	/^.+ \(KAOS remote conflict \d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\)(?:\.[^/.]+)?$/;
+	/^(?:.+ \(KAOS remote conflict \d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\)|.+ \(KAOS local backup \d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z [0-9a-f]{16}\))(?:\.[^/.]+)?$/;
 
 export type ConflictArtifactKind = "markdown" | "blob";
 export type MarkdownConflictArtifactSource = "disk" | "crdt" | "editor";
-export type ConflictArtifactSource = MarkdownConflictArtifactSource | "remote";
+export type ConflictArtifactSource = MarkdownConflictArtifactSource | "remote" | "local";
 export type ConflictArtifactOriginalConfidence = "candidate" | "possibly-truncated";
 
 export interface BuildMarkdownConflictArtifactPathOptions {
@@ -46,7 +49,8 @@ export function isMarkdownConflictArtifactPath(path: string): boolean {
 
 export function isBlobConflictArtifactPath(path: string): boolean {
 	const name = normalizeSlashes(path).split("/").pop() ?? path;
-	return BLOB_CONFLICT_ARTIFACT_NAME_RE.test(name);
+	return BLOB_CONFLICT_ARTIFACT_NAME_RE.test(name)
+		|| BLOB_LOCAL_BACKUP_ARTIFACT_NAME_RE.test(name);
 }
 
 export function isBaseBlobConflictArtifactPath(path: string): boolean {
@@ -86,20 +90,37 @@ export function parseBlobConflictArtifactPath(path: string): ParsedConflictArtif
 	const normalized = normalizeSlashes(path);
 	const { dir, name } = splitPath(normalized);
 	const match = BLOB_CONFLICT_ARTIFACT_NAME_RE.exec(name);
-	if (!match) return null;
-	const base = match[1];
-	const stamp = match[2];
+	if (match) {
+		const base = match[1];
+		const stamp = match[2];
+		if (!base || !stamp) return null;
+		const ext = match[4] ?? "";
+		return {
+			kind: "blob",
+			artifactPath: normalized,
+			inferredOriginalPath: `${dir}${base}${ext}`,
+			originalPathConfidence: base.length >= 180 ? "possibly-truncated" : "candidate",
+			source: "remote",
+			deviceName: null,
+			timestamp: stampToIso(stamp),
+			copyIndex: parseCopyIndex(match[3]),
+		};
+	}
+	const localBackup = BLOB_LOCAL_BACKUP_ARTIFACT_NAME_RE.exec(name);
+	if (!localBackup) return null;
+	const base = localBackup[1];
+	const stamp = localBackup[2];
 	if (!base || !stamp) return null;
-	const ext = match[4] ?? "";
+	const ext = localBackup[4] ?? "";
 	return {
 		kind: "blob",
 		artifactPath: normalized,
 		inferredOriginalPath: `${dir}${base}${ext}`,
 		originalPathConfidence: base.length >= 180 ? "possibly-truncated" : "candidate",
-		source: "remote",
+		source: "local",
 		deviceName: null,
 		timestamp: stampToIso(stamp),
-		copyIndex: parseCopyIndex(match[3]),
+		copyIndex: null,
 	};
 }
 
@@ -166,6 +187,26 @@ export function buildBlobConflictArtifactPath(path: string, date = new Date()): 
 export function buildBlobConflictArtifactCopyPath(basePath: string, copyIndex: number): string {
 	if (!Number.isInteger(copyIndex) || copyIndex <= 1) return basePath;
 	return basePath.replace(/(\.[^/.]+)?$/, ` ${copyIndex}$1`);
+}
+
+export function buildBlobLocalBackupArtifactPath(
+	path: string,
+	operationId: string,
+	date = new Date(),
+): string {
+	if (!/^[0-9a-f]{16}$/.test(operationId)) {
+		throw new Error("blob local backup operationId must be 16 lowercase hex characters");
+	}
+	const normalized = normalizeSlashes(path);
+	const { dir, name } = splitPath(normalized);
+	const dot = name.lastIndexOf(".");
+	const stamp = formatConflictArtifactStamp(date);
+	const suffix = ` (KAOS local backup ${stamp} ${operationId})`;
+	const ext = dot > 0 ? name.slice(dot) : "";
+	const base = dot > 0 ? name.slice(0, dot) : name;
+	const maxBase = Math.max(20, 255 - suffix.length - ext.length - 4);
+	const cappedBase = base.length > maxBase ? base.slice(0, maxBase) : base;
+	return `${dir}${cappedBase}${suffix}${ext}`;
 }
 
 function normalizeSlashes(path: string): string {

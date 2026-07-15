@@ -164,7 +164,7 @@ console.log("\n--- Authoritative blob delete snapshot: live references always wi
 	assertEqual(snapshot?.device, "phone", "blob snapshot exposes device");
 	assertEqual(
 		snapshot?.fingerprint,
-		JSON.stringify(["blob", blobPath, 500, "phone"]),
+		JSON.stringify(["blob", blobPath, 500, "phone", "absent"]),
 		"blob fingerprint covers the current tombstone",
 	);
 

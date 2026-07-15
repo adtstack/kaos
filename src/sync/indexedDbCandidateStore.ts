@@ -61,8 +61,32 @@ export async function getOrCreateLocalDeviceId(
 	randomUuid: () => string = defaultRandomUuid,
 	dbName = DB_NAME,
 ): Promise<string> {
+	return (await getOrCreateLocalDeviceIdentity(
+		indexedDbFactory,
+		randomUuid,
+		dbName,
+	)).localDeviceId;
+}
+
+export interface LocalDeviceIdentity {
+	localDeviceId: string;
+	status: "existing" | "created";
+}
+
+/**
+ * Return whether this install already owned its device-local identity.
+ *
+ * Migration code must not infer this from data.json because that file may be
+ * copied or synced from another device. The metadata transaction is the only
+ * device-local first-run boundary shared by every attachment authority store.
+ */
+export async function getOrCreateLocalDeviceIdentity(
+	indexedDbFactory: IndexedDbFactoryLike = defaultIndexedDbFactory(),
+	randomUuid: () => string = defaultRandomUuid,
+	dbName = DB_NAME,
+): Promise<LocalDeviceIdentity> {
 	const db = await openAckDatabase(indexedDbFactory, dbName);
-	return getOrCreateMetadataValue(db, LOCAL_DEVICE_ID_KEY, randomUuid);
+	return getOrCreateMetadataIdentity(db, LOCAL_DEVICE_ID_KEY, randomUuid);
 }
 
 export async function sha256Hex(input: string): Promise<string> {
@@ -106,11 +130,11 @@ function deleteValue(db: IDBDatabase, storeName: string, key: string): Promise<v
 	});
 }
 
-function getOrCreateMetadataValue(
+function getOrCreateMetadataIdentity(
 	db: IDBDatabase,
 	key: string,
 	createValue: () => string,
-): Promise<string> {
+): Promise<LocalDeviceIdentity> {
 	return new Promise((resolve, reject) => {
 		const tx = db.transaction(METADATA_STORE, "readwrite");
 		tx.oncomplete = () => {
@@ -120,16 +144,28 @@ function getOrCreateMetadataValue(
 		tx.onerror = () => reject(tx.error ?? new Error("IndexedDB transaction failed"));
 		tx.onabort = () => reject(tx.error ?? new Error("IndexedDB transaction aborted"));
 
-		let createdOrExisting: string | null = null;
+		let createdOrExisting: LocalDeviceIdentity | null = null;
 		const store = tx.objectStore(METADATA_STORE);
 		const getReq = store.get(key);
 		getReq.onsuccess = () => {
 			if (typeof getReq.result === "string" && getReq.result.length > 0) {
-				createdOrExisting = getReq.result;
+				createdOrExisting = {
+					localDeviceId: getReq.result,
+					status: "existing",
+				};
 				return;
 			}
-			createdOrExisting = createValue();
-			store.put(createdOrExisting, key);
+			if (getReq.result !== undefined) {
+				reject(new Error("IndexedDB local device ID metadata is corrupt"));
+				return;
+			}
+			const localDeviceId = createValue();
+			if (typeof localDeviceId !== "string" || localDeviceId.length === 0) {
+				reject(new Error("Generated local device ID is invalid"));
+				return;
+			}
+			createdOrExisting = { localDeviceId, status: "created" };
+			store.put(localDeviceId, key);
 		};
 		getReq.onerror = () => reject(getReq.error ?? new Error("IndexedDB local device ID read failed"));
 	});

@@ -130,13 +130,28 @@ export interface RestoreRecoveryVersionOptions {
 	path: string;
 	content: string;
 	expectedCurrentHash: string | null;
+	/**
+	 * Exact live bytes captured when `expectedCurrentHash` was computed. When
+	 * supplied, matching bytes allow the final restore path to stay synchronous
+	 * from its authority fences through the Y.Doc transaction.
+	 */
+	expectedCurrentContent?: string | null;
 	device?: string;
+	/** Final synchronous fence for open-editor or service-instance authority. */
+	canCommitRestore?: () => boolean;
+	/** Final synchronous disk identity fence, evaluated immediately before commit. */
+	isDiskRestoreAuthorityCurrent?: () => boolean;
 }
 
 export interface RestoreRecoveryVersionResult {
 	restored: boolean;
 	undeletion: boolean;
-	reason?: "current-hash-mismatch" | "missing-live-text";
+	reason?:
+		| "current-hash-mismatch"
+		| "missing-live-text"
+		| "live-authority-changed"
+		| "file-identity-moved"
+		| "disk-authority-changed";
 	currentHash: string | null;
 }
 
@@ -440,9 +455,58 @@ export async function restoreRecoveryVersionToLiveDoc(
 	options: RestoreRecoveryVersionOptions,
 ): Promise<RestoreRecoveryVersionResult> {
 	const path = normalizeVaultPath(options.path);
-	const currentContent = getLiveContentForFileVersion(liveDoc, options.fileId, path);
-	const currentHash = currentContent === null ? null : await sha256Hex(currentContent);
-	if (currentHash !== options.expectedCurrentHash) {
+	const livePathToId = liveDoc.getMap<string>("pathToId");
+	const liveIdToText = liveDoc.getMap<Y.Text>("idToText");
+	const liveMeta = liveDoc.getMap<unknown>("meta");
+	const liveUsesV2 = usesV2MetaPathModel(liveDoc);
+	const liveUsesNestedMeta = usesNestedMetaModel(liveDoc);
+	const initialPaths = collectActiveMarkdownPaths(liveDoc);
+	const initialFileIdPaths = [...initialPaths.entries()]
+		.filter(([, fileId]) => fileId === options.fileId)
+		.map(([activePath]) => activePath)
+		.sort();
+
+	// A history entry keeps the historical file ID. If that ID is currently
+	// active under a renamed path, restoring the old path must not clear the
+	// renamed file and move its metadata backwards.
+	if (initialFileIdPaths.some((activePath) => activePath !== path)) {
+		return {
+			restored: false,
+			undeletion: false,
+			reason: "file-identity-moved",
+			currentHash: null,
+		};
+	}
+
+	const initialActiveFileId = initialPaths.get(path) ?? null;
+	const targetFileId = initialActiveFileId ?? options.fileId;
+	const initialText = liveIdToText.get(targetFileId) ?? null;
+	if (initialActiveFileId && !initialText) {
+		return {
+			restored: false,
+			undeletion: false,
+			reason: "missing-live-text",
+			currentHash: null,
+		};
+	}
+	const currentContent = initialText?.toJSON() ?? null;
+	const hasCapturedCurrentContent = Object.prototype.hasOwnProperty.call(
+		options,
+		"expectedCurrentContent",
+	);
+	let currentHash: string | null;
+	if (hasCapturedCurrentContent && currentContent === options.expectedCurrentContent) {
+		// The orchestrator already hashed these exact bytes. Skipping a second
+		// async hash is what makes the final disk/CRDT authority boundary atomic
+		// with respect to the JavaScript event loop.
+		currentHash = options.expectedCurrentHash;
+	} else {
+		currentHash = currentContent === null ? null : await sha256Hex(currentContent);
+	}
+	if (
+		currentHash !== options.expectedCurrentHash
+		|| (hasCapturedCurrentContent && currentContent !== options.expectedCurrentContent)
+	) {
 		return {
 			restored: false,
 			undeletion: false,
@@ -451,15 +515,59 @@ export async function restoreRecoveryVersionToLiveDoc(
 		};
 	}
 
-	const livePathToId = liveDoc.getMap<string>("pathToId");
-	const liveIdToText = liveDoc.getMap<Y.Text>("idToText");
-	const liveMeta = liveDoc.getMap<unknown>("meta");
-	const liveUsesV2 = usesV2MetaPathModel(liveDoc);
-	const liveUsesNestedMeta = usesNestedMetaModel(liveDoc);
-	const livePaths = collectActiveMarkdownPaths(liveDoc);
-	const activeFileId = livePaths.get(path);
-	const targetFileId = activeFileId ?? options.fileId;
-	const undeletion = !activeFileId;
+	// sha256Hex is asynchronous. Revalidate the exact target identity/content
+	// after it resolves so an edit or rename during hashing cannot be erased by
+	// the following clear/insert transaction.
+	const currentPaths = collectActiveMarkdownPaths(liveDoc);
+	const currentActiveFileId = currentPaths.get(path) ?? null;
+	const currentFileIdPaths = [...currentPaths.entries()]
+		.filter(([, fileId]) => fileId === options.fileId)
+		.map(([activePath]) => activePath)
+		.sort();
+	const currentText = liveIdToText.get(targetFileId) ?? null;
+	const pathAuthorityCurrent = currentActiveFileId === initialActiveFileId;
+	const historicalIdentityCurrent =
+		currentFileIdPaths.length === initialFileIdPaths.length
+		&& currentFileIdPaths.every((activePath, index) => activePath === initialFileIdPaths[index]);
+	const textAuthorityCurrent =
+		currentText === initialText
+		&& (currentText?.toJSON() ?? null) === currentContent;
+	let externalAuthorityCurrent = true;
+	if (options.canCommitRestore) {
+		try {
+			externalAuthorityCurrent = options.canCommitRestore();
+		} catch {
+			externalAuthorityCurrent = false;
+		}
+	}
+	let diskAuthorityCurrent = true;
+	if (options.isDiskRestoreAuthorityCurrent) {
+		try {
+			diskAuthorityCurrent = options.isDiskRestoreAuthorityCurrent();
+		} catch {
+			diskAuthorityCurrent = false;
+		}
+	}
+	if (
+		!pathAuthorityCurrent
+		|| !historicalIdentityCurrent
+		|| !textAuthorityCurrent
+		|| !externalAuthorityCurrent
+		|| !diskAuthorityCurrent
+	) {
+		return {
+			restored: false,
+			undeletion: false,
+			reason: !diskAuthorityCurrent
+				? "disk-authority-changed"
+				: currentFileIdPaths.some((activePath) => activePath !== path)
+					? "file-identity-moved"
+					: "live-authority-changed",
+			currentHash,
+		};
+	}
+
+	const undeletion = !initialActiveFileId;
 
 	liveDoc.transact(() => {
 		let liveText = liveIdToText.get(targetFileId);

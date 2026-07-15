@@ -9,6 +9,9 @@ import type { TraceRecord } from "../observability/traceContext";
 import type { ProductFlightPathEventInput } from "../observability/traceSink";
 import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
 import {
+	ORIGIN_DISK_SYNC,
+	ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
+	ORIGIN_DISK_SYNC_RECOVER_BOUND,
 	ORIGIN_EDITOR_AUTHORITY_SHIELD,
 	ORIGIN_EDITOR_HEALTH_HEAL,
 } from "./origins";
@@ -45,6 +48,11 @@ const RECENT_EDITOR_REPAIR_DEFER_MS = 1200;
 const RECENT_EDITOR_PATCH_SHIELD_MS = 5000;
 const TYPING_AWARENESS_MIN_INTERVAL_MS = 750;
 const CONCURRENT_TYPING_NOTICE_COOLDOWN_MS = 8_000;
+const EDITOR_AUTHORITY_SHIELD_ORIGINS = new Set<string>([
+	ORIGIN_DISK_SYNC,
+	ORIGIN_DISK_SYNC_RECOVER_BOUND,
+	ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
+]);
 const CM_RESOLVE_RETRY_DELAYS_MS = [80, 160, 320, 640, 1000, 1500, 2000] as const;
 const CM_RESOLVE_DELAYED_ATTEMPT = 5;
 const CM_RESOLVE_IDLE_RETRY_DELAY_MS = 5000;
@@ -997,7 +1005,7 @@ export class EditorBindingManager {
 		}
 	}
 
-	private warnConcurrentTypingBlocked(path: string, remoteTypers: RemoteTypingPeer[], now = Date.now()): void {
+	private warnConcurrentTyping(path: string, remoteTypers: RemoteTypingPeer[], now = Date.now()): void {
 		const lastShownAt = this.concurrentTypingNoticeAtByPath.get(path) ?? 0;
 		if (now - lastShownAt < CONCURRENT_TYPING_NOTICE_COOLDOWN_MS) {
 			return;
@@ -1006,10 +1014,10 @@ export class EditorBindingManager {
 		this.concurrentTypingNoticeAtByPath.set(path, now);
 		const noteName = path.split("/").pop() ?? path;
 		new Notice(
-			`KAOS: Editing paused because ${formatRemoteTypers(remoteTypers)} recently typed in "${noteName}".`,
+			`KAOS: ${formatRemoteTypers(remoteTypers)} also recently typed in "${noteName}". Your edits remain enabled.`,
 			8000,
 		);
-		this.trace?.("editor", "concurrent-typing-blocked", {
+		this.trace?.("editor", "concurrent-typing-warning", {
 			path,
 			remoteTypers: remoteTypers.map((peer) => ({
 				clientId: peer.clientId,
@@ -1195,8 +1203,11 @@ export class EditorBindingManager {
 			const remoteTypers = this.getActiveRemoteTypersForPath(match.binding.path);
 			if (remoteTypers.length === 0) return transaction;
 
-			this.warnConcurrentTypingBlocked(match.binding.path, remoteTypers);
-			return [];
+			// Awareness is advisory only. Cancelling a CodeMirror user transaction
+			// here loses normal and IME/composition input and can look exactly like
+			// a rollback. Yjs remains responsible for merging concurrent edits.
+			this.warnConcurrentTyping(match.binding.path, remoteTypers);
+			return transaction;
 		}
 
 		const match = this.findBindingForState(transaction.startState);
@@ -1306,6 +1317,16 @@ export class EditorBindingManager {
 		editorContent: string;
 		incomingContent: string;
 	}): boolean {
+		// Only a freshly captured, named local repair may be fenced. Provider
+		// objects, y-codemirror objects, null/missing origins, and stale captures
+		// must flow through so the shield cannot turn a legitimate remote Yjs
+		// update into a whole-document editor writeback.
+		if (
+			typeof input.origin !== "string" ||
+			!EDITOR_AUTHORITY_SHIELD_ORIGINS.has(input.origin)
+		) {
+			return false;
+		}
 		if (
 			input.origin === ORIGIN_EDITOR_HEALTH_HEAL ||
 			input.origin === ORIGIN_EDITOR_AUTHORITY_SHIELD
@@ -1373,21 +1394,52 @@ export class EditorBindingManager {
 				? null
 				: Date.now() - binding.lastEditorDocChangeAtMs,
 		});
+		const expectedYText = binding.ytext;
+		const expectedYTextContent = expectedYText.toJSON();
 
 		queueMicrotask(() => {
 			this.editorAuthorityShieldLeafIds.delete(leafId);
 			binding.undoManager.destroy();
-			this.applyEditorAuthorityAfterShield(binding, editorContent, blockedOrigin);
+			this.applyEditorAuthorityAfterShield(
+				binding,
+				editorContent,
+				incomingContent,
+				expectedYText,
+				expectedYTextContent,
+				blockedOrigin,
+			);
 		});
 	}
 
 	private applyEditorAuthorityAfterShield(
 		binding: EditorBinding,
 		fallbackEditorContent: string,
+		expectedIncomingContent: string,
+		expectedYText: Y.Text,
+		expectedYTextContent: string,
 		blockedOrigin: unknown,
 	): void {
 		const file = binding.view.file;
 		if (!file || file.path !== binding.path) return;
+		const currentYText = this.vaultSync.getTextForPath(binding.path);
+		if (
+			currentYText !== expectedYText
+			|| expectedYTextContent !== expectedIncomingContent
+			|| expectedYText.toJSON() !== expectedYTextContent
+		) {
+			// The shield detached y-codemirror before scheduling this microtask.
+			// A provider advance or same-bytes Y.Text identity replacement in that
+			// gap is newer authority; writing the captured editor wholesale would
+			// roll it back. Re-evaluate binding only and leave CRDT untouched.
+			this.trace?.("editor", "editor-authority-shield-stale-snapshot", {
+				path: binding.path,
+				yTextIdentityCurrent: currentYText === expectedYText,
+				yTextContentCurrent: expectedYText.toJSON() === expectedYTextContent,
+				incomingMatchedCapturedCrdt: expectedYTextContent === expectedIncomingContent,
+			});
+			this.bind(binding.view, this.lastDeviceName);
+			return;
+		}
 
 		let editorContent = fallbackEditorContent;
 		try {
@@ -1397,10 +1449,9 @@ export class EditorBindingManager {
 			// blocked patch. That is still the last known editor authority.
 		}
 
-		const ytext = this.vaultSync.getTextForPath(binding.path) ?? binding.ytext;
-		const crdtContent = ytext.toJSON();
+		const crdtContent = currentYText.toJSON();
 		if (crdtContent !== editorContent) {
-			applyDiffToYText(ytext, crdtContent, editorContent, ORIGIN_EDITOR_AUTHORITY_SHIELD);
+			applyDiffToYText(currentYText, crdtContent, editorContent, ORIGIN_EDITOR_AUTHORITY_SHIELD);
 			this.recordFlightPathEvent?.({
 				priority: "important",
 				kind: PRODUCT_EVENT_KIND.editorAuthorityShieldApplied,

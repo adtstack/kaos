@@ -60,8 +60,8 @@ console.log("\n--- Test 3: source-grep static guard for recovery.skipped frontma
 // This is a static-text guard, not a runtime schema validator. It catches
 // accidental drift in the controller's frontmatter-ingest-blocked
 // instrumentation by checking that the typed exports exist in the
-// taxonomy module, the helper exists in the controller, and the helper
-// is invoked exactly six times. Real type-level enforcement comes from
+// taxonomy module, the helper exists in the controller, and every typed
+// branch is wired through the helper. Real type-level enforcement comes from
 // `RecoverySkippedFrontmatterData` and `FrontmatterIngestBlockBranch` in
 // src/telemetry/debug/flightEvents.ts; the runtime invariants are asserted by
 // tests/frontmatter-guard-orchestration.ts.
@@ -85,23 +85,28 @@ console.log("\n--- Test 3: source-grep static guard for recovery.skipped frontma
 		"flightEvents.ts exports RecoverySkippedFrontmatterData payload type",
 	);
 
-	// Closed-enum branch type covers exactly the six block sites.
+	// Closed-enum branch type covers every frontmatter-ingest block branch.
 	const branchTypeMatch = flight.match(
 		/export type FrontmatterIngestBlockBranch =\s*([\s\S]*?);/,
 	);
 	assert(branchTypeMatch !== null, "FrontmatterIngestBlockBranch declaration parses");
 	const branchSrc = branchTypeMatch?.[1] ?? "";
-	for (const literal of [
+	const branchLiterals = [
 		"disk-to-crdt-existing",
 		"disk-to-crdt-seed",
 		"bound-file-local-only-divergence",
 		"bound-file-local-only-seed",
 		"bound-file-open-idle-disk-recovery",
 		"bound-file-open-idle-seed",
-	]) {
+	];
+	for (const literal of branchLiterals) {
 		assert(
 			branchSrc.includes(`"${literal}"`),
 			`FrontmatterIngestBlockBranch includes "${literal}"`,
+		);
+		assert(
+			reconciliation.includes(`"${literal}"`),
+			`controller wires frontmatter-ingest branch "${literal}"`,
 		);
 	}
 
@@ -151,11 +156,12 @@ console.log("\n--- Test 3: source-grep static guard for recovery.skipped frontma
 		"helper builds payload with reason: \"frontmatter-ingest-blocked\"",
 	);
 
-	// Helper is invoked exactly six times (once per block site).
+	// Some branches are admitted through more than one authority-fenced path.
+	// Guard the semantic coverage instead of pinning that implementation count.
 	const helperInvocations = reconciliation.match(/this\.recordFrontmatterIngestBlocked\(/g) ?? [];
 	assert(
-		helperInvocations.length === 6,
-		`recordFrontmatterIngestBlocked invoked exactly six times in controller (got ${helperInvocations.length})`,
+		helperInvocations.length >= branchLiterals.length,
+		`recordFrontmatterIngestBlocked covers every typed branch (got ${helperInvocations.length} call sites)`,
 	);
 
 		// FLIGHT_TAXONOMY_VERSION is at 11 (bumped by editor authority shield).

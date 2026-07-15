@@ -7,12 +7,18 @@ export type PreservedUnresolvedReason =
 	| "remote-delete-read-failed"
 	| "remote-delete-open-editor-read-failed"
 	| "remote-delete-multiple-open-editor-authorities"
+	| "remote-delete-trash-failed"
 	| "remote-delete-hash-read-failed"
 	| "remote-delete-stat-failed"
+	| "remote-delete-local-conflict"
+	| "remote-download-local-conflict"
 	| "conflict-artifact-write-failed"
 	| "three-way-preserve-failed"
 	| "conflict-winner-flush-deferred"
+	| "restore-disk-settlement-failed"
 	| "multiple-editor-authorities"
+	| "legacy-upgrade-missing-local-blob"
+	| "local-blob-mutation-remote-conflict"
 	| "path-collision"
 	| "unknown";
 
@@ -21,8 +27,10 @@ export const REMOTE_DELETE_PRESERVED_UNRESOLVED_REASONS = [
 	"remote-delete-read-failed",
 	"remote-delete-open-editor-read-failed",
 	"remote-delete-multiple-open-editor-authorities",
+	"remote-delete-trash-failed",
 	"remote-delete-hash-read-failed",
 	"remote-delete-stat-failed",
+	"remote-delete-local-conflict",
 ] as const satisfies readonly PreservedUnresolvedReason[];
 
 export type RemoteDeletePreservedUnresolvedReason =
@@ -48,11 +56,14 @@ export function isRemoteDeletePreservedUnresolvedEntry(
 		return entry.reason === "remote-delete-missing-baseline"
 			|| entry.reason === "remote-delete-read-failed"
 			|| entry.reason === "remote-delete-open-editor-read-failed"
-			|| entry.reason === "remote-delete-multiple-open-editor-authorities";
+			|| entry.reason === "remote-delete-multiple-open-editor-authorities"
+			|| entry.reason === "remote-delete-trash-failed";
 	}
 	return entry.reason === "remote-delete-missing-baseline"
 		|| entry.reason === "remote-delete-hash-read-failed"
-		|| entry.reason === "remote-delete-stat-failed";
+		|| entry.reason === "remote-delete-stat-failed"
+		|| entry.reason === "remote-delete-trash-failed"
+		|| entry.reason === "remote-delete-local-conflict";
 }
 
 export interface PreservedUnresolvedEntry {
@@ -88,6 +99,16 @@ export interface PreservedUnresolvedSummary {
 	reasons: Record<string, number>;
 	samples: PreservedUnresolvedSample[];
 }
+
+export type PreservedUnresolvedMoveResult =
+	| { kind: "missing" }
+	| { kind: "unchanged"; entry: PreservedUnresolvedEntry }
+	| { kind: "moved"; entry: PreservedUnresolvedEntry }
+	| {
+		kind: "collision";
+		source: PreservedUnresolvedEntry;
+		target: PreservedUnresolvedEntry;
+	};
 
 function extensionFor(path: string): string | null {
 	const name = normalizePath(path).split("/").pop() ?? path;
@@ -189,6 +210,58 @@ export class PreservedUnresolvedRegistry {
 
 	get(path: string): PreservedUnresolvedEntry | null {
 		return this.entries.get(normalizePath(path)) ?? null;
+	}
+
+	/**
+	 * Move one unresolved episode to a renamed path without manufacturing a new
+	 * episode. If the destination already belongs to another episode, leave both
+	 * entries untouched so the caller can quarantine the path collision.
+	 */
+	move(oldPath: string, newPath: string): PreservedUnresolvedMoveResult {
+		const oldNormalized = normalizePath(oldPath);
+		const newNormalized = normalizePath(newPath);
+		const source = this.entries.get(oldNormalized);
+		if (!source) return { kind: "missing" };
+		if (oldNormalized === newNormalized) {
+			return { kind: "unchanged", entry: { ...source } };
+		}
+
+		const target = this.entries.get(newNormalized);
+		if (target) {
+			if (
+				target.kind !== source.kind ||
+				getPreservedUnresolvedEpisodeId(target) !== getPreservedUnresolvedEpisodeId(source)
+			) {
+				return {
+					kind: "collision",
+					source: { ...source },
+					target: { ...target },
+				};
+			}
+
+			const merged: PreservedUnresolvedEntry = {
+				...source,
+				...target,
+				path: newNormalized,
+				episodeId: getPreservedUnresolvedEpisodeId(source),
+				firstSeenAt: Math.min(source.firstSeenAt, target.firstSeenAt),
+				lastSeenAt: Math.max(source.lastSeenAt, target.lastSeenAt),
+				localHash: target.localHash ?? source.localHash ?? null,
+				knownRemoteHash: target.knownRemoteHash ?? source.knownRemoteHash ?? null,
+			};
+			this.entries.delete(oldNormalized);
+			this.paths.delete(oldNormalized);
+			this.entries.set(newNormalized, merged);
+			this.paths.add(newNormalized);
+			return { kind: "moved", entry: { ...merged } };
+		}
+
+		const moved = { ...source, path: newNormalized };
+		this.entries.delete(oldNormalized);
+		this.paths.delete(oldNormalized);
+		this.entries.set(newNormalized, moved);
+		this.paths.add(newNormalized);
+		return { kind: "moved", entry: { ...moved } };
 	}
 
 	clear(): void {

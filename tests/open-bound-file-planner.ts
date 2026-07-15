@@ -133,10 +133,10 @@ console.log("\n--- Test 8: missing baseline without evidence follows visible ope
 			passiveDiskEditor.missingBaselinePolicy === "open-bound-visible-authority",
 		"open-bound policy is recorded for disk/editor authority",
 	);
-	assert(passiveCrdtEditor.kind === "import-disk-to-crdt", "crdtOnly external disk edit imports disk without durable baseline evidence");
-	assert(passiveCrdtEditor.kind === "import-disk-to-crdt" && passiveCrdtEditor.preserveCrdt === true, "visible CRDT side is preserved once");
+	assert(passiveCrdtEditor.kind === "editor-wins-preserve", "visible CRDT authority wins without durable baseline evidence");
+	assert(passiveCrdtEditor.kind === "editor-wins-preserve" && passiveCrdtEditor.preserveDisk === true, "uncertain disk side is preserved once");
 	assert(
-		passiveCrdtEditor.kind === "import-disk-to-crdt" &&
+		passiveCrdtEditor.kind === "editor-wins-preserve" &&
 			passiveCrdtEditor.missingBaselinePolicy === "open-bound-visible-authority",
 		"open-bound policy is recorded for crdtOnly authority",
 	);
