@@ -426,10 +426,21 @@ export class KaosDashboardView extends ItemView {
 			}
 			row.createDiv({ text: artifact.artifactPath, cls: "kaos-dashboard-subpath" });
 			const actions = row.createDiv({ cls: "kaos-dashboard-row-actions" });
+			this.button(
+				actions,
+				"Use artifact",
+				() => this.confirmDashboardConflictResolution(artifact, { kind: "artifact" }),
+				artifact.kind !== "markdown" || !artifact.originalExists,
+			);
+			this.button(
+				actions,
+				"Use original",
+				() => this.confirmDashboardConflictResolution(artifact, { kind: "original" }),
+				artifact.kind !== "markdown" || !artifact.originalExists,
+			);
 			this.button(actions, "View diff", () => this.openConflictDiff(artifact), artifact.kind !== "markdown" || !artifact.originalExists);
 			this.button(actions, "Open artifact", () => this.openPath(artifact.artifactPath));
 			this.button(actions, "Open original", () => this.openPath(artifact.inferredOriginalPath), !artifact.originalExists);
-			this.button(actions, "Copy path", () => this.copyPath(artifact.artifactPath));
 		}
 	}
 
@@ -839,11 +850,70 @@ export class KaosDashboardView extends ItemView {
 		choice: ConflictResolutionChoice,
 	): Promise<void> {
 		await resolveConflictArtifactWithCas(this.app.vault, snapshot, choice);
-		// The artifact is intentionally retained because Obsidian exposes no
-		// identity-aware conditional delete. Keep its merge base as well so a later
-		// review still has the exact three-way context; normal persisted-state GC
-		// removes it after the user deletes the artifact manually.
+		this.deps.clearConflictMergeBase?.(snapshot.artifactPath);
 		await this.refresh(true);
+	}
+
+	private confirmDashboardConflictResolution(
+		artifact: DashboardConflictArtifact,
+		choice: Extract<ConflictResolutionChoice, { kind: "original" | "artifact" }>,
+	): Promise<void> {
+		const useArtifact = choice.kind === "artifact";
+		return new Promise((resolve, reject) => {
+			new ConfirmModal(
+				this.app,
+				useArtifact ? "Use conflict artifact?" : "Use original note?",
+				useArtifact
+					? `Replace "${artifact.inferredOriginalPath}" with the conflict artifact content and move the conflict artifact to trash?`
+					: `Keep "${artifact.inferredOriginalPath}" as the selected version and move the conflict artifact to trash?`,
+				async () => {
+					try {
+						await this.resolveConflictArtifactFromDashboard(artifact, choice);
+						new Notice(
+							useArtifact
+								? "Conflict resolved using artifact. Conflict artifact moved to trash."
+								: "Original selected. Conflict artifact moved to trash.",
+						);
+						resolve();
+					} catch (err) {
+						reject(err instanceof Error ? err : new Error(String(err)));
+					}
+				},
+				useArtifact ? "Use artifact" : "Use original",
+				"Cancel",
+				resolve,
+				"mod-cta",
+			).open();
+		});
+	}
+
+	private async resolveConflictArtifactFromDashboard(
+		artifact: DashboardConflictArtifact,
+		choice: Extract<ConflictResolutionChoice, { kind: "original" | "artifact" }>,
+	): Promise<void> {
+		if (artifact.kind !== "markdown" || !artifact.originalExists) {
+			throw new Error("Both Markdown notes must exist before choosing a conflict version.");
+		}
+		const artifactFile = this.app.vault.getAbstractFileByPath(artifact.artifactPath);
+		const originalFile = this.app.vault.getAbstractFileByPath(artifact.inferredOriginalPath);
+		if (!(artifactFile instanceof TFile) || !(originalFile instanceof TFile)) {
+			throw new Error("Both the conflict note and original note are required before choosing a version.");
+		}
+		const [originalText, artifactText] = await Promise.all([
+			this.app.vault.read(originalFile),
+			this.app.vault.read(artifactFile),
+		]);
+		await this.resolveConflictArtifact(
+			captureConflictResolutionSnapshot({
+				artifactPath: artifact.artifactPath,
+				originalPath: artifact.inferredOriginalPath,
+				artifactFile,
+				originalFile,
+				artifactText,
+				originalText,
+			}),
+			choice,
+		);
 	}
 
 	private async copyPath(path: string): Promise<void> {
@@ -894,7 +964,7 @@ class ConflictDiffModal extends Modal {
 		this.renderPath(pathGrid, "Base", this.data.baseHash ? `available (${this.data.baseHash.slice(0, 12)})` : "not available");
 
 		const actions = contentEl.createDiv({ cls: "modal-button-container kaos-conflict-diff-actions" });
-		actions.createEl("button", { text: "Keep original" }).addEventListener("click", () => {
+		actions.createEl("button", { text: "Use original" }).addEventListener("click", () => {
 			this.confirmResolution({ kind: "original" });
 		});
 		actions.createEl("button", { text: "Use artifact", cls: "mod-cta" }).addEventListener("click", () => {
@@ -1145,14 +1215,14 @@ class ConflictDiffModal extends Modal {
 		const useMerged = choice.kind === "merged";
 		new ConfirmModal(
 			this.app,
-			useMerged ? "Apply merged result?" : useArtifact ? "Use conflict artifact?" : "Keep original note?",
+			useMerged ? "Apply merged result?" : useArtifact ? "Use conflict artifact?" : "Use original note?",
 			useMerged
-				? `Replace "${this.data.originalPath}" with the merged result? "${this.data.artifactPath}" will be retained for review.`
+				? `Replace "${this.data.originalPath}" with the merged result and move "${this.data.artifactPath}" to trash?`
 				: useArtifact
-				? `Replace "${this.data.originalPath}" with the conflict artifact content? "${this.data.artifactPath}" will be retained for review.`
-				: `Keep "${this.data.originalPath}" as-is? "${this.data.artifactPath}" will be retained for review.`,
+				? `Replace "${this.data.originalPath}" with the conflict artifact content and move "${this.data.artifactPath}" to trash?`
+				: `Keep "${this.data.originalPath}" as-is and move "${this.data.artifactPath}" to trash?`,
 			() => this.applyResolution(choice),
-			useMerged ? "Apply merged" : useArtifact ? "Use artifact" : "Keep original",
+			useMerged ? "Apply merged" : useArtifact ? "Use artifact" : "Use original",
 			"Cancel",
 		).open();
 	}
@@ -1162,10 +1232,10 @@ class ConflictDiffModal extends Modal {
 			await this.data.onResolve(choice);
 			new Notice(
 				choice.kind === "merged"
-					? "Conflict resolved using merged result. Artifact retained for review."
+					? "Conflict resolved using merged result. Conflict artifact moved to trash."
 					: choice.kind === "artifact"
-						? "Conflict resolved using artifact. Artifact retained for review."
-						: "Original kept. Conflict artifact retained for review.",
+						? "Conflict resolved using artifact. Conflict artifact moved to trash."
+						: "Original selected. Conflict artifact moved to trash.",
 			);
 			this.close();
 		} catch (err) {

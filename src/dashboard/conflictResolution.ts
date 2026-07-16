@@ -24,7 +24,7 @@ export interface ConflictResolutionSnapshot {
 
 type ConflictResolutionVault = Pick<
 	Vault,
-	"getAbstractFileByPath" | "read" | "process"
+	"getAbstractFileByPath" | "read" | "process" | "trash"
 >;
 
 /**
@@ -60,9 +60,8 @@ export function captureConflictResolutionSnapshot(input: {
  * vault has no cross-file transaction, both sides are validated again after
  * that CAS. A failed post-commit validation is reported without a compensating
  * write: bytes alone cannot prove that the current original is still the write
- * from this operation (a same-content ABA may have occurred). Obsidian also
- * does not expose an identity-aware conditional delete, so the artifact is
- * deliberately retained after success.
+ * from this operation (a same-content ABA may have occurred). Once the selected
+ * content has settled, the exact conflict artifact is moved to Obsidian's trash.
  */
 export async function resolveConflictArtifactWithCas(
 	vault: ConflictResolutionVault,
@@ -93,10 +92,21 @@ export async function resolveConflictArtifactWithCas(
 	}
 
 	await validatePostCommitState(vault, snapshot, replacement, !changedOriginal);
+	await trashConflictArtifact(vault, snapshot);
+}
 
-	// A final identity check cannot make a later path-based Vault.delete atomic.
-	// Keep the validated artifact as a safety copy; the user may delete it
-	// manually after reviewing the applied resolution.
+async function trashConflictArtifact(
+	vault: ConflictResolutionVault,
+	snapshot: ConflictResolutionSnapshot,
+): Promise<void> {
+	// Vault.trash has no conditional/identity-aware variant. Check the exact
+	// snapshot immediately before the user-requested disposal, then use trash
+	// rather than a permanent delete so the removed conflict file is recoverable.
+	assertSnapshotFile(vault, snapshot.artifactPath, snapshot.artifactFile, snapshot.artifactFingerprint, "conflict artifact");
+	await vault.trash(snapshot.artifactFile, true);
+	if (vault.getAbstractFileByPath(snapshot.artifactPath) === snapshot.artifactFile) {
+		throw new Error("The conflict artifact could not be moved to trash after applying the selected resolution.");
+	}
 }
 
 async function validateUnchangedSnapshot(
