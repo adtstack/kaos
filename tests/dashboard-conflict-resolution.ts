@@ -18,10 +18,8 @@ class FakeVault {
 	readonly files = new Map<string, FakeTFile>();
 	readonly contents = new Map<FakeTFile, string>();
 	processCalls = 0;
-	deleteCalls = 0;
+	trashCalls = 0;
 	afterProcess: ((file: FakeTFile) => void) | null = null;
-	afterLookup: ((path: string, file: FakeTFile | null, call: number) => void) | null = null;
-	private readonly lookupCalls = new Map<string, number>();
 
 	add(path: string, content: string): FakeTFile {
 		const file = new FakeTFile(path, { ctime: 1, mtime: 1, size: content.length });
@@ -36,19 +34,8 @@ class FakeVault {
 		file.stat.size = content.length;
 	}
 
-	replace(path: string, content: string): FakeTFile {
-		const replacement = new FakeTFile(path, { ctime: 2, mtime: 2, size: content.length });
-		this.files.set(path, replacement);
-		this.contents.set(replacement, content);
-		return replacement;
-	}
-
 	getAbstractFileByPath(path: string): FakeTFile | null {
-		const file = this.files.get(path) ?? null;
-		const call = (this.lookupCalls.get(path) ?? 0) + 1;
-		this.lookupCalls.set(path, call);
-		this.afterLookup?.(path, file, call);
-		return file;
+		return this.files.get(path) ?? null;
 	}
 
 	async read(file: FakeTFile): Promise<string> {
@@ -66,10 +53,8 @@ class FakeVault {
 		return next;
 	}
 
-	async delete(file: FakeTFile): Promise<void> {
-		this.deleteCalls++;
-		// Model the unsafe path-based behavior available to callers when the host
-		// offers no identity-aware conditional delete.
+	async trash(file: FakeTFile, _system: boolean): Promise<void> {
+		this.trashCalls++;
 		this.files.delete(file.path);
 		this.contents.delete(file);
 	}
@@ -90,15 +75,24 @@ function fixture() {
 	return { vault, originalFile, artifactFile, snapshot };
 }
 
-console.log("\n--- Dashboard conflict resolution CAS ---");
+console.log("\n--- Dashboard conflict resolution CAS + artifact trash ---");
 
 {
 	const { vault, originalFile, artifactFile, snapshot } = fixture();
 	await resolveConflictArtifactWithCas(vault as any, snapshot, { kind: "artifact" });
 	assert.equal(await vault.read(originalFile), "artifact\n", "selected artifact replaces the exact original snapshot");
-	assert.equal(vault.getAbstractFileByPath(artifactFile.path), artifactFile, "resolved artifact is retained as a safety copy");
+	assert.equal(vault.getAbstractFileByPath(artifactFile.path), null, "resolved artifact is moved out of the vault");
 	assert.equal(vault.processCalls, 1, "original replacement uses one atomic process CAS");
-	assert.equal(vault.deleteCalls, 0, "resolution never attempts a non-conditional artifact delete");
+	assert.equal(vault.trashCalls, 1, "resolution moves the conflict artifact to trash once");
+}
+
+{
+	const { vault, originalFile, artifactFile, snapshot } = fixture();
+	await resolveConflictArtifactWithCas(vault as any, snapshot, { kind: "original" });
+	assert.equal(await vault.read(originalFile), "original\n", "original choice preserves the original content");
+	assert.equal(vault.getAbstractFileByPath(artifactFile.path), null, "original choice also removes the conflict artifact from the vault");
+	assert.equal(vault.processCalls, 0, "original choice does not write unchanged content");
+	assert.equal(vault.trashCalls, 1, "original choice moves the conflict artifact to trash once");
 }
 
 {
@@ -110,7 +104,7 @@ console.log("\n--- Dashboard conflict resolution CAS ---");
 	);
 	assert.equal(await vault.read(originalFile), "new editor content\n", "stale resolution never overwrites a newer original");
 	assert.equal(vault.getAbstractFileByPath(artifactFile.path), artifactFile, "stale original keeps the artifact");
-	assert.equal(vault.deleteCalls, 0, "stale original is rejected before delete");
+	assert.equal(vault.trashCalls, 0, "stale original is rejected before trash");
 }
 
 {
@@ -134,7 +128,8 @@ console.log("\n--- Dashboard conflict resolution CAS ---");
 	);
 	assert.equal(await vault.read(originalFile), "original\n", "same-content artifact rewrites do not touch the original");
 	assert.equal(vault.getAbstractFileByPath(artifactFile.path), artifactFile, "same-content rewrite still keeps the artifact");
-	assert.equal(vault.processCalls, 0, "Keep original validates without generating a no-op disk write");
+	assert.equal(vault.processCalls, 0, "Use original validates without generating a no-op disk write");
+	assert.equal(vault.trashCalls, 0, "stale artifact is rejected before trash");
 }
 
 {
@@ -157,6 +152,7 @@ console.log("\n--- Dashboard conflict resolution CAS ---");
 	assert.equal(await vault.read(artifactFile), "artifact changed during CAS\n", "racing artifact content is preserved");
 	assert.equal(vault.getAbstractFileByPath(artifactFile.path), artifactFile, "artifact race never deletes the artifact");
 	assert.equal(vault.processCalls, 1, "post-commit validation never performs a compensating disk write");
+	assert.equal(vault.trashCalls, 0, "artifact race is rejected before trash");
 }
 
 {
@@ -173,29 +169,7 @@ console.log("\n--- Dashboard conflict resolution CAS ---");
 	);
 	assert.equal(await vault.read(originalFile), "typing during resolution\n", "rollback never overwrites a newer editor write");
 	assert.equal(vault.getAbstractFileByPath(artifactFile.path), artifactFile, "concurrent original write keeps the artifact");
-	assert.equal(vault.deleteCalls, 0, "concurrent original write is rejected before delete");
+	assert.equal(vault.trashCalls, 0, "concurrent original write is rejected before trash");
 }
 
-{
-	const { vault, originalFile, artifactFile, snapshot } = fixture();
-	let replacementArtifact: FakeTFile | null = null;
-	vault.afterLookup = (path, file, call) => {
-		if (path !== artifactFile.path || file !== artifactFile || call !== 5) return;
-		// The fifth artifact lookup is the final post-commit identity check. Swap
-		// the path immediately after that check, in the gap where the old code
-		// proceeded to an unconditional Vault.delete.
-		replacementArtifact = vault.replace(path, "artifact\n");
-	};
-	await resolveConflictArtifactWithCas(vault as any, snapshot, { kind: "merged", mergedText: "merged\n" });
-	assert.equal(await vault.read(originalFile), "merged\n", "the selected resolution still commits before the former delete gap");
-	assert.ok(replacementArtifact, "a same-bytes replacement artifact is installed in the former delete gap");
-	assert.equal(
-		vault.getAbstractFileByPath(artifactFile.path),
-		replacementArtifact,
-		"the replacement artifact survives because resolution never performs a path-based delete",
-	);
-	assert.equal(await vault.read(replacementArtifact), "artifact\n", "replacement artifact bytes remain intact");
-	assert.equal(vault.deleteCalls, 0, "the delete-gap race cannot reach any delete primitive");
-}
-
-console.log("PASS dashboard conflict resolution CAS");
+console.log("PASS dashboard conflict resolution CAS + artifact trash");
