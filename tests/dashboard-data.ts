@@ -87,6 +87,8 @@ const baseInput: KaosDashboardCollectorInput = {
 		lastBlockedDivergenceAt: "2026-06-24T01:00:00Z",
 		blockedDivergenceSample: [{ ext: ".md", hash: "abcd" }],
 		unresolvedStructuralChangeCount: 1,
+		unresolvedStructuralChangeGroupCount: 1,
+		unresolvedStructuralChangePaths: ["old.md", "new.md"],
 		unresolvedStructuralChangeSample: [{
 			oldPaths: ["old.md"],
 			newPaths: ["new.md"],
@@ -323,6 +325,46 @@ console.log("\n--- Test 3b: legacy missing blob migration exposes explicit safe 
 			&& migration.resolution.canDownloadRemote
 			&& migration.resolution.canKeepLocalAbsent,
 		"the missing path is visible with exact-ref Download and Keep-absence actions",
+	);
+}
+
+console.log("\n--- Test 3c: structural path markers are represented once ---");
+{
+	const structuralOld = "notes/before.md";
+	const structuralNew = "archive/after.md";
+	const data = buildKaosDashboardData({
+		...baseInput,
+		preservedUnresolvedEntries: [structuralOld, structuralNew].map((path, index) => ({
+			path,
+			kind: "markdown" as const,
+			reason: "path-collision" as const,
+			episodeId: `structural-${index}`,
+			firstSeenAt: 1_777_000_000_000 + index,
+			lastSeenAt: 1_777_000_010_000 + index,
+		})),
+		frontmatterQuarantineEntries: [],
+		reconciliationState: {
+			...baseInput.reconciliationState,
+			blockedDivergenceCount: 0,
+			blockedDivergenceSample: [],
+			unresolvedStructuralChangeCount: 2,
+			unresolvedStructuralChangeGroupCount: 1,
+			unresolvedStructuralChangePaths: [structuralOld, structuralNew],
+			unresolvedStructuralChangeSample: [{
+				oldPaths: [structuralOld],
+				newPaths: [structuralNew],
+				reason: "ambiguous-structural-rename",
+				contentHashPrefix: "123456789abc",
+			}],
+		},
+	});
+	assert(
+		data.attentionTotalCount === 1,
+		"one logical move is counted once instead of old/new durable markers plus structural paths",
+	);
+	assert(
+		data.attention.length === 1 && data.attention[0]?.kind === "structural-change",
+		"duplicate path-collision rows are hidden while the structural row is active",
 	);
 }
 

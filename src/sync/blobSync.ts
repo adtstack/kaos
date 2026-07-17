@@ -2503,6 +2503,7 @@ export class BlobSyncManager {
 						return;
 					}
 					this.uploadQueue.delete(item.path);
+					this._completedUploads++;
 					this.log(
 						`upload: "${item.path}" unchanged (hash match), skipping`,
 					);
@@ -4721,10 +4722,7 @@ export class BlobSyncManager {
 			this.pendingUploadCount() +
 			this.uploadDebounce.size +
 			this.inflightUploads.size;
-		if (
-			upPending > 0 ||
-			this._completedUploads < this._totalUploadsThisCycle
-		) {
+		if (upPending > 0) {
 			parts.push(
 				`↑${this._completedUploads}/${this._totalUploadsThisCycle}`,
 			);
@@ -4732,10 +4730,7 @@ export class BlobSyncManager {
 
 		const downPending =
 			this.pendingDownloadCount() + this.inflightDownloads.size;
-		if (
-			downPending > 0 ||
-			this._completedDownloads < this._totalDownloadsThisCycle
-		) {
+		if (downPending > 0) {
 			parts.push(
 				`↓${this._completedDownloads}/${this._totalDownloadsThisCycle}`,
 			);

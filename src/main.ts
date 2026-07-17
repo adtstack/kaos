@@ -161,7 +161,10 @@ import { EditorWorkspaceOrchestrator } from "./runtime/editorWorkspaceOrchestrat
 import { SetupLinkController } from "./runtime/setupLinkController";
 import { TraceRuntimeController } from "./runtime/traceRuntimeController";
 import { registerCommands } from "./commands";
-import { buildKaosDashboardData } from "./dashboard/dashboardData";
+import {
+	buildKaosDashboardData,
+	getDashboardAttentionTotalCount,
+} from "./dashboard/dashboardData";
 import { withAttentionResolutionLock } from "./dashboard/attentionResolutionLock";
 import { mapWithConcurrency } from "./utils/concurrency";
 import {
@@ -5176,13 +5179,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (!this.statusBarEl) return;
 		const connectionState = this.connectionController?.getState();
 		const transferStatus = this.getBlobSync()?.transferStatus;
-		const diskAttention =
-			(this.diskMirror?.getDebugSnapshot().preservedUnresolved.totalCount ?? 0);
-		const blobAttention =
-			(this.getBlobSync()?.getDebugSnapshot().preservedUnresolved.totalCount ?? 0);
-		const structuralAttention =
-			this.reconciliationController.getState().unresolvedStructuralChangeCount;
-		const attentionCount = diskAttention + blobAttention + structuralAttention;
+		const attentionCount = getDashboardAttentionTotalCount({
+			preservedUnresolvedEntries: this.collectPreservedUnresolvedEntries(),
+			frontmatterQuarantineEntries: this.frontmatterQuarantineEntries,
+			reconciliationState: this.reconciliationController.getState(),
+		});
 		const vaultSync = this.vaultSync;
 		const serverReceipt = vaultSync ? {
 			serverAppliedLocalState: vaultSync.serverAppliedLocalState,

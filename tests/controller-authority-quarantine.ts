@@ -951,6 +951,8 @@ console.log("\n--- Open reconcile: captured editor authority changing without ac
 	const artifacts = new Map<string, string>();
 	const markerRecords: Array<{ path: string; reason: string }> = [];
 	const flushWrites: string[] = [];
+	let activeAttentionReason: string | null = null;
+	let attentionClearCalls = 0;
 
 	const controller = new ReconciliationController({
 		app: {
@@ -983,6 +985,20 @@ console.log("\n--- Open reconcile: captured editor authority changing without ac
 		getDiskMirror: () => ({
 			recordPreservedUnresolved: (candidate: string, reason: string) => {
 				markerRecords.push({ path: candidate, reason });
+				if (candidate === path) activeAttentionReason = reason;
+			},
+			getPreservedUnresolvedEntries: () => activeAttentionReason ? [{
+				path,
+				kind: "markdown",
+				reason: activeAttentionReason,
+				episodeId: "visible-authority-episode",
+				firstSeenAt: 1,
+				lastSeenAt: 1,
+			}] : [],
+			clearPreservedUnresolved: (candidate: string) => {
+				if (candidate !== path) return;
+				activeAttentionReason = null;
+				attentionClearCalls++;
 			},
 			suppressLocalCreate: async () => {},
 			flushWrite: async (candidate: string) => { flushWrites.push(candidate); },
@@ -1026,6 +1042,7 @@ console.log("\n--- Open reconcile: captured editor authority changing without ac
 			reason: "modify",
 			stat: { mtime: number; size: number },
 		): Promise<{ kind: string }>;
+		resolveConvergedVisibleAuthority(path: string): void;
 	};
 	internals.visibleAuthorityDeferredPaths.set(path, {
 		editorContents: [capturedEditorContent],
@@ -1069,6 +1086,19 @@ console.log("\n--- Open reconcile: captured editor authority changing without ac
 			record.path === path && record.reason === "conflict-winner-flush-deferred"
 		),
 		"changed pane authority synchronously records durable quarantine",
+	);
+	ytext.delete(0, ytext.length);
+	ytext.insert(0, diskContent);
+	liveEditorContent = diskContent;
+	internals.resolveConvergedVisibleAuthority(path);
+	assert(
+		!internals.visibleAuthorityDeferredPaths.has(path),
+		"verified disk/editor/CRDT convergence retires the stale multi-editor capture",
+	);
+	assertEqual(
+		attentionClearCalls,
+		1,
+		"verified convergence clears only the provisional conflict-winner warning",
 	);
 	controller.reset();
 	doc.destroy();

@@ -42,6 +42,10 @@ async function main() {
 		await updateNonInteractive(parseArgs(args));
 		return;
 	}
+	if (command === "start" || command === "stop") {
+		runUserServiceCommand(command, args);
+		return;
+	}
 	if (command === "uninstall") {
 		await uninstallUserHeadless(args);
 		return;
@@ -331,6 +335,13 @@ async function updateNonInteractive(raw) {
 		}
 		throw err;
 	}
+}
+
+function runUserServiceCommand(command, args) {
+	if (args.length > 0) {
+		throw new Error(`kaos ${command} does not accept arguments`);
+	}
+	runChecked("systemctl", ["--user", command, "kaos-headless-host"]);
 }
 
 async function printStatus(raw) {
@@ -2201,6 +2212,8 @@ function printUsage() {
 	console.log(`Usage:
   kaos install
   kaos update [--startup]
+  kaos start
+  kaos stop
   kaos uninstall [--dry-run] [--yes] [--purge-vault --vault <path>]
   kaos status
   kaos doctor
@@ -2210,7 +2223,8 @@ function printUsage() {
   kaos history <list|show|diff|tui> [options]
 
 Install is always interactive. Update is non-interactive and is used by the
-user systemd service during startup.
+user systemd service during startup. Start and stop control the installed
+user service.
 `);
 }
 

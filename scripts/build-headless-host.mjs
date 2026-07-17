@@ -445,6 +445,11 @@ and roll back the current symlink if verification fails. Updates also replace
 the KAOS runtime files in the configured vault from the verified release bundle,
 while preserving its data.json settings.
 
+Control the installed user service with:
+
+  kaos start
+  kaos stop
+
 Remove the user service, runner, state, and sync configuration with:
 
   kaos uninstall --yes

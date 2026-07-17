@@ -105,6 +105,10 @@ export interface ReconciliationState {
 	/** Safe sample of blocked paths: extensions + fingerprint hashes (no raw filenames). */
 	blockedDivergenceSample: Array<{ ext: string; hash: string }>;
 	unresolvedStructuralChangeCount: number;
+	/** Number of logical structural conflicts, independent of old/new path cardinality. */
+	unresolvedStructuralChangeGroupCount: number;
+	/** Complete path set used to suppress duplicate durable path-collision rows. */
+	unresolvedStructuralChangePaths: string[];
 	unresolvedStructuralChangeSample: Array<{
 		oldPaths: string[];
 		newPaths: string[];
@@ -561,6 +565,13 @@ export class ReconciliationController {
 				(total, change) => total + change.oldPaths.length + change.newPaths.length,
 				0,
 			),
+			unresolvedStructuralChangeGroupCount: this.unresolvedStructuralChanges.length,
+			unresolvedStructuralChangePaths: Array.from(new Set(
+				this.unresolvedStructuralChanges.flatMap((change) => [
+					...change.oldPaths,
+					...change.newPaths,
+				]),
+			)),
 			unresolvedStructuralChangeSample: this.unresolvedStructuralChanges.slice(0, 10).map((change) => ({
 				oldPaths: change.oldPaths.slice(0, 5),
 				newPaths: change.newPaths.slice(0, 5),
@@ -1640,6 +1651,7 @@ export class ReconciliationController {
 							currentEditorAuthority.kind === "single" &&
 							currentEditorAuthority.content === diskContent
 						) {
+							this.resolveConvergedVisibleAuthority(path);
 							const settledHash = await contentBaselineHash(diskContent);
 							recordSettledBaseline(path, settledHash, diskContent);
 							continue;
@@ -4376,6 +4388,30 @@ export class ReconciliationController {
 		) {
 			this.visibleAuthorityDeferredPaths.delete(path);
 		}
+	}
+
+	/**
+	 * All live authorities were compared synchronously by the caller and now
+	 * expose the same bytes. Retire a stale multi-editor capture and only the
+	 * matching provisional flush warning; stronger preservation failures remain.
+	 */
+	private resolveConvergedVisibleAuthority(path: string): void {
+		const marker = this.visibleAuthorityDeferredPaths.get(path);
+		if (!marker) return;
+		this.visibleAuthorityDeferredPaths.delete(path);
+
+		const diskMirror = this.deps.getDiskMirror();
+		const attention = diskMirror?.getPreservedUnresolvedEntries()
+			.find((entry) => entry.path === path);
+		if (attention?.reason === "conflict-winner-flush-deferred") {
+			diskMirror?.clearPreservedUnresolved(path);
+		}
+		this.deps.trace("reconcile", "visible-editor-authority-converged", {
+			path,
+			capturedReadComplete: marker.readComplete,
+			capturedEditorCandidateCount: marker.editorContents.length,
+			clearedAttention: attention?.reason === "conflict-winner-flush-deferred",
+		});
 	}
 
 	private async preserveUnresolvedVisibleAuthority(
