@@ -157,6 +157,24 @@ try {
 	});
 	assert.equal(status.status, 0, status.stderr || status.stdout);
 	assert.equal(JSON.parse(status.stdout).currentVersion, releaseManifest.version);
+	const fakeBin = join(root, "fake-bin");
+	const systemctlLog = join(root, "systemctl.log");
+	await mkdir(fakeBin, { recursive: true });
+	await writeFile(join(fakeBin, "systemctl"), "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$KAOS_SYSTEMCTL_LOG\"\n", "utf8");
+	await chmod(join(fakeBin, "systemctl"), 0o755);
+	for (const command of ["start", "stop"]) {
+		const serviceCommand = spawnSync(paths.binKaos, [command], {
+			encoding: "utf8",
+			env: {
+				...process.env,
+				HOME: home,
+				PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+				KAOS_SYSTEMCTL_LOG: systemctlLog,
+			},
+		});
+		assert.equal(serviceCommand.status, 0, serviceCommand.stderr || serviceCommand.stdout);
+	}
+	assert.equal(await readFile(systemctlLog, "utf8"), "--user\nstart\nkaos-headless-host\n--user\nstop\nkaos-headless-host\n");
 	console.log("  PASS  kaos update installs matching runner/plugin releases and preserves data.json");
 
 	console.log("\n--- headless host user install: startup update is failure-tolerant ---");

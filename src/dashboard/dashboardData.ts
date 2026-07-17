@@ -72,7 +72,13 @@ export function collectDashboardAttention(
 	>,
 ): DashboardAttentionItem[] {
 	const items: DashboardAttentionItem[] = [];
-	for (const entry of input.preservedUnresolvedEntries.slice(0, ATTENTION_SAMPLE_LIMIT)) {
+	const structuralPaths = new Set(
+		input.reconciliationState.unresolvedStructuralChangePaths,
+	);
+	const standaloneEntries = input.preservedUnresolvedEntries.filter(
+		(entry) => !structuralPaths.has(entry.path),
+	);
+	for (const entry of standaloneEntries.slice(0, ATTENTION_SAMPLE_LIMIT)) {
 		const remoteDeleteReason = isRemoteDeletePreservedUnresolvedEntry(entry)
 			? entry.reason
 			: null;
@@ -223,9 +229,18 @@ export function getDashboardAttentionTotalCount(
 		"preservedUnresolvedEntries" | "frontmatterQuarantineEntries" | "reconciliationState"
 	>,
 ): number {
-	return input.preservedUnresolvedEntries.length
-		+ input.frontmatterQuarantineEntries.length
-		+ input.reconciliationState.unresolvedStructuralChangeCount
+	const structuralPaths = new Set(
+		input.reconciliationState.unresolvedStructuralChangePaths,
+	);
+	const standalonePaths = new Set<string>();
+	for (const entry of input.preservedUnresolvedEntries) {
+		if (!structuralPaths.has(entry.path)) standalonePaths.add(entry.path);
+	}
+	for (const entry of input.frontmatterQuarantineEntries) {
+		if (!structuralPaths.has(entry.path)) standalonePaths.add(entry.path);
+	}
+	return standalonePaths.size
+		+ input.reconciliationState.unresolvedStructuralChangeGroupCount
 		+ input.reconciliationState.blockedDivergenceCount;
 }
 

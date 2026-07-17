@@ -406,6 +406,33 @@ console.log("\n--- Test 2c: repeated remote candidate dedupes the conflict artif
 	assert(manager.isPreservedUnresolved("img.png"), "artifact dedupe retains one Attention condition");
 }
 
+console.log("\n--- Test 2c.1: hash-equal upload reconciliation completes progress ---");
+{
+	const path = "already-settled.png";
+	const data = bytes("already settled bytes");
+	const hash = await sha256Hex(data);
+	const ref: BlobRef = { hash, size: data.byteLength };
+	const { manager, put } = makeHarness(undefined, { [path]: ref });
+	put(path, data);
+	(manager as any)._completedUploads = 0;
+	(manager as any)._totalUploadsThisCycle = 1;
+	(manager as any).enqueueUpload(path, 0, data.byteLength);
+	const item = (manager as any).uploadQueue.get(path);
+	item.status = "processing";
+
+	await (manager as any).processUpload(item);
+
+	assert(manager.pendingUploads === 0, "hash-equal upload leaves no queued work");
+	assert(manager.transferStatus === null, "hash-equal upload advances progress to an idle state");
+	(manager as any)._completedUploads = 68;
+	(manager as any)._totalUploadsThisCycle = 94;
+	assert(
+		manager.transferStatus === null,
+		"an idle queue never displays a stale partial cycle after terminal skips",
+	);
+	await manager.destroy();
+}
+
 console.log("\n--- Test 2d: exact prior-ref provenance admits a clean H1 -> H2 update ---");
 {
 	const path = "proven-clean.png";
