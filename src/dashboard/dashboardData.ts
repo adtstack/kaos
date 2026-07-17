@@ -236,10 +236,8 @@ export function getDashboardAttentionTotalCount(
 	for (const entry of input.preservedUnresolvedEntries) {
 		if (!structuralPaths.has(entry.path)) standalonePaths.add(entry.path);
 	}
-	for (const entry of input.frontmatterQuarantineEntries) {
-		if (!structuralPaths.has(entry.path)) standalonePaths.add(entry.path);
-	}
 	return standalonePaths.size
+		+ input.frontmatterQuarantineEntries.length
 		+ input.reconciliationState.unresolvedStructuralChangeGroupCount
 		+ input.reconciliationState.blockedDivergenceCount;
 }
