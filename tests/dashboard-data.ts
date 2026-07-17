@@ -342,7 +342,14 @@ console.log("\n--- Test 3c: structural path markers are represented once ---");
 			firstSeenAt: 1_777_000_000_000 + index,
 			lastSeenAt: 1_777_000_010_000 + index,
 		})),
-		frontmatterQuarantineEntries: [],
+		frontmatterQuarantineEntries: [{
+			path: structuralOld,
+			firstSeenAt: 1_777_000_020_000,
+			lastSeenAt: 1_777_000_030_000,
+			direction: "disk-to-crdt",
+			reasons: ["unsafe-frontmatter"],
+			count: 1,
+		}],
 		reconciliationState: {
 			...baseInput.reconciliationState,
 			blockedDivergenceCount: 0,
@@ -359,12 +366,16 @@ console.log("\n--- Test 3c: structural path markers are represented once ---");
 		},
 	});
 	assert(
-		data.attentionTotalCount === 1,
-		"one logical move is counted once instead of old/new durable markers plus structural paths",
+		data.attentionTotalCount === 2,
+		"one logical move is counted once while its frontmatter quarantine remains independent",
 	);
 	assert(
-		data.attention.length === 1 && data.attention[0]?.kind === "structural-change",
+		data.attention.filter((item) => item.kind === "structural-change").length === 1,
 		"duplicate path-collision rows are hidden while the structural row is active",
+	);
+	assert(
+		data.attention.filter((item) => item.kind === "frontmatter-quarantine").length === 1,
+		"frontmatter quarantine remains visible even when its path is part of the structural group",
 	);
 }
 
