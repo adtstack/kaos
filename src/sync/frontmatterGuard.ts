@@ -108,6 +108,53 @@ export function validateFrontmatterTransition(
 	};
 }
 
+/**
+ * Validate an Obsidian Bases document as whole-file YAML.
+ *
+ * Bases may legitimately begin with a YAML document marker (`---`), so they
+ * must never pass through the Markdown fenced-frontmatter extractor.  A
+ * malformed merge, duplicate mapping key, or non-map root is unsafe to write
+ * in either direction because Obsidian cannot reliably load it as a Base.
+ */
+export function validateBaseDocument(content: string): FrontmatterValidationResult {
+	try {
+		const parsed = yaml.load(content);
+		if (parsed != null && !isPlainObject(parsed)) {
+			return {
+				risk: "block",
+				reasons: ["base-yaml-non-map-root"],
+				frontmatterLength: content.length,
+			};
+		}
+		return {
+			risk: "ok",
+			reasons: [],
+			frontmatterLength: content.length,
+		};
+	} catch (error) {
+		return {
+			risk: "block",
+			reasons: [`base-${duplicateKeyReason(error, content)}`],
+			frontmatterLength: content.length,
+		};
+	}
+}
+
+export function validateCrdtDocumentTransition(
+	path: string,
+	previousContent: string | null | undefined,
+	nextContent: string,
+): FrontmatterValidationResult {
+	if (path.endsWith(".base")) {
+		const result = validateBaseDocument(nextContent);
+		return {
+			...result,
+			previousFrontmatterLength: previousContent?.length ?? null,
+		};
+	}
+	return validateFrontmatterTransition(previousContent, nextContent);
+}
+
 export function isFrontmatterBlocked(result: FrontmatterValidationResult): boolean {
 	return result.risk === "block";
 }

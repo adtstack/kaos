@@ -8,6 +8,7 @@
 import { classifySyncPath } from "../src/paths/pathCategory";
 import { planCategoryRenameAction } from "../src/sync/policy/renameAdmissionPolicy";
 import type { RenameAction } from "../src/sync/policy/renameAdmissionPolicy";
+import { isBlobSyncable, isMarkdownSyncable } from "../src/types";
 
 let passed = 0;
 let failed = 0;
@@ -124,6 +125,54 @@ console.log("\n--- Test 8b: KAOS conflict artifacts are excluded ---");
 	assert(cat.kind === "excluded", "markdown conflict artifact is excluded");
 }
 
+console.log("\n--- Test 8c: Obsidian Bases use the CRDT document lane ---");
+{
+	const path = "BACKLOG/BACKLOG.base";
+	assert(classify(path).kind === "markdown", ".base is classified as a CRDT document");
+	assert(isMarkdownSyncable(path, [], CONFIG), ".base is document-syncable");
+	assert(!isBlobSyncable(path, [], CONFIG), ".base is never attachment-syncable");
+	assert(classify("BACKLOG/BACKLOG.base.backup").kind === "excluded", ".base.backup is excluded");
+	assert(classify("BACKLOG/BACKLOG.backup").kind === "excluded", "plain .backup is excluded");
+}
+
+console.log("\n--- Test 8d: pre-upgrade Base safety artifacts stay local-only ---");
+{
+	const localBackup =
+		"BACKLOG/BACKLOG (KAOS local backup 2026-07-17T08-00-00Z 0123456789abcdef).base";
+	const remoteConflict =
+		"BACKLOG/BACKLOG (KAOS remote conflict 2026-07-17T08-00-00Z).base";
+	assert(classify(localBackup).kind === "excluded", "legacy Base local backup is excluded");
+	assert(classify(remoteConflict).kind === "excluded", "legacy Base remote conflict is excluded");
+	assert(!isMarkdownSyncable(localBackup, [], CONFIG), "legacy Base backup is not admitted as a document");
+	assert(!isMarkdownSyncable(remoteConflict, [], CONFIG), "legacy Base conflict is not admitted as a document");
+}
+
+console.log("\n--- Test 8e: artifact-named directory descendants stay local-only ---");
+{
+	const backupDir =
+		"BACKLOG (KAOS local backup 2026-07-17T08-00-00Z 0123456789abcdef)";
+	const markdownChild = `${backupDir}/card.md`;
+	const baseChild = `${backupDir}/nested/board.base`;
+	const blobChild = `${backupDir}/assets/icon.png`;
+	for (const path of [markdownChild, baseChild, blobChild]) {
+		const category = classify(path);
+		assert(category.kind === "excluded", `backup subtree child is excluded: ${path}`);
+		assert(
+			category.kind === "excluded" && category.reason === "local-safety-artifact",
+			`backup subtree uses the local-safety reason: ${path}`,
+		);
+	}
+	assert(!isMarkdownSyncable(markdownChild, [], CONFIG), "backup subtree Markdown is not syncable");
+	assert(!isMarkdownSyncable(baseChild, [], CONFIG), "backup subtree Base is not syncable");
+	assert(!isBlobSyncable(blobChild, [], CONFIG), "backup subtree attachment is not syncable");
+	assert(
+		classify(
+			"BACKLOG (KAOS local backup 2026-07-17T08-00-00Z 0123456789abcdeF)/card.md",
+		).kind === "markdown",
+		"non-canonical backup-like directory does not overmatch",
+	);
+}
+
 // -----------------------------------------------------------------------
 // Rename category matrix — full 9-case matrix + same-identity
 // -----------------------------------------------------------------------
@@ -219,6 +268,24 @@ console.log("\n--- Test 20: dirty path cleanup uses displayPath ---");
 	assert(action.kind === "tombstone-markdown", "tombstone action");
 	assert(action.kind === "tombstone-markdown" && action.dropDirty.includes("notes/file.md"), "drops old displayPath");
 	assert(action.kind === "tombstone-markdown" && action.dropDirty.includes(".trash/file.md"), "drops new displayPath");
+}
+
+console.log("\n--- Test 21: Base renames stay entirely in the document lane ---");
+{
+	const baseToBase = planRename("BACKLOG/BACKLOG.base", "BACKLOG/Archive.base");
+	assert(baseToBase.kind === "queue-markdown-rename", ".base→.base queues a document rename");
+	const baseToMarkdown = planRename("BACKLOG/BACKLOG.base", "BACKLOG/Archive.md");
+	assert(baseToMarkdown.kind === "queue-markdown-rename", ".base→.md stays in the same document lane");
+}
+
+console.log("\n--- Test 22: renames into artifact subtrees never admit the destination ---");
+{
+	const backupDir =
+		"BACKLOG (KAOS local backup 2026-07-17T08-00-00Z 0123456789abcdef)";
+	const documentAction = planRename("notes/card.md", `${backupDir}/card.md`);
+	assert(documentAction.kind === "tombstone-markdown", "document→backup subtree tombstones only the source");
+	const blobAction = planRename("assets/icon.png", `${backupDir}/assets/icon.png`);
+	assert(blobAction.kind === "defer-blob-to-events", "blob→backup subtree retires only the source blob");
 }
 
 console.log(`\n${"─".repeat(55)}`);

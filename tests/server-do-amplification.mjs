@@ -1,7 +1,7 @@
 // Regression test for issue #40: DO subrequest amplification fix.
 //
-// Static source-analysis checks that enforce the seven invariants listed in
-// the issue #40 / ca0dad2 post-mortem.  A companion runtime test is in
+// Static source-analysis checks that enforce the cost invariants listed in
+// the issue #40 / ca0dad2 post-mortem. A companion runtime test is in
 // tests/server-route-classification-runtime.ts.
 //
 // These tests fail loudly if a future change re-introduces any of the
@@ -11,18 +11,24 @@
 //      are console-only; a reconnect storm must not burn KAOS_SYNC writes).
 //   2. index.ts must classify routes before calling getAuthStateCached.
 //   3. auth.ts must have a TTL cache around getStoredServerConfig.
-//   4. server.ts must bypass ensureDocumentLoaded for /cdn-cgi/partyserver/.
+//   4. Cheap room operations must bypass getServerByName's /set-name/ request.
 //   5. server.ts must NOT call ensureDocumentLoaded in /__kaos/debug.
+//   6. The client must not poll server trace while idle.
+//   7. Every remaining getServerByName route call must be explicitly approved.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const syncSocketPath = resolve(here, "../server/src/routes/syncSocket.ts");
 const indexPath = resolve(here, "../server/src/index.ts");
 const authPath = resolve(here, "../server/src/routes/auth.ts");
+const mainPath = resolve(here, "../src/main.ts");
 const serverPath = resolve(here, "../server/src/server.ts");
+const serverRoutesDir = resolve(here, "../server/src/routes");
+const traceRoutesPath = resolve(here, "../server/src/routes/trace.ts");
+const traceRuntimePath = resolve(here, "../src/runtime/traceRuntimeController.ts");
 
 let passed = 0;
 let failed = 0;
@@ -172,30 +178,40 @@ console.log("\n--- Test 3: auth.ts has TTL cache for KAOS_CONFIG fetches ---");
 	);
 }
 
-// ── Test 4: server.ts bypasses ensureDocumentLoaded for PartyServer routes ────
-console.log("\n--- Test 4: server.ts bypasses ensureDocumentLoaded for /cdn-cgi/partyserver/ ---");
+// ── Test 4: cheap room operations bypass PartyServer /set-name amplification ─
+console.log("\n--- Test 4: cheap room operations bypass getServerByName /set-name amplification ---");
 {
-	const source = readFileSync(serverPath, "utf8");
+	const source = readFileSync(traceRoutesPath, "utf8");
 
 	assert(
-		source.includes("/cdn-cgi/partyserver/"),
-		"server.ts checks for /cdn-cgi/partyserver/ paths",
+		source.includes("fetchVaultRoomCheap"),
+		"trace routes define a direct cheap-room fetch helper",
+	);
+	assert(
+		/fetchVaultRoomCheap[\s\S]*?KAOS_SYNC\.idFromName[\s\S]*?KAOS_SYNC\.get/.test(source),
+		"cheap-room helper resolves the Durable Object directly",
+	);
+	assert(
+		/fetchVaultRoomCheap[\s\S]*?x-partykit-room/.test(source),
+		"cheap-room helper carries the room id without a separate set-name request",
 	);
 
-	// The bypass must appear before the final catch-all ensureDocumentLoaded
-	const partyserverVarPos = source.indexOf("isPartyServerInternal");
-	const lastEnsurePos = source.lastIndexOf("await this.ensureDocumentLoaded()");
-	assert(
-		partyserverVarPos !== -1 && lastEnsurePos !== -1 && partyserverVarPos < lastEnsurePos,
-		"PartyServer internal route bypass appears before the ensureDocumentLoaded catch-all",
-	);
+	for (const functionName of ["fetchVaultRoomMeta", "fetchVaultDebug"]) {
+		const start = source.indexOf(`function ${functionName}`);
+		const nextExport = start === -1 ? -1 : source.indexOf("\nexport ", start + 1);
+		const body = start === -1 ? "" : source.slice(start, nextExport === -1 ? source.length : nextExport);
+		assert(
+			body.includes("fetchVaultRoomCheap") && !body.includes("getServerByName"),
+			`${functionName} uses one direct DO request and no getServerByName call`,
+		);
+	}
 
-	// The bypass must return super.fetch without ensureDocumentLoaded
-	// Use multiline-safe pattern ([\s\S] to cross newlines)
-	const bypassBlock = source.slice(partyserverVarPos, partyserverVarPos + 400);
+	const traceStart = source.indexOf("export async function recordVaultTrace");
+	const traceEnd = traceStart === -1 ? -1 : source.indexOf("\nexport ", traceStart + 1);
+	const traceBody = traceStart === -1 ? "" : source.slice(traceStart, traceEnd === -1 ? source.length : traceEnd);
 	assert(
-		/isPartyServerInternal[\s\S]{0,150}isWebSocketUpgrade[\s\S]{0,100}return super\.fetch/.test(bypassBlock),
-		"non-WebSocket PartyServer internal routes call super.fetch without ensureDocumentLoaded",
+		traceBody.includes("fetchVaultRoomCheap") && !traceBody.includes("getServerByName"),
+		"recordVaultTrace uses one direct DO request and no getServerByName call",
 	);
 }
 
@@ -240,8 +256,26 @@ console.log("\n--- Test 5: /__kaos/debug does not call ensureDocumentLoaded (che
 	}
 }
 
-// ── Test 6: route-bucket logging is present and not_found is sampled ──────────
-console.log("\n--- Test 6: index.ts has route-bucket logging with not_found sampling ---");
+// ── Test 6: trace runtime does not poll the server while idle ─────────────────
+console.log("\n--- Test 6: trace runtime does not poll server trace while idle ---");
+{
+	const source = readFileSync(traceRuntimePath, "utf8");
+	assert(
+		!source.includes("serverInterval"),
+		"trace runtime has no periodic server interval",
+	);
+	assert(
+		!/setInterval\s*\(\s*\(\)\s*=>\s*\{[\s\S]{0,200}fetchServerTrace/.test(source),
+		"trace runtime never schedules fetchServerTrace with setInterval",
+	);
+	assert(
+		/async refreshServerTrace\(\)[\s\S]{0,100}fetchServerTrace/.test(source),
+		"explicit server trace refresh remains available",
+	);
+}
+
+// ── Test 7: route-bucket logging is present and not_found is sampled ──────────
+console.log("\n--- Test 7: index.ts has route-bucket logging with not_found sampling ---");
 {
 	const source = readFileSync(indexPath, "utf8");
 
@@ -269,8 +303,8 @@ console.log("\n--- Test 6: index.ts has route-bucket logging with not_found samp
 	);
 }
 
-// ── Test 7: AuthStateCached type exists with required config ──────────────────
-console.log("\n--- Test 7: AuthStateCached type has required config for claim/unclaimed modes ---");
+// ── Test 8: AuthStateCached type exists with required config ──────────────────
+console.log("\n--- Test 8: AuthStateCached type has required config for claim/unclaimed modes ---");
 {
 	const typesPath = resolve(here, "../server/src/routes/types.ts");
 	const source = readFileSync(typesPath, "utf8");
@@ -297,6 +331,53 @@ console.log("\n--- Test 7: AuthStateCached type has required config for claim/un
 			"AuthStateCached has required config: StoredServerConfig",
 		);
 	}
+}
+
+// ── Test 9: every document-owning getServerByName call is allowlisted ────────
+console.log("\n--- Test 9: getServerByName route calls are explicitly allowlisted ---");
+{
+	// These operations intentionally enter PartyServer's document lifecycle.
+	// Any new call must be cost-reviewed and added here with an explanation in
+	// docs/engineering/durable-object-cost-guardrails.md.
+	const approvedCalls = new Map([
+		["recoverySnapshots.ts", 1], // document-based recovery snapshot mutation
+		["snapshots.ts", 1], // document-based daily snapshot mutation
+		["syncSocket.ts", 1], // accepted WebSocket sync connection
+		["trace.ts", 1], // explicit full-document export for schema fallback/snapshot
+	]);
+	const observedCalls = new Map();
+	for (const file of readdirSync(serverRoutesDir).filter((name) => name.endsWith(".ts"))) {
+		const source = readFileSync(join(serverRoutesDir, file), "utf8");
+		const count = [...source.matchAll(/\bawait\s+getServerByName\s*\(/g)].length;
+		if (count > 0) observedCalls.set(file, count);
+	}
+
+	assert(
+		[...observedCalls.keys()].every((file) => approvedCalls.has(file)),
+		"no server route introduces an unapproved getServerByName call site",
+	);
+	assert(
+		[...approvedCalls.entries()].every(([file, count]) => observedCalls.get(file) === count),
+		"approved getServerByName call counts match the reviewed document-owning paths",
+	);
+}
+
+// ── Test 10: missing optional R2 does not trigger capability polling ─────────
+console.log("\n--- Test 10: capability polling is bounded to an active guided update ---");
+{
+	const source = readFileSync(mainPath, "utf8");
+	assert(
+		!source.includes("waitingForR2"),
+		"missing optional R2 capability does not create an indefinite polling condition",
+	);
+	assert(
+		source.includes("waitingForGuidedUpdate") && source.includes('refreshServerCapabilities("guided-update-poll")'),
+		"capability polling is named and gated as guided-update monitoring",
+	);
+	assert(
+		!source.includes('refreshServerCapabilities("background-poll")'),
+		"generic background capability polling is absent",
+	);
 }
 
 console.log(`\n${"─".repeat(55)}`);

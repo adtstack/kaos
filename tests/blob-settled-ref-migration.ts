@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { collectLegacyMissingBlobPaths } from "../src/sync/blobSettledRefMigration";
+import {
+	collectLegacyMissingBlobPaths,
+	scrubBlobSettlementDocumentOwnership,
+} from "../src/sync/blobSettledRefMigration";
 import type { BlobHashCache } from "../src/sync/blobHashCache";
 
 const hash = "a".repeat(64);
@@ -40,3 +43,52 @@ for (const identityStatus of ["created", "unknown"] as const) {
 }
 
 console.log("PASS blob v4 settled-ref migration planning\n");
+
+console.log("--- Blob document-ownership settlement scrub ---");
+
+const scrubbed = scrubBlobSettlementDocumentOwnership({
+	cache: {
+		"assets/kept.png": { hash: "kept" },
+		"BACKLOG/BACKLOG.base": { hash: "legacy-base" },
+	},
+	sourceVersions: {
+		"assets/kept.png": "source-kept",
+		"BACKLOG/BACKLOG.base": "source-base",
+	},
+	stages: {
+		"assets/kept.png": { kind: "download" },
+		"BACKLOG (KAOS local backup 20260717T010203Z abc12345)/image.png": {
+			kind: "download",
+		},
+	},
+	legacyMissingPaths: [
+		"assets/missing.png",
+		"BACKLOG/BACKLOG.base",
+	],
+	isPathBlobSyncable: (path) =>
+		!path.endsWith(".base") && !path.includes("(KAOS local backup "),
+});
+
+assert.deepEqual(
+	scrubbed.cache,
+	{ "assets/kept.png": { hash: "kept" } },
+	"legacy Base refs are removed from attachment settlement authority",
+);
+assert.deepEqual(
+	scrubbed.sourceVersions,
+	{ "assets/kept.png": "source-kept" },
+	"legacy Base source versions are removed with their attachment ownership",
+);
+assert.deepEqual(
+	scrubbed.stages,
+	{ "assets/kept.png": { kind: "download" } },
+	"excluded safety-subtree stages are removed from attachment ownership",
+);
+assert.deepEqual(
+	scrubbed.legacyMissingPaths,
+	["assets/missing.png"],
+	"document paths are removed from legacy attachment Attention state",
+);
+assert.equal(scrubbed.changed, true, "ownership scrub reports a durable migration");
+
+console.log("PASS blob document-ownership settlement scrub\n");

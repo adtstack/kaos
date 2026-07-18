@@ -7,11 +7,12 @@ import { getMetaPath, isFileMetaDeletedValue } from "./fileMeta";
 import { formatUnknown, yTextToString } from "../utils/format";
 import {
 	isFrontmatterBlocked,
-	validateFrontmatterTransition,
+	validateCrdtDocumentTransition,
 	type FrontmatterValidationResult,
 } from "./frontmatterGuard";
 import { isLocalOrigin } from "./origins";
 import { contentBaselineHash } from "./diskIndex";
+import { getOpenFileViewsForPath } from "../utils/openFileViews";
 import {
 	PreservedUnresolvedRegistry,
 	getPreservedUnresolvedEpisodeId,
@@ -1390,8 +1391,7 @@ export class DiskMirror {
 		nextContent: string,
 	): boolean {
 		if (!this.frontmatterGuardEnabled()) return false;
-
-		const validation = validateFrontmatterTransition(previousContent, nextContent);
+		const validation = validateCrdtDocumentTransition(path, previousContent, nextContent);
 		this.onFrontmatterValidated?.(
 			path,
 			"crdt-to-disk",
@@ -2855,7 +2855,25 @@ export class DiskMirror {
 		return views;
 	}
 
+	private getOpenFileViewsForPath(path: string): unknown[] {
+		const markdownViews = this.getOpenMarkdownViewsForPath(path);
+		return getOpenFileViewsForPath(
+			this.app.workspace as Parameters<typeof getOpenFileViewsForPath>[0],
+			path,
+			markdownViews,
+		);
+	}
+
+	private hasOpaqueOpenFileView(path: string): boolean {
+		return this.getOpenFileViewsForPath(path)
+			.some((view) => !(view instanceof MarkdownView));
+	}
+
 	private isOpenInWorkspace(path: string): boolean {
+		// Only MarkdownView has unsaved editor authority that requires the idle
+		// write scheduler. Bases are file-backed opaque views: their content
+		// writes use the normal exact-snapshot CAS path, while destructive remote
+		// deletes are still blocked by getOpenEditorAuthority below.
 		return this.getOpenMarkdownViewsForPath(path).length > 0;
 	}
 
@@ -2876,6 +2894,10 @@ export class DiskMirror {
 
 	private getOpenEditorAuthority(path: string): OpenEditorAuthority {
 		const views = this.getOpenMarkdownViewsForPath(path);
+		// Bases and other opaque file views do not expose unsaved UI state.  Their
+		// presence is authority we cannot read, so destructive decisions must fail
+		// closed until the view is gone.
+		if (this.hasOpaqueOpenFileView(path)) return { kind: "read-failed" };
 		if (views.length === 0) return { kind: "none" };
 
 		const contents: string[] = [];

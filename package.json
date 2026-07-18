@@ -1,6 +1,6 @@
 {
 	"name": "kaos",
-	"version": "1.9.6",
+	"version": "1.9.7",
 	"description": "A zero-terminal, real-time sync engine powered by your own Cloudflare Worker.",
 	"main": "main.js",
 	"type": "module",
@@ -60,6 +60,7 @@
 		"guard:production-bundles:transitional": "node scripts/guard-production-bundles.mjs --transitional",
 		"guard:no-src-js-artifacts": "node scripts/guard-no-src-js-artifacts.mjs",
 		"guard:concurrency-drift": "node scripts/guard-concurrency-drift.mjs",
+		"guard:do-cost": "node tests/server-do-amplification.mjs",
 		"guard:qa-isolation": "node scripts/guard-qa-isolation.mjs",
 		"guard:schema-version": "node scripts/guard-schema-version.mjs",
 		"clean:src-js-artifacts": "find src -name '*.js' -o -name '*.js.map' | xargs rm -f 2>/dev/null; echo 'cleaned'"

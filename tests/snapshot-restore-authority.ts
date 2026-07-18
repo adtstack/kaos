@@ -3,6 +3,7 @@ import type { TFile } from "obsidian";
 import {
 	captureBlobRestoreAuthority,
 	captureMarkdownRestoreAuthority,
+	diffSnapshot,
 	restoreFromSnapshot,
 } from "../src/sync/snapshotClient";
 import {
@@ -212,6 +213,34 @@ console.log("\n--- Test 8b: attachment restore mints a transitive causal ref for
 	);
 
 	providerPeerDoc.destroy();
+	snapshotDoc.destroy();
+	liveDoc.destroy();
+}
+
+console.log("\n--- Test 8c: legacy Base blob snapshots cannot reclaim document ownership ---");
+{
+	const path = "BACKLOG/BACKLOG.base";
+	const snapshotDoc = new Y.Doc();
+	snapshotDoc.getMap<BlobRef>("pathToBlob").set(path, {
+		hash: "c".repeat(64),
+		size: 42,
+	});
+	const liveDoc = new Y.Doc();
+
+	const diff = diffSnapshot(snapshotDoc, liveDoc);
+	assert(
+		!diff.blobsDeletedSinceSnapshot.some((entry) => entry.path === path)
+			&& !diff.blobsChanged.some((entry) => entry.path === path),
+		"legacy Base blob refs are not offered as attachment restore targets",
+	);
+	const result = restoreFromSnapshot(snapshotDoc, liveDoc, { blobPaths: [path] });
+	assert(result.blobsRestored === 0, "legacy Base blob restore applies no mutation");
+	assert(
+		result.blobRejected[0]?.reason === "path-owned-by-crdt-document-lane",
+		"legacy Base blob restore reports document-lane ownership",
+	);
+	assert(!liveDoc.getMap("pathToBlob").has(path), "live attachment map remains free of Base refs");
+
 	snapshotDoc.destroy();
 	liveDoc.destroy();
 }

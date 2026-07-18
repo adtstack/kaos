@@ -118,6 +118,11 @@ import {
 	type ReconcileMode,
 } from "../src/sync/vaultSync";
 import { ReconciliationController } from "../src/runtime/reconciliationController";
+import { isMarkdownSyncable } from "../src/types";
+import {
+	isFrontmatterBlocked,
+	validateCrdtDocumentTransition,
+} from "../src/sync/frontmatterGuard";
 import {
 	FLIGHT_KIND,
 	FLIGHT_TAXONOMY_VERSION,
@@ -203,6 +208,14 @@ interface CapturedTrace {
 	source: string;
 	msg: string;
 	details?: Record<string, unknown>;
+}
+
+interface CapturedDocumentGuardCall {
+	path: string;
+	previousContent: string | null;
+	nextContent: string;
+	reason: string;
+	blocked: boolean;
 }
 
 function makeTFile(path: string): TFile {
@@ -298,6 +311,7 @@ interface Fixture {
 	vaultSync: VaultSync;
 	controller: ReconciliationController;
 	preservedUnresolved: Set<string>;
+	documentGuardCalls: CapturedDocumentGuardCall[];
 }
 
 function buildFixture(opts: {
@@ -308,6 +322,7 @@ function buildFixture(opts: {
 	const events: CapturedEvent[] = [];
 	const traces: CapturedTrace[] = [];
 	const preservedUnresolved = new Set<string>();
+	const documentGuardCalls: CapturedDocumentGuardCall[] = [];
 
 	const recordFlightPathEvent = (event: FlightPathEventInput): void => {
 		events.push(asPathEvent(event));
@@ -328,6 +343,7 @@ function buildFixture(opts: {
 
 	const app = {
 		vault: {
+			getFiles: () => [file],
 			getMarkdownFiles: () => [file],
 			read: async (f: TFile & { path: string }) => {
 				if (f.path !== opts.path) {
@@ -378,8 +394,23 @@ function buildFixture(opts: {
 		getEditorBindings: () => null,
 		getDiskIndex: () => ({}),
 		setDiskIndex: () => {},
-		isMarkdownPathSyncable: () => true,
-		shouldBlockFrontmatterIngest: () => false,
+		isMarkdownPathSyncable: (path) => isMarkdownSyncable(path, [], ".obsidian"),
+		shouldBlockFrontmatterIngest: (path, previousContent, nextContent, reason) => {
+			const validation = validateCrdtDocumentTransition(
+				path,
+				previousContent,
+				nextContent,
+			);
+			const blocked = isFrontmatterBlocked(validation);
+			documentGuardCalls.push({
+				path,
+				previousContent,
+				nextContent,
+				reason,
+				blocked,
+			});
+			return blocked;
+		},
 		refreshServerCapabilities: async () => {},
 		validateOpenEditorBindings: () => {},
 		onReconciled: () => {},
@@ -404,6 +435,7 @@ function buildFixture(opts: {
 		vaultSync,
 		controller,
 		preservedUnresolved,
+		documentGuardCalls,
 	};
 }
 
@@ -948,6 +980,200 @@ console.log("\n--- Scenario F: emitDecision() throw propagates and seed mutation
 		createdForPath.length,
 		0,
 		"Scenario F: zero crdt.file.created events for the path that failed admission",
+	);
+}
+
+console.log("\n--- Scenario G: authoritative startup admits a Base document through Y.Text ---");
+{
+	const baseYaml = [
+		"filters:",
+		"  and:",
+		"    - 'file.folder == \"BACKLOG\"'",
+		"views:",
+		"  - type: table",
+		"    name: Backlog",
+	].join("\n");
+	const fx = buildFixture({
+		path: "BACKLOG/BACKLOG.base",
+		diskContent: baseYaml,
+		mode: "authoritative",
+	});
+
+	await fx.controller.runReconciliation("authoritative");
+	assertEq(
+		fx.vaultSync.getTextForPath(fx.path)?.toJSON(),
+		baseYaml,
+		"Scenario G: Base YAML is seeded byte-for-byte into Y.Text",
+	);
+	assert(
+		fx.events.some((event) =>
+			event.kind === "reconcile.file.decision"
+			&& event.path === fx.path
+			&& event.data.decision === "seed-disk-to-crdt"
+		),
+		"Scenario G: Base admission uses the document reconcile decision",
+	);
+	assert(
+		fx.events.some((event) => event.kind === "crdt.file.created" && event.path === fx.path),
+		"Scenario G: Base admission emits the normal CRDT document creation event",
+	);
+	assert(
+		fx.documentGuardCalls.some((call) =>
+			call.path === fx.path
+			&& call.reason === "reconcile-disk-to-crdt-seed"
+			&& call.blocked === false
+		),
+		"Scenario G: valid Base passes the path-aware whole-document guard before startup seed",
+	);
+}
+
+console.log("\n--- Scenario H: authoritative startup ignores a document inside a local-backup subtree ---");
+{
+	const fx = buildFixture({
+		path:
+			"BACKLOG (KAOS local backup 2026-07-17T08-00-00Z 0123456789abcdef)/card.md",
+		diskContent: "must remain local-only",
+		mode: "authoritative",
+	});
+
+	await fx.controller.runReconciliation("authoritative");
+	assert(
+		fx.vaultSync.getTextForPath(fx.path) === null,
+		"Scenario H: backup subtree document is never seeded into Y.Text",
+	);
+	assert(
+		!fx.events.some((event) => event.kind === "crdt.file.created" && event.path === fx.path),
+		"Scenario H: backup subtree document emits no CRDT creation event",
+	);
+	assert(
+		!fx.events.some((event) =>
+			event.kind === "reconcile.file.decision"
+			&& event.path === fx.path
+			&& event.data.decision === "seed-disk-to-crdt"
+		),
+		"Scenario H: backup subtree document receives no seed decision",
+	);
+}
+
+console.log("\n--- Scenario I: authoritative startup rejects malformed Base YAML before Y.Text admission ---");
+{
+	const malformedBase = "views: [broken\n";
+	const fx = buildFixture({
+		path: "BACKLOG/PARTIAL.base",
+		diskContent: malformedBase,
+		mode: "authoritative",
+	});
+
+	await fx.controller.runReconciliation("authoritative");
+	assert(
+		fx.vaultSync.getTextForPath(fx.path) === null,
+		"Scenario I: malformed Base remains local and never gets a Y.Text",
+	);
+	assert(
+		!fx.events.some((event) =>
+			event.kind === "crdt.file.created" && event.path === fx.path
+		),
+		"Scenario I: malformed Base emits no CRDT creation event",
+	);
+	assert(
+		!fx.events.some((event) =>
+			event.kind === "reconcile.file.decision"
+			&& event.path === fx.path
+			&& event.data.decision === "seed-disk-to-crdt"
+		),
+		"Scenario I: malformed Base never reaches the authoritative seed decision",
+	);
+	assert(
+		fx.documentGuardCalls.some((call) =>
+			call.path === fx.path
+			&& call.reason === "reconcile-disk-to-crdt-seed"
+			&& call.blocked === true
+		),
+		"Scenario I: path-aware Base guard blocks the refreshed startup snapshot",
+	);
+	assert(
+		fx.traces.some((trace) =>
+			trace.msg === "document-admission-blocked"
+			&& trace.details?.path === fx.path
+			&& trace.details?.stage === "reconcile-disk-to-crdt-seed"
+		),
+		"Scenario I: blocked startup admission records a conservative diagnostic",
+	);
+}
+
+console.log("\n--- Scenario J: conservative import admits valid Base YAML after guard validation ---");
+{
+	const baseYaml = [
+		"views:",
+		"  - type: table",
+		"    name: Backlog",
+	].join("\n");
+	const fx = buildFixture({
+		path: "BACKLOG/VALID-IMPORT.base",
+		diskContent: baseYaml,
+		mode: "conservative",
+	});
+
+	await fx.controller.runReconciliation("conservative");
+	await fx.controller.importUntrackedFiles();
+	assertEq(
+		fx.vaultSync.getTextForPath(fx.path)?.toJSON(),
+		baseYaml,
+		"Scenario J: valid imported Base is admitted byte-for-byte into Y.Text",
+	);
+	assert(
+		fx.documentGuardCalls.some((call) =>
+			call.path === fx.path
+			&& call.reason === "import-untracked-disk-to-crdt-seed"
+			&& call.blocked === false
+		),
+		"Scenario J: import validates valid Base YAML immediately before ensureFile",
+	);
+}
+
+console.log("\n--- Scenario K: conservative import rejects malformed Base YAML and retains it locally ---");
+{
+	const malformedBase = "filters:\n  and: [unfinished\n";
+	const fx = buildFixture({
+		path: "BACKLOG/PARTIAL-IMPORT.base",
+		diskContent: malformedBase,
+		mode: "conservative",
+	});
+
+	await fx.controller.runReconciliation("conservative");
+	await fx.controller.importUntrackedFiles();
+	assert(
+		fx.vaultSync.getTextForPath(fx.path) === null,
+		"Scenario K: malformed imported Base remains local and never gets a Y.Text",
+	);
+	assert(
+		!fx.events.some((event) =>
+			event.kind === "crdt.file.created" && event.path === fx.path
+		),
+		"Scenario K: malformed imported Base emits no CRDT creation event",
+	);
+	assert(
+		fx.documentGuardCalls.some((call) =>
+			call.path === fx.path
+			&& call.reason === "import-untracked-disk-to-crdt-seed"
+			&& call.blocked === true
+		),
+		"Scenario K: import path blocks malformed whole-file Base YAML before ensureFile",
+	);
+	const retainedUntracked = (
+		fx.controller as unknown as { untrackedFiles: string[] }
+	).untrackedFiles;
+	assert(
+		retainedUntracked.includes(fx.path),
+		"Scenario K: blocked Base stays queued as untracked for a corrected local retry",
+	);
+	assert(
+		fx.traces.some((trace) =>
+			trace.msg === "document-admission-blocked"
+			&& trace.details?.path === fx.path
+			&& trace.details?.stage === "import-untracked-disk-to-crdt-seed"
+		),
+		"Scenario K: blocked import records a conservative diagnostic",
 	);
 }
 

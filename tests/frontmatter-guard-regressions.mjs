@@ -4,6 +4,8 @@ const {
 	extractFrontmatter,
 	getFieldPolicy,
 	validateFrontmatterTransition,
+	validateBaseDocument,
+	validateCrdtDocumentTransition,
 	isFrontmatterBlocked,
 } = guard;
 
@@ -34,7 +36,7 @@ class FrontmatterBridgeHarness {
 		const next = this.disk.get(path);
 		if (typeof next !== "string") throw new Error(`Missing disk content for ${path}`);
 		const previous = this.crdt.get(path) ?? null;
-		const validation = validateFrontmatterTransition(previous, next);
+		const validation = validateCrdtDocumentTransition(path, previous, next);
 		if (this.guardEnabled && isFrontmatterBlocked(validation)) {
 			this.blocked.push({ path, direction: "disk-to-crdt", validation });
 			return false;
@@ -48,7 +50,7 @@ class FrontmatterBridgeHarness {
 		const next = this.crdt.get(path);
 		if (typeof next !== "string") throw new Error(`Missing CRDT content for ${path}`);
 		const previous = this.disk.get(path) ?? null;
-		const validation = validateFrontmatterTransition(previous, next);
+		const validation = validateCrdtDocumentTransition(path, previous, next);
 		if (this.guardEnabled && isFrontmatterBlocked(validation)) {
 			this.blocked.push({ path, direction: "crdt-to-disk", validation });
 			return false;
@@ -397,6 +399,60 @@ console.log("\n--- Test 18: disabled guard allows suspicious frontmatter for tro
 	assert(bridge.outbound(path), "disabled guard allows outbound write");
 	assert(bridge.disk.get(path) === corrupt, "disabled guard writes the suspicious state");
 	assert(bridge.blocked.length === 0, "disabled guard records no block");
+}
+
+console.log("\n--- Test 19: valid whole-file Base YAML is accepted, including --- marker ---");
+{
+	const content = [
+		"---",
+		"filters:",
+		"  and:",
+		"    - 'file.folder == \"BACKLOG\"'",
+		"views:",
+		"  - type: table",
+		"    name: Backlog",
+	].join("\n");
+	const result = validateBaseDocument(content);
+	assert(result.risk === "ok", "valid Base YAML is accepted");
+	assert(
+		!isFrontmatterBlocked(validateCrdtDocumentTransition("BACKLOG/BACKLOG.base", null, content)),
+		"Base YAML document marker is not mistaken for an unclosed Markdown fence",
+	);
+}
+
+console.log("\n--- Test 20: malformed Base YAML and duplicate keys are blocked ---");
+{
+	const malformed = validateBaseDocument("views: [broken\n");
+	assert(isFrontmatterBlocked(malformed), "malformed Base YAML is blocked");
+	assert(malformed.reasons.includes("base-yaml-parse-error"), "Base parse error is identified");
+
+	const duplicate = validateBaseDocument("views: []\nviews: []\n");
+	assert(isFrontmatterBlocked(duplicate), "duplicate Base keys are blocked");
+	assert(duplicate.reasons.includes("base-duplicate-key:views"), "duplicate Base key is identified");
+}
+
+console.log("\n--- Test 21: Base YAML must have a mapping root ---");
+{
+	const result = validateBaseDocument("- type: table\n");
+	assert(isFrontmatterBlocked(result), "sequence-root Base YAML is blocked");
+	assert(result.reasons.includes("base-yaml-non-map-root"), "non-map Base root is identified");
+}
+
+console.log("\n--- Test 22: blocked Base updates do not cross either bridge direction ---");
+{
+	const path = "BACKLOG/BACKLOG.base";
+	const clean = "views:\n  - type: table\n    name: Backlog\n";
+	const corrupt = "views: []\nviews: []\n";
+	const bridge = new FrontmatterBridgeHarness();
+	bridge.disk.set(path, clean);
+	bridge.crdt.set(path, corrupt);
+	assert(!bridge.outbound(path), "invalid remote Base is not written to disk");
+	assert(bridge.disk.get(path) === clean, "blocked remote Base leaves disk intact");
+
+	bridge.crdt.set(path, clean);
+	bridge.disk.set(path, corrupt);
+	assert(!bridge.inbound(path), "invalid local Base is not admitted to CRDT");
+	assert(bridge.crdt.get(path) === clean, "blocked local Base leaves CRDT intact");
 }
 
 console.log(`\n${"-".repeat(50)}`);

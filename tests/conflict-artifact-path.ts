@@ -6,6 +6,7 @@ import {
 	buildMarkdownConflictArtifactPath,
 	isBaseBlobConflictArtifactPath,
 	isBlobConflictArtifactPath,
+	isLocalSafetyArtifactPath,
 	isMarkdownConflictArtifactForOriginalPath,
 	isMarkdownConflictArtifactPath,
 	parseBlobConflictArtifactPath,
@@ -13,7 +14,7 @@ import {
 	parseMarkdownConflictArtifactPath,
 } from "../src/paths/conflictArtifactPath";
 import { classifySyncPath } from "../src/paths/pathCategory";
-import { isBlobSyncable } from "../src/types";
+import { isBlobSyncable, isMarkdownSyncable } from "../src/types";
 
 let passed = 0;
 let failed = 0;
@@ -228,6 +229,75 @@ console.log("\n--- Test 13: local backup builder respects the filename length ca
 	assert(
 		parseBlobConflictArtifactPath(path)?.originalPathConfidence === "possibly-truncated",
 		"capped local backup reports possibly-truncated original identity",
+	);
+}
+
+console.log("\n--- Test 14: Base document conflict artifacts preserve .base and remain local-only ---");
+{
+	const path = buildMarkdownConflictArtifactPath("BACKLOG/BACKLOG.base", {
+		date: new Date("2026-07-17T08:00:00.000Z"),
+		deviceName: "Phone",
+		source: "disk",
+	});
+	assert(
+		path === "BACKLOG/BACKLOG (KAOS conflict - disk from Phone 2026-07-17T08-00-00Z).base",
+		"Base conflict builder preserves the .base extension",
+	);
+	assert(isMarkdownConflictArtifactPath(path), "Base conflict matches the document artifact predicate");
+	assert(
+		parseMarkdownConflictArtifactPath(path)?.inferredOriginalPath === "BACKLOG/BACKLOG.base",
+		"Base conflict parser recovers the original Base path",
+	);
+	assert(
+		buildMarkdownConflictArtifactCopyPath(path, 2).endsWith(") 2.base"),
+		"Base conflict copy suffix is inserted before .base",
+	);
+	assert(!isMarkdownSyncable(path, [], ".obsidian"), "Base conflict is not re-synced as a document");
+	assert(
+		classifySyncPath({ path, excludePatterns: [], configDir: ".obsidian" }).kind === "excluded",
+		"Base conflict category is excluded",
+	);
+}
+
+console.log("\n--- Test 15: artifact-named directories make their entire subtree local-only ---");
+{
+	const backupDir =
+		"BACKLOG (KAOS local backup 2026-07-17T08-00-00Z 0123456789abcdef)";
+	const documentChild = `${backupDir}/card.md`;
+	const nestedBlobChild = `${backupDir}/assets/icon.png`;
+	const remoteConflictChild =
+		"archive (KAOS remote conflict 2026-07-17T08-00-01Z)/nested/board.base";
+	const documentConflictChild =
+		"board (KAOS conflict - disk from Phone 2026-07-17T08-00-02Z).base/nested/card.md";
+
+	for (const path of [
+		documentChild,
+		nestedBlobChild,
+		remoteConflictChild,
+		documentConflictChild,
+	]) {
+		assert(isLocalSafetyArtifactPath(path), `artifact subtree is recognized: ${path}`);
+		assert(
+			classifySyncPath({ path, excludePatterns: [], configDir: ".obsidian" }).kind === "excluded",
+			`artifact subtree is excluded by category: ${path}`,
+		);
+	}
+
+	assert(!isMarkdownSyncable(documentChild, [], ".obsidian"), "document child is not re-synced");
+	assert(!isBlobSyncable(nestedBlobChild, [], ".obsidian"), "blob child is not re-synced");
+	assert(
+		parseConflictArtifactPath(documentChild) === null,
+		"a subtree child is not parsed as the artifact that named its directory",
+	);
+	assert(
+		!isBlobConflictArtifactPath(documentChild),
+		"the legacy blob artifact predicate remains basename-only",
+	);
+	assert(
+		!isLocalSafetyArtifactPath(
+			"BACKLOG (KAOS local backup 2026-07-17T08-00-00Z 0123456789abcdeF)/card.md",
+		),
+		"near-match directory with a non-canonical operation id is not excluded",
 	);
 }
 

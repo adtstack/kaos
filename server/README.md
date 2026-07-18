@@ -162,3 +162,6 @@ If you set `SYNC_TOKEN`, that environment value becomes the required token inste
 - Blob existence checks use bounded concurrency.
 - Snapshot creation is daily-idempotent through the `/snapshots/maybe` route.
 - Snapshot archives are stored compressed to keep R2 usage modest.
+- Worker, Durable Object, storage, timer, and retry changes must follow the
+  [Durable Object cost guardrails](../docs/engineering/durable-object-cost-guardrails.md).
+  Run `npm run guard:do-cost` before committing those changes.

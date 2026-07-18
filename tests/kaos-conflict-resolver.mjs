@@ -16,6 +16,7 @@ const lockFile = join(root, "kaos.lock");
 try {
 	await mkdir(join(vault, "notes"), { recursive: true });
 	await mkdir(join(vault, "assets"), { recursive: true });
+	await mkdir(join(vault, "BACKLOG"), { recursive: true });
 	await mkdir(join(vault, ".obsidian", "plugins", "kaos"), { recursive: true });
 	await writeFile(join(vault, "notes", "a.md"), "current A\nsame\n", "utf8");
 	await writeFile(
@@ -27,6 +28,12 @@ try {
 	await writeFile(
 		join(vault, "notes", "b (KAOS conflict - disk from desktop 2026-06-23T14-21-40Z) 2.md"),
 		"artifact B\n",
+		"utf8",
+	);
+	await writeFile(join(vault, "BACKLOG", "BACKLOG.base"), "views:\n  - name: Current\n", "utf8");
+	await writeFile(
+		join(vault, "BACKLOG", "BACKLOG (KAOS conflict - crdt from phone 2026-07-17T08-00-00Z).base"),
+		"views:\n  - name: Restored\n",
 		"utf8",
 	);
 	await writeFile(join(vault, "assets", "img.png"), Buffer.from("local-image"));
@@ -51,9 +58,10 @@ try {
 
 	let inventory = list();
 	assert.equal(inventory.kind, "kaos-conflicts");
-	assert.equal(inventory.count, 5);
+	assert.equal(inventory.count, 6);
 	findItem(inventory, (item) => item.artifactPath?.includes("a (KAOS conflict"), "markdown artifact");
 	findItem(inventory, (item) => item.artifactPath?.includes("img (KAOS remote conflict"), "blob artifact");
+	findItem(inventory, (item) => item.artifactPath?.endsWith(".base"), "Base document artifact");
 	findItem(inventory, (item) => item.type === "preserved-unresolved" && item.path === "deleted.md", "preserved entry");
 
 	const markdown = findItem(inventory, (item) => item.artifactPath?.includes("a (KAOS conflict"), "markdown artifact");
@@ -68,6 +76,18 @@ try {
 	runOk(["conflicts", "keep-current", markdown.id, ...vaultArgs()]);
 	assert.equal(await readFile(join(vault, "notes", "a.md"), "utf8"), "current A\nsame\n");
 	assert.equal(existsSync(join(vault, "notes", "a (KAOS conflict - crdt from laptop 2026-06-23T14-20-40Z).md")), false);
+
+	inventory = list();
+	const base = findItem(inventory, (item) => item.artifactPath?.endsWith(".base"), "Base replacement artifact");
+	runOk(["conflicts", "keep-artifact", base.id, ...vaultArgs()]);
+	assert.equal(
+		await readFile(join(vault, "BACKLOG", "BACKLOG.base"), "utf8"),
+		"views:\n  - name: Restored\n",
+	);
+	assert.equal(
+		existsSync(join(vault, "BACKLOG", "BACKLOG (KAOS conflict - crdt from phone 2026-07-17T08-00-00Z).base")),
+		false,
+	);
 
 	inventory = list();
 	const replace = findItem(inventory, (item) => item.artifactPath?.includes("b (KAOS conflict"), "replacement artifact");

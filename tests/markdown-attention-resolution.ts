@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { MarkdownView, TFile } from "obsidian";
 import * as Y from "yjs";
 import {
@@ -23,6 +24,8 @@ function deferred<T>() {
 }
 
 interface FixtureOptions {
+	path?: string;
+	opaqueOpenFileView?: boolean;
 	readStable?: (
 		path: string,
 		reason: "create" | "modify",
@@ -35,7 +38,7 @@ interface FixtureOptions {
 }
 
 function makeFixture(options: FixtureOptions = {}) {
-	const path = "notes/attention-fence.md";
+	const path = options.path ?? "notes/attention-fence.md";
 	const content = "local preserved content\n";
 	const file = new FakeTFile(path, { mtime: 41, size: content.length });
 	let activeFile: TFile = file;
@@ -59,12 +62,14 @@ function makeFixture(options: FixtureOptions = {}) {
 	let baselineRecordCalls = 0;
 	let diskPort: DiskIngestPort | null = null;
 	let diskIndex = {};
+	let opaqueOpenFileView = options.opaqueOpenFileView === true;
 	const openView = options.editorContent === undefined
 		? null
 		: Object.assign(new MarkdownView(), {
 			file,
 			editor: { getValue: () => options.editorContent! },
 		});
+	const opaqueView = { file };
 
 	const vaultSync = {
 		isPathTombstoned: (candidate: string) => candidate === path && deletedPath,
@@ -116,7 +121,10 @@ function makeFixture(options: FixtureOptions = {}) {
 			},
 			workspace: {
 				getActiveViewOfType: () => openView,
-				iterateAllLeaves: () => {},
+				iterateAllLeaves: (callback: (leaf: { view: unknown }) => void) => {
+					if (openView) callback({ view: openView });
+					if (opaqueOpenFileView) callback({ view: opaqueView });
+				},
 			},
 		} as any,
 		getSettings: () => ({ deviceName: "attention-test" }) as any,
@@ -175,6 +183,7 @@ function makeFixture(options: FixtureOptions = {}) {
 		setDeletedPath(value: boolean) { deletedPath = value; },
 		setDeleteFingerprint(value: string) { deleteFingerprint = value; },
 		setActiveFileIds(value: string[]) { activeFileIds = [...value]; },
+		setOpaqueOpenFileView(value: boolean) { opaqueOpenFileView = value; },
 		replaceAttentionEpisode(episodeId: string) {
 			if (entry) entry = { ...entry, episodeId, lastSeenAt: entry.lastSeenAt + 1 };
 		},
@@ -479,6 +488,56 @@ console.log("\n--- Markdown Attention resolution fencing ---");
 	);
 	assert.equal(fixture.ensureCalls, 0, "unsaved editor does not grant an Accept lease");
 	fixture.doc.destroy();
+}
+
+// An open Base is an opaque file authority: Accept must leave the Attention
+// entry untouched until the view closes, after which the user can explicitly
+// retry the same action and obtain a fresh lease.
+{
+	const fixture = makeFixture({
+		path: "BACKLOG/BACKLOG.base",
+		opaqueOpenFileView: true,
+	});
+	await assert.rejects(
+		fixture.controller.beginAcceptRemoteDeletedMarkdown(
+			fixture.path,
+			"remote-delete-missing-baseline",
+			expectedEpisode,
+		),
+		/file view.*still open.*Close it/i,
+	);
+	assert.equal(fixture.attentionEpisodeId, "episode-1", "open Base keeps its remote-delete Attention episode");
+
+	fixture.setOpaqueOpenFileView(false);
+	const lease = await fixture.controller.beginAcceptRemoteDeletedMarkdown(
+		fixture.path,
+		"remote-delete-missing-baseline",
+		expectedEpisode,
+	);
+	fixture.controller.finishRemoteDeletedMarkdownResolution(lease);
+	assert.equal(fixture.attentionEpisodeId, "episode-1", "granting a post-close lease does not clear Attention before trash");
+	fixture.doc.destroy();
+}
+
+// main.ts must repeat the opaque-view fence after acquiring the lease and
+// immediately before the destructive trash boundary. This protects a Base
+// view that opens while the dashboard action is in flight.
+{
+	const mainSource = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+	const resolveStart = mainSource.indexOf("private async resolveRemoteDeleteAttention(");
+	const leaseStart = mainSource.indexOf("beginAcceptRemoteDeletedMarkdown(", resolveStart);
+	const finalOpaqueFence = mainSource.indexOf(
+		"assertNoOpaqueOpenFileViewForRemoteDelete(",
+		leaseStart,
+	);
+	const trashStart = mainSource.indexOf("await this.app.fileManager.trashFile(file)", finalOpaqueFence);
+	assert.ok(
+		resolveStart >= 0
+			&& leaseStart > resolveStart
+			&& finalOpaqueFence > leaseStart
+			&& trashStart > finalOpaqueFence,
+		"dashboard Accept rechecks opaque file views after its lease and before trashFile",
+	);
 }
 
 console.log("PASS Markdown Attention resolution fencing");

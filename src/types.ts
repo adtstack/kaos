@@ -3,13 +3,11 @@
  */
 
 import { isExcluded } from "./sync/exclude";
-import {
-	isBlobConflictArtifactPath,
-	isMarkdownConflictArtifactPath,
-} from "./paths/conflictArtifactPath";
+import { isLocalSafetyArtifactPath } from "./paths/conflictArtifactPath";
+import { isCrdtDocumentPath } from "./paths/crdtDocumentPath";
 
 // -------------------------------------------------------------------
-// Markdown CRDT types
+// Text-document CRDT types (Markdown and Obsidian Bases)
 // -------------------------------------------------------------------
 
 /** Metadata stored per file ID in the CRDT meta map. */
@@ -167,22 +165,24 @@ export { ORIGIN_SEED } from "./sync/origins";
 // -------------------------------------------------------------------
 
 /**
- * Check if a vault-relative path is a markdown file eligible for CRDT sync.
- * Single choke point for all ".md" checks in the codebase.
+ * Check if a vault-relative text document is eligible for CRDT sync.
+ *
+ * The legacy function name is retained for compatibility, but this lane owns
+ * both Markdown (`.md`) and Obsidian Bases (`.base`) documents.
  */
 export function isMarkdownSyncable(path: string, excludePatterns: string[], configDir: string): boolean {
-	if (!path.endsWith(".md")) return false;
-	if (isMarkdownConflictArtifactPath(path)) return false;
+	if (!isCrdtDocumentPath(path)) return false;
+	if (isLocalSafetyArtifactPath(path)) return false;
 	return !isExcluded(path, excludePatterns, configDir);
 }
 
 /**
- * Check if a vault-relative path is a non-markdown file eligible for
+ * Check if a vault-relative path is a non-document file eligible for
  * blob/attachment sync. Excludes the config directory, .trash/, user patterns,
- * and markdown files (handled by the CRDT text pipeline).
+ * and text documents (handled by the CRDT text pipeline).
  */
 export function isBlobSyncable(path: string, excludePatterns: string[], configDir: string): boolean {
-	if (path.endsWith(".md")) return false;
-	if (isBlobConflictArtifactPath(path)) return false;
+	if (isCrdtDocumentPath(path)) return false;
+	if (isLocalSafetyArtifactPath(path)) return false;
 	return !isExcluded(path, excludePatterns, configDir);
 }

@@ -417,12 +417,10 @@ export class VaultSyncServer extends YServer {
 			}
 		}
 
-		// PartyServer internal management routes (e.g. /cdn-cgi/partyserver/set-name/)
-		// must not hydrate the document (issue #40 fix).  These are framework
-		// bookkeeping calls that do not need the Y.Doc in memory.  The observed
-		// offender was /cdn-cgi/partyserver/set-name/ pairing with checkpoint-load
-		// on every reconnect.  Non-WebSocket internal routes are safe to delegate
-		// directly to the framework without document hydration.
+		// Legacy getServerByName() call sites use this framework route to install
+		// the room name. PartyServer initializes YServer before answering it, so
+		// cheap read-only probes must bypass getServerByName() entirely (see
+		// routes/trace.ts). Document-owning routes still delegate normally here.
 		const isPartyServerInternal = url.pathname.startsWith("/cdn-cgi/partyserver/");
 		const isWebSocketUpgrade = request.headers.get("upgrade")?.toLowerCase() === "websocket";
 		if (isPartyServerInternal && !isWebSocketUpgrade) {

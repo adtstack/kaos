@@ -25,6 +25,7 @@ import { appendTraceParams, type TraceHttpContext } from "../observability/trace
 import { obsidianRequest } from "../utils/http";
 import { yTextToString } from "../utils/format";
 import { ORIGIN_RESTORE } from "./origins";
+import { isCrdtDocumentPath } from "../paths/crdtDocumentPath";
 
 // -------------------------------------------------------------------
 // Types (mirrors server SnapshotIndex)
@@ -469,11 +470,15 @@ export function diffSnapshot(
 	// Blob diff
 	const snapshotBlobs = new Map<string, string>(); // path -> hash
 	snapPathToBlob.forEach((ref, path) => {
+		// Pre-upgrade snapshots may contain `.base` attachment refs. They are
+		// legacy migration residue, not selectable blob restore targets.
+		if (isCrdtDocumentPath(path)) return;
 		snapshotBlobs.set(path, ref.hash);
 	});
 
 	const liveBlobs = new Map<string, string>();
 	livePathToBlob.forEach((ref, path) => {
+		if (isCrdtDocumentPath(path)) return;
 		liveBlobs.set(path, ref.hash);
 	});
 
@@ -571,7 +576,8 @@ export interface MarkdownRestoreRejection {
 export type BlobRestoreRejectionReason =
 	| "authority-precondition-missing"
 	| "live-blob-ref-changed"
-	| "live-blob-tombstone-changed";
+	| "live-blob-tombstone-changed"
+	| "path-owned-by-crdt-document-lane";
 
 export interface BlobRestoreRejection {
 	path: string;
@@ -818,6 +824,13 @@ export function restoreFromSnapshot(
 	)];
 	for (const path of requestedBlobPaths) {
 		if (!snapPathToBlob.has(path)) continue;
+		if (isCrdtDocumentPath(path)) {
+			result.blobRejected.push({
+				path,
+				reason: "path-owned-by-crdt-document-lane",
+			});
+			continue;
+		}
 		if (options.expectedBlobAuthority) {
 			const rejection = validateBlobRestoreAuthority(
 				liveDoc,

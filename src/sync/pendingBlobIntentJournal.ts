@@ -5,6 +5,8 @@ import {
 	isSha256Hex,
 	type BlobRef,
 } from "../types";
+import { isCrdtDocumentPath } from "../paths/crdtDocumentPath";
+import { isLocalSafetyArtifactPath } from "../paths/conflictArtifactPath";
 
 export interface PendingBlobIntentScope {
 	host: string;
@@ -50,6 +52,44 @@ export type PendingBlobIntent =
 		oldPath: string;
 		newPath: string;
 	};
+
+/**
+ * Re-home a pre-upgrade attachment intent after `.base` became a document and
+ * after KAOS safety-artifact directories became local-only subtrees.
+ *
+ * - document source: drop; its legacy blob ref stays dormant for recovery
+ * - any local-safety path: drop; an incident-shaped folder rename must not
+ *   tombstone the original attachment when its old journal replays
+ * - blob -> document: retain only deletion of the old blob source
+ * - blob -> blob: unchanged
+ */
+export function migratePendingBlobIntentDocumentOwnership(
+	intent: PendingBlobIntent,
+): PendingBlobIntent | null {
+	if (intent.kind === "delete") {
+		return isCrdtDocumentPath(intent.path)
+			|| isLocalSafetyArtifactPath(intent.path)
+			? null
+			: intent;
+	}
+	if (
+		isLocalSafetyArtifactPath(intent.oldPath)
+		|| isLocalSafetyArtifactPath(intent.newPath)
+	) return null;
+	if (isCrdtDocumentPath(intent.oldPath)) return null;
+	if (!isCrdtDocumentPath(intent.newPath)) return intent;
+	const migrated = {
+		...intent,
+		kind: "delete",
+		path: intent.oldPath,
+	} as Extract<PendingBlobIntent, { kind: "delete" }> & {
+		oldPath?: string;
+		newPath?: string;
+	};
+	delete migrated.oldPath;
+	delete migrated.newPath;
+	return migrated;
+}
 
 export function pendingBlobIntentsOverlap(
 	left: PendingBlobIntent,

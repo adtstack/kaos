@@ -75,6 +75,8 @@ import {
 	buildMarkdownConflictArtifactPath,
 	isMarkdownConflictArtifactForOriginalPath,
 } from "../paths/conflictArtifactPath";
+import { isCrdtDocumentPath } from "../paths/crdtDocumentPath";
+import { getOpenFileViewsForPath } from "../utils/openFileViews";
 import {
 	getPreservedUnresolvedEpisodeId,
 	isRemoteDeletePreservedUnresolvedEntry,
@@ -1103,13 +1105,18 @@ export class ReconciliationController {
 			const diskFiles = new Map<string, string>();
 			const diskSnapshotRevisions = new Map<string, number>();
 			const diskPresentPaths = new Set<string>();
-			const allMdFiles = this.deps.app.vault.getMarkdownFiles();
+			const vault = this.deps.app.vault;
+			const allDocumentFiles = (
+				typeof vault.getFiles === "function"
+					? vault.getFiles()
+					: vault.getMarkdownFiles()
+			).filter((file) => isCrdtDocumentPath(file.path));
 			let excludedCount = 0;
 			let oversizedCount = 0;
 			let skippedByIndex = 0;
 
 			const eligibleFiles: TFile[] = [];
-			for (const file of allMdFiles) {
+			for (const file of allDocumentFiles) {
 				if (!this.deps.isMarkdownPathSyncable(file.path)) {
 					excludedCount++;
 					continue;
@@ -1287,6 +1294,42 @@ export class ReconciliationController {
 						dropMissingAfterScan(path);
 					}
 				}
+			}
+
+			// A disk-only document is about to cross the only reconciliation path
+			// that can create a brand-new Y.Text without first passing through the
+			// normal vault-event ingest pipeline.  Apply the same path-aware
+			// document guard here, after the final disk refresh and immediately
+			// before reconcileVault's synchronous seed loop.  In particular, a
+			// partially-written or malformed `.base` file must remain local instead
+			// of becoming the shared CRDT authority.
+			for (const [path, content] of diskFiles) {
+				if (
+					vaultSync.getTextForPath(path) ||
+					vaultSync.isMarkdownTombstoned(path)
+				) {
+					continue;
+				}
+				if (!this.deps.shouldBlockFrontmatterIngest(
+					path,
+					null,
+					content,
+					"reconcile-disk-to-crdt-seed",
+				)) {
+					continue;
+				}
+
+				diskFiles.delete(path);
+				diskSnapshotRevisions.delete(path);
+				this.recordFrontmatterIngestBlocked(path, false, "disk-to-crdt-seed");
+				this.deps.trace("reconcile", "document-admission-blocked", {
+					path,
+					stage: "reconcile-disk-to-crdt-seed",
+				});
+				this.deps.log(
+					`reconcile: document guard kept unsafe disk-only file local: "${path}"`,
+				);
+				this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
 			}
 
 			const result = vaultSync.reconcileVault(
@@ -2320,6 +2363,26 @@ export class ReconciliationController {
 
 			try {
 				const content = await this.deps.app.vault.read(file);
+				if (this.deps.shouldBlockFrontmatterIngest(
+					path,
+					null,
+					content,
+					"import-untracked-disk-to-crdt-seed",
+				)) {
+					// Keep the path in the untracked queue so a corrected local file can
+					// be retried without ever admitting this unsafe snapshot.
+					this.untrackedFiles.push(path);
+					this.recordFrontmatterIngestBlocked(path, false, "disk-to-crdt-seed");
+					this.deps.trace("reconcile", "document-admission-blocked", {
+						path,
+						stage: "import-untracked-disk-to-crdt-seed",
+					});
+					this.deps.log(
+						`importUntracked: document guard kept unsafe file local: "${path}"`,
+					);
+					this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
+					continue;
+				}
 				// Mint a per-path `op-import-untracked-*` opId BEFORE the CRDT
 				// mutation so the resulting `crdt.file.created` envelope is
 				// causally linkable to this admission attempt.
@@ -2707,6 +2770,26 @@ export class ReconciliationController {
 		}
 	}
 
+	/**
+	 * Destructive Attention actions cannot inspect unsaved state owned by a
+	 * non-Markdown file view (notably an open Obsidian Base). Keep the existing
+	 * Attention entry actionable and require the user to close that view before
+	 * granting or consuming delete authority.
+	 */
+	assertNoOpaqueOpenFileViewForRemoteDelete(path: string): void {
+		const markdownViews = this.getOpenMarkdownViewsForPath(path);
+		const hasOpaqueView = getOpenFileViewsForPath(
+			this.deps.app.workspace as Parameters<typeof getOpenFileViewsForPath>[0],
+			path,
+			markdownViews,
+		).some((view) => !(view instanceof MarkdownView));
+		if (hasOpaqueView) {
+			throw new Error(
+				`The file view for "${path}" is still open. Close it before accepting the remote delete.`,
+			);
+		}
+	}
+
 	private assertExpectedMarkdownLocalFile(
 		path: string,
 		expected: MarkdownRemoteDeleteEntryIdentity["localFile"],
@@ -2765,6 +2848,7 @@ export class ReconciliationController {
 			expectedEpisode?.localFile,
 			abstractFile instanceof TFile ? abstractFile : null,
 		);
+		this.assertNoOpaqueOpenFileViewForRemoteDelete(path);
 		const lease = this.acquireMarkdownRemoteDeleteResolution(
 			path,
 			"accept-remote-delete",
@@ -2795,6 +2879,7 @@ export class ReconciliationController {
 
 			// This is intentionally the final check after every await and before
 			// returning authority to call trashFile().
+			this.assertNoOpaqueOpenFileViewForRemoteDelete(path);
 			this.assertSameRemoteDeletedMarkdownEntry(path, capturedEntry);
 			this.assertAuthoritativeMarkdownRemoteDelete(
 				path,
@@ -6243,12 +6328,12 @@ export class ReconciliationController {
 	 * Single private helper that owns every `recovery.skipped` emission
 	 * with `data.reason === "frontmatter-ingest-blocked"`.
 	 *
-	 * Invoked from each of the six `shouldBlockFrontmatterIngest` block
-	 * branches (two in `syncFileFromDisk` for the unbound disk→CRDT
-	 * branches, four in `handleBoundFileSyncGap` for the bound recovery
-	 * branches). The `branch` parameter is a closed-enum literal covering
-	 * the six call sites; new emission sites are not permitted without
-	 * extending the `FrontmatterIngestBlockBranch` union.
+	 * Invoked from every `shouldBlockFrontmatterIngest` branch that would
+	 * otherwise mutate Y.Text. The `branch` parameter describes the semantic
+	 * admission lane; startup reconciliation and untracked import reuse
+	 * `disk-to-crdt-seed` because they are alternate entry points to the same
+	 * seed operation. New semantic lanes require extending the closed
+	 * `FrontmatterIngestBlockBranch` union.
 	 *
 	 * The pre-existing `scheduleTraceStateSnapshot("frontmatter-ingest-blocked")`
 	 * calls in the four bound branches are intentionally retained as a
@@ -6509,10 +6594,13 @@ export class ReconciliationController {
 		source?: "crdt" | "disk" | "editor",
 	): Promise<string | null> {
 		const vault = this.deps.app.vault;
-		if (typeof vault.getMarkdownFiles !== "function") return null;
+		const candidates = typeof vault.getFiles === "function"
+			? vault.getFiles()
+			: (typeof vault.getMarkdownFiles === "function" ? vault.getMarkdownFiles() : null);
+		if (candidates === null) return null;
 
 		const targetFingerprint = contentFingerprint(content);
-		for (const file of vault.getMarkdownFiles()) {
+		for (const file of candidates) {
 			if (!isMarkdownConflictArtifactForOriginalPath(file.path, path, source)) continue;
 			try {
 				const existingContent = await this.deps.app.vault.read(file);

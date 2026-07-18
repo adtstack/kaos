@@ -9,6 +9,11 @@ import {
 	recoverySnapshotMaybeTraceEventName,
 } from "../server/src/routes/recoverySnapshots";
 import { snapshotMaybeTraceEventName } from "../server/src/routes/snapshots";
+import {
+	fetchVaultDebug,
+	fetchVaultSchemaVersion,
+	recordVaultTrace,
+} from "../server/src/routes/trace";
 
 let passed = 0;
 let failed = 0;
@@ -183,6 +188,55 @@ console.log("\n--- Test 3d: automatic snapshot triggers treat Bad Gateway as tra
 	assert(serverSource.includes("recovery-snapshot-bootstrap-deferred"), "automatic large-vault bootstrap records a defer trace");
 	assert(serverSource.includes("pathToId.observe"), "recovery dirty tracking observes legacy pathToId changes");
 	assert(serverSource.includes("change.oldValue"), "recovery dirty tracking marks previous pathToId file id on rename/delete");
+}
+
+console.log("\n--- Test 3e: cheap room probes use one direct Durable Object request ---");
+{
+	let idFromNameCalls = 0;
+	let getCalls = 0;
+	const requests: Request[] = [];
+	const syncNamespace = {
+		idFromName: (name: string) => {
+			idFromNameCalls++;
+			return `id:${name}`;
+		},
+		get: () => {
+			getCalls++;
+			return {
+				fetch: async (request: Request) => {
+					requests.push(request);
+					const pathname = new URL(request.url).pathname;
+					if (pathname === "/__kaos/meta") {
+						return json({ meta: { schemaVersion: 2 } });
+					}
+					return json({ roomId: "vault-a", recent: [] });
+				},
+			};
+		},
+	};
+	const env = { KAOS_SYNC: syncNamespace } as any;
+
+	const debugResponse = await fetchVaultDebug(env, "vault-a");
+	assert(debugResponse.status === 200, "cheap debug probe succeeds");
+	assert(requests.length === 1, "cheap debug probe performs exactly one DO fetch");
+	assert(
+		requests[0]?.headers.get("x-partykit-room") === "vault-a",
+		"cheap debug probe carries the room-id hint on the same request",
+	);
+
+	const schemaVersion = await fetchVaultSchemaVersion(env, "vault-a");
+	assert(schemaVersion === 2, "cheap room-meta probe returns the stored schema version");
+	assert(requests.length === 2, "room-meta probe adds exactly one DO fetch without set-name");
+
+	await recordVaultTrace(env, "vault-a", "cost-guard-test", { source: "test" });
+	assert(requests.length === 3, "trace write adds exactly one DO fetch without set-name");
+	assert(requests[2]?.method === "POST", "trace write preserves the POST method");
+	assert(
+		requests[2]?.headers.get("x-partykit-room") === "vault-a",
+		"trace write carries the room-id hint on the same request",
+	);
+	assert(idFromNameCalls === 3, "each cheap room operation resolves the room id once");
+	assert(getCalls === 3, "each cheap room operation gets the room stub once");
 }
 
 console.log("\n--- Test 4: blob uploads reject poisoned content-addressed keys ---");

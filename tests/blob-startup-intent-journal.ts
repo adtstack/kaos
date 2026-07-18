@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import {
+	migratePendingBlobIntentDocumentOwnership,
 	PendingBlobIntentJournal,
 	type PendingBlobIntent,
 	type PendingBlobIntentScope,
@@ -77,6 +78,62 @@ const BASE_ABSENT: PendingBlobMutationBase = {
 	sourceVersionKnown: true,
 };
 const DELETE_FINGERPRINT_H1 = "delete-episode-h1";
+
+console.log("\n--- Blob ownership migration: old Base and safety-subtree intents cannot replay ---");
+{
+	const deleteBase = new PendingBlobIntentJournal()
+		.recordDelete("BACKLOG/BACKLOG.base", SCOPE_A, BASE_H1, 1);
+	assert(
+		migratePendingBlobIntentDocumentOwnership(deleteBase) === null,
+		"legacy Base delete intent is dropped",
+	);
+
+	const baseToBlob = new PendingBlobIntentJournal()
+		.recordRename("BACKLOG/BACKLOG.base", "assets/export.png", SCOPE_A, BASE_H1, 2)!;
+	assert(
+		migratePendingBlobIntentDocumentOwnership(baseToBlob) === null,
+		"legacy Base source rename is dropped and cannot tombstone document authority",
+	);
+
+	const blobToBase = new PendingBlobIntentJournal()
+		.recordRename("assets/old.png", "BACKLOG/BACKLOG.base", SCOPE_A, BASE_H1, 3)!;
+	const migratedBlobToBase = migratePendingBlobIntentDocumentOwnership(blobToBase);
+	assert(
+		migratedBlobToBase?.kind === "delete"
+			&& migratedBlobToBase.path === "assets/old.png"
+			&& migratedBlobToBase.id === blobToBase.id,
+		"blob→Base rename keeps only the old blob source deletion",
+	);
+
+	const blobToBlob = new PendingBlobIntentJournal()
+		.recordRename("assets/a.png", "assets/b.png", SCOPE_A, BASE_H1, 4)!;
+	assert(
+		migratePendingBlobIntentDocumentOwnership(blobToBlob) === blobToBlob,
+		"blob→blob intent remains unchanged",
+	);
+
+	const safetyDir =
+		"BACKLOG (KAOS local backup 2026-07-17T08-00-00Z 0123456789abcdef)";
+	const incidentRename = new PendingBlobIntentJournal()
+		.recordRename(
+			"BACKLOG/image.png",
+			`${safetyDir}/image.png`,
+			SCOPE_A,
+			BASE_H1,
+			5,
+		)!;
+	assert(
+		migratePendingBlobIntentDocumentOwnership(incidentRename) === null,
+		"incident-shaped rename into a local-backup subtree is dropped instead of tombstoning the source",
+	);
+
+	const safetyDelete = new PendingBlobIntentJournal()
+		.recordDelete(`${safetyDir}/nested/icon.png`, SCOPE_A, BASE_H1, 6);
+	assert(
+		migratePendingBlobIntentDocumentOwnership(safetyDelete) === null,
+		"legacy delete inside a local-backup subtree is dropped",
+	);
+}
 
 console.log("\n--- Persisted blob queue: exact local authority scope ---");
 {
@@ -589,6 +646,9 @@ console.log("\n--- main.ts startup, CAS, and receipt wiring ---");
 	const flushIntents = replay.indexOf("flushPendingBlobIntentPersistence()");
 	const flushSettled = replay.indexOf("flushBlobSettledRefPersistence()");
 	const firstApply = replay.indexOf("this.applyPendingBlobDelete(");
+	const documentMigration = replay.indexOf("migratePendingBlobIntentDocumentOwnership(intent)");
+	const migrationPersist = replay.indexOf("await this.enqueuePendingBlobIntentPersistence()", documentMigration);
+	const migrationFlush = replay.indexOf("await this.flushPendingBlobIntentPersistence()", migrationPersist);
 	assert(
 		replay.includes("!this.getRuntimeConfig().enableAttachmentSync")
 			&& replay.includes("vaultSync?.providerSynced")
@@ -598,6 +658,13 @@ console.log("\n--- main.ts startup, CAS, and receipt wiring ---");
 	assert(
 		flushIntents >= 0 && flushSettled > flushIntents && firstApply > flushSettled,
 		"replay flushes both durable local journals before applying any CRDT mutation",
+	);
+	assert(
+		documentMigration >= 0
+			&& migrationPersist > documentMigration
+			&& migrationFlush > migrationPersist
+			&& firstApply > migrationFlush,
+		"document-owned blob intents are migrated and durably flushed before any blob CAS",
 	);
 	assert(
 		replay.includes("getAbstractFileByPath(intent.path)")
@@ -733,6 +800,23 @@ console.log("\n--- main.ts startup, CAS, and receipt wiring ---");
 			&& !ensureSettled.includes("blobSettledRefStore.clear()")
 			&& enqueueSettled.includes("corruptBlobSettledRefStoreKeys.has(key)"),
 		"corrupt settlement authority is never auto-cleared or overwritten by a later enqueue",
+	);
+	assert(
+		ensureSettled.includes("scrubBlobSettlementDocumentOwnership({")
+			&& ensureSettled.includes("isPathBlobSyncable: (path) => this.isBlobPathSyncable(path)")
+			&& ensureSettled.includes("|| ownership.changed")
+			&& ensureSettled.indexOf("scrubBlobSettlementDocumentOwnership({")
+				< ensureSettled.indexOf("Object.assign(this.blobSettledRefs, nextSettledRefs)"),
+		"legacy Base and excluded safety-subtree settlement state is scrubbed and durably rewritten before attachment authority opens",
+	);
+	const legacyAttentionStart = main.indexOf("private hydrateLegacyMissingBlobAttention(");
+	const legacyAttentionEnd = main.indexOf("private persistBlobSettledRefs(", legacyAttentionStart);
+	const legacyAttention = main.slice(legacyAttentionStart, legacyAttentionEnd);
+	assert(
+		legacyAttention.includes("entry.reason !== LEGACY_MISSING_BLOB_ATTENTION_REASON")
+			&& legacyAttention.includes("this.isBlobPathSyncable(entry.path)")
+			&& legacyAttention.includes("retainedBlobEntries.length !== previousBlobEntries.length"),
+		"legacy attachment Attention is retired when a path moves to the Base document lane",
 	);
 	assert(
 		main.includes("localDeviceId: this.blobIntentLocalDeviceId ?? \"\"")

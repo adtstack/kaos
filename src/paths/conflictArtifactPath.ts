@@ -1,16 +1,18 @@
 /**
- * Local markdown conflict artifacts are safety copies, not sync documents.
+ * Local CRDT text-document conflict artifacts are safety copies, not sync
+ * documents. The legacy "markdown" API names also cover Obsidian Bases.
  *
  * Examples:
  *   note (KAOS conflict - disk from Laptop 2026-06-23T14-20-40Z).md
  *   note (KAOS conflict - crdt from iPad 2026-06-23T14-20-40Z) 2.md
  *   note (KAOS conflict from Old Device 2026-05-11T12-00-00Z).md
+ *   board (KAOS conflict - disk from Phone 2026-07-17T08-00-00Z).base
  */
 const MARKDOWN_CONFLICT_ARTIFACT_RE =
-	/(?:^|\/)[^/]+ \(KAOS conflict(?: - (?:crdt|disk|editor))? from [^/]+ \d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\)(?: \d+)?\.md$/;
+	/(?:^|\/)[^/]+ \(KAOS conflict(?: - (?:crdt|disk|editor))? from [^/]+ \d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z\)(?: \d+)?\.(?:md|base)$/;
 
 const MARKDOWN_CONFLICT_ARTIFACT_NAME_RE =
-	/^(.+) \(KAOS conflict(?: - (crdt|disk|editor))? from (.+) (\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)\)(?: (\d+))?(\.md)$/;
+	/^(.+) \(KAOS conflict(?: - (crdt|disk|editor))? from (.+) (\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)\)(?: (\d+))?(\.(?:md|base))$/;
 
 const BLOB_CONFLICT_ARTIFACT_NAME_RE =
 	/^(.+) \(KAOS remote conflict (\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)\)(?: (\d+))?(\.[^/.]+)?$/;
@@ -51,6 +53,28 @@ export function isBlobConflictArtifactPath(path: string): boolean {
 	const name = normalizeSlashes(path).split("/").pop() ?? path;
 	return BLOB_CONFLICT_ARTIFACT_NAME_RE.test(name)
 		|| BLOB_LOCAL_BACKUP_ARTIFACT_NAME_RE.test(name);
+}
+
+/**
+ * True when the path itself, or any directory containing it, has an exact
+ * KAOS safety-artifact name. A companion folder-note integration can mirror a
+ * visible backup rename onto a same-named directory; every descendant must
+ * remain local-only or reconciliation will admit the directory contents as
+ * brand-new documents and attachments.
+ *
+ * Parsing deliberately remains basename-only. Descendants identify a safety
+ * subtree, but they do not carry enough information to infer the original
+ * path of the artifact that named the directory.
+ */
+export function isLocalSafetyArtifactPath(path: string): boolean {
+	return normalizeSlashes(path)
+		.split("/")
+		.filter((segment) => segment.length > 0)
+		.some((segment) =>
+			MARKDOWN_CONFLICT_ARTIFACT_NAME_RE.test(segment)
+			|| BLOB_CONFLICT_ARTIFACT_NAME_RE.test(segment)
+			|| BLOB_LOCAL_BACKUP_ARTIFACT_NAME_RE.test(segment)
+		);
 }
 
 export function isBaseBlobConflictArtifactPath(path: string): boolean {
@@ -129,9 +153,7 @@ export function buildMarkdownConflictArtifactPath(
 	options: BuildMarkdownConflictArtifactPathOptions,
 ): string {
 	const { dir, name } = splitPath(path);
-	const dot = name.toLowerCase().endsWith(".md") ? name.length - 3 : -1;
-	const base = dot >= 0 ? name.slice(0, dot) : name;
-	const ext = dot >= 0 ? name.slice(dot) : ".md";
+	const { base, ext } = splitCrdtDocumentName(name);
 	const device = sanitizeMarkdownConflictDeviceName(options.deviceName);
 	const stamp = formatConflictArtifactStamp(options.date ?? new Date());
 	const cappedBase = base.slice(0, 100);
@@ -146,7 +168,7 @@ export function buildMarkdownConflictArtifactPath(
 
 export function buildMarkdownConflictArtifactCopyPath(basePath: string, copyIndex: number): string {
 	if (!Number.isInteger(copyIndex) || copyIndex <= 1) return basePath;
-	return basePath.replace(/(\.md)?$/, ` ${copyIndex}$1`);
+	return basePath.replace(/(\.(?:md|base))?$/, ` ${copyIndex}$1`);
 }
 
 export function isMarkdownConflictArtifactForOriginalPath(
@@ -155,9 +177,7 @@ export function isMarkdownConflictArtifactForOriginalPath(
 	source?: MarkdownConflictArtifactSource,
 ): boolean {
 	const { dir, name } = splitPath(originalPath);
-	const dot = name.toLowerCase().endsWith(".md") ? name.length - 3 : -1;
-	const base = dot >= 0 ? name.slice(0, dot) : name;
-	const ext = dot >= 0 ? name.slice(dot) : ".md";
+	const { base, ext } = splitCrdtDocumentName(name);
 	const cappedBase = base.slice(0, 100);
 	const sourcePart = source ? ` - ${source}` : "";
 	const escapedDir = escapeRegExp(dir);
@@ -219,6 +239,16 @@ function splitPath(path: string): { dir: string; name: string } {
 		dir: slash >= 0 ? path.slice(0, slash + 1) : "",
 		name: slash >= 0 ? path.slice(slash + 1) : path,
 	};
+}
+
+function splitCrdtDocumentName(name: string): { base: string; ext: ".md" | ".base" } {
+	if (name.endsWith(".base")) {
+		return { base: name.slice(0, -5), ext: ".base" };
+	}
+	if (name.endsWith(".md")) {
+		return { base: name.slice(0, -3), ext: ".md" };
+	}
+	return { base: name, ext: ".md" };
 }
 
 function stampToIso(stamp: string): string {

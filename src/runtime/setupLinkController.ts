@@ -35,15 +35,19 @@ export class SetupLinkController {
 
 		const currentVaultId = this.deps.getSettings().vaultId?.trim() ?? "";
 		if (incomingVaultId && currentVaultId && incomingVaultId !== currentVaultId) {
-			const localMarkdownCount = this.deps.app.vault
-				.getMarkdownFiles()
+			const vault = this.deps.app.vault;
+			const localDocumentCount = (
+				typeof vault.getFiles === "function"
+					? vault.getFiles()
+					: vault.getMarkdownFiles()
+			)
 				.filter((file) => this.deps.isMarkdownPathSyncable(file.path))
 				.length;
-			if (localMarkdownCount > 5) {
+			if (localDocumentCount > 5) {
 				const confirmed = await this.confirmVaultIdSwitch(
 					currentVaultId,
 					incomingVaultId,
-					localMarkdownCount,
+					localDocumentCount,
 				);
 				if (!confirmed) {
 					new Notice("Pairing cancelled. Vault ID unchanged.", 6000);
@@ -73,7 +77,7 @@ export class SetupLinkController {
 	private async confirmVaultIdSwitch(
 		currentVaultId: string,
 		incomingVaultId: string,
-		localMarkdownCount: number,
+		localDocumentCount: number,
 	): Promise<boolean> {
 		return await new Promise((resolve) => {
 			new ConfirmModal(
@@ -81,7 +85,7 @@ export class SetupLinkController {
 				"Switch vault ID",
 				`This pairing link points to a different vault ID. ` +
 					`Current vault ID: ${currentVaultId}. Incoming vault ID: ${incomingVaultId}. ` +
-					`This vault currently has ${localMarkdownCount} local markdown files. ` +
+					`This vault currently has ${localDocumentCount} local text documents. ` +
 					`Switching rooms may pull a different remote state. Continue and switch to the incoming vault ID?`,
 				() => resolve(true),
 				"Switch vault ID",
