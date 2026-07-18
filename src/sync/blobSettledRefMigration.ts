@@ -7,6 +7,68 @@ export const LEGACY_MISSING_BLOB_ATTENTION_REASON =
 
 export type LocalDeviceIdentityStatus = "unknown" | "existing" | "created";
 
+export interface BlobSettlementOwnershipState<TRef, TSourceVersion, TStage> {
+	cache: Record<string, TRef>;
+	sourceVersions: Record<string, TSourceVersion>;
+	stages: Record<string, TStage>;
+	legacyMissingPaths: readonly string[];
+}
+
+/**
+ * Remove durable attachment-lane state for paths that are now owned by a
+ * document lane (for example, `.base` after the Bases migration).
+ *
+ * The caller supplies the current blob ownership predicate so this migration
+ * also retires newly excluded local-safety artifact subtrees. Returning fresh
+ * objects keeps a loaded IndexedDB snapshot immutable until the scrubbed state
+ * has been durably persisted by the caller.
+ */
+export function scrubBlobSettlementDocumentOwnership<
+	TRef,
+	TSourceVersion,
+	TStage,
+>(input: BlobSettlementOwnershipState<TRef, TSourceVersion, TStage> & {
+	isPathBlobSyncable(path: string): boolean;
+}): BlobSettlementOwnershipState<TRef, TSourceVersion, TStage> & {
+	changed: boolean;
+} {
+	const cache: Record<string, TRef> = {};
+	const sourceVersions: Record<string, TSourceVersion> = {};
+	const stages: Record<string, TStage> = {};
+	let changed = false;
+
+	const copyOwned = <T>(
+		source: Record<string, T>,
+		target: Record<string, T>,
+	): void => {
+		for (const [path, value] of Object.entries(source)) {
+			if (!input.isPathBlobSyncable(path)) {
+				changed = true;
+				continue;
+			}
+			target[path] = value;
+		}
+	};
+
+	copyOwned(input.cache, cache);
+	copyOwned(input.sourceVersions, sourceVersions);
+	copyOwned(input.stages, stages);
+
+	const legacyMissingPaths = input.legacyMissingPaths.filter((path) => {
+		const keep = input.isPathBlobSyncable(path);
+		if (!keep) changed = true;
+		return keep;
+	});
+
+	return {
+		cache,
+		sourceVersions,
+		stages,
+		legacyMissingPaths,
+		changed,
+	};
+}
+
 /**
  * Find only legacy-known paths that disappeared on this same installation.
  *

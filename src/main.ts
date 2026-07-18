@@ -41,6 +41,7 @@ import {
 	planRenameEventCommit,
 } from "./sync/policy/vaultEventCommitPolicy";
 import { classifySyncPath } from "./paths/pathCategory";
+import { isCrdtDocumentPath } from "./paths/crdtDocumentPath";
 import type { TraceSink, ProductFlightPathEventInput } from "./observability/traceSink";
 import { NoopTraceSink } from "./observability/noopTraceSink";
 import {
@@ -91,6 +92,7 @@ import {
 import {
 	collectLegacyMissingBlobPaths,
 	LEGACY_MISSING_BLOB_ATTENTION_REASON,
+	scrubBlobSettlementDocumentOwnership,
 	type LocalDeviceIdentityStatus,
 } from "./sync/blobSettledRefMigration";
 import {
@@ -102,6 +104,7 @@ import {
 } from "./sync/preservedUnresolved";
 import {
 	PendingBlobIntentJournal,
+	migratePendingBlobIntentDocumentOwnership,
 	pendingBlobIntentsOverlap,
 	type PendingBlobIntent,
 	type PendingBlobIntentScope,
@@ -478,6 +481,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return isMarkdownSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
 	}
 
+	/** MarkdownView/y-codemirror binding remains `.md`-only. */
+	private isMarkdownEditorPathSyncable(path: string): boolean {
+		return path.endsWith(".md") && this.isMarkdownPathSyncable(path);
+	}
+
 	private isBlobPathSyncable(path: string): boolean {
 		return isBlobSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
 	}
@@ -492,6 +500,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private isIntrinsicBlobPathExcluded(path: string): boolean {
+		// A pre-upgrade room may still contain a blob ref for a normal `.base`
+		// document. Keep that legacy ref dormant instead of tombstoning it during
+		// the same reconcile that admits the disk file into the CRDT document lane.
+		// Safety artifacts and temporary paths do not receive this exception.
+		if (
+			path.endsWith(".base")
+			&& isMarkdownSyncable(path, [], this.getRuntimeConfig().vaultConfigDir)
+		) return false;
 		return !isBlobSyncable(path, [], this.getRuntimeConfig().vaultConfigDir);
 	}
 
@@ -808,15 +824,35 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			const inMemory = this.pendingBlobIntents.getEntries(scope);
 			const merged = new Map(loaded.entries.map((entry) => [entry.id, entry]));
 			for (const entry of inMemory) merged.set(entry.id, entry);
-			const entries = Array.from(merged.values());
+			const mergedEntries = Array.from(merged.values());
+			const migratedEntries = mergedEntries.map((entry) => ({
+				before: entry,
+				after: migratePendingBlobIntentDocumentOwnership(entry),
+			}));
+			const entries = migratedEntries
+				.map(({ after }) => after)
+				.filter((entry): entry is PendingBlobIntent => entry !== null);
+			const scrubbedDocumentIntentCount = migratedEntries.filter(
+				({ before, after }) => after !== before,
+			).length;
 			const foreignEntries = this.pendingBlobIntents.getEntries().filter((entry) =>
 				buildPendingBlobIntentStoreKey(entry.scope) !== key
 			);
 			this.pendingBlobIntents.hydrate([...foreignEntries, ...entries]);
 			this.pendingBlobIntentStore = store;
 			this.pendingBlobIntentStoreKey = key;
+			if (scrubbedDocumentIntentCount > 0) {
+				this.trace("blob", "pending-blob-document-intents-scrubbed", {
+					count: scrubbedDocumentIntentCount,
+					phase: "hydrate",
+				});
+			}
 
-			if (loaded.status === "missing" || inMemory.length > 0) {
+			if (
+				loaded.status === "missing"
+				|| inMemory.length > 0
+				|| scrubbedDocumentIntentCount > 0
+			) {
 				const write = this.enqueuePendingBlobIntentSnapshot(
 					scope,
 					key,
@@ -1079,10 +1115,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// The stable-tail check above makes the durable snapshot authoritative.
 			// Never merge by key presence: an absent key is a meaningful settlement
 			// retirement/stage removal and an old loaded value must not resurrect it.
-			const nextSettledRefs = { ...loaded.cache };
-			const nextSourceVersions = { ...loaded.sourceVersions };
-			const nextStages = { ...loaded.stages };
-			const legacyMissingPaths = loaded.migrationStatus === "initialized"
+			const loadedLegacyMissingPaths = loaded.migrationStatus === "initialized"
 				? loaded.legacyMissingPaths
 				: collectLegacyMissingBlobPaths({
 					identityStatus: this.blobLocalDeviceIdentityStatus,
@@ -1091,6 +1124,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						this.app.vault.getAbstractFileByPath(path) !== null,
 					isPathSyncable: (path) => this.isBlobPathSyncable(path),
 				});
+			const ownership = scrubBlobSettlementDocumentOwnership({
+				cache: loaded.cache,
+				sourceVersions: loaded.sourceVersions,
+				stages: loaded.stages,
+				legacyMissingPaths: loadedLegacyMissingPaths,
+				isPathBlobSyncable: (path) => this.isBlobPathSyncable(path),
+			});
+			const nextSettledRefs = ownership.cache;
+			const nextSourceVersions = ownership.sourceVersions;
+			const nextStages = ownership.stages;
+			const legacyMissingPaths = ownership.legacyMissingPaths;
 
 			for (const path of Object.keys(this.blobSettledRefs)) {
 				delete this.blobSettledRefs[path];
@@ -1117,6 +1161,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			if (
 				loaded.status === "missing"
 				|| loaded.migrationStatus === "uninitialized"
+				|| ownership.changed
 			) {
 				const write = this.enqueueBlobSettledRefSnapshot(
 					scope,
@@ -1207,14 +1252,20 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private hydrateLegacyMissingBlobAttention(): boolean {
-		if (this.legacyMissingBlobPaths.size === 0) return false;
 		const markdownEntries = this.preservedUnresolvedEntries.filter(
 			(entry) => entry.kind === "markdown",
 		);
-		const registry = new PreservedUnresolvedRegistry(
-			this.preservedUnresolvedEntries.filter((entry) => entry.kind === "blob"),
+		const previousBlobEntries = this.preservedUnresolvedEntries.filter(
+			(entry) => entry.kind === "blob",
 		);
-		let changed = false;
+		const retainedBlobEntries = previousBlobEntries.filter((entry) =>
+			entry.reason !== LEGACY_MISSING_BLOB_ATTENTION_REASON
+			|| this.isBlobPathSyncable(entry.path)
+		);
+		const registry = new PreservedUnresolvedRegistry(
+			retainedBlobEntries,
+		);
+		let changed = retainedBlobEntries.length !== previousBlobEntries.length;
 		for (const path of this.legacyMissingBlobPaths) {
 			const existing = registry.get(path);
 			if (existing?.reason === LEGACY_MISSING_BLOB_ATTENTION_REASON) continue;
@@ -2424,6 +2475,44 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			|| !this.blobSettledRefPersistenceHealthy
 		) return;
 
+		// A prior release may have durably journaled `.base` as an attachment.
+		// Remove those local intents and persist the scrub before any blob CAS in
+		// this pass. The legacy remote ref remains dormant; the CRDT document lane
+		// now owns the path and old blob intent must not tombstone it.
+		const currentScopeIntents = this.pendingBlobIntents.getEntries(scope);
+		const migratedDocumentIntents = currentScopeIntents.map((intent) => ({
+			before: intent,
+			after: migratePendingBlobIntentDocumentOwnership(intent),
+		}));
+		const ownershipChanges = migratedDocumentIntents.filter(
+			({ before, after }) => after !== before,
+		);
+		if (ownershipChanges.length > 0) {
+			const key = buildPendingBlobIntentStoreKey(scope);
+			const foreignEntries = this.pendingBlobIntents.getEntries().filter((entry) =>
+				buildPendingBlobIntentStoreKey(entry.scope) !== key
+			);
+			const migratedScopeEntries = migratedDocumentIntents
+				.map(({ after }) => after)
+				.filter((entry): entry is PendingBlobIntent => entry !== null);
+			this.pendingBlobIntents.hydrate([...foreignEntries, ...migratedScopeEntries]);
+			for (const { before } of ownershipChanges) {
+				this.pendingBlobRenameFiles.delete(before.id);
+			}
+			try {
+				await this.enqueuePendingBlobIntentPersistence();
+			} catch {
+				return;
+			}
+			if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return;
+			if (!await this.flushPendingBlobIntentPersistence()) return;
+			if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return;
+			this.trace("blob", "pending-blob-document-intents-scrubbed", {
+				count: ownershipChanges.length,
+				phase: "replay",
+			});
+		}
+
 		let changed = false;
 		let replayed = false;
 		for (const intent of this.pendingBlobIntents.getEntries(scope)) {
@@ -2831,7 +2920,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getSettings: () => this.settings,
 			getEditorBindings: () => this.editorBindings,
 			getDiskMirror: () => this.diskMirror,
-			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
+			isMarkdownPathSyncable: (path) => this.isMarkdownEditorPathSyncable(path),
 			maybeImportDeferredClosedOnlyPath: (path, reason) =>
 				this.reconciliationController.maybeImportDeferredClosedOnlyPath(path, reason),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
@@ -3227,7 +3316,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.editorBindings = new EditorBindingManager(
 				this.vaultSync,
 				this.settings.debug,
-				(path) => this.isMarkdownPathSyncable(path),
+				(path) => this.isMarkdownEditorPathSyncable(path),
 				(source, msg, details) => this.trace(source, msg, details),
 				(event) => this.recordFlightPathEvent(event),
 				bindingPropagationGate,
@@ -3418,14 +3507,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				// Periodically persist blob queue if transfers are active,
 				// or clear persisted queue if transfers completed
 				this.attachmentOrchestrator?.handleStatusTick();
-				const capabilityState = this.capabilityUpdateService?.capabilities ?? null;
-				const waitingForR2 =
-					!!this.settings.host &&
-					(!capabilityState || !capabilityState.attachments || !capabilityState.snapshots);
 				const waitingForGuidedUpdate = this.capabilityUpdateService?.hasActiveGuidedServerUpdate() ?? false;
-				if ((waitingForR2 || waitingForGuidedUpdate) &&
+				if (waitingForGuidedUpdate &&
 					(this.capabilityUpdateService?.shouldRefreshCapabilities() ?? false)) {
-					void this.refreshServerCapabilities("background-poll");
+					void this.refreshServerCapabilities("guided-update-poll");
 				}
 			}, 3000);
 			this.statusInterval = statusInterval;
@@ -3488,7 +3573,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				// markdown destination. If one slips through, fail loudly in QA mode
 				// and tombstone as a production fallback.
 				for (const [, newPath] of renames) {
-					if (!this.isMarkdownPathSyncable(newPath) && newPath.endsWith(".md")) {
+					if (!this.isMarkdownPathSyncable(newPath) && isCrdtDocumentPath(newPath)) {
 						const msg = `[BUG] onRenameBatchFlushed: excluded markdown destination reached applyRenameBatch: "${newPath}"`;
 						if (this.settings.qaDebugMode) {
 							throw new Error(msg);
@@ -4907,6 +4992,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.getCurrentRemoteDeleteAttention(normalizedTarget);
 					this.assertRemoteDeleteFingerprint(normalizedTarget);
 					this.assertDashboardLocalFileIdentity(normalizedTarget);
+					// The lease was fenced before its stable read, but a Base/file view
+					// can open while the dashboard action is in flight. Recheck at the
+					// destructive boundary so opaque view state is never trashed.
+					this.reconciliationController.assertNoOpaqueOpenFileViewForRemoteDelete(
+						normalizedTarget.path,
+					);
 					const file = this.app.vault.getAbstractFileByPath(normalizedTarget.path);
 					if (file instanceof TFile) {
 						this.attentionMarkdownDeleteInFlight.set(normalizedTarget.path, file);
@@ -5320,7 +5411,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			connected: vaultSync?.connected ?? false,
 			providerSynced: vaultSync?.providerSynced ?? false,
 			serverReceipt: vaultSync?.serverAppliedLocalState ?? null,
-			diskFileCount: this.app.vault.getMarkdownFiles().length,
+			diskFileCount: this.app.vault.getFiles().filter((file) => isCrdtDocumentPath(file.path)).length,
 			crdtPathCount: vaultSync?.getActiveMarkdownPaths().length ?? 0,
 			missingOnDisk: 0,
 			missingInCrdt: 0,

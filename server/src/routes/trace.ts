@@ -4,6 +4,30 @@ import type { Env } from "./types";
 
 const LOG_PREFIX = "[kaos-sync:worker]";
 
+/**
+ * Fetch a cheap room endpoint without PartyServer's getServerByName().
+ *
+ * getServerByName() first sends a separate /set-name/ request. PartyServer
+ * initializes YServer before answering that request, so a cold read-only probe
+ * can hydrate the entire CRDT document. Cheap endpoints only need a stable DO
+ * id and a room-id hint for their response payload.
+ */
+function fetchVaultRoomCheap(
+	env: Env,
+	vaultId: string,
+	pathname: string,
+	init?: RequestInit,
+): Promise<Response> {
+	const id = env.KAOS_SYNC.idFromName(vaultId);
+	const stub = env.KAOS_SYNC.get(id);
+	const headers = new Headers(init?.headers);
+	headers.set("x-partykit-room", vaultId);
+	return stub.fetch(new Request(`https://internal${pathname}`, {
+		...init,
+		headers,
+	}));
+}
+
 export async function recordVaultTrace(
 	env: Env,
 	vaultId: string,
@@ -11,8 +35,7 @@ export async function recordVaultTrace(
 	data: Record<string, unknown> = {},
 ): Promise<void> {
 	try {
-		const stub = await getServerByName(env.KAOS_SYNC, vaultId);
-		await stub.fetch("https://internal/__kaos/trace", {
+		await fetchVaultRoomCheap(env, vaultId, "/__kaos/trace", {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
@@ -36,8 +59,7 @@ export async function fetchVaultDocument(env: Env, vaultId: string): Promise<Uin
 async function fetchVaultRoomMeta(env: Env, vaultId: string): Promise<{
 	schemaVersion: number | null;
 } | null> {
-	const stub = await getServerByName(env.KAOS_SYNC, vaultId);
-	const res = await stub.fetch("https://internal/__kaos/meta");
+	const res = await fetchVaultRoomCheap(env, vaultId, "/__kaos/meta");
 	if (!res.ok) {
 		throw new Error(`room meta fetch failed (${res.status})`);
 	}
@@ -79,6 +101,5 @@ export async function fetchVaultSchemaVersion(env: Env, vaultId: string): Promis
 }
 
 export async function fetchVaultDebug(env: Env, vaultId: string): Promise<Response> {
-	const stub = await getServerByName(env.KAOS_SYNC, vaultId);
-	return await stub.fetch("https://internal/__kaos/debug");
+	return await fetchVaultRoomCheap(env, vaultId, "/__kaos/debug");
 }

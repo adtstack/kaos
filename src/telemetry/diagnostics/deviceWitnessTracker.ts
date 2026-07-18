@@ -36,6 +36,7 @@ import {
 	computeWitnessStateHash as _computeWitnessStateHash,
 	computeDeletedWitnessStateHash,
 } from "./witnessStateHash";
+import { isCrdtDocumentPath } from "../../paths/crdtDocumentPath";
 
 // -----------------------------------------------------------------------
 // Public types
@@ -882,7 +883,7 @@ export class DeviceWitnessTracker {
 	// -----------------------------------------------------------------------
 
 	private _isMarkdownPath(path: string): boolean {
-		if (!path.endsWith(".md")) return false;
+		if (!isCrdtDocumentPath(path)) return false;
 		// eslint-disable-next-line obsidianmd/hardcoded-config-path
 		const configDir = this.config.configDir ?? ".obsidian";
 		if (path.startsWith(configDir + "/")) return false;

@@ -21,6 +21,7 @@ const TEMPORARY_FILE_SUFFIXES = [
 	".swp",
 	".swo",
 	".bak",
+	".backup",
 	".orig",
 	".partial",
 	".crdownload",

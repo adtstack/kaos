@@ -255,7 +255,12 @@ export class DiagnosticsService {
 		const settings = this.deps.getSettings();
 		const state = this.deps.getState();
 
-		const diskFiles = this.deps.app.vault.getMarkdownFiles()
+		const vault = this.deps.app.vault;
+		const diskFiles = (
+			typeof vault.getFiles === "function"
+				? vault.getFiles()
+				: vault.getMarkdownFiles()
+		)
 			.filter((f) => this.deps.isMarkdownPathSyncable(f.path));
 
 		const crdtPaths = new Set<string>(

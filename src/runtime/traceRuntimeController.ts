@@ -24,7 +24,6 @@ export class TraceRuntimeController {
 	private logger: TraceLoggerPort | null = null;
 	private stateInterval: ReturnType<typeof setInterval> | null = null;
 	private stateTimer: ReturnType<typeof setTimeout> | null = null;
-	private serverInterval: ReturnType<typeof setInterval> | null = null;
 	private serverInFlight = false;
 	private recentServerTrace: unknown[] = [];
 	private lastMetadataRaceRejectionAt = 0;
@@ -57,9 +56,9 @@ export class TraceRuntimeController {
 		this.stateInterval = setInterval(() => {
 			this.scheduleSnapshot("interval");
 		}, 5000);
-		this.serverInterval = setInterval(() => {
-			void this.fetchServerTrace();
-		}, 15000);
+		// Server trace is fetched once after sync startup (main.ts) and when an
+		// explicit refresh is requested. Never poll it here: each read wakes the
+		// per-vault Durable Object and scales linearly with connected devices.
 
 		const errorHandler = (event: ErrorEvent): void => {
 			if (this.deps.isIndexedDbRelatedError(event.error ?? event.message)) {
@@ -152,10 +151,6 @@ export class TraceRuntimeController {
 		if (this.stateInterval) {
 			clearInterval(this.stateInterval);
 			this.stateInterval = null;
-		}
-		if (this.serverInterval) {
-			clearInterval(this.serverInterval);
-			this.serverInterval = null;
 		}
 		await this.logger?.shutdown();
 		this.logger = null;

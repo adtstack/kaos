@@ -1,6 +1,6 @@
 /**
  * Path category classification — the single place that determines whether
- * a vault path is markdown, blob, or excluded.
+ * a vault path is a CRDT text document, blob, or excluded.
  *
  * Delegates to existing product policy (isExcluded, extension checks) but
  * operates on canonicalized paths to ensure NFC/NFD-equivalent paths get
@@ -14,11 +14,14 @@
 import { canonicalizeVaultPath, type CanonicalPath } from "./canonicalPath";
 import { isExcluded } from "../sync/exclude";
 import {
-	isBlobConflictArtifactPath,
+	isLocalSafetyArtifactPath,
 	isMarkdownConflictArtifactPath,
 } from "./conflictArtifactPath";
+import { isCrdtDocumentPath } from "./crdtDocumentPath";
 
 export type PathSyncCategory =
+	// `markdown` is the legacy wire/runtime label for all CRDT text documents,
+	// including Obsidian Bases (`.base`).
 	| { kind: "markdown"; path: CanonicalPath }
 	| { kind: "blob"; path: CanonicalPath }
 	| { kind: "excluded"; path: CanonicalPath; reason: string };
@@ -30,11 +33,11 @@ export type PathSyncCategory =
  *   1. Excluded paths (config dir, .trash, user patterns) are always excluded.
  *   2. KAOS markdown/blob conflict and local-backup artifacts are excluded
  *      local-only safety copies.
- *   3. .md files that are not excluded are markdown.
- *   4. Non-.md files that are not excluded are blob.
+ *   3. `.md` and `.base` files that are not excluded are CRDT documents.
+ *   4. Other files that are not excluded are blobs.
  *
  * This matches the existing isMarkdownSyncable/isBlobSyncable contracts,
- * including their durable local-safety-artifact filename exclusions.
+ * including their durable local-safety-artifact subtree exclusions.
  */
 export function classifySyncPath(input: {
 	path: string;
@@ -50,18 +53,20 @@ export function classifySyncPath(input: {
 		return { kind: "excluded", path: canonical, reason: "excluded-by-pattern" };
 	}
 
+	// Preserve the legacy reason for a Markdown conflict artifact itself. The
+	// shared predicate below additionally catches every artifact subtree.
 	if (isMarkdownConflictArtifactPath(canonical.normalizedPath)) {
 		return { kind: "excluded", path: canonical, reason: "excluded-by-pattern" };
 	}
-	if (isBlobConflictArtifactPath(canonical.normalizedPath)) {
+	if (isLocalSafetyArtifactPath(canonical.normalizedPath)) {
 		return { kind: "excluded", path: canonical, reason: "local-safety-artifact" };
 	}
 
-	// Extension check on normalized path (same as isMarkdownSyncable).
-	if (canonical.normalizedPath.endsWith(".md")) {
+	// Text-document check on normalized path (same as isMarkdownSyncable).
+	if (isCrdtDocumentPath(canonical.normalizedPath)) {
 		return { kind: "markdown", path: canonical };
 	}
 
-	// Non-.md, non-excluded, non-artifact = blob-syncable.
+	// Non-document, non-excluded, non-artifact = blob-syncable.
 	return { kind: "blob", path: canonical };
 }

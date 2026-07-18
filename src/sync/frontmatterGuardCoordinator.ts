@@ -17,7 +17,7 @@
 import { Notice, arrayBufferToHex } from "obsidian";
 import {
 	isFrontmatterBlocked,
-	validateFrontmatterTransition,
+	validateCrdtDocumentTransition,
 	extractFrontmatter,
 	type FrontmatterValidationResult,
 } from "./frontmatterGuard";
@@ -71,7 +71,7 @@ export class FrontmatterGuardCoordinator {
 	): boolean {
 		if (!this.host.frontmatterGuardEnabled) return false;
 
-		const validation = validateFrontmatterTransition(previousContent, nextContent);
+		const validation = validateCrdtDocumentTransition(path, previousContent, nextContent);
 		this.handleFrontmatterValidation(
 			path,
 			"disk-to-crdt",
@@ -131,7 +131,7 @@ export class FrontmatterGuardCoordinator {
 
 	showFrontmatterGuardNotice(path: string): void {
 		new Notice(
-			`KAOS paused a properties update in "${path}" because the frontmatter looked unsafe. Check diagnostics before accepting the change.`,
+			`KAOS paused a document update in "${path}" because its YAML metadata looked unsafe. Check diagnostics before accepting the change.`,
 			12_000,
 		);
 	}
@@ -196,8 +196,8 @@ export class FrontmatterGuardCoordinator {
 		lastNoticeAt: number | null,
 	): Promise<void> {
 		const now = Date.now();
-		const prevHash = await this.hashFrontmatterContent(previousContent);
-		const nextHash = await this.hashFrontmatterContent(nextContent);
+		const prevHash = await this.hashFrontmatterContent(path, previousContent);
+		const nextHash = await this.hashFrontmatterContent(path, nextContent);
 		const updated = upsertFrontmatterQuarantineEntry(
 			this.host.getFrontmatterQuarantineEntries(),
 			{
@@ -235,12 +235,19 @@ export class FrontmatterGuardCoordinator {
 	// -----------------------------------------------------------------------
 
 	private async hashFrontmatterContent(
+		path: string,
 		content: string | null,
 	): Promise<string | undefined> {
 		if (content == null) return undefined;
-		const block = extractFrontmatter(content);
-		if (block.kind !== "present") return undefined;
-		const data = new TextEncoder().encode(block.frontmatterText);
+		let hashInput: string;
+		if (path.endsWith(".base")) {
+			hashInput = content;
+		} else {
+			const block = extractFrontmatter(content);
+			if (block.kind !== "present") return undefined;
+			hashInput = block.frontmatterText;
+		}
+		const data = new TextEncoder().encode(hashInput);
 		const digest = await crypto.subtle.digest("SHA-256", data);
 		return arrayBufferToHex(digest);
 	}

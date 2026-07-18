@@ -28,6 +28,7 @@ import { DeviceWitnessTracker } from "./diagnostics/deviceWitnessTracker";
 import { DiagnosticsService } from "./diagnostics/diagnosticsService";
 import type { FlightMode, FlightPathEventInput, FlightEventInput } from "./debug/flightEvents";
 import type { ProductFlightPathEventInput } from "../observability/traceSink";
+import { isCrdtDocumentPath } from "../paths/crdtDocumentPath";
 import { PersistentTraceLogger } from "./debug/trace";
 import type { TraceLoggerPort, TraceLoggerConfig } from "../observability/traceLogger";
 
@@ -173,7 +174,7 @@ export async function installTelemetryRuntime(host: TelemetryRuntimeHost): Promi
 		}
 
 		const isRecoveryDecisionMd =
-			event.kind === "recovery.decision" && event.path.endsWith(".md");
+			event.kind === "recovery.decision" && isCrdtDocumentPath(event.path);
 
 		if (!isRecoveryDecisionMd) {
 			void flightTrace?.recordPath(event);
@@ -181,7 +182,7 @@ export async function installTelemetryRuntime(host: TelemetryRuntimeHost): Promi
 
 		if (
 			(event.kind === "recovery.decision" || event.kind === "recovery.apply.done") &&
-			event.path.endsWith(".md")
+			isCrdtDocumentPath(event.path)
 		) {
 			deviceWitnessTracker?.markDirty(event.path, "recovery");
 		}
@@ -282,7 +283,7 @@ export async function installTelemetryRuntime(host: TelemetryRuntimeHost): Promi
 					if (change.kind === "deleted") {
 						// Tombstone transition — mark as "tombstone" origin so the
 						// witness knows to check isCrdtTombstoned().
-						if (change.path.endsWith(".md")) {
+						if (isCrdtDocumentPath(change.path)) {
 							deviceWitnessTracker?.markDirty(change.path, "tombstone");
 						}
 					} else if (change.kind === "added") {

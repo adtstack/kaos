@@ -44,6 +44,7 @@ import type {
 	DashboardRecoveryHistoryTarget,
 	DashboardSnapshotStatus,
 } from "../dashboard/dashboardTypes";
+import { getOpenFileViewsForPath } from "../utils/openFileViews";
 import { DashboardSnapshotCache } from "./dashboardSnapshotCache";
 import {
 	captureRestoreDiskRevision,
@@ -789,6 +790,15 @@ export class SnapshotService {
 		return views;
 	}
 
+	private hasOpaqueOpenFileViewForRestorePath(path: string): boolean {
+		const markdownViews = this.getOpenMarkdownViewsForRestorePath(path);
+		return getOpenFileViewsForPath(
+			this.deps.app.workspace as Parameters<typeof getOpenFileViewsForPath>[0],
+			path,
+			markdownViews,
+		).some((view) => !(view instanceof MarkdownView));
+	}
+
 	/**
 	 * Capture exact open-editor identities and bytes before asynchronous backup
 	 * work. The returned fence also rejects newly opened/closed/replaced views.
@@ -800,6 +810,11 @@ export class SnapshotService {
 		for (const requestedPath of paths) {
 			const path = normalizePath(requestedPath);
 			if (captured.has(path)) continue;
+			if (this.hasOpaqueOpenFileViewForRestorePath(path)) {
+				throw new Error(
+					`Restore not started: close the open file view for "${path}" and retry.`,
+				);
+			}
 			const entries: RestoreEditorAuthorityEntry[] = [];
 			for (const view of this.getOpenMarkdownViewsForRestorePath(path)) {
 				if (!view.file) {
@@ -824,6 +839,7 @@ export class SnapshotService {
 		captured: ReadonlyMap<string, readonly RestoreEditorAuthorityEntry[]>,
 	): boolean {
 		for (const [path, expectedEntries] of captured) {
+			if (this.hasOpaqueOpenFileViewForRestorePath(path)) return false;
 			const currentViews = this.getOpenMarkdownViewsForRestorePath(path);
 			if (currentViews.length !== expectedEntries.length) return false;
 			for (const expected of expectedEntries) {

@@ -24,7 +24,7 @@ const VERSION_FILE = "VERSION";
 const PLUGIN_FILES = ["manifest.json", "main.js", "telemetry.js", "styles.css"];
 const RESOLVER_DIR = ".kaos-resolver";
 const MARKDOWN_CONFLICT_ARTIFACT_NAME_RE =
-	/^(.+) \(KAOS conflict(?: - (crdt|disk|editor))? from (.+) (\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)\)(?: (\d+))?(\.md)$/;
+	/^(.+) \(KAOS conflict(?: - (crdt|disk|editor))? from (.+) (\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)\)(?: (\d+))?(\.(?:md|base))$/;
 const BLOB_CONFLICT_ARTIFACT_NAME_RE =
 	/^(.+) \(KAOS remote conflict (\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)\)(?: (\d+))?(\.[^/.]+)?$/;
 

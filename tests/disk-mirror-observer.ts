@@ -66,6 +66,8 @@ const FILE_PATH = "notes/test.md";
 const FILE_ID = "file-001";
 
 function makeHarness(options: {
+	filePath?: string;
+	opaqueOpenFileView?: boolean;
 	openEditorContent?: string | (() => string);
 	initialDiskContent?: string;
 	onRead?: () => void | Promise<void>;
@@ -86,6 +88,7 @@ function makeHarness(options: {
 	baselineTextProvider?: (path: string) => Promise<string | null> | string | null;
 	isMarkdownPathSyncable?: (path: string) => boolean;
 } = {}) {
+	const filePath = options.filePath ?? FILE_PATH;
 	const doc = new Y.Doc();
 	const meta = doc.getMap<{ path: string; deleted?: boolean }>("meta");
 	const ytext = doc.getText("content");
@@ -99,14 +102,15 @@ function makeHarness(options: {
 	let ensureFileCalls = 0;
 	let processCalls = 0;
 	let modifyCalls = 0;
+	let renameCalls = 0;
 	let abstractFileLookups = 0;
 	if (options.initialDiskContent !== undefined) {
-		diskFiles.set(FILE_PATH, options.initialDiskContent);
+		diskFiles.set(filePath, options.initialDiskContent);
 	}
 
 	// Seed meta so afterTxnHandler can resolve fileId → path
 	doc.transact(() => {
-		meta.set(FILE_ID, { path: FILE_PATH, deleted: false });
+		meta.set(FILE_ID, { path: filePath, deleted: false });
 	});
 
 	const fakeVaultSync = {
@@ -158,10 +162,10 @@ function makeHarness(options: {
 		updatePathsAfterRename: () => {},
 	};
 
-	const openView = options.openEditorContent === undefined
+	const markdownView = options.openEditorContent === undefined
 		? null
 		: Object.assign(new MarkdownView(), {
-			file: { path: FILE_PATH },
+			file: { path: filePath },
 			editor: {
 				getValue: () => {
 					const value = options.openEditorContent;
@@ -169,14 +173,17 @@ function makeHarness(options: {
 				},
 			},
 		});
+	const workspaceView = options.opaqueOpenFileView
+		? { file: { path: filePath } }
+		: markdownView;
 	const makeDiskFileIdentity = (path: string, contentLength: number) => Object.assign(new TFile(), {
 		path,
 		stat: { ctime: 1, mtime: 1, size: contentLength },
 	});
 	const diskFileIdentities = new Map<string, TFile>();
 	const nonFilePathOccupants = new Map<string, { path: string }>();
-	let currentDiskFile = makeDiskFileIdentity(FILE_PATH, options.initialDiskContent?.length ?? 0);
-	if (options.initialDiskContent !== undefined) diskFileIdentities.set(FILE_PATH, currentDiskFile);
+	let currentDiskFile = makeDiskFileIdentity(filePath, options.initialDiskContent?.length ?? 0);
+	if (options.initialDiskContent !== undefined) diskFileIdentities.set(filePath, currentDiskFile);
 	const getDiskFileIdentity = (path: string): TFile | null => {
 		const nonFile = nonFilePathOccupants.get(path);
 		if (nonFile) return nonFile as unknown as TFile;
@@ -193,9 +200,9 @@ function makeHarness(options: {
 	};
 	const fakeApp = {
 		workspace: {
-			getActiveViewOfType: () => openView,
+			getActiveViewOfType: () => markdownView,
 			iterateAllLeaves: (callback: (leaf: { view: unknown }) => void) => {
-				if (openView) callback({ view: openView });
+				if (workspaceView) callback({ view: workspaceView });
 			},
 		},
 		vault: {
@@ -233,7 +240,7 @@ function makeHarness(options: {
 				diskFiles.set(path, content);
 				const file = makeDiskFileIdentity(path, content.length);
 				diskFileIdentities.set(path, file);
-				if (path === FILE_PATH) currentDiskFile = file;
+				if (path === filePath) currentDiskFile = file;
 				await options.onAfterCreate?.();
 				return file;
 			},
@@ -244,6 +251,7 @@ function makeHarness(options: {
 		},
 		fileManager: {
 			renameFile: async (file: { path: string }, newPath: string) => {
+				renameCalls++;
 				await options.onBeforeRename?.();
 				const oldPath = file.path;
 				if (!diskFiles.has(oldPath)) throw new Error(`File not found: ${oldPath}`);
@@ -294,7 +302,8 @@ function makeHarness(options: {
 		getEnsureFileCalls: () => ensureFileCalls,
 		getProcessCalls: () => processCalls,
 		getModifyCalls: () => modifyCalls,
-		getCurrentDiskFile: () => diskFiles.has(FILE_PATH) ? currentDiskFile : null,
+		getRenameCalls: () => renameCalls,
+		getCurrentDiskFile: () => diskFiles.has(filePath) ? currentDiskFile : null,
 		getDiskFileAt: (path: string) => getDiskFileIdentity(path),
 		renameDiskFile: async (oldPath: string, newPath: string) => {
 			const file = getDiskFileIdentity(oldPath);
@@ -304,28 +313,28 @@ function makeHarness(options: {
 		replaceDiskFileIdentity: (content: string) => {
 			// Model delete + recreate at the same path. The bytes can be identical,
 			// but Obsidian exposes a new TFile object for the new filesystem entry.
-			diskFiles.set(FILE_PATH, content);
-			currentDiskFile = makeDiskFileIdentity(FILE_PATH, content.length);
-			diskFileIdentities.set(FILE_PATH, currentDiskFile);
+			diskFiles.set(filePath, content);
+			currentDiskFile = makeDiskFileIdentity(filePath, content.length);
+			diskFileIdentities.set(filePath, currentDiskFile);
 		},
 		replaceDiskFileIdentityAt: (path: string, content: string) => {
 			// Same ABA model for rename destinations and arbitrary vault paths.
 			diskFiles.set(path, content);
 			const replacement = makeDiskFileIdentity(path, content.length);
 			diskFileIdentities.set(path, replacement);
-			if (path === FILE_PATH) currentDiskFile = replacement;
+			if (path === filePath) currentDiskFile = replacement;
 			return replacement;
 		},
 		advanceDiskFileRevision: () => {
-			const file = getDiskFileIdentity(FILE_PATH);
+			const file = getDiskFileIdentity(filePath);
 			if (!file) throw new Error("File not found while advancing revision");
 			file.stat.mtime = (file.stat.mtime ?? 0) + 1;
-			file.stat.size = diskFiles.get(FILE_PATH)?.length ?? 0;
+			file.stat.size = diskFiles.get(filePath)?.length ?? 0;
 		},
 		occupyPathWithNonFile: () => {
-			nonFilePathOccupants.set(FILE_PATH, { path: FILE_PATH });
+			nonFilePathOccupants.set(filePath, { path: filePath });
 		},
-		hasNonFilePathOccupant: () => nonFilePathOccupants.has(FILE_PATH),
+		hasNonFilePathOccupant: () => nonFilePathOccupants.has(filePath),
 		setAuthoritativeDeleteFingerprint: (fingerprint: string | null) => {
 			authoritativeDeleteFingerprint = fingerprint;
 		},
@@ -517,6 +526,30 @@ console.log("\n--- Test 6: provider update to workspace-open file schedules open
 
 	clearTimers(mirror);
 	doc.destroy();
+}
+
+console.log("\n--- Test 6b: an open Base receives a content update without any rename/backup path ---");
+{
+	const basePath = "BACKLOG/BACKLOG.base";
+	const clean = "views:\n  - type: table\n    name: Local\n";
+	const remote = "views:\n  - type: table\n    name: Remote\n";
+	const baselineHash = await contentBaselineHash(clean);
+	const fixture = makeHarness({
+		filePath: basePath,
+		opaqueOpenFileView: true,
+		initialDiskContent: clean,
+		baselineHashProvider: () => baselineHash,
+	});
+	fixture.ytext.insert(0, remote);
+
+	const result = await fixture.mirror.flushWrite(basePath, true);
+	assert(result.kind === "written", "open Base content is updated through the text-document writer");
+	assert(fixture.diskFiles.get(basePath) === remote, "open Base receives the exact validated YAML bytes");
+	assert(fixture.getProcessCalls() === 1, "open Base update commits through Vault.process CAS");
+	assert(fixture.getModifyCalls() === 0, "open Base update never uses the racy modify fallback");
+	assert(fixture.getRenameCalls() === 0, "open Base update performs zero visible backup renames");
+
+	fixture.doc.destroy();
 }
 
 // ── Test 7: forced flush does not overwrite an open editor mismatch ──────────
