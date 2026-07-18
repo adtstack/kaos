@@ -14,11 +14,13 @@
 //   4. Cheap room operations must bypass getServerByName's /set-name/ request.
 //   5. server.ts must NOT call ensureDocumentLoaded in /__kaos/debug.
 //   6. The client must not poll server trace while idle.
-//   7. Every remaining getServerByName route call must be explicitly approved.
+//   7. Every remaining getServerByName call under server/src must be explicitly
+//      approved.
 
 import { readFileSync, readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
+import ts from "typescript";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const syncSocketPath = resolve(here, "../server/src/routes/syncSocket.ts");
@@ -26,7 +28,7 @@ const indexPath = resolve(here, "../server/src/index.ts");
 const authPath = resolve(here, "../server/src/routes/auth.ts");
 const mainPath = resolve(here, "../src/main.ts");
 const serverPath = resolve(here, "../server/src/server.ts");
-const serverRoutesDir = resolve(here, "../server/src/routes");
+const serverSrcDir = resolve(here, "../server/src");
 const traceRoutesPath = resolve(here, "../server/src/routes/trace.ts");
 const traceRuntimePath = resolve(here, "../src/runtime/traceRuntimeController.ts");
 
@@ -334,27 +336,111 @@ console.log("\n--- Test 8: AuthStateCached type has required config for claim/un
 }
 
 // ── Test 9: every document-owning getServerByName call is allowlisted ────────
-console.log("\n--- Test 9: getServerByName route calls are explicitly allowlisted ---");
+console.log("\n--- Test 9: getServerByName server calls are explicitly allowlisted ---");
 {
 	// These operations intentionally enter PartyServer's document lifecycle.
 	// Any new call must be cost-reviewed and added here with an explanation in
 	// docs/engineering/durable-object-cost-guardrails.md.
 	const approvedCalls = new Map([
-		["recoverySnapshots.ts", 1], // document-based recovery snapshot mutation
-		["snapshots.ts", 1], // document-based daily snapshot mutation
-		["syncSocket.ts", 1], // accepted WebSocket sync connection
-		["trace.ts", 1], // explicit full-document export for schema fallback/snapshot
+		["routes/recoverySnapshots.ts", 1], // document-based recovery snapshot mutation
+		["routes/snapshots.ts", 1], // document-based daily snapshot mutation
+		["routes/syncSocket.ts", 1], // accepted WebSocket sync connection
+		["routes/trace.ts", 1], // explicit full-document export for schema fallback/snapshot
 	]);
+
+	function listTypeScriptFiles(directory) {
+		return readdirSync(directory, { withFileTypes: true })
+			.sort((left, right) => left.name.localeCompare(right.name))
+			.flatMap((entry) => {
+				const path = join(directory, entry.name);
+				if (entry.isDirectory()) return listTypeScriptFiles(path);
+				return entry.isFile() && entry.name.endsWith(".ts") ? [path] : [];
+			});
+	}
+
+	function countGetServerByNameCalls(file, source) {
+		const sourceFile = ts.createSourceFile(
+			file,
+			source,
+			ts.ScriptTarget.Latest,
+			false,
+			ts.ScriptKind.TS,
+		);
+		const directBindings = new Set();
+		const namespaceBindings = new Set();
+		for (const statement of sourceFile.statements) {
+			if (
+				!ts.isImportDeclaration(statement) ||
+				!ts.isStringLiteral(statement.moduleSpecifier) ||
+				statement.moduleSpecifier.text !== "partyserver"
+			) {
+				continue;
+			}
+			const importClause = statement.importClause;
+			if (!importClause || importClause.isTypeOnly || !importClause.namedBindings) continue;
+			if (ts.isNamespaceImport(importClause.namedBindings)) {
+				namespaceBindings.add(importClause.namedBindings.name.text);
+				continue;
+			}
+			for (const specifier of importClause.namedBindings.elements) {
+				const importedName = (specifier.propertyName ?? specifier.name).text;
+				if (!specifier.isTypeOnly && importedName === "getServerByName") {
+					directBindings.add(specifier.name.text);
+				}
+			}
+		}
+
+		let count = 0;
+		function visit(node) {
+			if (ts.isCallExpression(node)) {
+				const expression = node.expression;
+				const isDirectCall =
+					ts.isIdentifier(expression) && directBindings.has(expression.text);
+				const isNamespaceCall =
+					ts.isPropertyAccessExpression(expression) &&
+					ts.isIdentifier(expression.expression) &&
+					namespaceBindings.has(expression.expression.text) &&
+					expression.name.text === "getServerByName";
+				if (isDirectCall || isNamespaceCall) count++;
+			}
+			ts.forEachChild(node, visit);
+		}
+		visit(sourceFile);
+		return count;
+	}
+
+	assert(
+		countGetServerByNameCalls(
+			"aliased-partyserver-import.ts",
+			'import { getServerByName as wakeRoom } from "partyserver";\nwakeRoom(namespace, room);',
+		) === 1,
+		"aliased partyserver getServerByName imports are counted",
+	);
+	assert(
+		countGetServerByNameCalls(
+			"namespace-partyserver-import.ts",
+			'import * as partyserver from "partyserver";\npartyserver.getServerByName(namespace, room);',
+		) === 1,
+		"namespace partyserver getServerByName calls are counted",
+	);
+	assert(
+		countGetServerByNameCalls(
+			"non-call-partyserver-references.ts",
+			'import { getServerByName } from "partyserver";\n// getServerByName(namespace, room)\nconst label = "getServerByName(namespace, room)";',
+		) === 0,
+		"partyserver imports, comments, and strings are not counted as calls",
+	);
+
 	const observedCalls = new Map();
-	for (const file of readdirSync(serverRoutesDir).filter((name) => name.endsWith(".ts"))) {
-		const source = readFileSync(join(serverRoutesDir, file), "utf8");
-		const count = [...source.matchAll(/\bawait\s+getServerByName\s*\(/g)].length;
-		if (count > 0) observedCalls.set(file, count);
+	for (const file of listTypeScriptFiles(serverSrcDir)) {
+		const source = readFileSync(file, "utf8");
+		const count = countGetServerByNameCalls(file, source);
+		if (count > 0) observedCalls.set(relative(serverSrcDir, file), count);
 	}
 
 	assert(
 		[...observedCalls.keys()].every((file) => approvedCalls.has(file)),
-		"no server route introduces an unapproved getServerByName call site",
+		"no server source file introduces an unapproved getServerByName call site",
 	);
 	assert(
 		[...approvedCalls.entries()].every(([file, count]) => observedCalls.get(file) === count),

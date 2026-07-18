@@ -62,7 +62,7 @@ trigger requires a new cost calculation and request-count test.
 
 | Path | Current cadence / scope | Why it exists | Bound |
 | --- | --- | --- | --- |
-| Socket ticket refresh | about every 4.5 minutes per connected device | keeps reconnect credentials valid | one in-flight timer; 30-second retry buffer |
+| Socket ticket refresh / reconnect | about every 4.5 minutes per connected device; connection events only otherwise | keeps reconnect credentials valid without allowing a socket or ticket retry storm | ticket HTTP and connect attempts are single-flight; `connection-close` pauses the vendor reconnect loop, including handshake failures that emit no disconnected status; one immediate recovery is allowed after proven sync, then pre-sync closes use equal-jitter exponential windows from 30–60 seconds up to a 2.5–5 minute cap; socket open does not reset this backoff—only Yjs `sync(true)` does; offline, fatal auth, explicit disconnect, and destroy stop requests until an explicit safe resume |
 | Recovery history maintenance | hourly per connected device when snapshots are supported | advances bounded file-history uploads | server idempotency, batch continuation, in-flight guard |
 | CRDT daily snapshot | daily per connected device when snapshots are supported | off-document recovery point | server daily idempotency |
 | Guided server update monitor | every 30 seconds only while an update is active | detects completion of an explicit deployment | persisted update state; 30-minute terminal timeout |
@@ -160,7 +160,7 @@ The guard currently enforces:
 - exactly one DO fetch for cheap debug/meta probes;
 - no document load in the debug handler;
 - no periodic server-trace polling in the plugin;
-- an explicit allowlist for every `getServerByName()` call in server routes; and
+- an explicit allowlist for every `getServerByName()` call under `server/src`; and
 - no indefinite capabilities polling merely because optional R2 is absent.
 
 When a legitimate architecture change requires updating a guard, update this

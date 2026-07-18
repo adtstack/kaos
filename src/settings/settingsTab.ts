@@ -8,6 +8,7 @@ import {
 } from "./settingsStore";
 import type { RecoveryStorageAuditReport } from "../sync/recoverySnapshotClient";
 import { randomBase64Url } from "../utils/base64url";
+import { SettingsCapabilityRefreshSession } from "./settingsCapabilityRefresh";
 
 type SettingsAuthMode = "env" | "claim" | "unclaimed" | "unknown";
 type SettingsStatusState = "disconnected" | "loading" | "syncing" | "connected" | "offline" | "error" | "unauthorized";
@@ -151,6 +152,8 @@ function createDetailsSection(containerEl: HTMLElement, title: string, open = fa
 }
 
 export class VaultSyncSettingTab extends PluginSettingTab {
+	private readonly capabilityRefreshSession = new SettingsCapabilityRefreshSession();
+
 	constructor(
 		app: App,
 		plugin: Plugin,
@@ -163,10 +166,13 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 		containerEl.addClass("kaos-settings-tab");
+		const setupIncomplete = !this.host.settings.host || !this.host.settings.token;
+		const capabilityRefreshGeneration =
+			this.capabilityRefreshSession.beginDisplay(!setupIncomplete);
+		const capabilityRefreshInFlight = this.capabilityRefreshSession.isInFlight;
 		const authMode = this.host.serverAuthMode;
 		const attachmentsAvailable = this.host.serverSupportsAttachments;
 		const attachmentCapKB = attachmentSizeCapKB(this.host.serverMaxBlobUploadBytes);
-		const setupIncomplete = !this.host.settings.host || !this.host.settings.token;
 		const syncStatus = this.host.getSettingsStatusSummary();
 
 		addSectionHeading(containerEl, "KAOS");
@@ -329,7 +335,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 							await this.host.updateSettings((settings) => {
 								settings.updateRepoUrl = value.trim();
 							}, "settings:update-repo-url");
-							this.display();
+							this.redisplayIfVisible();
 						}),
 				);
 
@@ -350,10 +356,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			const updateActions = updateCard.createDiv({ cls: "modal-button-container kaos-settings-status-actions" });
 			updateActions.createEl("button", { text: "Refresh update info" }).addEventListener("click", () => {
 				void this.host.refreshServerCapabilities("settings-refresh");
-				void this.host.refreshUpdateManifest("settings-refresh", true).then(() => this.display());
+				void this.host.refreshUpdateManifest("settings-refresh", true).then(() => this.redisplayIfVisible());
 			});
 			updateActions.createEl("button", { text: "Check file history storage" }).addEventListener("click", () => {
-				void this.host.refreshRecoveryStorageStatus("settings-refresh").then(() => this.display());
+				void this.host.refreshRecoveryStorageStatus("settings-refresh").then(() => this.redisplayIfVisible());
 			});
 			const updateActionUrl = updateState.updateActionUrl;
 			const bootstrapUrl = updateState.updateBootstrapUrl;
@@ -384,7 +390,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				});
 				updateButton.disabled = waitingForGuidedUpdate;
 				updateButton.addEventListener("click", () => {
-					void this.host.beginGuidedServerUpdate().then(() => this.display());
+					void this.host.beginGuidedServerUpdate().then(() => this.redisplayIfVisible());
 				});
 				if (waitingForGuidedUpdate || guidedStatus === "timed-out") {
 					updateActions.createEl("button", { text: "Open update action again" }).addEventListener("click", () => {
@@ -452,49 +458,52 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					}),
 			);
 
-				addSectionHeading(containerEl, "Attachments");
+		addSectionHeading(containerEl, "Attachments");
 
-			if (this.host.settings.host) {
-				new Setting(containerEl)
-					.setName("Attachment storage")
-					.setDesc(
-						attachmentsAvailable
+		if (this.host.settings.host) {
+			new Setting(containerEl)
+				.setName("Attachment storage")
+				.setDesc(
+					capabilityRefreshInFlight
+						? "Checking this server for object storage. This happens once when you open KAOS settings."
+						: attachmentsAvailable
 							? "Available on this server. The plugin can sync attachments, vault snapshots, and file history."
 							: "Not available on this server. Add object storage in Cloudflare, then redeploy.",
-					)
-					.addButton((button) =>
-						button
+				)
+				.addButton((button) =>
+					button
 						.setButtonText("Refresh")
+						.setDisabled(capabilityRefreshInFlight)
 						.onClick(async () => {
 							button.setDisabled(true);
 							await this.host.refreshServerCapabilities();
 							await this.host.refreshAttachmentSyncRuntime("capability-refresh");
-							this.display();
+							this.redisplayIfVisible();
 						}),
 				);
 		}
 
-				if (this.host.settings.host && !attachmentsAvailable) {
-					const callout = containerEl.createDiv({ cls: "kaos-settings-attachment-callout" });
-					callout.createEl("p", {
-						text: "Attachments are not syncing yet.",
-					});
-					callout.createEl("p", {
-						text: "Add object storage to enable attachment sync. It takes about a minute.",
-					});
-					const link = callout.createEl("a", {
-						text: "Watch the 1-minute setup video",
-						href: "https://youtu.be/Z7xCMEYfdFM",
-					});
-					link.setAttr("target", "_blank");
-				}
+		if (this.host.settings.host && !attachmentsAvailable && !capabilityRefreshInFlight) {
+			const callout = containerEl.createDiv({ cls: "kaos-settings-attachment-callout" });
+			callout.createEl("p", {
+				text: "Attachments are not syncing yet.",
+			});
+			callout.createEl("p", {
+				text: "Add object storage to enable attachment sync. It takes about a minute.",
+			});
+			const link = callout.createEl("a", {
+				text: "Watch the 1-minute setup video",
+				href: "https://youtu.be/Z7xCMEYfdFM",
+			});
+			link.setAttr("target", "_blank");
+		}
 
 		if (attachmentsAvailable || !this.host.settings.host) {
-				new Setting(containerEl)
-					.setName("Sync attachments")
-					.setDesc(
-						"Sync images, PDF files, and other attachments through object storage. This is enabled by default when the server supports it.",
-					)
+			new Setting(containerEl)
+				.setName("Sync attachments")
+				.setDesc(
+					"Sync images, PDF files, and other attachments through object storage. This is enabled by default when the server supports it.",
+				)
 				.addToggle((toggle) =>
 					toggle
 						.setValue(this.host.settings.enableAttachmentSync)
@@ -504,15 +513,15 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 								settings.attachmentSyncExplicitlyConfigured = true;
 							}, "settings:attachment-toggle");
 							await this.host.refreshAttachmentSyncRuntime("attachment-toggle");
-							this.display();
+							this.redisplayIfVisible();
 						}),
 				);
 		}
 
-			if ((attachmentsAvailable || !this.host.settings.host) && this.host.settings.enableAttachmentSync) {
-				new Setting(containerEl)
-					.setName("Max attachment size in kilobytes")
-					.setDesc(`Attachments larger than this are skipped. Maximum ${attachmentCapKB} KB.`)
+		if ((attachmentsAvailable || !this.host.settings.host) && this.host.settings.enableAttachmentSync) {
+			new Setting(containerEl)
+				.setName("Max attachment size in kilobytes")
+				.setDesc(`Attachments larger than this are skipped. Maximum ${attachmentCapKB} KB.`)
 				.addText((text) =>
 					text
 						.setPlaceholder("10240")
@@ -590,7 +599,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 							await this.host.updateSettings((settings) => {
 								settings.host = value.trim();
 							}, "settings:host");
-						this.display();
+							this.redisplayIfVisible();
 					}),
 			);
 
@@ -618,7 +627,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 							await this.host.updateSettings((settings) => {
 								settings.token = value.trim();
 							}, "settings:token");
-						this.display();
+							this.redisplayIfVisible();
 					}),
 			);
 
@@ -636,7 +645,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 							await this.host.updateSettings((settings) => {
 								settings.vaultId = value.trim();
 							}, "settings:vault-id");
-						this.display();
+							this.redisplayIfVisible();
 					}),
 			);
 
@@ -772,5 +781,33 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				text: "Changing the server URL, sync token, or vault ID requires reloading the plugin.",
 				cls: "setting-item-description",
 			});
+
+		if (capabilityRefreshGeneration !== null) {
+			void this.refreshCapabilitiesOnOpen(capabilityRefreshGeneration);
+		}
+	}
+
+	hide(): void {
+		this.capabilityRefreshSession.endDisplay();
+		super.hide();
+	}
+
+	private async refreshCapabilitiesOnOpen(generation: number): Promise<void> {
+		try {
+			await this.host.refreshServerCapabilities("settings-open");
+		} catch (err) {
+			console.warn("[kaos] Settings capability refresh failed", err);
+			new Notice("Could not refresh server storage capabilities. Showing cached status.", 6000);
+		} finally {
+			if (this.capabilityRefreshSession.complete(generation)) {
+				this.redisplayIfVisible();
+			}
+		}
+	}
+
+	private redisplayIfVisible(): void {
+		if (this.capabilityRefreshSession.isVisible) {
+			this.display();
+		}
 	}
 }

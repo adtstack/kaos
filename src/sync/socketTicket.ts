@@ -68,7 +68,40 @@ export function isTicketEndpointUnsupported(err: unknown): boolean {
  * is in place before the current one becomes unusable.
  */
 export const TICKET_REFRESH_BUFFER_MS = 30_000;
+/**
+ * A failed proactive refresh starts no sooner than the old fixed retry delay.
+ * Subsequent failures use exponentially wider equal-jitter windows so several
+ * devices do not keep retrying in lockstep during a prolonged outage.
+ */
+export const SOCKET_TICKET_RETRY_BASE_MS = TICKET_REFRESH_BUFFER_MS;
+// Never leave a disconnected client waiting longer than one normal 5-minute
+// ticket lifetime after the endpoint recovers.
+export const SOCKET_TICKET_RETRY_MAX_MS = 5 * 60_000;
 const MAX_REASONABLE_TICKET_TTL_MS = 24 * 60 * 60 * 1_000; // 24 hours
+
+/**
+ * Return an equal-jitter exponential delay for a 1-based consecutive failure.
+ *
+ * Failure 1: 30–60s, failure 2: 60–120s, ... capped at a 2.5–5m window.
+ * Keeping a non-zero lower half prevents an unlucky random sequence from
+ * degenerating back into a tight fixed-rate poll.
+ */
+export function socketTicketRetryDelayMs(
+	consecutiveFailures: number,
+	randomValue = Math.random(),
+): number {
+	const failure = Math.max(1, Math.floor(consecutiveFailures));
+	const boundedExponent = Math.min(failure, 30);
+	const ceiling = Math.min(
+		SOCKET_TICKET_RETRY_MAX_MS,
+		SOCKET_TICKET_RETRY_BASE_MS * (2 ** boundedExponent),
+	);
+	const floor = ceiling / 2;
+	const unit = Number.isFinite(randomValue)
+		? Math.max(0, Math.min(1, randomValue))
+		: 0.5;
+	return Math.floor(floor + ((ceiling - floor) * unit));
+}
 
 export interface CachedSocketTicket {
 	value: string;

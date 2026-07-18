@@ -3612,6 +3612,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// Schema version check — refuse to run if a newer plugin wrote this data
 			const schemaError = vaultSync.checkSchemaVersion();
 			if (schemaError) {
+				// Stop ticket/connect retries as well as the socket itself. This check
+				// can run before the first provider sync, so the later sync handler is
+				// not guaranteed to get a chance to disconnect the provider.
+				vaultSync.provider.disconnect();
 				console.error(`[kaos] ${schemaError}`);
 				new Notice(`KAOS: ${schemaError}`);
 				this.updateStatusBar("error");

@@ -127,7 +127,9 @@ export class ConnectionController {
 			return;
 		}
 		sync.provider.disconnect();
-		void sync.provider.connect();
+		void sync.provider.connect().catch((err: unknown) => {
+			this.deps.log(`Reconnect failed (${reason}): ${String(err)}`);
+		});
 	}
 
 	getSyncFacts(blobPendingUploads = 0): SyncFacts {
@@ -361,7 +363,9 @@ export class ConnectionController {
 				if (!currentSync || currentSync !== sync) return;
 				if (currentSync.fatalAuthError) return;
 				if (currentSync.connected || currentSync.provider.wsconnecting) return;
-				void currentSync.provider.connect();
+				void currentSync.provider.connect().catch((err: unknown) => {
+					this.deps.log(`Fast reconnect failed (${reason}): ${String(err)}`);
+				});
 			}, FAST_RECONNECT_JITTER_MS);
 		}, FAST_RECONNECT_DEBOUNCE_MS);
 	}
