@@ -49,7 +49,12 @@ import {
 import type { CandidateStore, ScopeKey, ScopeMetadata } from "./candidateStore";
 import { FLIGHT_KIND } from "../telemetry/debug/flightEvents";
 import type { FlightPathEventInput } from "../telemetry/debug/flightEvents";
-import { TICKET_REFRESH_BUFFER_MS, patchTicketInUrl } from "./socketTicket";
+import {
+	SocketTicketHttpError,
+	TICKET_REFRESH_BUFFER_MS,
+	patchTicketInUrl,
+	socketTicketRetryDelayMs,
+} from "./socketTicket";
 import type { PendingBlobMutationBase } from "./pendingBlobIntentJournal";
 
 export interface BlobRefCommitGuard {
@@ -100,6 +105,15 @@ type ProviderWithTerminableSocket = {
 		terminate?: () => void;
 	};
 };
+
+interface SocketTicketValue {
+	value: string;
+	expiresAt: number;
+	localExpiresAt: number;
+	ttlMs: number;
+}
+
+type SocketTicketRetryKind = "refresh" | "connect" | "auth";
 
 /** Current schema version. Stored in sys.schemaVersion. */
 export { SCHEMA_VERSION } from "./schema";
@@ -371,17 +385,39 @@ export class VaultSync {
 	 * Kept on the instance so the proactive refresh timer can call it after
 	 * the constructor's params() closure is no longer in scope.
 	 */
-	private _getSocketTicket: ((force?: boolean) => Promise<{
-		value: string;
-		expiresAt: number;
-		localExpiresAt: number;
-		ttlMs: number;
-	} | null>) | null = null;
+	private _getSocketTicket: ((force?: boolean) => Promise<SocketTicketValue | null>) | null = null;
 
 	/** Timer handle for the proactive provider URL ticket refresh. */
 	private _socketTicketRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+	private _socketTicketRefreshFailureCount = 0;
+	private _socketTicketConnectRetryFailureCount = 0;
+	private _socketTicketRefreshInFlight = false;
+	private _socketTicketRetryScheduled = false;
+	private _socketTicketRetryKind: SocketTicketRetryKind | null = null;
+	private _socketTicketRefreshPendingForOnline = false;
+	private _socketTicketOnlineHandler: (() => void) | null = null;
+	private _socketTicketConnectionWanted = false;
+	private _socketTicketConnectionIntentEpoch = 0;
+	private _socketTicketConnectInFlight: Promise<void> | null = null;
+	private _socketTicketConnectInFlightIntentEpoch: number | null = null;
+	private _socketTicketRequestInFlight: Promise<SocketTicketValue | null> | null = null;
+	private _socketTicketRequestInFlightForce = false;
+	private _socketTicketForcedRequestQueued: Promise<SocketTicketValue | null> | null = null;
+	private _socketTicketRawDisconnect: (() => void) | null = null;
 	private _socketAuthRecoveryInFlight = false;
 	private _socketAuthRecoveryAttempted = false;
+	private _socketAuthRecoveryReconnectStarted = false;
+	private _socketAuthRecoveryMessage: FatalAuthMessage | null = null;
+	private _socketAuthRecoveryIntentEpoch: number | null = null;
+	/** Exact rejected socket whose auth-triggered raw close must be ignored once. */
+	private _socketAuthRecoveryRejectedSocket: object | null = null;
+	/** Dedupes connection-close and its immediately following disconnected status. */
+	private _socketTicketConnectionCloseStatusPending = false;
+	/** A disconnected provider is waiting for a fresh URL or a bounded connect retry. */
+	private _socketTicketDisconnectRecoveryPending = false;
+	/** Socket-open is not success: only sync(true) re-arms one immediate reconnect. */
+	private _socketTicketReconnectAttemptedSinceSync = false;
+	private _destroyed = false;
 
 	constructor(
 		settings: VaultSyncSettings,
@@ -401,12 +437,7 @@ export class VaultSync {
 			 * Pass force=true to bypass the ticket cache and always fetch fresh.
 			 * If the callback returns null the provider falls back to ?token=.
 			 */
-				getSocketTicket?: (force?: boolean) => Promise<{
-					value: string;
-					expiresAt: number;
-					localExpiresAt: number;
-					ttlMs: number;
-				} | null>;
+				getSocketTicket?: (force?: boolean) => Promise<SocketTicketValue | null>;
 		},
 	) {
 		this.debug = settings.debug;
@@ -475,6 +506,15 @@ export class VaultSync {
 		this.provider = new YSyncProvider(settings.host, roomId, this.ydoc, {
 			prefix: syncPrefix,
 			params: async () => {
+				const paramsIntentEpoch = this._socketTicketConnectionIntentEpoch;
+				if (
+					this._destroyed
+					|| this._fatalAuthError
+					|| !this._socketTicketConnectionWanted
+					|| this.isSocketTicketNetworkOffline()
+				) {
+					throw new Error("socket ticket connection cancelled");
+				}
 				// Build base params (schema version + optional trace context).
 				const p: Record<string, string> = {
 					schemaVersion: String(SCHEMA_VERSION),
@@ -495,7 +535,15 @@ export class VaultSync {
 				// ticket.  See engineering/zero-config-auth.md § "Reconnect
 				// behavior" and engineering/warts-and-limits.md § "Pragmatic
 				// compromises".
-				const ticketResult = this._getSocketTicket ? await this._getSocketTicket() : null;
+				const ticketResult = await this.requestSocketTicket();
+				if (
+					this._destroyed
+					|| this._fatalAuthError
+					|| !this._socketTicketConnectionWanted
+					|| this._socketTicketConnectionIntentEpoch !== paramsIntentEpoch
+				) {
+					throw new Error("socket ticket connection cancelled");
+				}
 				if (ticketResult) {
 					p.ticket = ticketResult.value;
 					// Schedule proactive URL refresh before this ticket expires.
@@ -508,6 +556,11 @@ export class VaultSync {
 			connect: false,
 			maxBackoffTime: MAX_BACKOFF_TIME_MS,
 		});
+		this.installSocketTicketProviderLifecycle();
+		if (this._getSocketTicket && typeof window !== "undefined") {
+			this._socketTicketOnlineHandler = () => this.resumeDeferredSocketTicketRefresh();
+			window.addEventListener("online", this._socketTicketOnlineHandler);
+		}
 
 		// Wire update tracker before any Y.Doc events so timestamps are captured.
 		this.updateTracker = new UpdateTracker();
@@ -519,6 +572,18 @@ export class VaultSync {
 		);
 		this.serverAckTracker = new ServerAckTracker(this.trace, this.onFlightEvent);
 
+		// A handshake can close before y-partyserver ever emits status=disconnected.
+		// Observe connection-close as the complete close signal and let the status
+		// listener below act as a compatibility fallback. An explicit one-turn
+		// marker dedupes the disconnected status emitted for that same close.
+		(this.provider as unknown as {
+			on: (event: string, cb: (event: CloseEvent, provider: YSyncProvider) => void) => void;
+		}).on("connection-close", (_event, provider) => {
+			this.observeSocketTicketConnectionClose(
+				(provider as YSyncProvider & { ws?: object | null }).ws ?? null,
+			);
+		});
+
 		// Track connection generations for reconnect detection
 		this.provider.on("status", (event: { status: string }) => {
 			this.log(
@@ -526,22 +591,23 @@ export class VaultSync {
 				`(wsconnected=${this.provider.wsconnected}, synced=${this.provider.synced})`,
 			);
 			if (event.status === "connected") {
-				this._socketAuthRecoveryInFlight = false;
-				this._socketAuthRecoveryAttempted = false;
+				this._socketTicketDisconnectRecoveryPending = false;
+				if (this._socketAuthRecoveryAttempted) {
+					this._socketAuthRecoveryReconnectStarted = true;
+				}
 				this._connectionGeneration++;
 				this.log(`Connection generation: ${this._connectionGeneration}`);
-			} else if (
-				event.status === "disconnected"
-				&& this._getSocketTicket
-				&& !this._fatalAuthError
-				&& !this._socketAuthRecoveryInFlight
-			) {
+			} else if (event.status === "disconnected") {
 				// Best-effort: refresh provider.url before the reconnect timer fires.
 				// The proactive timer (scheduleSocketTicketRefresh) is the primary
 				// mechanism; this handles edge cases like laptop sleep where the
 				// disconnect happens without the timer having had a chance to fire.
-				void this.refreshProviderTicketUrl(true);
+				this.handleSocketTicketDisconnectedStatus();
 			}
+		});
+		this.provider.on("sync", (synced: boolean) => {
+			if (!synced) return;
+			this.markSocketTicketSyncSucceeded();
 		});
 
 		const handleFatalAuthPayload = (payload: string) => {
@@ -552,7 +618,11 @@ export class VaultSync {
 			if (this.tryRecoverSocketAuth(msg)) {
 				return;
 			}
-			if (msg.code === "unauthorized" && this._socketAuthRecoveryInFlight) {
+			if (
+				msg.code === "unauthorized"
+				&& this._socketAuthRecoveryInFlight
+				&& !this._socketAuthRecoveryReconnectStarted
+			) {
 				return;
 			}
 			this.markFatalAuth(msg);
@@ -576,8 +646,9 @@ export class VaultSync {
 				handleFatalAuthPayload(event.data);
 			}
 		});
-		void this.provider.connect().catch((err: unknown) => {
-			this.log(`Provider connect failed: ${formatUnknown(err)}`);
+		void this.provider.connect().catch(() => {
+			// The lifecycle wrapper records the failure and schedules a bounded
+			// retry. The constructor intentionally does not leak an unhandled promise.
 		});
 	}
 
@@ -2565,8 +2636,93 @@ export class VaultSync {
 		if (firstFatal) {
 			this.log(`Fatal auth error: ${msg.code} — stopping reconnection`);
 		}
+		this.cancelSocketAuthRecovery(true);
+		this._socketTicketRefreshPendingForOnline = false;
+		this.clearSocketTicketRefreshTimer();
 		this.provider.disconnect();
 		this.resolvePendingProviderSyncWaiters(false);
+	}
+
+	private cancelSocketAuthRecovery(resetAttempted: boolean): void {
+		this._socketAuthRecoveryInFlight = false;
+		if (resetAttempted) this._socketAuthRecoveryAttempted = false;
+		this._socketAuthRecoveryReconnectStarted = false;
+		this._socketAuthRecoveryMessage = null;
+		this._socketAuthRecoveryIntentEpoch = null;
+		this._socketAuthRecoveryRejectedSocket = null;
+	}
+
+	private markSocketTicketSyncSucceeded(): void {
+		// A socket-open event precedes server auth frames. Only a completed Yjs
+		// sync proves the fresh ticket was accepted, re-arms one immediate recovery,
+		// and resets the pre-sync connection-flap backoff.
+		this._socketAuthRecoveryAttempted = false;
+		this._socketAuthRecoveryInFlight = false;
+		this._socketAuthRecoveryReconnectStarted = false;
+		this._socketAuthRecoveryMessage = null;
+		this._socketAuthRecoveryIntentEpoch = null;
+		this._socketAuthRecoveryRejectedSocket = null;
+		this._socketTicketReconnectAttemptedSinceSync = false;
+		this._socketTicketConnectRetryFailureCount = 0;
+	}
+
+	private markFatalSocketTicketHttpAuth(err: unknown): boolean {
+		if (!(err instanceof SocketTicketHttpError) || (err.status !== 401 && err.status !== 403)) {
+			return false;
+		}
+		this.markFatalAuth({
+			code: "unauthorized",
+			clientSchemaVersion: null,
+			roomSchemaVersion: null,
+			reason: `socket ticket endpoint rejected credentials (${err.status})`,
+		});
+		return true;
+	}
+
+	private isCurrentSocketAuthRecovery(): boolean {
+		return !!this._socketAuthRecoveryMessage
+			&& !this._destroyed
+			&& !this._fatalAuthError
+			&& this._socketTicketConnectionWanted
+			&& this._socketAuthRecoveryIntentEpoch === this._socketTicketConnectionIntentEpoch;
+	}
+
+	private runSocketAuthRecovery(): void {
+		const msg = this._socketAuthRecoveryMessage;
+		if (!msg || !this.isCurrentSocketAuthRecovery()) return;
+		if (this.isSocketTicketNetworkOffline()) {
+			this.deferSocketTicketRetryUntilOnline("auth");
+			return;
+		}
+
+		void this.fetchAndPatchProviderTicket(true)
+			.then(async (refreshed) => {
+				if (!this.isCurrentSocketAuthRecovery()) return;
+				if (!refreshed) {
+					if (this.isSocketTicketNetworkOffline()) {
+						this.deferSocketTicketRetryUntilOnline("auth");
+						return;
+					}
+					this.log("Socket auth recovery unavailable: no ticket endpoint");
+					this.markFatalAuth(msg);
+					return;
+				}
+				this.log("Socket auth recovery: reconnecting with fresh ticket");
+				// This fresh socket is the one immediate auth recovery attempt. A
+				// handshake close before status=connected must therefore back off too.
+				this._socketTicketReconnectAttemptedSinceSync = true;
+				const reconnect = this.provider.connect();
+				this._socketAuthRecoveryIntentEpoch = this._socketTicketConnectionIntentEpoch;
+				await reconnect;
+			})
+			.catch((err: unknown) => {
+				this.log(`Socket auth recovery failed: ${formatUnknown(err)}`);
+				if (!this.isCurrentSocketAuthRecovery()) return;
+				if (this.markFatalSocketTicketHttpAuth(err)) return;
+				// Network and 5xx failures are transient. Keep auth recovery one-shot
+				// and retry the force-refresh action with bounded backoff.
+				this.scheduleSocketTicketRetry("auth");
+			});
 	}
 
 	private tryRecoverSocketAuth(msg: FatalAuthMessage): boolean {
@@ -2574,6 +2730,7 @@ export class VaultSync {
 			msg.code !== "unauthorized"
 			|| !this._getSocketTicket
 			|| this._fatalAuthError
+			|| !this._socketTicketConnectionWanted
 			|| this._socketAuthRecoveryInFlight
 			|| this._socketAuthRecoveryAttempted
 		) {
@@ -2582,30 +2739,18 @@ export class VaultSync {
 
 		this._socketAuthRecoveryInFlight = true;
 		this._socketAuthRecoveryAttempted = true;
+		this._socketAuthRecoveryReconnectStarted = false;
+		// Invalidate any params callback that was already awaiting a non-forced
+		// cached ticket, without revoking the app's desired connected state.
+		this._socketTicketConnectionIntentEpoch++;
+		this._socketAuthRecoveryMessage = msg;
+		this._socketAuthRecoveryIntentEpoch = this._socketTicketConnectionIntentEpoch;
 		this.log("Socket auth rejected; refreshing ticket before marking auth fatal");
-		this.provider.disconnect();
-
-		void this.fetchAndPatchProviderTicket(true)
-			.then((refreshed) => {
-				if (this._fatalAuthError) return;
-				if (!refreshed) {
-					this.log("Socket auth recovery unavailable: no ticket endpoint");
-					this.markFatalAuth(msg);
-					return;
-				}
-				this.log("Socket auth recovery: reconnecting with fresh ticket");
-				void this.provider.connect().catch((err: unknown) => {
-					this.log(`Socket auth recovery reconnect failed: ${formatUnknown(err)}`);
-					this.markFatalAuth(msg);
-				});
-			})
-			.catch((err: unknown) => {
-				this.log(`Socket auth recovery failed: ${formatUnknown(err)}`);
-				this.markFatalAuth(msg);
-			})
-			.finally(() => {
-				this._socketAuthRecoveryInFlight = false;
-			});
+		this.clearSocketTicketRefreshTimer();
+		this._socketAuthRecoveryRejectedSocket =
+			(this.provider as YSyncProvider & { ws?: object | null }).ws ?? null;
+		this._socketTicketRawDisconnect?.();
+		this.runSocketAuthRecovery();
 
 		return true;
 	}
@@ -2625,7 +2770,10 @@ export class VaultSync {
 		localExpiresAt: number;
 		ttlMs: number;
 	}): void {
+		if (this.shouldStopSocketTicketRefresh()) return;
 		this.clearSocketTicketRefreshTimer();
+		this._socketTicketRefreshFailureCount = 0;
+		this._socketTicketRefreshPendingForOnline = false;
 		const ttlRemaining = ticket.localExpiresAt - Date.now();
 		const buffer = Math.min(TICKET_REFRESH_BUFFER_MS, Math.floor(ttlRemaining / 2));
 		const msUntilRefresh = Math.max(250, ttlRemaining - buffer);
@@ -2633,6 +2781,7 @@ export class VaultSync {
 			this._socketTicketRefreshTimer = null;
 			void this.refreshProviderTicketUrl(true);
 		}, msUntilRefresh);
+		this.resumeProviderAfterTicketRefreshIfNeeded();
 	}
 
 	private clearSocketTicketRefreshTimer(): void {
@@ -2640,6 +2789,375 @@ export class VaultSync {
 			clearTimeout(this._socketTicketRefreshTimer);
 			this._socketTicketRefreshTimer = null;
 		}
+		this._socketTicketRetryScheduled = false;
+		this._socketTicketRetryKind = null;
+	}
+
+	private shouldStopSocketTicketRefresh(): boolean {
+		return this.shouldStopVaultSyncConnection() || !this._getSocketTicket;
+	}
+
+	private shouldStopVaultSyncConnection(): boolean {
+		return this._destroyed || this._fatalAuthError;
+	}
+
+	private socketTicketProviderWantsConnection(): boolean {
+		// YProvider sets its own shouldConnect only *after* async params succeeds.
+		// Therefore it cannot distinguish an intentional disconnect from a ticket
+		// request that failed before the socket opened. This app-owned intent is
+		// updated by the wrapped public connect()/disconnect() methods instead.
+		return this._socketTicketConnectionWanted;
+	}
+
+	private startSocketTicketRequest(force: boolean): Promise<SocketTicketValue | null> {
+		if (!this._getSocketTicket) return Promise.resolve(null);
+		const request = this._getSocketTicket(force);
+		this._socketTicketRequestInFlight = request;
+		this._socketTicketRequestInFlightForce = force;
+		void request.then(
+			() => {
+				if (this._socketTicketRequestInFlight === request) {
+					this._socketTicketRequestInFlight = null;
+					this._socketTicketRequestInFlightForce = false;
+				}
+			},
+			() => {
+				if (this._socketTicketRequestInFlight === request) {
+					this._socketTicketRequestInFlight = null;
+					this._socketTicketRequestInFlightForce = false;
+				}
+			},
+		);
+		return request;
+	}
+
+	private startQueuedForcedSocketTicketRequest(): Promise<SocketTicketValue | null> {
+		if (
+			this.shouldStopSocketTicketRefresh()
+			|| !this.socketTicketProviderWantsConnection()
+			|| this.isSocketTicketNetworkOffline()
+		) {
+			return Promise.resolve(null);
+		}
+		return this.startSocketTicketRequest(true);
+	}
+
+	private requestSocketTicket(force = false): Promise<SocketTicketValue | null> {
+		if (!this._getSocketTicket) return Promise.resolve(null);
+		const active = this._socketTicketRequestInFlight;
+		if (!active) return this.startSocketTicketRequest(force);
+		if (!force || this._socketTicketRequestInFlightForce) return active;
+		if (this._socketTicketForcedRequestQueued) return this._socketTicketForcedRequestQueued;
+
+		// A forced auth refresh must not inherit a possibly cached non-forced
+		// result. Serialize one forced request behind it; concurrent force callers
+		// share that queued request, so HTTP concurrency remains one.
+		const queued = active.then(
+			() => this.startQueuedForcedSocketTicketRequest(),
+			() => this.startQueuedForcedSocketTicketRequest(),
+		);
+		this._socketTicketForcedRequestQueued = queued;
+		void queued.then(
+			() => {
+				if (this._socketTicketForcedRequestQueued === queued) this._socketTicketForcedRequestQueued = null;
+			},
+			() => {
+				if (this._socketTicketForcedRequestQueued === queued) this._socketTicketForcedRequestQueued = null;
+			},
+		);
+		return queued;
+	}
+
+	private installSocketTicketProviderLifecycle(): void {
+		const provider = this.provider;
+		const connect = provider.connect.bind(provider);
+		const disconnect = provider.disconnect.bind(provider);
+		this._socketTicketRawDisconnect = disconnect;
+
+		provider.connect = (): Promise<void> => {
+			if (this._destroyed || this._fatalAuthError) return Promise.resolve();
+			// An idempotent duplicate joins the current async params/connect attempt
+			// without invalidating its epoch. If disconnect() revoked intent while an
+			// old attempt is still settling, a new connect intent must advance the
+			// epoch so that old params result cannot open the socket.
+			if (
+				this._socketTicketConnectInFlight
+				&& this._socketTicketConnectionWanted
+				&& this._socketTicketConnectInFlightIntentEpoch === this._socketTicketConnectionIntentEpoch
+			) {
+				return this._socketTicketConnectInFlight;
+			}
+			this._socketTicketConnectionIntentEpoch++;
+			this._socketTicketConnectionWanted = true;
+			const attemptIntentEpoch = this._socketTicketConnectionIntentEpoch;
+			if (this.isSocketTicketNetworkOffline()) {
+				this.deferSocketTicketRetryUntilOnline("connect");
+				return Promise.resolve();
+			}
+
+			const request = connect().then(() => {
+				// disconnect() may race the async params callback. If intent was
+				// revoked while the ticket request was in flight, close immediately
+				// and do not leave the successful params call's proactive timer alive.
+				if (
+					this._socketTicketConnectionIntentEpoch === attemptIntentEpoch
+					&& (!this._socketTicketConnectionWanted || this.shouldStopVaultSyncConnection())
+				) {
+					this.clearSocketTicketRefreshTimer();
+					disconnect();
+				}
+			}).catch((err: unknown) => {
+				// A disconnect followed by an immediate reconnect can leave the old
+				// async params attempt settling behind the new one. Only the attempt
+				// owning the current intent may classify errors or schedule retries.
+				if (this._socketTicketConnectionIntentEpoch === attemptIntentEpoch) {
+					this.log(`Provider connect failed: ${formatUnknown(err)}`);
+					if (!this.markFatalSocketTicketHttpAuth(err)) {
+						this.scheduleSocketTicketRetry("connect");
+					}
+				}
+				throw err;
+			});
+			this._socketTicketConnectInFlight = request;
+			this._socketTicketConnectInFlightIntentEpoch = attemptIntentEpoch;
+			void request.then(
+				() => {
+					if (this._socketTicketConnectInFlight === request) {
+						this._socketTicketConnectInFlight = null;
+						this._socketTicketConnectInFlightIntentEpoch = null;
+					}
+				},
+				() => {
+					if (this._socketTicketConnectInFlight === request) {
+						this._socketTicketConnectInFlight = null;
+						this._socketTicketConnectInFlightIntentEpoch = null;
+					}
+				},
+			);
+			return request;
+		};
+		provider.disconnect = (): void => {
+			this._socketTicketConnectionIntentEpoch++;
+			this._socketTicketConnectionWanted = false;
+			this._socketTicketDisconnectRecoveryPending = false;
+			this._socketTicketRefreshPendingForOnline = false;
+			// Revoking a socket intent cancels in-flight recovery work, but it is not
+			// proof that credentials succeeded. Preserve the one-shot attempted latch;
+			// only sync(true) may re-arm it for a live instance.
+			this.cancelSocketAuthRecovery(false);
+			this.clearSocketTicketRefreshTimer();
+			disconnect();
+		};
+	}
+
+	private isSocketTicketNetworkOffline(): boolean {
+		// Only pause when this runtime can observe the matching online event. A
+		// headless runtime without an event target must keep the bounded retry path
+		// instead of becoming permanently paused.
+		return this._socketTicketOnlineHandler !== null
+			&& typeof navigator !== "undefined"
+			&& navigator.onLine === false;
+	}
+
+	private resumeDeferredSocketTicketRefresh(): void {
+		if (!this._socketTicketRefreshPendingForOnline) return;
+		const retryKind = this._socketTicketRetryKind ?? "refresh";
+		this._socketTicketRefreshPendingForOnline = false;
+		this._socketTicketRetryKind = null;
+		if (this.shouldStopSocketTicketRefresh() || !this.socketTicketProviderWantsConnection()) return;
+		this.log("Network online; resuming deferred socket ticket refresh");
+		if (retryKind === "auth") {
+			this.runSocketAuthRecovery();
+		} else if (retryKind === "connect") {
+			this.connectProviderWithTicketRetry();
+		} else {
+			void this.refreshProviderTicketUrl(true);
+		}
+	}
+
+	private socketTicketRetryPriority(kind: SocketTicketRetryKind | null): number {
+		return kind === "auth" ? 3 : kind === "connect" ? 2 : kind === "refresh" ? 1 : 0;
+	}
+
+	private strongerSocketTicketRetryKind(
+		current: SocketTicketRetryKind | null,
+		candidate: SocketTicketRetryKind,
+	): SocketTicketRetryKind {
+		return this.socketTicketRetryPriority(current) >= this.socketTicketRetryPriority(candidate)
+			? current as SocketTicketRetryKind
+			: candidate;
+	}
+
+	private deferSocketTicketRetryUntilOnline(kind: SocketTicketRetryKind): void {
+		const effectiveKind = this.strongerSocketTicketRetryKind(this._socketTicketRetryKind, kind);
+		this.clearSocketTicketRefreshTimer();
+		this._socketTicketRetryKind = effectiveKind;
+		this._socketTicketRefreshPendingForOnline = true;
+		this.log("socket ticket request deferred while network is offline");
+	}
+
+	private scheduleSocketTicketRetry(kind: SocketTicketRetryKind): void {
+		if (this.shouldStopSocketTicketRefresh() || !this.socketTicketProviderWantsConnection()) return;
+		if (this.isSocketTicketNetworkOffline()) {
+			this.deferSocketTicketRetryUntilOnline(kind);
+			return;
+		}
+		if (this._socketTicketRetryScheduled) {
+			// Connect recovery dominates a concurrent URL-only refresh. Preserve the
+			// existing timer and its current backoff instead of creating a duplicate.
+			this._socketTicketRetryKind = this.strongerSocketTicketRetryKind(
+				this._socketTicketRetryKind,
+				kind,
+			);
+			return;
+		}
+
+		this.clearSocketTicketRefreshTimer();
+		const failureCount = kind === "connect"
+			? ++this._socketTicketConnectRetryFailureCount
+			: ++this._socketTicketRefreshFailureCount;
+		const retryMs = socketTicketRetryDelayMs(failureCount);
+		this._socketTicketRetryScheduled = true;
+		this._socketTicketRetryKind = kind;
+		this.log(
+			`socket ticket ${kind} retry scheduled in ${retryMs}ms ` +
+			`(failure ${failureCount})`,
+		);
+		this._socketTicketRefreshTimer = setTimeout(() => {
+			this._socketTicketRefreshTimer = null;
+			this._socketTicketRetryScheduled = false;
+			const pendingKind = this._socketTicketRetryKind;
+			this._socketTicketRetryKind = null;
+			const underlyingConnectionStopped =
+				(this.provider as YSyncProvider & { shouldConnect?: boolean }).shouldConnect === false;
+			if (pendingKind === "auth") {
+				this.runSocketAuthRecovery();
+			} else if (
+				pendingKind === "connect"
+				|| (
+					this._socketTicketConnectionWanted
+					&& !this.provider.wsconnected
+					&& !this.provider.wsconnecting
+					&& underlyingConnectionStopped
+				)
+			) {
+				this.connectProviderWithTicketRetry();
+			} else {
+				void this.refreshProviderTicketUrl(true);
+			}
+		}, retryMs);
+	}
+
+	private connectProviderWithTicketRetry(): void {
+		if (this.shouldStopSocketTicketRefresh() || !this.socketTicketProviderWantsConnection()) return;
+		if (this.provider.wsconnected || this.provider.wsconnecting) return;
+		if (this.isSocketTicketNetworkOffline()) {
+			this.deferSocketTicketRetryUntilOnline("connect");
+			return;
+		}
+		const reconnect = this.provider.connect();
+		if (this._socketAuthRecoveryInFlight) {
+			this._socketAuthRecoveryIntentEpoch = this._socketTicketConnectionIntentEpoch;
+		}
+		void reconnect.catch(() => {
+			// The lifecycle wrapper owns logging and retry scheduling.
+		});
+	}
+
+	private observeSocketTicketConnectionClose(closedSocket: object | null): void {
+		// y-partyserver emits connection-close and then, only for sockets that had
+		// opened, status=disconnected in the same close callback. Record that pair
+		// so the fallback status cannot process one close twice. Handshake failures
+		// have no status event; clear the marker at the next microtask instead.
+		this._socketTicketConnectionCloseStatusPending = true;
+		queueMicrotask(() => {
+			this._socketTicketConnectionCloseStatusPending = false;
+		});
+		this.handleSocketTicketConnectionClose(closedSocket);
+	}
+
+	private handleSocketTicketDisconnectedStatus(): void {
+		if (this._socketTicketConnectionCloseStatusPending) {
+			this._socketTicketConnectionCloseStatusPending = false;
+			return;
+		}
+		this.handleSocketTicketConnectionClose(null);
+	}
+
+	private handleSocketTicketConnectionClose(closedSocket: object | null = null): void {
+		if (
+			closedSocket !== null
+			&& closedSocket === this._socketAuthRecoveryRejectedSocket
+		) {
+			// Ignore exactly the old socket deliberately closed after unauthorized.
+			// A distinct fresh handshake socket must take the bounded retry path.
+			this._socketAuthRecoveryRejectedSocket = null;
+			return;
+		}
+		if (
+			!this._getSocketTicket
+			|| !this._socketTicketConnectionWanted
+			|| this._fatalAuthError
+			// manual/fatal/destroy and our own raw pause set shouldConnect=false
+			// before closing the socket. Ignore the close event they generate.
+			|| (this.provider as YSyncProvider & { shouldConnect?: boolean }).shouldConnect === false
+		) {
+			return;
+		}
+		this.recoverSocketTicketAfterDisconnect();
+	}
+
+	private recoverSocketTicketAfterDisconnect(): void {
+		if (this.shouldStopSocketTicketRefresh() || !this.socketTicketProviderWantsConnection()) return;
+		this._socketTicketDisconnectRecoveryPending = true;
+		// y-partyserver resets its unsuccessful reconnect counter as soon as a socket
+		// opens, before Yjs sync proves the connection is usable. Pause its loop on
+		// every real disconnect so open/close flapping cannot become a ~100ms loop.
+		this.pauseProviderReconnectForSocketTicketRetry();
+
+		const preSyncAuthFlap =
+			this._socketAuthRecoveryInFlight && this._socketAuthRecoveryReconnectStarted;
+		if (preSyncAuthFlap || this._socketTicketReconnectAttemptedSinceSync) {
+			this._socketTicketDisconnectRecoveryPending = false;
+			this.scheduleSocketTicketRetry("connect");
+			return;
+		}
+
+		// Permit exactly one immediate refresh + reconnect after the last proven
+		// sync. Every further pre-sync close uses the bounded connect counter below.
+		this._socketTicketReconnectAttemptedSinceSync = true;
+		if (this._socketTicketRetryScheduled || this._socketTicketConnectInFlight) {
+			this._socketTicketDisconnectRecoveryPending = false;
+			this.scheduleSocketTicketRetry("connect");
+			return;
+		}
+		if (this._socketTicketRefreshInFlight) return;
+		if (this.isSocketTicketNetworkOffline()) {
+			this._socketTicketDisconnectRecoveryPending = false;
+			this.deferSocketTicketRetryUntilOnline("connect");
+			return;
+		}
+		void this.refreshProviderTicketUrl(true);
+	}
+
+	private pauseProviderReconnectForSocketTicketRetry(): void {
+		if (!this._socketTicketDisconnectRecoveryPending) return;
+		const provider = this.provider as YSyncProvider & { shouldConnect?: boolean };
+		// disconnect() can emit another disconnected status. Guarding the provider's
+		// own intent prevents recursively pausing an already-paused reconnect loop.
+		if (provider.shouldConnect === false) return;
+		this._socketTicketRawDisconnect?.();
+	}
+
+	private resumeProviderAfterTicketRefreshIfNeeded(): void {
+		if (!this._socketTicketDisconnectRecoveryPending) return;
+		this._socketTicketDisconnectRecoveryPending = false;
+		if (this.shouldStopSocketTicketRefresh() || !this.socketTicketProviderWantsConnection()) return;
+		// This is the one immediate reconnect allowed since the last sync(true).
+		// Subsequent pre-sync disconnects are routed through connect retry backoff.
+		void this.provider.connect().catch(() => {
+			// The lifecycle wrapper owns logging and retry scheduling.
+		});
 	}
 
 	/**
@@ -2655,43 +3173,96 @@ export class VaultSync {
 		}
 	}
 
-	private async fetchAndPatchProviderTicket(force = false): Promise<boolean> {
-		if (!this._getSocketTicket) return false;
-		const ticket = await this._getSocketTicket(force);
-		if (!ticket) return false;
+	private async runFetchAndPatchProviderTicket(force: boolean): Promise<boolean> {
+		if (this.shouldStopSocketTicketRefresh() || !this._getSocketTicket) return false;
+		if (!this.socketTicketProviderWantsConnection()) return false;
+		const ticket = await this.requestSocketTicket(force);
+		if (!ticket) {
+			this.resumeProviderAfterTicketRefreshIfNeeded();
+			return false;
+		}
+		// A fetch that outlives destroy() or a fatal-auth frame must not mutate
+		// provider state or resurrect a refresh timer.
+		if (this.shouldStopSocketTicketRefresh()) return false;
+		if (!this.socketTicketProviderWantsConnection()) return false;
 		this.patchProviderTicket(ticket.value);
 		this.scheduleSocketTicketRefresh(ticket);
 		return true;
 	}
 
+	private fetchAndPatchProviderTicket(force = false): Promise<boolean> {
+		return this.runFetchAndPatchProviderTicket(force);
+	}
+
 	/**
 	 * Fetch a fresh ticket (optionally bypassing the cache) and patch
 	 * provider.url.  Reschedules the refresh timer on success.
-	 * On transient failure, retries after TICKET_REFRESH_BUFFER_MS so the
-	 * proactive refresh cycle survives intermittent network errors.
+	 * On transient failure, retries with bounded exponential equal jitter so
+	 * the proactive refresh cycle survives intermittent network errors without
+	 * turning a prolonged outage into a fixed-rate poll.
 	 */
 	private async refreshProviderTicketUrl(force = false): Promise<boolean> {
+		if (this.shouldStopSocketTicketRefresh()) return false;
+		if (this._socketTicketRefreshInFlight || this._socketTicketRetryScheduled) return false;
+		// provider.disconnect() sets shouldConnect=false. Do not keep refreshing
+		// credentials while a controller intentionally holds sync disconnected.
+		// Ordinary network loss leaves shouldConnect=true and remains recoverable.
+		if (!this.socketTicketProviderWantsConnection()) return false;
+		if (this.isSocketTicketNetworkOffline()) {
+			const retryKind = this._socketTicketDisconnectRecoveryPending ? "connect" : "refresh";
+			this.pauseProviderReconnectForSocketTicketRetry();
+			this._socketTicketDisconnectRecoveryPending = false;
+			this.deferSocketTicketRetryUntilOnline(retryKind);
+			return false;
+		}
+
+		this._socketTicketRefreshInFlight = true;
 		try {
-			return await this.fetchAndPatchProviderTicket(force);
+			const refreshed = await this.fetchAndPatchProviderTicket(force);
+			if (!refreshed && this.isSocketTicketNetworkOffline()) {
+				const retryKind = this._socketTicketDisconnectRecoveryPending ? "connect" : "refresh";
+				this.pauseProviderReconnectForSocketTicketRetry();
+				this._socketTicketDisconnectRecoveryPending = false;
+				this.deferSocketTicketRetryUntilOnline(retryKind);
+			}
+			return refreshed;
 		} catch (err) {
 			this.log(`socket ticket refresh failed: ${formatUnknown(err)}`);
-			if (this._fatalAuthError) return false;
+			if (this.shouldStopSocketTicketRefresh() || !this.socketTicketProviderWantsConnection()) return false;
+			if (this.markFatalSocketTicketHttpAuth(err)) return false;
+			if (this.isSocketTicketNetworkOffline()) {
+				const retryKind = this._socketTicketDisconnectRecoveryPending ? "connect" : "refresh";
+				this.pauseProviderReconnectForSocketTicketRetry();
+				this._socketTicketDisconnectRecoveryPending = false;
+				this.deferSocketTicketRetryUntilOnline(retryKind);
+				return false;
+			}
 			// Clear any existing timer before scheduling the retry so we never
 			// lose a handle and fire duplicate refreshes.  This matters when the
 			// disconnected best-effort path calls here while the proactive timer
 			// is already scheduled: without the clear, the proactive timer
 			// handle is overwritten but the timer still fires.
-			this.clearSocketTicketRefreshTimer();
-			this._socketTicketRefreshTimer = setTimeout(() => {
-				this._socketTicketRefreshTimer = null;
-				void this.refreshProviderTicketUrl(true);
-			}, TICKET_REFRESH_BUFFER_MS);
+			const retryKind = this._socketTicketDisconnectRecoveryPending ? "connect" : "refresh";
+			this.pauseProviderReconnectForSocketTicketRetry();
+			this._socketTicketDisconnectRecoveryPending = false;
+			this.scheduleSocketTicketRetry(retryKind);
 			return false;
+		} finally {
+			this._socketTicketRefreshInFlight = false;
 		}
 	}
 
 	async destroy(): Promise<void> {
 		this.log("Destroying VaultSync");
+		this._destroyed = true;
+		this._socketTicketRefreshPendingForOnline = false;
+		if (this._socketTicketOnlineHandler && typeof window !== "undefined") {
+			window.removeEventListener("online", this._socketTicketOnlineHandler);
+			this._socketTicketOnlineHandler = null;
+		}
+		// Revoke connection intent before awaiting persistence so an async params
+		// callback cannot open a socket after teardown has started.
+		this.provider.disconnect();
 		if (this._renameTimer) clearTimeout(this._renameTimer);
 		this.clearSocketTicketRefreshTimer();
 		this.clearPendingRenames();
