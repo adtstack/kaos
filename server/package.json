@@ -1,6 +1,6 @@
 {
 	"name": "kaos-server",
-	"version": "0.7.0",
+	"version": "0.7.1",
 	"private": true,
 	"description": "Cloudflare Worker server for Obsidian vault CRDT sync via y-partyserver",
 	"scripts": {
