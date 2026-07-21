@@ -1,6 +1,8 @@
 interface SetupPageOptions {
 	host: string;
 	deployRepo?: string;
+	claimEnabled?: boolean;
+	scriptNonce?: string;
 }
 
 interface RunningPageOptions {
@@ -13,6 +15,7 @@ interface RunningPageOptions {
 interface MobileSetupPageOptions {
 	host: string;
 	deployRepo?: string;
+	scriptNonce?: string;
 }
 
 function escapeHtml(value: string): string {
@@ -23,21 +26,13 @@ function escapeHtml(value: string): string {
 		.replace(/"/g, "&quot;");
 }
 
-const IS_MARKETPLACE_APPROVED = true;
-const DEFAULT_DEPLOY_REPO = "adtstack/kaos";
-
-function normalizeDeployRepo(value: string | undefined): string {
-	const raw = value?.trim();
-	if (!raw) return DEFAULT_DEPLOY_REPO;
-	// Keep this strict: owner/repo style slug only.
-	if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(raw)) {
-		return DEFAULT_DEPLOY_REPO;
-	}
-	return raw;
-}
-
 export function renderSetupPage(options: SetupPageOptions): string {
 	const safeHost = escapeHtml(options.host);
+	const safeNonce = options.scriptNonce ? escapeHtml(options.scriptNonce) : "";
+	const claimDisabled = options.claimEnabled === true ? "" : " disabled";
+	const initialStatus = options.claimEnabled === true
+		? ""
+		: "Claiming is locked. Configure a 32+ character KAOS_CLAIM_SECRET and redeploy.";
 
 	// Cleaned up the installation copy slightly for better reading
 	const installationStep = `<div class="step-text">
@@ -141,6 +136,29 @@ export function renderSetupPage(options: SetupPageOptions): string {
 
     #status { text-align: center; margin-top: 16px; font-size: 13px; color: #7bdff6; min-height: 20px; }
 
+    .claim-proof {
+      margin: 0 auto 16px;
+      width: min(420px, 100%);
+    }
+    .claim-proof label {
+      display: block;
+      margin-bottom: 7px;
+      color: #a9c0d8;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .claim-proof input {
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid rgba(161, 205, 255, 0.18);
+      border-radius: 10px;
+      padding: 12px 14px;
+      background: rgba(4, 10, 18, 0.75);
+      color: #f4f7fb;
+      font: inherit;
+    }
+    .claim-proof .hint { margin-top: 7px; color: #6984a3; font-size: 11px; }
+
     /* The Success State */
     .success-flow {
       display: none;
@@ -243,7 +261,8 @@ export function renderSetupPage(options: SetupPageOptions): string {
     .action-box p { font-size: 13px; margin-bottom: 4px;}
 
     #qr { background: #fff; padding: 8px; border-radius: 12px; display: inline-block;}
-    #qr canvas { display: block; border-radius: 4px; width: 120px; height: 120px;}
+    #qr img { display: block; border-radius: 4px; width: 120px; height: 120px;}
+    #qr .mobile-link { display: block; margin-top: 8px; color: #08111d; font-size: 11px; }
 
     /* Manual Fallback Accordion */
     details {
@@ -310,10 +329,15 @@ export function renderSetupPage(options: SetupPageOptions): string {
         <p>Your edge server is online. Claim it to generate your secure pairing token.</p>
         <div class="host-badge">${safeHost}</div>
       </section>
-      <div style="display: flex; justify-content: center;">
-        <button id="claim">Claim Server</button>
+      <div class="claim-proof">
+        <label for="claim-secret">Deployment claim secret</label>
+        <input id="claim-secret" type="password" autocomplete="off" autocapitalize="none" spellcheck="false"${claimDisabled} />
+        <p class="hint">Enter the secret you chose in Cloudflare during deployment. It is used only for this claim request.</p>
       </div>
-      <div id="status" aria-live="polite"></div>
+      <div style="display: flex; justify-content: center;">
+        <button id="claim"${claimDisabled}>Claim Server</button>
+      </div>
+      <div id="status" aria-live="polite">${initialStatus}</div>
     </div>
 
     <div id="success-flow" class="success-flow">
@@ -382,11 +406,11 @@ export function renderSetupPage(options: SetupPageOptions): string {
 
   </main>
 
-  <script src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"></script>
-  <script>
+  <script${safeNonce ? ` nonce="${safeNonce}"` : ""}>
     const initialView = document.getElementById("initial-view");
     const successFlow = document.getElementById("success-flow");
     const claimButton = document.getElementById("claim");
+    const claimSecretInput = document.getElementById("claim-secret");
     const statusEl = document.getElementById("status");
 
     const installedCheckbox = document.getElementById("installed");
@@ -420,19 +444,23 @@ export function renderSetupPage(options: SetupPageOptions): string {
 	      return host + "/mobile-setup#" + hash;
 	    }
 
-    function renderQr(text) {
-      if (!text || !window.QRious) return;
-      qrEl.innerHTML = "";
-      const canvas = document.createElement("canvas");
-      qrEl.appendChild(canvas);
-      new window.QRious({
-        element: canvas,
-        value: text,
-        size: 240,
-        level: "M",
-        foreground: "#08111d",
-        background: "#ffffff",
-      });
+    function renderQr(svg, mobileSetupUrl) {
+      qrEl.replaceChildren();
+      if (typeof svg === "string" && svg.startsWith("<svg")) {
+        const image = document.createElement("img");
+        image.alt = "Scan to connect KAOS on a mobile device";
+        image.width = 120;
+        image.height = 120;
+        image.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+        qrEl.appendChild(image);
+      }
+      if (typeof mobileSetupUrl === "string" && mobileSetupUrl) {
+        const mobileLink = document.createElement("a");
+        mobileLink.className = "mobile-link";
+        mobileLink.href = mobileSetupUrl;
+        mobileLink.textContent = svg ? "Open mobile setup" : "QR unavailable — open mobile setup";
+        qrEl.appendChild(mobileLink);
+      }
     }
 
     // Toggle Step 2 state based on checkbox
@@ -477,6 +505,11 @@ export function renderSetupPage(options: SetupPageOptions): string {
 	    });
 
 	    claimButton.addEventListener("click", async () => {
+	      const claimSecret = claimSecretInput.value;
+	      if (!claimSecret) {
+	        statusEl.textContent = "Enter the deployment claim secret.";
+	        return;
+	      }
 	      claimButton.disabled = true;
 	      statusEl.textContent = "Claiming server...";
 	      const token = randomToken();
@@ -485,14 +518,18 @@ export function renderSetupPage(options: SetupPageOptions): string {
 	      try {
 	        const res = await fetch("/claim", {
 	          method: "POST",
-	          headers: { "Content-Type": "application/json" },
+	          headers: {
+	            "Content-Type": "application/json",
+	            "X-KAOS-Claim-Proof": claimSecret,
+	          },
 	          body: JSON.stringify({ token, vaultId }),
 	        });
 
+	        const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          const data = await res.json().catch(() => ({}));
           throw new Error(data.error || "Claim failed");
         }
+	        claimSecretInput.value = "";
 
 	        // Setup the UI state
 	        hostInput.value = window.location.origin;
@@ -504,7 +541,7 @@ export function renderSetupPage(options: SetupPageOptions): string {
 	        openBtn.href = deepLink;
 
 	        // QR Code pointing to the trampoline page
-	        renderQr(buildMobileSetupUrl(window.location.origin, token, vaultId));
+	        renderQr(data.qrSvg, data.mobileSetupUrl || buildMobileSetupUrl(window.location.origin, token, vaultId));
 
         // Switch Views
         initialView.style.display = "none";
@@ -522,6 +559,7 @@ export function renderSetupPage(options: SetupPageOptions): string {
 
 export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
 	const safeHost = escapeHtml(options.host);
+	const safeNonce = options.scriptNonce ? escapeHtml(options.scriptNonce) : "";
 	return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -632,7 +670,7 @@ export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
 	    </details>
   </main>
 
-  <script>
+  <script${safeNonce ? ` nonce="${safeNonce}"` : ""}>
     const connectBtn = document.getElementById("connect-button");
 	    const statusEl = document.getElementById("status");
 	    const hostInput = document.getElementById("host-input");
@@ -651,7 +689,7 @@ export function renderMobileSetupPage(options: MobileSetupPageOptions): string {
 
 	    const { host, token, vaultId } = parseHash();
 
-	    if (!host || !token || !vaultId) {
+	    if (!host || !token || !vaultId || host !== window.location.origin) {
 	      statusEl.textContent = "Error: Invalid setup link. Please re-scan the QR code.";
 	      statusEl.style.color = "#ff6b6b";
 	    } else {

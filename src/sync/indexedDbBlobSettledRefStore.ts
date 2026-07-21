@@ -376,6 +376,7 @@ function isSettlementStageKind(
 	value: unknown,
 ): value is BlobSettlementStage["kind"] {
 	return value === "download"
+		|| value === "manual-download-conflict"
 		|| value === "upload"
 		|| value === "equality"
 		|| value === "rename"

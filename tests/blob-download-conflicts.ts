@@ -373,6 +373,11 @@ console.log("\n--- Test 2: stable differing attachment is preserved, never overw
 		),
 		"non-overwrite decision is traced",
 	);
+	manager.handleFileChange(files.get("img.png")!.file);
+	assert(manager.isPreservedUnresolved("img.png"), "a later modify event cannot implicitly clear the blob conflict");
+	assert(!(manager as any).uploadDebounce.has("img.png"), "a later modify event does not schedule an implicit upload");
+	assert(!(manager as any).uploadQueue.has("img.png"), "only an explicit Keep local action may queue the conflicted attachment");
+	assert(conflict ? files.has(conflict) : false, "the remote conflict candidate remains available for an explicit choice");
 }
 
 console.log("\n--- Test 2b: exact existing remote hash settles without a write ---");
@@ -433,6 +438,28 @@ console.log("\n--- Test 2c.1: hash-equal upload reconciliation completes progres
 	await manager.destroy();
 }
 
+console.log("\n--- Test 2c.2: a marker without a materialized artifact cannot block repair ---");
+{
+	const path = "missing-conflict-artifact.png";
+	const local = bytes("local candidate");
+	const remote = bytes("remote candidate");
+	const localHash = await sha256Hex(local);
+	const remoteHash = await sha256Hex(remote);
+	const { manager, put } = makeHarness();
+	put(path, local);
+	const refs = (manager as any).__defaultBlobRefs as Map<string, BlobRef>;
+	refs.set(path, { hash: remoteHash, size: remote.byteLength });
+	(manager as any).quarantineDownloadConflict(path, localHash, remoteHash, null);
+	(manager as any).downloadGateOpen = false;
+	const scheduled = (manager as any).scheduleDownload(
+		path,
+		remoteHash,
+		remote.byteLength,
+	);
+	assert(scheduled === true, "an artifact-less marker allows the authoritative candidate to be materialized again");
+	assert((manager as any).downloadQueue.has(path), "repair remains queued instead of leaving Attention without a choice");
+}
+
 console.log("\n--- Test 2d: exact prior-ref provenance admits a clean H1 -> H2 update ---");
 {
 	const path = "proven-clean.png";
@@ -462,6 +489,9 @@ console.log("\n--- Test 2d: exact prior-ref provenance admits a clean H1 -> H2 u
 		"a clean provenance-backed update creates no conflict artifact",
 	);
 	assert(!manager.isPreservedUnresolved(path), "a clean provenance-backed update creates no Attention marker");
+	const debug = manager.getDebugSnapshot();
+	assert(debug.blobConflictArtifacts === 0, "a clean remote advance does not increment the true conflict count");
+	assert(debug.blobSafetyBackups === 1, "a clean remote advance records one rollback safety copy");
 }
 
 console.log("\n--- Test 2e: prior-ref provenance never admits a different local hash ---");
@@ -492,6 +522,9 @@ console.log("\n--- Test 2e: prior-ref provenance never admits a different local 
 	assert(!!conflict && conflict.file.path !== path, "the rejected H2 candidate is preserved as an artifact");
 	assert(getModifyCalls() === 0, "provenance mismatch never reaches modifyBinary");
 	assert(manager.isPreservedUnresolved(path), "provenance mismatch records durable Attention");
+	const debug = manager.getDebugSnapshot();
+	assert(debug.blobConflictArtifacts === 1, "a divergent remote candidate increments the true conflict count");
+	assert(debug.blobSafetyBackups === 0, "a divergent conflict is not mislabeled as a clean safety copy");
 }
 
 console.log("\n--- Test 2f: H1 -> H2 -> H3 supersede accepts either contiguous disk state ---");
@@ -1622,6 +1655,9 @@ console.log("\n--- Test 5: clean remote delete moves the exact TFile to a visibl
 		!backupPath || !(manager as any).uploadQueue.has(backupPath),
 		"the remote-delete local safety backup is never uploaded",
 	);
+	const debug = manager.getDebugSnapshot();
+	assert(debug.blobConflictArtifacts === 0, "a clean remote delete does not increment the true conflict count");
+	assert(debug.blobSafetyBackups === 1, "a clean remote delete records one rollback safety copy");
 }
 
 console.log("\n--- Test 5b: prior Attention clears only after the visible backup rename settles ---");
@@ -2100,6 +2136,10 @@ console.log("\n--- Test 14: debug snapshot includes permanent failure counters -
 	assert(
 		"blobConflictArtifacts" in snapshot,
 		"debug snapshot has blobConflictArtifacts",
+	);
+	assert(
+		"blobSafetyBackups" in snapshot,
+		"debug snapshot has blobSafetyBackups",
 	);
 	assert(
 		snapshot.permanentUploadFailures === 0,
@@ -3309,6 +3349,263 @@ console.log("\n--- Test 24: excluded remote delete leaves local tool file untouc
 
 	assert(files.has("tools/node_modules/cache.bin"), "excluded tool file is preserved locally");
 	assert(deletedPaths.length === 0, "excluded remote delete does not call vault.delete");
+}
+
+// ── Test 25: transient HTTP exhaustion remains durably retryable ───────────
+
+console.log("\n--- Test 25: transient download failure retains automatic recovery intent ---");
+{
+	const { manager } = makeHarness();
+	const path = "assets/transient-download.png";
+	const data = bytes("eventually available");
+	const hash = await sha256Hex(data);
+	(manager as any).__defaultBlobRefs.set(path, { hash, size: data.byteLength });
+	(manager as any).enqueueDownload(path, hash, data.byteLength);
+	const item = (manager as any).downloadQueue.get(path);
+	item.retries = 3;
+	item.status = "processing";
+	let retryDelay = 0;
+	(manager as any).scheduleRetryKick = (delay: number) => { retryDelay = delay; };
+	(manager as any).blobClient = {
+		download: async () => {
+			throw Object.assign(new Error("temporary 503/network failure"), { status: 503 });
+		},
+	};
+	await (manager as any).processDownload(item);
+	assert(
+		(manager as any).downloadQueue.get(path) === item,
+		"transient retry exhaustion retains the download queue item",
+	);
+	assert(item.retries === 0, "the next retry cycle receives a fresh bounded budget");
+	assert(item.readyAt > Date.now() && retryDelay > 0, "automatic recovery is delayed with backoff");
+}
+
+// ── Test 26: terminal HTTP errors do not retry forever ─────────────────────
+
+console.log("\n--- Test 26: terminal download HTTP error retires queue item ---");
+{
+	const { manager } = makeHarness();
+	const path = "assets/forbidden-download.png";
+	const data = bytes("forbidden");
+	const hash = await sha256Hex(data);
+	(manager as any).__defaultBlobRefs.set(path, { hash, size: data.byteLength });
+	(manager as any).enqueueDownload(path, hash, data.byteLength);
+	const item = (manager as any).downloadQueue.get(path);
+	item.retries = 3;
+	item.status = "processing";
+	(manager as any).blobClient = {
+		download: async () => { throw Object.assign(new Error("forbidden"), { status: 403 }); },
+	};
+	const originalError = console.error;
+	console.error = () => {};
+	try {
+		await (manager as any).processDownload(item);
+	} finally {
+		console.error = originalError;
+	}
+	assert(!(manager as any).downloadQueue.has(path), "terminal 4xx response retires the download item");
+}
+
+// Exercise the real BlobHttpClient -> Obsidian requestUrl boundary. Obsidian's
+// default is throw=true for 400+, so this seam rejects unless production passes
+// throw:false and classifies the returned status itself.
+console.log("\n--- Test 27: BlobHttpClient preserves HTTP status classification ---");
+{
+	const requestOptions: Array<{ throw?: boolean }> = [];
+	(globalThis as {
+		__KAOS_TEST_REQUEST_URL__?: (request: unknown) => Promise<unknown>;
+	}).__KAOS_TEST_REQUEST_URL__ = async (request) => {
+		const options = request as { throw?: boolean };
+		requestOptions.push(options);
+		if (options.throw !== false) throw new Error("Obsidian default HTTP rejection");
+		return {
+			status: 403,
+			text: "forbidden",
+			arrayBuffer: new ArrayBuffer(0),
+			json: {},
+			headers: {},
+		};
+	};
+	try {
+		const { manager } = makeHarness();
+		const path = "assets/real-client-forbidden.png";
+		const data = bytes("forbidden");
+		const hash = await sha256Hex(data);
+		(manager as any).__defaultBlobRefs.set(path, { hash, size: data.byteLength });
+		(manager as any).enqueueDownload(path, hash, data.byteLength);
+		const item = (manager as any).downloadQueue.get(path);
+		item.retries = 3;
+		item.status = "processing";
+		const originalError = console.error;
+		console.error = () => {};
+		try {
+			await (manager as any).processDownload(item);
+		} finally {
+			console.error = originalError;
+		}
+		assert(requestOptions.length === 1, "real blob client performs one HTTP request");
+		assert(requestOptions[0]?.throw === false, "real blob client disables Obsidian's implicit HTTP throw");
+		assert(!(manager as any).downloadQueue.has(path), "real-client 403 remains terminal instead of entering a retry loop");
+	} finally {
+		delete (globalThis as { __KAOS_TEST_REQUEST_URL__?: unknown }).__KAOS_TEST_REQUEST_URL__;
+	}
+}
+
+// A local filesystem outage is transient just like a network outage. After a
+// bounded retry cycle, retain the exact remote intent instead of dropping it as
+// a permanent download failure.
+console.log("\n--- Test 28: transient createBinary failure retains recovery intent ---");
+{
+	const { app, manager } = makeHarness();
+	const path = "assets/transient-create.png";
+	const data = bytes("downloaded while storage is unavailable");
+	const hash = await sha256Hex(data);
+	(manager as any).__defaultBlobRefs.set(path, { hash, size: data.byteLength });
+	(manager as any).enqueueDownload(path, hash, data.byteLength);
+	const item = (manager as any).downloadQueue.get(path);
+	item.retries = 3;
+	item.status = "processing";
+	let retryDelay = 0;
+	let createCalls = 0;
+	(manager as any).scheduleRetryKick = (delay: number) => { retryDelay = delay; };
+	(manager as any).blobClient = { download: async () => data };
+	app.vault.createBinary = async () => {
+		createCalls++;
+		throw new Error("temporary filesystem busy");
+	};
+
+	await (manager as any).processDownload(item);
+	assert(createCalls === 1, "the storage write is attempted once in the exhausted cycle");
+	assert(
+		(manager as any).downloadQueue.get(path) === item,
+		"transient createBinary exhaustion retains the download queue item",
+	);
+	assert(item.retries === 0, "transient storage failure starts a fresh bounded retry cycle");
+	assert(item.readyAt > Date.now() && retryDelay > 0, "storage recovery is delayed with backoff");
+	assert(
+		!(manager as any).settlementStages[path],
+		"the failed pre-create settlement stage is safely aborted before retry",
+	);
+}
+
+// The file can be present even though the first post-create verification read
+// failed. The durable stage must be resumable instead of becoming a permanent
+// blocker that also suppresses future local uploads.
+console.log("\n--- Test 29: post-create read failure resumes durable settlement ---");
+{
+	const settledRefs: Record<string, BlobRef> = {};
+	const { app, manager, files } = makeHarness(() => true, settledRefs);
+	const path = "assets/post-create-read-retry.png";
+	const data = bytes("created before the first verification read fails");
+	const hash = await sha256Hex(data);
+	(manager as any).__defaultBlobRefs.set(path, { hash, size: data.byteLength });
+	(manager as any).enqueueDownload(path, hash, data.byteLength);
+	const item = (manager as any).downloadQueue.get(path);
+	item.retries = 3;
+	item.status = "processing";
+	(manager as any).blobClient = { download: async () => data };
+	let retryDelay = 0;
+	(manager as any).scheduleRetryKick = (delay: number) => { retryDelay = delay; };
+	const originalReadBinary = app.vault.readBinary;
+	let targetReads = 0;
+	let createCalls = 0;
+	const originalCreateBinary = app.vault.createBinary;
+	app.vault.createBinary = async (candidate: string, candidateData: ArrayBuffer) => {
+		createCalls++;
+		return await originalCreateBinary(candidate, candidateData);
+	};
+	app.vault.readBinary = async (file: TFile & { path: string }) => {
+		if (file.path === path && targetReads++ === 0) {
+			throw new Error("temporary post-create read failure");
+		}
+		return await originalReadBinary(file);
+	};
+
+	await (manager as any).processDownload(item);
+	assert(files.has(path), "createBinary materializes the exact target before verification fails");
+	assert(
+		(manager as any).settlementStages[path]?.kind === "download",
+		"the durable download stage remains available for exact resumption",
+	);
+	assert((manager as any).downloadQueue.get(path) === item, "the retry intent remains queued");
+	assert(
+		item.retries === 0 && item.readyAt > Date.now() && retryDelay > 0,
+		"post-create read exhaustion starts another bounded recovery cycle",
+	);
+
+	item.readyAt = 0;
+	item.status = "processing";
+	await (manager as any).processDownload(item);
+	assert(createCalls === 1, "resumption verifies the existing target without creating it twice");
+	assert(!(manager as any).settlementStages[path], "the resumed exact stage finalizes");
+	assert(!(manager as any).downloadQueue.has(path), "successful resumption retires the queue item");
+	assert(settledRefs[path]?.hash === hash, "resumption records the exact authoritative settlement");
+}
+
+// A finalization call may reject before committing anything. Retrying must use
+// the still-owned stage and exact disk bytes rather than discarding the queue.
+console.log("\n--- Test 30: post-create finalize failure resumes durable settlement ---");
+{
+	const settledRefs: Record<string, BlobRef> = {};
+	const { app, manager } = makeHarness(() => true, settledRefs);
+	const path = "assets/post-create-finalize-retry.png";
+	const data = bytes("created before settlement persistence rejects");
+	const hash = await sha256Hex(data);
+	(manager as any).__defaultBlobRefs.set(path, { hash, size: data.byteLength });
+	(manager as any).enqueueDownload(path, hash, data.byteLength);
+	const item = (manager as any).downloadQueue.get(path);
+	item.retries = 3;
+	item.status = "processing";
+	(manager as any).blobClient = { download: async () => data };
+	let retryDelay = 0;
+	(manager as any).scheduleRetryKick = (delay: number) => { retryDelay = delay; };
+	let createCalls = 0;
+	const originalCreateBinary = app.vault.createBinary;
+	app.vault.createBinary = async (candidate: string, candidateData: ArrayBuffer) => {
+		createCalls++;
+		return await originalCreateBinary(candidate, candidateData);
+	};
+	let failSettlement = true;
+	(manager as any).settlementPersistence = {
+		stage: async (candidate: string, stage: unknown) => {
+			(manager as any).settlementStages[candidate] = stage;
+		},
+		finalize: async (
+			candidate: string,
+			_stageId: string,
+			ref: BlobRef,
+		) => {
+			if (failSettlement) {
+				failSettlement = false;
+				throw new Error("temporary settlement persistence failure");
+			}
+			settledRefs[candidate] = { ...ref };
+			delete (manager as any).settlementStages[candidate];
+		},
+		retire: async () => {},
+		abort: async (candidate: string) => {
+			delete (manager as any).settlementStages[candidate];
+		},
+	};
+
+	await (manager as any).processDownload(item);
+	assert(
+		(manager as any).settlementStages[path]?.kind === "download",
+		"a rejected finalize retains its exact durable stage",
+	);
+	assert((manager as any).downloadQueue.get(path) === item, "finalize rejection retains retry intent");
+	assert(
+		item.retries === 0 && item.readyAt > Date.now() && retryDelay > 0,
+		"settlement persistence exhaustion starts another bounded recovery cycle",
+	);
+
+	item.readyAt = 0;
+	item.status = "processing";
+	await (manager as any).processDownload(item);
+	assert(createCalls === 1, "finalize resumption does not rewrite the canonical target");
+	assert(!(manager as any).settlementStages[path], "the retried finalization clears its stage");
+	assert(!(manager as any).downloadQueue.has(path), "the settled retry retires its queue item");
+	assert(settledRefs[path]?.hash === hash, "the retried finalization records settlement");
 }
 
 console.log("\n──────────────────────────────────────────────────");

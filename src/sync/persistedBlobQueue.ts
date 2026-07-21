@@ -54,11 +54,23 @@ const DOWNLOAD_KEYS = new Set([
 	"needsRerun",
 	"rerunResets",
 ]);
-const ATTENTION_RESOLUTION_KEYS = new Set([
+const REMOTE_DELETE_ATTENTION_RESOLUTION_KEYS = new Set([
 	"kind",
 	"expectedReason",
 	"episodeId",
 	"remoteDeleteFingerprint",
+]);
+const DOWNLOAD_CONFLICT_ATTENTION_RESOLUTION_KEYS = new Set([
+	"kind",
+	"expectedReason",
+	"episodeId",
+	"expectedLocalHash",
+	"expectedRemoteHash",
+	"expectedRemoteRef",
+	"expectedRemoteSourceVersion",
+	"artifactPath",
+	"artifactMtime",
+	"artifactSize",
 ]);
 const REMOTE_DELETE_REASONS = new Set<string>(
 	REMOTE_DELETE_PRESERVED_UNRESOLVED_REASONS,
@@ -125,15 +137,34 @@ function sameScope(
 }
 
 function isAttentionResolution(value: unknown): boolean {
-	if (!isRecord(value) || !hasOnlyKeys(value, ATTENTION_RESOLUTION_KEYS)) return false;
-	return Object.keys(value).length === ATTENTION_RESOLUTION_KEYS.size
-		&& value.kind === "keep-local-remote-delete"
-		&& typeof value.expectedReason === "string"
-		&& REMOTE_DELETE_REASONS.has(value.expectedReason)
+	if (!isRecord(value)) return false;
+	if (value.kind === "keep-local-remote-delete") {
+		return hasOnlyKeys(value, REMOTE_DELETE_ATTENTION_RESOLUTION_KEYS)
+			&& Object.keys(value).length === REMOTE_DELETE_ATTENTION_RESOLUTION_KEYS.size
+			&& typeof value.expectedReason === "string"
+			&& REMOTE_DELETE_REASONS.has(value.expectedReason)
+			&& typeof value.episodeId === "string"
+			&& value.episodeId.length > 0
+			&& typeof value.remoteDeleteFingerprint === "string"
+			&& value.remoteDeleteFingerprint.length > 0;
+	}
+	if (value.kind !== "keep-local-download-conflict") return false;
+	return hasOnlyKeys(value, DOWNLOAD_CONFLICT_ATTENTION_RESOLUTION_KEYS)
+		&& Object.keys(value).length === DOWNLOAD_CONFLICT_ATTENTION_RESOLUTION_KEYS.size
+		&& value.expectedReason === "remote-download-local-conflict"
 		&& typeof value.episodeId === "string"
 		&& value.episodeId.length > 0
-		&& typeof value.remoteDeleteFingerprint === "string"
-		&& value.remoteDeleteFingerprint.length > 0;
+		&& isSha256Hex(value.expectedLocalHash)
+		&& isSha256Hex(value.expectedRemoteHash)
+		&& isBlobRef(value.expectedRemoteRef)
+		&& value.expectedRemoteRef.hash === value.expectedRemoteHash
+		&& isBlobSourceVersion(value.expectedRemoteSourceVersion)
+		&& typeof value.artifactPath === "string"
+		&& value.artifactPath.length > 0
+		&& isOptionalNonNegativeSafeInteger(value.artifactMtime)
+		&& value.artifactMtime !== undefined
+		&& isOptionalNonNegativeSafeInteger(value.artifactSize)
+		&& value.artifactSize !== undefined;
 }
 
 function isUpload(value: unknown): boolean {

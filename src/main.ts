@@ -5,7 +5,11 @@ import {
 	generateVaultId,
 	type VaultSyncSettings,
 } from "./settings";
-import { SettingsStore } from "./settings/settingsStore";
+import {
+	persistSettingsMutation,
+	SettingsMutationQueue,
+	SettingsStore,
+} from "./settings/settingsStore";
 import {
 	VaultSync,
 	type BlobDeleteCommitResult,
@@ -150,6 +154,11 @@ import {
 	ConnectionController,
 	type ConnectionState,
 } from "./runtime/connectionController";
+import { readStableMarkdownSnapshot } from "./runtime/stableMarkdownReader";
+import {
+	assertBlobConflictResolutionAdmission,
+	executeBlobConflictResolution,
+} from "./runtime/blobConflictResolutionFlow";
 import {
 	buildRuntimeConfig,
 	type RuntimeConfig,
@@ -175,6 +184,9 @@ import {
 	KaosDashboardView,
 } from "./dashboard/KaosDashboardView";
 import type {
+	DashboardBlobConflictResolutionChoice,
+	DashboardBlobConflictResolutionResult,
+	DashboardBlobConflictResolutionTarget,
 	DashboardLegacyMissingBlobResolutionChoice,
 	DashboardLegacyMissingBlobResolutionTarget,
 	DashboardRemoteDeleteResolutionChoice,
@@ -371,6 +383,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private attentionMarkdownDeleteInFlight = new Map<string, TFile>();
 	private persistedState: PersistedPluginState = {};
 	private persistWriteChain: Promise<void> = Promise.resolve();
+	private readonly settingsMutationQueue = new SettingsMutationQueue();
 	private diskIndexSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
 	/** Pending stability checks for newly created/dropped files. */
@@ -1151,7 +1164,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.legacyMissingBlobPaths = new Set([
 				...legacyMissingPaths,
 				...Object.entries(nextStages)
-					.filter(([, stage]) => stage.kind !== "retire")
+					.filter(([, stage]) =>
+						stage.kind !== "retire"
+						&& stage.kind !== "manual-download-conflict"
+					)
 					.map(([path]) => path),
 			]);
 			this.blobSettledRefStore = store;
@@ -1235,6 +1251,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			: null;
 		if (!key || !store) {
 			this.blobSettledRefPersistenceHealthy = false;
+			this.attachmentOrchestrator?.revokeUploadAuthority(
+				"settled-ref-journal-scope-not-ready",
+			);
 			return Promise.reject(
 				new Error("Blob settlement store is not initialized for the active scope"),
 			);
@@ -1394,6 +1413,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.legacyMissingBlobPaths.delete(normalized);
 		await this.enqueueBlobSettledRefPersistence();
 		this.assertBlobSettlementCallbackAuthority(scope, vaultSync);
+		if (
+			!sameBlobRef(vaultSync.getBlobRef(normalized), ref)
+			|| vaultSync.getBlobSourceVersion(normalized) !== sourceVersion
+		) {
+			throw new Error(`Attachment source changed while settling "${normalized}"`);
+		}
 	}
 
 	private async retireBlobSettlement(
@@ -2868,6 +2893,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.resolveRemoteDeleteAttention(target, choice),
 				resolveLegacyMissingBlobAttention: (target, choice) =>
 					this.resolveLegacyMissingBlobAttention(target, choice),
+				resolveBlobConflict: (target, choice) =>
+					this.resolveBlobConflict(target, choice),
 			},
 		}));
 		this.addRibbonIcon("layout-dashboard", "Open dashboard", () => {
@@ -3104,6 +3131,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.clearSavedBlobQueue(scope, token),
 			getPreservedUnresolvedEntries: () => this.preservedUnresolvedEntries,
 			onPreservedUnresolvedChanged: () => this.persistPreservedUnresolvedState(),
+			persistPreservedUnresolvedChanged: () =>
+				this.persistPreservedUnresolvedStateDurably(),
 			hasPendingBlobIntentForPath: (path) =>
 				this.pendingBlobIntents.hasPath(path, this.getBlobIntentScope()),
 			replayPendingBlobIntents: (reason) => this.replayPendingBlobIntents(reason),
@@ -3710,69 +3739,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		path: string,
 		reason: MarkdownDirtyReason,
 	): Promise<StableMarkdownReadResult> {
-		const statPath = async (): Promise<{ mtime: number; size: number } | null> => {
-			try {
-				const stat = await this.app.vault.adapter.stat(path);
+		return readStableMarkdownSnapshot<TFile>({
+			stat: async (candidate) => {
+				const stat = await this.app.vault.adapter.stat(candidate);
 				return stat ? { mtime: stat.mtime, size: stat.size } : null;
-			} catch {
-				return null;
-			}
-		};
-		const sameStat = (
-			a: { mtime: number; size: number } | null,
-			b: { mtime: number; size: number } | null,
-		): boolean => !!a && !!b && a.mtime === b.mtime && a.size === b.size;
-
-		let previous: { mtime: number; size: number } | null = null;
-		let stable: { mtime: number; size: number } | null = null;
-		for (let i = 0; i < 3; i++) {
-			const current = await statPath();
-			if (!current) return { kind: "missing" };
-			if (sameStat(previous, current)) {
-				stable = current;
-				break;
-			}
-			previous = current;
-			if (i < 2) {
-				await new Promise((resolve) => setTimeout(resolve, 400));
-			}
-		}
-
-		if (!stable) {
-			this.trace("reconcile", "markdown-stable-read-unstable", {
-				path,
-				reason,
-				phase: "pre-read",
-			});
-			return { kind: "unstable" };
-		}
-
-		const file = this.app.vault.getAbstractFileByPath(path);
-		if (!(file instanceof TFile)) return { kind: "missing" };
-
-		const beforeRead = await statPath();
-		if (!sameStat(stable, beforeRead)) {
-			this.trace("reconcile", "markdown-stable-read-unstable", {
-				path,
-				reason,
-				phase: "before-read",
-			});
-			return { kind: "unstable" };
-		}
-
-		const content = await this.app.vault.read(file);
-		const afterRead = await statPath();
-		if (!afterRead) return { kind: "missing" };
-		if (!sameStat(beforeRead, afterRead)) {
-			this.trace("reconcile", "markdown-stable-read-unstable", {
-				path,
-				reason,
-				phase: "after-read",
-			});
-			return { kind: "unstable" };
-		}
-
-		return { kind: "ready", file, content, stat: afterRead };
+			},
+			getFile: (candidate) => {
+				const file = this.app.vault.getAbstractFileByPath(candidate);
+				return file instanceof TFile ? file : null;
+			},
+			read: (file) => this.app.vault.read(file),
+			trace: (message, details) => this.trace("reconcile", message, details),
+		}, path, reason);
 	}
 
 	private async importUntrackedFiles(): Promise<void> {
@@ -4730,6 +4708,22 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					&& blobSync?.isKeepLocalRemoteDeletePending(path, episodeId) === true,
 				getBlobRef: (path) => cloneBlobRef(vaultSync?.getBlobRef(path)) ?? null,
 			},
+			blobConflictResolutionState: {
+				available: vaultSync !== null
+					&& blobSync !== null
+					&& vaultSync.providerSynced
+					&& this.blobProviderReady
+					&& this.blobLocalPersistenceReady
+					&& this.blobSettledRefPersistenceHealthy,
+				isPathSyncable: (path) => this.isBlobPathSyncable(path),
+				getBlobRef: (path) => cloneBlobRef(vaultSync?.getBlobRef(path)) ?? null,
+				getBlobSourceVersion: (path) =>
+					vaultSync?.getBlobSourceVersion(path) ?? null,
+				isKeepLocalPending: (path, episodeId) =>
+					blobSync?.isKeepLocalDownloadConflictPending(path, episodeId) === true,
+				isUseRemoteResumePending: (path, episodeId) =>
+					blobSync?.isUseRemoteDownloadConflictResumePending(path, episodeId) === true,
+			},
 			frontmatterQuarantineEntries: this.frontmatterQuarantineEntries,
 			diskIndex: this.diskIndex,
 			snapshotStatus,
@@ -4738,6 +4732,107 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			openFileCount: this.editorWorkspace?.openFileCount ?? 0,
 			snapshotsAvailable: this.serverSupportsSnapshots,
 		});
+	}
+
+	private async resolveBlobConflict(
+		target: DashboardBlobConflictResolutionTarget,
+		choice: DashboardBlobConflictResolutionChoice,
+	): Promise<DashboardBlobConflictResolutionResult> {
+		if (choice !== "keep-local" && choice !== "use-remote-copy") {
+			throw new Error("Unknown attachment conflict resolution choice.");
+		}
+		const normalizedTarget: DashboardBlobConflictResolutionTarget = {
+			...target,
+			path: normalizePath(target.path),
+			artifactPath: normalizePath(target.artifactPath),
+			expectedRemoteRef: cloneBlobRef(target.expectedRemoteRef ?? undefined) ?? null,
+		};
+		return withAttentionResolutionLock(
+			this.attentionResolutionInFlight,
+			`blob:${normalizedTarget.path}`,
+			normalizedTarget.path,
+			async () => {
+				const vaultSync = this.vaultSync;
+				const blobSync = this.getBlobSync();
+				if (!vaultSync || !blobSync) {
+					throw new Error("Attachment sync is not initialized.");
+				}
+				this.assertDashboardLocalFileIdentity({
+					path: normalizedTarget.path,
+					localFile: normalizedTarget.originalFile,
+				});
+				this.assertDashboardLocalFileIdentity({
+					path: normalizedTarget.artifactPath,
+					localFile: normalizedTarget.artifactFile,
+				});
+				const originalIsFile = normalizedTarget.originalFile.kind === "file"
+					&& normalizedTarget.originalFile.mtime !== null
+					&& normalizedTarget.originalFile.size !== null;
+				const canResumeRemoteVacancy = choice === "use-remote-copy"
+					&& normalizedTarget.originalFile.kind === "missing"
+					&& blobSync.isUseRemoteDownloadConflictResumePending(
+						normalizedTarget.path,
+						normalizedTarget.episodeId,
+					);
+				const scope = this.getBlobIntentScope();
+				const queueScope = this.attachmentOrchestrator?.getQueuePersistenceScope(blobSync);
+				const admission = {
+					path: normalizedTarget.path,
+					choice,
+					authorityReady: vaultSync.providerSynced
+						&& this.blobProviderReady
+						&& this.blobLocalPersistenceReady
+						&& this.blobSettledRefPersistenceHealthy,
+					expectedRemoteRef: normalizedTarget.expectedRemoteRef,
+					expectedRemoteSourceVersion: normalizedTarget.expectedRemoteSourceVersion,
+					currentRemoteRef: vaultSync.getBlobRef(normalizedTarget.path),
+					currentRemoteSourceVersion: vaultSync.getBlobSourceVersion(normalizedTarget.path),
+					artifactIsExactFile: normalizedTarget.artifactFile.kind === "file"
+						&& normalizedTarget.artifactFile.mtime !== null
+						&& normalizedTarget.artifactFile.size !== null,
+					originalIsExactFile: originalIsFile,
+					canResumeRemoteVacancy,
+					hasPendingLocalMutation: this.pendingBlobIntents.hasPath(
+						normalizedTarget.path,
+						scope,
+					),
+					queueAuthorityAvailable: queueScope != null,
+				};
+				assertBlobConflictResolutionAdmission(admission);
+				const identity = {
+					episodeId: normalizedTarget.episodeId,
+					expectedLocalHash: normalizedTarget.expectedLocalHash,
+					expectedRemoteHash: normalizedTarget.expectedRemoteHash,
+					expectedRemoteRef: admission.expectedRemoteRef,
+					expectedRemoteSourceVersion: admission.expectedRemoteSourceVersion,
+					artifactPath: normalizedTarget.artifactPath,
+					originalMtime: normalizedTarget.originalFile.mtime,
+					originalSize: normalizedTarget.originalFile.size,
+					artifactMtime: normalizedTarget.artifactFile.mtime!,
+					artifactSize: normalizedTarget.artifactFile.size!,
+				};
+
+				return executeBlobConflictResolution({
+					path: normalizedTarget.path,
+					choice,
+					identity,
+					keepLocal: (path, selectedIdentity, persistQueue) =>
+						blobSync.keepLocalDownloadConflict(path, selectedIdentity, persistQueue),
+					useRemote: (path, selectedIdentity, persistQueue) =>
+						blobSync.acceptRemoteDownloadConflict(path, selectedIdentity, persistQueue),
+					persistKeepLocalQueue: (snapshot) =>
+						this.persistBlobQueueSnapshot(snapshot, queueScope!),
+					persistUseRemoteQueue: async (snapshot) => {
+						if (snapshot.uploads.length === 0 && snapshot.downloads.length === 0) {
+							await this.clearSavedBlobQueue();
+						} else {
+							await this.persistBlobQueueSnapshot(snapshot, queueScope!);
+						}
+					},
+					persistPluginState: () => this.persistPluginState(),
+				});
+			},
+		);
 	}
 
 	private async resolveLegacyMissingBlobAttention(
@@ -5772,8 +5867,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		mutator: (settings: VaultSyncSettings) => void,
 		reason = "settings-update",
 	): Promise<void> {
-		mutator(this.settings);
-		await this.saveSettings(reason);
+		await this.settingsMutationQueue.run(async () => {
+			// Snapshot only after this transaction reaches the head of the queue.
+			// Earlier saves may have committed or rolled back while this edit waited.
+			const previousPersistedState = { ...this.persistedState };
+			await persistSettingsMutation(
+				this.settings,
+				mutator,
+				() => this.saveSettings(reason),
+				() => {
+					// persistPluginState refreshes this in memory before saveData. Do not
+					// let a failed setup credential write leak into a later unrelated save.
+					this.persistedState = previousPersistedState;
+				},
+			);
+		});
 	}
 
 	private applyRuntimeSettings(reason: string): void {
@@ -6159,8 +6267,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private persistPreservedUnresolvedState(): void {
-		void this.persistPluginState();
+		void this.persistPreservedUnresolvedStateDurably();
+	}
+
+	private async persistPreservedUnresolvedStateDurably(): Promise<void> {
 		this.refreshStatusBar();
+		await this.persistPluginState();
 	}
 
 	private async persistPluginState(

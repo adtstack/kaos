@@ -78,6 +78,7 @@ export const SOCKET_TICKET_RETRY_BASE_MS = TICKET_REFRESH_BUFFER_MS;
 // ticket lifetime after the endpoint recovers.
 export const SOCKET_TICKET_RETRY_MAX_MS = 5 * 60_000;
 const MAX_REASONABLE_TICKET_TTL_MS = 24 * 60 * 60 * 1_000; // 24 hours
+const MAX_REASONABLE_TICKET_LENGTH = 16 * 1024;
 
 /**
  * Return an equal-jitter exponential delay for a 1-based consecutive failure.
@@ -135,6 +136,32 @@ export interface SocketTicketCache {
 	markUnsupported(): void;
 	/** True once `markUnsupported()` has been called. */
 	isUnsupported(): boolean;
+}
+
+export function parseSocketTicketResponse(
+	body: unknown,
+	receivedAt = Date.now(),
+): CachedSocketTicket {
+	const candidate = body as { ticket?: unknown; expiresAt?: unknown; ttlMs?: unknown } | null;
+	if (
+		typeof candidate?.ticket !== "string"
+		|| candidate.ticket.length === 0
+		|| candidate.ticket.length > MAX_REASONABLE_TICKET_LENGTH
+		|| typeof candidate.expiresAt !== "number"
+		|| !Number.isFinite(candidate.expiresAt)
+		|| typeof candidate.ttlMs !== "number"
+		|| !Number.isFinite(candidate.ttlMs)
+		|| candidate.ttlMs <= 0
+		|| candidate.ttlMs > MAX_REASONABLE_TICKET_TTL_MS
+	) {
+		throw new Error("socket ticket response malformed");
+	}
+	return {
+		value: candidate.ticket,
+		expiresAt: candidate.expiresAt,
+		localExpiresAt: receivedAt + candidate.ttlMs,
+		ttlMs: candidate.ttlMs,
+	};
 }
 
 export function createSocketTicketCache(): SocketTicketCache {
@@ -207,23 +234,5 @@ async function fetchSocketTicket(
 		throw new SocketTicketHttpError(res.status);
 	}
 
-	const body = res.json as { ticket?: unknown; expiresAt?: unknown; ttlMs?: unknown };
-	if (
-		typeof body?.ticket !== "string" ||
-		typeof body?.expiresAt !== "number" ||
-		typeof body?.ttlMs !== "number" ||
-		!Number.isFinite(body.ttlMs) ||
-		body.ttlMs <= 0 ||
-		body.ttlMs > MAX_REASONABLE_TICKET_TTL_MS
-	) {
-		throw new Error("socket ticket response malformed");
-	}
-
-	const receivedAt = Date.now();
-	return {
-		value: body.ticket,
-		expiresAt: body.expiresAt,
-		localExpiresAt: receivedAt + body.ttlMs,
-		ttlMs: body.ttlMs,
-	};
+	return parseSocketTicketResponse(res.json);
 }

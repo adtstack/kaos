@@ -144,4 +144,43 @@ assert.equal(collision.kind, "collision");
 assert.deepEqual(collisionRegistry.get(collisionSource.path), collisionSource);
 assert.deepEqual(collisionRegistry.get(collisionTarget.path), collisionTarget);
 
+const episodeRegistry = new PreservedUnresolvedRegistry([{
+	path: "Attachments/episode.png",
+	kind: "blob",
+	reason: "remote-download-local-conflict",
+	episodeId: "remote-episode-1",
+	firstSeenAt,
+	lastSeenAt,
+	localHash: "a".repeat(64),
+	knownRemoteHash: "b".repeat(64),
+	artifactPath: "Attachments/episode (KAOS remote conflict old).png",
+	knownRemoteRefFingerprint: "old-ref",
+	knownRemoteSourceVersion: "1:2",
+}]);
+episodeRegistry.record({
+	path: "Attachments/episode.png",
+	kind: "blob",
+	reason: "remote-download-local-conflict",
+	episodeId: "remote-episode-2",
+	localHash: null,
+	knownRemoteHash: "c".repeat(64),
+	artifactPath: null,
+	knownRemoteRefFingerprint: null,
+	knownRemoteSourceVersion: null,
+	at: lastSeenAt + 40,
+});
+assert.deepEqual(
+	{
+		artifactPath: episodeRegistry.get("Attachments/episode.png")?.artifactPath,
+		knownRemoteRefFingerprint: episodeRegistry.get("Attachments/episode.png")?.knownRemoteRefFingerprint,
+		knownRemoteSourceVersion: episodeRegistry.get("Attachments/episode.png")?.knownRemoteSourceVersion,
+	},
+	{
+		artifactPath: null,
+		knownRemoteRefFingerprint: null,
+		knownRemoteSourceVersion: null,
+	},
+	"a new conflict episode never inherits candidate authority from the previous episode",
+);
+
 console.log("preserved-unresolved registry tests passed");

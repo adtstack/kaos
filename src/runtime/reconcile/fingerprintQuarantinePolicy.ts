@@ -109,7 +109,7 @@ export function evaluateFingerprintQuarantine(
 	const sameFingerprint = previous?.fingerprint === fingerprint;
 	const withinTtl =
 		sameFingerprint && now - (previous?.lastAt ?? 0) < FINGERPRINT_QUARANTINE_TTL_MS;
-	const count = withinTtl ? previous!.count + 1 : 1;
+	const count = withinTtl ? previous.count + 1 : 1;
 
 	const newEntry: FingerprintEntry = {
 		fingerprint,

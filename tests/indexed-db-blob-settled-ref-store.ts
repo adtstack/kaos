@@ -135,6 +135,13 @@ console.log("\n--- IndexedDB blob settled refs: normalized durable round trip --
 			sourceVersion: SOURCE_VERSION_A,
 			stagedAt: 1_000,
 		},
+		"assets/pending-manual-download.png": {
+			stageId: "manual-download-stage-1",
+			kind: "manual-download-conflict",
+			ref: REF_A,
+			sourceVersion: SOURCE_VERSION_A,
+			stagedAt: 1_500,
+		},
 		"assets/pending-upload.png": {
 			stageId: "upload-stage-1",
 			kind: "upload",
@@ -180,6 +187,7 @@ console.log("\n--- IndexedDB blob settled refs: normalized durable round trip --
 		jsonValue(loaded.stages),
 		{
 			"assets/pending-download.png": stages["./assets\\pending-download.png"],
+			"assets/pending-manual-download.png": stages["assets/pending-manual-download.png"],
 			"assets/pending-upload.png": stages["assets/pending-upload.png"],
 			"assets/pending-equality.png": stages["assets/pending-equality.png"],
 			"assets/pending-rename.png": stages["assets/pending-rename.png"],
@@ -252,7 +260,13 @@ console.log("\n--- IndexedDB blob settled refs: ref-less retirement is the only 
 		"a ref-less retirement remains ref-less after persistence",
 	);
 
-	const refRequiredKinds = ["upload", "download", "equality", "rename"] as const;
+	const refRequiredKinds = [
+		"upload",
+		"download",
+		"manual-download-conflict",
+		"equality",
+		"rename",
+	] as const;
 	for (const [index, kind] of refRequiredKinds.entries()) {
 		const path = `assets/ref-less-${kind}.png`;
 		await assert.rejects(

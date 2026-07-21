@@ -13,6 +13,7 @@
 import worker from "../server/src/index";
 import type { Env } from "../server/src/routes/types";
 import {
+	CLAIM_PROOF_HEADER,
 	getStoredServerConfigCached,
 	invalidateStoredServerConfigCache,
 } from "../server/src/routes/auth";
@@ -376,6 +377,174 @@ console.log("\n--- Test 6: /vault/sync/:vaultId is classified as sync-socket, no
 		resp.status === 426 || resp.status === 401 || resp.status === 503,
 		`/vault/sync/:vaultId reaches the sync handler (status ${resp.status}, not 404)`,
 	);
+}
+
+// ── Test 7: malformed /claim requests never touch KAOS_CONFIG ───────────────
+//
+// /claim has a public request shape, deployment proof, and bounded body. All of
+// those checks must run before the claimed-state lookup; otherwise scanners can
+// turn malformed requests into Config Durable Object traffic. The handler-only
+// tests cannot prove this ordering, so exercise the real worker dispatcher with
+// a namespace that throws on any access.
+console.log("\n--- Test 7: invalid /claim requests are rejected before KAOS_CONFIG ---");
+{
+	const claimSecret = "claim-proof-0123456789abcdef-0123456789abcdef";
+	const token = "sync-token-0123456789abcdef-0123456789abcdef";
+	const vaultId = "vault-test-1234";
+	const preflightTrapEnv: Env = {
+		...trapEnv,
+		KAOS_CLAIM_SECRET: claimSecret,
+	};
+	const claimRequest = (options: {
+		contentType?: string;
+		origin?: string;
+		proof?: string;
+		body?: unknown;
+	}) => {
+		const headers = new Headers({
+			"Content-Type": options.contentType ?? "application/json",
+		});
+		if (options.origin !== undefined) headers.set("Origin", options.origin);
+		if (options.proof !== undefined) headers.set(CLAIM_PROOF_HEADER, options.proof);
+		return new Request("https://example.com/claim", {
+			method: "POST",
+			headers,
+			body: JSON.stringify(options.body ?? { token, vaultId }),
+		});
+	};
+	const invalidRequests: Array<{ label: string; request: Request; status: number }> = [
+		{
+			label: "non-JSON media type",
+			request: claimRequest({ contentType: "text/plain", proof: claimSecret }),
+			status: 415,
+		},
+		{
+			label: "cross-origin browser request",
+			request: claimRequest({
+				origin: "https://attacker.example",
+				proof: claimSecret,
+			}),
+			status: 403,
+		},
+		{
+			label: "missing claim proof",
+			request: claimRequest({}),
+			status: 403,
+		},
+		{
+			label: "malformed token",
+			request: claimRequest({ proof: claimSecret, body: { token: "short", vaultId } }),
+			status: 400,
+		},
+		{
+			label: "malformed vault ID",
+			request: claimRequest({ proof: claimSecret, body: { token, vaultId: "short" } }),
+			status: 400,
+		},
+	];
+
+	for (const candidate of invalidRequests) {
+		invalidateStoredServerConfigCache();
+		let response: Response | null = null;
+		let error: unknown = null;
+		try {
+			response = await worker.fetch(candidate.request, preflightTrapEnv);
+		} catch (caught) {
+			error = caught;
+		}
+		assert(error === null, `${candidate.label}: KAOS_CONFIG was not touched`);
+		assert(
+			response?.status === candidate.status,
+			`${candidate.label}: returned ${candidate.status}`,
+		);
+	}
+
+	// SYNC_TOKEN is already claimed authority and remains a zero-DO lock even
+	// when no first-claim deployment secret is configured.
+	invalidateStoredServerConfigCache();
+	const envModeResponse = await worker.fetch(
+		claimRequest({ proof: claimSecret }),
+		{ ...trapEnv, SYNC_TOKEN: token },
+	);
+	assert(envModeResponse.status === 403, "SYNC_TOKEN mode rejects /claim without KAOS_CONFIG");
+
+	invalidateStoredServerConfigCache();
+}
+
+// ── Test 8: a valid claim reaches config and remains atomically locked ───────
+console.log("\n--- Test 8: valid /claim reaches KAOS_CONFIG and cannot bypass claimed state ---");
+{
+	const claimSecret = "claim-proof-0123456789abcdef-0123456789abcdef";
+	const token = "sync-token-0123456789abcdef-0123456789abcdef";
+	const vaultId = "vault-test-1234";
+	let storedConfig: Record<string, unknown> = {
+		claimed: false,
+		tokenHash: null,
+		updateProvider: null,
+		updateRepoUrl: null,
+		updateRepoBranch: null,
+	};
+	let configCalls = 0;
+	let claimCalls = 0;
+	const configNamespace = {
+		idFromName: () => "global-config" as unknown as DurableObjectId,
+		get: () => ({
+			fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+				configCalls++;
+				const request = new Request(input, init);
+				const path = new URL(request.url).pathname;
+				if (path === "/__kaos/config") {
+					return new Response(JSON.stringify(storedConfig), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (path === "/__kaos/claim") {
+					claimCalls++;
+					if (storedConfig.claimed === true) {
+						return new Response(JSON.stringify({ error: "already_claimed" }), {
+							status: 403,
+							headers: { "Content-Type": "application/json" },
+						});
+					}
+					const body = await request.json() as { tokenHash: string };
+					storedConfig = { ...storedConfig, claimed: true, tokenHash: body.tokenHash };
+					return new Response(JSON.stringify({ ok: true }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				return new Response("not found", { status: 404 });
+			},
+		}) as unknown as DurableObjectStub,
+	} as unknown as Env["KAOS_CONFIG"];
+	const claimEnv: Env = {
+		KAOS_CLAIM_SECRET: claimSecret,
+		KAOS_CONFIG: configNamespace,
+		KAOS_SYNC: makeTrapNamespace() as unknown as Env["KAOS_SYNC"],
+	};
+	const makeValidClaim = () => new Request("https://example.com/claim", {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			Origin: "https://example.com",
+			[CLAIM_PROOF_HEADER]: claimSecret,
+		},
+		body: JSON.stringify({ token, vaultId }),
+	});
+
+	invalidateStoredServerConfigCache();
+	const first = await worker.fetch(makeValidClaim(), claimEnv);
+	assert(first.status === 200, "valid claim succeeds through the worker dispatcher");
+	assert(configCalls > 0, "valid claim reaches KAOS_CONFIG after preflight");
+	assert(claimCalls === 1, "valid claim performs exactly one atomic claim mutation");
+
+	invalidateStoredServerConfigCache();
+	const second = await worker.fetch(makeValidClaim(), claimEnv);
+	assert(second.status === 403, "a second valid claim is rejected as already claimed");
+	assert(claimCalls === 1, "already-claimed state cannot reach a second claim mutation");
+
+	invalidateStoredServerConfigCache();
 }
 
 console.log(`\n${"─".repeat(55)}`);

@@ -3,6 +3,12 @@ import type { StoredServerConfig } from "../config";
 
 export interface Env {
 	SYNC_TOKEN?: string;
+	/**
+	 * Deploy-time proof required to claim an otherwise unclaimed server.
+	 * This is separate from the generated sync token and is never persisted in
+	 * the Config Durable Object or returned to a client.
+	 */
+	KAOS_CLAIM_SECRET?: string;
 	KAOS_CANONICAL_REPO?: string;
 	KAOS_SYNC: DurableObjectNamespace<VaultSyncServer>;
 	KAOS_CONFIG: DurableObjectNamespace;

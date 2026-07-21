@@ -93,7 +93,7 @@ export function isObjectRecord(value: unknown): value is Record<string, unknown>
  * a normalized DecodedFileMeta. Returns null for invalid/unrecognizable values.
  */
 export function decodeFileMeta(value: unknown): DecodedFileMeta | null {
-	if (value instanceof Y.Map) {
+	if (isNestedFileMeta(value)) {
 		const path = value.get("path");
 		if (typeof path !== "string" || path.length === 0) return null;
 
@@ -127,13 +127,13 @@ export function decodeFileMeta(value: unknown): DecodedFileMeta | null {
 	}
 
 	if (isObjectRecord(value)) {
-		const path = (value as Record<string, unknown>).path;
+		const path = (value).path;
 		if (typeof path !== "string" || path.length === 0) return null;
 
-		const deletedAtRaw = (value as Record<string, unknown>).deletedAt;
-		const deletedRaw = (value as Record<string, unknown>).deleted;
-		const mtimeRaw = (value as Record<string, unknown>).mtime;
-		const deviceRaw = (value as Record<string, unknown>).device;
+		const deletedAtRaw = (value).deletedAt;
+		const deletedRaw = (value).deleted;
+		const mtimeRaw = (value).mtime;
+		const deviceRaw = (value).device;
 
 		const deletedAt =
 			typeof deletedAtRaw === "number" && Number.isFinite(deletedAtRaw)
@@ -168,25 +168,25 @@ export function decodeFileMeta(value: unknown): DecodedFileMeta | null {
 
 /** Get the path from a metadata value (flat or nested). Returns null if invalid. */
 export function getMetaPath(value: unknown): string | null {
-	if (value instanceof Y.Map) {
+	if (isNestedFileMeta(value)) {
 		const path = value.get("path");
 		return typeof path === "string" && path.length > 0 ? path : null;
 	}
 	if (isObjectRecord(value)) {
-		const path = (value as Record<string, unknown>).path;
-		return typeof path === "string" && path.length > 0 ? (path as string) : null;
+		const path = (value).path;
+		return typeof path === "string" && path.length > 0 ? (path) : null;
 	}
 	return null;
 }
 
 /** Get the mtime from a metadata value (flat or nested). Returns null if absent/invalid. */
 export function getMetaMtime(value: unknown): number | null {
-	if (value instanceof Y.Map) {
+	if (isNestedFileMeta(value)) {
 		const mtime = value.get("mtime");
 		return typeof mtime === "number" && Number.isFinite(mtime) ? mtime : null;
 	}
 	if (isObjectRecord(value)) {
-		const mtime = (value as Record<string, unknown>).mtime;
+		const mtime = (value).mtime;
 		return typeof mtime === "number" && Number.isFinite(mtime) ? mtime : null;
 	}
 	return null;
@@ -194,25 +194,25 @@ export function getMetaMtime(value: unknown): number | null {
 
 /** Get the device from a metadata value (flat or nested). Returns null if absent. */
 export function getMetaDevice(value: unknown): string | null {
-	if (value instanceof Y.Map) {
+	if (isNestedFileMeta(value)) {
 		const device = value.get("device");
 		return typeof device === "string" ? device : null;
 	}
 	if (isObjectRecord(value)) {
-		const device = (value as Record<string, unknown>).device;
-		return typeof device === "string" ? (device as string) : null;
+		const device = (value).device;
+		return typeof device === "string" ? (device) : null;
 	}
 	return null;
 }
 
 /** Get the deletedAt timestamp from a metadata value. Returns null if not tombstoned. */
 export function getMetaDeletedAt(value: unknown): number | null {
-	if (value instanceof Y.Map) {
+	if (isNestedFileMeta(value)) {
 		const deletedAt = value.get("deletedAt");
 		return typeof deletedAt === "number" && Number.isFinite(deletedAt) ? deletedAt : null;
 	}
 	if (isObjectRecord(value)) {
-		const deletedAt = (value as Record<string, unknown>).deletedAt;
+		const deletedAt = (value).deletedAt;
 		return typeof deletedAt === "number" && Number.isFinite(deletedAt) ? deletedAt : null;
 	}
 	return null;
@@ -220,14 +220,14 @@ export function getMetaDeletedAt(value: unknown): number | null {
 
 /** Check if a metadata value represents a deleted/tombstoned entry. Works with both shapes. */
 export function isFileMetaDeletedValue(value: unknown): boolean {
-	if (value instanceof Y.Map) {
+	if (isNestedFileMeta(value)) {
 		const deletedAt = value.get("deletedAt");
 		if (typeof deletedAt === "number" && Number.isFinite(deletedAt)) return true;
 		const deleted = value.get("deleted");
 		return deleted === true;
 	}
 	if (isObjectRecord(value)) {
-		const rec = value as Record<string, unknown>;
+		const rec = value;
 		if (typeof rec.deletedAt === "number" && Number.isFinite(rec.deletedAt)) return true;
 		return rec.deleted === true;
 	}
@@ -317,7 +317,7 @@ export function ensureNestedMetaEntry(
 	const existing = metaMap.get(fileId);
 
 	// Already nested — return directly
-	if (existing instanceof Y.Map) {
+	if (isNestedFileMeta(existing)) {
 		return existing;
 	}
 

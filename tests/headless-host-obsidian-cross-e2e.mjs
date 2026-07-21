@@ -92,7 +92,7 @@ async function main() {
 		const capabilities = await fetchCapabilities(host);
 		assert.equal(capabilities.attachments, true, "R2-enabled wrangler config should advertise attachments");
 		if (!useExternalWorker) {
-			token = await resolveAuthToken(host, token);
+			token = await resolveAuthToken(host, token, process.env.KAOS_CLAIM_SECRET, vaultId);
 		}
 
 		console.log("\n--- headless x Obsidian e2e: connect to running Obsidian QA vault ---");
@@ -304,22 +304,27 @@ async function configureObsidianKaos(client, { host, token, vaultId, deviceName 
 	`);
 }
 
-async function resolveAuthToken(host, defaultEnvToken) {
+async function resolveAuthToken(host, defaultEnvToken, claimSecret, vaultId) {
 	const capabilities = await fetchCapabilities(host);
 	if (capabilities?.claimed === true && capabilities?.authMode === "env") {
 		return defaultEnvToken;
 	}
-	return await claimServer(host);
+	if (typeof claimSecret !== "string" || claimSecret.length < 32) {
+		throw new Error("KAOS_CLAIM_SECRET is required to claim an unclaimed test Worker");
+	}
+	return await claimServer(host, claimSecret, vaultId);
 }
 
-async function claimServer(host) {
+async function claimServer(host, claimSecret, vaultId) {
 	const token = randomBytes(32).toString("hex");
 	const res = await fetch(`${host}/claim`, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
+			"Origin": host,
+			"X-KAOS-Claim-Proof": claimSecret,
 		},
-		body: JSON.stringify({ token }),
+		body: JSON.stringify({ token, vaultId }),
 	});
 	if (!res.ok) {
 		throw new Error(`claim failed (${res.status}): ${await res.text()}`);

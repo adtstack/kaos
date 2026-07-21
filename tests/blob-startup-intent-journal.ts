@@ -809,6 +809,10 @@ console.log("\n--- main.ts startup, CAS, and receipt wiring ---");
 				< ensureSettled.indexOf("Object.assign(this.blobSettledRefs, nextSettledRefs)"),
 		"legacy Base and excluded safety-subtree settlement state is scrubbed and durably rewritten before attachment authority opens",
 	);
+	assert(
+		ensureSettled.includes('stage.kind !== "manual-download-conflict"'),
+		"a durable explicit Use-remote stage is not reclassified as generic legacy-missing Attention on restart",
+	);
 	const legacyAttentionStart = main.indexOf("private hydrateLegacyMissingBlobAttention(");
 	const legacyAttentionEnd = main.indexOf("private persistBlobSettledRefs(", legacyAttentionStart);
 	const legacyAttention = main.slice(legacyAttentionStart, legacyAttentionEnd);

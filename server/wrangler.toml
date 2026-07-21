@@ -22,6 +22,20 @@ new_sqlite_classes = ["VaultSyncServer", "ServerConfig"]
 enabled = true
 
 # ---------------------------------------------------------------------------
+# Required first-claim secret
+# ---------------------------------------------------------------------------
+#
+# The Deploy to Cloudflare flow prompts for KAOS_CLAIM_SECRET from
+# .env.example.  For manual deployments, configure it as an encrypted Worker
+# secret before opening the public Worker URL:
+#
+#   npx wrangler secret put KAOS_CLAIM_SECRET
+#
+# Use a unique random value of at least 32 characters.  Do not put its value in
+# this TOML file and do not reuse the generated sync token.  Already-claimed
+# servers and explicit SYNC_TOKEN deployments continue to work without it.
+
+# ---------------------------------------------------------------------------
 # Optional hardening variables
 # ---------------------------------------------------------------------------
 #

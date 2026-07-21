@@ -75,7 +75,7 @@ export function decideClosedFileConflict(
 			diskMtime !== undefined &&
 			lastDiskIndexPersistedAt !== undefined;
 		const diskNewerThanLastSave =
-			hasMtimeEvidence && diskMtime! > lastDiskIndexPersistedAt!;
+			hasMtimeEvidence && diskMtime > lastDiskIndexPersistedAt;
 
 		if (diskNewerThanLastSave) {
 			return {

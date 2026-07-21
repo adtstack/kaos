@@ -14,11 +14,15 @@ is configured.
 - Attachments are uploaded through the Worker and stored in R2.
 - Snapshots are gzipped CRDT archives stored in R2.
 - Auth uses the claimed setup token by default, with `SYNC_TOKEN` as an optional hard override.
+- The one-time claim is protected by a separate deploy-time `KAOS_CLAIM_SECRET`.
 
 ## Standard deploy
 
 Use the **Deploy to Cloudflare** button above for the default setup. It targets the `server/` subdirectory so Cloudflare treats this folder as the project root.
-This repo intentionally keeps `.env.example` free of assignments so the deploy flow does not prompt for `SYNC_TOKEN` by default.
+The deploy flow reads `.env.example` and prompts for `KAOS_CLAIM_SECRET`. Choose
+a unique random value of 32–512 visible ASCII characters without spaces and
+keep it until the first claim succeeds. This secret only proves ownership of the fresh deployment; it
+is not the sync token and is never included in a setup link.
 
 The local `wrangler.toml` in this directory defines:
 
@@ -29,10 +33,15 @@ The local `wrangler.toml` in this directory defines:
 The default deploy is text-only:
 
 - no `SYNC_TOKEN` secret is required up front
+- `KAOS_CLAIM_SECRET` is required to authorize the one-time claim
 - no R2 binding is required up front
 - the first browser visit shows the claim page
 
-That claim page generates a token in the browser and returns an `obsidian://kaos?...` setup link you can use to configure the plugin.
+On first visit, enter the same `KAOS_CLAIM_SECRET` you chose during deployment.
+The claim page then generates a different sync token in the browser and returns
+an `obsidian://kaos?...` setup link. The claim secret is sent only in the
+same-origin claim request header and is never returned, logged, or embedded in
+the link.
 
 ## Guided server update for an existing deploy
 
@@ -95,20 +104,28 @@ After deploy, refresh your Worker URL. KAOS should report attachments/snapshots 
 ```bash
 cd server
 npm install
-npm run dev -- --var SYNC_TOKEN:dev-sync-token
+npm run dev -- --var KAOS_CLAIM_SECRET:local-claim-secret-at-least-32-chars
 ```
 
 The local Worker will be served by Wrangler. Use its printed local URL as the plugin's **Server host**.
 
-Passing `SYNC_TOKEN` locally is optional. If you omit it, the server starts unclaimed and you can claim it in a browser.
+Passing `SYNC_TOKEN` locally is optional. If you set it, the server starts in
+the explicit environment-token mode and does not use the claim flow. If you
+omit it, provide `KAOS_CLAIM_SECRET` as shown above, then enter that value in
+the browser to claim the server.
 
 ## Manual deploy
 
 ```bash
 cd server
 npm install
+npx wrangler secret put KAOS_CLAIM_SECRET
 npm run deploy
 ```
+
+Use a unique value of at least 32 characters. Do not store its value in
+`wrangler.toml` or reuse the sync token. An unclaimed server without a valid
+`KAOS_CLAIM_SECRET` fails closed and will not accept `/claim` requests.
 
 `npm run deploy` runs `scripts/auto-bind-r2.mjs` first. If no existing
 `KAOS_BUCKET` binding or explicit `KAOS_R2_BUCKET_NAME` is found, it leaves the
@@ -133,7 +150,11 @@ The commit SHA lets us verify the exact server snapshot Cloudflare built, which 
 
 ### WebSocket sync
 
-- `wss://<host>/vault/sync/<vaultId>?token=<setup-token>`
+- Obtain a short-lived ticket with `POST /vault/<vaultId>/auth/ticket`.
+- Connect to `wss://<host>/vault/sync/<vaultId>?ticket=<short-lived-ticket>`.
+- Legacy `?token=<setup-token>` remains available only for older plugin clients
+  during the migration window and can be disabled with
+  `KAOS_DISABLE_LEGACY_WS_TOKEN`.
 
 ### Blob APIs
 

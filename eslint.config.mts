@@ -69,6 +69,60 @@ export default tseslint.config(
 				tsconfigRootDir: import.meta.dirname,
 			},
 		},
+		rules: {
+			// Test programs intentionally report progress on stdout.
+			"no-console": "off",
+		},
+	},
+	{
+		files: ["server/src/concurrency.ts"],
+		rules: {
+			// This build-boundary copy must stay byte-identical to the canonical
+			// implementation, whose noUncheckedIndexedAccess setting requires it.
+			"@typescript-eslint/no-unnecessary-type-assertion": "off",
+		},
+	},
+	{
+		files: ["src/headless-host/**/*.ts"],
+		languageOptions: {
+			globals: {
+				...globals.node,
+				...globals.browser,
+			},
+		},
+		rules: {
+			// The headless host is a Node.js compatibility runtime, not an
+			// Obsidian-renderer entry point. These plugin-only restrictions are
+			// false positives at this boundary.
+			"import/no-nodejs-modules": "off",
+			"no-console": "off",
+			"no-restricted-globals": "off",
+			"obsidianmd/hardcoded-config-path": "off",
+		},
+	},
+	{
+		files: [
+			"src/headless-host/polyfills.ts",
+			"src/headless-host/obsidianShim.ts",
+			"src/headless-host/core/dom.ts",
+			"src/headless-host/core/events.ts",
+			"src/headless-host/core/plugin.ts",
+			"src/headless-host/core/workspace.ts",
+			"src/headless-host/kaos/bootKaosPlugin.ts",
+			"src/headless-host/kaos/config.ts",
+		],
+		rules: {
+			// These files deliberately reflect over the dynamically loaded Obsidian
+			// bundle and install DOM/runtime shims. Runtime guards are the type
+			// boundary; forcing static member types here would misrepresent it.
+			"@typescript-eslint/no-explicit-any": "off",
+			"@typescript-eslint/no-unsafe-argument": "off",
+			"@typescript-eslint/no-unsafe-assignment": "off",
+			"@typescript-eslint/no-unsafe-call": "off",
+			"@typescript-eslint/no-unsafe-member-access": "off",
+			"@typescript-eslint/no-unsafe-return": "off",
+			"@typescript-eslint/no-base-to-string": "off",
+		},
 	},
 	globalIgnores([
 		"node_modules",

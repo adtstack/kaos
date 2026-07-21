@@ -36,7 +36,10 @@ interface StoredFile {
 function makeFixture(
 	path = "assets/attention.png",
 	content = bytes("local attachment"),
-	options: { initialBlobRef?: { hash: string; size: number } } = {},
+	options: {
+		initialBlobRef?: { hash: string; size: number };
+		attachmentConcurrency?: number;
+	} = {},
 ) {
 	const files = new Map<string, StoredFile>();
 	let clock = 1;
@@ -143,7 +146,7 @@ function makeFixture(
 			token: "token",
 			vaultId: "vault",
 			maxAttachmentSizeKB: 1024,
-			attachmentConcurrency: 1,
+			attachmentConcurrency: options.attachmentConcurrency ?? 1,
 			debug: false,
 		},
 		{},
@@ -183,6 +186,21 @@ function makeFixture(
 }
 
 console.log("\n--- Blob Attention resolution safety ---");
+
+// The engine has its own final guard even when an older host bypasses
+// SettingsStore and constructs it with a corrupt zero concurrency value.
+{
+	const fixture = makeFixture(
+		"assets/concurrency.png",
+		bytes("local attachment"),
+		{ attachmentConcurrency: 0 },
+	);
+	assert.equal(
+		(fixture.manager as any).maxConcurrency,
+		1,
+		"zero transfer concurrency is clamped before either drain can run",
+	);
+}
 
 // Dashboard actions are bound to both the Attention episode and exact remote
 // tombstone snapshot, so an old modal cannot queue work for a newer incident.
@@ -354,7 +372,53 @@ console.log("\n--- Blob Attention resolution safety ---");
 	);
 }
 
-// A permanently failed explicit Keep-local upload remains actionable.
+// A transient failure cycle retains the explicit Keep-local upload as durable,
+// automatically retryable intent instead of silently deleting the queue item.
+{
+	const fixture = makeFixture();
+	fixture.manager.keepLocalRemoteDeletedBlob(
+		fixture.path,
+		"remote-delete-missing-baseline",
+		{
+			episodeId: "blob-attention-episode",
+			remoteDeleteFingerprint: "blob-delete-fingerprint",
+		},
+	);
+	const item = (fixture.manager as any).uploadQueue.get(fixture.path);
+	item.retries = 3;
+	let retryDelay = 0;
+	(fixture.manager as any).scheduleRetryKick = (delay: number) => { retryDelay = delay; };
+	(fixture.manager as any).blobClient = {
+		exists: async () => {
+			throw Object.assign(new Error("transient R2 failure"), { status: 503 });
+		},
+	};
+	const originalError = console.error;
+	console.error = () => {};
+	try {
+		await (fixture.manager as any).processUpload(item);
+	} finally {
+		console.error = originalError;
+	}
+	assert.equal(fixture.setBlobRefCalls, 0, "failed upload does not publish blob ref");
+	assert.equal(fixture.tombstoned, true, "failed upload retains tombstone");
+	assert.equal(
+		(fixture.manager as any).uploadQueue.get(fixture.path),
+		item,
+		"transient retry exhaustion retains the exact durable queue item",
+	);
+	assert.equal(item.retries, 0, "the next bounded retry cycle starts fresh");
+	assert.ok(item.readyAt > Date.now(), "the next retry cycle is backoff-delayed");
+	assert.ok(retryDelay > 0, "automatic recovery schedules a future drain");
+	assert.equal(
+		fixture.manager.isPreservedUnresolved(fixture.path),
+		true,
+		"permanent upload failure retains Attention marker",
+	);
+	assert.equal(fixture.markerChangedCalls, 0, "failure does not persist a false resolution");
+}
+
+// Explicit non-transient HTTP 4xx responses remain terminal and do not loop.
 {
 	const fixture = makeFixture();
 	fixture.manager.keepLocalRemoteDeletedBlob(
@@ -368,7 +432,7 @@ console.log("\n--- Blob Attention resolution safety ---");
 	const item = (fixture.manager as any).uploadQueue.get(fixture.path);
 	item.retries = 3;
 	(fixture.manager as any).blobClient = {
-		exists: async () => { throw new Error("permanent R2 failure"); },
+		exists: async () => { throw Object.assign(new Error("unauthorized"), { status: 401 }); },
 	};
 	const originalError = console.error;
 	console.error = () => {};
@@ -377,14 +441,16 @@ console.log("\n--- Blob Attention resolution safety ---");
 	} finally {
 		console.error = originalError;
 	}
-	assert.equal(fixture.setBlobRefCalls, 0, "failed upload does not publish blob ref");
-	assert.equal(fixture.tombstoned, true, "failed upload retains tombstone");
+	assert.equal(
+		(fixture.manager as any).uploadQueue.has(fixture.path),
+		false,
+		"terminal HTTP failure retires the transfer queue item",
+	);
 	assert.equal(
 		fixture.manager.isPreservedUnresolved(fixture.path),
 		true,
-		"permanent upload failure retains Attention marker",
+		"terminal Keep-local failure leaves Attention available for an explicit retry",
 	);
-	assert.equal(fixture.markerChangedCalls, 0, "failure does not persist a false resolution");
 }
 
 // A persisted download is only a hint; restart must not restore bytes for a
@@ -898,6 +964,35 @@ console.log("\n--- Blob Attention resolution safety ---");
 		"write settling during destroy",
 		"the last old-manager artifact write completes before teardown returns",
 	);
+}
+
+// A mobile/storage read rejection is not a file-change epoch. It must consume
+// the bounded retry budget and then sleep instead of resetting into a tight
+// immediate rerun loop.
+{
+	const fixture = makeFixture();
+	fixture.manager.keepLocalRemoteDeletedBlob(
+		fixture.path,
+		"remote-delete-missing-baseline",
+		{
+			episodeId: "blob-attention-episode",
+			remoteDeleteFingerprint: "blob-delete-fingerprint",
+		},
+	);
+	const manager = fixture.manager as any;
+	const item = manager.uploadQueue.get(fixture.path);
+	item.retries = 3;
+	item.status = "processing";
+	let retryDelay = 0;
+	manager.scheduleRetryKick = (delay: number) => { retryDelay = delay; };
+	manager.app.vault.readBinary = async () => {
+		throw new Error("mobile storage temporarily unavailable");
+	};
+	await manager.processUpload(item);
+	assert.equal(manager.uploadQueue.get(fixture.path), item, "transient read failure retains the exact upload intent");
+	assert.equal(item.retries, 0, "transient read starts a fresh bounded retry cycle");
+	assert.ok(item.readyAt > Date.now(), "transient read retry is delayed instead of immediately drained");
+	assert.ok(retryDelay > 0, "transient read schedules an automatic recovery timer");
 }
 
 console.log("PASS blob Attention resolution safety");

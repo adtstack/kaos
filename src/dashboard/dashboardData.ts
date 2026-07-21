@@ -1,4 +1,4 @@
-import { TFile } from "obsidian";
+import { normalizePath, TFile } from "obsidian";
 import {
 	getPreservedUnresolvedEpisodeId,
 	isRemoteDeletePreservedUnresolvedEntry,
@@ -10,6 +10,7 @@ import {
 } from "../paths/conflictArtifactPath";
 import type {
 	DashboardAttentionItem,
+	DashboardBlobConflictResolution,
 	DashboardConflictArtifact,
 	DashboardLocalFileIdentity,
 	DashboardMetric,
@@ -17,7 +18,7 @@ import type {
 	KaosDashboardCollectorInput,
 	KaosDashboardData,
 } from "./dashboardTypes";
-import { cloneBlobRef } from "../types";
+import { blobRefFingerprint, cloneBlobRef } from "../types";
 
 const ATTENTION_SAMPLE_LIMIT = 20;
 type DashboardServerReceipt = DashboardVaultSyncDebug["serverReceipt"];
@@ -32,6 +33,7 @@ export function buildKaosDashboardData(input: KaosDashboardCollectorInput): Kaos
 		recoveryStorageStatus: input.recoveryStorageStatus,
 		recentChanges: input.recentChanges,
 		conflicts: collectDashboardConflictArtifacts(input),
+		blobSafetyCopies: collectDashboardBlobSafetyCopies(input),
 		attention: collectDashboardAttention(input),
 		attentionTotalCount: getDashboardAttentionTotalCount(input),
 		actions: {
@@ -44,15 +46,41 @@ export function buildKaosDashboardData(input: KaosDashboardCollectorInput): Kaos
 }
 
 export function collectDashboardConflictArtifacts(
-	input: Pick<KaosDashboardCollectorInput, "app" | "diskIndex">,
+	input: Pick<
+		KaosDashboardCollectorInput,
+		"app" | "diskIndex" | "preservedUnresolvedEntries" | "blobConflictResolutionState"
+	>,
 ): DashboardConflictArtifact[] {
 	const files = input.app.vault.getFiles();
 	const artifacts: DashboardConflictArtifact[] = [];
 	for (const file of files) {
 		const parsed = parseConflictArtifactPath(file.path);
-		if (!parsed) continue;
+		if (!parsed || parsed.source === "local") continue;
 		artifacts.push(buildConflictArtifact(input, file, parsed));
 	}
+	return sortDashboardArtifacts(artifacts);
+}
+
+/**
+ * Collect visible rollback copies separately from true divergent conflicts.
+ * A local backup is produced even for a clean, causally-proven remote advance
+ * because Obsidian does not expose an atomic binary replace primitive.
+ */
+export function collectDashboardBlobSafetyCopies(
+	input: Pick<KaosDashboardCollectorInput, "app" | "diskIndex">,
+): DashboardConflictArtifact[] {
+	const copies: DashboardConflictArtifact[] = [];
+	for (const file of input.app.vault.getFiles()) {
+		const parsed = parseConflictArtifactPath(file.path);
+		if (parsed?.kind !== "blob" || parsed.source !== "local") continue;
+		copies.push(buildConflictArtifact(input, file, parsed));
+	}
+	return sortDashboardArtifacts(copies);
+}
+
+function sortDashboardArtifacts<T extends DashboardConflictArtifact>(
+	artifacts: T[],
+): T[] {
 	return artifacts.sort((left, right) => {
 		const leftTime = Date.parse(left.timestamp);
 		const rightTime = Date.parse(right.timestamp);
@@ -115,11 +143,18 @@ export function collectDashboardAttention(
 				: localFile.kind === "file"
 					? "A local file now exists. Run reconcile to settle it first."
 					: null;
+		const downloadConflictArtifactAvailable = entry.reason === "remote-download-local-conflict"
+			&& typeof entry.artifactPath === "string"
+			&& input.app.vault.getAbstractFileByPath(normalizePath(entry.artifactPath)) instanceof TFile;
 		items.push({
 			kind: "preserved-unresolved",
 			title: `${entry.kind} needs attention`,
 			path: entry.path,
-			detail: entry.reason,
+			detail: entry.reason === "remote-download-local-conflict"
+				? downloadConflictArtifactAvailable
+					? "Choose Keep local or Use remote copy in the Conflicts section."
+					: "The preserved remote copy is missing or was moved. Restore the exact copy from trash, or review the local attachment manually."
+				: entry.reason,
 			structuralChange: null,
 			firstSeenAt: new Date(entry.firstSeenAt).toISOString(),
 			lastSeenAt: new Date(entry.lastSeenAt).toISOString(),
@@ -281,7 +316,11 @@ function getCommonResolutionUnavailableReason(
 }
 
 function buildConflictArtifact(
-	input: Pick<KaosDashboardCollectorInput, "app" | "diskIndex">,
+	input: Pick<KaosDashboardCollectorInput, "app" | "diskIndex">
+		& Partial<Pick<
+			KaosDashboardCollectorInput,
+			"preservedUnresolvedEntries" | "blobConflictResolutionState"
+		>>,
 	file: TFile,
 	parsed: ParsedConflictArtifactPath,
 ): DashboardConflictArtifact {
@@ -301,6 +340,115 @@ function buildConflictArtifact(
 		artifactSize: typeof stat?.size === "number" ? stat.size : null,
 		artifactIndexed: Object.prototype.hasOwnProperty.call(input.diskIndex, parsed.artifactPath),
 		originalIndexed: Object.prototype.hasOwnProperty.call(input.diskIndex, parsed.inferredOriginalPath),
+		blobResolution: buildBlobConflictResolution(input, file, original, parsed),
+	};
+}
+
+function buildBlobConflictResolution(
+	input: Pick<KaosDashboardCollectorInput, "app">
+		& Partial<Pick<
+			KaosDashboardCollectorInput,
+			"preservedUnresolvedEntries" | "blobConflictResolutionState"
+		>>,
+	artifact: TFile,
+	original: ReturnType<KaosDashboardCollectorInput["app"]["vault"]["getAbstractFileByPath"]>,
+	parsed: ParsedConflictArtifactPath,
+): DashboardBlobConflictResolution | null {
+	if (parsed.kind !== "blob" || parsed.source !== "remote") return null;
+	const marker = input.preservedUnresolvedEntries?.find((entry) =>
+		entry.kind === "blob"
+		&& entry.reason === "remote-download-local-conflict"
+		&& normalizePath(entry.path) === normalizePath(parsed.inferredOriginalPath)
+	);
+	if (!marker || typeof marker.knownRemoteHash !== "string") return null;
+
+	const episodeId = getPreservedUnresolvedEpisodeId(marker);
+	const state = input.blobConflictResolutionState;
+	const remoteRef = cloneBlobRef(state?.getBlobRef(parsed.inferredOriginalPath) ?? undefined)
+		?? null;
+	const remoteSourceVersion = state?.getBlobSourceVersion(
+		parsed.inferredOriginalPath,
+	) ?? null;
+	const originalFile = original instanceof TFile
+		? { kind: "file" as const, mtime: original.stat.mtime, size: original.stat.size }
+		: original === null
+			? { kind: "missing" as const, mtime: null, size: null }
+			: { kind: "other" as const, mtime: null, size: null };
+	const artifactFile = {
+		kind: "file" as const,
+		mtime: artifact.stat.mtime,
+		size: artifact.stat.size,
+	};
+	const keepLocalPending = state?.isKeepLocalPending(
+		parsed.inferredOriginalPath,
+		episodeId,
+	) === true;
+	const useRemoteResumePending = state?.isUseRemoteResumePending(
+		parsed.inferredOriginalPath,
+		episodeId,
+	) === true;
+	let commonUnavailableReason: string | null = null;
+	if (parsed.originalPathConfidence === "possibly-truncated") {
+		commonUnavailableReason = "The original filename was truncated; locate both files manually.";
+	} else if (typeof marker.artifactPath !== "string" || marker.artifactPath.length === 0) {
+		commonUnavailableReason = "This conflict episode has no exact remote-copy binding; review it manually.";
+	} else if (
+		normalizePath(marker.artifactPath) !== normalizePath(parsed.artifactPath)
+	) {
+		commonUnavailableReason = "This is an older conflict copy; use the active candidate instead.";
+	} else if (state?.available !== true) {
+		commonUnavailableReason = "Attachment sync authority is not ready.";
+	} else if (!state.isPathSyncable(parsed.inferredOriginalPath)) {
+		commonUnavailableReason = "This path is no longer eligible for attachment sync.";
+	} else if (!remoteRef || remoteRef.hash !== marker.knownRemoteHash) {
+		commonUnavailableReason = "The remote attachment changed; refresh after the new conflict is preserved.";
+	} else if (remoteSourceVersion === null) {
+		commonUnavailableReason = "The exact remote attachment episode is unavailable.";
+	} else if (
+		marker.knownRemoteRefFingerprint
+		&& blobRefFingerprint(remoteRef) !== marker.knownRemoteRefFingerprint
+	) {
+		commonUnavailableReason = "The remote attachment identity changed.";
+	} else if (
+		marker.knownRemoteSourceVersion
+		&& remoteSourceVersion !== marker.knownRemoteSourceVersion
+	) {
+		commonUnavailableReason = "The remote attachment episode changed.";
+	}
+	let keepLocalUnavailableReason = commonUnavailableReason;
+	let useRemoteCopyUnavailableReason = commonUnavailableReason;
+	if (commonUnavailableReason === null && keepLocalPending) {
+		keepLocalUnavailableReason = "The selected local attachment is still being published.";
+		useRemoteCopyUnavailableReason = "Wait for the selected local attachment to finish publishing.";
+	} else if (commonUnavailableReason === null) {
+		if (useRemoteResumePending) {
+			keepLocalUnavailableReason = "The remote-copy choice is awaiting completion.";
+		}
+		if (originalFile.kind !== "file") {
+			keepLocalUnavailableReason = "The current local attachment is missing or changed type.";
+			if (!(originalFile.kind === "missing" && useRemoteResumePending)) {
+				useRemoteCopyUnavailableReason = "The current local attachment is missing or changed type.";
+			}
+		}
+	}
+
+	return {
+		kind: "remote-download-conflict",
+		episodeId,
+		// The marker hash describes the local bytes seen when quarantine began.
+		// The local file may legitimately change while the conflict remains open;
+		// the action re-hashes the exact Dashboard file identity under its path lock.
+		expectedLocalHash: null,
+		expectedRemoteHash: marker.knownRemoteHash,
+		expectedRemoteRef: remoteRef,
+		expectedRemoteSourceVersion: remoteSourceVersion,
+		originalFile,
+		artifactFile,
+		keepLocalPending,
+		canKeepLocal: keepLocalUnavailableReason === null,
+		canUseRemoteCopy: useRemoteCopyUnavailableReason === null,
+		keepLocalUnavailableReason,
+		useRemoteCopyUnavailableReason,
 	};
 }
 
