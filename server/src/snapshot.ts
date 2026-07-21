@@ -1,7 +1,7 @@
 import * as Y from "yjs";
 import { gzipSync } from "fflate";
 import { mapWithConcurrency } from "./concurrency";
-import { sha256Hex, bytesToHex } from "./hex";
+import { sha256Hex } from "./hex";
 
 // -------------------------------------------------------------------
 // Types

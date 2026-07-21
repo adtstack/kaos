@@ -7,7 +7,6 @@ const MESSAGE_SYNC = 0;
 // messageYjsSyncStep1 = 0, messageYjsSyncStep2 = 1, messageYjsUpdate = 2.
 // Covered by tests/server-sync-message-classifier.ts, which builds real
 // y-protocol frames so these local constants do not silently drift.
-const MESSAGE_YJS_SYNC_STEP_1 = 0;
 const MESSAGE_YJS_SYNC_STEP_2 = 1;
 const MESSAGE_YJS_UPDATE = 2;
 

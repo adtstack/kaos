@@ -1,8 +1,15 @@
 {
 	"name": "kaos-server",
-	"version": "0.7.1",
+	"version": "0.7.2",
 	"private": true,
 	"description": "Cloudflare Worker server for Obsidian vault CRDT sync via y-partyserver",
+	"cloudflare": {
+		"bindings": {
+			"KAOS_CLAIM_SECRET": {
+				"description": "Required for first claim. Generate a unique 32–512 character visible-ASCII value without spaces in a password manager, then enter it once on the KAOS claim page. Do not reuse the sync token."
+			}
+		}
+	},
 	"scripts": {
 		"dev": "wrangler dev",
 		"predeploy": "node scripts/auto-bind-r2.mjs",
@@ -12,12 +19,15 @@
 	"dependencies": {
 		"@noble/hashes": "1.7.1",
 		"fflate": "^0.8.2",
+		"lib0": "0.2.117",
 		"partyserver": "0.3.2",
+		"qrcode": "^1.5.4",
 		"y-partyserver": "2.1.2",
 		"yjs": "^13.6.20"
 	},
 	"devDependencies": {
 		"@cloudflare/workers-types": "4.20260305.0",
+		"miniflare": "4.20260305.0",
 		"tsx": "^4.22.3",
 		"typescript": "^5.8.3",
 		"wrangler": "4.69.0"

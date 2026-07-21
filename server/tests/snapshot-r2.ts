@@ -23,7 +23,6 @@ import {
 	listSnapshots,
 	computeFullUpdateHash,
 	applyRetention,
-	selectRetention,
 	snapshotPrefix,
 	DEFAULT_RETENTION,
 	type SnapshotIndex,
@@ -325,7 +324,7 @@ async function test6_retentionLegacyProtection(): Promise<void> {
 	await bucket.put(`${legacyPrefix}/index.json`, JSON.stringify(legacyIndex));
 
 	// Create a recent daily snapshot
-	const recentIndex = await createSnapshot(doc, vaultId, bucket, {
+	await createSnapshot(doc, vaultId, bucket, {
 		reason: "daily",
 		pinned: false,
 	});
@@ -408,7 +407,7 @@ async function test8_deleteOnlyWithR2(): Promise<void> {
 	});
 
 	// Snapshot before delete
-	const index1 = await createSnapshot(doc, vaultId, bucket, { reason: "daily", pinned: false });
+	await createSnapshot(doc, vaultId, bucket, { reason: "daily", pinned: false });
 	const latest = await getLatestSnapshotIndex(vaultId, bucket);
 
 	// Delete-only operation

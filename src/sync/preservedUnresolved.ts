@@ -80,6 +80,12 @@ export interface PreservedUnresolvedEntry {
 	lastSeenAt: number;
 	localHash?: string | null;
 	knownRemoteHash?: string | null;
+	/** Exact local-only candidate created for a blob download conflict. */
+	artifactPath?: string | null;
+	/** Exact remote BlobRef identity captured when the conflict was quarantined. */
+	knownRemoteRefFingerprint?: string | null;
+	/** Exact CRDT item episode captured when the conflict was quarantined. */
+	knownRemoteSourceVersion?: string | null;
 }
 
 export interface PreservedUnresolvedSample {
@@ -181,6 +187,7 @@ export class PreservedUnresolvedRegistry {
 		const continuesPreviousEpisode = previous?.kind === entry.kind
 			&& previous.reason === entry.reason
 			&& (!entry.episodeId || entry.episodeId === previousEpisodeId);
+		const previousInEpisode = continuesPreviousEpisode ? previous : undefined;
 		this.entries.set(path, {
 			path,
 			kind: entry.kind,
@@ -190,10 +197,37 @@ export class PreservedUnresolvedRegistry {
 				: entry.episodeId || createPreservedUnresolvedEpisodeId(at),
 			firstSeenAt: continuesPreviousEpisode ? previous.firstSeenAt : at,
 			lastSeenAt: at,
-			localHash: entry.localHash ?? previous?.localHash ?? null,
-			knownRemoteHash: entry.knownRemoteHash
-				?? previous?.knownRemoteHash
-				?? null,
+			localHash: entry.localHash !== undefined
+				? entry.localHash
+				: previousInEpisode?.localHash ?? null,
+			knownRemoteHash: entry.knownRemoteHash !== undefined
+				? entry.knownRemoteHash
+				: previousInEpisode?.knownRemoteHash ?? null,
+			...(entry.artifactPath !== undefined || previousInEpisode?.artifactPath !== undefined
+				? {
+					artifactPath: entry.artifactPath !== undefined
+						? entry.artifactPath
+						: previousInEpisode?.artifactPath ?? null,
+				}
+				: {}),
+			...(entry.knownRemoteRefFingerprint !== undefined
+				|| previousInEpisode?.knownRemoteRefFingerprint !== undefined
+				? {
+					knownRemoteRefFingerprint:
+						entry.knownRemoteRefFingerprint !== undefined
+							? entry.knownRemoteRefFingerprint
+							: previousInEpisode?.knownRemoteRefFingerprint ?? null,
+				}
+				: {}),
+			...(entry.knownRemoteSourceVersion !== undefined
+				|| previousInEpisode?.knownRemoteSourceVersion !== undefined
+				? {
+					knownRemoteSourceVersion:
+						entry.knownRemoteSourceVersion !== undefined
+							? entry.knownRemoteSourceVersion
+							: previousInEpisode?.knownRemoteSourceVersion ?? null,
+				}
+				: {}),
 		});
 		this.paths.add(path);
 	}

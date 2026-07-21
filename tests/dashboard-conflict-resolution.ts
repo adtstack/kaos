@@ -4,6 +4,9 @@ import {
 	captureConflictResolutionSnapshot,
 	resolveConflictArtifactWithCas,
 } from "../src/dashboard/conflictResolution";
+import { KaosDashboardView } from "../src/dashboard/KaosDashboardView";
+import { ConfirmModal } from "../src/ui/ConfirmModal";
+import type { DashboardConflictArtifact } from "../src/dashboard/dashboardTypes";
 
 class FakeTFile extends TFile {
 	constructor(
@@ -170,6 +173,46 @@ console.log("\n--- Dashboard conflict resolution CAS + artifact trash ---");
 	assert.equal(await vault.read(originalFile), "typing during resolution\n", "rollback never overwrites a newer editor write");
 	assert.equal(vault.getAbstractFileByPath(artifactFile.path), artifactFile, "concurrent original write keeps the artifact");
 	assert.equal(vault.trashCalls, 0, "concurrent original write is rejected before trash");
+}
+
+{
+	const originalOpen = ConfirmModal.prototype.open;
+	const actionCalls: Array<{ artifact: DashboardConflictArtifact; choice: string }> = [];
+	try {
+		// Exercise the real dashboard confirmation wrapper: opening the modal in
+		// this test selects its confirm action, just as clicking the CTA would.
+		ConfirmModal.prototype.open = function openAndConfirm(): void {
+			void (this as unknown as { onConfirm(): void | Promise<void> }).onConfirm();
+		};
+		const app = { vault: {} };
+		const view = new KaosDashboardView(
+			{ app } as any,
+			{
+				collectData: async () => { throw new Error("not used"); },
+				actions: {} as any,
+			},
+		);
+		(view as any).resolveConflictArtifactFromDashboard = async (
+			artifact: DashboardConflictArtifact,
+			choice: { kind: string },
+		) => {
+			actionCalls.push({ artifact, choice: choice.kind });
+		};
+		const artifact = {
+			kind: "markdown",
+			artifactPath: "notes/a (KAOS conflict).md",
+			inferredOriginalPath: "notes/a.md",
+			originalExists: true,
+		} as DashboardConflictArtifact;
+		await (view as any).confirmDashboardConflictResolution(artifact, { kind: "artifact" });
+		assert.deepEqual(
+			actionCalls,
+			[{ artifact, choice: "artifact" }],
+			"dashboard confirmation modal invokes the selected conflict action exactly once",
+		);
+	} finally {
+		ConfirmModal.prototype.open = originalOpen;
+	}
 }
 
 console.log("PASS dashboard conflict resolution CAS + artifact trash");

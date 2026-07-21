@@ -1,6 +1,8 @@
 # Zero Config Onboarding
 
-Self-hosted software usually dies at the onboarding step. Forcing a user to open a terminal, run OpenSSL to generate a 32-byte cryptographic secret, and paste it into a .env file guarantees a 90% abandonment rate.
+Self-hosted software usually dies at the onboarding step. KAOS keeps the
+bootstrap entirely in the browser: the deploy form collects a one-time claim
+secret, and the setup page generates the long-lived sync token locally.
 
 KAOS implements a consumer-grade, zero-terminal claim flow, while gracefully handling the realities of infrastructure paywalls.
 
@@ -15,11 +17,24 @@ To unlock the deploy button, we stripped out the PartyKit framework and ported t
 # The Single-Use Claim Architecture
 
 When deployed, the KAOS server boots into an "Unclaimed" state.
-- The user visits the Worker URL in their browser and is greeted by a lightweight, dependency-free HTML setup page.
+- Deploy to Cloudflare requires a unique 32–512 character visible-ASCII
+  `KAOS_CLAIM_SECRET` without spaces.
+- The user visits the Worker URL and enters that same one-time ownership proof.
 - The browser utilizes crypto.getRandomValues() to generate a high-entropy token locally.
-- The user clicks "Claim". The token is sent to the server.
+- The user clicks "Claim". The sync token is sent as JSON and the separate
+  ownership proof is sent in `X-KAOS-Claim-Proof`.
+- The server requires same-origin browser requests, `application/json`, a
+  configured claim secret, and a constant-time proof match before touching the
+  Config Durable Object.
 - The server hashes the token (SHA-256) and stores only the hash inside a singleton Config Durable Object via an ACID transaction.
 - The setup route permanently locks itself.
+
+The distinction is intentional: a completely public unclaimed endpoint has no
+signal that distinguishes the deploy owner from a bot. Origin and CORS checks
+stop browser CSRF but cannot stop a direct HTTP first-claim attempt. The
+deploy-time proof supplies that missing trust anchor without requiring a
+terminal. Existing claimed deployments and explicit `SYNC_TOKEN` deployments
+do not pass through this bootstrap path.
 
 For subsequent authentication, the plugin uses `Authorization: Bearer <token>` for HTTP endpoints.
 
@@ -65,7 +80,16 @@ If `y-partyserver` is upgraded, verify whether this behavior has changed — see
 
 ## Threat model notes
 
-The long-lived token is no longer placed in any URL.  A leaked ticket is bounded by the 5-minute TTL — useless by the time a log rotation or audit sees it.
+The long-lived token is no longer placed in the WebSocket transport URL. A
+leaked connection ticket is bounded by the 5-minute TTL — normally useless by
+the time a log rotation or audit sees it.
+
+The setup deep link still carries the sync token during initial device pairing.
+The plugin therefore accepts it only as an explicit `action=setup`, requires a
+canonical HTTPS origin plus token and vault ID, confirms fresh setup, verifies
+the credentials before saving, and refuses to repoint an already configured
+vault to a different host or vault ID. Server replacement remains a settings
+screen operation.
 
 For legacy clients still using `?token=`, the risk profile is unchanged from v1: acceptable when TLS is enabled end-to-end and server logs are access-controlled.
 
@@ -93,9 +117,13 @@ For the broader list of accepted compromises and tracked debt, see
 
 # The URI Protocol Handshake
 
-To completely eliminate the copy-paste step, the setup page generates a custom deep-link: `obsidian://kaos?action=setup&host=...&token=....`
+To eliminate the normal copy-paste step, the setup page generates a custom
+deep-link: `obsidian://kaos?action=setup&host=...&token=...&vaultId=...`.
 
-When clicked, the OS routes this directly to the Obsidian plugin, which intercepts the URI, configures its internal settings, and immediately boots the sync engine.
+When clicked, the OS routes this to the Obsidian plugin. The plugin validates
+the complete target, shows the destination and local document count, performs
+an authenticated ticket preflight, then saves and starts sync. A configured
+vault cannot be redirected to another server or vault by a deep link.
 
 # Graceful Degradation and the Credit Card Wall
 

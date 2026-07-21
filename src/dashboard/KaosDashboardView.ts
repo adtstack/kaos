@@ -1,6 +1,9 @@
 import { App, ItemView, Modal, Notice, Platform, TFile, type WorkspaceLeaf } from "obsidian";
 import type {
 	DashboardAttentionItem,
+	DashboardBlobConflictResolutionChoice,
+	DashboardBlobConflictResolutionResult,
+	DashboardBlobConflictResolutionTarget,
 	DashboardConflictArtifact,
 	DashboardMetric,
 	DashboardRecentChange,
@@ -19,8 +22,8 @@ import type {
 	KaosDashboardData,
 } from "./dashboardTypes";
 import {
+	deriveDashboardHealth,
 	resolveKaosDashboardMode,
-	selectMobileOverviewMetrics,
 	type KaosDashboardMode,
 } from "./dashboardLayout";
 import { formatDashboardDeviceName } from "./deviceDisplay";
@@ -61,6 +64,10 @@ export interface KaosDashboardActions {
 		target: DashboardLegacyMissingBlobResolutionTarget,
 		choice: DashboardLegacyMissingBlobResolutionChoice,
 	): Promise<DashboardRemoteDeleteResolutionResult>;
+	resolveBlobConflict(
+		target: DashboardBlobConflictResolutionTarget,
+		choice: DashboardBlobConflictResolutionChoice,
+	): Promise<DashboardBlobConflictResolutionResult>;
 }
 
 export interface KaosDashboardViewDeps {
@@ -141,7 +148,7 @@ export class KaosDashboardView extends ItemView {
 		const mode = this.getDashboardMode();
 		root.empty();
 		root.classList.toggle("is-phone-dashboard", mode === "phone");
-		this.renderHeader(root, mode);
+		this.renderHeader(root);
 		if (!this.data && this.loading) {
 			root.createDiv({ text: "Loading...", cls: "kaos-dashboard-muted" });
 			return;
@@ -152,25 +159,29 @@ export class KaosDashboardView extends ItemView {
 		}
 		if (!this.data) return;
 
-		if (mode === "phone") {
-			this.renderPhoneDashboard(root, this.data);
-			return;
+		this.renderHealthSummary(root, this.data);
+		if (this.data.attentionTotalCount > 0) {
+			this.renderAttention(root, this.data.attention, this.data.attentionTotalCount);
 		}
-
-		this.renderActions(root, this.data);
-		this.renderOverview(root, this.data.overview);
-		this.renderSnapshots(root, this.data);
-		this.renderConflicts(root, this.data.conflicts, this.data.settings.deviceName);
-		this.renderAttention(root, this.data.attention, this.data.attentionTotalCount);
+		if (this.data.conflicts.length > 0) {
+			this.renderConflicts(root, this.data.conflicts, this.data.settings.deviceName);
+		}
+		this.renderRecentActivity(root, this.data, mode === "phone" ? 10 : 40);
+		this.renderRecovery(root, this.data);
+		if (this.data.blobSafetyCopies.length > 0) {
+			this.renderBlobSafetyCopies(root, this.data.blobSafetyCopies);
+		}
+		this.renderOperations(root, this.data);
+		this.renderAdvanced(root, this.data.overview);
 	}
 
 	private getDashboardMode(): KaosDashboardMode {
 		return resolveKaosDashboardMode(Platform);
 	}
 
-	private renderHeader(root: HTMLElement, mode: KaosDashboardMode): void {
+	private renderHeader(root: HTMLElement): void {
 		const header = root.createDiv({ cls: "kaos-dashboard-header" });
-		header.createEl("h2", { text: mode === "phone" ? "Mobile dashboard" : "Dashboard" });
+		header.createEl("h2", { text: "Dashboard" });
 		const meta = header.createDiv({ cls: "kaos-dashboard-muted" });
 		if (this.data) {
 			const deviceName = formatDashboardDeviceName(
@@ -187,92 +198,120 @@ export class KaosDashboardView extends ItemView {
 		}
 	}
 
-	private renderPhoneDashboard(root: HTMLElement, data: KaosDashboardData): void {
-		this.renderMobileSummary(root, data);
-		this.renderMobileActions(root, data);
-		if (data.attentionTotalCount > 0) {
-			this.renderAttention(root, data.attention, data.attentionTotalCount);
-		}
-		if (data.conflicts.length > 0) {
-			this.renderConflicts(root, data.conflicts, data.settings.deviceName);
-		}
-		this.renderSnapshots(root, data, 10);
-		this.renderMobileOverview(root, selectMobileOverviewMetrics(data.overview));
-	}
-
-	private renderMobileSummary(root: HTMLElement, data: KaosDashboardData): void {
+	private renderHealthSummary(root: HTMLElement, data: KaosDashboardData): void {
+		const health = deriveDashboardHealth(data);
 		const status = data.overview.find((metric) => metric.label === "Status");
 		const connection = data.overview.find((metric) => metric.label === "Connection");
-		const recentValue = data.recentChanges.status === "ready"
-			? String(data.recentChanges.changes.length)
-			: data.recentChanges.status;
-		const metrics: DashboardMetric[] = [
-			{ label: "Status", value: status?.value ?? "unknown", tone: status?.tone },
-			{ label: "Connection", value: connection?.value ?? "unknown", tone: connection?.tone },
-			{ label: "Attention", value: String(data.attentionTotalCount), tone: data.attentionTotalCount > 0 ? "warn" : "ok" },
-			{ label: "Conflicts", value: String(data.conflicts.length), tone: data.conflicts.length > 0 ? "error" : "ok" },
-			{ label: "Recent changes", value: recentValue, tone: data.recentChanges.status === "error" ? "error" : undefined },
-			{
-				label: "Vault snapshots",
-				value: data.snapshotStatus.status === "ready"
-					? String(data.snapshotStatus.summary.snapshotCountLowerBound)
-					: data.snapshotStatus.status,
-				tone: data.snapshotStatus.status === "error" ? "error" : undefined,
-			},
-		];
-		this.renderMetricGrid(root, metrics, "kaos-dashboard-mobile-summary");
+		const hero = root.createDiv({
+			cls: `kaos-dashboard-health ${toneClass(health.tone)}`,
+		});
+		hero.setAttr("role", "status");
+		hero.setAttr("aria-live", "polite");
+		const layout = hero.createDiv({ cls: "kaos-dashboard-health-layout" });
+		const copy = layout.createDiv({ cls: "kaos-dashboard-health-copy" });
+		const label = copy.createDiv({ cls: "kaos-dashboard-health-label" });
+		label.createSpan({ cls: "kaos-dashboard-health-dot" });
+		label.createSpan({ text: health.label });
+		copy.createEl("h3", { text: health.headline });
+		copy.createDiv({ text: health.detail, cls: "kaos-dashboard-health-detail" });
+		const actions = layout.createDiv({ cls: "kaos-dashboard-health-actions" });
+		this.button(
+			actions,
+			this.loading ? "Refreshing…" : "Refresh",
+			() => this.refresh(),
+			this.loading,
+			this.loading ? "Refresh is already running." : undefined,
+			false,
+		);
+
+		const facts = hero.createDiv({ cls: "kaos-dashboard-health-facts" });
+		this.renderHealthFact(facts, "Status", status?.value ?? "unknown", status?.tone);
+		this.renderHealthFact(facts, "Connection", connection?.value ?? "unknown", connection?.tone);
+		this.renderHealthFact(
+			facts,
+			"Attention",
+			String(data.attentionTotalCount),
+			data.attentionTotalCount > 0 ? "warn" : "ok",
+		);
+		this.renderHealthFact(
+			facts,
+			"Conflicts",
+			String(data.conflicts.length),
+			data.conflicts.length > 0 ? "error" : "ok",
+		);
 	}
 
-	private renderActions(root: HTMLElement, data: KaosDashboardData): void {
-		const section = root.createDiv({ cls: "kaos-dashboard-actionbar" });
-		this.button(section, "Refresh", () => this.refresh());
-		this.button(section, "Reconnect", async () => this.deps.actions.reconnect(), !data.actions.syncInitialized);
-		this.button(section, "Force reconcile", async () => this.deps.actions.forceReconcile(), !data.actions.syncInitialized);
+	private renderHealthFact(
+		parent: HTMLElement,
+		label: string,
+		value: string,
+		tone?: DashboardTone,
+	): void {
+		const fact = parent.createDiv({ cls: `kaos-dashboard-health-fact ${toneClass(tone)}` });
+		fact.createSpan({ text: label, cls: "kaos-dashboard-health-fact-label" });
+		fact.createSpan({ text: value, cls: "kaos-dashboard-health-fact-value" });
+	}
+
+	private renderOperations(root: HTMLElement, data: KaosDashboardData): void {
+		const body = this.disclosure(
+			root,
+			"Operations",
+			"Sync, recovery, and maintenance actions",
+			"kaos-dashboard-operations",
+		);
+		const syncActions = this.actionGroup(body, "Sync operations");
+		this.button(syncActions, "Reconnect", async () => this.deps.actions.reconnect(), !data.actions.syncInitialized);
+		this.button(syncActions, "Force reconcile", async () => this.deps.actions.forceReconcile(), !data.actions.syncInitialized);
 		this.button(
-			section,
+			syncActions,
 			`Import untracked${data.actions.untrackedFileCount > 0 ? ` (${data.actions.untrackedFileCount})` : ""}`,
 			() => this.deps.actions.importUntracked(),
 			!data.actions.syncInitialized || data.actions.untrackedFileCount === 0,
 		);
-		this.button(section, "Take vault snapshot", () => this.deps.actions.takeSnapshotNow(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
-		this.button(section, "Browse vault snapshots", () => this.deps.actions.showSnapshotList(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
-		this.button(section, "Create file history point", () => this.deps.actions.createFileHistoryPoint(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
-		this.button(section, "Review file history", () => this.deps.actions.showRecoveryHistory(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
-		this.button(section, "Export diagnostics", async () => this.deps.actions.exportDiagnostics());
-		this.button(section, "Export with filenames", async () => this.deps.actions.exportDiagnosticsWithFilenames());
+
+		const recoveryActions = this.actionGroup(body, "Recovery operations");
+		const recoveryDisabled = !data.actions.syncInitialized
+			|| !data.actions.snapshotsAvailable
+			|| !data.actions.connected;
+		this.button(recoveryActions, "Take vault snapshot", () => this.deps.actions.takeSnapshotNow(), recoveryDisabled);
+		this.button(recoveryActions, "Browse vault snapshots", () => this.deps.actions.showSnapshotList(), recoveryDisabled);
+		this.button(recoveryActions, "Create file history point", () => this.deps.actions.createFileHistoryPoint(), recoveryDisabled);
+		this.button(recoveryActions, "Review file history", () => this.deps.actions.showRecoveryHistory(), recoveryDisabled);
 	}
 
-	private renderMobileActions(root: HTMLElement, data: KaosDashboardData): void {
-		const section = root.createDiv({ cls: "kaos-dashboard-actionbar kaos-dashboard-mobile-actionbar" });
-		this.button(section, "Refresh", () => this.refresh());
-		this.button(section, "Reconnect", async () => this.deps.actions.reconnect(), !data.actions.syncInitialized);
-		this.button(section, "Reconcile", async () => this.deps.actions.forceReconcile(), !data.actions.syncInitialized);
-		this.button(
-			section,
-			`Import${data.actions.untrackedFileCount > 0 ? ` (${data.actions.untrackedFileCount})` : ""}`,
-			() => this.deps.actions.importUntracked(),
-			!data.actions.syncInitialized || data.actions.untrackedFileCount === 0,
+	private renderAdvanced(root: HTMLElement, metrics: DashboardMetric[]): void {
+		const body = this.disclosure(
+			root,
+			"Advanced diagnostics",
+			`${metrics.length} detailed sync metrics`,
+			"kaos-dashboard-advanced",
 		);
-		this.button(section, "Vault snapshot", () => this.deps.actions.takeSnapshotNow(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
-
-		const details = root.createEl("details", { cls: "kaos-dashboard-mobile-more-actions" });
-		details.createEl("summary", { text: "More actions" });
-		const more = details.createDiv({ cls: "kaos-dashboard-row-actions" });
-		this.button(more, "Browse vault snapshots", () => this.deps.actions.showSnapshotList(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
-		this.button(more, "Create file history point", () => this.deps.actions.createFileHistoryPoint(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
-		this.button(more, "Review file history", () => this.deps.actions.showRecoveryHistory(), !data.actions.syncInitialized || !data.actions.snapshotsAvailable || !data.actions.connected);
-		this.button(more, "Export diagnostics", async () => this.deps.actions.exportDiagnostics());
-		this.button(more, "Export with filenames", async () => this.deps.actions.exportDiagnosticsWithFilenames());
+		this.renderMetricGrid(body, metrics);
+		const exports = this.actionGroup(body, "Diagnostic exports");
+		this.button(exports, "Export diagnostics", async () => this.deps.actions.exportDiagnostics());
+		this.button(exports, "Export with filenames", async () => this.deps.actions.exportDiagnosticsWithFilenames());
 	}
 
-	private renderOverview(root: HTMLElement, metrics: DashboardMetric[]): void {
-		const section = this.section(root, "Overview");
-		this.renderMetricGrid(section, metrics);
+	private disclosure(
+		root: HTMLElement,
+		title: string,
+		detail: string,
+		extraClass: string,
+	): HTMLElement {
+		const details = root.createEl("details", {
+			cls: `kaos-dashboard-disclosure ${extraClass}`,
+		});
+		const summary = details.createEl("summary", { cls: "kaos-dashboard-disclosure-summary" });
+		const copy = summary.createSpan({ cls: "kaos-dashboard-disclosure-copy" });
+		copy.createSpan({ text: title, cls: "kaos-dashboard-disclosure-title" });
+		copy.createSpan({ text: detail, cls: "kaos-dashboard-disclosure-detail" });
+		return details.createDiv({ cls: "kaos-dashboard-disclosure-body" });
 	}
 
-	private renderMobileOverview(root: HTMLElement, metrics: DashboardMetric[]): void {
-		const section = this.section(root, "Sync Detail");
-		this.renderMetricGrid(section, metrics);
+	private actionGroup(root: HTMLElement, title: string): HTMLElement {
+		const group = root.createDiv({ cls: "kaos-dashboard-action-group" });
+		group.createEl("h4", { text: title });
+		return group.createDiv({ cls: "kaos-dashboard-row-actions" });
 	}
 
 	private renderMetricGrid(root: HTMLElement, metrics: DashboardMetric[], extraClass = ""): void {
@@ -286,36 +325,8 @@ export class KaosDashboardView extends ItemView {
 		}
 	}
 
-	private renderSnapshots(root: HTMLElement, data: KaosDashboardData, changeLimit = 40): void {
-		const section = this.section(root, "Recent Changes");
-		const snapshotRow = section.createDiv({ cls: "kaos-dashboard-snapshot-summary" });
-		if (data.snapshotStatus.status === "ready") {
-			const summary = data.snapshotStatus.summary;
-			snapshotRow.createDiv({
-				text: `${summary.snapshotCountLowerBound} vault snapshot(s), ${formatBytes(summary.estimatedStorageBytesLowerBound)} stored`,
-				cls: "kaos-dashboard-strong",
-			});
-			snapshotRow.createDiv({
-				text: summary.latestCreatedAt ? `latest ${formatDateTime(summary.latestCreatedAt)}` : "no vault snapshot timestamp",
-				cls: "kaos-dashboard-muted",
-			});
-		} else {
-			snapshotRow.createDiv({ text: data.snapshotStatus.message, cls: `kaos-dashboard-${data.snapshotStatus.status === "error" ? "error" : "muted"}` });
-		}
-		const storage = recoveryStorageDisplay(data.recoveryStorageStatus);
-		const storageRow = section.createDiv({ cls: "kaos-dashboard-snapshot-summary" });
-		storageRow.createDiv({
-			text: `File history storage: ${storage.label}`,
-			cls: `kaos-dashboard-strong ${toneClass(storage.tone)}`,
-		});
-		if (storage.detail) {
-			storageRow.createDiv({
-				text: storage.detail,
-				cls: storage.tone === "error" ? "kaos-dashboard-error" : "kaos-dashboard-muted",
-			});
-		}
-		this.renderFileHistoryState(section, data.recentChanges);
-
+	private renderRecentActivity(root: HTMLElement, data: KaosDashboardData, changeLimit: number): void {
+		const section = this.section(root, "Recent activity", "kaos-dashboard-activity-section");
 		if (data.recentChanges.status !== "ready") {
 			section.createDiv({ text: data.recentChanges.message, cls: `kaos-dashboard-${data.recentChanges.status === "error" ? "error" : "muted"}` });
 			return;
@@ -327,6 +338,48 @@ export class KaosDashboardView extends ItemView {
 		const list = section.createDiv({ cls: "kaos-dashboard-list" });
 		for (const change of data.recentChanges.changes.slice(0, changeLimit)) {
 			this.renderRecentChange(list, change, data.settings.deviceName);
+		}
+	}
+
+	private renderRecovery(root: HTMLElement, data: KaosDashboardData): void {
+		const section = this.section(root, "Recovery", "kaos-dashboard-recovery-section");
+		section.createDiv({
+			text: "File history and vault snapshots provide separate recovery points.",
+			cls: "kaos-dashboard-muted kaos-dashboard-section-copy",
+		});
+		const grid = section.createDiv({ cls: "kaos-dashboard-recovery-grid" });
+		const snapshotRow = grid.createDiv({ cls: "kaos-dashboard-recovery-card" });
+		snapshotRow.createDiv({ text: "Vault snapshots", cls: "kaos-dashboard-recovery-label" });
+		if (data.snapshotStatus.status === "ready") {
+			const summary = data.snapshotStatus.summary;
+			snapshotRow.createDiv({
+				text: `${summary.snapshotCountLowerBound} vault snapshot(s), ${formatBytes(summary.estimatedStorageBytesLowerBound)} stored`,
+				cls: "kaos-dashboard-strong kaos-dashboard-recovery-value",
+			});
+			snapshotRow.createDiv({
+				text: summary.latestCreatedAt ? `latest ${formatDateTime(summary.latestCreatedAt)}` : "no vault snapshot timestamp",
+				cls: "kaos-dashboard-muted",
+			});
+		} else {
+			snapshotRow.createDiv({ text: data.snapshotStatus.message, cls: `kaos-dashboard-${data.snapshotStatus.status === "error" ? "error" : "muted"}` });
+		}
+
+		const historyRow = grid.createDiv({ cls: "kaos-dashboard-recovery-card" });
+		historyRow.createDiv({ text: "File history", cls: "kaos-dashboard-recovery-label" });
+		this.renderFileHistoryState(historyRow, data.recentChanges);
+
+		const storage = recoveryStorageDisplay(data.recoveryStorageStatus);
+		const storageRow = grid.createDiv({ cls: `kaos-dashboard-recovery-card ${toneClass(storage.tone)}` });
+		storageRow.createDiv({ text: "Recovery storage", cls: "kaos-dashboard-recovery-label" });
+		storageRow.createDiv({
+			text: storage.label,
+			cls: "kaos-dashboard-strong kaos-dashboard-recovery-value",
+		});
+		if (storage.detail) {
+			storageRow.createDiv({
+				text: storage.detail,
+				cls: storage.tone === "error" ? "kaos-dashboard-error" : "kaos-dashboard-muted",
+			});
 		}
 	}
 
@@ -400,7 +453,7 @@ export class KaosDashboardView extends ItemView {
 	}
 
 	private renderConflicts(root: HTMLElement, conflicts: DashboardConflictArtifact[], currentDeviceName: string): void {
-		const section = this.section(root, `Conflicts (${conflicts.length})`);
+		const section = this.section(root, `Conflicts (${conflicts.length})`, "kaos-dashboard-callout is-error");
 		if (conflicts.length === 0) {
 			section.createDiv({ text: "No conflict artifacts found.", cls: "kaos-dashboard-muted" });
 			return;
@@ -426,21 +479,127 @@ export class KaosDashboardView extends ItemView {
 			}
 			row.createDiv({ text: artifact.artifactPath, cls: "kaos-dashboard-subpath" });
 			const actions = row.createDiv({ cls: "kaos-dashboard-row-actions" });
-			this.button(
-				actions,
-				"Use artifact",
-				() => this.confirmDashboardConflictResolution(artifact, { kind: "artifact" }),
-				artifact.kind !== "markdown" || !artifact.originalExists,
-			);
-			this.button(
-				actions,
-				"Use original",
-				() => this.confirmDashboardConflictResolution(artifact, { kind: "original" }),
-				artifact.kind !== "markdown" || !artifact.originalExists,
-			);
+			if (artifact.kind === "markdown") {
+				this.button(
+					actions,
+					"Use artifact",
+					() => this.confirmDashboardConflictResolution(artifact, { kind: "artifact" }),
+					!artifact.originalExists,
+				);
+				this.button(
+					actions,
+					"Use original",
+					() => this.confirmDashboardConflictResolution(artifact, { kind: "original" }),
+					!artifact.originalExists,
+				);
+			} else {
+				const resolution = artifact.blobResolution;
+				const target = resolution ? {
+					...resolution,
+					path: artifact.inferredOriginalPath,
+					artifactPath: artifact.artifactPath,
+				} satisfies DashboardBlobConflictResolutionTarget : null;
+				const unavailableReason = resolution === null
+					? "No exact active conflict episode is available for this copy."
+					: null;
+				this.button(
+					actions,
+					"Keep local original",
+					() => {
+						if (!target) throw new Error("The active attachment conflict is unavailable.");
+						return this.confirmBlobConflictResolution(target, "keep-local");
+					},
+					target === null || !resolution?.canKeepLocal,
+					resolution?.keepLocalUnavailableReason ?? unavailableReason ?? undefined,
+				);
+				this.button(
+					actions,
+					"Use remote copy",
+					() => {
+						if (!target) throw new Error("The active attachment conflict is unavailable.");
+						return this.confirmBlobConflictResolution(target, "use-remote-copy");
+					},
+					target === null || !resolution?.canUseRemoteCopy,
+					resolution?.useRemoteCopyUnavailableReason ?? unavailableReason ?? undefined,
+				);
+				const keepLocalReason = resolution?.canKeepLocal === false
+					? resolution.keepLocalUnavailableReason
+					: null;
+				const useRemoteReason = resolution?.canUseRemoteCopy === false
+					? resolution.useRemoteCopyUnavailableReason
+					: null;
+				if (unavailableReason) {
+					row.createDiv({
+						text: unavailableReason,
+						cls: "kaos-dashboard-muted",
+					});
+				} else if (keepLocalReason && keepLocalReason === useRemoteReason) {
+					row.createDiv({
+						text: `Resolution unavailable: ${keepLocalReason}`,
+						cls: "kaos-dashboard-muted",
+					});
+				} else {
+					if (keepLocalReason) {
+						row.createDiv({
+							text: `Keep local unavailable: ${keepLocalReason}`,
+							cls: "kaos-dashboard-muted",
+						});
+					}
+					if (useRemoteReason) {
+						row.createDiv({
+							text: `Use remote copy unavailable: ${useRemoteReason}`,
+							cls: "kaos-dashboard-muted",
+						});
+					}
+				}
+			}
 			this.button(actions, "View diff", () => this.openConflictDiff(artifact), artifact.kind !== "markdown" || !artifact.originalExists);
 			this.button(actions, "Open artifact", () => this.openPath(artifact.artifactPath));
 			this.button(actions, "Open original", () => this.openPath(artifact.inferredOriginalPath), !artifact.originalExists);
+		}
+	}
+
+	private renderBlobSafetyCopies(
+		root: HTMLElement,
+		copies: DashboardConflictArtifact[],
+	): void {
+		const section = this.section(root, `Attachment safety copies (${copies.length})`, "kaos-dashboard-callout is-muted");
+		section.createDiv({
+			text: "These local-only rollback copies come from safe attachment replacement or remote deletion. They are not sync conflicts; review them before deleting them manually.",
+			cls: "kaos-dashboard-muted",
+		});
+		const list = section.createDiv({ cls: "kaos-dashboard-list" });
+		for (const copy of copies) {
+			const originalPathCertain = copy.originalPathConfidence !== "possibly-truncated";
+			const row = list.createDiv({ cls: "kaos-dashboard-row kaos-dashboard-conflict-row" });
+			row.createDiv({ text: copy.artifactPath, cls: "kaos-dashboard-path" });
+			row.createDiv({
+				text: [
+					"local rollback copy",
+					formatDateTime(copy.timestamp),
+					originalPathCertain
+						? copy.originalExists ? "current attachment exists" : "current attachment missing"
+						: "current path may be truncated",
+					"local-only",
+				].join(" · "),
+				cls: "kaos-dashboard-muted",
+			});
+			row.createDiv({
+				text: `${originalPathCertain ? "Current path" : "Possible current path"}: ${copy.inferredOriginalPath}`,
+				cls: "kaos-dashboard-subpath",
+			});
+			const actions = row.createDiv({ cls: "kaos-dashboard-row-actions" });
+			this.button(actions, "Open copy", () => this.openPath(copy.artifactPath));
+			this.button(
+				actions,
+				"Open current",
+				() => this.openPath(copy.inferredOriginalPath),
+				!originalPathCertain || !copy.originalExists,
+				!originalPathCertain
+					? "The original basename was truncated; locate the current attachment manually."
+					: undefined,
+			);
+			this.button(actions, "Copy path", () => this.copyPath(copy.artifactPath));
 		}
 	}
 
@@ -449,7 +608,8 @@ export class KaosDashboardView extends ItemView {
 		items: DashboardAttentionItem[],
 		totalCount: number,
 	): void {
-		const section = this.section(root, `Attention (${totalCount})`);
+		const attentionTone = items.some((item) => item.tone === "error") ? "error" : "warn";
+		const section = this.section(root, `Attention (${totalCount})`, `kaos-dashboard-callout is-${attentionTone}`);
 		if (totalCount === 0) {
 			section.createDiv({ text: "No files currently need attention.", cls: "kaos-dashboard-muted" });
 			return;
@@ -763,8 +923,10 @@ export class KaosDashboardView extends ItemView {
 		};
 	}
 
-	private section(root: HTMLElement, title: string): HTMLElement {
-		const section = root.createDiv({ cls: "kaos-dashboard-section" });
+	private section(root: HTMLElement, title: string, extraClass = ""): HTMLElement {
+		const section = root.createDiv({
+			cls: ["kaos-dashboard-section", extraClass].filter(Boolean).join(" "),
+		});
 		section.createEl("h3", { text: title });
 		return section;
 	}
@@ -775,6 +937,7 @@ export class KaosDashboardView extends ItemView {
 		action: () => void | Promise<void>,
 		disabled = false,
 		disabledReason?: string,
+		refreshAfterAction = true,
 	): HTMLButtonElement {
 		const button = parent.createEl("button", { text: label });
 		button.disabled = disabled;
@@ -786,7 +949,7 @@ export class KaosDashboardView extends ItemView {
 			if (button.disabled) return;
 			button.disabled = true;
 			Promise.resolve(action())
-				.then(() => this.refresh(true))
+				.then(() => refreshAfterAction ? this.refresh(true) : undefined)
 				.catch((err) => {
 					new Notice(`${label} failed: ${formatUnknown(err)}`, 7000);
 					console.warn(`[kaos] dashboard action failed: ${label}`, err);
@@ -811,13 +974,13 @@ export class KaosDashboardView extends ItemView {
 
 	private async openConflictDiff(artifact: DashboardConflictArtifact): Promise<void> {
 		if (artifact.kind !== "markdown") {
-			new Notice("Diff is available for Markdown conflict notes.");
+			new Notice("Diff is available for text-document conflict artifacts.");
 			return;
 		}
 		const artifactFile = this.app.vault.getAbstractFileByPath(artifact.artifactPath);
 		const originalFile = this.app.vault.getAbstractFileByPath(artifact.inferredOriginalPath);
 		if (!(artifactFile instanceof TFile) || !(originalFile instanceof TFile)) {
-			new Notice("Both the conflict note and original note are required for diff.", 5000);
+			new Notice("Both the conflict artifact and original document are required for diff.", 5000);
 			return;
 		}
 		const [originalText, artifactText] = await Promise.all([
@@ -862,7 +1025,7 @@ export class KaosDashboardView extends ItemView {
 		return new Promise((resolve, reject) => {
 			new ConfirmModal(
 				this.app,
-				useArtifact ? "Use conflict artifact?" : "Use original note?",
+				useArtifact ? "Use conflict artifact?" : "Use original document?",
 				useArtifact
 					? `Replace "${artifact.inferredOriginalPath}" with the conflict artifact content and move the conflict artifact to trash?`
 					: `Keep "${artifact.inferredOriginalPath}" as the selected version and move the conflict artifact to trash?`,
@@ -887,17 +1050,59 @@ export class KaosDashboardView extends ItemView {
 		});
 	}
 
+	private confirmBlobConflictResolution(
+		target: DashboardBlobConflictResolutionTarget,
+		choice: DashboardBlobConflictResolutionChoice,
+	): Promise<void> {
+		const keepLocal = choice === "keep-local";
+		return new Promise((resolve, reject) => {
+			new ConfirmModal(
+				this.app,
+				keepLocal ? "Keep local attachment?" : "Use remote attachment copy?",
+				keepLocal
+					? `Publish the current local attachment at "${target.path}" as the selected version? The remote conflict copy remains recoverable until the upload settles.`
+					: `Replace "${target.path}" with the reviewed remote copy? If the current local attachment differs, KAOS will preserve it as a local rollback safety copy.`,
+				async () => {
+					try {
+						const result = await this.deps.actions.resolveBlobConflict(target, choice);
+						const message = result.status === "pending"
+							? result.message
+							: keepLocal
+								? "Local attachment selected. Publishing is complete."
+								: [
+									"Remote attachment copy selected.",
+									result.safetyCopyPath
+										? `The previous local version was preserved at "${result.safetyCopyPath}".`
+										: "No additional local safety copy was needed.",
+									result.artifactRemoved
+										? ""
+										: "The reviewed conflict copy could not be moved to trash; review it manually.",
+								].filter(Boolean).join(" ");
+						new Notice(message, result.status === "completed" && !result.artifactRemoved ? 9000 : 6000);
+						resolve();
+					} catch (err) {
+						reject(err instanceof Error ? err : new Error(String(err)));
+					}
+				},
+				keepLocal ? "Keep local original" : "Use remote copy",
+				"Cancel",
+				resolve,
+				"mod-cta",
+			).open();
+		});
+	}
+
 	private async resolveConflictArtifactFromDashboard(
 		artifact: DashboardConflictArtifact,
 		choice: Extract<ConflictResolutionChoice, { kind: "original" | "artifact" }>,
 	): Promise<void> {
 		if (artifact.kind !== "markdown" || !artifact.originalExists) {
-			throw new Error("Both Markdown notes must exist before choosing a conflict version.");
+			throw new Error("Both text documents must exist before choosing a conflict version.");
 		}
 		const artifactFile = this.app.vault.getAbstractFileByPath(artifact.artifactPath);
 		const originalFile = this.app.vault.getAbstractFileByPath(artifact.inferredOriginalPath);
 		if (!(artifactFile instanceof TFile) || !(originalFile instanceof TFile)) {
-			throw new Error("Both the conflict note and original note are required before choosing a version.");
+			throw new Error("Both the conflict artifact and original document are required before choosing a version.");
 		}
 		const [originalText, artifactText] = await Promise.all([
 			this.app.vault.read(originalFile),

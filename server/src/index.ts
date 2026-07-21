@@ -7,14 +7,17 @@ import {
 	getCapabilities,
 	getHttpAuthToken,
 	getStoredServerConfigCached,
-	handleClaimRoute,
+	handleValidatedClaimRoute,
 	handleUpdateMetadataRoute,
+	isClaimSecretConfigured,
 	isAuthorized,
+	preflightClaimRequest,
 	rejectUnauthorizedVaultRequest,
 	supportsBuckets,
 } from "./routes/auth";
+import type { ValidatedClaimRequest } from "./routes/auth";
 import { handleBlobRoute } from "./routes/blobs";
-import { corsPreflight, html, json, withCors } from "./routes/http";
+import { corsPreflight, createCspNonce, html, json, withCors } from "./routes/http";
 import { handleSnapshotRoute } from "./routes/snapshots";
 import { handleRecoveryContentRoute, handleRecoverySnapshotRoute } from "./routes/recoverySnapshots";
 import { handleSyncSocketRoute, parseSyncPath } from "./routes/syncSocket";
@@ -386,11 +389,47 @@ const worker = {
 			return response;
 		}
 
-		// Only recognised routes reach this point.
+		// A first-claim request is public, so reject every statelessly invalid shape
+		// before paying for KAOS_CONFIG. Preserve the legacy SYNC_TOKEN lock without
+		// parsing a body or consulting the Config Durable Object.
+		let validatedClaim: ValidatedClaimRequest | null = null;
+		if (route.kind === "claim") {
+			const envToken = env.SYNC_TOKEN?.trim();
+			if (envToken) {
+				const response = json({ error: "already_claimed" }, 403);
+				logWorkerRequest({
+					route,
+					method: req.method,
+					status: response.status,
+					durationMs: Date.now() - start,
+					auth: "env",
+					isWebSocket,
+					cfRay,
+				});
+				return response;
+			}
+			const preflight = await preflightClaimRequest(req, env);
+			if (!preflight.ok) {
+				logWorkerRequest({
+					route,
+					method: req.method,
+					status: preflight.response.status,
+					durationMs: Date.now() - start,
+					auth: "skipped",
+					isWebSocket,
+					cfRay,
+				});
+				return preflight.response;
+			}
+			validatedClaim = preflight.claim;
+		}
+
+		// Only recognised and (for /claim) statelessly validated routes reach here.
 		const authState = await getAuthStateCached(env);
 		let response: Response;
 
 		if (route.kind === "home") {
+			const scriptNonce = createCspNonce();
 			const body = authState.claimed
 				? renderRunningPage({
 					host: url.origin,
@@ -401,19 +440,26 @@ const worker = {
 				: renderSetupPage({
 					host: url.origin,
 					deployRepo: canonicalRepoForSetup(env),
+					claimEnabled: isClaimSecretConfigured(env),
+					scriptNonce,
 				});
-			response = html(body);
+			response = html(body, 200, { scriptNonce });
 		} else if (route.kind === "mobile-setup") {
+			const scriptNonce = createCspNonce();
 			response = html(
 				renderMobileSetupPage({
 					host: url.origin,
 					deployRepo: canonicalRepoForSetup(env),
+					scriptNonce,
 				}),
+				200,
+				{ scriptNonce },
 			);
 		} else if (route.kind === "capabilities") {
 			response = withCors(await handleCapabilities(req, env, authState));
 		} else if (route.kind === "claim") {
-			response = await handleClaimRoute(req, env, authState);
+			// route.kind=claim can reach auth only through the successful preflight.
+			response = await handleValidatedClaimRoute(validatedClaim!, env, authState);
 		} else if (route.kind === "update-metadata") {
 			response = withCors(await handleUpdateMetadataRoute(req, env, authState));
 		} else if (route.kind === "sync-socket") {

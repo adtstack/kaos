@@ -1,17 +1,21 @@
+import { readFileSync } from "node:fs";
 import { TFile } from "obsidian";
 import {
 	buildKaosDashboardData,
 	collectDashboardAttention,
+	collectDashboardBlobSafetyCopies,
 	collectDashboardConflictArtifacts,
 } from "../src/dashboard/dashboardData";
 import { resolveRecoveryHistoryInitialSelection } from "../src/snapshots/recoveryHistorySelection";
 import {
+	deriveDashboardHealth,
 	resolveKaosDashboardMode,
 	selectMobileOverviewMetrics,
 } from "../src/dashboard/dashboardLayout";
 import { formatDashboardDeviceName } from "../src/dashboard/deviceDisplay";
 import { normalizeRecoveryStorageAuditReport } from "../src/sync/recoverySnapshotClient";
-import type { KaosDashboardCollectorInput } from "../src/dashboard/dashboardTypes";
+import type { DashboardMetric, KaosDashboardCollectorInput } from "../src/dashboard/dashboardTypes";
+import { blobRefFingerprint } from "../src/types";
 
 let passed = 0;
 let failed = 0;
@@ -45,14 +49,20 @@ function makeApp(files: FakeTFile[]) {
 	} as unknown as import("obsidian").App;
 }
 
+const longBackupBase = "a".repeat(181);
+const activeBlobLocalHash = "a".repeat(64);
+const activeBlobRemoteHash = "b".repeat(64);
+const activeBlobRemoteRef = { hash: activeBlobRemoteHash, size: 101 };
+const activeBlobArtifactPath = "assets/img (KAOS remote conflict 2026-06-23T15-00-00Z).png";
 const files = [
 	new FakeTFile("notes/a.md", { mtime: 10, size: 12 }),
 	new FakeTFile("notes/preserved.md", { mtime: 15, size: 25 }),
 	new FakeTFile("notes/a (KAOS conflict - disk from device-a 2026-06-23T14-20-40Z).md", { mtime: 20, size: 13 }),
 	new FakeTFile("notes/b (KAOS conflict - crdt from device-b 2026-06-24T09-00-00Z).md", { mtime: 30, size: 14 }),
 	new FakeTFile("assets/img.png", { mtime: 11, size: 100 }),
-	new FakeTFile("assets/img (KAOS remote conflict 2026-06-23T15-00-00Z).png", { mtime: 21, size: 101 }),
+	new FakeTFile(activeBlobArtifactPath, { mtime: 21, size: 101 }),
 	new FakeTFile("assets/img (KAOS local backup 2026-06-25T08-30-00Z 0123456789abcdef).png", { mtime: 31, size: 102 }),
+	new FakeTFile(`assets/${longBackupBase} (KAOS local backup 2026-06-26T08-30-00Z fedcba9876543210).png`, { mtime: 32, size: 103 }),
 ];
 
 const baseInput: KaosDashboardCollectorInput = {
@@ -127,6 +137,7 @@ const baseInput: KaosDashboardCollectorInput = {
 		permanentUploadFailures: 0,
 		permanentDownloadFailures: 0,
 		blobConflictArtifacts: 1,
+		blobSafetyBackups: 1,
 		localOnlyBlobConflictPaths: 1,
 	},
 	preservedUnresolvedEntries: [{
@@ -142,6 +153,18 @@ const baseInput: KaosDashboardCollectorInput = {
 		reason: "path-collision",
 		firstSeenAt: 1_777_000_000_001,
 		lastSeenAt: 1_777_000_010_001,
+	}, {
+		path: "assets/img.png",
+		kind: "blob",
+		reason: "remote-download-local-conflict",
+		episodeId: "episode-blob-download-conflict",
+		firstSeenAt: 1_777_000_000_002,
+		lastSeenAt: 1_777_000_010_002,
+		localHash: activeBlobLocalHash,
+		knownRemoteHash: activeBlobRemoteHash,
+		artifactPath: activeBlobArtifactPath,
+		knownRemoteRefFingerprint: blobRefFingerprint(activeBlobRemoteRef),
+		knownRemoteSourceVersion: "1:2",
 	}],
 	remoteDeleteResolutionState: {
 		markdownAvailable: true,
@@ -151,6 +174,14 @@ const baseInput: KaosDashboardCollectorInput = {
 			: null,
 		isKeepLocalPending: () => false,
 		getBlobRef: () => null,
+	},
+	blobConflictResolutionState: {
+		available: true,
+		isPathSyncable: () => true,
+		getBlobRef: (path) => path === "assets/img.png" ? activeBlobRemoteRef : null,
+		getBlobSourceVersion: (path) => path === "assets/img.png" ? "1:2" : null,
+		isKeepLocalPending: () => false,
+		isUseRemoteResumePending: () => false,
 	},
 	frontmatterQuarantineEntries: [{
 		path: "notes/frontmatter.md",
@@ -222,13 +253,124 @@ const baseInput: KaosDashboardCollectorInput = {
 	snapshotsAvailable: false,
 };
 
-console.log("\n--- Test 1: conflict artifacts are collected and sorted ---");
+console.log("\n--- Test 1: true conflicts and attachment safety copies are separated ---");
 {
 	const conflicts = collectDashboardConflictArtifacts(baseInput);
-	assert(conflicts.length === 4, "four conflict artifacts collected");
-	assert(conflicts[0]?.artifactPath.includes("2026-06-25T08-30-00Z") ?? false, "newest conflict first");
+	const safetyCopies = collectDashboardBlobSafetyCopies(baseInput);
+	assert(conflicts.length === 3, "three true conflict artifacts collected");
+	assert(conflicts[0]?.artifactPath.includes("2026-06-24T09-00-00Z") ?? false, "newest conflict first");
 	assert(conflicts.some((item) => item.kind === "blob" && item.source === "remote"), "blob conflict included");
-	assert(conflicts.some((item) => item.kind === "blob" && item.source === "local"), "local blob backup included");
+	assert(!conflicts.some((item) => item.source === "local"), "clean local backup is not counted as a conflict");
+	assert(safetyCopies.length === 2 && safetyCopies.every((item) => item.source === "local"), "local blob backups are collected separately");
+	assert(
+		safetyCopies.some((item) => item.originalPathConfidence === "possibly-truncated"),
+		"a truncated safety-copy basename remains visibly uncertain",
+	);
+	const blobConflict = conflicts.find((item) => item.kind === "blob");
+	assert(
+		blobConflict?.blobResolution?.canKeepLocal === true
+			&& blobConflict.blobResolution.canUseRemoteCopy === true,
+		"the active blob conflict exposes both explicit local and remote choices",
+	);
+	assert(
+		blobConflict?.blobResolution?.episodeId === "episode-blob-download-conflict"
+			&& blobConflict.blobResolution.expectedLocalHash === null
+			&& blobConflict.blobResolution.expectedRemoteRef?.hash === activeBlobRemoteHash
+			&& blobConflict.blobResolution.expectedRemoteSourceVersion === "1:2"
+			&& blobConflict.blobResolution.originalFile.kind === "file"
+			&& blobConflict.blobResolution.artifactFile.kind === "file",
+		"blob choices bind current local file identity separately from the quarantine-time hash and exact remote authority",
+	);
+}
+
+console.log("\n--- Test 1b: stale remote authority keeps both blob choices visible but disabled ---");
+{
+	const conflict = collectDashboardConflictArtifacts({
+		...baseInput,
+		blobConflictResolutionState: {
+			...baseInput.blobConflictResolutionState!,
+			getBlobSourceVersion: () => "1:3",
+		},
+	}).find((item) => item.kind === "blob");
+	assert(
+		conflict?.blobResolution?.canKeepLocal === false
+			&& conflict.blobResolution.canUseRemoteCopy === false
+			&& conflict.blobResolution.keepLocalUnavailableReason?.includes("episode changed") === true,
+		"a same-hash new remote episode cannot be accepted from a stale dashboard row",
+	);
+}
+
+console.log("\n--- Test 1c: a durable Use-remote stage can resume from a vacant canonical path ---");
+{
+	const conflict = collectDashboardConflictArtifacts({
+		...baseInput,
+		app: makeApp(files.filter((file) => file.path !== "assets/img.png")),
+		blobConflictResolutionState: {
+			...baseInput.blobConflictResolutionState!,
+			isUseRemoteResumePending: (path) => path === "assets/img.png",
+		},
+	}).find((item) => item.kind === "blob");
+	assert(
+		conflict?.blobResolution?.originalFile.kind === "missing"
+			&& conflict.blobResolution.canKeepLocal === false
+			&& conflict.blobResolution.canUseRemoteCopy === true
+			&& conflict.blobResolution.keepLocalUnavailableReason?.includes("missing") === true,
+		"only Use remote remains enabled while its durable manual stage resumes",
+	);
+}
+
+console.log("\n--- Test 1d: paths outside current attachment scope fail closed ---");
+{
+	const conflict = collectDashboardConflictArtifacts({
+		...baseInput,
+		blobConflictResolutionState: {
+			...baseInput.blobConflictResolutionState!,
+			isPathSyncable: () => false,
+		},
+	}).find((item) => item.kind === "blob");
+	assert(
+		conflict?.blobResolution?.canKeepLocal === false
+			&& conflict.blobResolution.canUseRemoteCopy === false
+			&& conflict.blobResolution.keepLocalUnavailableReason?.includes("no longer eligible") === true,
+		"legacy document and excluded paths do not expose attachment resolution actions",
+	);
+}
+
+console.log("\n--- Test 1e: only the exact active remote copy is actionable ---");
+{
+	const olderArtifactPath = "assets/img (KAOS remote conflict 2026-06-22T15-00-00Z).png";
+	const conflicts = collectDashboardConflictArtifacts({
+		...baseInput,
+		app: makeApp([
+			...files,
+			new FakeTFile(olderArtifactPath, { mtime: 19, size: 101 }),
+		]),
+	});
+	const active = conflicts.find((item) => item.artifactPath === activeBlobArtifactPath);
+	const older = conflicts.find((item) => item.artifactPath === olderArtifactPath);
+	assert(
+		active?.blobResolution?.canUseRemoteCopy === true
+			&& older?.blobResolution?.canKeepLocal === false
+			&& older.blobResolution.canUseRemoteCopy === false
+			&& older.blobResolution.keepLocalUnavailableReason?.includes("older conflict copy") === true,
+		"older basename-matching copies remain visible but cannot resolve the active episode",
+	);
+
+	const markerWithoutArtifact = baseInput.preservedUnresolvedEntries.map((entry) =>
+		entry.reason === "remote-download-local-conflict"
+			? { ...entry, artifactPath: null }
+			: entry
+	);
+	const unbound = collectDashboardConflictArtifacts({
+		...baseInput,
+		preservedUnresolvedEntries: markerWithoutArtifact,
+	}).find((item) => item.artifactPath === activeBlobArtifactPath);
+	assert(
+		unbound?.blobResolution?.canKeepLocal === false
+			&& unbound.blobResolution.canUseRemoteCopy === false
+			&& unbound.blobResolution.keepLocalUnavailableReason?.includes("no exact remote-copy binding") === true,
+		"legacy markers without an exact artifact binding remain manual-only",
+	);
 }
 
 console.log("\n--- Test 2: original existence and disk index flags are computed ---");
@@ -249,6 +391,10 @@ console.log("\n--- Test 3: attention aggregation includes all local attention ty
 	assert(attention.some((item) => item.kind === "structural-change"), "structural change included");
 	assert(attention.some((item) => item.kind === "blocked-divergence"), "blocked divergence included");
 	assert(attention.some((item) => item.kind === "frontmatter-quarantine"), "frontmatter quarantine included");
+	assert(
+		attention.find((item) => item.path === "assets/img.png")?.detail.includes("Conflicts section") === true,
+		"active download-conflict Attention points to the available version buttons",
+	);
 	const remoteDelete = attention.find((item) => item.path === "notes/preserved.md");
 	const pathCollision = attention.find((item) => item.path === "notes/path-collision.md");
 	assert(
@@ -295,6 +441,20 @@ console.log("\n--- Test 3: attention aggregation includes all local attention ty
 			.filter((item) => item.kind !== "preserved-unresolved")
 			.every((item) => item.resolution === null),
 		"non-file attention types do not expose remote-delete actions",
+	);
+}
+
+console.log("\n--- Test 3a: missing remote conflict copy has honest Attention guidance ---");
+{
+	const attention = collectDashboardAttention({
+		...baseInput,
+		app: makeApp(files.filter((file) => file.path !== activeBlobArtifactPath)),
+	});
+	const item = attention.find((candidate) => candidate.path === "assets/img.png");
+	assert(
+		item?.detail.includes("preserved remote copy is missing") === true
+			&& item.detail.includes("Conflicts section") === false,
+		"Attention does not direct the user to a conflict row that no longer exists",
 	);
 }
 
@@ -382,6 +542,8 @@ console.log("\n--- Test 3c: structural path markers are represented once ---");
 console.log("\n--- Test 4: dashboard data preserves snapshot unavailable and recent changes ---");
 {
 	const data = buildKaosDashboardData(baseInput);
+	assert(data.conflicts.every((item) => item.source !== "local"), "dashboard conflict count excludes clean safety copies");
+	assert(data.blobSafetyCopies.length === 2, "dashboard exposes attachment safety copies separately");
 	assert(data.snapshotStatus.status === "unavailable", "snapshot unavailable preserved");
 	assert(data.recoveryStorageStatus.status === "ready" && data.recoveryStorageStatus.report.status === "healthy", "recovery storage status preserved");
 	assert(data.recentChanges.status === "ready" && data.recentChanges.changes.length === 1, "recent changes preserved");
@@ -389,7 +551,7 @@ console.log("\n--- Test 4: dashboard data preserves snapshot unavailable and rec
 	assert(data.recentChanges.status === "ready" && data.recentChanges.lastAttempt?.status === "created", "last file history attempt preserved");
 	assert(data.recentChanges.status === "ready" && data.recentChanges.changes[0]?.previousContentHash === "oldhash", "previous content hash preserved for dashboard history navigation");
 	assert(data.actions.snapshotsAvailable === false, "snapshot action disabled state represented");
-	assert(data.attentionTotalCount === 5, "attention total includes entries hidden by collapsed/sample rows");
+	assert(data.attentionTotalCount === 6, "attention total includes the active blob conflict and entries hidden by collapsed/sample rows");
 	assert(data.overview.some((metric) => metric.label === "Server receipt" && metric.value === "confirmed"), "server receipt metric built");
 }
 
@@ -501,6 +663,132 @@ console.log("\n--- Test 7: mobile overview keeps actionable metrics ---");
 	assert(labels.includes("Server receipt"), "mobile overview keeps server receipt");
 	assert(labels.includes("Untracked"), "mobile overview keeps untracked count");
 	assert(!labels.includes("Open files"), "mobile overview drops passive open-file metric");
+}
+
+console.log("\n--- Test 7a: dashboard health summary follows action priority ---");
+{
+	const summarize = (
+		overview: DashboardMetric[],
+		attentionTotalCount = 0,
+		conflictCount = 0,
+		recovery: Partial<Pick<
+			ReturnType<typeof buildKaosDashboardData>,
+			"snapshotStatus" | "recoveryStorageStatus" | "recentChanges"
+		>> = {},
+	) => deriveDashboardHealth({
+		overview,
+		attentionTotalCount,
+		conflicts: Array.from({ length: conflictCount }, () => ({})) as unknown as ReturnType<typeof buildKaosDashboardData>["conflicts"],
+		snapshotStatus: recovery.snapshotStatus ?? { status: "unavailable", message: "Snapshots are not enabled." },
+		recoveryStorageStatus: recovery.recoveryStorageStatus ?? { status: "unavailable", message: "Recovery storage is not enabled." },
+		recentChanges: recovery.recentChanges ?? { status: "unavailable", message: "File history is not enabled.", lastAttempt: null },
+	});
+
+	const conflict = summarize([{ label: "Safety brake", value: "active", tone: "error" }], 2, 1);
+	assert(conflict.headline === "1 conflict needs review", "conflicts take priority over metric errors and attention");
+
+	const error = summarize([{ label: "Safety brake", value: "active", tone: "error" }], 2);
+	assert(error.tone === "error" && error.headline === "Sync needs attention", "metric errors take priority over attention");
+
+	const attention = summarize([{ label: "Untracked", value: "2", tone: "warn" }], 2);
+	assert(attention.tone === "warn" && attention.headline === "2 items need review", "attention takes priority over warning metrics");
+
+	const warning = summarize([
+		{ label: "Provider synced", value: "no", tone: "warn" },
+		{ label: "Disk writes", value: "1", tone: "busy" },
+	]);
+	assert(warning.headline === "Check sync status", "warning metrics take priority over background work");
+
+	const busy = summarize([{ label: "Disk writes", value: "1", tone: "busy" }]);
+	assert(busy.tone === "busy" && busy.label === "Working", "background work is shown without an action warning");
+
+	const healthy = summarize([{ label: "Connection", value: "online", tone: "ok" }]);
+	assert(healthy.tone === "ok" && healthy.label === "Healthy", "healthy snapshots show a clear healthy state");
+
+	const unknown = summarize([{ label: "Connection", value: "not initialized", tone: "muted" }]);
+	assert(unknown.tone === "warn" && unknown.headline === "Check sync status", "unknown connection state is never presented as healthy");
+
+	const snapshotError = summarize(
+		[{ label: "Connection", value: "online", tone: "ok" }],
+		0,
+		0,
+		{ snapshotStatus: { status: "error", message: "Snapshot request failed." } },
+	);
+	assert(snapshotError.tone === "error" && snapshotError.headline === "Recovery needs attention", "snapshot errors prevent a healthy hero");
+	const conflictWithSnapshotError = summarize(
+		[{ label: "Connection", value: "online", tone: "ok" }],
+		0,
+		1,
+		{ snapshotStatus: { status: "error", message: "Snapshot request failed." } },
+	);
+	assert(conflictWithSnapshotError.detail.includes("other flagged sync conditions"), "conflict-first hero still acknowledges recovery failures");
+
+	const historyError = summarize(
+		[{ label: "Connection", value: "online", tone: "ok" }],
+		0,
+		0,
+		{ recentChanges: { status: "error", message: "History request failed.", lastAttempt: null } },
+	);
+	assert(historyError.detail.includes("File history"), "file-history errors are named in the hero");
+
+	const degradedReport = {
+		...baseInput.recoveryStorageStatus,
+		status: "ready" as const,
+		report: {
+			...(baseInput.recoveryStorageStatus.status === "ready" ? baseInput.recoveryStorageStatus.report : {}),
+			status: "degraded" as const,
+		},
+	} as ReturnType<typeof buildKaosDashboardData>["recoveryStorageStatus"];
+	const degraded = summarize(
+		[{ label: "Connection", value: "online", tone: "ok" }],
+		0,
+		0,
+		{ recoveryStorageStatus: degradedReport },
+	);
+	assert(degraded.tone === "error" && degraded.detail.includes("Recovery storage"), "degraded recovery storage prevents a healthy hero");
+
+	const intentionalUnavailable = summarize(
+		[{ label: "Connection", value: "online", tone: "ok" }],
+		0,
+		0,
+		{
+			snapshotStatus: { status: "unavailable", message: "Unsupported." },
+			recoveryStorageStatus: { status: "unavailable", message: "Unsupported." },
+			recentChanges: { status: "unavailable", message: "Unsupported.", lastAttempt: null },
+		},
+	);
+	assert(intentionalUnavailable.tone === "ok", "intentionally unavailable recovery features do not create a false error");
+}
+
+console.log("\n--- Test 7b: dashboard presentation keeps actionable sections first ---");
+{
+	const viewSource = readFileSync("src/dashboard/KaosDashboardView.ts", "utf8");
+	const renderStart = viewSource.indexOf("private render(): void");
+	const renderEnd = viewSource.indexOf("private getDashboardMode", renderStart);
+	const renderBody = viewSource.slice(renderStart, renderEnd);
+	const calls = [
+		"this.renderHealthSummary",
+		"this.renderAttention",
+		"this.renderConflicts",
+		"this.renderRecentActivity",
+		"this.renderRecovery",
+		"this.renderOperations",
+		"this.renderAdvanced",
+	];
+	const positions = calls.map((call) => renderBody.indexOf(call));
+	assert(
+		positions.every((position) => position >= 0)
+			&& positions.every((position, index) => index === 0 || positions[index - 1]! < position),
+		"health, attention, conflicts, activity, recovery, operations, and advanced render in priority order",
+	);
+	const disclosureStart = viewSource.indexOf("private disclosure(");
+	const disclosureEnd = viewSource.indexOf("private actionGroup", disclosureStart);
+	const disclosureBody = viewSource.slice(disclosureStart, disclosureEnd);
+	assert(
+		disclosureBody.includes("root.createEl(\"details\"")
+			&& !/\bopen\s*:/.test(disclosureBody),
+		"operations and diagnostics use disclosures without forcing them open",
+	);
 }
 
 console.log("\n--- Test 8: recovery storage audit response normalization is tolerant ---");

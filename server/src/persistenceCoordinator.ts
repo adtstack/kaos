@@ -238,7 +238,7 @@ export class PersistenceCoordinator {
 			this.setPhase("delta_incremental");
 			const pendingBytes = pendingUpdates.reduce((sum, update) => sum + update.byteLength, 0);
 			const mergeStartedAt = nowMs();
-			delta = pendingUpdates.length === 1 ? pendingUpdates[0]! : Y.mergeUpdates(pendingUpdates);
+			delta = pendingUpdates.length === 1 ? pendingUpdates[0] : Y.mergeUpdates(pendingUpdates);
 			this.health.lastEncodeMs = (this.health.lastEncodeMs ?? 0) + (nowMs() - mergeStartedAt);
 			this.trace?.("save.delta_computed", {
 				source: "pending_incremental",

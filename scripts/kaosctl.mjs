@@ -27,6 +27,7 @@ const MARKDOWN_CONFLICT_ARTIFACT_NAME_RE =
 	/^(.+) \(KAOS conflict(?: - (crdt|disk|editor))? from (.+) (\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)\)(?: (\d+))?(\.(?:md|base))$/;
 const BLOB_CONFLICT_ARTIFACT_NAME_RE =
 	/^(.+) \(KAOS remote conflict (\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z)\)(?: (\d+))?(\.[^/.]+)?$/;
+const TERMINAL_GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 async function main() {
 	const [command = "help", ...args] = process.argv.slice(2);
@@ -357,7 +358,7 @@ async function printStatus(raw) {
 	} catch {
 		latestVersion = null;
 	}
-	console.log(JSON.stringify({
+	const status = {
 		kind: "kaos-user-status",
 		ok: true,
 		currentVersion,
@@ -366,14 +367,75 @@ async function printStatus(raw) {
 		vaultRoot: config.vaultRoot,
 		pluginDir: config.pluginDir,
 		serviceFile: paths.serviceFile,
-	}, null, 2));
+	};
+	if (useHumanCommandOutput(raw)) {
+		console.log(formatUserStatus(status));
+	} else {
+		console.log(JSON.stringify(status, null, 2));
+	}
 }
 
 async function runDoctorCommand(raw) {
 	const config = await readJsonFile(resolve(raw.config ?? defaultUserPaths().installConfig));
 	const paths = pathsFromConfig(config);
 	const result = runNodeJson(join(paths.currentLink, RUNNER), doctorArgs({ config, paths }));
-	console.log(JSON.stringify(result, null, 2));
+	if (useHumanCommandOutput(raw)) {
+		console.log(formatUserDoctor(result));
+	} else {
+		console.log(JSON.stringify(result, null, 2));
+	}
+}
+
+function useHumanCommandOutput(raw) {
+	return process.stdout.isTTY === true && raw.json !== "true";
+}
+
+function formatUserStatus(status) {
+	let update = "not checked";
+	if (status.updateAvailable === true) {
+		update = `${formatOutputValue(status.latestVersion)} available`;
+	} else if (status.updateAvailable === false) {
+		update = "up to date";
+	} else {
+		update = "check unavailable";
+	}
+	return formatOutputRows("KAOS Headless", [
+		["Version", formatOutputValue(status.currentVersion)],
+		["Update", update],
+		["Vault", formatOutputValue(status.vaultRoot)],
+		["Plugin", formatOutputValue(status.pluginDir)],
+		["Service file", formatOutputValue(status.serviceFile)],
+	]);
+}
+
+function formatUserDoctor(result) {
+	const ok = result?.ok === true;
+	const checks = Array.isArray(result?.checks) ? result.checks.filter(isRecord) : [];
+	const lines = [
+		`KAOS Headless Doctor — ${ok ? "PASS" : "FAIL"}`,
+		"",
+		...checks.map((check) => {
+			const detail = asNonEmptyString(check.detail);
+			return `${check.ok === true ? "PASS" : "FAIL"}  ${formatOutputValue(check.name)}${detail ? ` — ${safeTerminalText(detail)}` : ""}`;
+		}),
+	];
+	if (!ok) lines.push("", "One or more checks failed. Review the FAIL entries above.");
+	return lines.join("\n");
+}
+
+function formatOutputRows(title, rows) {
+	const labelWidth = rows.reduce((width, [label]) => Math.max(width, label.length), 0);
+	return [
+		title,
+		"",
+		...rows.map(([label, value]) => `${label.padEnd(labelWidth)}  ${safeTerminalText(value)}`),
+	].join("\n");
+}
+
+function formatOutputValue(value) {
+	if (typeof value === "string" && value.length > 0) return safeTerminalText(value);
+	if (typeof value === "number" || typeof value === "boolean") return String(value);
+	return "unknown";
 }
 
 async function runConflictsCommand(argv) {
@@ -772,44 +834,77 @@ async function loadHistoryTuiDiff(state) {
 }
 
 function renderHistoryTui(state) {
-	const width = Math.max(60, process.stdout.columns ?? 100);
-	const height = Math.max(14, process.stdout.rows ?? 28);
+	const { width, height } = terminalDimensions(process.stdout);
 	const manifest = state.manifests[state.selectedPoint];
 	const changes = historyVisibleEntries(manifest, state.kindFilter);
 	const lines = [
 		`KAOS file history  ·  ${state.manifests.length} point(s) loaded${state.nextCursor ? "  ·  more available" : ""}`,
-		`${safeTerminalText(state.message)}`,
-		"",
+		safeTerminalText(state.message),
 	];
+	const footer = "j/k move · Tab switch pane · Enter/d diff · t type filter · n older points · q quit";
 
 	if (width < 92) {
-		lines.push(`${state.focus === "points" ? ">" : " "} Points`, "");
-		for (let index = 0; index < Math.min(state.manifests.length, height - 8); index++) {
-			lines.push(historyTuiPointLine(state.manifests[index], index === state.selectedPoint, width));
+		const availableRows = Math.max(0, height - 5);
+		const pointRows = availableRows > 1
+			? Math.min(state.manifests.length, Math.max(1, Math.floor(availableRows * 0.4)))
+			: Math.min(state.manifests.length, availableRows);
+		const detailRows = Math.max(0, availableRows - pointRows);
+		const pointView = terminalViewport(state.manifests, state.selectedPoint, pointRows);
+		lines.push(`${state.focus === "points" ? ">" : " "} POINTS${formatViewportRange(pointView)}`);
+		for (let offset = 0; offset < pointView.items.length; offset++) {
+			const index = pointView.start + offset;
+			lines.push(historyTuiPointLine(pointView.items[offset], index === state.selectedPoint, width));
 		}
-		lines.push("", `${state.focus === "changes" ? ">" : " "} ${formatHistoryDate(manifest.createdAt)} · ${changes.length} change(s)`);
-		for (let index = 0; index < Math.min(changes.length, 4); index++) {
-			lines.push(historyTuiChangeLine(changes[index], index === state.selectedChange, width));
+		if (state.diffText !== null) {
+			const diffLines = state.diffText.split("\n").map((line) => safeTerminalText(line));
+			const diffView = terminalViewport(diffLines, 0, detailRows, { anchor: "start" });
+			lines.push(`${state.focus === "changes" ? ">" : " "} DIFF${formatViewportRange(diffView)}`);
+			lines.push(...diffView.items);
+		} else {
+			const changeView = terminalViewport(changes, state.selectedChange, detailRows);
+			lines.push(`${state.focus === "changes" ? ">" : " "} ${formatHistoryDate(manifest.createdAt)} · ${changes.length} change(s) · ${state.kindFilter}${formatViewportRange(changeView)}`);
+			for (let offset = 0; offset < changeView.items.length; offset++) {
+				const index = changeView.start + offset;
+				lines.push(historyTuiChangeLine(changeView.items[offset], index === state.selectedChange, width));
+			}
 		}
 	} else {
 		const leftWidth = Math.min(42, Math.max(32, Math.floor(width * 0.38)));
 		const rightWidth = width - leftWidth - 3;
-		lines.push(`${padRight(`${state.focus === "points" ? ">" : " "} POINTS`, leftWidth)} │ ${state.focus === "changes" ? ">" : " "} ${truncateTerminalText(`${formatHistoryDate(manifest.createdAt)} · ${changes.length} change(s) · ${state.kindFilter}`, rightWidth - 2)}`);
-		lines.push(`${"─".repeat(leftWidth)}─┼─${"─".repeat(rightWidth)}`);
-		const contentLines = state.diffText
+		const rowCount = Math.max(0, height - 5);
+		const pointView = terminalViewport(state.manifests, state.selectedPoint, rowCount);
+		const detailLines = state.diffText !== null
 			? state.diffText.split("\n").map((line) => safeTerminalText(line))
-			: changes.map((change, index) => historyTuiChangeLine(change, index === state.selectedChange, rightWidth));
-		const rowCount = Math.max(5, height - 7);
-		for (let index = 0; index < rowCount; index++) {
-			const point = state.manifests[index]
-				? historyTuiPointLine(state.manifests[index], index === state.selectedPoint, leftWidth)
+			: changes;
+		const detailView = terminalViewport(
+			detailLines,
+			state.diffText !== null ? 0 : state.selectedChange,
+			rowCount,
+			state.diffText !== null ? { anchor: "start" } : undefined,
+		);
+		const leftHeading = `${state.focus === "points" ? ">" : " "} POINTS${formatViewportRange(pointView)}`;
+		const rightHeading = state.diffText !== null
+			? `${state.focus === "changes" ? ">" : " "} DIFF${formatViewportRange(detailView)}`
+			: `${state.focus === "changes" ? ">" : " "} ${formatHistoryDate(manifest.createdAt)} · ${changes.length} change(s) · ${state.kindFilter}${formatViewportRange(detailView)}`;
+		lines.push(`${padRight(truncateTerminalText(leftHeading, leftWidth), leftWidth)} │ ${truncateTerminalText(rightHeading, rightWidth)}`);
+		lines.push(`${"─".repeat(leftWidth)}─┼─${"─".repeat(rightWidth)}`);
+		for (let offset = 0; offset < rowCount; offset++) {
+			const pointIndex = pointView.start + offset;
+			const point = pointView.items[offset]
+				? historyTuiPointLine(pointView.items[offset], pointIndex === state.selectedPoint, leftWidth)
 				: "";
-			const detail = contentLines[index] ?? "";
+			const detailIndex = detailView.start + offset;
+			const detailItem = detailView.items[offset];
+			const detail = state.diffText !== null
+				? detailItem ?? ""
+				: detailItem
+					? historyTuiChangeLine(detailItem, detailIndex === state.selectedChange, rightWidth)
+					: "";
 			lines.push(`${padRight(point, leftWidth)} │ ${truncateTerminalText(detail, rightWidth)}`);
 		}
 	}
-	lines.push("", "j/k move · Tab switch pane · Enter/d diff · t type filter · n older points · q quit");
-	process.stdout.write(`\x1b[?25l\x1b[2J\x1b[H${lines.join("\n")}\n`);
+	lines.push(footer);
+	renderTerminalFrame(lines, { width, height });
 }
 
 function historyVisibleEntries(manifest, kindFilter) {
@@ -865,16 +960,100 @@ function safeTerminalText(value) {
 
 function truncateTerminalText(value, width) {
 	const text = safeTerminalText(value);
-	if (text.length <= width) return text;
-	return width <= 1 ? text.slice(0, width) : `${text.slice(0, width - 1)}…`;
+	const available = Math.max(0, Math.floor(width));
+	if (terminalTextWidth(text) <= available) return text;
+	if (available === 0) return "";
+	if (available === 1) return "…";
+	let used = 0;
+	let truncated = "";
+	for (const grapheme of terminalGraphemes(text)) {
+		const graphemeWidth = terminalGraphemeWidth(grapheme);
+		if (used + graphemeWidth > available - 1) break;
+		truncated += grapheme;
+		used += graphemeWidth;
+	}
+	return `${truncated}…`;
+}
+
+function terminalTextWidth(value) {
+	return terminalGraphemes(safeTerminalText(value))
+		.reduce((width, grapheme) => width + terminalGraphemeWidth(grapheme), 0);
+}
+
+function terminalGraphemes(value) {
+	return Array.from(TERMINAL_GRAPHEME_SEGMENTER.segment(String(value)), ({ segment }) => segment);
+}
+
+function terminalGraphemeWidth(grapheme) {
+	if (!grapheme) return 0;
+	if (/^\p{Mark}+$/u.test(grapheme)) return 0;
+	if (/\p{Extended_Pictographic}/u.test(grapheme)) return 2;
+	const codePoint = grapheme.codePointAt(0) ?? 0;
+	return isFullWidthCodePoint(codePoint) ? 2 : 1;
+}
+
+function isFullWidthCodePoint(codePoint) {
+	return codePoint >= 0x1100 && (
+		codePoint <= 0x115f
+		|| codePoint === 0x2329
+		|| codePoint === 0x232a
+		|| (codePoint >= 0x2e80 && codePoint <= 0x303e)
+		|| (codePoint >= 0x3040 && codePoint <= 0xa4cf && codePoint !== 0x303f)
+		|| (codePoint >= 0xac00 && codePoint <= 0xd7a3)
+		|| (codePoint >= 0xf900 && codePoint <= 0xfaff)
+		|| (codePoint >= 0xfe10 && codePoint <= 0xfe19)
+		|| (codePoint >= 0xfe30 && codePoint <= 0xfe6f)
+		|| (codePoint >= 0xff00 && codePoint <= 0xff60)
+		|| (codePoint >= 0xffe0 && codePoint <= 0xffe6)
+		|| (codePoint >= 0x1b000 && codePoint <= 0x1b001)
+		|| (codePoint >= 0x1f200 && codePoint <= 0x1f251)
+		|| (codePoint >= 0x20000 && codePoint <= 0x3fffd)
+	);
+}
+
+function terminalDimensions(output) {
+	const width = Number.isInteger(output.columns) && output.columns > 0 ? output.columns : 100;
+	const height = Number.isInteger(output.rows) && output.rows > 0 ? output.rows : 28;
+	return { width, height };
+}
+
+function terminalViewport(items, selected, size, options = {}) {
+	const total = items.length;
+	const count = Math.max(0, Math.min(total, Number.isFinite(size) ? Math.floor(size) : 0));
+	if (count === 0) return { items: [], start: 0, end: 0, total };
+	const safeSelected = Math.max(0, Math.min(total - 1, Number.isFinite(selected) ? Math.floor(selected) : 0));
+	const maxStart = Math.max(0, total - count);
+	const start = options.anchor === "start"
+		? 0
+		: Math.max(0, Math.min(maxStart, safeSelected - Math.floor(count / 2)));
+	return {
+		items: items.slice(start, start + count),
+		start,
+		end: start + count,
+		total,
+	};
+}
+
+function formatViewportRange(view) {
+	if (view.total <= view.items.length || view.items.length === 0) return "";
+	return ` · ${view.start + 1}-${view.end}/${view.total}`;
+}
+
+function renderTerminalFrame(lines, { width, height }) {
+	const visible = lines
+		.slice(0, height)
+		.map((line) => truncateTerminalText(line, width));
+	process.stdout.write(`\x1b[?25l\x1b[2J\x1b[H${visible.join("\n")}`);
 }
 
 function padLeft(value, width) {
-	return String(value).padStart(width, " ");
+	const text = String(value);
+	return `${" ".repeat(Math.max(0, width - terminalTextWidth(text)))}${text}`;
 }
 
 function padRight(value, width) {
-	return String(value).padEnd(width, " ");
+	const text = String(value);
+	return `${text}${" ".repeat(Math.max(0, width - terminalTextWidth(text)))}`;
 }
 
 function parseSubcommandArgs(argv) {
@@ -1557,22 +1736,38 @@ function resolveUserPath(path) {
 }
 
 function renderConflictUi({ inventory, selected, message, mode, detailText, readOnly }) {
-	process.stdout.write("\x1b[?25l\x1b[2J\x1b[H");
-	process.stdout.write(`KAOS conflict resolver${readOnly ? " (read-only)" : ""}\n`);
-	process.stdout.write(`${message}\n\n`);
+	const { width, height } = terminalDimensions(process.stdout);
+	const lines = [
+		`KAOS conflict resolver${readOnly ? " (read-only)" : ""}`,
+		safeTerminalText(message),
+	];
 	if (inventory.items.length === 0) {
-		process.stdout.write("No conflicts found.\n\nq quit\n");
+		lines.push("No conflicts found.", "q quit");
+		renderTerminalFrame(lines, { width, height });
 		return;
 	}
-	for (let i = 0; i < inventory.items.length; i++) {
-		const prefix = i === selected ? ">" : " ";
-		process.stdout.write(`${prefix} ${inventory.items[i].id} ${formatConflictSummary(inventory.items[i])}\n`);
+	const footer = "Keys: j/k move  enter detail  d diff  1 keep-current/keep-local  2 keep-artifact  x accept-delete  b backups  q quit";
+	const availableRows = Math.max(0, height - (mode === "detail" ? 5 : 4));
+	const listRows = mode === "detail" && availableRows > 1
+		? Math.min(inventory.items.length, Math.max(1, Math.floor(availableRows * 0.4)))
+		: Math.min(inventory.items.length, availableRows);
+	const detailRows = mode === "detail" ? Math.max(0, availableRows - listRows) : 0;
+	const listView = terminalViewport(inventory.items, selected, listRows);
+	lines.push(`CONFLICTS · ${inventory.items.length}${formatViewportRange(listView)}`);
+	for (let offset = 0; offset < listView.items.length; offset++) {
+		const index = listView.start + offset;
+		const prefix = index === selected ? ">" : " ";
+		lines.push(`${prefix} ${listView.items[offset].id} ${formatConflictSummary(listView.items[offset])}`);
 	}
-	process.stdout.write("\nKeys: j/k move  enter detail  d diff  1 keep-current/keep-local  2 keep-artifact  x accept-delete  b backups  q quit\n\n");
 	if (mode === "detail") {
-		process.stdout.write(detailText);
-		process.stdout.write("\n");
+		const detailLines = String(detailText || "No detail available.")
+			.split("\n")
+			.map((line) => safeTerminalText(line));
+		const detailView = terminalViewport(detailLines, 0, detailRows, { anchor: "start" });
+		lines.push(`DETAIL${formatViewportRange(detailView)}`, ...detailView.items);
 	}
+	lines.push(footer);
+	renderTerminalFrame(lines, { width, height });
 }
 
 function createKeyReader(input) {
@@ -2215,8 +2410,8 @@ function printUsage() {
   kaos start
   kaos stop
   kaos uninstall [--dry-run] [--yes] [--purge-vault --vault <path>]
-  kaos status
-  kaos doctor
+  kaos status [--json]
+  kaos doctor [--json]
   kaos ui [--vault <path>]
   kaos conflicts <command> [options]
   kaos history [--config <path>]

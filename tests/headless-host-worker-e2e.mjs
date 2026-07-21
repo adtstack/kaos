@@ -37,6 +37,7 @@ async function main() {
 	const dataA = join(root, "data-a.json");
 	const dataB = join(root, "data-b.json");
 	const envToken = randomBytes(32).toString("hex");
+	const claimSecret = randomBytes(32).toString("hex");
 	const children = [];
 
 	await mkdir(vaultA, { recursive: true });
@@ -59,6 +60,8 @@ async function main() {
 		persistDir,
 		"--log-level",
 		"error",
+		"--var",
+		`KAOS_CLAIM_SECRET:${claimSecret}`,
 	], {
 		cwd: resolve("server"),
 		stdio: ["ignore", "pipe", "pipe"],
@@ -66,7 +69,8 @@ async function main() {
 			...process.env,
 			CLOUDFLARE_INCLUDE_PROCESS_ENV: "true",
 			CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false",
-			SYNC_TOKEN: envToken,
+			SYNC_TOKEN: "",
+			KAOS_CLAIM_SECRET: claimSecret,
 		},
 	});
 	children.push(wrangler);
@@ -78,7 +82,7 @@ async function main() {
 		await waitForWorker(host, wranglerOutput);
 		const capabilities = await fetchCapabilities(host);
 		assert.equal(capabilities.attachments, true, "R2-enabled wrangler config should advertise attachments");
-		const token = await resolveAuthToken(host, envToken);
+		const token = await resolveAuthToken(host, envToken, claimSecret, vaultId);
 		await writeHeadlessData(dataA, {
 			host,
 			token,
@@ -195,6 +199,7 @@ async function runNoR2GracefulSmoke() {
 	const dataA = join(root, "data-a.json");
 	const dataB = join(root, "data-b.json");
 	const envToken = randomBytes(32).toString("hex");
+	const claimSecret = randomBytes(32).toString("hex");
 	const children = [];
 
 	await mkdir(vaultA, { recursive: true });
@@ -213,6 +218,8 @@ async function runNoR2GracefulSmoke() {
 		persistDir,
 		"--log-level",
 		"error",
+		"--var",
+		`KAOS_CLAIM_SECRET:${claimSecret}`,
 	], {
 		cwd: resolve("server"),
 		stdio: ["ignore", "pipe", "pipe"],
@@ -231,7 +238,7 @@ async function runNoR2GracefulSmoke() {
 		await waitForWorker(host, wranglerOutput);
 		const capabilities = await fetchCapabilities(host);
 		assert.equal(capabilities.attachments, false, "default wrangler config should not advertise attachments");
-		const token = await resolveAuthToken(host, envToken);
+		const token = await resolveAuthToken(host, envToken, claimSecret, vaultId);
 		await writeHeadlessData(dataA, {
 			host,
 			token,
@@ -282,6 +289,7 @@ async function runOperationalSmokeScript() {
 	const tokenFile = join(root, "sync-token");
 	const envFile = join(root, "headless.env");
 	const envToken = randomBytes(32).toString("hex");
+	const claimSecret = randomBytes(32).toString("hex");
 	const children = [];
 
 	await mkdir(primaryVault, { recursive: true });
@@ -299,6 +307,8 @@ async function runOperationalSmokeScript() {
 		persistDir,
 		"--log-level",
 		"error",
+		"--var",
+		`KAOS_CLAIM_SECRET:${claimSecret}`,
 	], {
 		cwd: resolve("server"),
 		stdio: ["ignore", "pipe", "pipe"],
@@ -314,7 +324,7 @@ async function runOperationalSmokeScript() {
 	let primary = null;
 	try {
 		await waitForWorker(host, wranglerOutput);
-		const token = await resolveAuthToken(host, envToken);
+		const token = await resolveAuthToken(host, envToken, claimSecret, vaultId);
 		await writeFile(tokenFile, token, "utf8");
 		await writeFile(envFile, `KAOS_HOST=${host}
 KAOS_VAULT_ID=${vaultId}
@@ -486,12 +496,15 @@ async function waitForWorker(host, output) {
 	}, e2eTimeout(20_000));
 }
 
-async function resolveAuthToken(host, defaultEnvToken) {
+async function resolveAuthToken(host, defaultEnvToken, claimSecret, vaultId) {
 	const capabilities = await fetchCapabilities(host);
 	if (capabilities?.claimed === true && capabilities?.authMode === "env") {
 		return defaultEnvToken;
 	}
-	return await claimServer(host);
+	if (typeof claimSecret !== "string" || claimSecret.length < 32) {
+		throw new Error("KAOS_CLAIM_SECRET is required to claim an unclaimed test Worker");
+	}
+	return await claimServer(host, claimSecret, vaultId);
 }
 
 async function fetchCapabilities(host) {
@@ -502,14 +515,16 @@ async function fetchCapabilities(host) {
 	return await capabilitiesRes.json();
 }
 
-async function claimServer(host) {
+async function claimServer(host, claimSecret, vaultId) {
 	const token = randomBytes(32).toString("hex");
 	const res = await fetch(`${host}/claim`, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
+			"Origin": host,
+			"X-KAOS-Claim-Proof": claimSecret,
 		},
-		body: JSON.stringify({ token }),
+		body: JSON.stringify({ token, vaultId }),
 	});
 	if (!res.ok) {
 		throw new Error(`claim failed (${res.status}): ${await res.text()}`);

@@ -51,7 +51,42 @@ export interface DashboardConflictArtifact {
 	artifactSize: number | null;
 	artifactIndexed: boolean;
 	originalIndexed: boolean;
+	blobResolution: DashboardBlobConflictResolution | null;
 }
+
+export interface DashboardBlobConflictResolution {
+	kind: "remote-download-conflict";
+	episodeId: string;
+	expectedLocalHash: string | null;
+	expectedRemoteHash: string;
+	expectedRemoteRef: BlobRef | null;
+	expectedRemoteSourceVersion: string | null;
+	originalFile: DashboardLocalFileIdentity;
+	artifactFile: DashboardLocalFileIdentity;
+	keepLocalPending: boolean;
+	canKeepLocal: boolean;
+	canUseRemoteCopy: boolean;
+	keepLocalUnavailableReason: string | null;
+	useRemoteCopyUnavailableReason: string | null;
+}
+
+export interface DashboardBlobConflictResolutionTarget
+	extends DashboardBlobConflictResolution {
+	path: string;
+	artifactPath: string;
+}
+
+export type DashboardBlobConflictResolutionChoice =
+	| "keep-local"
+	| "use-remote-copy";
+
+export type DashboardBlobConflictResolutionResult =
+	| { status: "pending"; message: string }
+	| {
+		status: "completed";
+		safetyCopyPath: string | null;
+		artifactRemoved: boolean;
+	};
 
 export interface DashboardAttentionItem {
 	kind: "preserved-unresolved" | "structural-change" | "blocked-divergence" | "frontmatter-quarantine";
@@ -195,6 +230,11 @@ export interface KaosDashboardData {
 	recoveryStorageStatus: DashboardRecoveryStorageStatus;
 	recentChanges: DashboardRecentChanges;
 	conflicts: DashboardConflictArtifact[];
+	/**
+	 * Local rollback copies created during otherwise clean blob replacement or
+	 * remote deletion. These are deliberately not counted as conflicts.
+	 */
+	blobSafetyCopies: DashboardConflictArtifact[];
 	attention: DashboardAttentionItem[];
 	attentionTotalCount: number;
 	actions: DashboardActionState;
@@ -234,6 +274,8 @@ export interface DashboardBlobSyncDebug {
 	permanentUploadFailures: number;
 	permanentDownloadFailures: number;
 	blobConflictArtifacts: number;
+	/** Session count of clean-operation rollback copies, when supported. */
+	blobSafetyBackups?: number;
 	localOnlyBlobConflictPaths: number;
 }
 
@@ -259,6 +301,14 @@ export interface KaosDashboardCollectorInput {
 			episodeId: string,
 		): boolean;
 		getBlobRef(path: string): BlobRef | null;
+	};
+	blobConflictResolutionState?: {
+		available: boolean;
+		isPathSyncable(path: string): boolean;
+		getBlobRef(path: string): BlobRef | null;
+		getBlobSourceVersion(path: string): string | null;
+		isKeepLocalPending(path: string, episodeId: string): boolean;
+		isUseRemoteResumePending(path: string, episodeId: string): boolean;
 	};
 	frontmatterQuarantineEntries: FrontmatterQuarantineEntry[];
 	diskIndex: DiskIndex;

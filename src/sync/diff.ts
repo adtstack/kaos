@@ -69,10 +69,10 @@ export function applyDiffToYTextWithPostcondition(
 	newText: string,
 	origin: string,
 ): DiffPostconditionResult {
-	const currentText = ytext.toString();
+	const currentText = ytext.toJSON();
 	if (currentText !== oldText) {
 		forceReplaceYText(ytext, newText, origin);
-		const afterForce = ytext.toString();
+		const afterForce = ytext.toJSON();
 		return {
 			diffSkippedDueToStaleBase: true,
 			matchesAfterDiff: false,
@@ -84,7 +84,7 @@ export function applyDiffToYTextWithPostcondition(
 
 	applyDiffToYText(ytext, oldText, newText, origin);
 
-	const afterDiff = ytext.toString();
+	const afterDiff = ytext.toJSON();
 	if (afterDiff === newText) {
 		return {
 			diffSkippedDueToStaleBase: false,
@@ -96,7 +96,7 @@ export function applyDiffToYTextWithPostcondition(
 	}
 
 	forceReplaceYText(ytext, newText, origin);
-	const afterForce = ytext.toString();
+	const afterForce = ytext.toJSON();
 	return {
 		diffSkippedDueToStaleBase: false,
 		matchesAfterDiff: false,

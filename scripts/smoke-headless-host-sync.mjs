@@ -560,13 +560,6 @@ async function stopChild(child) {
 	]);
 }
 
-function dumpPeerOutput(peer) {
-	console.error("\n[headless smoke peer stdout]");
-	console.error(peer.output.stdout.trim() || "(empty)");
-	console.error("\n[headless smoke peer stderr]");
-	console.error(peer.output.stderr.trim() || "(empty)");
-}
-
 function trimOutput(text) {
 	return text.length > 20_000 ? text.slice(-20_000) : text;
 }

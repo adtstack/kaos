@@ -3,7 +3,8 @@
 Real-time Obsidian vault sync that runs on infrastructure you own.
 
 KAOS pairs an Obsidian plugin with a small Cloudflare Worker/Durable Object
-server. Markdown files stay as normal local files, while text edits merge live
+server. Markdown and Obsidian Base (`.base`) documents stay as normal local
+files, while text edits merge live
 across devices through Yjs CRDTs. Attachments, snapshots, and deployment updates
 are handled separately so the core editing path stays fast and understandable.
 
@@ -23,7 +24,7 @@ KAOS's history.
 
 ## What KAOS Cares About
 
-**Local files stay real.** Your vault remains a folder of Markdown files on
+**Local files stay real.** Your vault remains a folder of Markdown and Base documents on
 disk. KAOS syncs that folder instead of replacing it with a hosted database or a
 new editor.
 
@@ -43,7 +44,7 @@ the first thing a user has to understand.
 bounded reset tools exist because sync systems fail in boring, real-world ways.
 KAOS treats recovery as product surface, not as an afterthought.
 
-**Limits should be explicit.** KAOS is for personal and small-team Markdown
+**Limits should be explicit.** KAOS is for personal and small-team text-document
 vaults. It is not trying to sync every Obsidian setting, every plugin database,
 empty folders, or arbitrarily large text archives.
 
@@ -52,16 +53,16 @@ empty folders, or arbitrarily large text archives.
 KAOS has two parts: the Obsidian plugin and the Cloudflare Worker server.
 
 1. Click **Deploy to Cloudflare** above to create the Worker in your account.
-2. Open the Worker URL and claim the server.
+2. Enter the one-time claim secret chosen during deployment and claim the server.
 3. Install the KAOS Obsidian plugin.
 4. Connect your vault from the claim page, setup link, or QR code.
 5. Optional: add a Cloudflare R2 bucket for attachments and snapshots.
 
-After pairing, Markdown files begin syncing through the shared vault room.
+After pairing, Markdown and `.base` files begin syncing through the shared vault room.
 
 ## How It Works
 
-1. Each Markdown file receives a stable identity and a `Y.Text` CRDT.
+1. Each Markdown or `.base` document receives a stable identity and a `Y.Text` CRDT.
 2. Per-file CRDTs live inside one vault-level `Y.Doc`, so cross-file operations
    such as renames can be handled as one shared transaction.
 3. Live editor edits flow through Yjs and CodeMirror.
@@ -75,7 +76,7 @@ After pairing, Markdown files begin syncing through the shared vault room.
 
 ## Attachments and Snapshots
 
-Markdown sync works without R2. To sync images, PDFs, and other attachments,
+Markdown and `.base` sync work without R2. To sync images, PDFs, and other attachments,
 configure an R2 bucket for the server.
 
 R2 also enables daily automatic snapshots and manual point-in-time backups.
@@ -119,13 +120,26 @@ KAOS commands are available from the Obsidian command palette.
 
 | Command | Purpose |
 | --- | --- |
+| Open dashboard | Review sync health, conflicts, recovery, and actions |
 | Reconnect to sync server | Reopen the live sync connection |
-| Force reconcile | Re-merge local disk state with the CRDT |
+| Force reconcile vault with sync state | Re-merge local disk state with the CRDT |
 | Show sync debug info | Inspect connection, queue, and file state |
+| Copy debug info to clipboard | Copy the redacted diagnostic summary |
+| Show recent sync events | Print the recent event timeline to the console |
+| Show files needing attention | List preserved conflicts and guarded files |
+| Export sync diagnostics (safe) | Export diagnostics without filenames |
+| Export sync diagnostics with filenames | Export a local-private diagnostic bundle |
+| Migrate sync schema to v2 | Run the explicit legacy schema migration |
+| Import untracked files now | Admit eligible local documents into sync |
 | Clear local server-receipt state | Reset this device's local receipt tracking |
-| Take snapshot now | Create an immediate R2 snapshot |
-| Browse and restore snapshots | Inspect, diff, and restore snapshot files |
-| Reset local cache | Clear local IndexedDB state and re-sync |
+| Reset local cache (re-sync from server) | Clear local IndexedDB state and re-sync |
+| Take vault snapshot now | Create an immediate R2 snapshot |
+| Browse and restore vault snapshots | Inspect, diff, and restore snapshot files |
+| Create file history point | Save a file-level recovery point |
+| Review file history | Browse and restore file history |
+| Cleanup old vault snapshots | Apply snapshot retention cleanup |
+| Check file history storage | Diagnose and repair history storage |
+| Cleanup file history | Remove history entries using the configured policy |
 | Nuclear reset | Wipe shared CRDT state and re-seed from disk |
 
 ## Engineering Notes

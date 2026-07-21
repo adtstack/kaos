@@ -11,6 +11,15 @@ import {
 import { json } from "./http";
 import type { AuthState, AuthStateCached, Env, UpdateProvider } from "./types";
 import { MAX_BLOB_UPLOAD_BYTES } from "../contracts";
+import * as QRCode from "qrcode/lib/browser";
+
+export const CLAIM_PROOF_HEADER = "X-KAOS-Claim-Proof";
+const MIN_CLAIM_SECRET_LENGTH = 32;
+const MAX_CLAIM_SECRET_LENGTH = 512;
+const MIN_CLAIM_TOKEN_LENGTH = 32;
+const MAX_CLAIM_TOKEN_LENGTH = 512;
+const MIN_CLAIM_VAULT_ID_LENGTH = 8;
+const MAX_CLAIM_VAULT_ID_LENGTH = 128;
 
 export function getHttpAuthToken(req: Request): string | null {
 	const auth = req.headers.get("Authorization");
@@ -28,6 +37,137 @@ export function getSocketAuthToken(req: Request): string | null {
 async function hashToken(token: string): Promise<string> {
 	const bytes = new TextEncoder().encode(token);
 	return sha256Hex(bytes);
+}
+
+function configuredClaimSecret(env: Env): string | null {
+	const secret = env.KAOS_CLAIM_SECRET;
+	if (
+		typeof secret !== "string"
+		|| secret.length < MIN_CLAIM_SECRET_LENGTH
+		|| secret.length > MAX_CLAIM_SECRET_LENGTH
+		|| !/^[\x21-\x7e]+$/.test(secret)
+	) {
+		return null;
+	}
+	return secret;
+}
+
+export function isClaimSecretConfigured(env: Env): boolean {
+	return configuredClaimSecret(env) !== null;
+}
+
+function containsControlCharacter(value: string): boolean {
+	return Array.from(value).some((character) => {
+		const codePoint = character.codePointAt(0) ?? 0;
+		return codePoint <= 0x1f || codePoint === 0x7f;
+	});
+}
+
+function isValidClaimToken(value: unknown): value is string {
+	return typeof value === "string"
+		&& value.length >= MIN_CLAIM_TOKEN_LENGTH
+		&& value.length <= MAX_CLAIM_TOKEN_LENGTH
+		&& /^[\x21-\x7e]+$/.test(value);
+}
+
+function isValidClaimVaultId(value: unknown): value is string {
+	return typeof value === "string"
+		&& value === value.trim()
+		&& value.length >= MIN_CLAIM_VAULT_ID_LENGTH
+		&& value.length <= MAX_CLAIM_VAULT_ID_LENGTH
+		&& !containsControlCharacter(value);
+}
+
+export interface ValidatedClaimRequest {
+	host: string;
+	token: string;
+	tokenHash: string;
+	vaultId: string;
+}
+
+export type ClaimRequestPreflightResult =
+	| { ok: true; claim: ValidatedClaimRequest }
+	| { ok: false; response: Response };
+
+/**
+ * Compare fixed-size SHA-256 digests so a wrong prefix does not return sooner
+ * than a right prefix.  Claim proofs are bounded before hashing to avoid an
+ * attacker turning this endpoint into an unbounded CPU/memory input.
+ */
+async function claimProofMatches(expected: string, supplied: string | null): Promise<boolean> {
+	if (supplied === null || supplied.length > MAX_CLAIM_SECRET_LENGTH) return false;
+	const [expectedHash, suppliedHash] = await Promise.all([
+		hashToken(expected),
+		hashToken(supplied),
+	]);
+	let difference = 0;
+	for (let i = 0; i < expectedHash.length; i++) {
+		difference |= expectedHash.charCodeAt(i) ^ suppliedHash.charCodeAt(i);
+	}
+	return difference === 0;
+}
+
+/**
+ * Validate every stateless part of a first-claim request before the Worker
+ * consults KAOS_CONFIG. The parsed body is returned to the second phase so the
+ * request stream is consumed exactly once.
+ */
+export async function preflightClaimRequest(
+	req: Request,
+	env: Env,
+): Promise<ClaimRequestPreflightResult> {
+	const url = new URL(req.url);
+	const claimSecret = configuredClaimSecret(env);
+	if (!claimSecret) {
+		return { ok: false, response: json({ error: "claim_not_configured" }, 503) };
+	}
+
+	const mediaType = req.headers.get("Content-Type")?.split(";", 1)[0]?.trim().toLowerCase();
+	if (mediaType !== "application/json") {
+		return {
+			ok: false,
+			response: json({ error: "content_type_must_be_application_json" }, 415),
+		};
+	}
+
+	// Browser requests must originate from the Worker itself. Requests without
+	// Origin (for example an operator's curl invocation) still need the proof.
+	const origin = req.headers.get("Origin");
+	if (origin !== null && origin !== url.origin) {
+		return { ok: false, response: json({ error: "claim_origin_forbidden" }, 403) };
+	}
+
+	if (!(await claimProofMatches(claimSecret, req.headers.get(CLAIM_PROOF_HEADER)))) {
+		return { ok: false, response: json({ error: "claim_proof_invalid" }, 403) };
+	}
+
+	let body: unknown;
+	try {
+		body = await req.json();
+	} catch {
+		return { ok: false, response: json({ error: "invalid json" }, 400) };
+	}
+
+	if (typeof body !== "object" || body === null || Array.isArray(body)) {
+		return { ok: false, response: json({ error: "invalid json" }, 400) };
+	}
+	const claim = body as { token?: unknown; vaultId?: unknown };
+	if (!isValidClaimToken(claim.token)) {
+		return { ok: false, response: json({ error: "invalid token" }, 400) };
+	}
+	if (!isValidClaimVaultId(claim.vaultId)) {
+		return { ok: false, response: json({ error: "invalid vaultId" }, 400) };
+	}
+
+	return {
+		ok: true,
+		claim: {
+			host: url.origin,
+			token: claim.token,
+			tokenHash: await hashToken(claim.token),
+			vaultId: claim.vaultId,
+		},
+	};
 }
 
 export function supportsBuckets(env: Env): boolean {
@@ -227,6 +367,11 @@ function buildObsidianSetupUrl(host: string, token: string, vaultId?: string): s
 	return `obsidian://kaos?${params.toString()}`;
 }
 
+function buildMobileSetupUrl(host: string, token: string, vaultId: string): string {
+	const fragment = new URLSearchParams({ host, token, vaultId }).toString();
+	return `${host}/mobile-setup#${fragment}`;
+}
+
 export function getCapabilities(
 	auth: AuthState,
 	env: Env,
@@ -269,29 +414,31 @@ export function getCapabilities(
 	};
 }
 
-export async function handleClaimRoute(req: Request, env: Env, authState: AuthState): Promise<Response> {
-	const url = new URL(req.url);
+export async function handleValidatedClaimRoute(
+	claim: ValidatedClaimRequest,
+	env: Env,
+	authState: AuthState,
+): Promise<Response> {
 	if (authState.claimed) {
 		return json({ error: "already_claimed" }, 403);
 	}
 
-	let body: { token?: string; vaultId?: string } = {};
+	const { host, token, tokenHash, vaultId } = claim;
+	const mobileSetupUrl = buildMobileSetupUrl(host, token, vaultId);
+	let qrSvg: string | null = null;
 	try {
-		body = await req.json();
+		qrSvg = await QRCode.toString(mobileSetupUrl, {
+			type: "svg",
+			errorCorrectionLevel: "M",
+			margin: 2,
+			width: 240,
+			color: { dark: "#08111d", light: "#ffffff" },
+		});
 	} catch {
-		return json({ error: "invalid json" }, 400);
+		// QR is a convenience only.  Do not log the generated URL/token and
+		// do not make the atomic claim depend on optional rendering.
+		console.warn("[kaos-sync:worker] local QR rendering unavailable");
 	}
-
-	if (typeof body.token !== "string" || body.token.trim().length < 32) {
-		return json({ error: "invalid token" }, 400);
-	}
-	if (body.vaultId !== undefined && (typeof body.vaultId !== "string" || body.vaultId.trim().length < 8)) {
-		return json({ error: "invalid vaultId" }, 400);
-	}
-
-	const token = body.token.trim();
-	const vaultId = typeof body.vaultId === "string" ? body.vaultId.trim() : "";
-	const tokenHash = await hashToken(token);
 	const claimed = await claimServerConfig(env, tokenHash);
 	if (!claimed) {
 		return json({ error: "already_claimed" }, 403);
@@ -309,8 +456,10 @@ export async function handleClaimRoute(req: Request, env: Env, authState: AuthSt
 
 	return json({
 		ok: true,
-		host: url.origin,
-		obsidianUrl: buildObsidianSetupUrl(url.origin, token, vaultId || undefined),
+		host,
+		obsidianUrl: buildObsidianSetupUrl(host, token, vaultId),
+		mobileSetupUrl,
+		qrSvg,
 		capabilities: getCapabilities(
 			{ mode: "claim", claimed: true, tokenHash },
 			env,
@@ -318,6 +467,18 @@ export async function handleClaimRoute(req: Request, env: Env, authState: AuthSt
 			{ includePrivateUpdateMetadata: true },
 		),
 	});
+}
+
+export async function handleClaimRoute(req: Request, env: Env, authState: AuthState): Promise<Response> {
+	// Direct callers that already have auth state retain the inexpensive and
+	// backwards-compatible already-claimed response. The Worker dispatcher uses
+	// preflightClaimRequest() before obtaining this state.
+	if (authState.claimed) {
+		return json({ error: "already_claimed" }, 403);
+	}
+	const preflight = await preflightClaimRequest(req, env);
+	if (!preflight.ok) return preflight.response;
+	return await handleValidatedClaimRoute(preflight.claim, env, authState);
 }
 
 export async function handleUpdateMetadataRoute(req: Request, env: Env, authState: AuthState): Promise<Response> {

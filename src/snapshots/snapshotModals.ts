@@ -35,9 +35,6 @@ export class SnapshotListModal extends Modal {
 				text: `Storage: at least ${this.snapshots.length} vault snapshots using ~${totalMB.toFixed(1)} MB (may be more). ` +
 					`Consider pruning old vault snapshots to reduce storage usage.`,
 			});
-			warning.style.color = "var(--text-error)";
-			warning.style.marginBottom = "8px";
-			warning.style.fontSize = "0.85em";
 		}
 
 		const list = contentEl.createDiv({ cls: "snapshot-list" });

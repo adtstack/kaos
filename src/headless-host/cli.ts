@@ -8,6 +8,11 @@ import { HeadlessVaultPoller, type HeadlessVaultPollerOptions } from "./core/vau
 import { bootKaosHeadlessPlugin } from "./kaos/bootKaosPlugin";
 import { mergeConfigPatch, mergeKaosHeadlessConfig, readKaosHeadlessData, type KaosHeadlessConfigPatch } from "./kaos/config";
 import { HeadlessHostLockfile } from "./kaos/lockfile";
+import {
+	formatHeadlessDoctor,
+	formatHeadlessStatus,
+	shouldUseHumanOutput,
+} from "./humanOutput";
 
 type CliMode = "run" | "status" | "dump-config" | "doctor";
 
@@ -23,6 +28,7 @@ interface CliOptions {
 	pollQuietMs: number;
 	requireSyncConfig: boolean;
 	skipWorkerCapabilities: boolean;
+	forceJson: boolean;
 	configPatch: KaosHeadlessConfigPatch;
 }
 
@@ -119,7 +125,7 @@ export async function runHeadlessHostCli(
 			poller.stop();
 			let unloadError: unknown;
 			try {
-				await plugin.onunload();
+				await Promise.resolve(plugin.onunload());
 			} catch (err) {
 				unloadError = err;
 				log("plugin-unload-failed", { reason, error: errorMessage(err) });
@@ -130,7 +136,9 @@ export async function runHeadlessHostCli(
 			log("shutdown", { reason });
 			await sleep(750);
 			if (reason === "boot-only" && unloadError !== undefined) {
-				throw unloadError;
+				throw unloadError instanceof Error
+					? unloadError
+					: new Error(errorMessage(unloadError));
 			}
 		};
 		log("booted", {
@@ -178,6 +186,7 @@ async function parseArgs(argv: string[]): Promise<CliOptions> {
 		pollQuietMs: parseNonNegativeInt(raw["poll-quiet-ms"], 1100, "poll-quiet-ms"),
 		requireSyncConfig: raw["require-sync-config"] === "true",
 		skipWorkerCapabilities: raw["skip-worker-capabilities"] === "true",
+		forceJson: raw.json === "true",
 		configPatch: {
 			host: readStringOption(raw.host, process.env.KAOS_HOST),
 			token,
@@ -201,7 +210,7 @@ function parseKeyValueArgs(argv: string[]): Record<string, string> {
 			out["boot-only"] = "true";
 			continue;
 		}
-		if (arg === "--status" || arg === "--dump-config" || arg === "--doctor") {
+		if (arg === "--status" || arg === "--dump-config" || arg === "--doctor" || arg === "--json") {
 			out[arg.slice(2)] = "true";
 			continue;
 		}
@@ -278,9 +287,10 @@ function printUsage(): void {
 	console.log(`Usage: npm run headless:host -- [--vault <path>] [--data-file <path>] [--boot-only] [--poll-interval-ms <ms>]
 
 Options:
-  --status                    Print current headless host status JSON and exit.
+  --status                    Print current headless host status and exit.
   --dump-config               Print resolved config JSON with secrets redacted and exit.
   --doctor                    Check local paths and optional Worker capabilities, then exit.
+  --json                      Force JSON output with --status or --doctor.
   --require-sync-config       With --doctor, fail unless host/token/vaultId/deviceName are configured.
   --skip-worker-capabilities  With --doctor, skip the Worker /api/capabilities network probe.
   --vault <path>              Vault root. Defaults to a temporary directory.
@@ -304,7 +314,7 @@ Options:
 async function printStatus(options: CliOptions): Promise<void> {
 	const data = mergeConfigPatch(await readKaosHeadlessData(options.dataFile), options.configPatch);
 	const lock = await readLockStatus(options.lockFile);
-	log("status", {
+	const status = {
 		vaultRoot: options.vaultRoot,
 		dataFile: options.dataFile,
 		lockFile: options.lockFile,
@@ -313,7 +323,12 @@ async function printStatus(options: CliOptions): Promise<void> {
 		lockHeld: lock.held,
 		lock,
 		configured: summarizeConfig(data),
-	});
+	};
+	if (useHumanOutput(options)) {
+		console.log(formatHeadlessStatus(status));
+	} else {
+		log("status", status);
+	}
 }
 
 async function printDumpConfig(options: CliOptions): Promise<void> {
@@ -353,7 +368,7 @@ async function printDoctor(options: CliOptions): Promise<boolean> {
 	}
 	const ok = checks.every((check) => check.ok);
 	const lock = await readLockStatus(options.lockFile);
-	log("doctor", {
+	const doctor = {
 		ok,
 		vaultRoot: options.vaultRoot,
 		dataFile: options.dataFile,
@@ -364,8 +379,17 @@ async function printDoctor(options: CliOptions): Promise<boolean> {
 		lock,
 		configured: summarizeConfig(data),
 		checks,
-	});
+	};
+	if (useHumanOutput(options)) {
+		console.log(formatHeadlessDoctor(doctor));
+	} else {
+		log("doctor", doctor);
+	}
 	return ok;
+}
+
+function useHumanOutput(options: CliOptions): boolean {
+	return shouldUseHumanOutput(process.stdout.isTTY, options.forceJson);
 }
 
 async function readLockStatus(path: string): Promise<Record<string, unknown>> {

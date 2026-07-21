@@ -390,7 +390,7 @@ export class FlightTraceController {
 
 	private async _resolveAndRecordCore(event: FlightPathEventInput, reservedSeq: number | undefined): Promise<void> {
 		const identity = await this.getPathId(event.path);
-		const { path: _removedPath, ...rest } = event;
+		const rest = { ...event, path: undefined };
 		this.recorder?.record(
 			{
 				...rest,
@@ -481,4 +481,3 @@ async function deleteDirectoryRecursive(app: App, dir: string): Promise<void> {
 		try { await app.vault.adapter.rmdir(dir, false); } catch { /* ok */ }
 	} catch { /* skip */ }
 }
-

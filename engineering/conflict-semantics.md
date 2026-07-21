@@ -64,8 +64,25 @@ classification so restart reconciliation does not seed it into CRDT.
 4. Show a Notice to the user.
 5. Increment `_blobConflictArtifacts` counter (visible in debug snapshot).
 
-**Who wins:** Local version stays at the original path. Remote version is
-preserved as a local-only artifact.
+**Who wins:** Neither side is selected automatically. The local version stays
+at the original path and the remote version remains a local-only artifact until
+the user makes an explicit choice in Dashboard → Conflicts.
+
+**Manual resolution:** Every active blob conflict row shows two distinct
+actions:
+
+- **Keep local original** publishes the exact reviewed local bytes as a causal
+  successor of the exact remote ref. The marker and remote artifact remain
+  until the guarded upload and durable settlement complete.
+- **Use remote copy** installs the exact reviewed remote artifact at the
+  canonical path without rewriting the remote ref. The displaced local file is
+  retained as a visible `KAOS local backup` safety copy.
+
+Both actions are bound to the conflict episode, original/artifact file
+identities, full remote ref, and CRDT source version. A changed file or stale
+remote episode disables or rejects the action without selecting either side.
+Ordinary file modify events do not clear this conflict marker or queue an
+implicit upload.
 
 **Sync behavior:** Blob conflict artifacts are **local-only**. They are
 skipped by upload/reconcile paths using both the session-local guard and
@@ -77,6 +94,17 @@ marker.
 **Rationale:** Binary conflict artifacts may be large (images, PDFs) and
 uploading them could create confusion on other devices. The local device
 that experienced the conflict is responsible for resolving it.
+
+### Attachment rollback safety copies are not conflicts
+
+A causally proven clean remote replacement or remote deletion may move the
+exact previous `TFile` to
+`<base> (KAOS local backup <timestamp> <operation-id>).<ext>` before changing
+the canonical path. This is a no-clobber rollback copy required because the
+Vault API does not provide an atomic binary replace operation. It remains
+local-only and visible for manual review, but it is tracked and displayed
+separately from true `KAOS remote conflict` artifacts and does not increment
+the blob conflict counter.
 
 ## 3. Remote delete conflict (local-dirty preservation)
 

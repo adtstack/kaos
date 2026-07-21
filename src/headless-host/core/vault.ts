@@ -1,8 +1,5 @@
-// eslint-disable-next-line import/no-nodejs-modules -- The headless Vault adapter intentionally runs in Node.js, outside Obsidian's renderer.
 import { readdirSync, statSync, type Dirent } from "node:fs";
-// eslint-disable-next-line import/no-nodejs-modules -- The headless Vault adapter intentionally runs in Node.js, outside Obsidian's renderer.
 import { appendFile, link, mkdir, open, readdir, readFile, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
-// eslint-disable-next-line import/no-nodejs-modules -- The headless Vault adapter intentionally runs in Node.js, outside Obsidian's renderer.
 import { dirname, resolve, sep } from "node:path";
 import { HeadlessEventEmitter } from "./events";
 import { normalizePath, parentFolderForPath, TFile, TFolder, type HeadlessFileStats } from "./fileTypes";
@@ -56,7 +53,6 @@ export class HeadlessVault extends HeadlessEventEmitter {
 	constructor(options: HeadlessVaultOptions) {
 		super();
 		this.adapter = new HeadlessVaultAdapter(options.vaultRoot);
-		// eslint-disable-next-line obsidianmd/hardcoded-config-path -- This is the configurable default for the standalone headless Vault implementation.
 		this.configDir = options.configDir ?? ".obsidian";
 		this.name = options.name ?? "Headless Vault";
 		this.trashDir = normalizePath(options.trashDir ?? ".trash");

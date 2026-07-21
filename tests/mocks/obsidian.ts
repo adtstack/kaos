@@ -30,6 +30,35 @@ export class Notice {
 /** Stub class. Type-only in DiskMirror but exported for completeness. */
 export class App {}
 
+/** Minimal ItemView base used by dashboard interaction tests. */
+export class ItemView {
+	readonly app: unknown;
+	readonly contentEl = {};
+	navigation = false;
+
+	constructor(readonly leaf: { app?: unknown } = {}) {
+		this.app = leaf.app;
+	}
+
+	addAction(): void {}
+}
+
+/** Stable desktop defaults; individual tests can exercise layout policy directly. */
+export const Platform = {
+	isMobile: false,
+	isPhone: false,
+	isTablet: false,
+};
+
+/** Injectable requestUrl seam for tests that exercise authenticated HTTP wiring. */
+export async function requestUrl(request: unknown): Promise<unknown> {
+	const handler = (globalThis as {
+		__KAOS_TEST_REQUEST_URL__?: (value: unknown) => Promise<unknown> | unknown;
+	}).__KAOS_TEST_REQUEST_URL__;
+	if (!handler) throw new Error("requestUrl is not configured in this test");
+	return await handler(request);
+}
+
 /** Stub class. ConfirmModal extends Modal — needs to exist as a constructor. */
 export class Modal {
 	constructor(_app?: unknown) {}

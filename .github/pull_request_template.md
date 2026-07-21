@@ -6,6 +6,25 @@
 
 <!-- List the focused checks you ran. -->
 
+## Sync and physical-device safety
+
+For changes that touch live sync, socket admission or reconnect, persistence,
+conflict handling, attachment transfer, or the mobile lifecycle:
+
+- [ ] I linked evidence from a fresh active edit converging across the affected
+      real-device topology (three devices when multi-device behavior changed).
+- [ ] I linked evidence that background/foreground or network restoration
+      reconnects without a plugin reload when reconnect or lifecycle code changed.
+- [ ] I linked real-device evidence that the competing version is preserved and
+      conflict artifacts remain local-only when conflict handling changed.
+- [ ] I linked bounded soak or stress evidence when retry, timer, queue, or
+      backoff behavior changed.
+- [ ] The Verification section records device/OS, Obsidian, plugin, and server
+      versions and points to the retained evidence.
+
+Mark each inapplicable item `N/A` with a short reason. Automated and desktop-CDP
+tests support these checks but do not replace applicable real-device evidence.
+
 ## Remote cost safety
 
 For changes that can reach a Worker, Durable Object, DO storage, R2, reconnect

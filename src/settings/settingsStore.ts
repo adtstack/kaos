@@ -3,6 +3,9 @@ import { randomBase64Url } from "../utils/base64url";
 /** Controls how external disk edits (git, other editors) are imported into CRDT. */
 export type ExternalEditPolicy = "always" | "closed-only" | "never";
 export const MAX_ATTACHMENT_SIZE_KB = 10 * 1024;
+export const MAX_TEXT_FILE_SIZE_KB = 50 * 1024;
+export const MIN_ATTACHMENT_CONCURRENCY = 1;
+export const MAX_ATTACHMENT_CONCURRENCY = 5;
 export const EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION = 1;
 
 export function attachmentSizeCapKB(serverMaxBlobUploadBytes?: number | null): number {
@@ -105,6 +108,61 @@ export interface SettingsLoadResult<TState extends Partial<VaultSyncSettings>> {
 	migrated: boolean;
 }
 
+/**
+ * Run settings transactions strictly in invocation order.  The queue retains a
+ * fulfilled tail after failures so one rejected save cannot poison later edits.
+ */
+export class SettingsMutationQueue {
+	private tail: Promise<void> = Promise.resolve();
+
+	run<T>(transaction: () => Promise<T>): Promise<T> {
+		const result = this.tail.then(transaction);
+		this.tail = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		return result;
+	}
+}
+
+function restoreSettingsInPlace(
+	settings: VaultSyncSettings,
+	previous: VaultSyncSettings,
+	previousKeys: Array<string | symbol>,
+): void {
+	const currentRecord = settings as unknown as Record<string, unknown>;
+	const previousKeySet = new Set(previousKeys);
+	for (const key of Reflect.ownKeys(currentRecord)) {
+		if (!previousKeySet.has(key)) {
+			Reflect.deleteProperty(currentRecord, key);
+		}
+	}
+	Object.assign(settings, previous);
+}
+
+/**
+ * Keep the shared settings object unchanged when durable persistence rejects.
+ * Runtime services retain this object's identity, so rollback must restore it
+ * in place instead of swapping in a clone.
+ */
+export async function persistSettingsMutation(
+	settings: VaultSyncSettings,
+	mutator: (settings: VaultSyncSettings) => void,
+	persist: () => Promise<void>,
+	rollbackPersistentState?: () => void | Promise<void>,
+): Promise<void> {
+	const previous = { ...settings };
+	const previousKeys = Reflect.ownKeys(settings);
+	try {
+		mutator(settings);
+		await persist();
+	} catch (error) {
+		restoreSettingsInPlace(settings, previous, previousKeys);
+		await rollbackPersistentState?.();
+		throw error;
+	}
+}
+
 /** Generate a random vault ID (16 bytes, base64url). */
 export function generateVaultId(): string {
 	return randomBase64Url(16);
@@ -131,11 +189,50 @@ export function readVaultSyncSettings(
 		data as Partial<VaultSyncSettings>,
 	);
 	let migrated = false;
+	const repairString = (key: keyof VaultSyncSettings): void => {
+		if (typeof settings[key] === "string") return;
+		(settings as unknown as Record<keyof VaultSyncSettings, unknown>)[key] =
+			DEFAULT_SETTINGS[key];
+		migrated = true;
+	};
+	const repairBoolean = (key: keyof VaultSyncSettings): void => {
+		if (typeof settings[key] === "boolean") return;
+		(settings as unknown as Record<keyof VaultSyncSettings, unknown>)[key] =
+			DEFAULT_SETTINGS[key];
+		migrated = true;
+	};
+	for (const key of [
+		"host",
+		"token",
+		"vaultId",
+		"deviceName",
+		"excludePatterns",
+		"qaTraceSecret",
+		"updateRepoUrl",
+		"updateRepoBranch",
+	] as const) repairString(key);
+	for (const key of [
+		"debug",
+		"frontmatterGuardEnabled",
+		"enableAttachmentSync",
+		"showRemoteCursors",
+		"remoteTypingGuardEnabled",
+		"qaTraceEnabled",
+		"qaDebugMode",
+	] as const) repairBoolean(key);
 	if (
-		rawExternalEditPolicy != null &&
-		rawExternalEditPolicy !== "always" &&
-		rawExternalEditPolicy !== "closed-only" &&
-		rawExternalEditPolicy !== "never"
+		settings.qaTraceMode !== "safe"
+		&& settings.qaTraceMode !== "qa-safe"
+		&& settings.qaTraceMode !== "full"
+		&& settings.qaTraceMode !== "local-private"
+	) {
+		settings.qaTraceMode = DEFAULT_SETTINGS.qaTraceMode;
+		migrated = true;
+	}
+	if (
+		settings.externalEditPolicy !== "always"
+		&& settings.externalEditPolicy !== "closed-only"
+		&& settings.externalEditPolicy !== "never"
 	) {
 		settings.externalEditPolicy = DEFAULT_SETTINGS.externalEditPolicy;
 		migrated = true;
@@ -161,12 +258,47 @@ export function readVaultSyncSettings(
 	if (
 		typeof settings.maxAttachmentSizeKB !== "number" ||
 		!Number.isFinite(settings.maxAttachmentSizeKB) ||
+		!Number.isInteger(settings.maxAttachmentSizeKB) ||
 		settings.maxAttachmentSizeKB <= 0 ||
 		settings.maxAttachmentSizeKB > attachmentSizeCapKB()
 	) {
 		settings.maxAttachmentSizeKB = Math.min(
 			attachmentSizeCapKB(),
 			Math.max(1, Math.floor(Number(settings.maxAttachmentSizeKB) || DEFAULT_SETTINGS.maxAttachmentSizeKB)),
+		);
+		migrated = true;
+	}
+	if (
+		typeof settings.maxFileSizeKB !== "number"
+		|| !Number.isFinite(settings.maxFileSizeKB)
+		|| !Number.isInteger(settings.maxFileSizeKB)
+		|| settings.maxFileSizeKB < 1
+		|| settings.maxFileSizeKB > MAX_TEXT_FILE_SIZE_KB
+	) {
+		const numeric = typeof settings.maxFileSizeKB === "number"
+			&& Number.isFinite(settings.maxFileSizeKB)
+			? settings.maxFileSizeKB
+			: DEFAULT_SETTINGS.maxFileSizeKB;
+		settings.maxFileSizeKB = Math.min(
+			MAX_TEXT_FILE_SIZE_KB,
+			Math.max(1, Math.floor(numeric)),
+		);
+		migrated = true;
+	}
+	if (
+		typeof settings.attachmentConcurrency !== "number"
+		|| !Number.isFinite(settings.attachmentConcurrency)
+		|| !Number.isInteger(settings.attachmentConcurrency)
+		|| settings.attachmentConcurrency < MIN_ATTACHMENT_CONCURRENCY
+		|| settings.attachmentConcurrency > MAX_ATTACHMENT_CONCURRENCY
+	) {
+		const numeric = typeof settings.attachmentConcurrency === "number"
+			&& Number.isFinite(settings.attachmentConcurrency)
+			? settings.attachmentConcurrency
+			: DEFAULT_SETTINGS.attachmentConcurrency;
+		settings.attachmentConcurrency = Math.min(
+			MAX_ATTACHMENT_CONCURRENCY,
+			Math.max(MIN_ATTACHMENT_CONCURRENCY, Math.floor(numeric)),
 		);
 		migrated = true;
 	}

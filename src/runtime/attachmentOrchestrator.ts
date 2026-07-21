@@ -87,6 +87,7 @@ interface AttachmentOrchestratorDeps {
 	): Promise<void>;
 	getPreservedUnresolvedEntries(): PreservedUnresolvedEntry[];
 	onPreservedUnresolvedChanged(): void;
+	persistPreservedUnresolvedChanged(): Promise<void>;
 	hasPendingBlobIntentForPath(path: string): boolean;
 	replayPendingBlobIntents(reason: string): Promise<void>;
 	trace: TraceRecord;
@@ -292,6 +293,16 @@ export class AttachmentOrchestrator {
 					)
 					: Promise.reject(new Error("Attachment manager authority changed")),
 			},
+			async () => {
+				if (!this.isManagerAuthorityCurrent(blobSync)) {
+					throw new Error("Attachment manager authority changed");
+				}
+				await this.deps.persistPreservedUnresolvedChanged();
+				if (!this.isManagerAuthorityCurrent(blobSync)) {
+					throw new Error("Attachment manager authority changed");
+				}
+			},
+			() => this.isManagerAuthorityCurrent(blobSync),
 		);
 		blobSync.setInventoryGateReady(
 			this.downloadGateLayoutReady,

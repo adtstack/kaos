@@ -59,14 +59,50 @@ function runCommand(cmd, args, token, extraEnv = {}) {
 	});
 }
 
-async function claimServer() {
+async function claimServer(claimSecret) {
 	const token = randomBytes(32).toString("hex");
+	const plainTextRes = await fetch(`${HOST}/claim`, {
+		method: "POST",
+		headers: {
+			"Content-Type": "text/plain",
+			"X-KAOS-Claim-Proof": claimSecret,
+		},
+		body: JSON.stringify({ token }),
+	});
+	if (plainTextRes.status !== 415) {
+		throw new Error(`claim text/plain hardening failed (expected 415, got ${plainTextRes.status})`);
+	}
+
+	const missingProofRes = await fetch(`${HOST}/claim`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ token }),
+	});
+	if (missingProofRes.status !== 403) {
+		throw new Error(`claim proof hardening failed (expected 403, got ${missingProofRes.status})`);
+	}
+
+	const crossOriginRes = await fetch(`${HOST}/claim`, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			"Origin": "https://attacker.example",
+			"X-KAOS-Claim-Proof": claimSecret,
+		},
+		body: JSON.stringify({ token }),
+	});
+	if (crossOriginRes.status !== 403) {
+		throw new Error(`claim origin hardening failed (expected 403, got ${crossOriginRes.status})`);
+	}
+
 	const res = await fetch(`${HOST}/claim`, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
+			"Origin": HOST,
+			"X-KAOS-Claim-Proof": claimSecret,
 		},
-		body: JSON.stringify({ token }),
+		body: JSON.stringify({ token, vaultId: VAULT_ID }),
 	});
 	if (!res.ok) {
 		const text = await res.text();
@@ -77,6 +113,12 @@ async function claimServer() {
 	if (typeof payload?.obsidianUrl !== "string" || !payload.obsidianUrl.startsWith("obsidian://kaos?")) {
 		throw new Error("claim response missing Obsidian setup URL");
 	}
+	if (typeof payload?.qrSvg !== "string" || !payload.qrSvg.startsWith("<svg")) {
+		throw new Error("claim response missing locally generated QR SVG");
+	}
+	if (JSON.stringify(payload).includes(claimSecret)) {
+		throw new Error("claim response leaked deployment claim secret");
+	}
 
 	const capabilities = await fetch(`${HOST}/api/capabilities`).then((result) => result.json());
 	if (capabilities?.claimed !== true || capabilities?.authMode !== "claim") {
@@ -86,7 +128,7 @@ async function claimServer() {
 	return token;
 }
 
-async function resolveAuthToken(defaultEnvToken) {
+async function resolveAuthToken(defaultEnvToken, claimSecret) {
 	const capabilitiesRes = await fetch(`${HOST}/api/capabilities`);
 	if (!capabilitiesRes.ok) {
 		throw new Error(`capabilities probe failed (${capabilitiesRes.status})`);
@@ -95,12 +137,13 @@ async function resolveAuthToken(defaultEnvToken) {
 	if (capabilities?.claimed === true && capabilities?.authMode === "env") {
 		return defaultEnvToken;
 	}
-	return await claimServer();
+	return await claimServer(claimSecret);
 }
 
 async function main() {
 	const persistDir = mkdtempSync(join(tmpdir(), "kaos-wrangler-"));
 	const envToken = randomBytes(32).toString("hex");
+	const claimSecret = randomBytes(32).toString("hex");
 	const wrangler = spawn(
 		WRANGLER_BIN,
 		[
@@ -119,6 +162,8 @@ async function main() {
 			// post-expiry reconnect to be exercised in seconds, not 5 minutes.
 			"--var",
 			"KAOS_TICKET_TTL_MS:8000",
+			"--var",
+			`KAOS_CLAIM_SECRET:${claimSecret}`,
 		],
 		{
 			cwd: resolve("server"),
@@ -127,7 +172,7 @@ async function main() {
 				...process.env,
 			CLOUDFLARE_INCLUDE_PROCESS_ENV: "true",
 			CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false",
-			SYNC_TOKEN: envToken,
+			SYNC_TOKEN: "",
 			},
 		},
 	);
@@ -147,7 +192,7 @@ async function main() {
 
 	try {
 		await waitForWorker();
-		const token = await resolveAuthToken(envToken);
+		const token = await resolveAuthToken(envToken, claimSecret);
 		await runCommand("node", [
 			"tests/schema-guard.mjs",
 		], token);

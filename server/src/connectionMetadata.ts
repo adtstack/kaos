@@ -7,7 +7,7 @@ export type WsMessageLike = ArrayBuffer | ArrayBufferView | string;
 
 export interface ConnectionStateCarrier {
 	state: unknown;
-	setState?: (state: unknown | ((prevState: unknown) => unknown)) => unknown;
+	setState?: (updater: (prevState: unknown) => unknown) => unknown;
 }
 
 export function attachConnectionClientKind(

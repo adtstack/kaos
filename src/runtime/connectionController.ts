@@ -220,6 +220,20 @@ export class ConnectionController {
 
 		sync.onProviderSync((generation) => {
 			if (!this.deps.isReconciled()) {
+				// waitForProviderSync() may time out and start a conservative
+				// reconciliation just before the provider's first authoritative sync
+				// arrives.  Do not drop that edge: the reconciliation controller's
+				// pending bit is consumed after the in-flight startup pass and its safe
+				// mode is re-evaluated then (which promotes the follow-up to
+				// authoritative).
+				if (this.deps.getAwaitingFirstProviderSyncAfterStartup()) {
+					this.deps.setAwaitingFirstProviderSyncAfterStartup(false);
+					this.deps.setReconnectPending();
+					this.deps.log(
+						`First provider sync arrived during startup reconciliation (gen ${generation}) — marked authoritative catch-up pending`,
+					);
+					return;
+				}
 				this.deps.log(`Provider sync ignored: initial startup still running (gen ${generation})`);
 				return;
 			}
