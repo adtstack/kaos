@@ -1,4 +1,6 @@
 import * as Y from "yjs";
+import { EditorState, type TransactionSpec } from "@codemirror/state";
+import { ySyncFacet } from "y-codemirror.next";
 import { EditorBindingManager } from "../src/sync/editorBinding";
 import {
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
@@ -64,6 +66,9 @@ function buildManagerFixture(options: {
 		getTextForPath: (p: string) => (p === path ? expectedText : null),
 		getFileId: () => "file-1",
 		getFileIdForText: (text: Y.Text) => (text === expectedText ? "file-1" : "other-file"),
+		isPendingRenameTarget: () => false,
+		isMarkdownTombstoned: () => false,
+		ensureFile: () => null,
 	};
 
 	const cmDom = { isConnected: true };
@@ -119,6 +124,7 @@ function buildManagerFixture(options: {
 	};
 
 	(manager as unknown as { bindings: Map<string, unknown> }).bindings.set("leaf-1", binding);
+	(manager as unknown as { knownCmViews: Set<unknown> }).knownCmViews.add(cm);
 	return { manager, binding, flightEvents, awarenessStates };
 }
 
@@ -1170,6 +1176,234 @@ console.log("\n--- Test 25: stale path bindings detach before user input propaga
 		"stale path binding is removed before the editor update phase",
 	);
 	await Promise.resolve();
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 26: same-leaf CM overlap selects the focused replacement editor ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const nextPath = "Notes/next.md";
+	const sharedContent = "identical note body";
+	const oldDom = binding.cm.dom;
+	const newDom = { isConnected: true };
+	binding.view.file = { path: nextPath };
+	binding.view.editor = { getValue: () => sharedContent };
+	binding.view.containerEl = {
+		contains: (node: unknown) => node === oldDom || node === newDom,
+	};
+	binding.cm.hasFocus = false;
+	binding.cm.state = {
+		doc: { length: sharedContent.length, toString: () => sharedContent },
+		facet: () => null,
+	};
+	const replacementCm = {
+		dom: newDom,
+		hasFocus: true,
+		state: {
+			doc: { length: sharedContent.length, toString: () => sharedContent },
+			facet: () => null,
+		},
+		dispatch: () => {},
+	};
+	const known = (manager as unknown as { knownCmViews: Set<unknown> }).knownCmViews;
+	known.add(binding.cm);
+	known.add(replacementCm);
+
+	const resolved = (manager as unknown as {
+		getCmView: (view: unknown) => unknown;
+	}).getCmView(binding.view);
+	assertEq(resolved, replacementCm, "focused replacement CM wins over connected stale CM with identical text");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 27: indistinguishable same-leaf CM overlap waits instead of guessing ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const sharedContent = "identical note body";
+	const oldDom = binding.cm.dom;
+	const newDom = { isConnected: true };
+	binding.view.file = { path: "Notes/next.md" };
+	binding.view.editor = { getValue: () => sharedContent };
+	binding.view.containerEl = {
+		contains: (node: unknown) => node === oldDom || node === newDom,
+	};
+	binding.cm.hasFocus = false;
+	binding.cm.state = {
+		doc: { length: sharedContent.length, toString: () => sharedContent },
+		facet: () => null,
+	};
+	const replacementCm = {
+		dom: newDom,
+		hasFocus: false,
+		state: {
+			doc: { length: sharedContent.length, toString: () => sharedContent },
+			facet: () => null,
+		},
+		dispatch: () => {},
+	};
+	const known = (manager as unknown as { knownCmViews: Set<unknown> }).knownCmViews;
+	known.add(binding.cm);
+	known.add(replacementCm);
+
+	const resolved = (manager as unknown as {
+		getCmView: (view: unknown) => unknown;
+	}).getCmView(binding.view);
+	assertEq(resolved, null, "ambiguous identical CM overlap defers binding until identity is clear");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 28: apply guard rejects a stale CM even when document bytes match ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const nextPath = "Notes/next.md";
+	const sharedContent = "identical note body";
+	const oldDom = binding.cm.dom;
+	const newDom = { isConnected: true };
+	binding.view.file = { path: nextPath };
+	binding.view.editor = { getValue: () => sharedContent };
+	binding.view.containerEl = {
+		contains: (node: unknown) => node === oldDom || node === newDom,
+	};
+	binding.cm.hasFocus = false;
+	binding.cm.state = {
+		doc: { length: sharedContent.length, toString: () => sharedContent },
+		facet: () => null,
+	};
+	const replacementCm = {
+		dom: newDom,
+		hasFocus: true,
+		state: {
+			doc: { length: sharedContent.length, toString: () => sharedContent },
+			facet: () => null,
+		},
+		dispatch: () => {},
+	};
+	const nextDoc = new Y.Doc();
+	const nextText = nextDoc.getText("content");
+	nextText.insert(0, sharedContent);
+	const known = (manager as unknown as { knownCmViews: Set<unknown> }).knownCmViews;
+	known.add(binding.cm);
+	known.add(replacementCm);
+	let staleDispatches = 0;
+	binding.cm.dispatch = () => {
+		staleDispatches++;
+	};
+
+	const applied = (manager as unknown as {
+		applyBinding: (options: unknown) => boolean;
+	}).applyBinding({
+		action: "bind",
+		deviceName: "TestDevice",
+		view: binding.view,
+		cm: binding.cm,
+		cmId: "cm-old",
+		leafId: "leaf-1",
+		filePath: nextPath,
+		ytext: nextText,
+		fileId: "file-next",
+	});
+
+	assertEq(applied, false, "apply guard refuses the non-current CM identity");
+	assertEq(staleDispatches, 0, "stale CM is not reconfigured");
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.get("leaf-1"),
+		binding,
+		"rejected stale apply leaves the previous binding untouched",
+	);
+	nextDoc.destroy();
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 29: rapid same-leaf switch binds the replacement without moving selection ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const nextPath = "Notes/long-next.md";
+	const nextContent = `heading\n${"x".repeat(2200)}\nfooter`;
+	const nextDoc = new Y.Doc();
+	const nextText = nextDoc.getText("content");
+	nextText.insert(0, nextContent);
+	const oldDom = binding.cm.dom;
+	const newDom = { isConnected: true };
+	const scrollDOM = { scrollTop: 840 };
+	let replacementState = EditorState.create({
+		doc: nextContent,
+		selection: { anchor: 1100, head: 1125 },
+		extensions: [manager.compartment.of([])],
+	});
+	const replacementTransactions: Array<{
+		docChanged: boolean;
+		scrollIntoView: boolean;
+	}> = [];
+	const replacementCm = {
+		dom: newDom,
+		hasFocus: true,
+		get state() {
+			return replacementState;
+		},
+		dispatch(spec: TransactionSpec) {
+			const transaction = replacementState.update(spec);
+			replacementState = transaction.state;
+			replacementTransactions.push({
+				docChanged: transaction.docChanged,
+				scrollIntoView: transaction.scrollIntoView,
+			});
+		},
+		scrollDOM,
+	};
+	let oldDispatches = 0;
+	binding.cm.dispatch = () => {
+		oldDispatches++;
+	};
+	binding.cm.hasFocus = false;
+	binding.lastBoundAtMs = Date.now();
+	binding.view.file = { path: nextPath };
+	binding.view.editor = { getValue: () => nextContent };
+	binding.view.containerEl = {
+		contains: (node: unknown) => node === oldDom || node === newDom,
+	};
+	const known = (manager as unknown as { knownCmViews: Set<unknown> }).knownCmViews;
+	known.add(binding.cm);
+	known.add(replacementCm);
+	const fixtureVaultSync = (manager as unknown as {
+		vaultSync: {
+			getTextForPath: (path: string) => Y.Text | null;
+			getFileId: (path: string) => string | undefined;
+			getFileIdForText: (text: Y.Text) => string | undefined;
+		};
+	}).vaultSync;
+	fixtureVaultSync.getTextForPath = (path: string) => path === nextPath ? nextText : binding.ytext;
+	fixtureVaultSync.getFileId = (path: string) => path === nextPath ? "file-next" : "file-1";
+	fixtureVaultSync.getFileIdForText = (text: Y.Text) => text === nextText ? "file-next" : "file-1";
+
+	manager.bind(binding.view as never, "TestDevice");
+
+	const rebound = (manager as unknown as {
+		bindings: Map<string, { path: string; cm: unknown; settleWindowMs: number }>;
+	}).bindings.get("leaf-1");
+	assertEq(rebound?.path, nextPath, "rapid switch binds the new file path");
+	assertEq(rebound?.cm, replacementCm, "rapid switch binds the focused replacement CM");
+	assertEq(rebound?.settleWindowMs, 1600, "rapid switch activates the extended settle window");
+	assertEq(oldDispatches, 1, "old CM is detached exactly once");
+	assertEq(replacementTransactions.length, 1, "replacement CM is configured exactly once");
+	assertEq(replacementTransactions[0]?.docChanged, false, "binding reconfigure does not change document bytes");
+	assertEq(replacementTransactions[0]?.scrollIntoView, false, "binding reconfigure does not request scrolling");
+	assertEq(replacementState.selection.main.anchor, 1100, "selection anchor survives binding reconfigure");
+	assertEq(replacementState.selection.main.head, 1125, "selection head survives binding reconfigure");
+	assertEq(scrollDOM.scrollTop, 840, "binding reconfigure leaves scrollTop untouched");
+	assertEq(replacementState.facet(ySyncFacet)?.ytext, nextText, "replacement CM receives the new file Y.Text");
+	nextDoc.destroy();
 	clearPendingHealthChecks(manager);
 }
 

@@ -86,6 +86,18 @@ function makeFixture(
 				}
 				return put(candidate, data);
 			},
+			rename: async (file: StoredFile["file"], newPath: string) => {
+				const stored = files.get(file.path);
+				if (!stored || stored.file !== file) throw new Error("missing source");
+				if (files.has(newPath)) {
+					const error = new Error("exists") as Error & { code?: string };
+					error.code = "EEXIST";
+					throw error;
+				}
+				files.delete(file.path);
+				file.path = newPath;
+				files.set(newPath, stored);
+			},
 			createFolder: async () => {},
 			adapter: {
 				stat: async (candidate: string) =>
@@ -749,8 +761,8 @@ console.log("\n--- Blob Attention resolution safety ---");
 
 // A newer ref received during an active download is a distinct rerun target;
 // it must not mutate the hash being verified by the old byte stream. Neither
-// attempt may overwrite an existing local attachment. Once H2 is authoritative,
-// H1 must leave no disk artifact; only H2 may be preserved as the candidate.
+// H1 must leave no disk artifact. Once H2 is authoritative, it becomes
+// canonical and the exact local bytes remain in a local-only safety backup.
 {
 	const fixture = makeFixture();
 	const firstBytes = bytes("first remote version");
@@ -814,28 +826,35 @@ console.log("\n--- Blob Attention resolution safety ---");
 	await manager.processDownload(item);
 	assert.equal(
 		new TextDecoder().decode(fixture.files.get(fixture.path)?.data),
-		"local attachment",
-		"the rerun also leaves the local attachment untouched",
+		"second remote version",
+		"the rerun installs the authoritative H2 bytes",
 	);
-	const conflictContents = Array.from(fixture.files.entries())
-		.filter(([path]) => path.includes("KAOS remote conflict"))
+	const backupContents = Array.from(fixture.files.entries())
+		.filter(([path]) => path.includes("KAOS local backup"))
 		.map(([, stored]) => new TextDecoder().decode(stored.data));
 	assert.deepEqual(
-		new Set(conflictContents),
-		new Set(["second remote version"]),
-		"only the authoritative H2 candidate is preserved",
+		new Set(backupContents),
+		new Set(["local attachment"]),
+		"the independent local bytes remain in one safety backup",
+	);
+	assert.equal(
+		Array.from(fixture.files.keys()).some((path) =>
+			path.includes("KAOS remote conflict")
+		),
+		false,
+		"authoritative H2 creates no remote conflict artifact",
 	);
 }
 
-// If a conflict-artifact write already crossed its pre-write fence, Accept
-// waits for that filesystem promise before deleting the original attachment
-// and clearing the marker.
+// If an authoritative canonical create already crossed its pre-write fence,
+// Accept waits for that filesystem promise and its no-clobber compensation
+// before deleting the restored original and clearing the marker.
 {
 	const fixture = makeFixture();
 	const remote = bytes("remote write already started");
 	const remoteHash = await sha256Hex(remote);
-	const artifactStarted = deferred<void>();
-	const releaseArtifact = deferred<void>();
+	const createStarted = deferred<void>();
+	const releaseCreate = deferred<void>();
 	const manager = fixture.manager as any;
 	fixture.setRemoteBlobRef({ hash: remoteHash, size: remote.byteLength });
 	manager.blobClient = { download: async () => remote };
@@ -844,9 +863,9 @@ console.log("\n--- Blob Attention resolution safety ---");
 		candidate: string,
 		data: ArrayBuffer,
 	) => {
-		if (candidate.includes("KAOS remote conflict")) {
-			artifactStarted.resolve();
-			await releaseArtifact.promise;
+		if (candidate === fixture.path) {
+			createStarted.resolve();
+			await releaseCreate.promise;
 		}
 		return createBinary(candidate, data);
 	};
@@ -866,7 +885,7 @@ console.log("\n--- Blob Attention resolution safety ---");
 		manager.inflightDownloads.delete(fixture.path);
 		manager.notifyTransferSettled(fixture.path);
 	});
-	await artifactStarted.promise;
+	await createStarted.promise;
 	fixture.setRemoteBlobRef(undefined);
 	let acceptingResolved = false;
 	const accepting = fixture.manager.acceptRemoteDeletedBlob(
@@ -879,23 +898,31 @@ console.log("\n--- Blob Attention resolution safety ---");
 		},
 	).then(() => { acceptingResolved = true; });
 	await Promise.resolve();
-	assert.equal(acceptingResolved, false, "Accept waits for the artifact write");
+	assert.equal(acceptingResolved, false, "Accept waits for the canonical write and compensation");
 	assert.equal(
-		fixture.files.has(fixture.path),
+		Array.from(fixture.files.values()).some((stored) =>
+			new TextDecoder().decode(stored.data) === "local attachment"
+		),
 		true,
-		"Accept preserves the original while the artifact write is pending",
+		"the original remains visible in its safety backup while create is pending",
 	);
-	releaseArtifact.resolve();
+	releaseCreate.resolve();
 	await processing;
 	await accepting;
 	assert.equal(fixture.files.has(fixture.path), false, "Accept deletes the original after the write settles");
-	const conflict = Array.from(fixture.files.entries()).find(
-		([path]) => path.includes("KAOS remote conflict"),
+	assert.equal(
+		Array.from(fixture.files.values()).some((stored) =>
+			new TextDecoder().decode(stored.data) === "remote write already started"
+		),
+		true,
+		"the superseded in-flight remote bytes remain in a local safety backup",
 	);
 	assert.equal(
-		new TextDecoder().decode(conflict?.[1].data),
-		"remote write already started",
-		"the in-flight remote candidate remains preserved as an artifact",
+		Array.from(fixture.files.keys()).some((path) =>
+			path.includes("KAOS remote conflict")
+		),
+		false,
+		"the in-flight remote candidate creates no conflict artifact",
 	);
 	assert.equal(
 		fixture.manager.isPreservedUnresolved(fixture.path),
@@ -905,13 +932,13 @@ console.log("\n--- Blob Attention resolution safety ---");
 }
 
 // Manager teardown is an async barrier: a replacement manager cannot start
-// while an old conflict-artifact write is still capable of completing.
+// while an old canonical write and its compensation are still completing.
 {
 	const fixture = makeFixture();
 	const remote = bytes("write settling during destroy");
 	const remoteHash = await sha256Hex(remote);
-	const artifactStarted = deferred<void>();
-	const releaseArtifact = deferred<void>();
+	const createStarted = deferred<void>();
+	const releaseCreate = deferred<void>();
 	const manager = fixture.manager as any;
 	fixture.setRemoteBlobRef({ hash: remoteHash, size: remote.byteLength });
 	manager.blobClient = { download: async () => remote };
@@ -920,9 +947,9 @@ console.log("\n--- Blob Attention resolution safety ---");
 		candidate: string,
 		data: ArrayBuffer,
 	) => {
-		if (candidate.includes("KAOS remote conflict")) {
-			artifactStarted.resolve();
-			await releaseArtifact.promise;
+		if (candidate === fixture.path) {
+			createStarted.resolve();
+			await releaseCreate.promise;
 		}
 		return createBinary(candidate, data);
 	};
@@ -943,12 +970,12 @@ console.log("\n--- Blob Attention resolution safety ---");
 		manager.notifyTransferSettled(fixture.path);
 	});
 	manager.activeTransferPromises.add(processing);
-	await artifactStarted.promise;
+	await createStarted.promise;
 	let destroyResolved = false;
 	const destroying = fixture.manager.destroy().then(() => { destroyResolved = true; });
 	await Promise.resolve();
 	assert.equal(destroyResolved, false, "destroy waits for the old filesystem write");
-	releaseArtifact.resolve();
+	releaseCreate.resolve();
 	await destroying;
 	assert.equal(destroyResolved, true, "destroy resolves after the write settles");
 	assert.equal(
@@ -956,13 +983,19 @@ console.log("\n--- Blob Attention resolution safety ---");
 		"local attachment",
 		"the old manager never overwrites the local attachment",
 	);
-	const conflict = Array.from(fixture.files.entries()).find(
-		([path]) => path.includes("KAOS remote conflict"),
+	assert.equal(
+		Array.from(fixture.files.values()).some((stored) =>
+			new TextDecoder().decode(stored.data) === "write settling during destroy"
+		),
+		true,
+		"the stale remote bytes are retired to a safety backup before teardown returns",
 	);
 	assert.equal(
-		new TextDecoder().decode(conflict?.[1].data),
-		"write settling during destroy",
-		"the last old-manager artifact write completes before teardown returns",
+		Array.from(fixture.files.keys()).some((path) =>
+			path.includes("KAOS remote conflict")
+		),
+		false,
+		"teardown creates no stale conflict artifact",
 	);
 }
 
