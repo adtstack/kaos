@@ -71,6 +71,23 @@ export function applyDiffToYTextWithPostcondition(
 ): DiffPostconditionResult {
 	const currentText = ytext.toJSON();
 	if (currentText !== oldText) {
+		// The caller's base became stale before commit. The authority decision is
+		// still valid, but replaying a patch computed from oldText would be unsafe.
+		// Rebase the targeted diff on the actual Y.Text instead of deleting and
+		// reinserting the whole document. This preserves stable CRDT positions and
+		// editor selections whenever surrounding text is unchanged.
+		applyDiffToYText(ytext, currentText, newText, origin);
+		const afterRebasedDiff = ytext.toJSON();
+		if (afterRebasedDiff === newText) {
+			return {
+				diffSkippedDueToStaleBase: true,
+				matchesAfterDiff: true,
+				forceReplaceApplied: false,
+				finalMatchesExpected: true,
+				finalLength: afterRebasedDiff.length,
+			};
+		}
+
 		forceReplaceYText(ytext, newText, origin);
 		const afterForce = ytext.toJSON();
 		return {

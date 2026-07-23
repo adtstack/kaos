@@ -288,8 +288,15 @@ export class EditorBindingManager {
 		if (!this.canBindPath(view, "bind")) return;
 
 		const leafId = (view.leaf as unknown as { id: string }).id ?? file.path;
+		const existing = this.bindings.get(leafId);
 		const cm = this.getCmView(view);
 		if (!cm) {
+			// A file switch may leave the previous CM connected while the new CM is
+			// still mounting. Detach the old yCollab immediately; retry will bind the
+			// new editor once its document agrees with the MarkdownView facade.
+			if (existing && existing.path !== file.path) {
+				this.unbind(view);
+			}
 			this.log(`bind: waiting for Obsidian editor view for "${file.path}"`);
 			this.scheduleCmResolveRetry(view, deviceName, leafId, "bind");
 			return;
@@ -298,7 +305,10 @@ export class EditorBindingManager {
 		this.cmDegradedWarned = false;
 		const cmId = this.getCmId(cm);
 		this.carryCmActivityToPath(cm, file.path);
-		const existing = this.bindings.get(leafId);
+		const rapidSwitch =
+			!!existing
+			&& existing.path !== file.path
+			&& Date.now() - existing.lastBoundAtMs <= FAST_SWITCH_WINDOW_MS;
 
 		if (existing && existing.path === file.path && existing.cm === cm) {
 			const health = this.inspectBindingHealth(view, existing);
@@ -379,6 +389,7 @@ export class EditorBindingManager {
 			filePath: file.path,
 			ytext: target.ytext,
 			fileId: target.fileId,
+			rapidSwitch,
 		});
 	}
 
@@ -1038,15 +1049,15 @@ export class EditorBindingManager {
 
 		const leafId =
 			(view.leaf as unknown as { id?: string }).id ?? view.file?.path ?? null;
-		if (leafId) {
-			const existing = this.bindings.get(leafId);
-			if (
-				existing
-				&& existing.cm.dom.isConnected
-				&& container.contains(existing.cm.dom)
-			) {
-				return existing.cm;
-			}
+		let editorContent: string;
+		try {
+			editorContent = view.editor.getValue();
+		} catch {
+			this.trace?.("editor", "cm-resolution-editor-read-failed", {
+				leafId: leafId ?? "unknown",
+				path: view.file?.path ?? null,
+			});
+			return null;
 		}
 
 		const matches: EditorView[] = [];
@@ -1066,16 +1077,36 @@ export class EditorBindingManager {
 		}
 
 		if (matches.length === 0) return null;
-		if (matches.length === 1) return matches[0]!;
 
-		const activeElement =
-			typeof document !== "undefined" ? document.activeElement : null;
-		const focused = matches.filter((cm) =>
-			cm.hasFocus || (activeElement ? cm.dom.contains(activeElement) : false),
-		);
+		// During a same-leaf file switch Obsidian can briefly keep both the old
+		// and new CodeMirror DOM trees connected. Never trust the stored binding
+		// merely because its DOM is still contained by the MarkdownView. The CM
+		// document must agree with the public editor facade for the current file.
+		const currentDocumentMatches = matches.filter((cm) => {
+			try {
+				return cm.state.doc.toString() === editorContent;
+			} catch {
+				return false;
+			}
+		});
+		if (currentDocumentMatches.length === 0) {
+			this.trace?.("editor", "cm-resolution-document-mismatch", {
+				leafId: leafId ?? "unknown",
+				path: view.file?.path ?? null,
+				editorLength: editorContent.length,
+				matches: matches.map((cm) => this.getCmId(cm)),
+			});
+			return null;
+		}
+
+		const focused = currentDocumentMatches.filter((cm) => {
+			const activeElement = cm.dom.ownerDocument?.activeElement ?? null;
+			return cm.hasFocus || (activeElement ? cm.dom.contains(activeElement) : false);
+		});
 		if (focused.length === 1) return focused[0]!;
+		if (currentDocumentMatches.length === 1) return currentDocumentMatches[0]!;
 
-		const ids = matches.map((cm) => this.getCmId(cm));
+		const ids = currentDocumentMatches.map((cm) => this.getCmId(cm));
 		this.trace?.("editor", "cm-resolution-ambiguous", {
 			leafId: leafId ?? "unknown",
 			path: view.file?.path ?? null,
@@ -1764,6 +1795,7 @@ export class EditorBindingManager {
 		fileId?: string;
 		existing?: EditorBinding;
 		reason?: string;
+		rapidSwitch?: boolean;
 	}): boolean {
 		const {
 			action,
@@ -1777,6 +1809,7 @@ export class EditorBindingManager {
 			fileId,
 			existing,
 			reason,
+			rapidSwitch: rapidSwitchHint,
 		} = options;
 
 		if (!this.canApplyBindingToEditor({
@@ -1785,6 +1818,7 @@ export class EditorBindingManager {
 			leafId,
 			filePath,
 			ytext,
+			cm,
 			reason,
 		})) {
 			return false;
@@ -1826,10 +1860,11 @@ export class EditorBindingManager {
 		}
 		this.pendingReplacementCmToLeafId.delete(cm);
 		const boundAtMs = Date.now();
-		const rapidSwitch =
+		const rapidSwitch = rapidSwitchHint ?? (
 			!!existing
 			&& existing.path !== filePath
-			&& boundAtMs - existing.lastBoundAtMs <= FAST_SWITCH_WINDOW_MS;
+			&& boundAtMs - existing.lastBoundAtMs <= FAST_SWITCH_WINDOW_MS
+		);
 		const settleWindowMs = rapidSwitch
 			? FAST_SWITCH_BINDING_SETTLE_WINDOW_MS
 			: BASE_BINDING_SETTLE_WINDOW_MS;
@@ -1925,8 +1960,20 @@ export class EditorBindingManager {
 		leafId: string;
 		filePath: string;
 		ytext: Y.Text;
+		cm: EditorView;
 		reason?: string;
 	}): boolean {
+		if (input.view.file?.path !== input.filePath) {
+			this.trace?.("editor", "binding-apply-view-path-changed", {
+				action: input.action,
+				path: input.filePath,
+				currentPath: input.view.file?.path ?? null,
+				reason: input.reason ?? null,
+				leafId: input.leafId,
+			});
+			return false;
+		}
+
 		let editorContent: string;
 		try {
 			editorContent = input.view.editor.getValue();
@@ -1940,8 +1987,64 @@ export class EditorBindingManager {
 			return false;
 		}
 
+		let cmContent: string;
+		try {
+			if (
+				!input.cm.dom.isConnected
+				|| !input.view.containerEl.contains(input.cm.dom)
+			) {
+				this.trace?.("editor", "binding-apply-cm-detached", {
+					action: input.action,
+					path: input.filePath,
+					reason: input.reason ?? null,
+					leafId: input.leafId,
+				});
+				return false;
+			}
+			cmContent = input.cm.state.doc.toString();
+		} catch {
+			this.trace?.("editor", "binding-apply-cm-read-failed", {
+				action: input.action,
+				path: input.filePath,
+				reason: input.reason ?? null,
+				leafId: input.leafId,
+			});
+			return false;
+		}
+		if (cmContent !== editorContent) {
+			this.trace?.("editor", "binding-apply-cm-diverged", {
+				action: input.action,
+				path: input.filePath,
+				reason: input.reason ?? null,
+				leafId: input.leafId,
+				editorLength: editorContent.length,
+				cmLength: cmContent.length,
+			});
+			this.log(
+				`${input.action}: skipped binding for "${input.filePath}" ` +
+				"because selected CodeMirror does not match the current editor",
+			);
+			return false;
+		}
+		const resolvedCm = this.getCmView(input.view);
+		if (resolvedCm !== input.cm) {
+			this.trace?.("editor", "binding-apply-cm-not-current", {
+				action: input.action,
+				path: input.filePath,
+				reason: input.reason ?? null,
+				leafId: input.leafId,
+				selectedCmId: this.getCmId(input.cm),
+				resolvedCmId: resolvedCm ? this.getCmId(resolvedCm) : null,
+			});
+			this.log(
+				`${input.action}: skipped binding for "${input.filePath}" ` +
+				"because selected CodeMirror is no longer current",
+			);
+			return false;
+		}
+
 		const crdtContent = input.ytext.toJSON();
-		if (editorContent === crdtContent) {
+		if (cmContent === crdtContent) {
 			return true;
 		}
 

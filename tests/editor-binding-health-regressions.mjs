@@ -87,7 +87,7 @@ console.log("\n--- Test 5: bind cm-change path is guarded before unbind ---");
 	assert(section !== null, "bind section found");
 	assert(section?.includes("\"bind-target-changed:cm-changed\""), "bind cm-change path has recent activity guard");
 	assert(section?.includes("this.pendingReplacementCmToLeafId.set(cm, leafId)"), "deferred bind cm-change tracks the replacement editor");
-	assert(section?.indexOf("\"bind-target-changed:cm-changed\"") < section?.indexOf("this.unbind(view)"), "bind cm-change guard runs before unbind");
+	assert(section?.indexOf("\"bind-target-changed:cm-changed\"") < section?.lastIndexOf("this.unbind(view)"), "bind cm-change guard runs before replacement unbind");
 }
 
 console.log("\n--- Test 6: pending replacement cm updates still map to the binding ---");
@@ -134,8 +134,8 @@ console.log("\n--- Test 8: applyBinding refuses divergent editor content ---");
 		"applyBinding guard runs before creating yCollab state",
 	);
 	assert(
-		guardSection?.includes("editorContent === crdtContent"),
-		"canApplyBindingToEditor only allows matching editor and CRDT content",
+		guardSection?.includes("cmContent === crdtContent"),
+		"canApplyBindingToEditor only allows matching selected CM and CRDT content",
 	);
 	assert(
 		guardSection?.includes('"binding-apply-editor-diverged"'),
