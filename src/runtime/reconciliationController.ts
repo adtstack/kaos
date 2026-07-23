@@ -33,7 +33,6 @@ import type {
 import {
 	applyDiffToYText,
 	applyDiffToYTextWithPostcondition,
-	forceReplaceYText,
 	type DiffPostconditionResult,
 } from "../sync/diff";
 import { decideExternalEditImport } from "../sync/externalEditPolicy";
@@ -1928,8 +1927,9 @@ export class ReconciliationController {
 										expectedDiskRevision: diskSnapshotRevisions.get(path) ?? -1,
 										stage: "closed-file-3way-auto-merge",
 										commit: () => {
-											forceReplaceYText(
+											applyDiffToYTextWithPostcondition(
 												ytext,
+												crdtContent,
 												mergeResult.mergedText,
 												ORIGIN_DISK_SYNC_RECOVER_BOUND,
 											);
@@ -2010,8 +2010,9 @@ export class ReconciliationController {
 										expectedDiskRevision: diskSnapshotRevisions.get(path) ?? -1,
 										stage: "closed-file-conflict-disk-wins",
 										commit: () => {
-											forceReplaceYText(
+											applyDiffToYTextWithPostcondition(
 												ytext,
+												crdtContent,
 												diskContent,
 												ORIGIN_DISK_SYNC_RECOVER_BOUND,
 											);
@@ -2077,8 +2078,9 @@ export class ReconciliationController {
 								expectedDiskRevision: diskSnapshotRevisions.get(path) ?? -1,
 								stage: "closed-file-import-disk",
 								commit: () => {
-									forceReplaceYText(
+									applyDiffToYTextWithPostcondition(
 										ytext,
+										crdtContent,
 										diskContent,
 										ORIGIN_DISK_SYNC_RECOVER_BOUND,
 									);
@@ -3727,8 +3729,9 @@ export class ReconciliationController {
 						expectedCrdtContent: crdtContent,
 						expectedDiskRevision: stableDiskRevision,
 						stage: "closed-dirty-visible-authority-disk-wins",
-						commit: () => forceReplaceYText(
+						commit: () => applyDiffToYTextWithPostcondition(
 							existingText,
+							crdtContent,
 							content,
 							ORIGIN_DISK_SYNC_RECOVER_BOUND,
 						),
@@ -4935,8 +4938,13 @@ export class ReconciliationController {
 			expectedVisibleAuthorityMarker: visibleAuthorityMarker,
 			stage: "startup-open-editor-convergence",
 			commit: () => {
-				forceReplaceYText(ytext, editorAuthority, ORIGIN_DISK_SYNC_RECOVER_BOUND);
-				return yTextToString(ytext) === editorAuthority;
+				const result = applyDiffToYTextWithPostcondition(
+					ytext,
+					crdtContent,
+					editorAuthority,
+					ORIGIN_DISK_SYNC_RECOVER_BOUND,
+				);
+				return result.finalMatchesExpected;
 			},
 		});
 		if (convergenceAttempt.kind === "stale") {
@@ -5060,8 +5068,13 @@ export class ReconciliationController {
 				return false;
 			}
 			const convergenceAttempt = await commitTarget(() => {
-				forceReplaceYText(expectedYText, targetContent, ORIGIN_DISK_SYNC_RECOVER_BOUND);
-				return yTextToString(expectedYText) === targetContent;
+				const result = applyDiffToYTextWithPostcondition(
+					expectedYText,
+					crdtContent,
+					targetContent,
+					ORIGIN_DISK_SYNC_RECOVER_BOUND,
+				);
+				return result.finalMatchesExpected;
 			});
 			if (convergenceAttempt.kind === "stale") return false;
 			convergenceApplied = convergenceAttempt.value;
@@ -6282,8 +6295,13 @@ export class ReconciliationController {
 					"bound-file-ambiguous-convergence",
 					crdtContent,
 					() => {
-						forceReplaceYText(existingText, editorAuthority, ORIGIN_DISK_SYNC_RECOVER_BOUND);
-						return yTextToString(existingText) === editorAuthority;
+						const result = applyDiffToYTextWithPostcondition(
+							existingText,
+							crdtContent ?? "",
+							editorAuthority,
+							ORIGIN_DISK_SYNC_RECOVER_BOUND,
+						);
+						return result.finalMatchesExpected;
 					},
 				);
 				if (convergenceAttempt.kind === "stale") {

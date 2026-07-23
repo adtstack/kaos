@@ -96,7 +96,7 @@ if (rootPackage.version !== pluginManifest.version) {
 }
 if (pluginVersions[rootPackage.version] !== pluginManifest.minAppVersion) {
 	throw new Error(
-		`versions.json is missing ${rootPackage.version} -> ${pluginManifest.minAppVersion}. Run npm version so version-bump.mjs registers the plugin version.`,
+		`versions.json is missing ${rootPackage.version} -> ${pluginManifest.minAppVersion}. Run npm run version:sync so version-bump.mjs registers the plugin version.`,
 	);
 }
 

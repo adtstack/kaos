@@ -1,6 +1,10 @@
 {
 	"name": "kaos",
-	"version": "1.10.0",
+	"version": "1.10.1",
+	"releaseVersions": {
+		"server": "0.7.2",
+		"headlessHost": "0.2.5"
+	},
 	"description": "A zero-terminal, real-time sync engine powered by your own Cloudflare Worker.",
 	"main": "main.js",
 	"type": "module",
@@ -26,7 +30,7 @@
 		"build:qa-product": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs qa-product",
 		"build:server-release": "node build-server-release.mjs",
 		"test:server-update-local": "npm run build:server-release && node tests/server-update-local.mjs",
-		"test:regressions": "npm run guard:no-src-js-artifacts && npm run guard:concurrency-drift && npm run guard:qa-isolation && npm run guard:schema-version && node tests/run-regressions.mjs",
+		"test:regressions": "npm run version:check && npm run test:versioning && npm run guard:no-src-js-artifacts && npm run guard:concurrency-drift && npm run guard:qa-isolation && npm run guard:schema-version && node tests/run-regressions.mjs",
 		"test:regressions:release": "npm run test:regressions",
 		"test:coverage:critical": "c8 --all --check-coverage --lines 75 --statements 75 --branches 80 --functions 65 --include 'src/headless-host/humanOutput.ts' --include 'src/runtime/setupLinkController.ts' --include 'src/runtime/stableMarkdownReader.ts' --include 'src/dashboard/dashboardLayout.ts' --include 'src/settings/settingsStore.ts' --include 'src/runtime/connectionController.ts' node tests/run-regressions.mjs --only setup-link-controller --only connection-controller-startup-sync --only stable-markdown-reader --only dashboard-data --only settings-hardening --only headless-host-human-output",
 		"test:ci": "npm run test:regressions && npm run test:integration:worker",
@@ -45,7 +49,11 @@
 		"qa:prepare": "bun run qa/scripts/prepare-vault.ts",
 		"qa:obsidian": "bun run qa/controllers/single-device.ts",
 		"qa:two-device": "bun run qa/controllers/two-device.ts",
-		"version": "node version-bump.mjs && git add manifest.json versions.json",
+		"version:bump": "node version-bump.mjs",
+		"version:sync": "node version-bump.mjs --sync",
+		"version:check": "node version-bump.mjs --check",
+		"preversion": "node -e \"console.error('Use npm run version:bump -- patch instead of npm version.'); process.exit(1)\"",
+		"test:versioning": "node tests/version-bump.mjs",
 		"lint": "eslint .",
 		"lint:changed": "node scripts/lint-changed.mjs",
 		"lint:staged": "node scripts/lint-staged.mjs",
