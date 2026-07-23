@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import * as Y from "yjs";
 
 const diffModule = await import("../src/sync/diff.ts");
@@ -144,24 +145,40 @@ console.log("\n--- Test 6: stale-base disk patch does not duplicate task icons o
 	doc.destroy();
 }
 
-console.log("\n--- Test 7: recovery postcondition force-replaces stale-base mismatch ---");
+console.log("\n--- Test 7: recovery postcondition rebases stale-base mismatch without whole replacement ---");
 {
 	const doc = new Y.Doc();
 	const ytext = doc.getText("content");
-	ytext.insert(0, "abcX");
+	const staleBase = "prefix\nabc\nsuffix\n";
+	const current = "prefix\nabcX\nsuffix\n";
+	const expected = "prefix\nabcY\nsuffix\n";
+	ytext.insert(0, current);
+	let delta = null;
+	ytext.observe((event) => {
+		delta = event.delta;
+	});
 
 	const result = applyDiffToYTextWithPostcondition(
 		ytext,
-		"abc",
-		"abcY",
+		staleBase,
+		expected,
 		"disk-sync-recover-bound",
 	);
 
-	assert(ytext.toString() === "abcY", "postcondition helper lands exact expected content");
-	assert(result.diffSkippedDueToStaleBase, "stale-base patch is skipped before mutation");
-	assert(!result.matchesAfterDiff, "stale-base patch mismatch is detected");
-	assert(result.forceReplaceApplied, "force replace is applied after mismatch");
-	assert(result.finalMatchesExpected, "force replace satisfies the postcondition");
+	assert(ytext.toString() === expected, "postcondition helper lands exact expected content");
+	assert(result.diffSkippedDueToStaleBase, "stale caller base is detected");
+	assert(result.matchesAfterDiff, "current Y.Text is used as the rebased diff source");
+	assert(!result.forceReplaceApplied, "stale base does not force a whole-document replacement");
+	assert(result.finalMatchesExpected, "rebased diff satisfies the postcondition");
+	assert(
+		delta?.some((part) => typeof part.retain === "number" && part.retain >= "prefix\nabc".length),
+		"rebased recovery retains the stable prefix",
+	);
+	const deleted = (delta ?? []).reduce(
+		(sum, part) => sum + (typeof part.delete === "number" ? part.delete : 0),
+		0,
+	);
+	assert(deleted < current.length, "rebased recovery does not delete the whole document");
 	doc.destroy();
 }
 
@@ -175,6 +192,18 @@ console.log("\n--- Test 8: forceReplaceYText replaces the whole Y.Text exactly -
 
 	assert(ytext.toString() === "new", "forceReplaceYText replaces old content exactly");
 	doc.destroy();
+}
+
+console.log("\n--- Test 9: reconciliation cannot bypass targeted diff recovery ---");
+{
+	const reconciliationSource = readFileSync(
+		new URL("../src/runtime/reconciliationController.ts", import.meta.url),
+		"utf8",
+	);
+	assert(
+		!reconciliationSource.includes("forceReplaceYText("),
+		"reconciliation never invokes whole-document replacement directly",
+	);
 }
 
 console.log(`\n${"─".repeat(50)}`);
