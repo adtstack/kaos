@@ -3,6 +3,7 @@ import {
 	DEFAULT_SETTINGS,
 	VaultSyncSettingTab,
 	generateVaultId,
+	type ExternalEditPolicy,
 	type VaultSyncSettings,
 } from "./settings";
 import {
@@ -18,7 +19,10 @@ import {
 } from "./sync/vaultSync";
 import { SCHEMA_VERSION } from "./sync/vaultSync";
 import { EditorBindingManager } from "./sync/editorBinding";
-import { DiskMirror } from "./sync/diskMirror";
+import {
+	DiskMirror,
+	type ObservedDiskMutationRevision,
+} from "./sync/diskMirror";
 import {
 	moveSettledBlobRefs,
 	type BlobQueueSnapshot,
@@ -388,6 +392,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	/** Pending stability checks for newly created/dropped files. */
 	private pendingStabilityChecks = new Set<string>();
+	/** Monotonic identity for exact-content open-editor modify guards. */
+	private externalDiskMutationSequence = 0;
 
 	/** In-memory ring of recent high-level plugin events. */
 	private eventRing: Array<{ ts: string; msg: string }> = [];
@@ -474,13 +480,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			computeRecoveryStateHash: async (_path, content) => {
 				return this.lab?.computeWitnessStateHash(content) ?? null;
 			},
-			getEffectiveExternalEditPolicy: (runtimePolicy) => {
-				if (__KAOS_QA_HARNESS_ENABLED__) {
-					const override = this._qaState?.externalEditPolicyOverride;
-					if (override != null) return override;
-				}
-				return runtimePolicy;
-			},
+			getEffectiveExternalEditPolicy: (runtimePolicy) =>
+				this.getEffectiveExternalEditPolicy(runtimePolicy),
 			registerDiskIngestPort: (port) => {
 				if (__KAOS_QA_HARNESS_ENABLED__ && this._qaState) {
 					this._qaState.diskIngestPort = port;
@@ -492,6 +493,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private isMarkdownPathSyncable(path: string): boolean {
 		return isMarkdownSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
+	}
+
+	private getEffectiveExternalEditPolicy(runtimePolicy: ExternalEditPolicy): ExternalEditPolicy {
+		if (__KAOS_QA_HARNESS_ENABLED__) {
+			const override = this._qaState?.externalEditPolicyOverride;
+			if (override != null) return override;
+		}
+		return runtimePolicy;
 	}
 
 	/** MarkdownView/y-codemirror binding remains `.md`-only. */
@@ -3350,6 +3359,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				(event) => this.recordFlightPathEvent(event),
 				bindingPropagationGate,
 				() => this.settings.remoteTypingGuardEnabled,
+				(path, externalContent) => {
+					void this.reconciliationController.preserveRejectedExternalEditorReload(
+						path,
+						externalContent,
+					).catch((err) => {
+						this.trace("conflict", "external-editor-reload-preservation-failed", {
+							path,
+							error: formatUnknown(err),
+						});
+					});
+				},
+				() =>
+					this.getEffectiveExternalEditPolicy(
+						this.getRuntimeConfig().externalEditPolicy,
+					) !== "always",
 			);
 
 			// 3. Global CM6 extension
@@ -3826,7 +3850,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					// "no suppression active and our last write was either
 					// long ago or never"; "unknown" is the fallback when
 					// the diskMirror is not yet wired (early-startup race).
-						const dm = this.diskMirror;
+					const dm = this.diskMirror;
 					const suppressWindowActive = !!dm?.isSuppressed(file.path);
 					const lastDiskWriteOkAtMs = dm?.getLastDiskWriteOkAt(file.path) ?? null;
 					const dtSinceWrite = lastDiskWriteOkAtMs === null
@@ -3844,6 +3868,71 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						writerGuess = "kaos-write";
 					} else {
 						writerGuess = "external";
+					}
+					const externalReloadGuardEnabled =
+						this.getEffectiveExternalEditPolicy(
+							this.getRuntimeConfig().externalEditPolicy,
+						) !== "always";
+					const observedAt = Date.now();
+					const diskMutationRevision: ObservedDiskMutationRevision = {
+						path: file.path,
+						ctime: typeof file.stat?.ctime === "number" ? file.stat.ctime : null,
+						mtime: typeof file.stat?.mtime === "number" ? file.stat.mtime : null,
+						size: typeof file.stat?.size === "number" ? file.stat.size : null,
+					};
+					const editorBindingsAtEvent = this.editorBindings;
+					if (
+						externalReloadGuardEnabled &&
+						editorBindingsAtEvent?.isBound(file.path)
+					) {
+						const sequence = ++this.externalDiskMutationSequence;
+						editorBindingsAtEvent.beginExternalDiskMutation(file.path, sequence);
+						void (async () => {
+							let content: string | null = null;
+							if (dm) {
+								if (writerGuess === "kaos-write") {
+									// Timing is diagnostic only. The exact event revision must match
+									// the intended bytes before this event may bypass the guard.
+									const probe = await dm.probeRecentWriteFingerprint(
+										file,
+										diskMutationRevision,
+									);
+									if (probe.kind === "self-write") return;
+									if (probe.kind !== "stale-or-unreadable") {
+										content = probe.content;
+									}
+								} else {
+									content = await dm.readExactObservedDiskRevision(
+										file,
+										diskMutationRevision,
+									);
+								}
+							}
+
+							// A result belongs only to the runtime and binding manager that
+							// observed the event. Reset/reinit must not arm a new editor.
+							if (this.diskMirror !== dm || this.editorBindings !== editorBindingsAtEvent) {
+								return;
+							}
+							if (
+								this.getEffectiveExternalEditPolicy(
+									this.getRuntimeConfig().externalEditPolicy,
+								) === "always"
+							) {
+								return;
+							}
+							editorBindingsAtEvent.noteExternalDiskMutation({
+								...diskMutationRevision,
+								sequence,
+								observedAt,
+								content,
+							});
+						})().catch((err) => {
+							this.trace("editor", "external-disk-reload-guard-probe-failed", {
+								path: file.path,
+								error: formatUnknown(err),
+							});
+						});
 					}
 					this.traceSink.recordPath({
 						kind: "disk.modify.observed",
@@ -4319,6 +4408,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.connectionController = null;
 		this.editorBindings = null;
 		this.diskMirror = null;
+		this.externalDiskMutationSequence = 0;
 		this.awaitingFirstProviderSyncAfterStartup = false;
 		this.blobLocalPersistenceReady = false;
 		this.blobProviderReady = false;

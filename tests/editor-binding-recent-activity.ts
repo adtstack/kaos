@@ -1,5 +1,5 @@
 import * as Y from "yjs";
-import { EditorState, type TransactionSpec } from "@codemirror/state";
+import { Annotation, EditorState, type TransactionSpec } from "@codemirror/state";
 import { ySyncFacet } from "y-codemirror.next";
 import { EditorBindingManager } from "../src/sync/editorBinding";
 import {
@@ -15,6 +15,23 @@ import { isMarkdownSyncable } from "../src/types";
 
 let passed = 0;
 let failed = 0;
+let externalDiskMutationSequence = 0;
+
+function externalDiskMutationNotice(
+	path: string,
+	content: string,
+	mtime = Date.now(),
+) {
+	return {
+		path,
+		ctime: 1,
+		mtime,
+		size: new TextEncoder().encode(content).byteLength,
+		sequence: ++externalDiskMutationSequence,
+		observedAt: Date.now(),
+		content,
+	};
+}
 
 function assertEq<T>(actual: T, expected: T, msg: string): void {
 	if (actual === expected) {
@@ -45,9 +62,17 @@ function clearPendingHealthChecks(manager: unknown): void {
 function buildManagerFixture(options: {
 	lastEditorChangeAgeMs: number;
 	lastEditorDocChangeAgeMs?: number | null;
+	externalReloadGuardEnabled?: () => boolean;
 }) {
 	const flightEvents: Array<{ kind: string; data?: Record<string, unknown> }> = [];
+	const rejectedExternalReloads: Array<{ path: string; content: string }> = [];
 	const path = "Notes/typing.md";
+	let liveEditorContent = "typing now";
+	const liveFileStat = {
+		ctime: 1,
+		mtime: Date.now() - 10_123,
+		size: new TextEncoder().encode(liveEditorContent).byteLength,
+	};
 	const doc = new Y.Doc();
 	const expectedText = doc.getText("expected");
 	expectedText.insert(0, "server text");
@@ -77,8 +102,8 @@ function buildManagerFixture(options: {
 		hasFocus: true,
 		state: {
 			doc: {
-				length: 10,
-				toString: () => "typing now",
+				get length() { return liveEditorContent.length; },
+				toString: () => liveEditorContent,
 			},
 			facet: () => ({
 				ytext: facetText,
@@ -90,10 +115,10 @@ function buildManagerFixture(options: {
 	};
 
 	const view = {
-		file: { path },
+		file: { path, stat: liveFileStat },
 		leaf: { id: "leaf-1" },
 		containerEl: { contains: (node: unknown) => node === cmDom },
-		editor: { getValue: () => "typing now" },
+		editor: { getValue: () => liveEditorContent },
 	};
 
 	const manager = new EditorBindingManager(
@@ -104,6 +129,12 @@ function buildManagerFixture(options: {
 		(event) => {
 			flightEvents.push({ kind: event.kind, data: event.data });
 		},
+		undefined,
+		undefined,
+		(rejectedPath, content) => {
+			rejectedExternalReloads.push({ path: rejectedPath, content });
+		},
+		options.externalReloadGuardEnabled,
 	);
 	const binding = {
 		view,
@@ -125,7 +156,18 @@ function buildManagerFixture(options: {
 
 	(manager as unknown as { bindings: Map<string, unknown> }).bindings.set("leaf-1", binding);
 	(manager as unknown as { knownCmViews: Set<unknown> }).knownCmViews.add(cm);
-	return { manager, binding, flightEvents, awarenessStates };
+	return {
+		manager,
+		binding,
+		flightEvents,
+		awarenessStates,
+		rejectedExternalReloads,
+		setLiveEditorContent: (content: string) => { liveEditorContent = content; },
+		setLiveFileStat: (mtime: number, size: number) => {
+			liveFileStat.mtime = mtime;
+			liveFileStat.size = size;
+		},
+	};
 }
 
 function installLiveCmReplacement(manager: unknown, binding: {
@@ -348,6 +390,175 @@ console.log("\n--- Test 9: remote-style editor transactions do not count as user
 	});
 
 	assertEq(binding.lastEditorDocChangeAtMs, before, "unannotated doc change leaves user activity timestamp unchanged");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 9a: editor-origin revisions distinguish programmatic edits from provider patches ---");
+{
+	const { manager, binding, setLiveEditorContent } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "typing now");
+	(manager as unknown as { maybeHealBinding: () => void }).maybeHealBinding = () => {};
+	const thirdPartyAnnotation = Annotation.define<boolean>();
+	let state = EditorState.create({
+		doc: "typing now",
+		extensions: [
+			manager.getBaseExtension(),
+			// Forces CodeMirror to recreate the final Transaction after every filter.
+			EditorState.transactionExtender.of(() => ({
+				annotations: thirdPartyAnnotation.of(true),
+			})),
+		],
+	});
+	const installCmState = (next: EditorState) => {
+		(binding.cm as unknown as { state: EditorState }).state = next;
+		state = next;
+	};
+	installCmState(state);
+	const activityBefore = binding.lastEditorDocChangeAtMs;
+	const before = manager.captureOpenEditorMutationTicket(
+		binding.path,
+		[binding.view as never],
+	);
+	const programmaticTransaction = state.update({
+		changes: { from: 0, to: state.doc.length, insert: "plugin-applied document" },
+	});
+	installCmState(programmaticTransaction.state);
+	setLiveEditorContent("plugin-applied document");
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "plugin-applied document");
+	(manager as unknown as {
+		handleLiveEditorUpdate: (update: unknown) => void;
+	}).handleLiveEditorUpdate({
+		view: binding.cm,
+		docChanged: true,
+		transactions: [programmaticTransaction],
+	});
+	const afterProgrammatic = manager.captureOpenEditorMutationTicket(
+		binding.path,
+		[binding.view as never],
+	);
+	assertEq(
+		afterProgrammatic.views[0]!.editorAuthorityRevision >
+			before.views[0]!.editorAuthorityRevision,
+		true,
+		"programmatic CodeMirror edit advances editor authority revision",
+	);
+	assertEq(
+		afterProgrammatic.views[0]!.editorAuthorityContent,
+		"plugin-applied document",
+		"authority ticket retains the exact programmatic successor document",
+	);
+	assertEq(
+		binding.lastEditorDocChangeAtMs,
+		activityBefore,
+		"programmatic authority still does not masquerade as user activity",
+	);
+
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "provider document");
+	const providerTransaction = state.update({
+		changes: { from: 0, to: state.doc.length, insert: "provider document" },
+	});
+	installCmState(providerTransaction.state);
+	setLiveEditorContent("provider document");
+	(manager as unknown as {
+		handleLiveEditorUpdate: (update: unknown) => void;
+	}).handleLiveEditorUpdate({
+		view: binding.cm,
+		docChanged: true,
+		transactions: [providerTransaction],
+	});
+	const afterProvider = manager.captureOpenEditorMutationTicket(
+		binding.path,
+		[binding.view as never],
+	);
+	assertEq(
+		afterProvider.views[0]!.editorRevision >
+			afterProgrammatic.views[0]!.editorRevision,
+		true,
+		"provider patch still advances the general mutation fence revision",
+	);
+	assertEq(
+		afterProvider.views[0]!.editorAuthorityRevision,
+		afterProgrammatic.views[0]!.editorAuthorityRevision,
+		"provider patch does not advance editor authority revision",
+	);
+	assertEq(
+		afterProvider.views[0]!.editorAuthorityContent,
+		"plugin-applied document",
+		"provider patch cannot relabel its document as editor-origin authority",
+	);
+
+	const filterFalseContent = "filter-disabled plugin document";
+	const filterFalseTransaction = state.update({
+		changes: { from: 0, to: state.doc.length, insert: filterFalseContent },
+		filter: false,
+	});
+	installCmState(filterFalseTransaction.state);
+	setLiveEditorContent(filterFalseContent);
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, filterFalseContent);
+	(manager as unknown as {
+		handleLiveEditorUpdate: (update: unknown) => void;
+	}).handleLiveEditorUpdate({
+		view: binding.cm,
+		docChanged: true,
+		transactions: [filterFalseTransaction],
+	});
+	const afterFilterFalse = manager.captureOpenEditorMutationTicket(
+		binding.path,
+		[binding.view as never],
+	);
+	assertEq(
+		afterFilterFalse.views[0]!.editorAuthorityRevision >
+			afterProvider.views[0]!.editorAuthorityRevision,
+		true,
+		"filter:false editor/API edit still advances editor authority",
+	);
+	assertEq(
+		afterFilterFalse.views[0]!.editorAuthorityContent,
+		filterFalseContent,
+		"filter:false provenance carries the exact successor document",
+	);
+
+	const batchedLocalContent = "local member of a batched update";
+	const batchedProviderContent = "provider member after local transaction";
+	const batchedLocal = state.update({
+		changes: { from: 0, to: state.doc.length, insert: batchedLocalContent },
+	});
+	installCmState(batchedLocal.state);
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, batchedProviderContent);
+	const batchedProvider = state.update({
+		changes: { from: 0, to: state.doc.length, insert: batchedProviderContent },
+	});
+	installCmState(batchedProvider.state);
+	setLiveEditorContent(batchedProviderContent);
+	(manager as unknown as {
+		handleLiveEditorUpdate: (update: unknown) => void;
+	}).handleLiveEditorUpdate({
+		view: binding.cm,
+		docChanged: true,
+		transactions: [batchedLocal, batchedProvider],
+	});
+	const afterBatch = manager.captureOpenEditorMutationTicket(
+		binding.path,
+		[binding.view as never],
+	);
+	assertEq(
+		afterBatch.views[0]!.editorAuthorityContent,
+		batchedLocalContent,
+		"a later provider transaction in one ViewUpdate cannot steal local provenance",
+	);
+	assertEq(
+		binding.lastEditorDocChangeAtMs,
+		activityBefore,
+		"all activityless provenance cases leave the user timestamp unchanged",
+	);
 	clearPendingHealthChecks(manager);
 }
 
@@ -907,6 +1118,716 @@ console.log("\n--- Test 19a2: explicit snapshot restore is never undone by the a
 		false,
 		"snapshot restore never emits editor.authority_shield.applied",
 	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a3: correlated external editor reload is blocked before Y.Text ---");
+{
+	const {
+		manager,
+		binding,
+		rejectedExternalReloads,
+	} = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "typing now");
+	manager.noteExternalDiskMutation(
+		externalDiskMutationNotice(binding.path, "external disk replacement"),
+	);
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "external disk replacement" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+
+	const result = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+
+	assertEq(Array.isArray(result), true, "external reload is replaced with a cancelled transaction list");
+	assertEq((result as unknown[]).length, 0, "external reload produces no CodeMirror document change");
+	assertEq(binding.ytext.toString(), "typing now", "blocked reload never reaches Y.Text");
+	assertEq(rejectedExternalReloads.length, 1, "external candidate is handed to conflict preservation");
+	assertEq(
+		rejectedExternalReloads[0]?.content,
+		"external disk replacement",
+		"conflict preservation receives the exact external bytes",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a3b: exact content correlation handles mixed EOL without size false positives ---");
+{
+	const { manager, binding, rejectedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "typing now");
+	const rawExternal = "line one\r\nline two\n";
+	const normalizedExternal = "line one\nline two\n";
+	manager.noteExternalDiskMutation(
+		externalDiskMutationNotice(binding.path, rawExternal),
+	);
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => normalizedExternal },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+	const result = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+
+	assertEq(Array.isArray(result), true, "mixed LF/CRLF external reload is blocked by exact normalized content");
+	assertEq(
+		rejectedExternalReloads[0]?.content,
+		rawExternal,
+		"conflict preservation receives the exact mixed-EOL disk representation",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a3c: same-size unrelated plugin edit is never a disk reload ---");
+{
+	const { manager, binding, rejectedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "typing now");
+	const diskContent = "disk state";
+	const pluginContent = "plugin now";
+	assertEq(
+		new TextEncoder().encode(diskContent).byteLength,
+		new TextEncoder().encode(pluginContent).byteLength,
+		"test candidates have the same byte size",
+	);
+	manager.noteExternalDiskMutation(
+		externalDiskMutationNotice(binding.path, diskContent),
+	);
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => pluginContent },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+	const result = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+
+	assertEq(result, transaction, "same-size editor/API transaction remains a normal editor-origin edit");
+	assertEq(rejectedExternalReloads.length, 0, "unrelated plugin content is not mislabeled as external");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a3c2: filter:false cannot bypass an exact external reload guard ---");
+{
+	const {
+		manager,
+		binding,
+		rejectedExternalReloads,
+		setLiveEditorContent,
+	} = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	(manager as unknown as { maybeHealBinding: () => void }).maybeHealBinding = () => {};
+	const beforeContent = "typing now";
+	const externalContent = "filter bypass external";
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, beforeContent);
+	const state = EditorState.create({
+		doc: beforeContent,
+		extensions: manager.getBaseExtension(),
+	});
+	(binding.cm as unknown as { state: EditorState }).state = state;
+	manager.noteExternalDiskMutation(
+		externalDiskMutationNotice(binding.path, externalContent),
+	);
+	const beforeTicket = manager.captureOpenEditorMutationTicket(
+		binding.path,
+		[binding.view as never],
+	);
+	const transaction = state.update({
+		changes: { from: 0, to: state.doc.length, insert: externalContent },
+		filter: false,
+	});
+	(binding.cm as unknown as { state: EditorState }).state = transaction.state;
+	setLiveEditorContent(externalContent);
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, externalContent);
+	(manager as unknown as {
+		handleLiveEditorUpdate: (update: unknown) => void;
+	}).handleLiveEditorUpdate({
+		view: binding.cm,
+		docChanged: true,
+		transactions: [transaction],
+	});
+	await Promise.resolve();
+
+	const afterTicket = manager.captureOpenEditorMutationTicket(
+		binding.path,
+		[binding.view as never],
+	);
+	assertEq(
+		binding.ytext.toString(),
+		beforeContent,
+		"filter:false external reload is reverted by exact post-update CAS",
+	);
+	assertEq(rejectedExternalReloads.length, 1, "filter bypass preserves the exact external candidate");
+	assertEq(
+		afterTicket.views[0]!.editorAuthorityRevision,
+		beforeTicket.views[0]!.editorAuthorityRevision,
+		"rejected filter:false reload never becomes editor authority",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a3c3: a later transaction filter cannot resurrect an external reload ---");
+{
+	const {
+		manager,
+		binding,
+		rejectedExternalReloads,
+		setLiveEditorContent,
+	} = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	(manager as unknown as { maybeHealBinding: () => void }).maybeHealBinding = () => {};
+	const beforeContent = "typing now";
+	const externalContent = "resurrected external reload";
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, beforeContent);
+	const resurrectCancelledChange = EditorState.transactionFilter.of((transaction) => {
+		if (transaction.docChanged) return transaction;
+		return {
+			changes: {
+				from: 0,
+				to: transaction.startState.doc.length,
+				insert: externalContent,
+			},
+		};
+	});
+	const state = EditorState.create({
+		doc: beforeContent,
+		// Transaction filters run in reverse extension order. The manager blocks
+		// first; this deliberately hostile filter then recreates the same change.
+		extensions: [resurrectCancelledChange, manager.getBaseExtension()],
+	});
+	(binding.cm as unknown as { state: EditorState }).state = state;
+	manager.noteExternalDiskMutation(
+		externalDiskMutationNotice(binding.path, externalContent),
+	);
+	const beforeTicket = manager.captureOpenEditorMutationTicket(
+		binding.path,
+		[binding.view as never],
+	);
+	const transaction = state.update({
+		changes: { from: 0, to: state.doc.length, insert: externalContent },
+	});
+	assertEq(
+		transaction.docChanged,
+		true,
+		"later transaction filter recreates the cancelled document change",
+	);
+	(binding.cm as unknown as { state: EditorState }).state = transaction.state;
+	setLiveEditorContent(externalContent);
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, externalContent);
+	(manager as unknown as {
+		handleLiveEditorUpdate: (update: unknown) => void;
+	}).handleLiveEditorUpdate({
+		view: binding.cm,
+		docChanged: true,
+		transactions: [transaction],
+	});
+	await Promise.resolve();
+
+	const afterTicket = manager.captureOpenEditorMutationTicket(
+		binding.path,
+		[binding.view as never],
+	);
+	assertEq(
+		binding.ytext.toString(),
+		beforeContent,
+		"resurrected external reload is reverted by exact post-update CAS",
+	);
+	assertEq(
+		rejectedExternalReloads.length,
+		1,
+		"resurrected external bytes are preserved exactly once",
+	);
+	assertEq(
+		afterTicket.views[0]!.editorAuthorityRevision,
+		beforeTicket.views[0]!.editorAuthorityRevision,
+		"resurrected external reload never becomes editor authority",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a3d: event order survives delayed exact-content proof ---");
+{
+	const {
+		manager,
+		binding,
+		rejectedExternalReloads,
+		setLiveEditorContent,
+		setLiveFileStat,
+	} = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "typing now");
+	const externalContent = "delayed external";
+	const coarseMtime = Math.floor(Date.now() / 1000) * 1000;
+	setLiveFileStat(coarseMtime, new TextEncoder().encode(externalContent).byteLength);
+	const notice = externalDiskMutationNotice(binding.path, externalContent, coarseMtime);
+	manager.beginExternalDiskMutation(binding.path, notice.sequence);
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => externalContent },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+	const result = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+	assertEq(result, transaction, "editor transaction may arrive while exact disk read is pending");
+
+	setLiveEditorContent(externalContent);
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, externalContent);
+	(manager as unknown as {
+		editorRevisionByCm: WeakMap<object, number>;
+	}).editorRevisionByCm.set(binding.cm, 1);
+	manager.noteExternalDiskMutation(notice);
+
+	assertEq(binding.ytext.toString(), "typing now", "synchronous event sequence restores editor authority");
+	assertEq(rejectedExternalReloads.length, 1, "delayed proof still preserves the exact external version");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a4: disk marker never blocks a Y.Text/provider patch ---");
+{
+	const { manager, binding, rejectedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	manager.noteExternalDiskMutation(
+		externalDiskMutationNotice(binding.path, "disk candidate"),
+	);
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "provider state");
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "provider state" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+
+	const result = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+
+	assertEq(result, transaction, "Y.Text-first provider patch remains normal collaboration");
+	assertEq(rejectedExternalReloads.length, 0, "provider patch is not preserved as a disk conflict");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a4b: provider advance does not open a disk-reload bypass ---");
+{
+	const { manager, binding, rejectedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	manager.noteExternalDiskMutation(
+		externalDiskMutationNotice(binding.path, "external disk replacement"),
+	);
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "newer provider authority");
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "external disk replacement" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+
+	const result = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+
+	assertEq(Array.isArray(result), true, "correlated editor reload is blocked during provider/editor skew");
+	assertEq(binding.ytext.toString(), "newer provider authority", "provider authority remains untouched");
+	assertEq(rejectedExternalReloads.length, 1, "external disk candidate is still preserved");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a5: late external event uses exact CAS rollback ---");
+{
+	const {
+		manager,
+		binding,
+		rejectedExternalReloads,
+		setLiveEditorContent,
+		setLiveFileStat,
+	} = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "typing now");
+	let externalMtime = Date.now() - 100;
+	if (externalMtime % 1000 === 0) externalMtime--;
+	setLiveFileStat(externalMtime, 25);
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "late external replacement" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+	const result = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+	assertEq(result, transaction, "unattributed editor change waits for a matching disk event");
+
+	setLiveEditorContent("late external replacement");
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "late external replacement");
+	(manager as unknown as {
+		editorRevisionByCm: WeakMap<object, number>;
+	}).editorRevisionByCm.set(binding.cm, 1);
+	manager.noteExternalDiskMutation(
+		externalDiskMutationNotice(
+			binding.path,
+			"late external replacement",
+			externalMtime,
+		),
+	);
+
+	assertEq(binding.ytext.toString(), "typing now", "exact unchanged Y.Text is restored to editor authority");
+	assertEq(rejectedExternalReloads.length, 1, "late external candidate is preserved exactly once");
+	assertEq(
+		rejectedExternalReloads[0]?.content,
+		"late external replacement",
+		"late-order preservation keeps the external candidate",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a6: coarse-mtime plugin autosave cannot roll back or poison later edits ---");
+{
+	const {
+		manager,
+		binding,
+		rejectedExternalReloads,
+		setLiveEditorContent,
+		setLiveFileStat,
+	} = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "typing now");
+	const coarseMtime = Math.floor(Date.now() / 1000) * 1000;
+	setLiveFileStat(coarseMtime, 10);
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "plugin now" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+	(manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+	setLiveEditorContent("plugin now");
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "plugin now");
+	(manager as unknown as {
+		editorRevisionByCm: WeakMap<object, number>;
+	}).editorRevisionByCm.set(binding.cm, 1);
+	manager.noteExternalDiskMutation(
+		externalDiskMutationNotice(binding.path, "plugin now", coarseMtime),
+	);
+
+	assertEq(
+		binding.ytext.toString(),
+		"plugin now",
+		"ambiguous coarse-mtime autosave keeps the plugin editor change",
+	);
+	assertEq(rejectedExternalReloads.length, 0, "normal autosave creates no external conflict copy");
+	const nextPluginTransaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "plugin two" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+	const nextResult = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(nextPluginTransaction);
+	assertEq(
+		nextResult,
+		nextPluginTransaction,
+		"the autosave event does not poison the plugin's next non-user editor edit",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a7: provider advance invalidates late external rollback ---");
+{
+	const {
+		manager,
+		binding,
+		rejectedExternalReloads,
+		setLiveEditorContent,
+		setLiveFileStat,
+	} = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "typing now");
+	let externalMtime = Date.now() - 100;
+	if (externalMtime % 1000 === 0) externalMtime--;
+	setLiveFileStat(externalMtime, 18);
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "external candidate" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+	(manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+	setLiveEditorContent("external candidate");
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "newer provider authority");
+	(manager as unknown as {
+		editorRevisionByCm: WeakMap<object, number>;
+	}).editorRevisionByCm.set(binding.cm, 1);
+	manager.noteExternalDiskMutation(
+		externalDiskMutationNotice(binding.path, "external candidate", externalMtime),
+	);
+
+	assertEq(
+		binding.ytext.toString(),
+		"newer provider authority",
+		"newer provider content survives a stale late-order rollback candidate",
+	);
+	assertEq(rejectedExternalReloads.length, 1, "stale rollback candidate is preserved without rollback");
+	assertEq(
+		rejectedExternalReloads[0]?.content,
+		"external candidate",
+		"provider advance cannot discard the proven external bytes",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a8: user input cannot poison or erase exact external correlation ---");
+{
+	const { manager, binding, rejectedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "typing now");
+	manager.noteExternalDiskMutation(
+		externalDiskMutationNotice(binding.path, "disk state"),
+	);
+	const userTransaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "typing now!" },
+		annotation: () => "input.type",
+		isUserEvent: (event: string) => event === "input" || event === "input.type",
+	};
+	(manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(userTransaction);
+	const laterProgrammaticTransaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "later programmatic change" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+	const result = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(laterProgrammaticTransaction);
+
+	assertEq(result, laterProgrammaticTransaction, "post-input programmatic change is not tied to an older disk event");
+	assertEq(rejectedExternalReloads.length, 0, "unrelated post-input content is not classified as external");
+	const delayedExternalReload = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "disk state" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+	const delayedResult = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(delayedExternalReload);
+	assertEq(
+		Array.isArray(delayedResult),
+		true,
+		"user input does not erase a still-pending exact external reload marker",
+	);
+	assertEq(rejectedExternalReloads.length, 1, "the delayed exact external candidate is preserved");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a8b: user input during delayed proof keeps both newer authority and external bytes ---");
+{
+	const {
+		manager,
+		binding,
+		rejectedExternalReloads,
+		setLiveEditorContent,
+		setLiveFileStat,
+	} = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "editor before external");
+	setLiveEditorContent("editor before external");
+	const externalContent = "external while proof pending";
+	const coarseMtime = Math.floor(Date.now() / 1000) * 1000;
+	setLiveFileStat(coarseMtime, new TextEncoder().encode(externalContent).byteLength);
+	const notice = externalDiskMutationNotice(binding.path, externalContent, coarseMtime);
+	manager.beginExternalDiskMutation(binding.path, notice.sequence);
+	const externalTransaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => externalContent },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+	(manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(externalTransaction);
+	setLiveEditorContent(externalContent);
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, externalContent);
+	(manager as unknown as {
+		editorRevisionByCm: WeakMap<object, number>;
+	}).editorRevisionByCm.set(binding.cm, 1);
+
+	const userContent = `${externalContent}\nuser successor`;
+	const userTransaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => userContent },
+		annotation: () => "input.type",
+		isUserEvent: (event: string) => event === "input" || event === "input.type",
+	};
+	(manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(userTransaction);
+	setLiveEditorContent(userContent);
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, userContent);
+	(manager as unknown as {
+		editorRevisionByCm: WeakMap<object, number>;
+	}).editorRevisionByCm.set(binding.cm, 2);
+
+	manager.noteExternalDiskMutation(notice);
+	assertEq(binding.ytext.toString(), userContent, "newer user authority is never rolled back");
+	assertEq(rejectedExternalReloads.length, 1, "late proof still preserves the external candidate");
+	assertEq(
+		rejectedExternalReloads[0]?.content,
+		externalContent,
+		"late preservation keeps the exact external bytes",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a9: out-of-order exact reads cannot replace a newer marker ---");
+{
+	const { manager, binding, rejectedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const older = externalDiskMutationNotice(binding.path, "older external");
+	const newer = externalDiskMutationNotice(binding.path, "newer external");
+	manager.beginExternalDiskMutation(binding.path, older.sequence);
+	manager.beginExternalDiskMutation(binding.path, newer.sequence);
+	manager.noteExternalDiskMutation(newer);
+	manager.noteExternalDiskMutation(older);
+
+	const pending = (manager as unknown as {
+		pendingExternalDiskMutations: Map<string, { content: string | null }>;
+	}).pendingExternalDiskMutations.get(binding.path);
+	assertEq(pending?.content, "newer external", "older async completion cannot replace the newer marker");
+	assertEq(rejectedExternalReloads.length, 1, "older proven external bytes are preserved off-path");
+	assertEq(rejectedExternalReloads[0]?.content, "older external", "stale completion preserves its exact bytes");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a10: an old async proof cannot cross close and reopen ---");
+{
+	const { manager, binding, rejectedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const notice = externalDiskMutationNotice(binding.path, "external before reopen");
+	manager.beginExternalDiskMutation(binding.path, notice.sequence);
+	manager.unbind(binding.view as never);
+	// Model a new binding lifetime on the same path before the old read resolves.
+	(manager as unknown as { bindings: Map<string, unknown> }).bindings.set("leaf-1", binding);
+	manager.noteExternalDiskMutation(notice);
+
+	const pending = (manager as unknown as {
+		pendingExternalDiskMutations: Map<string, unknown>;
+	}).pendingExternalDiskMutations.get(binding.path);
+	assertEq(pending, undefined, "old proof cannot arm the reopened editor binding");
+	assertEq(rejectedExternalReloads.length, 1, "the exact old candidate is still preserved");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a11: always policy bypasses an already pending guard ---");
+{
+	let guardEnabled = true;
+	const { manager, binding, rejectedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		externalReloadGuardEnabled: () => guardEnabled,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "typing now");
+	const externalContent = "allowed by always";
+	manager.noteExternalDiskMutation(
+		externalDiskMutationNotice(binding.path, externalContent),
+	);
+	guardEnabled = false;
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => externalContent },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+	const result = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch(transaction);
+
+	assertEq(result, transaction, "always policy lets the pending external reload continue");
+	assertEq(rejectedExternalReloads.length, 0, "always policy creates no rejected-reload artifact");
 	clearPendingHealthChecks(manager);
 }
 

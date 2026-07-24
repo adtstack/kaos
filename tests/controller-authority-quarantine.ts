@@ -933,11 +933,11 @@ console.log("\n--- Closed reconcile: hash-race marker blocks visible CRDT winner
 	fixture.doc.destroy();
 }
 
-console.log("\n--- Open reconcile: captured editor authority changing without activity is preserved, never applied ---");
+console.log("\n--- Open reconcile: programmatic editor successor replaces a deferred capture without artifacts ---");
 {
 	const path = "Open/captured-authority-changed.md";
-	const diskContent = "disk candidate\n";
-	const crdtContent = "CRDT candidate\n";
+	const diskContent = "shared base\n";
+	const crdtContent = diskContent;
 	const capturedEditorContent = "captured editor candidate\n";
 	let liveEditorContent = "later pane candidate without activity event\n";
 	const file = makeTFile(path, diskContent, 41);
@@ -945,6 +945,40 @@ console.log("\n--- Open reconcile: captured editor authority changing without ac
 		file,
 		editor: { getValue: () => liveEditorContent },
 	});
+	const cm = {};
+	const capturedTicket = {
+		path,
+		views: [{
+			view,
+			viewId: "view-open-authority",
+			leafId: "open-authority-leaf",
+			cm,
+			cmId: "cm-open-authority",
+			bindingEpoch: 1,
+			editorRevision: 0,
+			editorAuthorityRevision: 0,
+			editorAuthorityContent: null,
+			editorDocument: {},
+			editorContent: capturedEditorContent,
+		}],
+	};
+	const liveTicket = {
+		path,
+		views: [{
+			view,
+			viewId: "view-open-authority",
+			leafId: "open-authority-leaf",
+			cm,
+			cmId: "cm-open-authority",
+			bindingEpoch: 1,
+			editorRevision: 1,
+			editorAuthorityRevision: 1,
+			editorAuthorityContent: liveEditorContent,
+			editorDocument: {},
+			editorContent: liveEditorContent,
+		}],
+	};
+	let currentTicket = liveTicket;
 	const doc = new Y.Doc();
 	const ytext = doc.getText("content");
 	ytext.insert(0, crdtContent);
@@ -1006,7 +1040,8 @@ console.log("\n--- Open reconcile: captured editor authority changing without ac
 		getBlobSync: () => null,
 		getEditorBindings: () => ({
 			isBound: () => true,
-			captureOpenEditorMutationTicket: () => ({ path, views: [] }),
+			getLastEditorActivityForPath: () => null,
+			captureOpenEditorMutationTicket: () => currentTicket,
 			validateOpenEditorMutationTicket: () => ({ current: true }),
 		}) as never,
 		getDiskIndex: () => ({}),
@@ -1032,8 +1067,19 @@ console.log("\n--- Open reconcile: captured editor authority changing without ac
 			capturedCrdtContent: string;
 			capturedDiskRevision: number;
 			capturedEditorActivity: number | null;
+			capturedEditorTicket: unknown;
 			capturedAt: number;
 		}>;
+		classifyVisibleAuthorityTicketProgress(
+			previous: unknown,
+			current: unknown,
+			contents: string[],
+			readComplete: boolean,
+		): { kind: string; advancedEditorContents: string[] };
+		captureVisibleAuthorityAtDirtyAdmission(
+			path: string,
+			reason: "modify",
+		): void;
 		handleBoundFileSyncGap(
 			file: TFile,
 			content: string,
@@ -1051,10 +1097,72 @@ console.log("\n--- Open reconcile: captured editor authority changing without ac
 		capturedCrdtContent: crdtContent,
 		capturedDiskRevision: 0,
 		capturedEditorActivity: null,
+		capturedEditorTicket: capturedTicket,
 		capturedAt: Date.now() - 1,
 	});
-	// No controller activity hook is called between capture and this re-plan.
+	const providerOnlyTicket = {
+		...liveTicket,
+		views: [{
+			...liveTicket.views[0]!,
+			editorAuthorityRevision: 0,
+			editorAuthorityContent: null,
+		}],
+	};
+	assertEqual(
+		internals.classifyVisibleAuthorityTicketProgress(
+			capturedTicket,
+			providerOnlyTicket,
+			[liveEditorContent],
+			true,
+		).kind,
+		"not-successor",
+		"a provider-only CodeMirror revision cannot replace captured editor authority",
+	);
+	const unresolvedCmTicket = {
+		path,
+		views: [{
+			viewId: "view-open-authority",
+			leafId: "open-authority-leaf",
+			cmId: null,
+			bindingEpoch: 1,
+			editorRevision: 0,
+			editorAuthorityRevision: 0,
+			editorAuthorityContent: null,
+			editorContent: liveEditorContent,
+		}],
+	};
+	assertEqual(
+		internals.classifyVisibleAuthorityTicketProgress(
+			unresolvedCmTicket,
+			unresolvedCmTicket,
+			[liveEditorContent],
+			true,
+		).kind,
+		"unavailable",
+		"same-view missing-CM lineage keeps the user-activity fallback available",
+	);
+	assertEqual(
+		internals.classifyVisibleAuthorityTicketProgress(
+			capturedTicket,
+			unresolvedCmTicket,
+			[liveEditorContent],
+			true,
+		).kind,
+		"unavailable",
+		"temporary CM loss does not look like a revision rollback",
+	);
+	// No user-activity timestamp changes between capture and this re-plan. The
+	// editor-origin revision is the sole proof that the programmatic change is a
+	// successor rather than a competing pane/provider snapshot.
 	liveEditorContent = "later pane candidate without activity event\n";
+	internals.captureVisibleAuthorityAtDirtyAdmission(path, "modify");
+	const admissionMarker = internals.visibleAuthorityDeferredPaths.get(path);
+	assert(
+		admissionMarker?.readComplete === true &&
+		admissionMarker.editorContents.length === 1 &&
+		admissionMarker.editorContents[0] === liveEditorContent,
+		"dirty admission replaces the stale capture with the programmatic successor",
+	);
 	const outcome = await internals.handleBoundFileSyncGap(
 		file,
 		diskContent,
@@ -1065,40 +1173,149 @@ console.log("\n--- Open reconcile: captured editor authority changing without ac
 	);
 
 	const marker = internals.visibleAuthorityDeferredPaths.get(path);
-	assertEqual(outcome.kind, "handled", "changed captured authority is handled as unresolved");
-	assertEqual(ytext.toString(), crdtContent, "changed pane authority cannot overwrite CRDT");
-	assertEqual(flushWrites.length, 0, "changed pane authority cannot write the original disk path");
-	assertEqual(diskContent, "disk candidate\n", "changed pane authority leaves original disk bytes intact");
-	assert(marker?.readComplete === false, "combined captured/live editor authority is permanently ambiguous");
+	assertEqual(outcome.kind, "handled", "programmatic successor is handled without quarantine");
+	assertEqual(ytext.toString(), crdtContent, "successor classification does not force a CRDT write");
+	assertEqual(flushWrites.length, 0, "successor classification does not write the original disk path");
+	assert(marker?.readComplete === true, "programmatic successor remains a complete single authority");
 	assert(
-		marker?.editorContents.includes(capturedEditorContent) === true &&
-		marker.editorContents.includes(liveEditorContent),
-		"both captured and later visible pane candidates remain represented",
+		marker?.editorContents.length === 1 &&
+		marker.editorContents[0] === liveEditorContent,
+		"later editor-origin document replaces the stale captured snapshot",
 	);
-	assert(
-		[...artifacts.values()].includes(capturedEditorContent) &&
-		[...artifacts.values()].includes(liveEditorContent) &&
-		[...artifacts.values()].includes(crdtContent),
-		"captured, live pane, and CRDT candidates are preserved as artifacts",
-	);
-	assert(
-		markerRecords.some((record) =>
-			record.path === path && record.reason === "conflict-winner-flush-deferred"
-		),
-		"changed pane authority synchronously records durable quarantine",
-	);
+	assertEqual(artifacts.size, 0, "programmatic successor creates no conflict artifacts");
+	assertEqual(markerRecords.length, 0, "programmatic successor creates no durable quarantine");
 	ytext.delete(0, ytext.length);
 	ytext.insert(0, diskContent);
 	liveEditorContent = diskContent;
 	internals.resolveConvergedVisibleAuthority(path);
 	assert(
 		!internals.visibleAuthorityDeferredPaths.has(path),
-		"verified disk/editor/CRDT convergence retires the stale multi-editor capture",
+		"verified disk/editor/CRDT convergence retires the successor capture",
 	);
 	assertEqual(
 		attentionClearCalls,
-		1,
-		"verified convergence clears only the provisional conflict-winner warning",
+		0,
+		"artifact-free successor convergence has no warning to clear",
+	);
+
+	artifacts.clear();
+	markerRecords.length = 0;
+	activeAttentionReason = null;
+	const providerVisibleContent = "provider-only visible document\n";
+	liveEditorContent = providerVisibleContent;
+	currentTicket = {
+		...liveTicket,
+		views: [{
+			...liveTicket.views[0]!,
+			editorRevision: 1,
+			editorAuthorityRevision: 0,
+			editorAuthorityContent: null,
+			editorContent: providerVisibleContent,
+		}],
+	};
+	internals.visibleAuthorityDeferredPaths.set(path, {
+		editorContents: [capturedEditorContent],
+		readComplete: true,
+		capturedDiskContent: diskContent,
+		capturedCrdtContent: crdtContent,
+		capturedDiskRevision: 0,
+		capturedEditorActivity: null,
+		capturedEditorTicket: capturedTicket,
+		capturedAt: Date.now() - 1,
+	});
+	internals.captureVisibleAuthorityAtDirtyAdmission(path, "modify");
+	const providerAdmissionMarker = internals.visibleAuthorityDeferredPaths.get(path);
+	assert(
+		providerAdmissionMarker?.readComplete === false &&
+		providerAdmissionMarker.editorContents.includes(capturedEditorContent) &&
+		providerAdmissionMarker.editorContents.includes(providerVisibleContent),
+		"dirty admission keeps provider-only replacement separate from captured authority",
+	);
+	const providerOutcome = await internals.handleBoundFileSyncGap(
+		file,
+		diskContent,
+		ytext,
+		[view],
+		"modify",
+		{ mtime: 41, size: diskContent.length },
+	);
+	const providerMarker = internals.visibleAuthorityDeferredPaths.get(path);
+	assertEqual(providerOutcome.kind, "handled", "provider-only replacement remains quarantined");
+	assert(providerMarker?.readComplete === false, "provider-only replacement stays ambiguous");
+	assert(
+		providerMarker?.editorContents.includes(capturedEditorContent) === true &&
+		providerMarker.editorContents.includes(providerVisibleContent),
+		"provider-only replacement cannot erase the captured editor candidate",
+	);
+	assert(
+		[...artifacts.values()].includes(capturedEditorContent) &&
+		[...artifacts.values()].includes(providerVisibleContent),
+		"provider-only replacement preserves both visible candidates as artifacts",
+	);
+	assert(
+		markerRecords.some((record) =>
+			record.path === path && record.reason === "conflict-winner-flush-deferred"
+		),
+		"provider-only replacement still records durable quarantine",
+	);
+
+	artifacts.clear();
+	markerRecords.length = 0;
+	activeAttentionReason = null;
+	const interveningLocalContent = "intervening local API document\n";
+	const laterProviderContent = "provider document after local API edit\n";
+	liveEditorContent = laterProviderContent;
+	currentTicket = {
+		...liveTicket,
+		views: [{
+			...liveTicket.views[0]!,
+			editorRevision: 2,
+			editorAuthorityRevision: 1,
+			editorAuthorityContent: interveningLocalContent,
+			editorContent: laterProviderContent,
+		}],
+	};
+	internals.visibleAuthorityDeferredPaths.set(path, {
+		editorContents: [capturedEditorContent],
+		readComplete: true,
+		capturedDiskContent: diskContent,
+		capturedCrdtContent: crdtContent,
+		capturedDiskRevision: 0,
+		capturedEditorActivity: null,
+		capturedEditorTicket: capturedTicket,
+		capturedAt: Date.now() - 1,
+	});
+	internals.captureVisibleAuthorityAtDirtyAdmission(path, "modify");
+	const interleavedMarker = internals.visibleAuthorityDeferredPaths.get(path);
+	assert(
+		interleavedMarker?.readComplete === false &&
+		!interleavedMarker.editorContents.includes(capturedEditorContent) &&
+		interleavedMarker.editorContents.includes(interveningLocalContent) &&
+		interleavedMarker.editorContents.includes(laterProviderContent),
+		"A -> B(local) -> C(provider) replaces superseded A and retains exact B/C candidates",
+	);
+	const retainedTicketView = (
+		interleavedMarker?.capturedEditorTicket as { views?: Array<Record<string, unknown>> } | null
+	)?.views?.[0];
+	assert(
+		retainedTicketView !== undefined &&
+		!("view" in retainedTicketView) &&
+		!("cm" in retainedTicketView) &&
+		!("editorDocument" in retainedTicketView),
+		"deferred authority retains only lightweight lineage fields",
+	);
+	const interleavedOutcome = await internals.handleBoundFileSyncGap(
+		file,
+		diskContent,
+		ytext,
+		[view],
+		"modify",
+		{ mtime: 41, size: diskContent.length },
+	);
+	assertEqual(interleavedOutcome.kind, "handled", "interleaved authority remains fail-closed");
+	assert(
+		[...artifacts.values()].includes(interveningLocalContent),
+		"the exact intervening local document is preserved as a conflict artifact",
 	);
 	controller.reset();
 	doc.destroy();

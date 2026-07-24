@@ -20,6 +20,7 @@ import type { QaScenario, QaContext } from "../types";
 
 const SCRATCH_CLOSED = "QA-scratch/s05-frontmatter-closed.md";
 const SCRATCH_OPEN = "QA-scratch/s05-frontmatter-open-editor.md";
+let previousOpenExternalPolicy: "always" | "closed-only" | "never" | null = null;
 
 const INITIAL_FM = [
 	"---",
@@ -117,6 +118,10 @@ export const s05bFrontmatterOpenEditor: QaScenario = {
 	tags: ["frontmatter", "editor-bound", "single-device", "layer2"],
 
 	async setup(ctx: QaContext): Promise<void> {
+		// This scenario specifically exercises the opt-in open-file import lane.
+		// The default closed-only policy now rejects the editor reload by design.
+		const policyChange = await ctx.kaos.setExternalEditPolicyOverride("always");
+		previousOpenExternalPolicy = policyChange.previous;
 		await ctx.deleteFile(SCRATCH_OPEN).catch(() => {});
 		await ctx.waitForIdle(5000);
 	},
@@ -170,5 +175,9 @@ export const s05bFrontmatterOpenEditor: QaScenario = {
 	async cleanup(ctx: QaContext): Promise<void> {
 		await ctx.closeFile(SCRATCH_OPEN).catch(() => {});
 		await ctx.deleteFile(SCRATCH_OPEN).catch(() => {});
+		if (previousOpenExternalPolicy !== null) {
+			await ctx.kaos.setExternalEditPolicyOverride(previousOpenExternalPolicy);
+			previousOpenExternalPolicy = null;
+		}
 	},
 };
