@@ -1,6 +1,6 @@
 # Live Editor Authority Policy
 
-Status: active policy as of 2026-07-01.
+Status: active policy as of 2026-07-24.
 
 This document records the policy for protecting an open CodeMirror/Yjs editor
 from stale whole-document style patches while preserving normal live
@@ -8,27 +8,61 @@ collaboration.
 
 ## Decision
 
-Use recent local typing as the protection boundary.
+Use recent local typing as the protection boundary for Y.Text-origin repair
+patches. Treat an external disk reload as a separate, policy-controlled input.
 
 Do not use "the file is open" as the boundary.
 Do not auto-merge live editor strings outside Yjs.
 Do not remove editor binding or cursor state unless the recent-typing shield
 still fails in production.
 
-Current policy:
+Current Yjs policy:
 
 1. Let normal Yjs collaboration patches flow.
 2. Let any incoming patch flow when it preserves the current editor content.
 3. If an incoming non-user patch would remove current editor content, treat it
    as destructive.
-4. Shield a destructive patch only when this device has a real document edit
-   for the same binding within `RECENT_EDITOR_PATCH_SHIELD_MS` (currently
-   5000 ms).
+4. Shield an eligible named local-repair patch only when this device has a real
+   document edit for the same binding within
+   `RECENT_EDITOR_PATCH_SHIELD_MS` (currently 5000 ms).
 5. If the editor is merely open but has no recent local typing, do not shield
    the patch.
-6. If conflict preservation is needed, use existing conflict artifact /
+6. Provider-origin patches are never converted into whole-document editor
+   writebacks by this shield.
+7. If conflict preservation is needed, use existing conflict artifact /
    reconciliation paths outside the live editor. The live editor does not do
    automatic 3-way merges.
+
+Current external-disk policy:
+
+1. "External" describes an event route, not whether the change is trusted or
+   intended. It includes user scripts, other Obsidian plugins that write via
+   `Vault.modify`/the filesystem, and separate editors.
+2. A plugin change made through the live editor/CodeMirror API remains an
+   editor-origin change. Its Yjs propagation and following autosave continue
+   through the normal editor flow.
+3. `closed-only` (the default) and `never` do not let an unsuppressed external
+   `vault.modify` event become an editor-origin Y.Text update while the note is
+   open.
+4. A timing-based `writerGuess` is diagnostics only. If a modify event lands
+	inside KAOS's self-write window, that event's exact TFile identity/stat
+	revision and bytes must match the recent intended-write fingerprint. A later
+	file revision cannot prove an older event. A mismatch enters the external
+	reload guard without consuming normal reconciliation suppression state.
+5. The disk event and the following non-user CodeMirror replacement are
+	correlated by exact content after BOM/line-ending normalization, not by byte
+	size. The replacement is cancelled before y-codemirror can copy it into
+	Y.Text. Same-size unrelated plugin/API edits remain normal editor changes.
+6. If a host reports the editor replacement first, rollback is allowed only
+	when the exact disk content matches and either the synchronously captured
+	event sequence or a matching high-resolution mtime proves the disk write came
+	first. The exact binding, CodeMirror, Y.Text, epoch, revision, and content
+	snapshots must remain unchanged. If newer state prevents rollback, the disk
+	candidate is still preserved. Ambiguous coarse-mtime cases keep the
+	editor/API change rather than risk rolling it back.
+7. The rejected external bytes are preserved as a disk-sourced conflict note.
+8. `always` leaves this interception disabled and uses the existing open-file
+   reconciliation lane.
 
 ## Why "open" Is Not Enough
 
@@ -69,9 +103,14 @@ invent a merged document in the editor binding layer.
 | User transaction from this editor | Allow | This is the local source of truth. |
 | Non-user patch preserves editor content | Allow | Remote content is additive or compatible with local editor state. |
 | Destructive patch, no recent local typing | Allow | The open editor is passive; blocking would resurrect stale state. |
-| Destructive patch, recent local typing | Shield | Prevent stale repair/provider state from overwriting active input. |
+| Destructive named local-repair patch, recent local typing | Shield | Prevent a stale local recovery decision from overwriting active input. |
+| Provider-origin Y.Text patch, including destructive content | Allow | Preserve Yjs collaboration semantics; never turn it into whole-document local writeback. |
+| Plugin writes through the editor/CodeMirror API | Allow normal editor/Yjs flow and autosave | This is an editor-origin operation even though it is non-user/programmatic. |
+| Script, plugin `Vault.modify`, or separate editor writes disk while the note is open, `closed-only` or `never` | Cancel the correlated reload and preserve the disk candidate | These are legitimate disk-origin changes, but they must not silently replace the open editor. |
+| Correlated external disk reload, `closed-only` or `never` | Cancel and preserve disk candidate | Keep the open editor/Y.Text authoritative without losing the external version. |
+| Correlated external disk reload, `always` | Allow existing open-file lane | This is the explicit opt-in policy. |
 | Same note open on another idle device | Allow remote updates | Open-only blocking causes cross-device deadlock. |
-| Same note actively typed on both devices | Let Yjs handle normal collaboration; shield only destructive non-user replacement | Avoid replacing CRDT semantics with plugin string merge. |
+| Same note actively typed on both devices | Let Yjs handle normal collaboration; shield only an eligible named local-repair replacement | Avoid replacing CRDT semantics with plugin string merge. |
 
 ## Shield Behavior
 
@@ -89,6 +128,41 @@ The shield is narrow:
 
 This is intentionally not a general conflict resolver. It is a last-second
 guard against active typing loss.
+
+## External Reload Guard
+
+The external reload guard runs before the recent-typing shield. It first
+classifies the direction of a CodeMirror transaction from live state:
+
+- `Y.Text == incoming editor document` means Y.Text changed first. This is a
+  provider or local-repair patch and continues through the normal Yjs path.
+- Otherwise, a non-user replacement whose normalized content exactly matches
+	the correlated event's stable raw disk read is rejected. This remains true
+	during a transient provider/editor skew, so a provider advance cannot open a
+	disk-reload bypass.
+- Without a preceding disk marker, `Y.Text == current editor document` records
+  a short-lived editor-first candidate for the reverse event ordering.
+
+A user transaction always passes through, but it does not erase an exact pending
+disk candidate: a delayed reload of those same bytes is still blocked, while an
+unrelated programmatic editor/API change remains normal. This also lets late
+proof preserve the external bytes without rolling back newer user authority.
+The regular transaction filter is not the only enforcement point. A final
+transaction extender rechecks exact provenance after every filter and also runs
+for `filter: false`. If another extension recreates a cancelled replacement, or
+a caller bypasses filters, the final transaction is marked as an external
+reload and a post-update compare-and-revert restores the prior editor/Y.Text
+state only while the exact binding lineage and contents are unchanged. The
+external bytes are still preserved exactly once.
+Event order is recorded synchronously before the asynchronous exact-content
+read, and the read revalidates path, TFile identity, ctime, mtime, and size
+before and after I/O. Out-of-order completions cannot replace a newer marker;
+their proven bytes are preserved off-path. Closing the last bound pane, opting
+into `always`, or resetting the runtime invalidates the guard state, so an
+older asynchronous proof cannot arm a reopened editor or a new policy lifetime.
+
+Rollback uses `ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT`, which is registered as a
+local repair origin so DiskMirror does not echo the rejection back to disk.
 
 ## Reconciliation Compare-and-Commit
 
@@ -110,6 +184,33 @@ This closes the file-open and file-create transition where the first local
 input can arrive after an authority decision but before its write. It also
 avoids restoring the older open-editor-owns-everything model, so passive open
 files and normal Yjs collaboration retain their current behavior.
+
+Deferred visible-authority snapshots use a second, narrower revision in the
+same ticket. A general CodeMirror revision advances for every document change,
+including provider/Y.Text patches. The editor-authority revision advances only
+when the transaction starts in CodeMirror: user input, undo/redo, or a
+programmatic editor/API edit. Final transaction annotations carry the exact
+editor-origin document after all filters/extenders, including `filter: false`;
+a later provider transaction in the same update cannot relabel that snapshot.
+Reconciliation replaces an older deferred snapshot only when the same view,
+CodeMirror identity, and binding epoch remain
+present, this authority revision advances, and the latest editor-origin content
+is exactly the one currently visible. Thus a plugin can legitimately change
+`A -> B` without emitting a user-activity timestamp and `B` supersedes `A`
+without conflict artifacts. A provider-rendered `A -> C` cannot claim that
+lineage and remains conservative/preserved. If local `B` is followed by a
+provider-rendered `C` before reconciliation samples the editor, the exact `B`
+provenance is retained with `C`; a single superseded `A` is dropped instead of
+creating a stale third candidate. The correction that rejects an editor-first
+external reload also advances this narrow revision so the temporary external
+document is not quarantined twice.
+
+Deferred markers retain only primitive lineage fields, never MarkdownView,
+EditorView, DOM, or CodeMirror document objects. A temporarily unresolved
+CodeMirror is classified as unavailable rather than as a lineage rollback, so
+the existing path-scoped user-activity fallback can still recapture a complete
+visible document. A changed view identity, binding epoch, or resolved
+CodeMirror identity remains incompatible and cannot use that fallback.
 
 A create event has one additional narrow guard: if the live editor is already
 ahead of the stable disk snapshot, the create import waits for the normal
@@ -140,16 +241,49 @@ The policy is covered by:
 - `tests/editor-binding-recent-activity.ts`
   - destructive local repair patch is blocked during recent typing
   - provider-origin preserving patch is allowed
-  - provider-origin destructive patch is blocked during recent typing
-  - provider-origin destructive patch is allowed when the editor is idle
+  - provider-origin destructive patch is always allowed
+	- correlated external reload is cancelled before it reaches Y.Text
+	- mixed LF/CRLF reloads use exact normalized content, while unrelated
+	  same-size programmatic edits remain normal editor-origin changes
+	- `filter: false` and a later filter that recreates a cancelled replacement
+	  are reverted by exact post-update CAS and preserve the disk bytes once
+	- delayed exact-content proof retains synchronous event ordering
+	- user input during delayed proof remains authoritative without discarding
+	  the proven external candidate
+	- editor-first external reload uses exact disk-revision and state CAS rollback
+	- a provider advance prevents rollback but cannot discard proven external bytes
+	- out-of-order exact reads cannot replace a newer marker
+	- a proof from before close/reopen cannot arm the replacement binding
+  - a coarse-mtime plugin autosave cannot roll back the editor-origin change or
+    poison the next programmatic editor edit
+  - programmatic editor changes advance editor authority without advancing the
+    user-activity timestamp; provider patches do not
   - pre-bind input and binding-epoch changes invalidate mutation tickets
+- `tests/controller-authority-quarantine.ts`
+  - a same-lineage programmatic successor replaces the deferred snapshot with
+    no conflict note or durable quarantine
+  - a provider-only editor revision cannot erase the captured candidate
+  - `A -> B(local) -> C(provider)` retains exact `B` and `C` while dropping a
+    single superseded `A`
+  - temporarily missing CodeMirror state uses the activity fallback, and
+    deferred markers retain no live editor/view/document references
+- `tests/controller-recovery-orchestration.ts`
+  - rejected external bytes are deduplicated and preserved as a disk conflict note
+- `tests/disk-mirror-origin-classification.ts`
+  - external reload rejection is a registered local origin
+- `tests/trace-event-behavior.ts`
+	- recent self-write fingerprint probing is exact and does not consume the
+	  reconciliation suppressor
+	- a same-size later disk revision cannot prove an older event was a self-write
 - `tests/editor-binding-health-regressions.mjs`
   - filtering does not attempt live 3-way auto-merge
   - destructive patch shielding depends on recent editor activity
   - patch capture does not store a live merge base
+  - timing attribution cannot hide a suppression-window external write
 - `tests/reconciliation-safety-brake.ts`
   - editor or CRDT changes after an authority decision abort the stale commit
 - `tests/controller-recovery-orchestration.ts`
-  - create events wait when the live editor is ahead of the disk snapshot
+	- create events wait when the live editor is ahead of the disk snapshot
+	- reset cancels in-flight rejected-reload conflict preservation
 
 When changing this policy, update this document and those tests together.

@@ -40,6 +40,7 @@ const SCRATCH = "QA-scratch/s10d-recovery-amplifier.md";
 const INITIAL = "# Recovery Amplifier Test\n\nOriginal content line 1.\nOriginal content line 2.\nOriginal content line 3.\n";
 // Divergent content simulates an external disk edit while editor is idle.
 const DIVERGENT = "# Recovery Amplifier Test\n\nExternal edit line 1.\nExternal edit line 2.\nExternal edit line 3.\nExtra line added externally.\n";
+let previousExternalPolicy: "always" | "closed-only" | "never" | null = null;
 
 export const s10dRecoveryAmplifierOrchestration: QaScenario = {
 	id: "issue-22-recovery-amplifier-orchestration",
@@ -49,6 +50,8 @@ export const s10dRecoveryAmplifierOrchestration: QaScenario = {
 	traceExportPrivacy: "safe",
 
 	async setup(ctx: QaContext): Promise<void> {
+		const policyChange = await ctx.kaos.setExternalEditPolicyOverride("always");
+		previousExternalPolicy = policyChange.previous;
 		await ctx.deleteFile(SCRATCH).catch(() => {});
 		await ctx.waitForIdle(8000);
 	},
@@ -148,5 +151,9 @@ export const s10dRecoveryAmplifierOrchestration: QaScenario = {
 	async cleanup(ctx: QaContext): Promise<void> {
 		await ctx.closeFile(SCRATCH).catch(() => {});
 		await ctx.deleteFile(SCRATCH).catch(() => {});
+		if (previousExternalPolicy !== null) {
+			await ctx.kaos.setExternalEditPolicyOverride(previousExternalPolicy);
+			previousExternalPolicy = null;
+		}
 	},
 };

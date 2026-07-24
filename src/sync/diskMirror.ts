@@ -151,6 +151,8 @@ const DEBOUNCE_BURST_MS = 1000;
 const OPEN_FILE_IDLE_MS = 1500;
 const OPEN_FILE_ACTIVE_GRACE_MS = 1200;
 const SUPPRESS_MS = 500;
+const RECENT_WRITE_FINGERPRINT_MS = 5000;
+const RECENT_WRITE_FINGERPRINT_MAX_ENTRIES = 200;
 const MAX_CONCURRENT_WRITES = 5;
 const BURST_THRESHOLD = 20;
 const REMOTE_CREATE_AUTHORIZATION_MS = 30_000;
@@ -173,6 +175,25 @@ interface SuppressionEntry {
 	expectedBytes?: number;
 	expectedHash?: string;
 }
+
+interface RecentWriteFingerprint {
+	recordedAt: number;
+	expectedBytes: number;
+	expectedHash: string;
+}
+
+export interface ObservedDiskMutationRevision {
+	path: string;
+	ctime: number | null;
+	mtime: number | null;
+	size: number | null;
+}
+
+export type RecentWriteFingerprintProbe =
+	| { kind: "self-write"; content: string }
+	| { kind: "not-self-write"; content: string }
+	| { kind: "unproven"; content: string }
+	| { kind: "stale-or-unreadable" };
 
 interface PendingRemoteRename {
 	oldPath: string;
@@ -308,6 +329,12 @@ export class DiskMirror {
 	 * a writerGuess (kaos-write vs external) for diagnostics.
 	 */
 	private lastDiskWriteOkAt = new Map<string, number>();
+	/**
+	 * Short-lived, non-consuming proof of the content KAOS most recently meant
+	 * to write. The editor reload guard uses this only to disambiguate a real
+	 * external write that lands inside the normal self-write suppression window.
+	 */
+	private recentWriteFingerprints = new Map<string, RecentWriteFingerprint>();
 	/** Supplied by the plugin; DiskMirror does not own sync-path policy. */
 	private isMarkdownPathSyncable: (path: string) => boolean = () => true;
 
@@ -2373,6 +2400,73 @@ export class DiskMirror {
 		return v === undefined ? null : v;
 	}
 
+	/**
+	 * Read the exact file revision represented by a vault event. TFile objects
+	 * are mutable, so both identity and stat values are checked before and after
+	 * the asynchronous read. A later write must never become proof for an older
+	 * modify event.
+	 */
+	async readExactObservedDiskRevision(
+		file: TFile,
+		revision: ObservedDiskMutationRevision,
+	): Promise<string | null> {
+		if (!this.isObservedDiskRevisionCurrent(file, revision)) return null;
+		try {
+			const content = await this.app.vault.read(file);
+			if (!this.isObservedDiskRevisionCurrent(file, revision)) return null;
+			if (
+				revision.size !== null &&
+				new TextEncoder().encode(content).byteLength !== revision.size
+			) {
+				return null;
+			}
+			return content;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * Classify the exact observed revision against KAOS's recent intended
+	 * write, while returning the same revision's content for the editor reload
+	 * guard. This does not consume the reconciliation suppression entry.
+	 */
+	async probeRecentWriteFingerprint(
+		file: TFile,
+		revision: ObservedDiskMutationRevision,
+	): Promise<RecentWriteFingerprintProbe> {
+		const path = normalizePath(revision.path);
+		const expected = this.recentWriteFingerprints.get(path);
+		const expectedIsFresh =
+			expected !== undefined &&
+			Date.now() - expected.recordedAt <= RECENT_WRITE_FINGERPRINT_MS;
+		if (expected && !expectedIsFresh) {
+			this.recentWriteFingerprints.delete(path);
+		}
+
+		const content = await this.readExactObservedDiskRevision(file, revision);
+		if (content === null) return { kind: "stale-or-unreadable" };
+		if (!expectedIsFresh || !expected) return { kind: "unproven", content };
+
+		const observed = await this.fingerprintContent(content);
+		if (!this.isObservedDiskRevisionCurrent(file, revision)) {
+			return { kind: "stale-or-unreadable" };
+		}
+		return observed.bytes === expected.expectedBytes &&
+			observed.hash === expected.expectedHash
+			? { kind: "self-write", content }
+			: { kind: "not-self-write", content };
+	}
+
+	/** Backward-compatible boolean probe used by suppression diagnostics/tests. */
+	async matchesRecentWriteFingerprint(file: TFile): Promise<boolean | null> {
+		const revision = this.captureObservedDiskMutationRevision(file);
+		const result = await this.probeRecentWriteFingerprint(file, revision);
+		if (result.kind === "self-write") return true;
+		if (result.kind === "not-self-write") return false;
+		return null;
+	}
+
 	async shouldSuppressModify(file: TFile): Promise<boolean> {
 		return this.shouldSuppressWriteEvent(file, "modify");
 	}
@@ -2804,6 +2898,7 @@ export class DiskMirror {
 		this.remoteDeleteGenerations.clear();
 		this.remoteCreateAuthorizations.clear();
 		this.lastDiskWriteOkAt.clear();
+		this.recentWriteFingerprints.clear();
 		this.log("DiskMirror destroyed");
 	}
 
@@ -2963,6 +3058,19 @@ export class DiskMirror {
 			expectedBytes: fingerprint.bytes,
 			expectedHash: fingerprint.hash,
 		});
+		const normalized = normalizePath(path);
+		const recentFingerprint: RecentWriteFingerprint = {
+			recordedAt: Date.now(),
+			expectedBytes: fingerprint.bytes,
+			expectedHash: fingerprint.hash,
+		};
+		this.recentWriteFingerprints.delete(normalized);
+		while (this.recentWriteFingerprints.size >= RECENT_WRITE_FINGERPRINT_MAX_ENTRIES) {
+			const oldestPath = this.recentWriteFingerprints.keys().next().value as string | undefined;
+			if (oldestPath === undefined) break;
+			this.recentWriteFingerprints.delete(oldestPath);
+		}
+		this.recentWriteFingerprints.set(normalized, recentFingerprint);
 	}
 
 	private suppressDelete(path: string): void {
@@ -3105,6 +3213,63 @@ export class DiskMirror {
 			bytes: bytes.length,
 			hash: arrayBufferToHex(digest),
 		};
+	}
+
+	private captureObservedDiskMutationRevision(file: TFile): ObservedDiskMutationRevision {
+		return {
+			path: file.path,
+			ctime:
+				typeof file.stat?.ctime === "number" && Number.isFinite(file.stat.ctime)
+					? file.stat.ctime
+					: null,
+			mtime:
+				typeof file.stat?.mtime === "number" && Number.isFinite(file.stat.mtime)
+					? file.stat.mtime
+					: null,
+			size:
+				typeof file.stat?.size === "number" && Number.isFinite(file.stat.size)
+					? file.stat.size
+					: null,
+		};
+	}
+
+	private isObservedDiskRevisionCurrent(
+		file: TFile,
+		revision: ObservedDiskMutationRevision,
+	): boolean {
+		const path = normalizePath(revision.path);
+		if (normalizePath(file.path) !== path) return false;
+		const getAbstractFileByPath = (
+			this.app.vault as unknown as {
+				getAbstractFileByPath?: (candidatePath: string) => unknown;
+			}
+		).getAbstractFileByPath;
+		if (
+			typeof getAbstractFileByPath === "function" &&
+			getAbstractFileByPath.call(this.app.vault, path) !== file
+		) {
+			return false;
+		}
+		const stat = file.stat;
+		if (
+			revision.ctime !== null &&
+			(typeof stat?.ctime !== "number" || stat.ctime !== revision.ctime)
+		) {
+			return false;
+		}
+		if (
+			revision.mtime !== null &&
+			(typeof stat?.mtime !== "number" || stat.mtime !== revision.mtime)
+		) {
+			return false;
+		}
+		if (
+			revision.size !== null &&
+			(typeof stat?.size !== "number" || stat.size !== revision.size)
+		) {
+			return false;
+		}
+		return true;
 	}
 
 	private runPathWriteLocked<T>(path: string, work: () => Promise<T>): Promise<T> {

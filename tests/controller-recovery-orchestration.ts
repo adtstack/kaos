@@ -1409,6 +1409,84 @@ console.log("\n--- Test 5f: dirty admission preserves editor E across close with
 }
 
 // -------------------------------------------------------------------
+// Test 5f2 — rejected external reload keeps an exact disk conflict copy
+// -------------------------------------------------------------------
+
+console.log("\n--- Test 5f2: rejected external reload preserves the exact disk candidate ---");
+{
+	const editorAuthority = "open editor authority E\n";
+	const externalDiskCandidate = "external script candidate D\r\n";
+	const externalEditorCandidate = "external script candidate D\n";
+	const fix = buildFixture({
+		path: "Notes/rejected-external-reload.md",
+		disk: externalDiskCandidate,
+		editor: editorAuthority,
+		crdt: editorAuthority,
+	});
+
+	await Promise.all([
+		fix.controller.preserveRejectedExternalEditorReload(fix.path, externalEditorCandidate),
+		fix.controller.preserveRejectedExternalEditorReload(fix.path, externalEditorCandidate),
+	]);
+
+	const diskArtifacts = Array.from(fix.getCreatedFiles().entries()).filter(([artifactPath]) =>
+		artifactPath.includes("KAOS conflict - disk"),
+	);
+	assertEq(diskArtifacts.length, 1, "concurrent preservation requests dedupe to one disk conflict note");
+	assertEq(diskArtifacts[0]?.[1], externalDiskCandidate, "disk conflict note keeps exact CRLF disk bytes");
+	assertEq(fix.ytext.toString(), editorAuthority, "preservation does not mutate open-editor CRDT authority");
+	assertEq(fix.getCurrentDiskContent(), externalDiskCandidate, "preservation does not mutate the primary disk path");
+	fix.controller.reset();
+	fix.doc.destroy();
+}
+
+// -------------------------------------------------------------------
+// Test 5f3 — reset cancels in-flight external-reload preservation
+// -------------------------------------------------------------------
+
+console.log("\n--- Test 5f3: reset cancels in-flight external conflict preservation ---");
+{
+	const editorAuthority = "open editor authority\n";
+	const externalDiskCandidate = "external candidate\n";
+	const fix = buildFixture({
+		path: "Notes/rejected-external-reset.md",
+		disk: externalDiskCandidate,
+		editor: editorAuthority,
+		crdt: editorAuthority,
+	});
+	const deps = (fix.controller as unknown as {
+		deps: { app: { vault: { read: (file: TFile) => Promise<string> } } };
+	}).deps;
+	const originalRead = deps.app.vault.read.bind(deps.app.vault);
+	let releaseRead: (() => void) | null = null;
+	let markReadStarted: (() => void) | null = null;
+	const readStarted = new Promise<void>((resolve) => { markReadStarted = resolve; });
+	const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+	deps.app.vault.read = async (file) => {
+		markReadStarted?.();
+		await readGate;
+		return originalRead(file);
+	};
+
+	const preservation = fix.controller.preserveRejectedExternalEditorReload(
+		fix.path,
+		externalDiskCandidate,
+	);
+	await readStarted;
+	fix.controller.reset();
+	releaseRead?.();
+	await preservation;
+
+	assertEq(fix.getCreatedFiles().size, 0, "reset prevents stale preservation from creating an artifact");
+	assertEq(
+		fix.getPreservedUnresolvedCalls().length,
+		0,
+		"cancelled stale work does not publish a false unresolved marker",
+	);
+	fix.doc.destroy();
+}
+
+// -------------------------------------------------------------------
 // Test 5g — final open-file mutation fence rejects stale async snapshots
 // -------------------------------------------------------------------
 

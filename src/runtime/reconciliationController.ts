@@ -199,7 +199,38 @@ interface DeferredVisibleEditorAuthority {
 	capturedCrdtContent: string | null;
 	capturedDiskRevision: number;
 	capturedEditorActivity: number | null;
+	capturedEditorTicket: VisibleAuthorityLineageTicket | null;
 	capturedAt: number;
+}
+
+type VisibleAuthorityTicketProgressKind =
+	| "successor"
+	| "not-successor"
+	| "unavailable"
+	| "incompatible";
+
+interface VisibleAuthorityLineageViewTicket {
+	viewId: string;
+	leafId: string;
+	cmId: string | null;
+	bindingEpoch: number;
+	editorRevision: number;
+	editorAuthorityRevision: number;
+	editorAuthorityContent: string | null;
+	editorContent: string | null;
+}
+
+interface VisibleAuthorityLineageTicket {
+	path: string;
+	views: VisibleAuthorityLineageViewTicket[];
+}
+
+interface VisibleAuthorityTicketProgress {
+	kind: VisibleAuthorityTicketProgressKind;
+	/** Exact local editor-origin snapshots observed between both tickets. */
+	advancedEditorContents: string[];
+	/** A complete same-lineage local advance supersedes one older exact snapshot. */
+	supersedesPreviousSingle: boolean;
 }
 
 type DeferredVisibleAuthorityDecision =
@@ -471,6 +502,10 @@ export class ReconciliationController {
 	private diskBaselineRevisions = new Map<string, number>();
 	/** Exact live editor authority that must survive an open -> closed race. */
 	private visibleAuthorityDeferredPaths = new Map<string, DeferredVisibleEditorAuthority>();
+	/** Serialize conflict-copy preservation for rejected external editor reloads. */
+	private externalEditorReloadPreservationByPath = new Map<string, Promise<void>>();
+	/** Invalidates fire-and-forget preservation work across reset/reinitialization. */
+	private lifecycleGeneration = 0;
 	/** At most one Keep/Accept resolution may own a Markdown path. */
 	private markdownRemoteDeleteResolutions = new Map<string, InternalMarkdownResolutionLease>();
 	private closedOnlyDeferredImports = new Set<string>();
@@ -587,6 +622,7 @@ export class ReconciliationController {
 	}
 
 	reset(): void {
+		this.lifecycleGeneration += 1;
 		if (this.reconcileCooldownTimer) {
 			clearTimeout(this.reconcileCooldownTimer);
 			this.reconcileCooldownTimer = null;
@@ -610,6 +646,7 @@ export class ReconciliationController {
 		this.markdownRemoteDeleteResolutions.clear();
 		this.markdownDiskRevisions.clear();
 		this.visibleAuthorityDeferredPaths.clear();
+		this.externalEditorReloadPreservationByPath.clear();
 		this.closedOnlyDeferredImports.clear();
 		this.markdownDrainPromise = null;
 		this.lastMarkdownDirtyAt = 0;
@@ -2531,6 +2568,112 @@ export class ReconciliationController {
 		this.queueDirtyMarkdownPath(file.path, reason, opId);
 	}
 
+	/**
+	 * Preserve bytes from another app when its attempted CodeMirror reload was
+	 * rejected to keep an open editor authoritative. The primary path remains
+	 * untouched here; ordinary reconciliation decides its eventual winner.
+	 */
+	preserveRejectedExternalEditorReload(path: string, externalContent: string): Promise<void> {
+		const generation = this.lifecycleGeneration;
+		const previous = this.externalEditorReloadPreservationByPath.get(path)
+			?? Promise.resolve();
+		const current = previous
+			.catch(() => undefined)
+			.then(() => {
+				if (generation !== this.lifecycleGeneration) return;
+				return this.preserveRejectedExternalEditorReloadNow(
+					path,
+					externalContent,
+					generation,
+				);
+			});
+		this.externalEditorReloadPreservationByPath.set(path, current);
+		return current.finally(() => {
+			if (this.externalEditorReloadPreservationByPath.get(path) === current) {
+				this.externalEditorReloadPreservationByPath.delete(path);
+			}
+		});
+	}
+
+	private async preserveRejectedExternalEditorReloadNow(
+		path: string,
+		externalContent: string,
+		generation: number,
+	): Promise<void> {
+		const isCurrent = () => generation === this.lifecycleGeneration;
+		if (!isCurrent()) return;
+		if (!this.deps.isMarkdownPathSyncable(path)) return;
+		let preservedContent = externalContent;
+		const currentFile = this.deps.app.vault.getAbstractFileByPath(path);
+		if (currentFile instanceof TFile) {
+			try {
+				const currentDiskContent = await this.deps.app.vault.read(currentFile);
+				if (!isCurrent()) return;
+				if (
+					currentDiskContent === externalContent ||
+					currentDiskContent.replace(/\r\n?/g, "\n") === externalContent
+				) {
+					// CodeMirror normalizes line endings. Prefer the matching on-disk
+					// representation so a CRLF external edit is preserved faithfully.
+					preservedContent = currentDiskContent;
+				}
+			} catch {
+				// The transaction snapshot still preserves the rejected text candidate.
+			}
+		}
+		const currentCrdtContent = yTextToString(
+			this.deps.getVaultSync()?.getTextForPath(path),
+		);
+		const currentEditorAuthority = this.getOpenEditorAuthority(
+			this.getOpenMarkdownViewsForPath(path),
+		);
+		if (
+			currentCrdtContent === externalContent &&
+			(
+				currentEditorAuthority.kind !== "single" ||
+				currentEditorAuthority.content === externalContent
+			)
+		) {
+			return;
+		}
+
+		try {
+			const artifact = await this.createMarkdownConflictArtifact(
+				path,
+				preservedContent,
+				"external-editor-reload-rejected",
+				"disk",
+				isCurrent,
+			);
+			if (!isCurrent()) return;
+			this.deps.trace("conflict", "external-editor-reload-preserved", {
+				path,
+				conflictPath: artifact.path,
+				created: artifact.created,
+				externalLength: preservedContent.length,
+				crdtLength: currentCrdtContent?.length ?? null,
+				editorAuthorityKind: currentEditorAuthority.kind,
+			});
+			if (artifact.created) {
+				this.showConflictNotice(
+					`External change detected for "${path.split("/").pop()}" — ` +
+					"the open editor was kept and the external version was preserved as a conflict note.",
+				);
+			}
+		} catch (err) {
+			if (!isCurrent()) return;
+			this.deps.getDiskMirror()?.recordPreservedUnresolved?.(
+				path,
+				"conflict-artifact-write-failed",
+			);
+			this.deps.trace("conflict", "external-editor-reload-preserve-failed", {
+				path,
+				externalLength: preservedContent.length,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+
 	private captureVisibleAuthorityAtDirtyAdmission(
 		path: string,
 		reason: MarkdownDirtyReason,
@@ -2550,11 +2693,12 @@ export class ReconciliationController {
 		const currentEditorContents = Array.from(new Set(currentContents));
 		const currentReadComplete =
 			readComplete && currentContents.length === openViews.length;
-		const editorBindings = this.deps.getEditorBindings() as
-			| { getLastEditorActivityForPath?: (candidatePath: string) => number | null }
-			| null;
+		const editorBindings = this.deps.getEditorBindings();
 		const currentEditorActivity =
 			editorBindings?.getLastEditorActivityForPath?.(path) ?? null;
+		const currentEditorTicket = this.compactVisibleAuthorityTicket(
+			editorBindings?.captureOpenEditorMutationTicket?.(path, openViews) ?? null,
+		);
 		const previous = this.visibleAuthorityDeferredPaths.get(path);
 		const editorActivityAdvanced =
 			currentEditorActivity !== null &&
@@ -2563,12 +2707,30 @@ export class ReconciliationController {
 				previous?.capturedEditorActivity === undefined ||
 				currentEditorActivity > previous.capturedEditorActivity
 			);
+		const ticketProgress: VisibleAuthorityTicketProgress = previous
+			? this.classifyVisibleAuthorityTicketProgress(
+				previous.capturedEditorTicket,
+				currentEditorTicket,
+				currentEditorContents,
+				currentReadComplete,
+			)
+			: {
+				kind: "unavailable",
+				advancedEditorContents: [],
+				supersedesPreviousSingle: false,
+			};
 		const recaptureIsAuthoritative =
-			currentReadComplete && (!previous || editorActivityAdvanced);
+			currentReadComplete &&
+			(
+				!previous ||
+				ticketProgress.kind === "successor" ||
+				(ticketProgress.kind === "unavailable" && editorActivityAdvanced)
+			);
 		const editorContents = recaptureIsAuthoritative
 			? currentEditorContents
 			: Array.from(new Set([
-				...(previous?.editorContents ?? []),
+				...this.getRetainedVisibleAuthorityContents(previous, ticketProgress),
+				...ticketProgress.advancedEditorContents,
 				...currentEditorContents,
 			]));
 		const currentCrdtContent = yTextToString(
@@ -2584,6 +2746,7 @@ export class ReconciliationController {
 			capturedCrdtContent: currentCrdtContent,
 			capturedDiskRevision: this.getMarkdownDiskRevision(path),
 			capturedEditorActivity: currentEditorActivity,
+			capturedEditorTicket: currentEditorTicket,
 			capturedAt: Date.now(),
 		});
 		this.deps.trace("reconcile", "visible-editor-authority-captured-at-dirty-admission", {
@@ -2592,6 +2755,9 @@ export class ReconciliationController {
 			openViewCount: openViews.length,
 			readComplete: currentReadComplete,
 			editorCandidateCount: editorContents.length,
+			ticketProgress: ticketProgress.kind,
+			advancedEditorCandidateCount: ticketProgress.advancedEditorContents.length,
+			recaptureIsAuthoritative,
 			crdtLength: currentCrdtContent?.length ?? null,
 			diskRevision: this.getMarkdownDiskRevision(path),
 		});
@@ -3229,6 +3395,7 @@ export class ReconciliationController {
 						deferredAuthority.readComplete &&
 						editorContents.length === 1,
 					capturedDiskRevision: this.getMarkdownDiskRevision(newPath),
+					capturedEditorTicket: null,
 					capturedAt: Math.max(
 						existingTargetAuthority.capturedAt,
 						deferredAuthority.capturedAt,
@@ -3238,6 +3405,7 @@ export class ReconciliationController {
 				this.visibleAuthorityDeferredPaths.set(newPath, {
 					...deferredAuthority,
 					capturedDiskRevision: this.getMarkdownDiskRevision(newPath),
+					capturedEditorTicket: null,
 				});
 			}
 			redirected = true;
@@ -4207,6 +4375,155 @@ export class ReconciliationController {
 		return editorBindings?.captureOpenEditorMutationTicket?.(path, openViews) ?? null;
 	}
 
+	/**
+	 * Deferred markers can outlive an editor tab. Retain only stable primitive
+	 * lineage fields so a marker never keeps MarkdownView, EditorView, DOM, or a
+	 * CodeMirror document tree alive after that tab closes.
+	 */
+	private compactVisibleAuthorityTicket(
+		ticket: OpenEditorMutationTicket | null,
+	): VisibleAuthorityLineageTicket | null {
+		if (!ticket) return null;
+		return {
+			path: ticket.path,
+			views: ticket.views.map((snapshot) => ({
+				viewId: snapshot.viewId,
+				leafId: snapshot.leafId,
+				cmId: snapshot.cmId,
+				bindingEpoch: snapshot.bindingEpoch,
+				editorRevision: snapshot.editorRevision,
+				editorAuthorityRevision: snapshot.editorAuthorityRevision,
+				editorAuthorityContent: snapshot.editorAuthorityContent,
+				editorContent: snapshot.editorContent,
+			})),
+		};
+	}
+
+	/**
+	 * Decide whether a fresh visible document is a genuine successor produced
+	 * by the same editor lineage. General CodeMirror revisions are insufficient:
+	 * provider/Y.Text patches advance them too. The authority revision advances
+	 * only for user or programmatic editor-origin transactions.
+	 */
+	private classifyVisibleAuthorityTicketProgress(
+		previous: VisibleAuthorityLineageTicket | null,
+		current: VisibleAuthorityLineageTicket | null,
+		currentEditorContents: readonly string[],
+		currentReadComplete: boolean,
+	): VisibleAuthorityTicketProgress {
+		const result = (
+			kind: VisibleAuthorityTicketProgressKind,
+			advancedEditorContents: Iterable<string> = [],
+			supersedesPreviousSingle = false,
+		): VisibleAuthorityTicketProgress => ({
+			kind,
+			advancedEditorContents: Array.from(new Set(advancedEditorContents)),
+			supersedesPreviousSingle,
+		});
+		if (!previous || !current) return result("unavailable");
+		if (
+			!currentReadComplete ||
+			currentEditorContents.length !== 1 ||
+			previous.path !== current.path ||
+			previous.views.length !== current.views.length
+		) {
+			return result("incompatible");
+		}
+
+		const currentAuthority = currentEditorContents[0]!;
+		const previousByLeafId = new Map(
+			previous.views.map((snapshot) => [snapshot.leafId, snapshot] as const),
+		);
+		if (previousByLeafId.size !== previous.views.length) return result("incompatible");
+
+		let authorityRevisionAdvanced = false;
+		let authorityContentMatchesCurrent = true;
+		let cmLineageUnavailable = false;
+		const advancedEditorContents = new Set<string>();
+		for (const snapshot of current.views) {
+			const earlier = previousByLeafId.get(snapshot.leafId);
+			if (
+				!earlier ||
+				earlier.viewId !== snapshot.viewId ||
+				earlier.bindingEpoch !== snapshot.bindingEpoch
+			) {
+				return result("incompatible");
+			}
+			const snapshotCmLineageUnavailable =
+				earlier.cmId === null || snapshot.cmId === null;
+			if (snapshotCmLineageUnavailable) {
+				cmLineageUnavailable = true;
+			} else if (earlier.cmId !== snapshot.cmId) {
+				return result("incompatible");
+			}
+			if (snapshot.editorContent !== currentAuthority) {
+				return result("incompatible");
+			}
+			if (snapshotCmLineageUnavailable) {
+				// Revision zero is only a placeholder when CM resolution fails. Do not
+				// mistake it for a lineage rollback and disable the activity fallback.
+				continue;
+			}
+			if (
+				typeof earlier.editorAuthorityRevision !== "number" ||
+				typeof snapshot.editorAuthorityRevision !== "number"
+			) {
+				return result("unavailable", advancedEditorContents);
+			}
+			if (
+				snapshot.editorRevision < earlier.editorRevision ||
+				snapshot.editorAuthorityRevision < earlier.editorAuthorityRevision
+			) {
+				return result("incompatible");
+			}
+			if (snapshot.editorAuthorityRevision > earlier.editorAuthorityRevision) {
+				authorityRevisionAdvanced = true;
+				if (snapshot.editorAuthorityContent !== null) {
+					advancedEditorContents.add(snapshot.editorAuthorityContent);
+				}
+				if (snapshot.editorAuthorityContent !== currentAuthority) {
+					// A local edit occurred, but a later provider patch is what is now
+					// visible. Return its exact ticket snapshot so callers preserve B in
+					// A -> B(local) -> C(provider), rather than retaining only A and C.
+					authorityContentMatchesCurrent = false;
+				}
+			}
+		}
+
+		if (!authorityContentMatchesCurrent) {
+			return result(
+				"not-successor",
+				advancedEditorContents,
+				!cmLineageUnavailable && advancedEditorContents.size > 0,
+			);
+		}
+		if (cmLineageUnavailable) {
+			// Same view/binding lineage with a temporarily unresolved CM may still use
+			// the path-scoped user-activity fallback. A replaced view was rejected above.
+			return result("unavailable", advancedEditorContents);
+		}
+		return result(
+			authorityRevisionAdvanced ? "successor" : "not-successor",
+			advancedEditorContents,
+			authorityRevisionAdvanced && advancedEditorContents.size > 0,
+		);
+	}
+
+	private getRetainedVisibleAuthorityContents(
+		marker: DeferredVisibleEditorAuthority | undefined,
+		progress: VisibleAuthorityTicketProgress,
+	): string[] {
+		if (!marker) return [];
+		if (
+			progress.supersedesPreviousSingle &&
+			marker.readComplete &&
+			marker.editorContents.length === 1
+		) {
+			return [];
+		}
+		return marker.editorContents;
+	}
+
 	private canCommitOpenEditorMutation(input: {
 		path: string;
 		ticket: OpenEditorMutationTicket | null;
@@ -4754,6 +5071,12 @@ export class ReconciliationController {
 		const currentEditorContents = Array.from(new Set(capturedEditorContents));
 		const currentReadComplete =
 			readComplete && capturedEditorContents.length === input.openViews.length;
+		const currentEditorTicket = this.compactVisibleAuthorityTicket(
+			this.captureOpenEditorMutationTicket(
+				input.path,
+				input.openViews,
+			),
+		);
 		const editorActivityAdvanced =
 			input.lastEditorActivity !== null &&
 			(
@@ -4761,12 +5084,30 @@ export class ReconciliationController {
 				previous?.capturedEditorActivity === undefined ||
 				input.lastEditorActivity > previous.capturedEditorActivity
 			);
+		const ticketProgress: VisibleAuthorityTicketProgress = previous
+			? this.classifyVisibleAuthorityTicketProgress(
+				previous.capturedEditorTicket,
+				currentEditorTicket,
+				currentEditorContents,
+				currentReadComplete,
+			)
+			: {
+				kind: "unavailable",
+				advancedEditorContents: [],
+				supersedesPreviousSingle: false,
+			};
 		const recaptureIsAuthoritative =
-			currentReadComplete && (!previous || editorActivityAdvanced);
+			currentReadComplete &&
+			(
+				!previous ||
+				ticketProgress.kind === "successor" ||
+				(ticketProgress.kind === "unavailable" && editorActivityAdvanced)
+			);
 		const editorContents = recaptureIsAuthoritative
 			? currentEditorContents
 			: Array.from(new Set([
-				...(previous?.editorContents ?? []),
+				...this.getRetainedVisibleAuthorityContents(previous, ticketProgress),
+				...ticketProgress.advancedEditorContents,
 				...currentEditorContents,
 			]));
 		this.visibleAuthorityDeferredPaths.set(input.path, {
@@ -4778,7 +5119,15 @@ export class ReconciliationController {
 			capturedCrdtContent: input.crdtContent,
 			capturedDiskRevision: this.getMarkdownDiskRevision(input.path),
 			capturedEditorActivity: input.lastEditorActivity,
+			capturedEditorTicket: currentEditorTicket,
 			capturedAt: Date.now(),
+		});
+		this.deps.trace("reconcile", "visible-editor-authority-recaptured-at-settle", {
+			path: input.path,
+			ticketProgress: ticketProgress.kind,
+			advancedEditorCandidateCount: ticketProgress.advancedEditorContents.length,
+			recaptureIsAuthoritative,
+			editorCandidateCount: editorContents.length,
 		});
 		this.requestReconciliationFollowup(input.path, `open-editor-settle:${input.reason}`);
 	}
@@ -4793,8 +5142,9 @@ export class ReconciliationController {
 		if (!ytext) return false;
 		const crdtContent = yTextToString(ytext) ?? "";
 		const mutationTicket = this.captureOpenEditorMutationTicket(path, openViews);
+		const visibleAuthorityTicket = this.compactVisibleAuthorityTicket(mutationTicket);
 		const diskMutationRevision = this.getMarkdownDiskRevision(path);
-		const visibleAuthorityMarker = this.visibleAuthorityDeferredPaths.get(path) ?? null;
+		let visibleAuthorityMarker = this.visibleAuthorityDeferredPaths.get(path) ?? null;
 		const viewStates: Array<{ view: MarkdownView; editorContent: string }> = [];
 		let editorReadFailed = false;
 		for (const view of openViews) {
@@ -4818,6 +5168,61 @@ export class ReconciliationController {
 		}
 
 		const editorAuthority = distinctEditorContents[0]!;
+		const lastEditorActivity = this.deps.getEditorBindings()
+			?.getLastEditorActivityForPath?.(path) ?? null;
+		if (visibleAuthorityMarker) {
+			const ticketProgress = this.classifyVisibleAuthorityTicketProgress(
+				visibleAuthorityMarker.capturedEditorTicket,
+				visibleAuthorityTicket,
+				distinctEditorContents,
+				true,
+			);
+			if (ticketProgress.kind === "successor") {
+				visibleAuthorityMarker = {
+					editorContents: [editorAuthority],
+					readComplete: true,
+					capturedDiskContent: diskContent,
+					capturedCrdtContent: crdtContent,
+					capturedDiskRevision: this.getMarkdownDiskRevision(path),
+					capturedEditorActivity: lastEditorActivity,
+					capturedEditorTicket: visibleAuthorityTicket,
+					capturedAt: Date.now(),
+				};
+				this.visibleAuthorityDeferredPaths.set(path, visibleAuthorityMarker);
+				this.deps.trace("reconcile", "visible-editor-authority-successor-accepted", {
+					path,
+					stage: "open-file-reconcile-divergence",
+					editorLength: editorAuthority.length,
+				});
+			} else if (ticketProgress.advancedEditorContents.length > 0) {
+				const editorContents = Array.from(new Set([
+					...this.getRetainedVisibleAuthorityContents(
+						visibleAuthorityMarker,
+						ticketProgress,
+					),
+					...ticketProgress.advancedEditorContents,
+					editorAuthority,
+				]));
+				visibleAuthorityMarker = {
+					...visibleAuthorityMarker,
+					editorContents,
+					readComplete: editorContents.length === 1,
+					capturedDiskContent: diskContent,
+					capturedCrdtContent: crdtContent,
+					capturedDiskRevision: this.getMarkdownDiskRevision(path),
+					capturedEditorActivity: lastEditorActivity,
+					capturedEditorTicket: visibleAuthorityTicket,
+					capturedAt: Date.now(),
+				};
+				this.visibleAuthorityDeferredPaths.set(path, visibleAuthorityMarker);
+				this.deps.trace("reconcile", "visible-editor-authority-intervening-local-preserved", {
+					path,
+					stage: "open-file-reconcile-divergence",
+					ticketProgress: ticketProgress.kind,
+					editorCandidateCount: editorContents.length,
+				});
+			}
+		}
 		if (editorAuthority === crdtContent) {
 			return false;
 		}
@@ -4831,8 +5236,6 @@ export class ReconciliationController {
 		const baselineHash = this.deps.getDiskIndex()[path]?.contentHash ?? null;
 		const editorMatchesDisk = editorAuthority === diskContent;
 		const editorMatchesCrdt = editorAuthority === crdtContent;
-		const lastEditorActivity = this.deps.getEditorBindings()
-			?.getLastEditorActivityForPath?.(path) ?? null;
 		const preflightAction = planOpenBoundFileReconcile({
 			diskHash,
 			crdtHash,
@@ -5157,8 +5560,9 @@ export class ReconciliationController {
 
 		const crdtContent = yTextToString(existingText);
 		const mutationTicket = this.captureOpenEditorMutationTicket(file.path, openViews);
+		const visibleAuthorityTicket = this.compactVisibleAuthorityTicket(mutationTicket);
 		const diskMutationRevision = this.getMarkdownDiskRevision(file.path);
-		const visibleAuthorityMarker = this.visibleAuthorityDeferredPaths.get(file.path) ?? null;
+		let visibleAuthorityMarker = this.visibleAuthorityDeferredPaths.get(file.path) ?? null;
 		let mutationTicketStale = false;
 		const commitMutation = async <T>(
 			stage: string,
@@ -5181,28 +5585,81 @@ export class ReconciliationController {
 			mutationTicketStale ||= attempt.kind === "stale";
 			return attempt;
 		};
-		const deferredVisibleAuthority = this.visibleAuthorityDeferredPaths.get(file.path);
+		let deferredVisibleAuthority = this.visibleAuthorityDeferredPaths.get(file.path);
 		if (deferredVisibleAuthority) {
 			const currentAuthority = this.getOpenEditorAuthority(openViews);
 			const currentEditorContents = currentAuthority.kind === "single"
 				? [currentAuthority.content]
 				: [];
+			const currentEditorActivity =
+				editorBindings?.getLastEditorActivityForPath(file.path) ?? null;
+			const ticketProgress = this.classifyVisibleAuthorityTicketProgress(
+				deferredVisibleAuthority.capturedEditorTicket,
+				visibleAuthorityTicket,
+				currentEditorContents,
+				currentAuthority.kind === "single",
+			);
+			const editorActivityAdvanced =
+				currentEditorActivity !== null &&
+				(
+					deferredVisibleAuthority.capturedEditorActivity === null ||
+					currentEditorActivity > deferredVisibleAuthority.capturedEditorActivity
+				);
+			if (
+				currentAuthority.kind === "single" &&
+				(
+					ticketProgress.kind === "successor" ||
+					(ticketProgress.kind === "unavailable" && editorActivityAdvanced)
+				)
+			) {
+				const successorMarker: DeferredVisibleEditorAuthority = {
+					editorContents: [currentAuthority.content],
+					readComplete: true,
+					capturedDiskContent: content,
+					capturedCrdtContent: crdtContent,
+					capturedDiskRevision: this.getMarkdownDiskRevision(file.path),
+					capturedEditorActivity: currentEditorActivity,
+					capturedEditorTicket: visibleAuthorityTicket,
+					capturedAt: Date.now(),
+				};
+				this.visibleAuthorityDeferredPaths.set(file.path, successorMarker);
+				visibleAuthorityMarker = successorMarker;
+				deferredVisibleAuthority = successorMarker;
+				this.deps.trace("reconcile", "visible-editor-authority-successor-accepted", {
+					path: file.path,
+					stage: "bound-file-sync-gap",
+					ticketProgress: ticketProgress.kind,
+					editorActivityAdvanced,
+					editorLength: currentAuthority.content.length,
+				});
+			}
+			const hasDistinctInterveningEditorAuthority =
+				ticketProgress.advancedEditorContents.some(
+					(candidate) => !deferredVisibleAuthority!.editorContents.includes(candidate),
+				);
 			const exactCapturedAuthorityStillVisible =
 				deferredVisibleAuthority.readComplete &&
 				deferredVisibleAuthority.editorContents.length === 1 &&
 				currentAuthority.kind === "single" &&
-				currentAuthority.content === deferredVisibleAuthority.editorContents[0];
+				currentAuthority.content === deferredVisibleAuthority.editorContents[0] &&
+				!hasDistinctInterveningEditorAuthority;
 			if (!exactCapturedAuthorityStillVisible) {
 				const combinedMarker: DeferredVisibleEditorAuthority = {
 					...deferredVisibleAuthority,
 					editorContents: Array.from(new Set([
-						...deferredVisibleAuthority.editorContents,
+						...this.getRetainedVisibleAuthorityContents(
+							deferredVisibleAuthority,
+							ticketProgress,
+						),
+						...ticketProgress.advancedEditorContents,
 						...currentEditorContents,
 					])),
 					readComplete: false,
 					capturedDiskContent: content,
 					capturedCrdtContent: crdtContent,
 					capturedDiskRevision: this.getMarkdownDiskRevision(file.path),
+					capturedEditorActivity: currentEditorActivity,
+					capturedEditorTicket: visibleAuthorityTicket,
 					capturedAt: Date.now(),
 				};
 				this.visibleAuthorityDeferredPaths.set(file.path, combinedMarker);
@@ -5347,6 +5804,7 @@ export class ReconciliationController {
 				capturedCrdtContent: crdtContent,
 				capturedDiskRevision: this.getMarkdownDiskRevision(file.path),
 				capturedEditorActivity: lastEditorActivityForPlanner,
+				capturedEditorTicket: visibleAuthorityTicket,
 				capturedAt: Date.now(),
 			};
 			this.visibleAuthorityDeferredPaths.set(file.path, marker);
@@ -6572,8 +7030,11 @@ export class ReconciliationController {
 		content: string,
 		reason: string,
 		source?: "crdt" | "disk" | "editor",
+		isCurrent: () => boolean = () => true,
 	): Promise<MarkdownConflictArtifactResult> {
+		if (!isCurrent()) throw new Error("stale reconciliation work");
 		const existing = await this.findExistingMarkdownConflictArtifact(path, content, source);
+		if (!isCurrent()) throw new Error("stale reconciliation work");
 		if (existing !== null) {
 			this.deps.trace("conflict", "conflict-artifact-deduped", {
 				path,
@@ -6590,9 +7051,11 @@ export class ReconciliationController {
 			source,
 		});
 		for (let i = 0; i < 100; i++) {
+			if (!isCurrent()) throw new Error("stale reconciliation work");
 			const candidate = buildMarkdownConflictArtifactCopyPath(basePath, i + 1);
 			if (this.deps.app.vault.getAbstractFileByPath(candidate)) continue;
 			await this.deps.getDiskMirror()?.suppressLocalCreate(candidate, content);
+			if (!isCurrent()) throw new Error("stale reconciliation work");
 			await this.deps.app.vault.create(candidate, content);
 			this.deps.trace("conflict", "conflict-artifact-created", {
 				path,

@@ -24,6 +24,7 @@ function sliceBetween(source, startMarker, endMarker) {
 
 const workspaceSource = readFileSync(new URL("../src/runtime/editorWorkspaceOrchestrator.ts", import.meta.url), "utf8");
 const bindingSource = readFileSync(new URL("../src/sync/editorBinding.ts", import.meta.url), "utf8");
+const mainSource = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
 
 console.log("\n--- Test 1: validateOpenBindings delegates repair to guarded audit ---");
 {
@@ -202,9 +203,11 @@ console.log("\n--- Test 9a: remote typing awareness is advisory only ---");
 		section?.includes("this.warnConcurrentTyping(match.binding.path, remoteTypers)"),
 		"active remote typing emits an advisory warning",
 	);
+	const nonUserBranchIndex = section?.indexOf("const { leafId, binding } = match;") ?? -1;
+	const cancelledTransactionIndex = section?.indexOf("return [];") ?? -1;
 	assert(
-		!section?.includes("return [];"),
-		"filter never cancels a user transaction",
+		nonUserBranchIndex >= 0 && cancelledTransactionIndex > nonUserBranchIndex,
+		"only the non-user external-reload branch may cancel a transaction",
 	);
 	assert(
 		warningSection?.includes('"concurrent-typing-warning"'),
@@ -235,6 +238,36 @@ console.log("\n--- Test 9b: live editor patch filtering has no 3-way merge state
 	assert(
 		!section?.includes("baseContent"),
 		"pending Y.Text patch does not include live merge baseContent",
+	);
+}
+
+console.log("\n--- Test 9c: modify attribution cannot hide suppression-window external writes ---");
+{
+	const section = sliceBetween(
+		mainSource,
+		"const externalReloadGuardEnabled =",
+		"this.traceSink.recordPath({",
+	);
+	assert(section !== null, "modify-event external reload guard section found");
+	assert(
+		section?.includes("editorBindingsAtEvent.beginExternalDiskMutation"),
+		"every candidate modify event records synchronous ordering before async proof",
+	);
+	assert(
+		section?.includes("dm.probeRecentWriteFingerprint("),
+		"timing-attributed KAOS writes are verified against their exact event revision",
+	);
+	assert(
+		section?.includes('if (probe.kind === "self-write") return;'),
+		"only an exact self-write fingerprint bypasses the external reload guard",
+	);
+	assert(
+		section?.includes("this.diskMirror !== dm || this.editorBindings !== editorBindingsAtEvent"),
+		"late proof is fenced to the runtime and binding manager that observed the event",
+	);
+	assert(
+		section?.includes(') === "always"'),
+		"the explicit always policy still bypasses late asynchronous guard admission",
 	);
 }
 

@@ -1,4 +1,11 @@
-import { Compartment, EditorState, Transaction, type Extension, type TransactionSpec } from "@codemirror/state";
+import {
+	Annotation,
+	Compartment,
+	EditorState,
+	Transaction,
+	type Extension,
+	type TransactionSpec,
+} from "@codemirror/state";
 import { EditorView, ViewPlugin, type ViewUpdate } from "@codemirror/view";
 import { yCollab, ySyncFacet } from "y-codemirror.next";
 import * as Y from "yjs";
@@ -13,6 +20,7 @@ import {
 	ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
 	ORIGIN_EDITOR_AUTHORITY_SHIELD,
+	ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT,
 	ORIGIN_EDITOR_HEALTH_HEAL,
 } from "./origins";
 import {
@@ -46,6 +54,7 @@ const POST_BIND_HEALTH_GRACE_MS = 100;
 const LIVE_UPDATE_HEALTH_RETRY_DELAY_MS = 120;
 const RECENT_EDITOR_REPAIR_DEFER_MS = 1200;
 const RECENT_EDITOR_PATCH_SHIELD_MS = 5000;
+const EXTERNAL_DISK_RELOAD_CORRELATION_MS = 5000;
 const TYPING_AWARENESS_MIN_INTERVAL_MS = 750;
 const CONCURRENT_TYPING_NOTICE_COOLDOWN_MS = 8_000;
 const EDITOR_AUTHORITY_SHIELD_ORIGINS = new Set<string>([
@@ -123,6 +132,74 @@ interface PendingYTextPatch {
 	at: number;
 }
 
+export interface ExternalDiskMutationNotice {
+	path: string;
+	ctime: number | null;
+	mtime: number | null;
+	size: number | null;
+	/** Monotonic event identity from the owning plugin runtime. */
+	sequence: number;
+	/** Wall-clock time at which the vault event itself was observed. */
+	observedAt: number;
+	/** Exact raw text read while the event's TFile identity/stat remained current. */
+	content: string | null;
+}
+
+interface PendingExternalDiskMutation extends ExternalDiskMutationNotice {
+	at: number;
+	consumedLeafIds: Set<string>;
+	retireScheduled: boolean;
+}
+
+interface RecentEditorOriginChange {
+	path: string;
+	leafId: string;
+	binding: EditorBinding;
+	cm: EditorView;
+	ytext: Y.Text;
+	bindingEpoch: number;
+	expectedEditorRevision: number;
+	observedDiskCtime: number | null;
+	observedDiskMtime: number | null;
+	observedDiskSize: number | null;
+	observedDiskSequence: number;
+	beforeContent: string;
+	afterContent: string;
+	at: number;
+}
+
+type EditorAuthorityTransactionSource =
+	| "user"
+	| "editor-api"
+	| "external-reload-correction";
+
+interface EditorAuthorityTransactionProvenance {
+	content: string;
+	source: EditorAuthorityTransactionSource;
+}
+
+interface ExternalReloadFilterBypass {
+	path: string;
+	leafId: string;
+	bindingEpoch: number;
+	beforeContent: string;
+	externalContent: string;
+}
+
+/**
+ * An annotation, rather than Transaction object identity, survives every
+ * CodeMirror transaction filter/extender rewrite and is still present when the
+ * final ViewUpdate is delivered.
+ */
+const EDITOR_AUTHORITY_TRANSACTION =
+	Annotation.define<EditorAuthorityTransactionProvenance>();
+
+/**
+ * `filter: false` deliberately bypasses transaction filters. The extender still
+ * runs, so mark an exact external reload for a post-update compare-and-revert.
+ */
+const EXTERNAL_RELOAD_FILTER_BYPASS = Annotation.define<ExternalReloadFilterBypass>();
+
 export type OpenEditorMutationInvalidReason =
 	| "path-changed"
 	| "view-set-changed"
@@ -135,11 +212,19 @@ export type OpenEditorMutationInvalidReason =
 
 export interface OpenEditorMutationViewTicket {
 	readonly view: MarkdownView;
+	readonly viewId: string;
 	readonly leafId: string;
 	readonly cm: EditorView | null;
 	readonly cmId: string | null;
 	readonly bindingEpoch: number;
 	readonly editorRevision: number;
+	/**
+	 * Advances only when this editor is the source of the document change.
+	 * Provider/Y.Text patches still advance editorRevision, but not this value.
+	 */
+	readonly editorAuthorityRevision: number;
+	/** Exact document produced by the latest editor-origin transaction. */
+	readonly editorAuthorityContent: string | null;
 	readonly editorDocument: unknown;
 	readonly editorContent: string | null;
 }
@@ -191,6 +276,8 @@ export class EditorBindingManager {
 	private cmIds = new WeakMap<EditorView, string>();
 	private cmToLeafId = new WeakMap<EditorView, string>();
 	private cmCounter = 0;
+	private viewIds = new WeakMap<MarkdownView, string>();
+	private viewCounter = 0;
 	private pendingHealthChecks = new Map<string, ReturnType<typeof setTimeout>>();
 	private healthWorkInFlight = new Set<string>();
 	private lastDeviceName = "unknown";
@@ -203,10 +290,16 @@ export class EditorBindingManager {
 	private lastEditorDocChangeAtByPath = new Map<string, number>();
 	private lastUserDocChangeAtByCm = new WeakMap<EditorView, number>();
 	private editorRevisionByCm = new WeakMap<EditorView, number>();
+	private editorAuthorityRevisionByCm = new WeakMap<EditorView, number>();
+	private editorAuthorityContentByCm = new WeakMap<EditorView, string>();
 	private bindingEpochByLeafId = new Map<string, number>();
 	private pendingReplacementCmToLeafId = new WeakMap<EditorView, string>();
 	private lastTypingAwarenessAtByLeaf = new Map<string, number>();
 	private concurrentTypingNoticeAtByPath = new Map<string, number>();
+	private pendingExternalDiskMutations = new Map<string, PendingExternalDiskMutation>();
+	private recentEditorOriginChanges = new Map<string, RecentEditorOriginChange>();
+	private lastExternalDiskMutationSequenceByPath = new Map<string, number>();
+	private observedExternalDiskMutationSequenceByPath = new Map<string, number>();
 
 	private readonly debug: boolean;
 
@@ -218,6 +311,11 @@ export class EditorBindingManager {
 		private recordFlightPathEvent?: (event: ProductFlightPathEventInput) => void,
 		private readonly bindingPropagationGate?: BindingPropagationGate,
 		private readonly isRemoteTypingGuardEnabled: () => boolean = () => true,
+		private readonly onExternalEditorReloadRejected?: (
+			path: string,
+			externalContent: string,
+		) => void,
+		private readonly isExternalDiskReloadGuardEnabled: () => boolean = () => true,
 	) {
 		this.debug = debug;
 		// Register the reconfigure hook so the harness can trigger CM extension
@@ -249,6 +347,7 @@ export class EditorBindingManager {
 		const handleLiveEditorUpdate = this.handleLiveEditorUpdate.bind(this);
 		const unregisterKnownCmView = this.unregisterKnownCmView.bind(this);
 		const filterRiskyNonUserPatch = this.filterRiskyNonUserPatch.bind(this);
+		const annotateEditorDocumentOrigin = this.annotateEditorDocumentOrigin.bind(this);
 		const fenceStaleUserBinding = this.fenceStaleUserBinding.bind(this);
 		return [
 			this.compartment.of([]),
@@ -257,6 +356,9 @@ export class EditorBindingManager {
 			// in the ViewPlugin below; this filter runs before the patch reaches
 			// the editor document.
 			EditorState.transactionFilter.of(filterRiskyNonUserPatch),
+			// Extenders run after every transaction filter and even when a caller uses
+			// `filter: false`, so provenance attached here reaches the final update.
+			EditorState.transactionExtender.of(annotateEditorDocumentOrigin),
 			EditorState.transactionExtender.of(fenceStaleUserBinding),
 			ViewPlugin.fromClass(
 				class {
@@ -274,6 +376,194 @@ export class EditorBindingManager {
 				},
 			),
 		];
+	}
+
+	/**
+	 * Record event order synchronously, before the exact-content read starts.
+	 * The transaction filter can then distinguish an event that preceded an
+	 * editor/API transaction even when both share the same millisecond timestamp.
+	 */
+	beginExternalDiskMutation(path: string, sequence: number): void {
+		const previous = this.observedExternalDiskMutationSequenceByPath.get(path) ?? 0;
+		if (sequence > previous) {
+			this.observedExternalDiskMutationSequenceByPath.set(path, sequence);
+		}
+	}
+
+	/**
+	 * Correlate an unsuppressed vault.modify event with a CodeMirror document
+	 * replacement caused by Obsidian reloading bytes written by another app.
+	 *
+	 * The normal ordering is disk event first, editor reload second; the
+	 * transaction filter consumes the marker before y-codemirror can copy the
+	 * replacement into Y.Text. Some hosts deliver the editor update first. For
+	 * that ordering we revert only when the event's exact raw content matches
+	 * the editor replacement and either event order or a high-resolution mtime
+	 * proves the disk write preceded it. Every captured editor/Y.Text identity,
+	 * content, epoch, and revision must still match before rollback.
+	 */
+	noteExternalDiskMutation(notice: ExternalDiskMutationNotice): void {
+		if (!this.isExternalDiskReloadGuardEnabled()) {
+			this.invalidateExternalDiskReloadCorrelation(notice.path, notice.sequence);
+			return;
+		}
+		const hasLiveBinding = Array.from(this.bindings.values()).some(
+			(binding) =>
+				binding.path === notice.path &&
+				binding.view.file?.path === notice.path,
+		);
+		if (!hasLiveBinding) {
+			this.invalidateExternalDiskReloadCorrelation(notice.path, notice.sequence);
+			return;
+		}
+		const previousSequence =
+			this.lastExternalDiskMutationSequenceByPath.get(notice.path) ?? 0;
+		if (notice.sequence <= previousSequence) {
+			// Async reads may finish out of order. Never replace a newer exact
+			// marker with an older revision; preserve the older proven bytes instead.
+			if (notice.content !== null) {
+				this.notifyExternalEditorReloadRejected(notice.path, notice.content);
+			}
+			this.trace?.("editor", "external-disk-reload-guard-stale-event", {
+				path: notice.path,
+				sequence: notice.sequence,
+				currentSequence: previousSequence,
+				contentPreserved: notice.content !== null,
+			});
+			return;
+		}
+		this.lastExternalDiskMutationSequenceByPath.set(notice.path, notice.sequence);
+		const now = Date.now();
+		const candidate = this.getFreshRecentEditorOriginChange(notice.path, now);
+		const normalizedDiskContent = notice.content === null
+			? null
+			: this.normalizeDiskContentForEditor(notice.content);
+		const candidateContentMatches =
+			candidate !== null &&
+			normalizedDiskContent !== null &&
+			candidate.afterContent === normalizedDiskContent;
+		const exactDiskRevisionMatches =
+			candidate !== null &&
+			candidate.observedDiskMtime !== null &&
+			candidate.observedDiskSize !== null &&
+			typeof notice.mtime === "number" &&
+			Number.isFinite(notice.mtime) &&
+			typeof notice.size === "number" &&
+			Number.isFinite(notice.size) &&
+			notice.mtime === candidate.observedDiskMtime &&
+			notice.size === candidate.observedDiskSize &&
+			(
+				candidate.observedDiskCtime === null ||
+				notice.ctime === null ||
+				notice.ctime === candidate.observedDiskCtime
+			);
+		const eventObservedBeforeEditorChange =
+			candidate !== null && candidate.observedDiskSequence >= notice.sequence;
+		const highResolutionMtimeProvesDiskFirst =
+			exactDiskRevisionMatches &&
+			notice.mtime !== null &&
+			notice.mtime > 0 &&
+			notice.mtime % 1000 !== 0 &&
+			notice.mtime < candidate.at &&
+			candidate.at - notice.mtime <= EXTERNAL_DISK_RELOAD_CORRELATION_MS;
+		const diskMutationPredatesEditorChange =
+			candidateContentMatches &&
+			(eventObservedBeforeEditorChange || highResolutionMtimeProvesDiskFirst);
+
+		if (candidate && diskMutationPredatesEditorChange) {
+			this.recentEditorOriginChanges.delete(notice.path);
+			this.notifyExternalEditorReloadRejected(
+				notice.path,
+				notice.content ?? candidate.afterContent,
+			);
+			if (this.isRecentEditorOriginChangeCurrent(candidate)) {
+				applyDiffToYText(
+					candidate.ytext,
+					candidate.afterContent,
+					candidate.beforeContent,
+					ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT,
+				);
+				this.trace?.("editor", "external-disk-editor-reload-reverted", {
+					path: notice.path,
+					leafId: candidate.leafId,
+					cmId: candidate.binding.cmId,
+					beforeLength: candidate.beforeContent.length,
+					externalLength: candidate.afterContent.length,
+					eventObservedAt: notice.observedAt,
+					diskMtime: notice.mtime,
+					diskSize: notice.size,
+					editorChangeAt: candidate.at,
+				});
+			} else {
+				this.trace?.("editor", "external-disk-editor-reload-revert-skipped", {
+					path: notice.path,
+					reason: "exact-state-changed",
+					externalCandidatePreserved: true,
+					diskMtime: notice.mtime,
+					editorChangeAt: candidate.at,
+				});
+			}
+			return;
+		} else if (candidate && candidateContentMatches && exactDiskRevisionMatches) {
+			// Exact bytes/revision are known, but a coarse or non-monotonic clock
+			// cannot safely distinguish an editor API change from an editor-first
+			// disk reload. Keep a current editor/API result. If another authority has
+			// already replaced it, preserve the exact disk candidate without rollback.
+			this.recentEditorOriginChanges.delete(notice.path);
+			const candidateStillCurrent = this.isRecentEditorOriginChangeCurrent(candidate);
+			if (!candidateStillCurrent) {
+				this.notifyExternalEditorReloadRejected(
+					notice.path,
+					notice.content ?? candidate.afterContent,
+				);
+			}
+			this.trace?.("editor", "external-disk-editor-reload-ambiguous-preserved", {
+				path: notice.path,
+				leafId: candidate.leafId,
+				cmId: candidate.binding.cmId,
+				diskMtime: notice.mtime,
+				diskSize: notice.size,
+				editorChangeAt: candidate.at,
+				externalCandidatePreserved: !candidateStillCurrent,
+			});
+			return;
+		} else if (
+			candidate &&
+			candidateContentMatches &&
+			candidate.observedDiskSequence < notice.sequence
+		) {
+			// A programmatic editor/API change is followed by Obsidian's normal
+			// autosave modify event. Without proof that this disk revision was
+			// already visible before the editor transaction, do not arm a marker
+			// that could cancel the plugin's next non-user edit.
+			this.recentEditorOriginChanges.delete(notice.path);
+			this.trace?.("editor", "editor-origin-autosave-observed", {
+				path: notice.path,
+				leafId: candidate.leafId,
+				cmId: candidate.binding.cmId,
+				diskMtime: notice.mtime,
+				diskSize: notice.size,
+				editorChangeAt: candidate.at,
+				exactDiskRevisionMatches,
+			});
+			return;
+		}
+		if (notice.content === null) {
+			this.trace?.("editor", "external-disk-reload-guard-proof-unavailable", {
+				path: notice.path,
+				ctime: notice.ctime,
+				mtime: notice.mtime,
+				size: notice.size,
+			});
+			return;
+		}
+
+		this.rememberPendingExternalDiskMutation({
+			...notice,
+			at: now,
+			consumedLeafIds: new Set<string>(),
+			retireScheduled: false,
+		});
 	}
 
 	/**
@@ -560,6 +850,9 @@ export class EditorBindingManager {
 		this.bindings.delete(leafId);
 		this.cmToLeafId.delete(binding.cm);
 		this.bumpBindingEpoch(leafId);
+		if (!Array.from(this.bindings.values()).some((item) => item.path === binding.path)) {
+			this.invalidateExternalDiskReloadCorrelation(binding.path);
+		}
 
 		try {
 			binding.cm.dispatch({
@@ -589,6 +882,10 @@ export class EditorBindingManager {
 			this.log(`unbindAll: destroyed binding for "${binding.path}"`);
 		}
 		this.bindings.clear();
+		this.pendingExternalDiskMutations.clear();
+		this.recentEditorOriginChanges.clear();
+		this.lastExternalDiskMutationSequenceByPath.clear();
+		this.observedExternalDiskMutationSequenceByPath.clear();
 		this.clearLocalPresence("unbind-all");
 	}
 
@@ -619,6 +916,7 @@ export class EditorBindingManager {
 				// Don't break — a path could theoretically be open in multiple leaves
 			}
 		}
+		this.invalidateExternalDiskReloadCorrelation(path);
 	}
 
 	/**
@@ -640,6 +938,7 @@ export class EditorBindingManager {
 		for (const [leafId, binding] of this.bindings) {
 			const newPath = renames.get(binding.path);
 			if (newPath) {
+				const previousPath = binding.path;
 				this.log(`updatePaths: "${binding.path}" -> "${newPath}" (leaf=${leafId})`);
 				const lastDocChange = this.lastEditorDocChangeAtByPath.get(binding.path);
 				if (lastDocChange != null) {
@@ -647,6 +946,7 @@ export class EditorBindingManager {
 					this.lastEditorDocChangeAtByPath.delete(binding.path);
 				}
 				binding.path = newPath;
+				this.invalidateExternalDiskReloadCorrelation(previousPath);
 				this.bumpBindingEpoch(leafId);
 				this.publishLocalActiveFile(binding);
 			}
@@ -772,13 +1072,18 @@ export class EditorBindingManager {
 				} catch {
 					// A ticket without a readable editor cannot authorize a later write.
 				}
-				return {
-					view,
-					leafId,
+					return {
+						view,
+						viewId: this.getViewId(view),
+						leafId,
 					cm,
 					cmId: cm ? this.getCmId(cm) : null,
 					bindingEpoch: this.bindingEpochByLeafId.get(leafId) ?? 0,
 					editorRevision: cm ? (this.editorRevisionByCm.get(cm) ?? 0) : 0,
+					editorAuthorityRevision:
+						cm ? (this.editorAuthorityRevisionByCm.get(cm) ?? 0) : 0,
+					editorAuthorityContent:
+						cm ? (this.editorAuthorityContentByCm.get(cm) ?? null) : null,
 					editorDocument: cm?.state.doc ?? null,
 					editorContent,
 				};
@@ -1152,6 +1457,14 @@ export class EditorBindingManager {
 		return cmId;
 	}
 
+	private getViewId(view: MarkdownView): string {
+		const existing = this.viewIds.get(view);
+		if (existing) return existing;
+		const viewId = `view-${++this.viewCounter}`;
+		this.viewIds.set(view, viewId);
+		return viewId;
+	}
+
 	private registerKnownCmView(cm: EditorView): void {
 		this.knownCmViews.add(cm);
 	}
@@ -1250,13 +1563,63 @@ export class EditorBindingManager {
 
 		const editorContent = transaction.startState.doc.toString();
 		const incomingContent = transaction.newDoc.toString();
+		const currentYTextContent = binding.ytext.toJSON();
+		const externalReloadGuardEnabled = this.isExternalDiskReloadGuardEnabled();
+		if (!externalReloadGuardEnabled) {
+			this.invalidateExternalDiskReloadCorrelation(binding.path);
+		}
+		const pendingDiskMutation = externalReloadGuardEnabled
+			? this.getFreshPendingExternalDiskMutation(binding.path)
+			: null;
 		const pendingPatch = this.pendingYTextPatches.get(binding.ytext);
 		const validPendingPatch =
 			pendingPatch &&
+			pendingPatch.path === binding.path &&
 			pendingPatch.leafId === leafId &&
 			Date.now() - pendingPatch.at <= 1000
 				? pendingPatch
 				: null;
+		if (currentYTextContent === incomingContent) {
+			// Y.Text changed first: this is a normal Yjs/provider/local-repair patch,
+			// not an Obsidian disk reload originating in the editor document.
+			this.recentEditorOriginChanges.delete(binding.path);
+		} else if (
+			pendingDiskMutation &&
+			!pendingDiskMutation.consumedLeafIds.has(leafId) &&
+			pendingDiskMutation.content !== null &&
+			incomingContent === this.normalizeDiskContentForEditor(pendingDiskMutation.content)
+		) {
+			// The external disk event is stronger evidence than a transient
+			// editor/Y.Text mismatch. This also covers a provider advance landing
+			// between the disk event and Obsidian's editor reload.
+			this.recentEditorOriginChanges.delete(binding.path);
+			this.consumePendingExternalDiskMutation(pendingDiskMutation, leafId);
+			this.notifyExternalEditorReloadRejected(
+				binding.path,
+				pendingDiskMutation.content,
+			);
+			this.trace?.("editor", "external-disk-editor-reload-blocked", {
+				path: binding.path,
+				leafId,
+				cmId: binding.cmId,
+				editorLength: editorContent.length,
+				externalLength: incomingContent.length,
+				diskMtime: pendingDiskMutation.mtime,
+				diskSize: pendingDiskMutation.size,
+				correlationAgeMs: Date.now() - pendingDiskMutation.at,
+			});
+			return [];
+		} else if (currentYTextContent === editorContent) {
+			// A non-user CodeMirror/API edit starts in the editor and is then copied
+			// into Y.Text by y-codemirror. It is a real successor of the visible
+			// document even though it deliberately does not count as user activity.
+			this.captureRecentEditorOriginChange(
+				leafId,
+				binding,
+				editorContent,
+				incomingContent,
+			);
+		}
 		if (!this.shouldShieldYTextPatch({
 			origin: validPendingPatch?.origin ?? null,
 			editorContent,
@@ -1275,6 +1638,264 @@ export class EditorBindingManager {
 			validPendingPatch?.origin ?? null,
 		);
 		return { effects: this.compartment.reconfigure([]) };
+	}
+
+	/**
+	 * Attach final document provenance after all transaction filters have run.
+	 * This is intentionally an extender: CodeMirror preserves its annotation
+	 * across later extenders and invokes it for `filter: false` transactions.
+	 */
+	private annotateEditorDocumentOrigin(
+		transaction: Transaction,
+	): Pick<TransactionSpec, "annotations"> | null {
+		if (!transaction.docChanged) return null;
+		const incomingContent = transaction.newDoc.toString();
+		if (this.isUserTransaction(transaction)) {
+			return {
+				annotations: EDITOR_AUTHORITY_TRANSACTION.of({
+					content: incomingContent,
+					source: "user",
+				}),
+			};
+		}
+
+		const match = this.findBindingForState(transaction.startState);
+		if (!match) return null;
+		const { leafId, binding } = match;
+		if (this.editorAuthorityShieldLeafIds.has(leafId)) return null;
+
+		const editorContent = transaction.startState.doc.toString();
+		const currentYTextContent = binding.ytext.toJSON();
+		const pendingPatch = this.pendingYTextPatches.get(binding.ytext);
+		const validPendingPatch =
+			pendingPatch &&
+			pendingPatch.path === binding.path &&
+			pendingPatch.leafId === leafId &&
+			Date.now() - pendingPatch.at <= 1000
+				? pendingPatch
+				: null;
+
+		if (currentYTextContent === incomingContent) {
+			if (validPendingPatch?.origin !== ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT) {
+				return null;
+			}
+			return {
+				annotations: EDITOR_AUTHORITY_TRANSACTION.of({
+					content: incomingContent,
+					source: "external-reload-correction",
+				}),
+			};
+		}
+
+		const externalReloadGuardEnabled = this.isExternalDiskReloadGuardEnabled();
+		if (!externalReloadGuardEnabled) {
+			this.invalidateExternalDiskReloadCorrelation(binding.path);
+		}
+		const pendingDiskMutation = externalReloadGuardEnabled
+			? this.getFreshPendingExternalDiskMutation(binding.path)
+			: null;
+		if (
+			pendingDiskMutation &&
+			pendingDiskMutation.content !== null &&
+			incomingContent === this.normalizeDiskContentForEditor(pendingDiskMutation.content)
+		) {
+			// A document-changing transaction reaching the extender proves that the
+			// regular filter was bypassed (`filter: false`) or rewritten later. Preserve
+			// the exact external bytes, then restore the previous editor document with a
+			// post-update compare-and-revert.
+			this.recentEditorOriginChanges.delete(binding.path);
+			const alreadyConsumed = pendingDiskMutation.consumedLeafIds.has(leafId);
+			this.consumePendingExternalDiskMutation(pendingDiskMutation, leafId);
+			if (!alreadyConsumed) {
+				this.notifyExternalEditorReloadRejected(binding.path, pendingDiskMutation.content);
+			}
+			this.trace?.("editor", "external-disk-editor-reload-filter-bypassed", {
+				path: binding.path,
+				leafId,
+				cmId: binding.cmId,
+				sequence: pendingDiskMutation.sequence,
+			});
+			return {
+				annotations: EXTERNAL_RELOAD_FILTER_BYPASS.of({
+					path: binding.path,
+					leafId,
+					bindingEpoch: this.bindingEpochByLeafId.get(leafId) ?? 0,
+					beforeContent: editorContent,
+					externalContent: incomingContent,
+				}),
+			};
+		}
+
+		if (currentYTextContent !== editorContent) return null;
+		this.captureRecentEditorOriginChange(
+			leafId,
+			binding,
+			editorContent,
+			incomingContent,
+		);
+		return {
+			annotations: EDITOR_AUTHORITY_TRANSACTION.of({
+				content: incomingContent,
+				source: "editor-api",
+			}),
+		};
+	}
+
+	private captureRecentEditorOriginChange(
+		leafId: string,
+		binding: EditorBinding,
+		beforeContent: string,
+		afterContent: string,
+	): void {
+		const fileStat = binding.view.file?.stat;
+		this.rememberRecentEditorOriginChange({
+			path: binding.path,
+			leafId,
+			binding,
+			cm: binding.cm,
+			ytext: binding.ytext,
+			bindingEpoch: this.bindingEpochByLeafId.get(leafId) ?? 0,
+			expectedEditorRevision: (this.editorRevisionByCm.get(binding.cm) ?? 0) + 1,
+			observedDiskMtime:
+				typeof fileStat?.mtime === "number" && Number.isFinite(fileStat.mtime)
+					? fileStat.mtime
+					: null,
+			observedDiskCtime:
+				typeof fileStat?.ctime === "number" && Number.isFinite(fileStat.ctime)
+					? fileStat.ctime
+					: null,
+			observedDiskSize:
+				typeof fileStat?.size === "number" && Number.isFinite(fileStat.size)
+					? fileStat.size
+					: null,
+			observedDiskSequence:
+				this.observedExternalDiskMutationSequenceByPath.get(binding.path) ?? 0,
+			beforeContent,
+			afterContent,
+			at: Date.now(),
+		});
+	}
+
+	private rememberPendingExternalDiskMutation(marker: PendingExternalDiskMutation): void {
+		this.pendingExternalDiskMutations.set(marker.path, marker);
+		setTimeout(() => {
+			if (this.pendingExternalDiskMutations.get(marker.path) === marker) {
+				this.pendingExternalDiskMutations.delete(marker.path);
+			}
+		}, EXTERNAL_DISK_RELOAD_CORRELATION_MS);
+	}
+
+	private getFreshPendingExternalDiskMutation(path: string): PendingExternalDiskMutation | null {
+		const marker = this.pendingExternalDiskMutations.get(path);
+		if (!marker) return null;
+		if (Date.now() - marker.at <= EXTERNAL_DISK_RELOAD_CORRELATION_MS) {
+			return marker;
+		}
+		this.pendingExternalDiskMutations.delete(path);
+		return null;
+	}
+
+	private consumePendingExternalDiskMutation(
+		marker: PendingExternalDiskMutation,
+		leafId: string,
+	): void {
+		marker.consumedLeafIds.add(leafId);
+		if (marker.retireScheduled) return;
+		const allLiveBindingsConsumed = () => Array.from(this.bindings.entries())
+			.filter(([, binding]) =>
+				binding.path === marker.path && binding.view.file?.path === marker.path
+			)
+			.every(([candidateLeafId]) => marker.consumedLeafIds.has(candidateLeafId));
+		if (!allLiveBindingsConsumed()) return;
+
+		// Keep the marker through the remainder of transaction construction. A
+		// later filter may recreate changes after our filter returned [], and the
+		// final extender must still recognize that exact external document.
+		marker.retireScheduled = true;
+		queueMicrotask(() => {
+			if (this.pendingExternalDiskMutations.get(marker.path) !== marker) return;
+			if (allLiveBindingsConsumed()) {
+				this.pendingExternalDiskMutations.delete(marker.path);
+			} else {
+				marker.retireScheduled = false;
+			}
+		});
+	}
+
+	private rememberRecentEditorOriginChange(candidate: RecentEditorOriginChange): void {
+		this.recentEditorOriginChanges.set(candidate.path, candidate);
+		setTimeout(() => {
+			if (this.recentEditorOriginChanges.get(candidate.path) === candidate) {
+				this.recentEditorOriginChanges.delete(candidate.path);
+			}
+		}, EXTERNAL_DISK_RELOAD_CORRELATION_MS);
+	}
+
+	private getFreshRecentEditorOriginChange(
+		path: string,
+		now: number,
+	): RecentEditorOriginChange | null {
+		const candidate = this.recentEditorOriginChanges.get(path);
+		if (!candidate) return null;
+		if (now - candidate.at <= EXTERNAL_DISK_RELOAD_CORRELATION_MS) {
+			return candidate;
+		}
+		this.recentEditorOriginChanges.delete(path);
+		return null;
+	}
+
+	private isRecentEditorOriginChangeCurrent(candidate: RecentEditorOriginChange): boolean {
+		if (this.bindings.get(candidate.leafId) !== candidate.binding) return false;
+		if (candidate.binding.view.file?.path !== candidate.path) return false;
+		if (candidate.binding.cm !== candidate.cm) return false;
+		if ((this.bindingEpochByLeafId.get(candidate.leafId) ?? 0) !== candidate.bindingEpoch) {
+			return false;
+		}
+		if ((this.editorRevisionByCm.get(candidate.cm) ?? 0) !== candidate.expectedEditorRevision) {
+			return false;
+		}
+		if (candidate.cm.state.doc.toString() !== candidate.afterContent) return false;
+		if (this.vaultSync.getTextForPath(candidate.path) !== candidate.ytext) return false;
+		if (candidate.ytext.toJSON() !== candidate.afterContent) return false;
+		try {
+			return candidate.binding.view.editor.getValue() === candidate.afterContent;
+		} catch {
+			return false;
+		}
+	}
+
+	private clearExternalDiskReloadCorrelation(path: string): void {
+		this.pendingExternalDiskMutations.delete(path);
+		this.recentEditorOriginChanges.delete(path);
+	}
+
+	private invalidateExternalDiskReloadCorrelation(
+		path: string,
+		throughSequence = this.observedExternalDiskMutationSequenceByPath.get(path) ?? 0,
+	): void {
+		this.clearExternalDiskReloadCorrelation(path);
+		const previous = this.lastExternalDiskMutationSequenceByPath.get(path) ?? 0;
+		if (throughSequence > previous) {
+			// A proof started for an earlier binding/policy lifetime must not arm a
+			// later editor if its asynchronous read finishes after the transition.
+			this.lastExternalDiskMutationSequenceByPath.set(path, throughSequence);
+		}
+	}
+
+	private normalizeDiskContentForEditor(content: string): string {
+		const withoutBom = content.charCodeAt(0) === 0xfeff ? content.slice(1) : content;
+		return withoutBom.replace(/\r\n?/g, "\n");
+	}
+
+	private notifyExternalEditorReloadRejected(path: string, externalContent: string): void {
+		try {
+			this.onExternalEditorReloadRejected?.(path, externalContent);
+		} catch (err) {
+			this.trace?.("editor", "external-disk-editor-reload-preserve-callback-failed", {
+				path,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
 	}
 
 	private fenceStaleUserBinding(transaction: Transaction): TransactionSpec | null {
@@ -1507,11 +2128,63 @@ export class EditorBindingManager {
 
 	private handleLiveEditorUpdate(update: ViewUpdate): void {
 		const userDocumentEdit = this.isUserDocumentEdit(update);
+		let editorAuthorityAdvanceCount = 0;
+		let latestEditorAuthorityContent: string | null = null;
+		const externalReloadBypasses: ExternalReloadFilterBypass[] = [];
+		for (const transaction of update.transactions) {
+			if (!transaction.docChanged) continue;
+			if (this.isUserTransaction(transaction)) {
+				editorAuthorityAdvanceCount += 1;
+				const annotated = transaction.annotation(EDITOR_AUTHORITY_TRANSACTION);
+				try {
+					latestEditorAuthorityContent = annotated?.content
+						?? transaction.newDoc.toString();
+				} catch {
+					// Synthetic harness transactions may omit newDoc. A missing exact
+					// snapshot fails closed below without changing activity detection.
+					latestEditorAuthorityContent = null;
+				}
+				continue;
+			}
+
+			const provenance = transaction.annotation(EDITOR_AUTHORITY_TRANSACTION);
+			if (
+				provenance &&
+				typeof provenance.content === "string"
+			) {
+				editorAuthorityAdvanceCount += 1;
+				latestEditorAuthorityContent = provenance.content;
+			}
+			const bypass = transaction.annotation(EXTERNAL_RELOAD_FILTER_BYPASS);
+			if (
+				bypass &&
+				typeof bypass.path === "string" &&
+				typeof bypass.leafId === "string"
+			) {
+				externalReloadBypasses.push(bypass);
+			}
+		}
 		if (update.docChanged) {
 			this.editorRevisionByCm.set(
 				update.view,
 				(this.editorRevisionByCm.get(update.view) ?? 0) + 1,
 			);
+		}
+		if (editorAuthorityAdvanceCount > 0) {
+			this.editorAuthorityRevisionByCm.set(
+				update.view,
+				(this.editorAuthorityRevisionByCm.get(update.view) ?? 0) +
+					editorAuthorityAdvanceCount,
+			);
+			if (latestEditorAuthorityContent !== null) {
+				this.editorAuthorityContentByCm.set(
+					update.view,
+					latestEditorAuthorityContent,
+				);
+			} else {
+				// A missing exact successor snapshot must fail closed in reconciliation.
+				this.editorAuthorityContentByCm.delete(update.view);
+			}
 		}
 		if (userDocumentEdit) {
 			this.lastUserDocChangeAtByCm.set(update.view, Date.now());
@@ -1529,7 +2202,87 @@ export class EditorBindingManager {
 			);
 			this.publishLocalTypingActivity(match.leafId, match.binding, match.binding.lastEditorDocChangeAtMs);
 		}
+		for (const bypass of externalReloadBypasses) {
+			this.deferExternalReloadFilterBypassRollback(update.view, bypass);
+		}
 		this.maybeHealBinding(match.leafId, match.binding, "live-update");
+	}
+
+	private deferExternalReloadFilterBypassRollback(
+		cm: EditorView,
+		bypass: ExternalReloadFilterBypass,
+	): void {
+		queueMicrotask(() => {
+			const match = this.findBindingForCm(cm);
+			if (
+				!match ||
+				match.leafId !== bypass.leafId ||
+				match.binding.path !== bypass.path ||
+				match.binding.view.file?.path !== bypass.path ||
+				(this.bindingEpochByLeafId.get(match.leafId) ?? 0) !== bypass.bindingEpoch
+			) {
+				this.trace?.("editor", "external-disk-editor-reload-bypass-revert-skipped", {
+					path: bypass.path,
+					reason: "binding-lineage-changed",
+				});
+				return;
+			}
+
+			const { binding } = match;
+			const currentYText = this.vaultSync.getTextForPath(bypass.path);
+			let currentEditorContent: string | null = null;
+			try {
+				currentEditorContent = binding.view.editor.getValue();
+			} catch {
+				// An unreadable or replaced editor is newer uncertainty; leave it alone.
+			}
+			if (
+				currentYText !== binding.ytext ||
+				currentEditorContent !== bypass.externalContent ||
+				cm.state.doc.toString() !== bypass.externalContent
+			) {
+				this.trace?.("editor", "external-disk-editor-reload-bypass-revert-skipped", {
+					path: bypass.path,
+					reason: "exact-editor-state-changed",
+				});
+				return;
+			}
+
+			const currentYTextContent = currentYText.toJSON();
+			if (currentYTextContent === bypass.externalContent) {
+				applyDiffToYText(
+					currentYText,
+					bypass.externalContent,
+					bypass.beforeContent,
+					ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT,
+				);
+			} else if (currentYTextContent === bypass.beforeContent) {
+				cm.dispatch({
+					changes: {
+						from: 0,
+						to: cm.state.doc.length,
+						insert: bypass.beforeContent,
+					},
+					annotations: EDITOR_AUTHORITY_TRANSACTION.of({
+						content: bypass.beforeContent,
+						source: "external-reload-correction",
+					}),
+				});
+			} else {
+				this.trace?.("editor", "external-disk-editor-reload-bypass-revert-skipped", {
+					path: bypass.path,
+					reason: "crdt-advanced",
+				});
+				return;
+			}
+
+			this.trace?.("editor", "external-disk-editor-reload-bypass-reverted", {
+				path: bypass.path,
+				leafId: bypass.leafId,
+				beforeLength: bypass.beforeContent.length,
+				externalLength: bypass.externalContent.length,
+			});
+		});
 	}
 
 	private carryCmActivityToPath(cm: EditorView, path: string): void {

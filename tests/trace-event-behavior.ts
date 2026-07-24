@@ -109,7 +109,7 @@ console.log("\n--- Test 2: receipt startup failure trace does not leak room name
 }
 
 function makeSuppressionMirror(
-	readContent: () => string,
+	readContent: () => string | Promise<string>,
 	events: CapturedTrace[],
 ): DiskMirror {
 	const app = {
@@ -167,6 +167,101 @@ console.log("\n--- Test 4: suppression mismatch trace fires from changed file st
 	assert(!suppressed, "changed observed state does not suppress modify event");
 	assert(!!mismatch, "changed observed state emits suppression-mismatch");
 	assert(mismatch?.details?.reason === "size-mismatch", "suppression mismatch includes reason");
+}
+
+console.log("\n--- Test 4b: recent self-write fingerprint probe is exact and non-consuming ---");
+{
+	let diskContent = "expected";
+	const events: CapturedTrace[] = [];
+	const mirror = makeSuppressionMirror(() => diskContent, events);
+	await (mirror as any).suppressWrite("Notes/suppressed.md", "expected");
+	const file = new TFile() as TFile & { path: string; stat: { size: number } };
+	file.path = "Notes/suppressed.md";
+	file.stat = { size: new TextEncoder().encode(diskContent).length };
+
+	assert(
+		await mirror.matchesRecentWriteFingerprint(file) === true,
+		"matching recent bytes prove the modify is KAOS's self-write",
+	);
+	assert(
+		mirror.isSuppressed(file.path),
+		"fingerprint probe does not consume the normal reconciliation suppressor",
+	);
+
+	diskContent = "external";
+	file.stat = { size: new TextEncoder().encode(diskContent).length };
+	assert(
+		await mirror.matchesRecentWriteFingerprint(file) === false,
+		"same-size external bytes are not hidden by the timing suppression window",
+	);
+	assert(
+		mirror.isSuppressed(file.path),
+		"mismatch probe also leaves definitive suppression handling to reconciliation",
+	);
+}
+
+console.log("\n--- Test 4c: fingerprint proof cannot cross a file revision change ---");
+{
+	let releaseRead: (() => void) | null = null;
+	const readGate = new Promise<void>((resolve) => {
+		releaseRead = resolve;
+	});
+	let diskContent = "external";
+	const events: CapturedTrace[] = [];
+	const mirror = makeSuppressionMirror(async () => {
+		await readGate;
+		return diskContent;
+	}, events);
+	await (mirror as any).suppressWrite("Notes/revision-race.md", "expected");
+	const file = new TFile() as TFile & {
+		path: string;
+		stat: { ctime: number; mtime: number; size: number };
+	};
+	file.path = "Notes/revision-race.md";
+	file.stat = { ctime: 1, mtime: 10, size: 8 };
+
+	const probe = mirror.probeRecentWriteFingerprint(file, {
+		path: file.path,
+		ctime: 1,
+		mtime: 10,
+		size: 8,
+	});
+	// The event represented external bytes, but a later same-size revision now
+	// contains KAOS's expected bytes before the asynchronous read completes.
+	diskContent = "expected";
+	file.stat = { ctime: 1, mtime: 11, size: 8 };
+	releaseRead?.();
+
+	assert(
+		(await probe).kind === "stale-or-unreadable",
+		"later same-size bytes cannot prove that the older modify event was a self-write",
+	);
+	assert(
+		mirror.isSuppressed(file.path),
+		"stale revision probe leaves definitive suppression state untouched",
+	);
+}
+
+console.log("\n--- Test 4d: exact revision reads preserve raw UTF-8, BOM, and mixed EOL bytes ---");
+{
+	const rawContent = "\ufeff한글\r\nline two\n";
+	const events: CapturedTrace[] = [];
+	const mirror = makeSuppressionMirror(() => rawContent, events);
+	const rawBytes = new TextEncoder().encode(rawContent).byteLength;
+	const file = new TFile() as TFile & {
+		path: string;
+		stat: { ctime: number; mtime: number; size: number };
+	};
+	file.path = "Notes/raw-revision.md";
+	file.stat = { ctime: 2, mtime: 20, size: rawBytes };
+
+	const observed = await mirror.readExactObservedDiskRevision(file, {
+		path: file.path,
+		ctime: 2,
+		mtime: 20,
+		size: rawBytes,
+	});
+	assert(observed === rawContent, "exact revision read returns the unchanged raw text representation");
 }
 
 console.log("\n--- Test 5: diskMirror remote delete emits trace with deleteMode ---");
