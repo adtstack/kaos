@@ -94,7 +94,6 @@ function makeInput(overrides: Partial<DiagnosticsBundleInput> = {}): Diagnostics
 			deviceName: SENSITIVE_DEVICE,
 			debug: false,
 			enableAttachmentSync: false,
-			externalEditPolicy: "always",
 		},
 		stateSnapshot: {
 			reconciled: true,
@@ -223,6 +222,14 @@ console.log("\n--- Test 1: safe mode — settings redaction ---");
 	assert(
 		!(settings.token as Record<string, unknown>)["length"],
 		"safe mode: token has no length field",
+	);
+	assert(
+		settings.externalEditBehavior === "include-open-files-safely",
+		"safe mode: diagnostics report the one effective external-edit behavior",
+	);
+	assert(
+		!("externalEditPolicy" in settings),
+		"safe mode: diagnostics expose no raw external-edit policy",
 	);
 }
 

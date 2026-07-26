@@ -74,6 +74,9 @@ After pairing, Markdown and `.base` files begin syncing through the shared vault
 7. Attachments sync through content-addressed R2 storage when configured.
 8. Daily and on-demand snapshots provide a recovery path outside the live CRDT.
 
+External changes to open notes merge automatically when edits do not overlap.
+Overlapping edits are preserved as a local conflict note for review.
+
 ## Attachments and Snapshots
 
 Markdown and `.base` sync work without R2. To sync images, PDFs, and other attachments,
@@ -83,6 +86,16 @@ R2 also enables daily automatic snapshots and manual point-in-time backups.
 Snapshots can be browsed, compared with the current vault, and selectively
 restored. Without R2, text sync still works, but attachment sync and snapshots
 are disabled.
+
+## Shared Exclude File
+
+Put vault-wide sync exclusions in `SYSTEM/SETTING/kaos-exclude.md`. Add one
+vault-relative file or folder prefix per line; blank lines and lines beginning
+with `#` are ignored. KAOS syncs this control file itself so Obsidian and
+headless devices apply the same policy, and reloads it while running.
+
+Existing device-local `excludePatterns` values remain active for backward
+compatibility, but new exclusions should be maintained only in the shared file.
 
 ## Guided Server Update
 

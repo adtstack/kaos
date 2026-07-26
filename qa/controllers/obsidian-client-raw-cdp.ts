@@ -44,8 +44,8 @@ export class RawCdpObsidianClient {
 
 	/**
 	 * Discover and connect to the main Obsidian renderer page.
-	 * Selects the page whose title matches "* - Obsidian *" (the vault tab).
-	 * Falls back to any "page" type target if no title match.
+	 * Selects the page whose URL identifies the Obsidian renderer.
+	 * Falls back to an Obsidian title match, then any suitable page target.
 	 */
 	async connect(): Promise<void> {
 		const listUrl = `http://${this.host}:${this.port}/json/list`;
@@ -56,16 +56,18 @@ export class RawCdpObsidianClient {
 		const targets: CdpTarget[] = await res.json();
 
 		// Pick the main Obsidian page:
-		// Priority 1: title contains "Obsidian" and type === "page"
-		// Priority 2: url contains "obsidian.md/index.html"
+		// Priority 1: url contains "obsidian.md/index.html"
+		// Priority 2: title contains "Obsidian" and type === "page"
 		// Priority 3: first page-type target
 		let target: CdpTarget | undefined;
 
 		target = targets.find(
-			(t) => t.type === "page" && t.title.includes("Obsidian") && !t.title.includes("DevTools"),
+			(t) => t.type === "page" && t.url.includes("obsidian.md/index.html"),
 		);
 		if (!target) {
-			target = targets.find((t) => t.url.includes("obsidian.md/index.html"));
+			target = targets.find(
+				(t) => t.type === "page" && t.title.includes("Obsidian") && !t.title.includes("DevTools"),
+			);
 		}
 		if (!target) {
 			target = targets.find(

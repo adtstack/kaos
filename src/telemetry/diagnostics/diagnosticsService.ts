@@ -6,6 +6,7 @@ import { DiskMirror } from "../../sync/diskMirror";
 import { VaultSync, type ReconcileMode } from "../../sync/vaultSync";
 import type { TraceHttpContext } from "../debug/trace";
 import type { VaultSyncSettings } from "../../settings";
+import { EXTERNAL_EDIT_BEHAVIOR } from "../../sync/externalEditBehavior";
 import {
 	buildFrontmatterQuarantineDebugLines,
 	type FrontmatterQuarantineEntry,
@@ -175,7 +176,7 @@ export class DiagnosticsService {
 				`  content hash: ${entry.contentHashPrefix}`,
 			]),
 			`Active disk observers: ${this.deps.getDiskMirror()?.activeObserverCount ?? 0}`,
-			`External edit policy: ${settings.externalEditPolicy}`,
+			`External edit behavior: ${EXTERNAL_EDIT_BEHAVIOR}`,
 			`Attachment sync: ${settings.enableAttachmentSync ? "enabled" : "disabled"}`,
 			...(blobSync ? [
 				`Pending downloads: ${blobSync.pendingDownloads}`,
@@ -326,7 +327,6 @@ export class DiagnosticsService {
 				deviceName: settings.deviceName,
 				debug: settings.debug,
 				enableAttachmentSync: settings.enableAttachmentSync,
-				externalEditPolicy: settings.externalEditPolicy,
 			},
 			stateSnapshot: {
 				reconciled: state.reconciled,

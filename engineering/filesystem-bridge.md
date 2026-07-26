@@ -49,6 +49,16 @@ We entirely replaced time-based suppression with observed state acknowledgment. 
 
 If a user edits a file out-of-band using a different markdown editor, the hash changes, the suppression is bypassed, and the new text is seamlessly ingested into the CRDT using fast-diff.
 
+For an open Markdown note, ingest is still CRDT-first rather than disk-owned.
+The editor boundary intercepts only the correlated whole-document reload and
+hands the exact disk candidate to `ReconciliationController`. The controller
+compares the durable baseline, the current editor/Y.Text authority, and the
+stable disk candidate. A non-overlapping result enters one targeted Y.Text
+transaction and reaches every pane through y-codemirror; overlapping or
+adjacent changes leave the primary Y.Text untouched and preserve the complete
+external candidate as a local conflict artifact. The binding and `DiskMirror`
+layers do not choose a merge winner.
+
 ## Current Invariants
 
 This architecture guarantees the following strict invariants for the filesystem bridge:

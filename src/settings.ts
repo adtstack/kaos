@@ -1,7 +1,6 @@
 export {
 	DEFAULT_SETTINGS,
 	generateVaultId,
-	type ExternalEditPolicy,
 	type VaultSyncSettings,
 } from "./settings/settingsStore";
 export {

@@ -55,6 +55,30 @@ export function applyDiffToYText(
 	}, origin);
 }
 
+export type ExactDiffResult =
+	| { kind: "unchanged" }
+	| { kind: "applied" }
+	| { kind: "stale-base"; currentText: string }
+	| { kind: "postcondition-failed"; currentText: string };
+
+export function applyExactDiffToYText(
+	ytext: Y.Text,
+	expectedOldText: string,
+	newText: string,
+	origin: string,
+): ExactDiffResult {
+	const currentText = ytext.toJSON();
+	if (currentText !== expectedOldText) {
+		return { kind: "stale-base", currentText };
+	}
+	if (currentText === newText) return { kind: "unchanged" };
+	applyDiffToYText(ytext, expectedOldText, newText, origin);
+	const after = ytext.toJSON();
+	return after === newText
+		? { kind: "applied" }
+		: { kind: "postcondition-failed", currentText: after };
+}
+
 export interface DiffPostconditionResult {
 	diffSkippedDueToStaleBase: boolean;
 	matchesAfterDiff: boolean;

@@ -1,9 +1,19 @@
+import { createHash } from "node:crypto";
 import * as Y from "yjs";
 import { MarkdownView, TFile } from "obsidian";
+import { ReconciliationController } from "../src/runtime/reconciliationController";
+import type { DiskIngestPort } from "../src/runtime/engineControlPort";
 import { DiskMirror } from "../src/sync/diskMirror";
+import type { InterceptedExternalDiskMutation } from "../src/sync/editorBinding";
+import { ORIGIN_OPEN_EXTERNAL_EDIT_MERGE } from "../src/sync/origins";
 import { ServerAckTracker } from "../src/sync/serverAckTracker";
 import { InMemoryCandidateStore, type ScopeKey, type ScopeMetadata } from "../src/sync/candidateStore";
 import type { TraceEventDetails } from "../src/telemetry/debug/trace";
+
+Object.defineProperty(globalThis, "__KAOS_QA_HARNESS_ENABLED__", {
+	configurable: true,
+	value: false,
+});
 
 let passed = 0;
 let failed = 0;
@@ -111,11 +121,14 @@ console.log("\n--- Test 2: receipt startup failure trace does not leak room name
 function makeSuppressionMirror(
 	readContent: () => string | Promise<string>,
 	events: CapturedTrace[],
+	vaultReadContent: () => string | Promise<string> = readContent,
 ): DiskMirror {
 	const app = {
 		vault: {
-			read: async () => readContent(),
-			adapter: {},
+			read: async () => vaultReadContent(),
+			adapter: {
+				read: async () => readContent(),
+			},
 		},
 		workspace: {
 			getActiveViewOfType: () => null,
@@ -246,7 +259,13 @@ console.log("\n--- Test 4d: exact revision reads preserve raw UTF-8, BOM, and mi
 {
 	const rawContent = "\ufeff한글\r\nline two\n";
 	const events: CapturedTrace[] = [];
-	const mirror = makeSuppressionMirror(() => rawContent, events);
+	const mirror = makeSuppressionMirror(
+		() => rawContent,
+		events,
+		// Obsidian's Vault.read strips a UTF-8 BOM. The adapter is the exact
+		// representation boundary used by the modify event proof.
+		() => rawContent.slice(1),
+	);
 	const rawBytes = new TextEncoder().encode(rawContent).byteLength;
 	const file = new TFile() as TFile & {
 		path: string;
@@ -1004,7 +1023,6 @@ console.log("\n--- Test 5: Multi-pass: unknown-baseline preserved file is NOT re
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync,
 		getDiskMirror: () => mirror,
@@ -1127,6 +1145,565 @@ console.log("\n--- Test 6: Multi-pass: read-failure during remote-delete becomes
 		mirror.preservedUnresolvedPaths.has("Notes/read-fails.md"),
 		"path recorded as preserved-unresolved after read failure",
 	);
+}
+
+interface OpenExternalTraceFixtureOptions {
+	path: string;
+	baseline: string;
+	live: string;
+	external: string;
+	blockFrontmatter?: boolean;
+	recentTyping?: boolean;
+}
+
+interface OpenExternalTraceFixture {
+	events: CapturedTrace[];
+	controller: ReconciliationController;
+	doc: Y.Doc;
+	captureCandidate(sequence: number): void;
+	ingest(): Promise<void>;
+	setBaselineReadHook(hook: (() => Promise<void>) | null): void;
+	advanceEditorRevision(): void;
+	dispose(): void;
+}
+
+function traceContentHash(content: string): string {
+	return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+function makeOpenExternalTraceFile(path: string, size: number): TFile {
+	const file = new TFile() as TFile & {
+		path: string;
+		stat: { mtime: number; size: number };
+	};
+	file.path = path;
+	file.stat = { ctime: 1, mtime: 1, size };
+	return file;
+}
+
+function clearOpenExternalTraceDrainTimer(controller: ReconciliationController): void {
+	const internals = controller as never as {
+		markdownDrainTimer: ReturnType<typeof setTimeout> | null;
+	};
+	if (internals.markdownDrainTimer) {
+		clearTimeout(internals.markdownDrainTimer);
+		internals.markdownDrainTimer = null;
+	}
+}
+
+function buildOpenExternalTraceFixture(
+	options: OpenExternalTraceFixtureOptions,
+): OpenExternalTraceFixture {
+	const { path } = options;
+	let diskContent = options.external;
+	let editorContent = options.live;
+	let editorRevision = 0;
+	let baselineReadHook: (() => Promise<void>) | null = null;
+	let diskIngestPort: DiskIngestPort | null = null;
+	const events: CapturedTrace[] = [];
+	const artifacts = new Map<string, { file: TFile; content: string }>();
+	const baselineTexts = new Map([[traceContentHash(options.baseline), options.baseline]]);
+	let diskIndex: Record<string, { mtime: number; size: number; contentHash?: string }> = {
+		[path]: {
+			mtime: 0,
+			size: options.baseline.length,
+			contentHash: traceContentHash(options.baseline),
+		},
+	};
+	const lastEditorActivity = options.recentTyping ? Date.now() : null;
+
+	const doc = new Y.Doc();
+	const ytext = doc.getText("content");
+	ytext.insert(0, options.live);
+	doc.on("afterTransaction", (transaction) => {
+		if (transaction.origin !== ORIGIN_OPEN_EXTERNAL_EDIT_MERGE) return;
+		// Model the bound CodeMirror view receiving the controller-origin Y.Text
+		// patch before the post-merge ticket/marker is recaptured.
+		editorContent = ytext.toString();
+		editorRevision += 1;
+	});
+	const file = makeOpenExternalTraceFile(path, diskContent.length);
+	const view = new MarkdownView(null as never) as MarkdownView & {
+		file: TFile;
+		editor: { getValue(): string };
+	};
+	view.file = file;
+	view.editor = { getValue: () => editorContent } as never;
+
+	const editorBindings = {
+		isBound: (candidatePath: string) => candidatePath === path,
+		getBindingDebugInfoForView: () => ({
+			leafId: "trace-leaf",
+			storedCmId: "trace-cm",
+			liveCmId: "trace-cm",
+			cmMatches: true,
+		}),
+		getCollabDebugInfoForView: () => ({
+			hasSyncFacet: true,
+			awarenessMatchesProvider: true,
+			yTextMatchesExpected: true,
+			undoManagerMatchesFacet: true,
+			facetFileId: "trace-file-id",
+			expectedFileId: "trace-file-id",
+		}),
+		getLastEditorActivityForPath: () => lastEditorActivity,
+		captureOpenEditorMutationTicket: (
+			ticketPath: string,
+			ticketViews: readonly MarkdownView[],
+		) => ({
+			path: ticketPath,
+			views: ticketViews.map((ticketView) => ({
+				view: ticketView,
+				viewId: "trace-view",
+				leafId: "trace-leaf",
+				cm: null,
+				cmId: null,
+				bindingEpoch: 0,
+				editorRevision,
+				editorAuthorityRevision: editorRevision,
+				editorAuthorityContent: editorContent,
+				editorDocument: editorRevision,
+				editorContent,
+			})),
+		}),
+		validateOpenEditorMutationTicket: (ticket: {
+			path: string;
+			views: ReadonlyArray<{
+				view: MarkdownView;
+				leafId: string;
+				editorRevision: number;
+			}>;
+		}, currentViews: readonly MarkdownView[]) => {
+			if (
+				ticket.path !== path ||
+				ticket.views.length !== currentViews.length ||
+				ticket.views.some((snapshot, index) => snapshot.view !== currentViews[index])
+			) {
+				return { current: false as const, reason: "view-set-changed" as const };
+			}
+			const stale = ticket.views.find((snapshot) =>
+				snapshot.editorRevision !== editorRevision
+			);
+			return stale
+				? {
+					current: false as const,
+					reason: "editor-revision-changed" as const,
+					leafId: stale.leafId,
+				}
+				: { current: true as const };
+		},
+		separateUndoCaptureForPath: () => 1,
+		repair: () => true,
+		rebind: () => {},
+		unbindByPath: () => {},
+	};
+
+	const app = {
+		vault: {
+			read: async (candidate: TFile) => {
+				if (candidate.path === path) return diskContent;
+				const artifact = artifacts.get(candidate.path);
+				if (artifact) return artifact.content;
+				throw new Error("trace fixture unexpected file read");
+			},
+			create: async (artifactPath: string, content: string) => {
+				const artifactFile = makeOpenExternalTraceFile(artifactPath, content.length);
+				artifacts.set(artifactPath, { file: artifactFile, content });
+				return artifactFile;
+			},
+			adapter: {
+				stat: async () => ({ mtime: 1, size: diskContent.length }),
+			},
+			getAbstractFileByPath: (candidatePath: string) => (
+				candidatePath === path
+					? file
+					: (artifacts.get(candidatePath)?.file ?? null)
+			),
+			getMarkdownFiles: () => [
+				file,
+				...Array.from(artifacts.values(), (artifact) => artifact.file),
+			],
+		},
+		workspace: {
+			iterateAllLeaves: (callback: (leaf: { view: MarkdownView }) => void) => {
+				callback({ view });
+			},
+		},
+	};
+
+	const vaultSync = {
+		connected: true,
+		providerSynced: true,
+		getTextForPath: (candidatePath: string) => candidatePath === path ? ytext : null,
+		getActiveMarkdownPaths: () => [path],
+		isPendingRenameTarget: () => false,
+		isMarkdownTombstoned: () => false,
+		getFileIdForText: () => "trace-file-id",
+		serverAckTracker: {
+			withActiveOpId: (_opId: string | undefined, run: () => void) => run(),
+		},
+	};
+
+	const controller = new ReconciliationController({
+		app: app as never,
+		getSettings: () => ({ deviceName: "TraceTest" }) as never,
+		getRuntimeConfig: () => ({
+			maxFileSizeBytes: 0,
+			maxFileSizeKB: 0,
+			excludePatterns: [],
+		}) as never,
+		getVaultSync: () => vaultSync as never,
+		getDiskMirror: () => ({
+			shouldSuppressCreate: async () => false,
+			shouldSuppressModify: async () => false,
+			suppressLocalCreate: async () => {},
+			isPreservedUnresolved: () => false,
+			getPreservedUnresolvedEntries: () => [],
+			recordPreservedUnresolved: () => {},
+			clearPreservedUnresolved: () => {},
+			flushWrite: async (
+				flushPath: string,
+				_force: boolean,
+				writeOptions: { expectedDiskContent?: string; recordBaseline?: boolean } = {},
+			) => {
+				if (
+					writeOptions.expectedDiskContent !== undefined &&
+					writeOptions.expectedDiskContent !== diskContent
+				) {
+					return {
+						kind: "deferred" as const,
+						path: flushPath,
+						reason: "disk-changed-during-write" as const,
+					};
+				}
+				const settledContent = ytext.toString();
+				diskContent = settledContent;
+				return {
+					kind: "written" as const,
+					path: flushPath,
+					isCreate: false,
+					content: settledContent,
+					contentHash: traceContentHash(settledContent),
+					baselineRecorded: writeOptions.recordBaseline !== false,
+				};
+			},
+		}) as never,
+		getBlobSync: () => null,
+		getEditorBindings: () => editorBindings as never,
+		getDiskIndex: () => diskIndex,
+		setDiskIndex: (next) => { diskIndex = next; },
+		getBaselineText: async (hash: string) => {
+			await baselineReadHook?.();
+			return baselineTexts.get(hash) ?? null;
+		},
+		recordBaselineText: (hash: string, content: string) => {
+			baselineTexts.set(hash, content);
+		},
+		recordConflictMergeBase: () => {},
+		isMarkdownPathSyncable: () => true,
+		shouldBlockFrontmatterIngest: (
+			_candidatePath: string,
+			_previousContent: string | null,
+			_nextContent: string,
+			reason: string,
+		) => options.blockFrontmatter === true &&
+			reason === "bound-file-open-safe-external-merge",
+		refreshServerCapabilities: async () => {},
+		validateOpenEditorBindings: () => {},
+		onReconciled: () => {},
+		getAwaitingFirstProviderSyncAfterStartup: () => false,
+		setAwaitingFirstProviderSyncAfterStartup: () => {},
+		saveDiskIndex: async () => {},
+		refreshStatusBar: () => {},
+		trace: captureTrace(events),
+		scheduleTraceStateSnapshot: () => {},
+		log: () => {},
+		registerDiskIngestPort: (port: DiskIngestPort) => { diskIngestPort = port; },
+	});
+
+	return {
+		events,
+		controller,
+		doc,
+		captureCandidate: (sequence) => {
+			const candidate: InterceptedExternalDiskMutation = Object.freeze({
+				path,
+				content: options.external,
+				sequence,
+				observedAt: sequence,
+				ctime: sequence,
+				mtime: sequence,
+				size: options.external.length,
+			});
+			controller.noteInterceptedExternalDiskMutation(candidate);
+			clearOpenExternalTraceDrainTimer(controller);
+		},
+		ingest: () => {
+			if (!diskIngestPort) throw new Error("trace fixture disk ingest port missing");
+			return diskIngestPort.ingestDiskFileNow(path, "modify");
+		},
+		setBaselineReadHook: (hook) => { baselineReadHook = hook; },
+		advanceEditorRevision: () => { editorRevision += 1; },
+		dispose: () => {
+			clearOpenExternalTraceDrainTimer(controller);
+			controller.reset();
+			doc.destroy();
+		},
+	};
+}
+
+console.log("\n--- Test 14: open external edit traces are complete and privacy-safe ---");
+{
+	const expectedMessages = [
+		"open-external-candidate-captured",
+		"open-external-recent-typing-deferred",
+		"open-external-clean-merge-applied",
+		"open-external-overlapping-hunk-preserved",
+		"open-external-stale-replan",
+		"open-external-frontmatter-blocked",
+		"open-external-disk-settled",
+		"open-external-baseline-advanced",
+	] as const;
+	type ExpectedOpenExternalMessage = typeof expectedMessages[number];
+
+	const baselineMarker = "TRACE_BASELINE_CONTENT_SENTINEL";
+	const liveMarker = "TRACE_LIVE_CONTENT_SENTINEL";
+	const externalMarker = "TRACE_EXTERNAL_CONTENT_SENTINEL";
+	const arbitraryThrownMessage = "TRACE_ARBITRARY_THROWN_MESSAGE_SENTINEL";
+	const baselineContent = `## Work\n${baselineMarker}\n\n## Life\nshared life\n`;
+	const liveContent = `## Work\n${liveMarker}\n\n## Life\nshared life\n`;
+	const externalContent = `## Work\n${baselineMarker}\n\n## Life\n${externalMarker}\n`;
+	const mergedContent = `## Work\n${liveMarker}\n\n## Life\n${externalMarker}\n`;
+	const overlappingExternalContent =
+		`## Work\n${externalMarker}\n\n## Life\nshared life\n`;
+	const privateValues = [
+		baselineMarker,
+		liveMarker,
+		externalMarker,
+		baselineContent,
+		liveContent,
+		externalContent,
+		mergedContent,
+		overlappingExternalContent,
+		arbitraryThrownMessage,
+	];
+
+	const clean = buildOpenExternalTraceFixture({
+		path: "Notes/trace-clean.md",
+		baseline: baselineContent,
+		live: liveContent,
+		external: externalContent,
+	});
+	clean.captureCandidate(101);
+	await clean.ingest();
+
+	const conflict = buildOpenExternalTraceFixture({
+		path: "Notes/trace-overlap.md",
+		baseline: baselineContent,
+		live: liveContent,
+		external: overlappingExternalContent,
+	});
+	await conflict.ingest();
+
+	const guarded = buildOpenExternalTraceFixture({
+		path: "Notes/trace-frontmatter.md",
+		baseline: baselineContent,
+		live: liveContent,
+		external: externalContent,
+		blockFrontmatter: true,
+	});
+	await guarded.ingest();
+
+	const stale = buildOpenExternalTraceFixture({
+		path: "Notes/trace-stale.md",
+		baseline: baselineContent,
+		live: liveContent,
+		external: externalContent,
+	});
+	let markBaselineReadStarted: (() => void) | null = null;
+	let releaseBaselineRead: (() => void) | null = null;
+	const baselineReadStarted = new Promise<void>((resolve) => {
+		markBaselineReadStarted = resolve;
+	});
+	const baselineReadGate = new Promise<void>((resolve) => {
+		releaseBaselineRead = resolve;
+	});
+	stale.setBaselineReadHook(async () => {
+		markBaselineReadStarted?.();
+		markBaselineReadStarted = null;
+		await baselineReadGate;
+	});
+	const staleIngest = stale.ingest();
+	await baselineReadStarted;
+	stale.advanceEditorRevision();
+	releaseBaselineRead?.();
+	await staleIngest;
+	stale.setBaselineReadHook(null);
+
+	const typing = buildOpenExternalTraceFixture({
+		path: "Notes/trace-recent-typing.md",
+		baseline: baselineContent,
+		live: liveContent,
+		external: externalContent,
+		recentTyping: true,
+	});
+	await typing.ingest();
+
+	const scenarioEvents = {
+		clean: clean.events,
+		conflict: conflict.events,
+		guarded: guarded.events,
+		stale: stale.events,
+		typing: typing.events,
+	};
+	assert(
+		scenarioEvents.clean.some((event) => event.msg === "open-external-candidate-captured"),
+		"clean intercepted scenario emits candidate-captured",
+	);
+	assert(
+		scenarioEvents.clean.some((event) => event.msg === "open-external-clean-merge-applied"),
+		"clean three-way scenario emits clean-merge-applied",
+	);
+	assert(
+		scenarioEvents.clean.some((event) => event.msg === "open-external-disk-settled"),
+		"clean three-way scenario emits disk-settled",
+	);
+	assert(
+		scenarioEvents.clean.some((event) => event.msg === "open-external-baseline-advanced"),
+		"clean three-way scenario emits baseline-advanced",
+	);
+	assert(
+		scenarioEvents.conflict.some((event) =>
+			event.msg === "open-external-overlapping-hunk-preserved"
+		),
+		"overlapping-hunk scenario emits preserved trace",
+	);
+	assert(
+		scenarioEvents.guarded.some((event) => event.msg === "open-external-frontmatter-blocked"),
+		"frontmatter-guarded scenario emits blocked trace",
+	);
+	assert(
+		scenarioEvents.stale.some((event) => event.msg === "open-external-stale-replan"),
+		"real editor-revision race emits stale-replan",
+	);
+	assert(
+		scenarioEvents.typing.some((event) => event.msg === "open-external-recent-typing-deferred"),
+		"recent editor activity scenario emits typing-deferred",
+	);
+
+	const expectedMessageSet = new Set<string>(expectedMessages);
+	const openExternalEvents = Object.values(scenarioEvents)
+		.flat()
+		.filter((event): event is CapturedTrace & { msg: ExpectedOpenExternalMessage } =>
+			expectedMessageSet.has(event.msg)
+		);
+	const contracts: Record<ExpectedOpenExternalMessage, {
+		keys: readonly string[];
+		reasons: readonly string[];
+	}> = {
+		"open-external-candidate-captured": {
+			keys: ["path", "reason", "sequence", "contentLength"],
+			reasons: ["intercepted-external-disk-mutation"],
+		},
+		"open-external-recent-typing-deferred": {
+			keys: ["path", "reason", "diskLength", "currentLength", "deferMs"],
+			reasons: ["recent-editor-activity", "recent-editor-activity-local-only"],
+		},
+		"open-external-clean-merge-applied": {
+			keys: ["path", "reason", "diskLength", "currentLength", "targetLength"],
+			reasons: ["apply-external", "apply-clean-merge"],
+		},
+		"open-external-overlapping-hunk-preserved": {
+			keys: [
+				"path",
+				"reason",
+				"diskLength",
+				"currentLength",
+				"hunkCount",
+				"artifactCreated",
+			],
+			reasons: ["overlapping-hunks"],
+		},
+		"open-external-stale-replan": {
+			keys: ["reason", "deferMs"],
+			reasons: ["open-external-clean-merge", "open-external-conflict-settlement"],
+		},
+		"open-external-frontmatter-blocked": {
+			keys: ["path", "reason", "diskLength", "currentLength", "targetLength"],
+			reasons: ["bound-file-open-safe-external-merge"],
+		},
+		"open-external-disk-settled": {
+			keys: ["path", "reason", "contentLength", "contentHashPrefix"],
+			reasons: [
+				"apply-external",
+				"apply-clean-merge",
+				"already-settled",
+				"open-external-representation-normalized",
+				"open-external-current-only",
+				"open-external-overlapping-hunks",
+				"open-external-missing-baseline",
+			],
+		},
+		"open-external-baseline-advanced": {
+			keys: ["path", "reason", "contentLength", "contentHashPrefix"],
+			reasons: [
+				"apply-external",
+				"apply-clean-merge",
+				"already-settled",
+				"open-external-representation-normalized",
+				"open-external-current-only",
+				"open-external-overlapping-hunks",
+				"open-external-missing-baseline",
+			],
+		},
+	};
+	const boundedCategories = ["exception", "non-error-throw"];
+	for (const msg of expectedMessages) {
+		const emitted = openExternalEvents.filter((event) => event.msg === msg);
+		assert(
+			emitted.length > 0,
+			`${msg} is emitted by real controller behavior`,
+		);
+		for (const event of emitted) {
+			const details = (event.details ?? {}) as Record<string, unknown>;
+			const contract = contracts[msg];
+			const unexpectedKeys = Object.keys(details).filter((key) =>
+				!contract.keys.includes(key)
+			);
+			assert(
+				unexpectedKeys.length === 0,
+				`${msg} details use only the explicit key allowlist`,
+			);
+			assert(
+				contract.keys.every((key) => key in details),
+				`${msg} details include every contracted key`,
+			);
+			assert(
+				typeof details.reason === "string" && contract.reasons.includes(details.reason),
+				`${msg} reason is bounded`,
+			);
+			for (const categoryKey of ["category", "errorCategory"] as const) {
+				if (categoryKey in details) {
+					assert(
+						typeof details[categoryKey] === "string" &&
+							boundedCategories.includes(details[categoryKey]),
+						`${msg} ${categoryKey} is bounded`,
+					);
+				}
+			}
+			const serialized = JSON.stringify(details);
+			assert(
+				privateValues.every((privateValue) => !serialized.includes(privateValue)),
+				`${msg} excludes baseline/live/external/merged content and arbitrary thrown messages`,
+			);
+		}
+	}
+
+	clean.dispose();
+	conflict.dispose();
+	guarded.dispose();
+	stale.dispose();
+	typing.dispose();
 }
 
 console.log("\n──────────────────────────────────────────────────");

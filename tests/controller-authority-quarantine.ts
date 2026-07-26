@@ -9,6 +9,11 @@ import {
 } from "../src/sync/preservedUnresolved";
 import { VaultSync } from "../src/sync/vaultSync";
 
+Object.defineProperty(globalThis, "__KAOS_QA_HARNESS_ENABLED__", {
+	configurable: true,
+	value: false,
+});
+
 let passed = 0;
 let failed = 0;
 
@@ -175,7 +180,6 @@ console.log("\n--- Controller quarantine: persisted markers block every full-rec
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as never,
 		getVaultSync: () => vaultSync,
 		getDiskMirror: () => ({
@@ -287,7 +291,6 @@ function makeDirtyFixture(options: DirtyFixtureOptions = {}) {
 			maxFileSizeBytes: options.maxFileSizeBytes ?? 0,
 			maxFileSizeKB: 1,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as never,
 		getVaultSync: () => ({
 			getTextForPath: (candidate: string) => candidate === path ? ytext : null,
@@ -646,7 +649,6 @@ console.log("\n--- Closed reconcile: same-bytes TFile delete/recreate ABA fails 
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as never,
 		getVaultSync: () => ({
 			connected: true,
@@ -796,7 +798,6 @@ function makeVisibleWinnerMarkerRace(winner: "disk" | "crdt") {
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as never,
 		getVaultSync: () => vaultSync as never,
 		getDiskMirror: () => ({
@@ -1010,7 +1011,6 @@ console.log("\n--- Open reconcile: programmatic editor successor replaces a defe
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as never,
 		getVaultSync: () => ({
 			getTextForPath: (candidate: string) => candidate === path ? ytext : null,

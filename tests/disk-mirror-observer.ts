@@ -34,7 +34,11 @@
 
 import * as Y from "yjs";
 import { MarkdownView, TFile } from "obsidian";
-import { DiskMirror } from "../src/sync/diskMirror";
+import {
+	DiskMirror,
+	type RemoteProjectionAdmissionLease,
+} from "../src/sync/diskMirror";
+import { RemoteProjectionPolicyGate } from "../src/runtime/remoteProjectionPolicyGate";
 import { contentBaselineHash } from "../src/sync/diskIndex";
 import type { MetaChangeBatch } from "../src/sync/fileMeta";
 import {
@@ -81,6 +85,7 @@ function makeHarness(options: {
 	onAfterRename?: () => void | Promise<void>;
 	onBeforeTrash?: () => void | Promise<void>;
 	onAfterTrash?: () => void | Promise<void>;
+	stripBomOnVaultRead?: boolean;
 	trashBehavior?: "success" | "throw" | "missing";
 	ensureFileBehavior?: "settle" | "throw" | "null" | "mismatch";
 	onAfterEnsureFileSettle?: () => void;
@@ -88,6 +93,10 @@ function makeHarness(options: {
 	baselineHashProvider?: (path: string) => string | null | undefined;
 	baselineTextProvider?: (path: string) => Promise<string | null> | string | null;
 	isMarkdownPathSyncable?: (path: string) => boolean;
+	isRemoteProjectionAllowed?: (path: string) => boolean;
+	captureRemoteProjectionAdmission?: (
+		paths: readonly string[],
+	) => RemoteProjectionAdmissionLease | null;
 } = {}) {
 	const filePath = options.filePath ?? FILE_PATH;
 	const doc = new Y.Doc();
@@ -177,13 +186,17 @@ function makeHarness(options: {
 	const workspaceView = options.opaqueOpenFileView
 		? { file: { path: filePath } }
 		: markdownView;
+	const byteLength = (content: string): number => new TextEncoder().encode(content).byteLength;
 	const makeDiskFileIdentity = (path: string, contentLength: number) => Object.assign(new TFile(), {
 		path,
 		stat: { ctime: 1, mtime: 1, size: contentLength },
 	});
 	const diskFileIdentities = new Map<string, TFile>();
 	const nonFilePathOccupants = new Map<string, { path: string }>();
-	let currentDiskFile = makeDiskFileIdentity(filePath, options.initialDiskContent?.length ?? 0);
+	let currentDiskFile = makeDiskFileIdentity(
+		filePath,
+		options.initialDiskContent === undefined ? 0 : byteLength(options.initialDiskContent),
+	);
 	if (options.initialDiskContent !== undefined) diskFileIdentities.set(filePath, currentDiskFile);
 	const getDiskFileIdentity = (path: string): TFile | null => {
 		const nonFile = nonFilePathOccupants.get(path);
@@ -194,7 +207,7 @@ function makeHarness(options: {
 		}
 		let file = diskFileIdentities.get(path);
 		if (!file) {
-			file = makeDiskFileIdentity(path, diskFiles.get(path)?.length ?? 0);
+			file = makeDiskFileIdentity(path, byteLength(diskFiles.get(path) ?? ""));
 			diskFileIdentities.set(path, file);
 		}
 		return file;
@@ -216,7 +229,12 @@ function makeHarness(options: {
 			read: async (file: { path: string }) => {
 				const content = diskFiles.get(file.path) ?? "";
 				await options.onRead?.();
-				return content;
+				return options.stripBomOnVaultRead && content.charCodeAt(0) === 0xfeff
+					? content.slice(1)
+					: content;
+			},
+			adapter: {
+				read: async (path: string) => diskFiles.get(path) ?? "",
 			},
 			modify: async (file: { path: string }, content: string) => {
 				modifyCalls++;
@@ -239,7 +257,7 @@ function makeHarness(options: {
 				await options.onBeforeCreate?.();
 				if (diskFiles.has(path)) throw new Error(`File already exists: ${path}`);
 				diskFiles.set(path, content);
-				const file = makeDiskFileIdentity(path, content.length);
+				const file = makeDiskFileIdentity(path, byteLength(content));
 				diskFileIdentities.set(path, file);
 				if (path === filePath) currentDiskFile = file;
 				await options.onAfterCreate?.();
@@ -283,6 +301,14 @@ function makeHarness(options: {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const mirror = new DiskMirror(fakeApp as any, fakeVaultSync as any, fakeEditorBindings as any, false);
 	mirror.setMarkdownPathSyncabilityPredicate(options.isMarkdownPathSyncable ?? (() => true));
+	mirror.setRemoteProjectionAdmissionPredicate(
+		options.isRemoteProjectionAllowed ?? (() => true),
+	);
+	if (options.captureRemoteProjectionAdmission) {
+		mirror.setRemoteProjectionAdmissionProvider(
+			options.captureRemoteProjectionAdmission,
+		);
+	}
 	if (options.baselineHashProvider) {
 		mirror.setDiskBaselineHashProvider(options.baselineHashProvider);
 	}
@@ -315,13 +341,13 @@ function makeHarness(options: {
 			// Model delete + recreate at the same path. The bytes can be identical,
 			// but Obsidian exposes a new TFile object for the new filesystem entry.
 			diskFiles.set(filePath, content);
-			currentDiskFile = makeDiskFileIdentity(filePath, content.length);
+			currentDiskFile = makeDiskFileIdentity(filePath, byteLength(content));
 			diskFileIdentities.set(filePath, currentDiskFile);
 		},
 		replaceDiskFileIdentityAt: (path: string, content: string) => {
 			// Same ABA model for rename destinations and arbitrary vault paths.
 			diskFiles.set(path, content);
-			const replacement = makeDiskFileIdentity(path, content.length);
+			const replacement = makeDiskFileIdentity(path, byteLength(content));
 			diskFileIdentities.set(path, replacement);
 			if (path === filePath) currentDiskFile = replacement;
 			return replacement;
@@ -344,6 +370,290 @@ function makeHarness(options: {
 			metaChangeObserver(batch);
 		},
 	};
+}
+
+// ── Test 2c: provider projection waits for shared policy readiness ────────────
+
+console.log("\n--- Test 2c: provider projection is fenced without blocking local scheduling ---");
+{
+	const fixture = makeHarness({
+		isRemoteProjectionAllowed: () => false,
+	});
+	fixture.mirror.startMapObservers();
+
+	fixture.doc.transact(
+		() => { fixture.ytext.insert(0, "remote hidden content"); },
+		fixture.fakeProvider,
+	);
+	assert(
+		debounceTimerCount(fixture.mirror) === 0,
+		"closed policy gate blocks provider Y.Text projection before queue admission",
+	);
+
+	fixture.emitMetaChanges({
+		origin: fixture.fakeProvider,
+		isLocal: false,
+		changes: [{
+			kind: "added",
+			fileId: FILE_ID,
+			next: { shape: "flat", path: FILE_PATH },
+		}],
+	});
+	assert(
+		debounceTimerCount(fixture.mirror) === 0,
+		"closed policy gate blocks provider metadata projection before queue admission",
+	);
+
+	const blocked = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		requireRemoteProjectionAdmission: true,
+	});
+	assert(
+		blocked.kind === "deferred" &&
+			blocked.reason === "remote-projection-not-ready",
+		"an explicitly remote-authorized direct flush fails closed",
+	);
+	assert(
+		!fixture.diskFiles.has(FILE_PATH),
+		"blocked remote projection creates no disk file",
+	);
+
+	fixture.mirror.scheduleWrite(FILE_PATH);
+	assert(
+		debounceTimerCount(fixture.mirror) === 1,
+		"the separate gate does not block ordinary local scheduling",
+	);
+	clearTimers(fixture.mirror);
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 2c2: queued remote lease survives open deferral but not gate ABA ---");
+{
+	const gate = new RemoteProjectionPolicyGate();
+	gate.close(1);
+	gate.open(1);
+	let editorContent = "local editor\n";
+	const fixture = makeHarness({
+		initialDiskContent: "local editor\n",
+		openEditorContent: () => editorContent,
+		captureRemoteProjectionAdmission: (paths) => {
+			const lease = gate.captureLease(paths);
+			return lease
+				? { isCurrent: () => gate.isLeaseCurrent(lease) }
+				: null;
+		},
+	});
+	fixture.ytext.insert(0, "remote content\n");
+	fixture.mirror.notifyFileOpened(FILE_PATH);
+	const lease = fixture.mirror.captureRemoteProjectionAdmission([FILE_PATH]);
+	assert(lease !== null, "the remote observer can capture a generation lease");
+
+	const deferred = await fixture.mirror.flushWrite(FILE_PATH, false, {
+		remoteProjectionAdmission: lease!,
+	});
+	assert(
+		deferred.kind === "deferred" && deferred.reason === "open-editor-mismatch",
+		"open editor authority defers the remote write",
+	);
+
+	gate.close(1);
+	gate.open(1);
+	editorContent = "remote content\n";
+	await fixture.mirror.flushOpenPath(FILE_PATH, "test-stale-provider-lease");
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === "local editor\n",
+		"the deferred write retains its old lease and cannot cross a close/open ABA",
+	);
+	clearTimers(fixture.mirror);
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 2c3: an in-flight remote write rechecks its lease at the atomic boundary ---");
+{
+	const gate = new RemoteProjectionPolicyGate();
+	gate.close(2);
+	gate.open(2);
+	let releaseProcess!: () => void;
+	let processEntered!: () => void;
+	const entered = new Promise<void>((resolve) => { processEntered = resolve; });
+	const processGate = new Promise<void>((resolve) => { releaseProcess = resolve; });
+	const fixture = makeHarness({
+		initialDiskContent: "baseline\n",
+		onBeforeProcess: async () => {
+			processEntered();
+			await processGate;
+		},
+		captureRemoteProjectionAdmission: (paths) => {
+			const lease = gate.captureLease(paths);
+			return lease
+				? { isCurrent: () => gate.isLeaseCurrent(lease) }
+				: null;
+		},
+	});
+	fixture.ytext.insert(0, "remote replacement\n");
+	const lease = fixture.mirror.captureRemoteProjectionAdmission([FILE_PATH]);
+	const write = fixture.mirror.flushWrite(FILE_PATH, true, {
+		remoteProjectionAdmission: lease!,
+		expectedDiskContent: "baseline\n",
+	});
+	await entered;
+	gate.close(3);
+	gate.open(3);
+	releaseProcess();
+	const result = await write;
+	assert(
+		result.kind === "deferred" && result.reason === "remote-projection-not-ready",
+		"the stale operation is rejected immediately before atomic disk mutation",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === "baseline\n",
+		"an invalidated in-flight lease writes no bytes",
+	);
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 2c4: provider reopen waits for in-flight remote trash ---");
+{
+	const gate = new RemoteProjectionPolicyGate();
+	gate.close(20);
+	gate.open(20);
+	let releaseTrash!: () => void;
+	let reportTrashEntered!: () => void;
+	const trashEntered = new Promise<void>((resolve) => { reportTrashEntered = resolve; });
+	const trashGate = new Promise<void>((resolve) => { releaseTrash = resolve; });
+	const fixture = makeHarness({
+		initialDiskContent: "clean delete baseline\n",
+		onBeforeTrash: async () => {
+			reportTrashEntered();
+			await trashGate;
+		},
+		captureRemoteProjectionAdmission: (paths) => {
+			const lease = gate.captureLease(paths);
+			return lease
+				? {
+					isCurrent: () => gate.isLeaseCurrent(lease),
+					enterCriticalSection: () => gate.enterCriticalSection(lease),
+				}
+				: null;
+		},
+	});
+	fixture.ytext.insert(0, "clean delete baseline\n");
+	fixture.setAuthoritativeDeleteFingerprint("delete-before-reconnect");
+
+	const deletion = (fixture.mirror as unknown as {
+		handleRemoteDelete: (
+			path: string,
+			options: { baselineText?: string | null },
+		) => Promise<void>;
+	}).handleRemoteDelete(FILE_PATH, { baselineText: "clean delete baseline\n" });
+	await trashEntered;
+	gate.close(21);
+	let retryRequested = 0;
+	assert(
+		gate.open(21, () => { retryRequested++; }) === false,
+		"provider projection cannot reopen while an older recoverable trash is active",
+	);
+	assert(gate.readyGeneration === null, "trash barrier keeps the next generation closed");
+	releaseTrash();
+	await deletion;
+	assert(retryRequested === 1, "trash settlement requests one fresh policy-open attempt");
+	assert(gate.open(21) === true, "the next generation opens only after trash settles");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 2c5: provider reopen waits for in-flight remote rename ---");
+{
+	const targetPath = "notes/renamed-after-reconnect.md";
+	const gate = new RemoteProjectionPolicyGate();
+	gate.close(30);
+	gate.open(30);
+	let releaseRename!: () => void;
+	let reportRenameEntered!: () => void;
+	const renameEntered = new Promise<void>((resolve) => { reportRenameEntered = resolve; });
+	const renameGate = new Promise<void>((resolve) => { releaseRename = resolve; });
+	const fixture = makeHarness({
+		initialDiskContent: "rename source\n",
+		onBeforeRename: async () => {
+			reportRenameEntered();
+			await renameGate;
+		},
+		captureRemoteProjectionAdmission: (paths) => {
+			const lease = gate.captureLease(paths);
+			return lease
+				? {
+					isCurrent: () => gate.isLeaseCurrent(lease),
+					enterCriticalSection: () => gate.enterCriticalSection(lease),
+				}
+				: null;
+		},
+	});
+	fixture.ytext.insert(0, "rename source\n");
+	fixture.meta.set(FILE_ID, { path: targetPath, deleted: false });
+
+	const rename = (fixture.mirror as unknown as {
+		handleRemoteRename: (fileId: string, oldPath: string, newPath: string) => Promise<void>;
+	}).handleRemoteRename(FILE_ID, FILE_PATH, targetPath);
+	await renameEntered;
+	gate.close(31);
+	let retryRequested = 0;
+	assert(
+		gate.open(31, () => { retryRequested++; }) === false,
+		"provider projection cannot reopen while an older rename is active",
+	);
+	assert(gate.readyGeneration === null, "rename barrier keeps the next generation closed");
+	releaseRename();
+	await rename;
+	assert(retryRequested === 1, "rename settlement requests one fresh policy-open attempt");
+	assert(gate.open(31) === true, "the next generation opens only after rename settles");
+
+	clearTimers(fixture.mirror);
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 2d: provider delete and rename are fenced by the same gate ---");
+{
+	const deleteFixture = makeHarness({
+		initialDiskContent: "local bytes survive\n",
+		isRemoteProjectionAllowed: () => false,
+	});
+	deleteFixture.ytext.insert(0, "local bytes survive\n");
+	deleteFixture.setAuthoritativeDeleteFingerprint("remote-delete-v1");
+
+	await (deleteFixture.mirror as unknown as {
+		handleRemoteDelete: (path: string) => Promise<void>;
+	}).handleRemoteDelete(FILE_PATH);
+	assert(
+		deleteFixture.diskFiles.get(FILE_PATH) === "local bytes survive\n",
+		"closed policy gate prevents provider delete from mutating disk",
+	);
+	assert(
+		deleteFixture.getTrashAttempts() === 0 &&
+			deleteFixture.getHardDeleteCalls() === 0,
+		"blocked provider delete never reaches a delete primitive",
+	);
+	deleteFixture.doc.destroy();
+
+	const targetPath = "notes/remote-target.md";
+	const renameFixture = makeHarness({
+		initialDiskContent: "local rename source\n",
+		isRemoteProjectionAllowed: () => false,
+	});
+	renameFixture.ytext.insert(0, "local rename source\n");
+	renameFixture.meta.set(FILE_ID, { path: targetPath, deleted: false });
+
+	await (renameFixture.mirror as unknown as {
+		handleRemoteRename: (fileId: string, oldPath: string, newPath: string) => Promise<void>;
+	}).handleRemoteRename(FILE_ID, FILE_PATH, targetPath);
+	assert(
+		renameFixture.diskFiles.has(FILE_PATH) &&
+			!renameFixture.diskFiles.has(targetPath),
+		"closed policy gate prevents provider rename from mutating either path",
+	);
+	assert(
+		renameFixture.getRenameCalls() === 0,
+		"blocked provider rename never reaches the filesystem rename primitive",
+	);
+	renameFixture.doc.destroy();
 }
 
 // ── Test 2b: excluded remote paths never enter the write queue ───────────────
@@ -724,6 +1034,92 @@ console.log("\n--- Test 12: expectedDiskContent rejects a stale reconciliation p
 	);
 	assert(fixture.getProcessCalls() === 0, "snapshot mismatch is rejected before atomic commit");
 	assert(fixture.getModifyCalls() === 0, "snapshot mismatch performs no fallback modify");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 12a: Vault.process accepts the same document snapshot with a raw BOM ---");
+{
+	const rawDiskContent = "\ufeffsame logical authority\r\nsecond line\r\n";
+	const documentDiskContent = rawDiskContent.slice(1);
+	const settledCrdtContent = "same logical authority\nsecond line\n";
+	const fixture = makeHarness({
+		initialDiskContent: rawDiskContent,
+		stripBomOnVaultRead: true,
+	});
+	fixture.ytext.insert(0, settledCrdtContent);
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: documentDiskContent,
+	});
+
+	assert(
+		result.kind === "written",
+		"atomic CAS recognizes Vault.read's BOM-stripped snapshot inside raw Vault.process",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === settledCrdtContent,
+		"representation-only raw disk bytes settle to the authoritative Y.Text snapshot",
+	);
+	assert(fixture.getProcessCalls() === 1, "representation settlement uses one atomic process");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 12a1: a meaningful raw edit at process entry still aborts the CAS ---");
+{
+	const rawDiskContent = "\ufeffsame logical authority\r\nsecond line\r\n";
+	const newerRawExternal = "\ufeffdifferent external authority\r\nsecond line\r\n";
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: rawDiskContent,
+		stripBomOnVaultRead: true,
+		onBeforeProcess: () => {
+			fixture.diskFiles.set(FILE_PATH, newerRawExternal);
+		},
+	});
+	fixture.ytext.insert(0, "same logical authority\nsecond line\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: rawDiskContent.slice(1),
+	});
+
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"BOM-aware atomic CAS rejects a meaningful external change at process entry",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === newerRawExternal,
+		"the newer raw external candidate remains byte-for-byte intact",
+	);
+	assert(fixture.getProcessCalls() === 1, "process-entry race is detected inside the atomic callback");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 12a2: raw-process equivalence never erases a CRLF content precondition ---");
+{
+	const rawDiskContent = "\ufeffsame logical authority\r\nsecond line\r\n";
+	const staleLfPlan = "same logical authority\nsecond line\n";
+	const fixture = makeHarness({
+		initialDiskContent: rawDiskContent,
+		stripBomOnVaultRead: true,
+	});
+	fixture.ytext.insert(0, "new CRDT content\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: staleLfPlan,
+	});
+
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"BOM compatibility does not normalize CRLF away from the exact document CAS",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === rawDiskContent,
+		"a line-ending mismatch preserves the raw external disk snapshot",
+	);
+	assert(fixture.getProcessCalls() === 0, "line-ending mismatch is rejected before atomic commit");
 
 	fixture.doc.destroy();
 }
@@ -1578,6 +1974,41 @@ console.log("\n--- Test 14l: post-process disk change blocks baseline settlement
 	fixture.doc.destroy();
 }
 
+console.log("\n--- Test 14l2: post-process same-file stat ABA blocks baseline settlement ---");
+{
+	const expectedDiskContent = "DISK_BEFORE_SAME_FILE_ABA\n";
+	const committedContent = "REMOTE_WRITE_BEFORE_SAME_FILE_ABA\n";
+	let readCount = 0;
+	let baselinePublished = false;
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: expectedDiskContent,
+		onRead: () => {
+			readCount++;
+			if (readCount === 2) fixture.advanceDiskFileRevision();
+		},
+	});
+	fixture.mirror.setDiskWriteCallback(() => { baselinePublished = true; });
+	fixture.ytext.insert(0, committedContent);
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent,
+	});
+
+	assert(readCount === 2, "written settlement reaches the final disk readback boundary");
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"same-file stat advance during written readback is not reported settled",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === committedContent,
+		"same-file ABA leaves the atomically committed bytes intact for a fresh plan",
+	);
+	assert(!baselinePublished, "same-file post-commit ABA publishes no durable baseline");
+
+	fixture.doc.destroy();
+}
+
 console.log("\n--- Test 14m: post-create same-bytes ABA blocks baseline settlement ---");
 {
 	const createdContent = "REMOTE_CREATE_C1\n";
@@ -2324,6 +2755,188 @@ console.log("\n--- Test 17c: a conflict discovered at Vault.process entry aborts
 		"atomic-process blocking preserves both candidates",
 	);
 	assert(fixture.getProcessCalls() === 1, "the process callback runs once and aborts before commit");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 17d: caller authority is checked inside Vault.process before bytes commit ---");
+{
+	const diskContent = "DISK_BEFORE_AUTHORITY_RACE\n";
+	const crdtContent = "CRDT_FROM_ORIGINAL_PLAN\n";
+	let authorityCurrent = true;
+	let baselineCalls = 0;
+	const fixture = makeHarness({
+		initialDiskContent: diskContent,
+		onBeforeProcess: () => {
+			authorityCurrent = false;
+		},
+	});
+	fixture.mirror.setDiskWriteCallback(() => { baselineCalls++; });
+	fixture.ytext.insert(0, crdtContent);
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: diskContent,
+		recordBaseline: true,
+		isAuthorityCurrent: () => authorityCurrent,
+	} as Parameters<DiskMirror["flushWrite"]>[2]);
+
+	assert(
+		result.kind === "deferred" && result.reason === "authority-stale",
+		"authority invalidation at process entry returns a bounded stale deferral",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === diskContent,
+		"authority invalidation inside Vault.process returns no replacement bytes",
+	);
+	assert(fixture.getProcessCalls() === 1, "authority is rechecked inside the atomic callback");
+	assert(baselineCalls === 0, "atomic authority rejection publishes no baseline callback");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 17e: unchanged settlement rechecks caller authority before baseline callback ---");
+{
+	const settledContent = "UNCHANGED_AUTHORITY_SNAPSHOT\n";
+	let authorityCurrent = true;
+	let readCount = 0;
+	let baselineCalls = 0;
+	const fixture = makeHarness({
+		initialDiskContent: settledContent,
+		onRead: () => {
+			readCount++;
+			if (readCount === 2) authorityCurrent = false;
+		},
+	});
+	fixture.mirror.setDiskWriteCallback(() => { baselineCalls++; });
+	fixture.ytext.insert(0, settledContent);
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: settledContent,
+		recordBaseline: true,
+		isAuthorityCurrent: () => authorityCurrent,
+	} as Parameters<DiskMirror["flushWrite"]>[2]);
+
+	assert(readCount === 2, "unchanged settlement reaches the final disk readback boundary");
+	assert(
+		result.kind === "deferred" && result.reason === "authority-stale",
+		"authority invalidation during unchanged readback is not reported settled",
+	);
+	assert(baselineCalls === 0, "stale unchanged snapshot publishes no baseline callback");
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === settledContent,
+		"unchanged authority rejection leaves disk bytes untouched",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 17f: a successful create consumes remote-create authority before stale settlement ---");
+{
+	const createdContent = "REMOTE_CREATE_THEN_STALE\n";
+	const fixture = makeHarness({
+		baselineHashProvider: () => "durable-prior-baseline",
+	});
+	fixture.ytext.insert(0, createdContent);
+	(fixture.mirror as unknown as {
+		authorizeRemoteCreate(path: string): void;
+	}).authorizeRemoteCreate(FILE_PATH);
+
+	const first = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		isAuthorityCurrent: (phase: "before-commit" | "after-commit") =>
+			phase === "before-commit",
+	} as Parameters<DiskMirror["flushWrite"]>[2]);
+
+	assert(
+		first.kind === "deferred" && first.reason === "authority-stale",
+		"a post-create authority change defers settlement after the file was created",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === createdContent,
+		"the stale settlement accurately reports that create already committed",
+	);
+	assert(
+		!(fixture.mirror as unknown as {
+			remoteCreateAuthorizations: Map<string, number>;
+		}).remoteCreateAuthorizations.has(FILE_PATH),
+		"the one-shot remote-create authorization is consumed by the committed create",
+	);
+
+	// Model a local delete after that committed-but-unsettled create. A normal
+	// retry must respect the durable baseline instead of borrowing stale create
+	// authority and resurrecting the path.
+	fixture.diskFiles.delete(FILE_PATH);
+	const retry = await fixture.mirror.flushWrite(FILE_PATH, true);
+	assert(
+		retry.kind === "deferred" && retry.reason === "disk-changed-during-write",
+		"an ordinary retry cannot reuse the consumed create authority after local delete",
+	);
+	assert(
+		!fixture.diskFiles.has(FILE_PATH),
+		"the local delete remains intact after the ordinary retry",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 17g: raw BOM artifact create is acknowledged by exact suppression ---");
+{
+	const rawArtifact = "\ufeffexternal conflict\r\n";
+	const fixture = makeHarness({
+		initialDiskContent: rawArtifact,
+		stripBomOnVaultRead: true,
+	});
+	const file = fixture.getCurrentDiskFile();
+	if (!file) throw new Error("fixture must expose the raw artifact file");
+
+	await fixture.mirror.suppressLocalCreate(FILE_PATH, rawArtifact);
+	const suppressed = await fixture.mirror.shouldSuppressCreate(file);
+
+	assert(
+		suppressed,
+		"self-create suppression fingerprints the exact adapter bytes instead of Vault.read text",
+	);
+	assert(!fixture.mirror.isSuppressed(FILE_PATH), "exact raw acknowledgement consumes suppression");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 18: exact local-create suppression handles roll back without ABA ---");
+{
+	type SuppressionHandle = Readonly<{ path: string; token: unknown }>;
+	type CancellableSuppressionContract = {
+		suppressLocalCreate(path: string, content: string): Promise<SuppressionHandle | void>;
+		rollbackLocalCreateSuppression?: (handle: SuppressionHandle) => boolean;
+	};
+	const fixture = makeHarness();
+	const contract = fixture.mirror as unknown as CancellableSuppressionContract;
+	const recentFingerprints = (fixture.mirror as unknown as {
+		recentWriteFingerprints: Map<string, unknown>;
+	}).recentWriteFingerprints;
+	const first = await contract.suppressLocalCreate(FILE_PATH, "stale conflict candidate\n");
+	const rollback = contract.rollbackLocalCreateSuppression;
+
+	assert(first !== undefined, "local-create suppression returns an exact rollback handle");
+	assert(typeof rollback === "function", "DiskMirror exposes exact local-create suppression rollback");
+	assert(fixture.mirror.isSuppressed(FILE_PATH), "registered create suppression is initially active");
+	assert(recentFingerprints.has(FILE_PATH), "registered create suppression publishes recent proof");
+	if (first !== undefined && rollback) {
+		assert(rollback.call(contract, first), "current suppression handle rolls back owned state");
+		assert(!fixture.mirror.isSuppressed(FILE_PATH), "rollback removes active suppression residue");
+		assert(!recentFingerprints.has(FILE_PATH), "rollback removes recent fingerprint residue");
+
+		const older = await contract.suppressLocalCreate(FILE_PATH, "older candidate\n");
+		const newer = await contract.suppressLocalCreate(FILE_PATH, "newer candidate\n");
+		assert(older !== undefined && newer !== undefined, "same-path replacements each return handles");
+		if (older !== undefined && newer !== undefined) {
+			assert(
+				!rollback.call(contract, older),
+				"an older handle cannot erase a newer same-path suppression",
+			);
+			assert(fixture.mirror.isSuppressed(FILE_PATH), "newer suppression remains active after old rollback");
+			assert(recentFingerprints.has(FILE_PATH), "newer recent proof remains after old rollback");
+			assert(rollback.call(contract, newer), "newer exact handle can clean up its own state");
+		}
+	}
 
 	fixture.doc.destroy();
 }

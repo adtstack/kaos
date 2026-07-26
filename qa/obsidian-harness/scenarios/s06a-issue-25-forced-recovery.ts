@@ -174,8 +174,8 @@ export const s06aIssue25ForcedRecoveryLocalOnly: QaScenario = {
 		const path = issue25UniquePath();
 		const fixture = buildIssue25Fixture({ fillerLines: 400 });
 		let paused = false;
-		let previousExternalPolicy: "always" | "closed-only" | "never" | null = null;
-		let policyRestored = false;
+		let previousDiskIngestSuspended: boolean | null = null;
+		let diskIngestRestored = false;
 
 		try {
 
@@ -213,8 +213,8 @@ export const s06aIssue25ForcedRecoveryLocalOnly: QaScenario = {
 		if (!paused) {
 			throw new Error("Issue-25 (forced-localOnly): failed to pause binding propagation (path not bound?)");
 		}
-		const policyChange = await ctx.kaos.setExternalEditPolicyOverride("never");
-		previousExternalPolicy = policyChange.previous;
+		const suspensionChange = await ctx.kaos.setDiskIngestSuspended(true);
+		previousDiskIngestSuspended = suspensionChange.previous;
 		const divergent = fixture.replace(
 			ISSUE_25_TASKS_ANCHOR_1,
 			`${ISSUE_25_TASKS_ANCHOR_1}\nlocal-only-divergence\n# qa-editor-divergence`,
@@ -240,9 +240,9 @@ export const s06aIssue25ForcedRecoveryLocalOnly: QaScenario = {
 			throw new Error("Issue-25 (forced-localOnly): expected CRDT!=disk before recovery (but they match)");
 		}
 
-		// Re-enable normal import policy before running the forced sync pass.
-		await ctx.kaos.setExternalEditPolicyOverride(previousExternalPolicy);
-		policyRestored = true;
+		// Restore automatic disk ingest before running the explicit recovery pass.
+		await ctx.kaos.setDiskIngestSuspended(previousDiskIngestSuspended);
+		diskIngestRestored = true;
 		console.log("[S06a-localOnly] precondition OK", {
 			diskAfterEdit,
 			editorAfterEdit,
@@ -279,8 +279,8 @@ export const s06aIssue25ForcedRecoveryLocalOnly: QaScenario = {
 		await ctx.closeFile(path);
 		await ctx.deleteFile(path);
 		} finally {
-			if (!policyRestored && previousExternalPolicy) {
-				await ctx.kaos.setExternalEditPolicyOverride(previousExternalPolicy);
+			if (!diskIngestRestored && previousDiskIngestSuspended !== null) {
+				await ctx.kaos.setDiskIngestSuspended(previousDiskIngestSuspended);
 			}
 			if (paused) {
 				await ctx.kaos.resumeEditorPropagation(path);

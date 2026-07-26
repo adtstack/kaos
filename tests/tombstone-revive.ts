@@ -14,6 +14,11 @@
 
 import * as Y from "yjs";
 
+Object.defineProperty(globalThis, "__KAOS_QA_HARNESS_ENABLED__", {
+	configurable: true,
+	value: false,
+});
+
 let passed = 0;
 let failed = 0;
 
@@ -422,7 +427,6 @@ console.log("\n--- Test 8: importUntrackedFiles through real ReconciliationContr
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => null,

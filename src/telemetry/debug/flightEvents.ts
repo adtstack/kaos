@@ -185,7 +185,7 @@ export type FrontmatterIngestBlockBranch =
 	| "bound-file-local-only-divergence"
 	| "bound-file-local-only-seed"
 	| "bound-file-open-idle-disk-recovery"
-	| "bound-file-open-idle-seed";
+	| "bound-file-open-safe-external-merge";
 
 /**
  * Typed payload shape for the `frontmatter-ingest-blocked` variant of
@@ -305,8 +305,6 @@ export type SkipReason =
 	| "excluded-path"
 	| "oversized-text-file"
 	| "frontmatter-unsafe"
-	| "external-policy-never"
-	| "external-policy-open-file"
 	| "suppressed-remote-writeback"
 	| "pending-rename-target"
 	| "tombstoned-path"

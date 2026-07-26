@@ -100,6 +100,7 @@ const MAIN_FORBIDDEN = [
 	"getEngineControlPort",
 	"pauseEditorPropagation",
 	"resumeEditorPropagation",
+	"setDiskIngestSuspended",
 	"setExternalEditPolicyOverride",
 ];
 

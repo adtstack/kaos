@@ -89,7 +89,12 @@ export type DashboardBlobConflictResolutionResult =
 	};
 
 export interface DashboardAttentionItem {
-	kind: "preserved-unresolved" | "structural-change" | "blocked-divergence" | "frontmatter-quarantine";
+	kind:
+		| "preserved-unresolved"
+		| "structural-change"
+		| "blocked-divergence"
+		| "frontmatter-quarantine"
+		| "remote-projection-policy";
 	title: string;
 	path: string | null;
 	detail: string;
@@ -223,7 +228,6 @@ export interface KaosDashboardData {
 		deviceName: string;
 		vaultId: string;
 		attachmentSyncEnabled: boolean;
-		externalEditPolicy: string;
 	};
 	overview: DashboardMetric[];
 	snapshotStatus: DashboardSnapshotStatus;
@@ -291,6 +295,7 @@ export interface KaosDashboardCollectorInput {
 	diskMirror: DashboardDiskMirrorDebug | null;
 	blobSync: DashboardBlobSyncDebug | null;
 	preservedUnresolvedEntries: PreservedUnresolvedEntry[];
+	remoteProjectionPolicyError?: string | null;
 	remoteDeleteResolutionState?: {
 		markdownAvailable: boolean;
 		blobAvailable: boolean;

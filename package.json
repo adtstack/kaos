@@ -1,6 +1,6 @@
 {
 	"name": "kaos",
-	"version": "1.10.2",
+	"version": "1.10.3",
 	"releaseVersions": {
 		"server": "0.7.2",
 		"headlessHost": "0.2.5"
@@ -48,6 +48,7 @@
 		"qa:analyze-bundles": "bun run qa/scripts/analyze-bundles.ts",
 		"qa:prepare": "bun run qa/scripts/prepare-vault.ts",
 		"qa:obsidian": "bun run qa/controllers/single-device.ts",
+		"qa:open-external-merge": "bun run qa/controllers/open-external-merge.ts",
 		"qa:two-device": "bun run qa/controllers/two-device.ts",
 		"version:bump": "node version-bump.mjs",
 		"version:sync": "node version-bump.mjs --sync",

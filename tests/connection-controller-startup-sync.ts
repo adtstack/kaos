@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import { ConnectionController } from "../src/runtime/connectionController";
 import { ReconciliationController } from "../src/runtime/reconciliationController";
 
+Object.defineProperty(globalThis, "__KAOS_QA_HARNESS_ENABLED__", {
+	configurable: true,
+	value: false,
+});
+
 type Listener = () => void;
 
 function eventTarget() {
@@ -30,7 +35,10 @@ function fixture() {
 	let reconcileInFlight = true;
 	let pendingMarks = 0;
 	const reconnectRuns: number[] = [];
+	const projectionBlockedRuns: number[] = [];
 	const logs: string[] = [];
+	const order: string[] = [];
+	let prepareResult = true;
 	const sync = {
 		connected: true,
 		localReady: true,
@@ -56,6 +64,13 @@ function fixture() {
 		setReconnectPending: () => { pendingMarks++; },
 		isReconcileInFlight: () => reconcileInFlight,
 		runReconnectReconciliation: (generation) => { reconnectRuns.push(generation); },
+		runProjectionBlockedReconciliation: (generation) => {
+			projectionBlockedRuns.push(generation);
+		},
+		prepareProviderSync: (generation) => {
+			order.push(`prepare:${generation}`);
+			return prepareResult;
+		},
 		refreshServerCapabilities: () => {},
 		flushOpenWrites: () => {},
 		updateOfflineStatus: () => {},
@@ -75,9 +90,12 @@ function fixture() {
 		setReconciled(value: boolean) { reconciled = value; },
 		setAwaiting(value: boolean) { awaitingFirstSync = value; },
 		setInFlight(value: boolean) { reconcileInFlight = value; },
+		setPrepareResult(value: boolean) { prepareResult = value; },
 		get awaiting() { return awaitingFirstSync; },
 		get pendingMarks() { return pendingMarks; },
 		reconnectRuns,
+		projectionBlockedRuns,
+		order,
 		logs,
 	};
 }
@@ -87,6 +105,7 @@ console.log("\n--- ConnectionController startup provider-sync race ---");
 {
 	const fx = fixture();
 	fx.emitProviderSync(7);
+	assert.deepEqual(fx.order, ["prepare:7"], "startup sync prepares shared policy before pending reconciliation");
 	assert.equal(fx.pendingMarks, 1, "first sync during conservative startup marks a follow-up reconcile");
 	assert.equal(fx.awaiting, false, "the observed first sync edge is consumed exactly once");
 	assert.deepEqual(fx.reconnectRuns, [], "startup does not start a competing reconcile while one is active");
@@ -107,8 +126,34 @@ console.log("\n--- ConnectionController startup provider-sync race ---");
 	fx.setReconciled(true);
 	fx.setInFlight(false);
 	fx.emitProviderSync(8);
+	assert.deepEqual(
+		fx.order,
+		["prepare:8"],
+		"late first sync prepares shared policy before authoritative reconciliation",
+	);
 	assert.deepEqual(fx.reconnectRuns, [8], "late first sync after startup runs authoritative reconciliation directly");
 	assert.equal(fx.awaiting, false);
+	fx.controller.stop();
+}
+
+{
+	const fx = fixture();
+	fx.setReconciled(true);
+	fx.setAwaiting(false);
+	fx.setInFlight(false);
+	fx.setPrepareResult(false);
+	fx.emitProviderSync(9);
+	assert.deepEqual(fx.order, ["prepare:9"], "invalid provider policy is still observed");
+	assert.deepEqual(
+		fx.reconnectRuns,
+		[],
+		"failed policy preparation prevents authoritative remote projection",
+	);
+	assert.deepEqual(
+		fx.projectionBlockedRuns,
+		[9],
+		"failed policy preparation still runs a projection-fenced local-ingress reconciliation",
+	);
 	fx.controller.stop();
 }
 
@@ -187,7 +232,6 @@ console.log("\n--- Startup pending sync is consumed by authoritative reconciliat
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "closed-only",
 		}) as any,
 		getVaultSync: () => sync,
 		getDiskMirror: () => ({}) as any,
@@ -227,6 +271,7 @@ console.log("\n--- Startup pending sync is consumed by authoritative reconciliat
 		setReconnectPending: () => reconciliation.markPending(),
 		isReconcileInFlight: () => reconciliation.isReconcileInFlight,
 		runReconnectReconciliation: (generation) => { void reconciliation.runReconnectReconciliation(generation); },
+		prepareProviderSync: () => true,
 		refreshServerCapabilities: () => {},
 		flushOpenWrites: () => {},
 		updateOfflineStatus: () => {},

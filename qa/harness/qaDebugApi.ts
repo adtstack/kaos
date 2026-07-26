@@ -148,12 +148,12 @@ export interface KaosQaDebugApi {
 	 * a real filesystem event. Use ONLY in forced-recovery regression
 	 * scenarios — NOT as a substitute for natural event-pipeline tests.
 	 */
-	__qaOnlyForceSyncFileFromDiskUnsafe(path: string, reason?: "create" | "modify"): Promise<void>;
+	ingestDiskFileNow(path: string, reason?: "create" | "modify"): Promise<void>;
 
 	/** QA-ONLY. Unsafe. Pause editor->CRDT propagation for a bound path. */
-	__qaOnlyPauseEditorBindingPropagationUnsafe(path: string): Promise<boolean>;
+	pauseEditorPropagation(path: string): Promise<boolean>;
 	/** QA-ONLY. Unsafe. Resume editor->CRDT propagation for a bound path. */
-	__qaOnlyResumeEditorBindingPropagationUnsafe(path: string): Promise<boolean>;
+	resumeEditorPropagation(path: string): Promise<boolean>;
 
 	/**
 	 * QA-ONLY. Unsafe.
@@ -284,14 +284,11 @@ export interface KaosQaDebugApi {
 	/**
 	 * QA-ONLY. Unsafe.
 	 *
-	 * Sets an in-memory-only external edit policy override.
-	 * Does NOT persist to settings, does NOT push update metadata.
-	 * Pass null to clear and revert to the real setting.
-	 * Returns the previous effective policy.
+	 * Suspends automatic disk ingest in memory for deterministic QA setup.
+	 * Does NOT persist to settings or alter the production external-edit behavior.
+	 * Returns the previous suspension state.
 	 */
-	__qaOnlySetExternalEditPolicyOverrideUnsafe(
-		policy: "always" | "closed-only" | "never" | null,
-	): Promise<{ previous: "always" | "closed-only" | "never" }>;
+	setDiskIngestSuspended(suspended: boolean): Promise<{ previous: boolean }>;
 }
 
 // -----------------------------------------------------------------------
@@ -320,6 +317,8 @@ void _debugPortCheck; void _unsafePortCheck;
 
 interface PluginHandle {
 	app: App;
+	settings: { qaTraceSecret: string };
+	saveSettings(reason?: string): Promise<void>;
 	getVaultSync(): VaultSync | null;
 	getReconciliationController(): ReconciliationController;
 	getConnectionController(): ConnectionController | null;
@@ -664,11 +663,8 @@ export function buildQaDebugApi(plugin: PluginHandle): KaosQaDebugApi {
 		async startFlightTrace(mode, secret): Promise<void> {
 			// If a secret is provided, update settings before starting the trace
 			if (secret) {
-				const p = plugin as unknown as { settings?: { qaTraceSecret?: string }; saveData?: (d: unknown) => Promise<void> };
-				if (p.settings) {
-					p.settings.qaTraceSecret = secret;
-					await p.saveData?.(p.settings);
-				}
+				plugin.settings.qaTraceSecret = secret;
+				await plugin.saveSettings("qa:trace-secret");
 			}
 			await plugin.startQaFlightTrace(mode);
 		},
@@ -702,10 +698,8 @@ export function buildQaDebugApi(plugin: PluginHandle): KaosQaDebugApi {
 		async resumeEditorPropagation(path: string): Promise<boolean> {
 			return plugin.getEngineControlPort().resumeEditorPropagation(path);
 		},
-		async setExternalEditPolicyOverride(
-			policy: "always" | "closed-only" | "never" | null,
-		): Promise<{ previous: "always" | "closed-only" | "never" }> {
-			const previous = plugin.getEngineControlPort().setExternalEditPolicyOverride(policy);
+		async setDiskIngestSuspended(suspended: boolean): Promise<{ previous: boolean }> {
+			const previous = plugin.getEngineControlPort().setDiskIngestSuspended(suspended);
 			return { previous };
 		},
 		async __qaOnlyEmitPhaseUnsafe(phase: "setup" | "run" | "assert" | "cleanup"): Promise<void> {

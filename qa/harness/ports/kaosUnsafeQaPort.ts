@@ -49,10 +49,8 @@ export interface KaosUnsafeQaPort {
 	__qaOnlyClearWitnessSuppressionUnsafe?(path: string): void;
 	__qaOnlyTriggerWitnessDirtyUnsafe?(path: string): void;
 
-	// --- Policy override ---
-	setExternalEditPolicyOverride(
-		policy: "always" | "closed-only" | "never" | null,
-	): Promise<{ previous: "always" | "closed-only" | "never" }>;
+	// --- Automatic disk-ingest control ---
+	setDiskIngestSuspended(suspended: boolean): Promise<{ previous: boolean }>;
 
 	// --- Witness observation (read-only but QA-specific) ---
 	witnessDeviceSettled(

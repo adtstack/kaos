@@ -15,8 +15,6 @@
  * Do not mount on window. Do not ship as a product command.
  */
 
-import type { ExternalEditPolicy } from "../settings";
-
 export interface EngineControlPort {
 	/** Trigger a deterministic disk→CRDT ingest for a single path. Bypasses the dirty queue. */
 	ingestDiskFileNow(path: string, reason: "create" | "modify"): Promise<void>;
@@ -24,8 +22,8 @@ export interface EngineControlPort {
 	pauseEditorPropagation(path: string): boolean;
 	/** Resume editor↔CRDT propagation for a previously paused path. Returns true if resumed. */
 	resumeEditorPropagation(path: string): boolean;
-	/** Set a transient in-memory external edit policy override (no persist, no settings save). Returns previous effective policy. */
-	setExternalEditPolicyOverride(policy: ExternalEditPolicy | null): ExternalEditPolicy;
+	/** Suspend automatic disk ingest for deterministic QA setup. Returns the previous state. */
+	setDiskIngestSuspended(suspended: boolean): boolean;
 }
 
 /**
