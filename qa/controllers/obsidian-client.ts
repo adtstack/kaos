@@ -14,7 +14,7 @@
  *   /path/to/Obsidian --remote-debugging-port=9222
  */
 
-import { chromium, type CDPSession, type Browser } from "playwright";
+import type { CDPSession, Browser, Page } from "playwright";
 
 export interface ObsidianClientOptions {
 	/** Chrome DevTools Protocol port Obsidian was launched with. Default: 9222 */
@@ -33,6 +33,7 @@ export interface ObsidianClientResult<T> {
 
 export class ObsidianClient {
 	private browser: Browser | null = null;
+	private page: Page | null = null;
 	private cdpSession: CDPSession | null = null;
 	private readonly port: number;
 	private readonly host: string;
@@ -44,25 +45,30 @@ export class ObsidianClient {
 		this.connectTimeoutMs = opts.connectTimeoutMs ?? 60_000;
 	}
 
-	async connect(): Promise<void> {
-		this.browser = await chromium.connectOverCDP(
+	protected async connectBrowser(): Promise<Browser> {
+		const { chromium } = await import("playwright");
+		return chromium.connectOverCDP(
 			`http://${this.host}:${this.port}`,
 			{ timeout: this.connectTimeoutMs },
 		);
+	}
+
+	async connect(): Promise<void> {
+		this.browser = await this.connectBrowser();
 		const contexts = this.browser.contexts();
 		if (contexts.length === 0) throw new Error("No browser context found in Obsidian");
-		const pages = await contexts[0]!.pages();
+		const pages = contexts.flatMap((context) => context.pages());
 		if (pages.length === 0) throw new Error("No pages found in Obsidian context");
+		this.page =
+			pages.find((page) => page.url().includes("obsidian.md/index.html")) ?? pages[0]!;
 		// Connect CDP session for direct evaluate
-		this.cdpSession = await pages[0]!.context().newCDPSession(pages[0]!);
+		this.cdpSession = await this.page.context().newCDPSession(this.page);
 	}
 
 	/** Evaluate an expression string in the Obsidian renderer process. */
 	async evalRaw<T = unknown>(expression: string): Promise<T> {
-		if (!this.browser) throw new Error("Not connected — call connect() first");
-		const contexts = this.browser.contexts();
-		const pages = await contexts[0]!.pages();
-		const result = await pages[0]!.evaluate(expression as never);
+		if (!this.browser || !this.page) throw new Error("Not connected — call connect() first");
+		const result = await this.page.evaluate(expression as never);
 		return result as T;
 	}
 
@@ -300,6 +306,7 @@ export class ObsidianClient {
 
 	async close(): Promise<void> {
 		this.cdpSession = null;
+		this.page = null;
 		await this.browser?.close();
 		this.browser = null;
 	}

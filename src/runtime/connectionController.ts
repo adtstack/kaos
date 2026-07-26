@@ -31,6 +31,16 @@ interface ConnectionControllerDeps {
 	setReconnectPending(): void;
 	isReconcileInFlight(): boolean;
 	runReconnectReconciliation(generation: number): void;
+	/**
+	 * Keep disk/editor ingress operational while CRDT-to-disk projection stays
+	 * closed because the shared policy could not be established.
+	 */
+	runProjectionBlockedReconciliation?(generation: number): void;
+	/**
+	 * Establish the shared provider policy for this generation before any
+	 * authoritative CRDT-to-disk reconciliation is admitted.
+	 */
+	prepareProviderSync?(generation: number): boolean;
 	refreshServerCapabilities(reason: string): void;
 	flushOpenWrites(reason: string): void;
 	updateOfflineStatus(): void;
@@ -219,6 +229,22 @@ export class ConnectionController {
 		if (!sync) return;
 
 		sync.onProviderSync((generation) => {
+			if (!(this.deps.prepareProviderSync?.(generation) ?? true)) {
+				this.deps.log(
+					`Provider sync held: shared policy is not ready (gen ${generation})`,
+				);
+				if (!this.deps.isReconciled()) {
+					// Startup owns the initial local-ingress pass after
+					// waitForProviderSync resolves. Do not race it from this event edge.
+					return;
+				}
+				if (this.deps.isReconcileInFlight()) {
+					this.deps.setReconnectPending();
+					return;
+				}
+				this.deps.runProjectionBlockedReconciliation?.(generation);
+				return;
+			}
 			if (!this.deps.isReconciled()) {
 				// waitForProviderSync() may time out and start a conservative
 				// reconciliation just before the provider's first authoritative sync

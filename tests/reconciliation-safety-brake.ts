@@ -6,6 +6,11 @@ import {
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
 } from "../src/sync/origins";
 
+Object.defineProperty(globalThis, "__KAOS_QA_HARNESS_ENABLED__", {
+	configurable: true,
+	value: false,
+});
+
 let passed = 0;
 let failed = 0;
 
@@ -156,6 +161,194 @@ console.log("\n--- Test 2b: clean equal disk/CRDT paths get a settled baseline -
 	assert(diskIndex[path]?.mtime === 5, "equal path keeps fresh disk stats");
 	assert(flushed.length === 0, "equal path does not need a disk flush");
 	assert(saveDiskIndexCalls === 1, "disk index save is attempted after clean baseline recording");
+}
+
+console.log("\n--- Test 2b0: projection-blocked missing disk preserves local-deletion baseline ---");
+{
+	const path = "locally-deleted-while-policy-closed.md";
+	const priorContent = "last clean local content\n";
+	const remoteContent = "provider content still present\n";
+	const priorHash = await contentBaselineHash(priorContent);
+	const priorEntry = {
+		mtime: 17,
+		size: priorContent.length,
+		contentHash: priorHash,
+	};
+	let diskIndex: DiskIndex = { [path]: { ...priorEntry } };
+	let flushCalls = 0;
+	const ytext = { toJSON: () => remoteContent };
+	const vaultSync = {
+		connected: true,
+		providerSynced: true,
+		getActiveMarkdownPaths: () => [path],
+		getTextForPath: (candidate: string) => candidate === path ? ytext : null,
+		isMarkdownTombstoned: () => false,
+		reconcileVault: () => ({
+			mode: "authoritative",
+			createdOnDisk: [path],
+			updatedOnDisk: [],
+			seededToCrdt: [],
+			untracked: [],
+			tombstonedDiskConflicts: [],
+			pathBindingConflicts: [],
+			skipped: 0,
+		}),
+		runIntegrityChecks: () => ({
+			duplicateIds: 0,
+			orphansCleaned: 0,
+			duplicateActivePaths: 0,
+		}),
+	};
+	const diskMirror = {
+		captureRemoteProjectionAdmission: () => null,
+		flushWrite: async () => {
+			flushCalls++;
+			throw new Error("projection-blocked path must not reach DiskMirror");
+		},
+		getPreservedUnresolvedEntries: () => [],
+	};
+	const controller = new ReconciliationController({
+		app: {
+			vault: {
+				getFiles: () => [],
+				getMarkdownFiles: () => [],
+				getAbstractFileByPath: () => null,
+				adapter: { stat: async () => null },
+			},
+			workspace: { iterateAllLeaves: () => {} },
+		} as any,
+		getSettings: () => ({ deviceName: "device" }) as any,
+		getRuntimeConfig: () => ({
+			maxFileSizeBytes: 0,
+			maxFileSizeKB: 0,
+			excludePatterns: [],
+		}) as any,
+		getVaultSync: () => vaultSync as any,
+		getDiskMirror: () => diskMirror as any,
+		getBlobSync: () => null,
+		getEditorBindings: () => null,
+		getDiskIndex: () => diskIndex,
+		setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
+		isMarkdownPathSyncable: () => true,
+		isRemoteProjectionAllowed: () => false,
+		shouldBlockFrontmatterIngest: () => false,
+		refreshServerCapabilities: async () => {},
+		validateOpenEditorBindings: () => {},
+		onReconciled: () => {},
+		getAwaitingFirstProviderSyncAfterStartup: () => false,
+		setAwaitingFirstProviderSyncAfterStartup: () => {},
+		saveDiskIndex: async () => {},
+		refreshStatusBar: () => {},
+		trace: () => {},
+		scheduleTraceStateSnapshot: () => {},
+		log: () => {},
+	} as any);
+
+	await controller.runReconciliation("authoritative");
+
+	assert(flushCalls === 0, "closed provider policy performs no missing-path projection");
+	assert(
+		JSON.stringify(diskIndex[path]) === JSON.stringify(priorEntry),
+		"closed provider policy preserves the exact prior baseline for local deletion detection",
+	);
+	controller.reset();
+}
+
+console.log("\n--- Test 2b0a: admitted missing-disk projection that later defers preserves baseline ---");
+{
+	const path = "locally-deleted-during-admitted-projection.md";
+	const priorContent = "last clean deletion baseline\n";
+	const remoteContent = "remote candidate after local delete\n";
+	const priorHash = await contentBaselineHash(priorContent);
+	const priorEntry = {
+		mtime: 23,
+		size: priorContent.length,
+		contentHash: priorHash,
+	};
+	let diskIndex: DiskIndex = { [path]: { ...priorEntry } };
+	let flushCalls = 0;
+	const admission = { isCurrent: () => false };
+	const vaultSync = {
+		connected: true,
+		providerSynced: true,
+		getActiveMarkdownPaths: () => [path],
+		getTextForPath: (candidate: string) => (
+			candidate === path ? { toJSON: () => remoteContent } : null
+		),
+		isMarkdownTombstoned: () => false,
+		reconcileVault: () => ({
+			mode: "authoritative",
+			createdOnDisk: [path],
+			updatedOnDisk: [],
+			seededToCrdt: [],
+			untracked: [],
+			tombstonedDiskConflicts: [],
+			pathBindingConflicts: [],
+			skipped: 0,
+		}),
+		runIntegrityChecks: () => ({
+			duplicateIds: 0,
+			orphansCleaned: 0,
+			duplicateActivePaths: 0,
+		}),
+	};
+	const diskMirror = {
+		captureRemoteProjectionAdmission: () => admission,
+		flushWrite: async () => {
+			flushCalls++;
+			return {
+				kind: "deferred" as const,
+				path,
+				reason: "remote-projection-not-ready" as const,
+			};
+		},
+		getPreservedUnresolvedEntries: () => [],
+	};
+	const controller = new ReconciliationController({
+		app: {
+			vault: {
+				getFiles: () => [],
+				getMarkdownFiles: () => [],
+				getAbstractFileByPath: () => null,
+				adapter: { stat: async () => null },
+			},
+			workspace: { iterateAllLeaves: () => {} },
+		} as any,
+		getSettings: () => ({ deviceName: "device" }) as any,
+		getRuntimeConfig: () => ({
+			maxFileSizeBytes: 0,
+			maxFileSizeKB: 0,
+			excludePatterns: [],
+		}) as any,
+		getVaultSync: () => vaultSync as any,
+		getDiskMirror: () => diskMirror as any,
+		getBlobSync: () => null,
+		getEditorBindings: () => null,
+		getDiskIndex: () => diskIndex,
+		setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
+		isMarkdownPathSyncable: () => true,
+		isRemoteProjectionAllowed: () => true,
+		shouldBlockFrontmatterIngest: () => false,
+		refreshServerCapabilities: async () => {},
+		validateOpenEditorBindings: () => {},
+		onReconciled: () => {},
+		getAwaitingFirstProviderSyncAfterStartup: () => false,
+		setAwaitingFirstProviderSyncAfterStartup: () => {},
+		saveDiskIndex: async () => {},
+		refreshStatusBar: () => {},
+		trace: () => {},
+		scheduleTraceStateSnapshot: () => {},
+		log: () => {},
+	} as any);
+
+	await controller.runReconciliation("authoritative");
+
+	assert(flushCalls === 1, "admitted projection reaches the simulated mid-flight policy close");
+	assert(
+		JSON.stringify(diskIndex[path]) === JSON.stringify(priorEntry),
+		"mid-flight projection deferral preserves the exact local-deletion baseline",
+	);
+	controller.reset();
 }
 
 console.log("\n--- Test 2b1: baseline records the disk snapshot C1, never later CRDT C2 ---");
@@ -1517,7 +1710,6 @@ console.log("\n--- Test 5: bound recovery aborts when CRDT changes after authori
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => null,
@@ -1652,7 +1844,6 @@ console.log("\n--- Test 6: bound ambiguous divergence creates a conflict artifac
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => null,
@@ -1763,7 +1954,6 @@ console.log("\n--- Test 7: repeated identical recovery fingerprint is quarantine
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => null,
@@ -1880,7 +2070,6 @@ console.log("\n--- Test 8: successful recovery clears quarantine fingerprint ---
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => null,
@@ -2015,7 +2204,6 @@ console.log("\n--- Test 9: convergence failure does not create infinite conflict
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => null,
@@ -2072,7 +2260,6 @@ console.log("\n--- Test 9: convergence failure does not create infinite conflict
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => restartVaultSync as any,
 		getDiskMirror: () => null,
@@ -2177,7 +2364,6 @@ console.log("\n--- Test 10: second reconcile after successful convergence does n
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => null,
@@ -2279,7 +2465,6 @@ console.log("\n--- Test 11: artifact creation failure does NOT trigger convergen
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => null,
@@ -2327,7 +2512,6 @@ console.log("\n--- Test 12: recovery fingerprint TTL prevents stale accumulation
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => null,
 		getDiskMirror: () => null,

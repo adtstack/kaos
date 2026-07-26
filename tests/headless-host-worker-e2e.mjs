@@ -4,6 +4,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -22,6 +23,7 @@ function e2eTimeout(ms) {
 
 async function main() {
 	assert.ok(existsSync(WRANGLER_BIN), "server/node_modules/.bin/wrangler is required");
+	await runWorkerReadinessRegression();
 	runBuild();
 	await runNoR2GracefulSmoke();
 	await runOperationalSmokeScript();
@@ -185,6 +187,32 @@ async function main() {
 			await stopChild(child);
 		}
 		rmSync(root, { recursive: true, force: true });
+	}
+}
+
+async function runWorkerReadinessRegression() {
+	let probeCount = 0;
+	const server = createHttpServer((request, response) => {
+		assert.equal(request.url, "/api/capabilities");
+		probeCount += 1;
+		if (probeCount === 1) {
+			response.writeHead(404).end("not ready");
+			return;
+		}
+		response.writeHead(200, { "content-type": "application/json" }).end("{}");
+	});
+	await new Promise((resolvePromise, rejectPromise) => {
+		server.once("error", rejectPromise);
+		server.listen(0, "127.0.0.1", resolvePromise);
+	});
+	try {
+		const address = server.address();
+		assert.ok(address && typeof address !== "string", "readiness fixture must expose a TCP port");
+		await waitForWorker(`http://127.0.0.1:${address.port}`, { exited: false });
+		assert.ok(probeCount >= 2, "worker readiness must reject a transient 404 response");
+		console.log("  PASS  worker readiness waits through a transient capabilities 404");
+	} finally {
+		await new Promise((resolvePromise) => server.close(resolvePromise));
 	}
 }
 
@@ -489,7 +517,7 @@ async function waitForWorker(host, output) {
 		if (output.exited) throw new Error("wrangler exited before accepting requests");
 		try {
 			const res = await fetch(`${host}/api/capabilities`);
-			return res.status > 0;
+			return res.ok;
 		} catch {
 			return false;
 		}

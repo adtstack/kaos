@@ -14,6 +14,7 @@ export type PreservedUnresolvedReason =
 	| "remote-download-local-conflict"
 	| "conflict-artifact-write-failed"
 	| "three-way-preserve-failed"
+	| "open-external-targeted-diff-failed"
 	| "conflict-winner-flush-deferred"
 	| "restore-disk-settlement-failed"
 	| "multiple-editor-authorities"

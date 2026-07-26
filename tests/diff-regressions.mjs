@@ -1,12 +1,16 @@
 import { readFileSync } from "node:fs";
+import { YSyncConfig } from "y-codemirror.next";
 import * as Y from "yjs";
 
 const diffModule = await import("../src/sync/diff.ts");
 const {
 	applyDiffToYText,
 	applyDiffToYTextWithPostcondition,
+	applyExactDiffToYText,
 	forceReplaceYText,
 } = diffModule.default;
+const originsModule = await import("../src/sync/origins.ts");
+const { ORIGIN_OPEN_EXTERNAL_EDIT_MERGE } = originsModule.default;
 
 let passed = 0;
 let failed = 0;
@@ -204,6 +208,195 @@ console.log("\n--- Test 9: reconciliation cannot bypass targeted diff recovery -
 		!reconciliationSource.includes("forceReplaceYText("),
 		"reconciliation never invokes whole-document replacement directly",
 	);
+}
+
+console.log("\n--- Test 10: exact diff preserves a relative anchor in unchanged text ---");
+{
+	assert(
+		typeof applyExactDiffToYText === "function",
+		"applyExactDiffToYText is exported",
+	);
+	if (typeof applyExactDiffToYText === "function") {
+		const doc = new Y.Doc();
+		const ytext = doc.getText("content");
+		const oldText = "before\nanchor\nafter\n";
+		const newText = "external before\nanchor\nafter\n";
+		ytext.insert(0, oldText);
+		const relativeAnchor = Y.createRelativePositionFromTypeIndex(
+			ytext,
+			"before\n".length,
+		);
+
+		const result = applyExactDiffToYText(
+			ytext,
+			oldText,
+			newText,
+			ORIGIN_OPEN_EXTERNAL_EDIT_MERGE,
+		);
+		const absoluteAnchor = Y.createAbsolutePositionFromRelativePosition(
+			relativeAnchor,
+			doc,
+		);
+
+		assert(result.kind === "applied", "exact diff reports applied");
+		assert(ytext.toString() === newText, "exact diff lands the requested text");
+		assert(
+			absoluteAnchor?.type === ytext
+				&& absoluteAnchor.index === "external before\n".length,
+			"relative anchor still points to the anchor line",
+		);
+		doc.destroy();
+	}
+}
+
+console.log("\n--- Test 11: exact diff rejects a stale expected base without mutation ---");
+{
+	if (typeof applyExactDiffToYText === "function") {
+		const doc = new Y.Doc();
+		const ytext = doc.getText("content");
+		const actual = "current collaborator text\n";
+		const target = "external target text\n";
+		ytext.insert(0, actual);
+
+		const result = applyExactDiffToYText(
+			ytext,
+			"stale expected base\n",
+			target,
+			ORIGIN_OPEN_EXTERNAL_EDIT_MERGE,
+		);
+
+		assert(
+			JSON.stringify(result) === JSON.stringify({ kind: "stale-base", currentText: actual }),
+			"stale base returns the exact stale-base result",
+		);
+		assert(ytext.toString() === actual, "stale base leaves current text untouched");
+		assert(!ytext.toString().includes(target), "stale base does not add target content");
+		doc.destroy();
+	}
+}
+
+console.log("\n--- Test 12: user undo excludes the external merge origin ---");
+{
+	if (
+		typeof applyExactDiffToYText === "function"
+		&& typeof ORIGIN_OPEN_EXTERNAL_EDIT_MERGE === "string"
+	) {
+		const doc = new Y.Doc();
+		const ytext = doc.getText("content");
+		ytext.insert(0, "base\n");
+		const undoManager = new Y.UndoManager(ytext);
+		const editorOrigin = new YSyncConfig(ytext, null);
+		// y-codemirror registers its YSyncConfig instance as the tracked user-edit
+		// origin on the binding's UndoManager.
+		undoManager.addTrackedOrigin(editorOrigin);
+
+		doc.transact(() => ytext.insert(0, "user-one "), editorOrigin);
+		undoManager.stopCapturing();
+		const beforeExternalMerge = ytext.toString();
+		const externalResult = applyExactDiffToYText(
+			ytext,
+			beforeExternalMerge,
+			"user-one external base\n",
+			ORIGIN_OPEN_EXTERNAL_EDIT_MERGE,
+		);
+		doc.transact(() => ytext.insert(ytext.length, "user-two\n"), editorOrigin);
+
+		assert(externalResult.kind === "applied", "external merge is applied exactly");
+		assert(
+			!undoManager.trackedOrigins.has(ORIGIN_OPEN_EXTERNAL_EDIT_MERGE),
+			"external merge origin is not tracked by the user UndoManager",
+		);
+		undoManager.undo();
+		assert(
+			ytext.toString() === "user-one external base\n",
+			"first undo removes only the later user insert",
+		);
+		undoManager.undo();
+		assert(
+			ytext.toString() === "external base\n",
+			"second undo removes only the earlier user insert and keeps external text",
+		);
+
+		undoManager.destroy();
+		editorOrigin.undoManager.destroy();
+		doc.destroy();
+	}
+}
+
+console.log("\n--- Test 13: exact diff unchanged result emits no Yjs update ---");
+{
+	const doc = new Y.Doc();
+	const ytext = doc.getText("content");
+	const unchanged = "already exact\n";
+	ytext.insert(0, unchanged);
+	const stateVectorBefore = Y.encodeStateVector(doc);
+	let updateCount = 0;
+	const countUpdate = () => {
+		updateCount++;
+	};
+	doc.on("update", countUpdate);
+
+	const result = applyExactDiffToYText(
+		ytext,
+		unchanged,
+		unchanged,
+		ORIGIN_OPEN_EXTERNAL_EDIT_MERGE,
+	);
+	const stateVectorAfter = Y.encodeStateVector(doc);
+	doc.off("update", countUpdate);
+
+	assert(
+		JSON.stringify(result) === JSON.stringify({ kind: "unchanged" }),
+		"unchanged text returns the exact unchanged result",
+	);
+	assert(updateCount === 0, "unchanged text emits no Yjs update");
+	assert(
+		Buffer.from(stateVectorAfter).equals(Buffer.from(stateVectorBefore)),
+		"unchanged text leaves the Yjs state vector untouched",
+	);
+	assert(ytext.toString() === unchanged, "unchanged text preserves content exactly");
+	doc.destroy();
+}
+
+console.log("\n--- Test 14: exact diff reports synchronous postcondition interference ---");
+{
+	const doc = new Y.Doc();
+	const ytext = doc.getText("content");
+	const oldText = "base\n";
+	const newText = "external base\n";
+	const interferedText = "external base\nintervening collaborator text\n";
+	ytext.insert(0, oldText);
+	let armed = true;
+	let interferenceCount = 0;
+	const interfereOnce = (_event, transaction) => {
+		if (!armed || transaction.origin !== ORIGIN_OPEN_EXTERNAL_EDIT_MERGE) return;
+		armed = false;
+		interferenceCount++;
+		ytext.insert(ytext.length, "intervening collaborator text\n");
+	};
+	ytext.observe(interfereOnce);
+
+	const result = applyExactDiffToYText(
+		ytext,
+		oldText,
+		newText,
+		ORIGIN_OPEN_EXTERNAL_EDIT_MERGE,
+	);
+	ytext.unobserve(interfereOnce);
+
+	assert(interferenceCount === 1, "one-shot observer interferes exactly once");
+	assert(
+		JSON.stringify(result) === JSON.stringify({
+			kind: "postcondition-failed",
+			currentText: interferedText,
+		}),
+		"interference returns the exact postcondition-failed result",
+	);
+	assert(
+		ytext.toString() === interferedText,
+		"exact diff does not force-replace intervening content",
+	);
+	doc.destroy();
 }
 
 console.log(`\n${"─".repeat(50)}`);

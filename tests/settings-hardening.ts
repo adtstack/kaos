@@ -1,7 +1,6 @@
 import {
 	attachmentSizeCapKB,
 	DEFAULT_SETTINGS,
-	EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION,
 	MAX_ATTACHMENT_SIZE_KB,
 	MAX_ATTACHMENT_CONCURRENCY,
 	MAX_TEXT_FILE_SIZE_KB,
@@ -44,12 +43,11 @@ console.log("\n--- Test 2: invalid attachment max falls back inside the valid ra
 
 console.log("\n--- Test 3: valid attachment max is preserved ---");
 {
-	const { settings, migrated } = readVaultSyncSettings({
+	const { settings } = readVaultSyncSettings({
 		attachmentSyncExplicitlyConfigured: true,
 		maxAttachmentSizeKB: 4096,
 	});
 	assert(settings.maxAttachmentSizeKB === 4096, "valid attachment setting is preserved");
-	assert(!migrated, "valid attachment setting does not force migration");
 }
 
 console.log("\n--- Test 4: server capability can lower the effective attachment cap ---");
@@ -68,16 +66,11 @@ console.log("\n--- Test 4: server capability can lower the effective attachment 
 	);
 }
 
-console.log("\n--- Test 5: external edits default to closed files only ---");
+console.log("\n--- Test 5: external edit policy is absent from live defaults ---");
 {
 	assert(
-		DEFAULT_SETTINGS.externalEditPolicy === "closed-only",
-		"default external edit policy protects open editor files",
-	);
-	const { settings } = readVaultSyncSettings(undefined);
-	assert(
-		settings.externalEditPolicy === "closed-only",
-		"loaded empty settings inherit the closed-only policy",
+		!Object.hasOwn(DEFAULT_SETTINGS, "externalEditPolicy"),
+		"default settings expose no external edit policy",
 	);
 }
 
@@ -92,61 +85,6 @@ console.log("\n--- Test 6: remote typing advisory is enabled by default ---");
 		settings.remoteTypingGuardEnabled,
 		"loaded empty settings inherit the remote typing advisory",
 	);
-}
-
-console.log("\n--- Test 7: old always external edit policy is migrated to closed-only ---");
-{
-	const { settings, migrated } = readVaultSyncSettings({
-		attachmentSyncExplicitlyConfigured: true,
-		externalEditPolicy: "always",
-	});
-	assert(
-		settings.externalEditPolicy === "closed-only",
-		"legacy always policy is migrated to closed-only",
-	);
-	assert(
-		settings.externalEditPolicySafetyMigrationVersion === EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION,
-		"legacy always migration records the safety migration marker",
-	);
-	assert(migrated, "legacy always policy marks settings as migrated");
-}
-
-console.log("\n--- Test 8: explicit post-migration always policy is preserved ---");
-{
-	const { settings, migrated } = readVaultSyncSettings({
-		attachmentSyncExplicitlyConfigured: true,
-		externalEditPolicy: "always",
-		externalEditPolicySafetyMigrationVersion: EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION,
-	});
-	assert(
-		settings.externalEditPolicy === "always",
-		"post-migration explicit always policy is preserved",
-	);
-	assert(!migrated, "post-migration explicit always policy does not re-migrate");
-}
-
-console.log("\n--- Test 9: invalid external edit policy falls back to closed-only ---");
-{
-	const { settings, migrated } = readVaultSyncSettings({
-		attachmentSyncExplicitlyConfigured: true,
-		externalEditPolicy: "surprise" as never,
-	});
-	assert(
-		settings.externalEditPolicy === "closed-only",
-		"invalid external edit policy is repaired to closed-only",
-	);
-	assert(migrated, "invalid external edit policy marks settings as migrated");
-
-	const repairedNull = readVaultSyncSettings({
-		attachmentSyncExplicitlyConfigured: true,
-		externalEditPolicy: null as never,
-		externalEditPolicySafetyMigrationVersion: EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION,
-	});
-	assert(
-		repairedNull.settings.externalEditPolicy === "closed-only",
-		"null external edit policy cannot bypass the closed-file safety default",
-	);
-	assert(repairedNull.migrated, "null external edit policy marks settings as migrated");
 }
 
 console.log("\n--- Test 10: persisted transfer concurrency is a finite 1..5 integer ---");

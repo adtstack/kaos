@@ -3,10 +3,11 @@ import {
 	DEFAULT_SETTINGS,
 	VaultSyncSettingTab,
 	generateVaultId,
-	type ExternalEditPolicy,
 	type VaultSyncSettings,
 } from "./settings";
+import { EXTERNAL_EDIT_BEHAVIOR } from "./sync/externalEditBehavior";
 import {
+	type ExternalEditPolicyCompatibilityFields,
 	persistSettingsMutation,
 	SettingsMutationQueue,
 	SettingsStore,
@@ -168,6 +169,24 @@ import {
 	type RuntimeConfig,
 } from "./runtime/runtimeConfig";
 import {
+	readKaosExcludeFile,
+	readKaosExcludeFileFromCrdt,
+	type KaosExcludeFileSnapshot,
+} from "./runtime/excludeFile";
+import {
+	RemoteProjectionPolicyGate,
+} from "./runtime/remoteProjectionPolicyGate";
+import {
+	ProviderPolicySettlementCoordinator,
+	type ProviderPolicySettlementRequest,
+} from "./runtime/providerPolicySettlementCoordinator";
+import {
+	KAOS_EXCLUDE_FILE_PATH,
+	isKaosExcludeFilePath,
+	mergeExcludePatterns,
+	parseExcludePatterns,
+} from "./sync/exclude";
+import {
 	ReconciliationController,
 	type MarkdownDirtyReason,
 	type StableMarkdownReadResult,
@@ -244,7 +263,7 @@ type PendingBlobReplayApplyResult =
 	| PendingBlobReplayPrecondition
 	| PendingBlobReplayMutation;
 
-type PersistedPluginState = Partial<VaultSyncSettings> & {
+type PersistedPluginState = Partial<VaultSyncSettings> & ExternalEditPolicyCompatibilityFields & {
 	_diskIndex?: DiskIndex;
 	_baselineTexts?: BaselineTextStore;
 	_conflictMergeBases?: ConflictMergeBaseStore;
@@ -310,7 +329,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	// ---------------------------------------------------------------------------
 	private _qaState: {
 		diskIngestPort: DiskIngestPort | null;
-		externalEditPolicyOverride: import("./settings").ExternalEditPolicy | null;
+		diskIngestSuspended: boolean;
 		pausedEditorPropagationPaths: Set<string>;
 		bindingReconfigureHook: ((path: string, deviceName: string, action: "pause" | "resume") => void) | null;
 		controlPort: EngineControlPort;
@@ -322,8 +341,29 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private recoverySnapshotInterval: ReturnType<typeof setInterval> | null = null;
 	private crdtSnapshotInterval: ReturnType<typeof setInterval> | null = null;
 
-	/** Parsed exclude patterns from settings. */
+	/** Effective union of the shared exclude file and legacy device settings. */
 	private excludePatterns: string[] = [];
+	private excludeFilePatterns: string[] = [];
+	/**
+	 * Provider-authoritative bootstrap overlay. Kept separate from the disk
+	 * snapshot so policy readiness never changes local editor/disk admission.
+	 */
+	private providerExcludeFilePatterns: string[] = [];
+	private remoteProjectionPolicyGate = new RemoteProjectionPolicyGate();
+	private providerExcludePolicyGeneration: number | null = null;
+	private providerExcludePolicyVaultSync: VaultSync | null = null;
+	private providerExcludeFileLastError: string | null = null;
+	private providerExcludePolicySettlementCoordinator =
+		new ProviderPolicySettlementCoordinator((request) =>
+			this.runProviderExcludePolicySettlement(request));
+	private markdownAttentionGeneration = 0;
+	private markdownSyncScopeGeneration = 0;
+	private markdownSyncScopeFingerprint: string | null = null;
+	/** undefined = not read yet, null = confirmed absent, string = exact file body. */
+	private excludeFileRaw: string | null | undefined;
+	private excludeFileRefreshInFlight: Promise<void> | null = null;
+	private excludeFileRefreshEpoch = 0;
+	private excludeFileLastError: string | null = null;
 
 	/** Max file size in characters (derived from settings KB). */
 	private maxFileSize = 0;
@@ -439,6 +479,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (previousHash && previousHash !== baseHash) this.baselineTextDeleteCandidates.add(previousHash);
 			},
 			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
+			isRemoteProjectionAllowed: (path) =>
+				this.remoteProjectionPolicyGate.isRemoteProjectionAllowed(path),
+			getMarkdownAttentionGeneration: () => this.markdownAttentionGeneration,
+			getMarkdownSyncScopeGeneration: () => this.markdownSyncScopeGeneration,
 			shouldTombstoneIntrinsicMarkdownPath: (path) => this.isIntrinsicMarkdownPathExcluded(path),
 			shouldTombstoneIntrinsicBlobPath: (path) => this.isIntrinsicBlobPathExcluded(path),
 			shouldBlockFrontmatterIngest: (path, previousContent, nextContent, reason) =>
@@ -446,7 +490,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			refreshServerCapabilities: (reason) => this.refreshServerCapabilities(reason),
 			validateOpenEditorBindings: (reason) => this.editorWorkspace?.validateOpenBindings(reason),
 			replayPendingBlobIntents: (reason) => this.replayPendingBlobIntents(reason),
-			onReconciled: (reason) => this.editorWorkspace?.onReconciled(reason),
+			onReconciled: (reason) => {
+				this.editorWorkspace?.onReconciled(reason);
+				if (reason === "reconcile-authoritative") {
+					void this.settleProviderExcludePolicyOverlay(reason);
+				}
+			},
 			onBlobReconciled: (mode, reconciledVaultSync) => {
 				if (
 					mode === "authoritative"
@@ -480,8 +529,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			computeRecoveryStateHash: async (_path, content) => {
 				return this.lab?.computeWitnessStateHash(content) ?? null;
 			},
-			getEffectiveExternalEditPolicy: (runtimePolicy) =>
-				this.getEffectiveExternalEditPolicy(runtimePolicy),
+			...(__KAOS_QA_HARNESS_ENABLED__ ? {
+				isDiskIngestSuspendedForQa: () =>
+					this._qaState?.diskIngestSuspended === true,
+			} : {}),
 			registerDiskIngestPort: (port) => {
 				if (__KAOS_QA_HARNESS_ENABLED__ && this._qaState) {
 					this._qaState.diskIngestPort = port;
@@ -495,12 +546,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return isMarkdownSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
 	}
 
-	private getEffectiveExternalEditPolicy(runtimePolicy: ExternalEditPolicy): ExternalEditPolicy {
-		if (__KAOS_QA_HARNESS_ENABLED__) {
-			const override = this._qaState?.externalEditPolicyOverride;
-			if (override != null) return override;
+	private updateMarkdownSyncScopeGeneration(runtimeConfig: RuntimeConfig): void {
+		const nextFingerprint = JSON.stringify([
+			runtimeConfig.vaultConfigDir,
+			[...runtimeConfig.excludePatterns].sort(),
+		]);
+		if (
+			this.markdownSyncScopeFingerprint !== null &&
+			this.markdownSyncScopeFingerprint !== nextFingerprint
+		) {
+			this.markdownSyncScopeGeneration++;
 		}
-		return runtimePolicy;
+		this.markdownSyncScopeFingerprint = nextFingerprint;
 	}
 
 	/** MarkdownView/y-codemirror binding remains `.md`-only. */
@@ -535,7 +592,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private getRuntimeConfig(): RuntimeConfig {
 		if (!this.runtimeConfig) {
-			this.runtimeConfig = buildRuntimeConfig(this.settings, this.app.vault.configDir);
+			this.runtimeConfig = this.buildEffectiveRuntimeConfig();
 		}
 		return this.runtimeConfig;
 	}
@@ -2799,7 +2856,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (__KAOS_QA_HARNESS_ENABLED__) {
 			this._qaState = {
 				diskIngestPort: null,
-				externalEditPolicyOverride: null,
+				diskIngestSuspended: false,
 				pausedEditorPropagationPaths: new Set(),
 				bindingReconfigureHook: null,
 				controlPort: {
@@ -2821,10 +2878,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						this._qaState.bindingReconfigureHook?.(path, this.settings.deviceName, "resume");
 						return true;
 					},
-					setExternalEditPolicyOverride: (policy) => {
+					setDiskIngestSuspended: (suspended) => {
 						if (!this._qaState) throw new Error("QA state not initialised");
-						const previous = this._qaState.externalEditPolicyOverride ?? this.getRuntimeConfig().externalEditPolicy;
-						this._qaState.externalEditPolicyOverride = policy;
+						const previous = this._qaState.diskIngestSuspended;
+						this._qaState.diskIngestSuspended = suspended;
 						return previous;
 					},
 				},
@@ -2940,6 +2997,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 		await this.loadSettings();
 		this.applyRuntimeSettings("load-settings");
+		await this.refreshExcludeFile("startup", false);
 			const isFrontmatterGuardEnabled = () => this.settings.frontmatterGuardEnabled;
 			this.frontmatterGuardCoordinator = new FrontmatterGuardCoordinator({
 				get frontmatterGuardEnabled() { return isFrontmatterGuardEnabled(); },
@@ -2957,8 +3015,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getEditorBindings: () => this.editorBindings,
 			getDiskMirror: () => this.diskMirror,
 			isMarkdownPathSyncable: (path) => this.isMarkdownEditorPathSyncable(path),
-			maybeImportDeferredClosedOnlyPath: (path, reason) =>
-				this.reconciliationController.maybeImportDeferredClosedOnlyPath(path, reason),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
 			log: (message) => this.log(message),
 		});
@@ -3246,6 +3302,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 		try {
 			this.idbDegradedHandled = false;
+			// A VaultSync replacement starts a new provider-generation namespace.
+			// Keep the gate closed until this runtime establishes policy from its
+			// own converged Y.Doc.
+			this.remoteProjectionPolicyGate = new RemoteProjectionPolicyGate();
+			this.providerExcludeFilePatterns = [];
+			this.providerExcludePolicyGeneration = null;
+			this.providerExcludePolicyVaultSync = null;
+			this.providerExcludeFileLastError = null;
+			await this.refreshExcludeFile("init-sync", false);
 			this.applyRuntimeSettings("init-sync");
 			const initPersistenceAuthority = this.blobAuthorityScopeGuard.capture();
 			await this.ensurePendingBlobIntentPersistence();
@@ -3336,6 +3401,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				scope: { ...blobRuntimeScope },
 				token: { ...blobRuntimeToken },
 			};
+			const closeProviderProjection = (event: { status: string }) => {
+				if (!isCurrentInitBlobAuthority() || event.status !== "connected") return;
+				this.closeRemoteProjectionForProviderGeneration(
+					vaultSync,
+					vaultSync.connectionGeneration,
+				);
+			};
+			vaultSync.provider.on("status", closeProviderProjection);
+			// The constructor begins connecting immediately. Close the generation
+			// already observed in case `connected` fired before this listener was
+			// installed.
+			this.closeRemoteProjectionForProviderGeneration(
+				vaultSync,
+				vaultSync.connectionGeneration,
+			);
 
 			// 2. EditorBindingManager
 			const bindingPropagationGate: BindingPropagationGate = {
@@ -3359,21 +3439,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				(event) => this.recordFlightPathEvent(event),
 				bindingPropagationGate,
 				() => this.settings.remoteTypingGuardEnabled,
-				(path, externalContent) => {
-					void this.reconciliationController.preserveRejectedExternalEditorReload(
-						path,
-						externalContent,
-					).catch((err) => {
-						this.trace("conflict", "external-editor-reload-preservation-failed", {
-							path,
-							error: formatUnknown(err),
-						});
-					});
+				(candidate) => {
+					this.reconciliationController.noteInterceptedExternalDiskMutation(candidate);
 				},
-				() =>
-					this.getEffectiveExternalEditPolicy(
-						this.getRuntimeConfig().externalEditPolicy,
-					) !== "always",
+				() => true,
 			);
 
 			// 3. Global CM6 extension
@@ -3400,9 +3469,33 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					),
 				() => this.settings.deviceName,
 				this.preservedUnresolvedEntries,
-				() => this.persistPreservedUnresolvedState(),
+				() => this.handleMarkdownAttentionStateChanged(),
 			);
 			this.diskMirror.setMarkdownPathSyncabilityPredicate((path) => this.isMarkdownPathSyncable(path));
+			this.diskMirror.setRemoteProjectionAdmissionPredicate(
+				(path) => this.remoteProjectionPolicyGate.isRemoteProjectionAllowed(path),
+			);
+			this.diskMirror.setRemoteProjectionAdmissionProvider((paths) => {
+				const policyLease = this.remoteProjectionPolicyGate.captureLease(paths);
+				if (!policyLease) return null;
+				return {
+					isCurrent: () =>
+						this.vaultSync === vaultSync &&
+						vaultSync.connectionGeneration === policyLease.generation &&
+						this.remoteProjectionPolicyGate.isLeaseCurrent(policyLease),
+					enterCriticalSection: () => {
+						if (
+							this.vaultSync !== vaultSync ||
+							vaultSync.connectionGeneration !== policyLease.generation
+						) {
+							return null;
+						}
+						return this.remoteProjectionPolicyGate.enterCriticalSection(
+							policyLease,
+						);
+					},
+				};
+			});
 			this.diskMirror.setDiskBaselineHashProvider(
 				(path) => this.diskIndex[path]?.contentHash ?? null,
 			);
@@ -3457,6 +3550,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				runReconnectReconciliation: (generation) => {
 					void this.reconciliationController.runReconnectReconciliation(generation);
 				},
+				runProjectionBlockedReconciliation: (generation) => {
+					this.log(
+						`Running local-ingress reconciliation while provider projection is held (gen ${generation})`,
+					);
+					void this.runReconciliation("authoritative");
+				},
+				prepareProviderSync: (generation) =>
+					this.prepareProviderSyncPolicy(generation),
 				refreshServerCapabilities: (reason) => {
 					void this.refreshServerCapabilities(reason);
 				},
@@ -3536,6 +3637,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			});
 			const statusInterval = setInterval(() => {
 				if (!isCurrentInitBlobAuthority()) return;
+				void this.refreshExcludeFile("status-tick");
 				if (
 					vaultSync.localReady
 					&& !vaultSync.idbError
@@ -3711,6 +3813,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.showFatalSyncNotice();
 				return;
 			}
+			let providerPolicyReady = !providerSynced;
 			if (providerSynced) {
 				const postSyncSchemaError = vaultSync.checkSchemaVersion();
 				if (postSyncSchemaError) {
@@ -3720,6 +3823,23 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					return;
 				}
 				vaultSync.markCurrentSchema(this.settings.deviceName);
+				providerPolicyReady = this.prepareProviderSyncPolicy(
+					vaultSync.connectionGeneration,
+				);
+				if (!providerPolicyReady) {
+					this.blobProviderReady = false;
+					if (this.providerExcludeFileLastError) {
+						this.updateStatusBar("error");
+						this.log(
+							"Shared provider policy is invalid; continuing with local-ingress reconciliation while remote projection stays closed.",
+						);
+					} else {
+						this.updateStatusBar("syncing");
+						this.log(
+							"Shared provider policy is ready, but remote projection is waiting for an older filesystem commit to settle.",
+						);
+					}
+				}
 			}
 
 			const mode = vaultSync.getSafeReconcileMode();
@@ -3727,8 +3847,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			await this.runReconciliation(mode);
 			if (!isCurrentInitBlobAuthority()) return;
-			this.reconciliationController.lastGeneration = vaultSync.connectionGeneration;
-			if (providerSynced) {
+			if (!providerSynced || providerPolicyReady) {
+				this.reconciliationController.lastGeneration =
+					vaultSync.connectionGeneration;
+			}
+			if (providerSynced && providerPolicyReady) {
 				this.awaitingFirstProviderSyncAfterStartup = false;
 			}
 
@@ -3829,6 +3952,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("modify", (file) => {
+				if (file instanceof TFile && isKaosExcludeFilePath(file.path)) {
+					void this.refreshExcludeFile("vault-modify");
+				}
 				if (!this.reconciliationController.isReconciled) {
 					if (file instanceof TFile && this.isMarkdownPathSyncable(file.path)) {
 						this.reconciliationController.noteMarkdownDiskMutation(file.path);
@@ -3869,10 +3995,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					} else {
 						writerGuess = "external";
 					}
-					const externalReloadGuardEnabled =
-						this.getEffectiveExternalEditPolicy(
-							this.getRuntimeConfig().externalEditPolicy,
-						) !== "always";
 					const observedAt = Date.now();
 					const diskMutationRevision: ObservedDiskMutationRevision = {
 						path: file.path,
@@ -3881,10 +4003,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						size: typeof file.stat?.size === "number" ? file.stat.size : null,
 					};
 					const editorBindingsAtEvent = this.editorBindings;
-					if (
-						externalReloadGuardEnabled &&
-						editorBindingsAtEvent?.isBound(file.path)
-					) {
+					if (editorBindingsAtEvent?.isBound(file.path)) {
 						const sequence = ++this.externalDiskMutationSequence;
 						editorBindingsAtEvent.beginExternalDiskMutation(file.path, sequence);
 						void (async () => {
@@ -3912,13 +4031,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 							// A result belongs only to the runtime and binding manager that
 							// observed the event. Reset/reinit must not arm a new editor.
 							if (this.diskMirror !== dm || this.editorBindings !== editorBindingsAtEvent) {
-								return;
-							}
-							if (
-								this.getEffectiveExternalEditPolicy(
-									this.getRuntimeConfig().externalEditPolicy,
-								) === "always"
-							) {
 								return;
 							}
 							editorBindingsAtEvent.noteExternalDiskMutation({
@@ -3964,6 +4076,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
 				if (!(file instanceof TFile)) return;
+				if (
+					isKaosExcludeFilePath(oldPath)
+					|| isKaosExcludeFilePath(file.path)
+				) {
+					void this.refreshExcludeFile("vault-rename");
+				}
 				if (this.attachmentOrchestrator?.consumeRemoteOverwriteBackupRename(file, oldPath)) {
 					this.log(
 						`Consumed operation-owned attachment backup rename: "${oldPath}" -> "${file.path}"`,
@@ -4155,6 +4273,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("delete", (file) => {
+				if (file instanceof TFile && isKaosExcludeFilePath(file.path)) {
+					void this.refreshExcludeFile("vault-delete");
+				}
 				if (!this.reconciliationController.isReconciled) {
 					if (file instanceof TFile) {
 						if (this.isMarkdownPathSyncable(file.path)) {
@@ -4325,6 +4446,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("create", (file) => {
+				if (file instanceof TFile && isKaosExcludeFilePath(file.path)) {
+					void this.refreshExcludeFile("vault-create");
+				}
 				if (!this.reconciliationController.isReconciled) {
 					if (file instanceof TFile && this.isMarkdownPathSyncable(file.path)) {
 						this.reconciliationController.dropDirtyPath(file.path);
@@ -4378,6 +4502,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * After this, the plugin is in the same state as before initSync().
 	 */
 	private async teardownSync(): Promise<void> {
+		this.reconciliationController.revokeAsyncAuthority();
 		this.log("teardownSync: tearing down all sync state");
 
 		// Safe teardown ordering for disk index baseline persistence:
@@ -4412,6 +4537,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.awaitingFirstProviderSyncAfterStartup = false;
 		this.blobLocalPersistenceReady = false;
 		this.blobProviderReady = false;
+		this.remoteProjectionPolicyGate = new RemoteProjectionPolicyGate();
+		this.providerExcludeFilePatterns = [];
+		this.providerExcludePolicyGeneration = null;
+		this.providerExcludePolicyVaultSync = null;
+		this.providerExcludeFileLastError = null;
+		this.applyRuntimeSettings("teardown-sync");
 		this.editorWorkspace?.reset();
 		this.idbDegradedHandled = false;
 
@@ -4714,6 +4845,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (this.vaultSync?.idbError) {
 			return "error";
 		}
+		if (this.providerExcludeFileLastError) {
+			return "error";
+		}
 		if (
 			this.settings.enableAttachmentSync
 			&& !!this.settings.host
@@ -4778,7 +4912,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				deviceName: this.settings.deviceName || "unknown-device",
 				vaultId: this.settings.vaultId || "unknown-vault",
 				attachmentSyncEnabled: this.settings.enableAttachmentSync,
-				externalEditPolicy: this.settings.externalEditPolicy,
 			},
 			syncStatusLabel: status.label,
 			connectionLabel: connection.label,
@@ -4788,6 +4921,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			diskMirror: this.diskMirror?.getDebugSnapshot() ?? null,
 			blobSync: this.getBlobSync()?.getDebugSnapshot() ?? null,
 			preservedUnresolvedEntries: this.collectPreservedUnresolvedEntries(),
+			remoteProjectionPolicyError: this.providerExcludeFileLastError,
 			remoteDeleteResolutionState: {
 				markdownAvailable: vaultSync !== null && this.diskMirror !== null,
 				blobAvailable: vaultSync !== null && blobSync !== null,
@@ -5463,6 +5597,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			preservedUnresolvedEntries: this.collectPreservedUnresolvedEntries(),
 			frontmatterQuarantineEntries: this.frontmatterQuarantineEntries,
 			reconciliationState: this.reconciliationController.getState(),
+			remoteProjectionPolicyError: this.providerExcludeFileLastError,
 		});
 		const vaultSync = this.vaultSync;
 		const serverReceipt = vaultSync ? {
@@ -5472,7 +5607,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			candidatePersistenceHealthy: vaultSync.candidatePersistenceHealthy,
 			serverReceiptStartupValidation: vaultSync.serverReceiptStartupValidation,
 		} : null;
-		if (connectionState) {
+		if (this.providerExcludeFileLastError) {
+			renderSyncStatus(
+				this.statusBarEl,
+				"error",
+				transferStatus,
+				attentionCount,
+			);
+		} else if (connectionState) {
 			renderConnectionState(this.statusBarEl, connectionState, transferStatus, serverReceipt, attentionCount);
 		} else {
 			renderSyncStatus(this.statusBarEl, _coarseState, transferStatus, attentionCount);
@@ -5569,7 +5711,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				deviceName: this.settings.deviceName,
 				debug: this.settings.debug,
 				enableAttachmentSync: this.settings.enableAttachmentSync,
-				externalEditPolicy: this.settings.externalEditPolicy,
+				externalEditBehavior: EXTERNAL_EDIT_BEHAVIOR,
 			},
 			state: {
 				reconciled: this.reconciliationController.getState().reconciled,
@@ -5877,7 +6019,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// intentionally guard-only: the first applyRuntimeSettings() call must not
 		// mistake startup hydration for a live scope transition and erase a valid
 		// same-scope transfer queue that was just restored from data.json.
-		this.runtimeConfig = buildRuntimeConfig(this.settings, this.app.vault.configDir);
+		this.runtimeConfig = this.buildEffectiveRuntimeConfig();
 		this.blobAuthorityScopeGuard.activate(this.getBlobIntentScope());
 		// Load disk index from plugin data (stored under _diskIndex key)
 		if (data && typeof data._diskIndex === "object" && data._diskIndex !== null) {
@@ -5975,7 +6117,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private applyRuntimeSettings(reason: string): void {
-		this.runtimeConfig = buildRuntimeConfig(this.settings, this.app.vault.configDir);
+		this.runtimeConfig = this.buildEffectiveRuntimeConfig();
+		this.updateMarkdownSyncScopeGeneration(this.runtimeConfig);
 		this.activateBlobAuthorityScope(`runtime-settings:${reason}`);
 		this.excludePatterns = this.runtimeConfig.excludePatterns;
 		this.maxFileSize = this.runtimeConfig.maxFileSizeBytes;
@@ -5986,10 +6129,391 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			hostConfigured: !!this.runtimeConfig.host,
 			vaultIdConfigured: !!this.runtimeConfig.vaultId,
 			enableAttachmentSync: this.runtimeConfig.enableAttachmentSync,
-			externalEditPolicy: this.runtimeConfig.externalEditPolicy,
+			externalEditBehavior: EXTERNAL_EDIT_BEHAVIOR,
 			maxFileSizeKB: this.runtimeConfig.maxFileSizeKB,
 			excludePatternCount: this.runtimeConfig.excludePatterns.length,
+			legacyExcludePatternCount: parseExcludePatterns(this.settings.excludePatterns).length,
+			excludeFilePatternCount: this.excludeFilePatterns.length,
+			providerExcludeOverlayPatternCount: this.providerExcludeFilePatterns.length,
 		});
+	}
+
+	private buildEffectiveRuntimeConfig(): RuntimeConfig {
+		const runtimeConfig = buildRuntimeConfig(this.settings, this.app.vault.configDir);
+		return {
+			...runtimeConfig,
+			excludePatterns: mergeExcludePatterns(
+				runtimeConfig.excludePatterns,
+				this.excludeFilePatterns,
+				this.providerExcludeFilePatterns,
+			),
+		};
+	}
+
+	private closeRemoteProjectionForProviderGeneration(
+		vaultSync: VaultSync,
+		generation: number,
+	): void {
+		if (this.vaultSync !== vaultSync) return;
+		this.remoteProjectionPolicyGate.close(generation);
+		this.trace("reconcile", "provider-policy-gate-closed", {
+			generation,
+		});
+	}
+
+	/**
+	 * Establish the shared provider policy from the already-converged Y.Doc.
+	 * This is synchronous so ConnectionController can enforce the happens-before
+	 * boundary before it schedules reconnect reconciliation.
+	 */
+	private prepareProviderSyncPolicy(generation: number): boolean {
+		const vaultSync = this.vaultSync;
+		if (!vaultSync || generation !== vaultSync.connectionGeneration) {
+			return false;
+		}
+		if (
+			this.providerExcludePolicyVaultSync === vaultSync &&
+			this.providerExcludePolicyGeneration === generation &&
+			this.remoteProjectionPolicyGate.readyGeneration === generation
+		) {
+			return true;
+		}
+		if (vaultSync.checkSchemaVersion()) {
+			return false;
+		}
+
+		if (this.remoteProjectionPolicyGate.currentGeneration !== generation) {
+			this.remoteProjectionPolicyGate.close(generation);
+		}
+		if (this.remoteProjectionPolicyGate.currentGeneration !== generation) {
+			return false;
+		}
+
+		try {
+			const snapshot = readKaosExcludeFileFromCrdt(vaultSync);
+			if (
+				this.vaultSync !== vaultSync ||
+				vaultSync.connectionGeneration !== generation
+			) {
+				return false;
+			}
+			this.providerExcludeFilePatterns = snapshot.patterns;
+			this.providerExcludePolicyVaultSync = vaultSync;
+			this.providerExcludePolicyGeneration = generation;
+			this.providerExcludeFileLastError = null;
+			this.applyRuntimeSettings(`provider-exclude-policy:${generation}`);
+			if (!this.remoteProjectionPolicyGate.open(
+				generation,
+				() => {
+					queueMicrotask(() => {
+						this.resumeProviderSyncPolicyAfterProjectionDrain(
+							vaultSync,
+							generation,
+						);
+					});
+				},
+			)) {
+				this.trace("reconcile", "provider-policy-gate-open-deferred", {
+					generation,
+					reason: "older-filesystem-commit-active",
+				});
+				return false;
+			}
+			this.log(
+				snapshot.present
+					? `Provider exclude policy ready (${snapshot.patterns.length} pattern(s), gen ${generation})`
+					: `Provider exclude policy authoritatively absent (gen ${generation})`,
+			);
+			this.trace("reconcile", "provider-policy-gate-opened", {
+				generation,
+				present: snapshot.present,
+				providerPatternCount: snapshot.patterns.length,
+				effectivePatternCount: this.excludePatterns.length,
+			});
+			this.refreshStatusBar();
+			return true;
+		} catch (err) {
+			const message = formatUnknown(err);
+			if (message !== this.providerExcludeFileLastError) {
+				this.providerExcludeFileLastError = message;
+				this.log(
+					`Provider exclude policy invalid; remote projection remains closed: ${message}`,
+				);
+				this.trace("reconcile", "provider-policy-bootstrap-failed", {
+					generation,
+					error: message,
+				});
+				new Notice(
+					"Shared exclude policy is invalid; remote files remain protected from projection.",
+					8000,
+				);
+			}
+			this.refreshStatusBar();
+			return false;
+		}
+	}
+
+	private resumeProviderSyncPolicyAfterProjectionDrain(
+		vaultSync: VaultSync,
+		generation: number,
+	): void {
+		if (
+			this.vaultSync !== vaultSync ||
+			vaultSync.connectionGeneration !== generation
+		) {
+			return;
+		}
+		if (!this.prepareProviderSyncPolicy(generation)) return;
+
+		this.blobProviderReady = true;
+		this.awaitingFirstProviderSyncAfterStartup = false;
+		if (this.reconciliationController.isReconcileInFlight) {
+			this.reconciliationController.markPending();
+		} else {
+			void this.reconciliationController.runReconnectReconciliation(generation);
+		}
+		this.refreshStatusBar();
+		this.trace("reconcile", "provider-policy-gate-open-resumed", {
+			generation,
+			reason: "older-filesystem-commit-drained",
+		});
+	}
+
+	private settleProviderExcludePolicyOverlay(reason: string): Promise<void> {
+		const vaultSync = this.providerExcludePolicyVaultSync;
+		const generation = this.providerExcludePolicyGeneration;
+		if (!vaultSync || generation === null) return Promise.resolve();
+		return this.providerExcludePolicySettlementCoordinator.request({
+			vaultSync,
+			generation,
+			reason,
+		});
+	}
+
+	private async runProviderExcludePolicySettlement(
+		request: ProviderPolicySettlementRequest,
+	): Promise<void> {
+		const vaultSync = request.vaultSync as VaultSync;
+		const { generation, reason } = request;
+		if (
+			!vaultSync ||
+			generation === null ||
+			this.vaultSync !== vaultSync ||
+			vaultSync.connectionGeneration !== generation ||
+			this.remoteProjectionPolicyGate.readyGeneration !== generation
+		) {
+			return;
+		}
+
+		let diskSnapshot: KaosExcludeFileSnapshot;
+		let crdtSnapshot: KaosExcludeFileSnapshot;
+		let diskAuthority: {
+			file: TFile | null;
+			revision: { ctime: number; mtime: number; size: number } | null;
+			refreshEpoch: number;
+		};
+		try {
+			const refresh = this.excludeFileRefreshInFlight;
+			if (refresh) await refresh;
+			const before = this.captureExcludeFileDiskAuthority();
+			const refreshEpoch = this.excludeFileRefreshEpoch;
+			// Read fresh after reconciliation; do not reuse a status-tick read that
+			// may have started before DiskMirror committed the control document.
+			diskSnapshot = await readKaosExcludeFile(this.app.vault.adapter);
+			const after = this.captureExcludeFileDiskAuthority();
+			if (!this.isSameExcludeFileDiskAuthority(before, after)) {
+				throw new Error("shared exclude file changed during settlement read");
+			}
+			diskAuthority = { ...after, refreshEpoch };
+			if (
+				this.vaultSync !== vaultSync ||
+				vaultSync.connectionGeneration !== generation
+			) {
+				return;
+			}
+			crdtSnapshot = readKaosExcludeFileFromCrdt(vaultSync);
+		} catch (err) {
+			this.log(
+				`Provider exclude policy settlement retained the overlay: ${formatUnknown(err)}`,
+			);
+			return;
+		}
+
+		let currentDiskAuthority: ReturnType<
+			typeof this.captureExcludeFileDiskAuthority
+		>;
+		try {
+			currentDiskAuthority = this.captureExcludeFileDiskAuthority();
+		} catch (err) {
+			this.log(
+				`Provider exclude policy settlement retained the overlay: ${formatUnknown(err)}`,
+			);
+			return;
+		}
+		if (
+			this.excludeFileRefreshEpoch !== diskAuthority.refreshEpoch ||
+			!this.isSameExcludeFileDiskAuthority(
+				diskAuthority,
+				currentDiskAuthority,
+			)
+		) {
+			this.log(
+				`Provider exclude policy settlement deferred (${reason}): disk authority changed`,
+			);
+			return;
+		}
+
+		if (diskSnapshot.raw !== crdtSnapshot.raw) {
+			this.log(
+				`Provider exclude policy settlement deferred (${reason}): disk and CRDT control snapshots differ`,
+			);
+			this.trace("reconcile", "provider-policy-overlay-retained", {
+				reason,
+				generation,
+				diskPresent: diskSnapshot.present,
+				crdtPresent: crdtSnapshot.present,
+			});
+			return;
+		}
+
+		const previousPatterns = this.excludePatterns;
+		this.applyExcludeFileSnapshot(
+			diskSnapshot,
+			`provider-settlement:${generation}`,
+			false,
+		);
+		this.providerExcludeFilePatterns = [];
+		this.providerExcludePolicyGeneration = null;
+		this.providerExcludePolicyVaultSync = null;
+		this.applyRuntimeSettings(`provider-exclude-overlay-cleared:${generation}`);
+		const effectiveChanged =
+			previousPatterns.length !== this.excludePatterns.length ||
+			previousPatterns.some(
+				(pattern, index) => pattern !== this.excludePatterns[index],
+			);
+		this.trace("reconcile", "provider-policy-overlay-cleared", {
+			reason,
+			generation,
+			effectiveChanged,
+			effectivePatternCount: this.excludePatterns.length,
+		});
+		if (effectiveChanged && this.reconciliationController?.isReconciled) {
+			void this.runReconciliation(vaultSync.getSafeReconcileMode());
+		}
+	}
+
+	private captureExcludeFileDiskAuthority(): {
+		file: TFile | null;
+		revision: { ctime: number; mtime: number; size: number } | null;
+	} {
+		const candidate = this.app.vault.getAbstractFileByPath(
+			KAOS_EXCLUDE_FILE_PATH,
+		);
+		if (candidate === null) return { file: null, revision: null };
+		if (!(candidate instanceof TFile)) {
+			throw new Error("shared exclude path is occupied by a non-file");
+		}
+		return {
+			file: candidate,
+			revision: {
+				ctime: candidate.stat.ctime,
+				mtime: candidate.stat.mtime,
+				size: candidate.stat.size,
+			},
+		};
+	}
+
+	private isSameExcludeFileDiskAuthority(
+		left: {
+			file: TFile | null;
+			revision: { ctime: number; mtime: number; size: number } | null;
+		},
+		right: {
+			file: TFile | null;
+			revision: { ctime: number; mtime: number; size: number } | null;
+		},
+	): boolean {
+		if (left.file !== right.file) return false;
+		if (left.revision === null || right.revision === null) {
+			return left.revision === right.revision;
+		}
+		return left.revision.ctime === right.revision.ctime
+			&& left.revision.mtime === right.revision.mtime
+			&& left.revision.size === right.revision.size;
+	}
+
+	private refreshExcludeFile(
+		reason: string,
+		reconcileOnChange = true,
+	): Promise<void> {
+		if (this.excludeFileRefreshInFlight) return this.excludeFileRefreshInFlight;
+		this.excludeFileRefreshEpoch += 1;
+		const refresh = this.loadExcludeFile(reason, reconcileOnChange).finally(() => {
+			if (this.excludeFileRefreshInFlight === refresh) {
+				this.excludeFileRefreshInFlight = null;
+			}
+		});
+		this.excludeFileRefreshInFlight = refresh;
+		return refresh;
+	}
+
+	private async loadExcludeFile(
+		reason: string,
+		reconcileOnChange: boolean,
+	): Promise<void> {
+		let snapshot;
+		try {
+			snapshot = await readKaosExcludeFile(this.app.vault.adapter);
+		} catch (err) {
+			const message = formatUnknown(err);
+			if (message !== this.excludeFileLastError) {
+				this.excludeFileLastError = message;
+				this.log(`Exclude file read failed; retaining the previous policy: ${message}`);
+				this.trace("reconcile", "exclude-file-read-failed", { reason, error: message });
+			}
+			return;
+		}
+
+		this.excludeFileLastError = null;
+		this.applyExcludeFileSnapshot(snapshot, reason, reconcileOnChange);
+	}
+
+	private applyExcludeFileSnapshot(
+		snapshot: KaosExcludeFileSnapshot,
+		reason: string,
+		reconcileOnChange: boolean,
+	): void {
+		if (snapshot.raw === this.excludeFileRaw) return;
+
+		const previousPatterns = this.excludePatterns;
+		this.excludeFileRaw = snapshot.raw;
+		this.excludeFilePatterns = snapshot.patterns;
+		this.applyRuntimeSettings(`exclude-file:${reason}`);
+		const effectiveChanged = previousPatterns.length !== this.excludePatterns.length
+			|| previousPatterns.some((pattern, index) => pattern !== this.excludePatterns[index]);
+
+		this.log(
+			snapshot.present
+				? `Exclude file loaded (${snapshot.patterns.length} pattern(s))`
+				: "Exclude file not present; shared exclusions are empty",
+		);
+		this.trace("reconcile", "exclude-file-reloaded", {
+			reason,
+			present: snapshot.present,
+			filePatternCount: snapshot.patterns.length,
+			effectivePatternCount: this.excludePatterns.length,
+			effectiveChanged,
+		});
+
+		const vaultSync = this.vaultSync;
+		if (
+			reconcileOnChange
+			&& effectiveChanged
+			&& vaultSync
+			&& this.reconciliationController?.isReconciled
+		) {
+			void this.runReconciliation(vaultSync.getSafeReconcileMode());
+		}
 	}
 
 	get serverAuthMode(): ServerCapabilities["authMode"] | "unknown" {
@@ -6296,6 +6820,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			_blobHashCache: this.blobHashCache,
 			...(this.lastDiskIndexPersistedAt > 0 && { _lastDiskIndexPersistedAt: this.lastDiskIndexPersistedAt }),
 		};
+		// New installs use the shared vault file. Keep reading a non-empty legacy
+		// value for compatibility, but do not persist an empty device-local field.
+		if (!this.settings.excludePatterns.trim()) delete nextState.excludePatterns;
 		delete nextState._blobSettledRefs;
 		delete nextState._blobSettledRefsByDevice;
 		applyPersistedBaselineTextFields(
@@ -6358,6 +6885,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private persistPreservedUnresolvedState(): void {
 		void this.persistPreservedUnresolvedStateDurably();
+	}
+
+	private handleMarkdownAttentionStateChanged(): void {
+		this.markdownAttentionGeneration++;
+		this.persistPreservedUnresolvedState();
 	}
 
 	private async persistPreservedUnresolvedStateDurably(): Promise<void> {

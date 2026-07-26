@@ -35,11 +35,33 @@ export type RemoteDeleteDecision =
 export type DiskWriteDeferReason =
 	| "missing-ytext"
 	| "path-excluded"
+	| "remote-projection-not-ready"
 	| "open-editor-mismatch"
 	| "active-editor-unflushed"
 	| "recent-editor-activity"
 	| "disk-changed-during-write"
-	| "crdt-changed-during-write";
+	| "crdt-changed-during-write"
+	| "authority-stale";
+
+export type DiskWriteAuthorityPhase = "before-commit" | "after-commit";
+
+/**
+ * Immutable authority captured when provider work is admitted.
+ *
+ * The closure must bind the VaultSync identity, provider generation, and the
+ * gate's close epoch. A later close/open cycle therefore cannot make this
+ * operation current again even when the visible CRDT state is identical.
+ */
+export interface RemoteProjectionAdmissionLease {
+	readonly isCurrent: () => boolean;
+	/**
+	 * Enter the provider epoch's async filesystem commit section.
+	 *
+	 * When present, the policy gate will hold a later generation closed until
+	 * the returned release function is called.
+	 */
+	readonly enterCriticalSection?: () => (() => void) | null;
+}
 
 export type DiskWriteResult =
 	| {
@@ -73,6 +95,17 @@ export interface DiskFileRevision {
 }
 
 export interface DiskWriteOptions {
+	/**
+	 * Exact provider-generation lease captured by the observer or reconciliation
+	 * planner that admitted this CRDT-to-disk operation.
+	 */
+	remoteProjectionAdmission?: RemoteProjectionAdmissionLease;
+	/**
+	 * Marks a CRDT-to-disk write that originated from provider projection or
+	 * authoritative reconciliation. Local restore/editor settlement callers do
+	 * not set this flag and therefore do not depend on provider policy readiness.
+	 */
+	requireRemoteProjectionAdmission?: boolean;
 	/**
 	 * Whether a successful write should immediately advance the persisted
 	 * baseline. Conflict winners pass false so the next reconcile must first
@@ -113,6 +146,16 @@ export interface DiskWriteOptions {
 	 * example a user-confirmed snapshot restore), never as a generic retry flag.
 	 */
 	allowCreateIfMissing?: boolean;
+	/**
+	 * Optional controller-owned optimistic authority lease.
+	 *
+	 * DiskMirror does not interpret editor, baseline, or merge semantics. It only
+	 * asks the synchronous predicate whether the caller's original decision is
+	 * still admissible. A false return or throw fails closed before bytes/baseline
+	 * publication. `after-commit` permits the caller to account for the stat change
+	 * caused by DiskMirror's own atomic write while retaining every other fence.
+	 */
+	isAuthorityCurrent?: (phase: DiskWriteAuthorityPhase) => boolean;
 }
 
 type ExistingFileWriteAbortReason =
@@ -123,7 +166,8 @@ type ExistingFileWriteAbortReason =
 	| "crdt-changed"
 	| "remote-delete-active"
 	| "preserved-unresolved"
-	| "open-write-deferred";
+	| "open-write-deferred"
+	| "authority-stale";
 
 class ExistingFileWriteAborted extends Error {
 	constructor(readonly reason: ExistingFileWriteAbortReason) {
@@ -174,12 +218,19 @@ interface SuppressionEntry {
 	expiresAt: number;
 	expectedBytes?: number;
 	expectedHash?: string;
+	token?: object;
 }
 
 interface RecentWriteFingerprint {
 	recordedAt: number;
 	expectedBytes: number;
 	expectedHash: string;
+	token: object;
+}
+
+export interface LocalCreateSuppressionHandle {
+	readonly path: string;
+	readonly token: object;
 }
 
 export interface ObservedDiskMutationRevision {
@@ -203,6 +254,18 @@ interface PendingRemoteRename {
 
 function hashPrefix(hash: string | null | undefined): string | null {
 	return typeof hash === "string" ? hash.slice(0, 12) : null;
+}
+
+/**
+ * Obsidian's document read boundary removes one leading UTF-8 BOM, while the
+ * adapter-backed Vault.process callback receives the raw text. Keep the atomic
+ * CAS exact apart from that single host representation difference; line endings
+ * and every other character remain part of the precondition.
+ */
+function rawContentMatchesVaultReadSnapshot(rawContent: string, snapshot: string): boolean {
+	return rawContent === snapshot || (
+		rawContent.charCodeAt(0) === 0xfeff && rawContent.slice(1) === snapshot
+	);
 }
 
 export class DiskMirror {
@@ -337,6 +400,16 @@ export class DiskMirror {
 	private recentWriteFingerprints = new Map<string, RecentWriteFingerprint>();
 	/** Supplied by the plugin; DiskMirror does not own sync-path policy. */
 	private isMarkdownPathSyncable: (path: string) => boolean = () => true;
+	/** Separate from syncability so provider bootstrap never blocks local ingress. */
+	private isRemoteProjectionAllowed: (path: string) => boolean = () => true;
+	private captureRemoteProjectionAdmissionProvider:
+		(paths: readonly string[]) => RemoteProjectionAdmissionLease | null =
+			(paths) => paths.every((path) => this.isRemoteProjectionAllowed(path))
+				? { isCurrent: () => paths.every((path) => this.isRemoteProjectionAllowed(path)) }
+				: null;
+	/** Exact queue provenance retained across debounce and open-editor deferrals. */
+	private remoteProjectionWriteAdmissions =
+		new Map<string, RemoteProjectionAdmissionLease>();
 
 	private readonly debug: boolean;
 
@@ -396,6 +469,31 @@ export class DiskMirror {
 		this.isMarkdownPathSyncable = predicate;
 	}
 
+	setRemoteProjectionAdmissionPredicate(predicate: (path: string) => boolean): void {
+		this.isRemoteProjectionAllowed = predicate;
+		this.captureRemoteProjectionAdmissionProvider = (paths) =>
+			paths.every((path) => predicate(path))
+				? { isCurrent: () => paths.every((path) => predicate(path)) }
+				: null;
+	}
+
+	setRemoteProjectionAdmissionProvider(
+		provider: (paths: readonly string[]) => RemoteProjectionAdmissionLease | null,
+	): void {
+		this.captureRemoteProjectionAdmissionProvider = provider;
+	}
+
+	captureRemoteProjectionAdmission(
+		paths: readonly string[],
+	): RemoteProjectionAdmissionLease | null {
+		const normalizedPaths = paths.map((path) => normalizePath(path));
+		try {
+			return this.captureRemoteProjectionAdmissionProvider(normalizedPaths);
+		} catch {
+			return null;
+		}
+	}
+
 	// -------------------------------------------------------------------
 	// Map observers (structural: add/delete)
 	// -------------------------------------------------------------------
@@ -431,7 +529,7 @@ export class DiskMirror {
 						const path = normalizePath(change.path);
 						this.bumpRemoteDeleteGeneration(path);
 						this.authorizeRemoteCreate(path);
-						this.scheduleWrite(path);
+						this.scheduleRemoteWrite(path);
 						break;
 					}
 					case "path-changed": {
@@ -453,7 +551,7 @@ export class DiskMirror {
 							const path = normalizePath(change.next.path);
 							this.bumpRemoteDeleteGeneration(path);
 							this.authorizeRemoteCreate(path);
-							this.scheduleWrite(path);
+							this.scheduleRemoteWrite(path);
 						}
 						break;
 					}
@@ -495,7 +593,7 @@ export class DiskMirror {
 				if (this.openPaths.has(path)) continue;
 
 				this.log(`afterTxn: remote content change to closed file "${path}"`);
-				this.scheduleWrite(path);
+				this.scheduleRemoteWrite(path);
 			}
 		};
 		this.vaultSync.ydoc.on("afterTransaction", afterTxnHandler);
@@ -577,7 +675,7 @@ export class DiskMirror {
 			if (isLocalOrigin(txn.origin, this.vaultSync.provider)) return;
 			const originLabel = describeOrigin(txn.origin, this.vaultSync.provider);
 			this.log(`text observer: remote change to "${path}" (origin=${originLabel})`);
-			this.scheduleWrite(path);
+			this.scheduleRemoteWrite(path);
 		};
 
 		ytext.observe(handler);
@@ -602,6 +700,21 @@ export class DiskMirror {
 	// -------------------------------------------------------------------
 	// Write scheduling (debounce + concurrency-limited queue)
 	// -------------------------------------------------------------------
+
+	private scheduleRemoteWrite(path: string): void {
+		path = normalizePath(path);
+		const admission = this.captureRemoteProjectionAdmission([path]);
+		if (!admission) {
+			this.log(`scheduleRemoteWrite: policy not ready for "${path}"`);
+			return;
+		}
+		if (!this.isMarkdownPathSyncable(path)) {
+			this.scheduleWrite(path);
+			return;
+		}
+		this.remoteProjectionWriteAdmissions.set(path, admission);
+		this.scheduleWrite(path);
+	}
 
 	scheduleWrite(path: string): void {
 		path = normalizePath(path);
@@ -724,7 +837,16 @@ export class DiskMirror {
 				await Promise.all(
 					batch.map((path) => {
 						const force = this.forcedWritePaths.delete(path);
-						return this.flushWrite(path, force);
+						const remoteProjectionAdmission =
+							this.remoteProjectionWriteAdmissions.get(path);
+						if (remoteProjectionAdmission) {
+							this.remoteProjectionWriteAdmissions.delete(path);
+						}
+						return this.flushWrite(path, force, {
+							requireRemoteProjectionAdmission:
+								remoteProjectionAdmission !== undefined,
+							remoteProjectionAdmission,
+						});
 					}),
 				);
 			}
@@ -747,7 +869,27 @@ export class DiskMirror {
 			this.log(`flushWrite: skipping excluded path "${path}"`);
 			return { kind: "deferred", path, reason: "path-excluded" };
 		}
-		return this.runPathWriteLocked(path, () => this.flushWriteUnlocked(path, force, options));
+		const remoteProjectionAdmission =
+			options.remoteProjectionAdmission ??
+			(options.requireRemoteProjectionAdmission === true
+				? this.captureRemoteProjectionAdmission([path])
+				: undefined);
+		const effectiveOptions: DiskWriteOptions = remoteProjectionAdmission
+			? { ...options, remoteProjectionAdmission }
+			: options;
+		if (
+			options.requireRemoteProjectionAdmission === true &&
+			(!remoteProjectionAdmission || !this.isRemoteProjectionAdmissionCurrent(
+				remoteProjectionAdmission,
+			))
+		) {
+			this.log(`flushWrite: remote projection policy not ready for "${path}"`);
+			return { kind: "deferred", path, reason: "remote-projection-not-ready" };
+		}
+		return this.runPathWriteLocked(
+			path,
+			() => this.flushWriteUnlocked(path, force, effectiveOptions),
+		);
 	}
 
 	private async flushWriteUnlocked(
@@ -758,6 +900,9 @@ export class DiskMirror {
 		const normalized = normalizePath(path);
 		if (this.isPreservedUnresolved(normalized)) {
 			return this.blockPreservedUnresolvedWrite(normalized, "preflight");
+		}
+		if (!this.isCallerAuthorityCurrent(path, options, "before-commit", "preflight")) {
+			return this.deferCallerAuthorityStale(path, "preflight", options);
 		}
 		// Keep one disk compare snapshot across CRDT retries. Otherwise a local
 		// edit that lands during attempt 1 could become the accepted baseline for
@@ -771,13 +916,22 @@ export class DiskMirror {
 			if (this.isAuthoritativeMarkdownDeleteActiveForWrite(normalized)) {
 				return this.deferDiskChangedWrite(path, "remote-delete-active");
 			}
+			if (!this.isCallerAuthorityCurrent(path, options, "before-commit", `attempt-${attempt}`)) {
+				return this.deferCallerAuthorityStale(path, `attempt-${attempt}`, options);
+			}
 			const ytext = this.vaultSync.getTextForPath(path);
 			if (!ytext) {
 				this.log(`flushWrite: no Y.Text for "${path}", skipping`);
 				return { kind: "deferred", path: normalized, reason: "missing-ytext" };
 			}
 			const content = ytext.toJSON();
-			const preflightDefer = this.getOpenWriteDeferral(path, content, force, "preflight");
+			const preflightDefer = this.getOpenWriteDeferral(
+				path,
+				content,
+				force,
+				"preflight",
+				options,
+			);
 			if (preflightDefer) {
 				return preflightDefer;
 			}
@@ -810,6 +964,9 @@ export class DiskMirror {
 				}
 				if (existing instanceof TFile) {
 					const currentContent = await this.app.vault.read(existing);
+					if (!this.isCallerAuthorityCurrent(path, options, "before-commit", "post-read")) {
+						return this.deferCallerAuthorityStale(path, "post-read", options);
+					}
 					if (this.isPreservedUnresolved(normalized)) {
 						return this.blockPreservedUnresolvedWrite(normalized, "post-read");
 					}
@@ -820,7 +977,13 @@ export class DiskMirror {
 						return this.deferDiskChangedWrite(path, "post-read-file-revision");
 					}
 					if (this.didCrdtChangeDuringWrite(path, content, "read")) continue;
-					const postReadDefer = this.getOpenWriteDeferral(path, content, force, "post-read");
+					const postReadDefer = this.getOpenWriteDeferral(
+						path,
+						content,
+						force,
+						"post-read",
+						options,
+					);
 					if (postReadDefer) {
 						return postReadDefer;
 					}
@@ -842,6 +1005,14 @@ export class DiskMirror {
 								return this.deferDiskChangedWrite(path, "missing-durable-baseline");
 							}
 							const currentDiskHash = await contentBaselineHash(currentContent);
+							if (!this.isCallerAuthorityCurrent(
+								path,
+								options,
+								"before-commit",
+								"post-baseline-hash",
+							)) {
+								return this.deferCallerAuthorityStale(path, "post-baseline-hash", options);
+							}
 							if (!this.isExactDiskFileCurrent(normalized, existing)) {
 								return this.deferDiskChangedWrite(path, "post-baseline-hash-file-identity");
 							}
@@ -851,6 +1022,7 @@ export class DiskMirror {
 								content,
 								force,
 								"post-baseline-hash",
+								options,
 							);
 							if (postHashDefer) return postHashDefer;
 							const latestBaselineHash = baselineProvider(normalized)?.toLowerCase() ?? null;
@@ -863,11 +1035,16 @@ export class DiskMirror {
 					if (currentContent !== expectedDiskSnapshot) {
 						return this.deferDiskChangedWrite(path, "initial-read");
 					}
+					const atomicExpectedDiskSnapshot = expectedDiskSnapshot;
 					if (this.shouldBlockFrontmatterWrite(path, currentContent, content)) {
 						return { kind: "blocked", path: normalized, reason: "frontmatter" };
 					}
 
 					await this.suppressWrite(path, content);
+					if (!this.isCallerAuthorityCurrent(path, options, "before-commit", "post-suppress")) {
+						this.suppressedPaths.delete(normalized);
+						return this.deferCallerAuthorityStale(path, "post-suppress", options);
+					}
 					if (!this.isExactDiskFileCurrent(normalized, existing)) {
 						this.suppressedPaths.delete(normalized);
 						return this.deferDiskChangedWrite(path, "post-suppress-file-identity");
@@ -880,7 +1057,13 @@ export class DiskMirror {
 						this.suppressedPaths.delete(normalized);
 						continue;
 					}
-					const preModifyDefer = this.getOpenWriteDeferral(path, content, force, "pre-modify");
+					const preModifyDefer = this.getOpenWriteDeferral(
+						path,
+						content,
+						force,
+						"pre-modify",
+						options,
+					);
 					if (preModifyDefer) {
 						this.suppressedPaths.delete(normalized);
 						return preModifyDefer;
@@ -896,6 +1079,7 @@ export class DiskMirror {
 					).process;
 					let processOpenDefer: DiskWriteResult | null = null;
 					if (typeof atomicProcess === "function") {
+						let committedDiskRevision: DiskFileRevision | undefined;
 						try {
 							await atomicProcess.call(this.app.vault, existing, (latestDiskContent) => {
 								if (this.isPreservedUnresolved(normalized)) {
@@ -910,7 +1094,7 @@ export class DiskMirror {
 								if (latestDiskContent === content) {
 									throw new ExistingFileWriteAborted("already-current");
 								}
-								if (latestDiskContent !== expectedDiskSnapshot) {
+								if (!rawContentMatchesVaultReadSnapshot(latestDiskContent, atomicExpectedDiskSnapshot)) {
 									throw new ExistingFileWriteAborted("disk-changed");
 								}
 								if (this.vaultSync.getTextForPath(path)?.toJSON() !== content) {
@@ -924,9 +1108,18 @@ export class DiskMirror {
 									content,
 									force,
 									"atomic-process",
+									options,
 								);
 								if (processOpenDefer) {
 									throw new ExistingFileWriteAborted("open-write-deferred");
+								}
+								if (!this.isCallerAuthorityCurrent(
+									path,
+									options,
+									"before-commit",
+									"atomic-process",
+								)) {
+									throw new ExistingFileWriteAborted("authority-stale");
 								}
 								return content;
 							});
@@ -956,6 +1149,9 @@ export class DiskMirror {
 							if (err.reason === "open-write-deferred" && processOpenDefer) {
 								return processOpenDefer;
 							}
+							if (err.reason === "authority-stale") {
+								return this.deferCallerAuthorityStale(path, "atomic-process", options);
+							}
 							continue;
 						}
 						if (!this.isExactDiskFileCurrent(normalized, existing)) {
@@ -966,6 +1162,63 @@ export class DiskMirror {
 							this.suppressedPaths.delete(normalized);
 							return this.blockPreservedUnresolvedWrite(normalized, "post-atomic-process");
 						}
+						if (!this.isCallerAuthorityCurrent(path, options, "after-commit", "post-atomic-process")) {
+							this.suppressedPaths.delete(normalized);
+							return this.deferCallerAuthorityStale(path, "post-atomic-process", options);
+						}
+						committedDiskRevision = this.captureDiskFileRevision(existing);
+						this.log(`flushWrite: updated "${path}" (${content.length} chars)`);
+						const contentHash = await contentBaselineHash(content);
+						if (!this.isCallerAuthorityCurrent(path, options, "after-commit", "post-write-hash")) {
+							this.suppressedPaths.delete(normalized);
+							return this.deferCallerAuthorityStale(path, "post-write-hash", options);
+						}
+						if (this.isPreservedUnresolved(normalized)) {
+							this.suppressedPaths.delete(normalized);
+							return this.blockPreservedUnresolvedWrite(normalized, "post-write-hash");
+						}
+						if (!this.isExactDiskFileCurrent(normalized, existing)) {
+							this.suppressedPaths.delete(normalized);
+							return this.deferDiskChangedWrite(path, "post-write-hash-file-identity");
+						}
+						if (!(await this.isSettledDiskSnapshotCurrent(
+							normalized,
+							existing,
+							content,
+							ytext,
+							"post-write-hash",
+							committedDiskRevision,
+						))) {
+							this.suppressedPaths.delete(normalized);
+							return this.deferDiskChangedWrite(path, "post-write-readback");
+						}
+						if (!this.isCallerAuthorityCurrent(path, options, "after-commit", "pre-written-settlement")) {
+							this.suppressedPaths.delete(normalized);
+							return this.deferCallerAuthorityStale(path, "pre-written-settlement", options);
+						}
+						this.lastDiskWriteOkAt.set(normalized, Date.now());
+						const baselineRecorded = options.recordBaseline !== false;
+						if (baselineRecorded) {
+							this._onDiskWriteCallback?.(normalized, contentHash, content);
+						}
+						this._flightEventHandler?.({
+							priority: "important",
+							kind: "disk.write.ok",
+							severity: "info",
+							scope: "file",
+							source: "diskMirror",
+							layer: "disk",
+							path: normalized,
+							data: { contentLength: content.length, isCreate: false, baselineRecorded },
+						});
+						return {
+							kind: "written",
+							path: normalized,
+							isCreate: false,
+							content,
+							contentHash,
+							baselineRecorded,
+						};
 					} else {
 						// A final read followed by Vault.modify is still a TOCTOU window. If
 						// a host cannot provide Vault.process, refusing the write is the only
@@ -974,49 +1227,6 @@ export class DiskMirror {
 						this.suppressedPaths.delete(normalized);
 						return this.deferDiskChangedWrite(path, "atomic-process-unavailable");
 					}
-					this.log(`flushWrite: updated "${path}" (${content.length} chars)`);
-					const contentHash = await contentBaselineHash(content);
-					if (this.isPreservedUnresolved(normalized)) {
-						this.suppressedPaths.delete(normalized);
-						return this.blockPreservedUnresolvedWrite(normalized, "post-write-hash");
-					}
-					if (!this.isExactDiskFileCurrent(normalized, existing)) {
-						this.suppressedPaths.delete(normalized);
-						return this.deferDiskChangedWrite(path, "post-write-hash-file-identity");
-					}
-					if (!(await this.isSettledDiskSnapshotCurrent(
-						normalized,
-						existing,
-						content,
-						ytext,
-						"post-write-hash",
-					))) {
-						this.suppressedPaths.delete(normalized);
-						return this.deferDiskChangedWrite(path, "post-write-readback");
-					}
-					this.lastDiskWriteOkAt.set(normalized, Date.now());
-					const baselineRecorded = options.recordBaseline !== false;
-					if (baselineRecorded) {
-						this._onDiskWriteCallback?.(normalized, contentHash, content);
-					}
-					this._flightEventHandler?.({
-						priority: "important",
-						kind: "disk.write.ok",
-						severity: "info",
-						scope: "file",
-						source: "diskMirror",
-						layer: "disk",
-						path: normalized,
-						data: { contentLength: content.length, isCreate: false, baselineRecorded },
-					});
-					return {
-						kind: "written",
-						path: normalized,
-						isCreate: false,
-						content,
-						contentHash,
-						baselineRecorded,
-					};
 				} else {
 					const hasExplicitCreateAuthority =
 						options.allowCreateIfMissing === true ||
@@ -1045,8 +1255,38 @@ export class DiskMirror {
 						const dirExists =
 							this.app.vault.getAbstractFileByPath(normalizePath(dir));
 						if (!dirExists) {
-							await this.app.vault.createFolder(dir);
+							if (!this.isCallerAuthorityCurrent(
+								path,
+								options,
+								"before-commit",
+								"pre-create-folder",
+							)) {
+								return this.deferCallerAuthorityStale(
+									path,
+									"pre-create-folder",
+									options,
+								);
+							}
+							const releaseProjectionCommit =
+								this.enterRemoteProjectionCriticalSection(
+									options.remoteProjectionAdmission,
+								);
+							if (!releaseProjectionCommit) {
+								return this.deferCallerAuthorityStale(
+									path,
+									"pre-create-folder-critical-section",
+									options,
+								);
+							}
+							try {
+								await this.app.vault.createFolder(dir);
+							} finally {
+								releaseProjectionCommit();
+							}
 						}
+					}
+					if (!this.isCallerAuthorityCurrent(path, options, "before-commit", "post-create-folder")) {
+						return this.deferCallerAuthorityStale(path, "post-create-folder", options);
 					}
 					if (this.app.vault.getAbstractFileByPath(normalized)) {
 						this.remoteCreateAuthorizations.delete(normalized);
@@ -1057,11 +1297,21 @@ export class DiskMirror {
 					if (this.isPreservedUnresolved(normalized)) {
 						return this.blockPreservedUnresolvedWrite(normalized, "post-create-folder");
 					}
-					const preCreateDefer = this.getOpenWriteDeferral(path, content, force, "pre-create");
+					const preCreateDefer = this.getOpenWriteDeferral(
+						path,
+						content,
+						force,
+						"pre-create",
+						options,
+					);
 					if (preCreateDefer) {
 						return preCreateDefer;
 					}
 					await this.suppressWrite(path, content);
+					if (!this.isCallerAuthorityCurrent(path, options, "before-commit", "post-suppress-create")) {
+						this.suppressedPaths.delete(normalized);
+						return this.deferCallerAuthorityStale(path, "post-suppress-create", options);
+					}
 					if (this.isPreservedUnresolved(normalized)) {
 						this.suppressedPaths.delete(normalized);
 						return this.blockPreservedUnresolvedWrite(normalized, "post-suppress-create");
@@ -1070,7 +1320,13 @@ export class DiskMirror {
 						this.suppressedPaths.delete(normalized);
 						continue;
 					}
-					const preCreateWriteDefer = this.getOpenWriteDeferral(path, content, force, "pre-create-write");
+					const preCreateWriteDefer = this.getOpenWriteDeferral(
+						path,
+						content,
+						force,
+						"pre-create-write",
+						options,
+					);
 					if (preCreateWriteDefer) {
 						this.suppressedPaths.delete(normalized);
 						return preCreateWriteDefer;
@@ -1085,7 +1341,32 @@ export class DiskMirror {
 							this.suppressedPaths.delete(normalized);
 							return this.blockPreservedUnresolvedWrite(normalized, "pre-create-commit");
 						}
-						createdFile = await this.app.vault.create(normalized, content);
+						if (!this.isCallerAuthorityCurrent(path, options, "before-commit", "pre-create-commit")) {
+							this.suppressedPaths.delete(normalized);
+							return this.deferCallerAuthorityStale(path, "pre-create-commit", options);
+						}
+						const releaseProjectionCommit =
+							this.enterRemoteProjectionCriticalSection(
+								options.remoteProjectionAdmission,
+							);
+						if (!releaseProjectionCommit) {
+							this.suppressedPaths.delete(normalized);
+							return this.deferCallerAuthorityStale(
+								path,
+								"pre-create-critical-section",
+								options,
+							);
+						}
+						try {
+							createdFile = await this.app.vault.create(normalized, content);
+						} finally {
+							releaseProjectionCommit();
+						}
+						// The one-shot semantic create intent is consumed by the physical
+						// create itself, not by later baseline settlement. From this point on,
+						// an authority/readback deferral must not leave permission that could
+						// resurrect a subsequent local delete on an ordinary retry.
+						this.remoteCreateAuthorizations.delete(normalized);
 					} catch (createError) {
 						// Vault.create is a no-clobber operation. If a local file won the
 						// race after our last existence check, classify that state instead of
@@ -1124,11 +1405,19 @@ export class DiskMirror {
 						}
 						throw createError;
 					}
-					this.remoteCreateAuthorizations.delete(normalized);
+					if (!this.isCallerAuthorityCurrent(path, options, "after-commit", "post-create")) {
+						this.suppressedPaths.delete(normalized);
+						return this.deferCallerAuthorityStale(path, "post-create", options);
+					}
+					const committedDiskRevision = this.captureDiskFileRevision(createdFile);
 					this.log(
 						`flushWrite: created "${path}" on disk (${content.length} chars)`,
 					);
 					const contentHash = await contentBaselineHash(content);
+					if (!this.isCallerAuthorityCurrent(path, options, "after-commit", "post-create-hash")) {
+						this.suppressedPaths.delete(normalized);
+						return this.deferCallerAuthorityStale(path, "post-create-hash", options);
+					}
 					if (this.isPreservedUnresolved(normalized)) {
 						this.suppressedPaths.delete(normalized);
 						return this.blockPreservedUnresolvedWrite(normalized, "post-create-hash");
@@ -1139,9 +1428,14 @@ export class DiskMirror {
 						content,
 						ytext,
 						"post-create-hash",
+						committedDiskRevision,
 					))) {
 						this.suppressedPaths.delete(normalized);
 						return this.deferDiskChangedWrite(path, "post-create-readback");
+					}
+					if (!this.isCallerAuthorityCurrent(path, options, "after-commit", "pre-create-settlement")) {
+						this.suppressedPaths.delete(normalized);
+						return this.deferCallerAuthorityStale(path, "pre-create-settlement", options);
 					}
 					this.lastDiskWriteOkAt.set(normalized, Date.now());
 					const baselineRecorded = options.recordBaseline !== false;
@@ -1186,7 +1480,11 @@ export class DiskMirror {
 
 		this.log(`flushWrite: deferred "${path}" (CRDT changed repeatedly during write preparation)`);
 		if (!force) {
-			this.scheduleWrite(path);
+			if (options.requireRemoteProjectionAdmission === true) {
+				this.scheduleRemoteWrite(path);
+			} else {
+				this.scheduleWrite(path);
+			}
 		}
 		return { kind: "deferred", path: normalized, reason: "crdt-changed-during-write" };
 	}
@@ -1202,6 +1500,9 @@ export class DiskMirror {
 		if (this.isPreservedUnresolved(normalized)) {
 			return this.blockPreservedUnresolvedWrite(normalized, "unchanged-pre-hash");
 		}
+		if (!this.isCallerAuthorityCurrent(path, options, "before-commit", "unchanged-pre-hash")) {
+			return this.deferCallerAuthorityStale(path, "unchanged-pre-hash", options);
+		}
 		if (!this.isExactDiskFileCurrent(normalized, expectedFile)) {
 			return this.deferDiskChangedWrite(path, "unchanged-file-identity");
 		}
@@ -1209,6 +1510,9 @@ export class DiskMirror {
 			return this.deferDiskChangedWrite(path, "unchanged-file-revision");
 		}
 		const contentHash = await contentBaselineHash(content);
+		if (!this.isCallerAuthorityCurrent(path, options, "before-commit", "unchanged-post-hash")) {
+			return this.deferCallerAuthorityStale(path, "unchanged-post-hash", options);
+		}
 		if (this.isPreservedUnresolved(normalized)) {
 			return this.blockPreservedUnresolvedWrite(normalized, "unchanged-post-hash");
 		}
@@ -1228,6 +1532,14 @@ export class DiskMirror {
 		);
 		if (!settled) {
 			return this.deferDiskChangedWrite(path, "post-unchanged-readback");
+		}
+		if (!this.isCallerAuthorityCurrent(
+			path,
+			options,
+			"before-commit",
+			"pre-unchanged-settlement",
+		)) {
+			return this.deferCallerAuthorityStale(path, "pre-unchanged-settlement", options);
 		}
 		// isSettledDiskSnapshotCurrent itself awaits a read. Recheck synchronously
 		// in its caller so a same-TFile save queued by that read cannot enter the
@@ -1313,6 +1625,14 @@ export class DiskMirror {
 			&& this.app.vault.getAbstractFileByPath(normalized) === expected;
 	}
 
+	private captureDiskFileRevision(file: TFile): DiskFileRevision {
+		return {
+			ctime: file.stat.ctime,
+			mtime: file.stat.mtime,
+			size: file.stat.size,
+		};
+	}
+
 	private isDiskRevisionCurrent(
 		file: TFile,
 		expected: DiskFileRevision | undefined,
@@ -1335,6 +1655,96 @@ export class DiskMirror {
 			reason: "disk-changed-during-write",
 		});
 		return { kind: "deferred", path: normalized, reason: "disk-changed-during-write" };
+	}
+
+	private isCallerAuthorityCurrent(
+		path: string,
+		options: DiskWriteOptions,
+		phase: DiskWriteAuthorityPhase,
+		boundary: string,
+	): boolean {
+		if (
+			options.remoteProjectionAdmission &&
+			!this.isRemoteProjectionAdmissionCurrent(options.remoteProjectionAdmission)
+		) {
+			this.trace?.("disk", "remote-projection-admission-stale", {
+				path: normalizePath(path),
+				phase,
+				boundary,
+			});
+			return false;
+		}
+		if (!options.isAuthorityCurrent) return true;
+		let current = false;
+		try {
+			current = options.isAuthorityCurrent(phase) === true;
+		} catch {
+			current = false;
+		}
+		if (!current) {
+			this.trace?.("disk", "disk-write-authority-stale", {
+				path: normalizePath(path),
+				phase,
+				boundary,
+				reason: "authority-stale",
+			});
+		}
+		return current;
+	}
+
+	private deferCallerAuthorityStale(
+		path: string,
+		boundary: string,
+		options?: DiskWriteOptions,
+	): DiskWriteResult {
+		const normalized = normalizePath(path);
+		if (
+			options?.remoteProjectionAdmission &&
+			!this.isRemoteProjectionAdmissionCurrent(options.remoteProjectionAdmission)
+		) {
+			this.log(
+				`flushWrite: deferred "${normalized}" because provider admission expired (${boundary})`,
+			);
+			return {
+				kind: "deferred",
+				path: normalized,
+				reason: "remote-projection-not-ready",
+			};
+		}
+		this.log(`flushWrite: deferred "${normalized}" because caller authority expired (${boundary})`);
+		return { kind: "deferred", path: normalized, reason: "authority-stale" };
+	}
+
+	private isRemoteProjectionAdmissionCurrent(
+		admission: RemoteProjectionAdmissionLease,
+	): boolean {
+		try {
+			return admission.isCurrent() === true;
+		} catch {
+			return false;
+		}
+	}
+
+	private enterRemoteProjectionCriticalSection(
+		admission: RemoteProjectionAdmissionLease | undefined,
+	): (() => void) | null {
+		if (!admission) return () => {};
+		if (!this.isRemoteProjectionAdmissionCurrent(admission)) return null;
+		if (!admission.enterCriticalSection) return () => {};
+		try {
+			return admission.enterCriticalSection();
+		} catch {
+			return null;
+		}
+	}
+
+	private retainRemoteProjectionAdmission(
+		path: string,
+		options: DiskWriteOptions,
+	): void {
+		const admission = options.remoteProjectionAdmission;
+		if (!admission) return;
+		this.remoteProjectionWriteAdmissions.set(normalizePath(path), admission);
 	}
 
 	private blockPreservedUnresolvedWrite(path: string, phase: string): DiskWriteResult {
@@ -1374,6 +1784,7 @@ export class DiskMirror {
 		content: string,
 		force: boolean,
 		phase: string,
+		options: DiskWriteOptions,
 	): DiskWriteResult | null {
 		const normalized = normalizePath(path);
 		const isOpenOrViewed = this.openPaths.has(path) || this.isOpenInWorkspace(path);
@@ -1385,6 +1796,7 @@ export class DiskMirror {
 				`(open editor differs from CRDT, phase=${phase})`,
 			);
 			if (!force) {
+				this.retainRemoteProjectionAdmission(path, options);
 				this.scheduleOpenWrite(path);
 			}
 			return { kind: "deferred", path: normalized, reason: "open-editor-mismatch" };
@@ -1400,11 +1812,13 @@ export class DiskMirror {
 				`flushWrite: deferring open "${path}" ` +
 				`(active editor has unflushed changes, phase=${phase})`,
 			);
+			this.retainRemoteProjectionAdmission(path, options);
 			this.scheduleOpenWrite(path);
 			return { kind: "deferred", path: normalized, reason: "active-editor-unflushed" };
 		}
 		if (this.hasRecentEditorActivity(path)) {
 			this.log(`flushWrite: deferring open "${path}" (recent editor activity, phase=${phase})`);
+			this.retainRemoteProjectionAdmission(path, options);
 			this.scheduleOpenWrite(path);
 			return { kind: "deferred", path: normalized, reason: "recent-editor-activity" };
 		}
@@ -1479,8 +1893,14 @@ export class DiskMirror {
 	private async handleRemoteDelete(
 		path: string,
 		options: { baselineText?: string | null } = {},
+		admission: RemoteProjectionAdmissionLease | null =
+			this.captureRemoteProjectionAdmission([path]),
 	): Promise<void> {
 		const normalized = normalizePath(path);
+		if (!admission || !this.isRemoteProjectionAdmissionCurrent(admission)) {
+			this.log(`remote delete: policy not ready for "${normalized}"`);
+			return;
+		}
 		if (!this.isMarkdownPathSyncable(normalized)) {
 			this.log(`remote delete: skipping excluded path "${normalized}"`);
 			return;
@@ -1501,6 +1921,7 @@ export class DiskMirror {
 			options,
 			deleteGeneration,
 			expectedDeleteFingerprint,
+			admission,
 		));
 	}
 
@@ -1509,12 +1930,14 @@ export class DiskMirror {
 		options: { baselineText?: string | null },
 		deleteGeneration: number,
 		expectedDeleteFingerprint: string,
+		admission: RemoteProjectionAdmissionLease,
 	): Promise<void> {
 		const normalized = normalizePath(path);
 		if (!this.isRemoteDeleteOperationCurrent(
 			normalized,
 			deleteGeneration,
 			expectedDeleteFingerprint,
+			admission,
 		)) {
 			this.traceStaleRemoteDeleteCancellation(
 				normalized,
@@ -1532,6 +1955,7 @@ export class DiskMirror {
 			normalized,
 			deleteGeneration,
 			expectedDeleteFingerprint,
+			admission,
 		)) {
 			this.traceStaleRemoteDeleteCancellation(
 				normalized,
@@ -1682,6 +2106,7 @@ export class DiskMirror {
 							normalized,
 							deleteGeneration,
 							expectedDeleteFingerprint,
+							admission,
 						)) {
 							this.traceStaleRemoteDeleteCancellation(
 								normalized,
@@ -1754,6 +2179,7 @@ export class DiskMirror {
 						normalized,
 						deleteGeneration,
 						expectedDeleteFingerprint,
+						admission,
 					)) {
 						this.traceStaleRemoteDeleteCancellation(
 							normalized,
@@ -1796,11 +2222,13 @@ export class DiskMirror {
 										normalized,
 										deleteGeneration,
 										expectedDeleteFingerprint,
+										admission,
 									)) return false;
 									return phase === "before"
 										? this.isExactDiskFileCurrent(normalized, fileToDelete)
 										: this.app.vault.getAbstractFileByPath(normalized) === null;
 								},
+								admission,
 							);
 						} catch (deleteErr) {
 							this.suppressedPaths.delete(normalized);
@@ -1836,6 +2264,7 @@ export class DiskMirror {
 							normalized,
 							deleteGeneration,
 							expectedDeleteFingerprint,
+							admission,
 						);
 						const pathAfterTrash = this.app.vault.getAbstractFileByPath(normalized);
 						if (deleteMode === "stale" || !deleteStillCurrent || pathAfterTrash !== null) {
@@ -1855,7 +2284,7 @@ export class DiskMirror {
 									);
 								}
 							} else if (this.getAuthoritativeMarkdownDeleteFingerprint(normalized) === null) {
-								this.scheduleWrite(normalized);
+								this.scheduleRemoteWrite(normalized);
 							}
 							this.traceStaleRemoteDeleteCancellation(
 								normalized,
@@ -1874,6 +2303,7 @@ export class DiskMirror {
 						this.pendingOpenWrites.delete(normalized);
 						this.writeQueue.delete(normalized);
 						this.forcedWritePaths.delete(normalized);
+						this.remoteProjectionWriteAdmissions.delete(normalized);
 						for (const timers of [this.debounceTimers, this.openWriteTimers]) {
 							const timer = timers.get(normalized);
 							if (timer) clearTimeout(timer);
@@ -1941,6 +2371,7 @@ export class DiskMirror {
 								normalized,
 								deleteGeneration,
 								expectedDeleteFingerprint,
+								admission,
 							)) {
 								throw new Error("remote delete episode changed before dirty revival");
 							}
@@ -2015,6 +2446,7 @@ export class DiskMirror {
 						this.pendingOpenWrites.delete(normalized);
 						this.writeQueue.delete(normalized);
 						this.forcedWritePaths.delete(normalized);
+						this.remoteProjectionWriteAdmissions.delete(normalized);
 						const pending = this.debounceTimers.get(normalized);
 						if (pending) {
 							clearTimeout(pending);
@@ -2040,10 +2472,22 @@ export class DiskMirror {
 		}
 	}
 
-	private async handleRemoteRename(fileId: string, oldPath: string, newPath: string): Promise<void> {
+	private async handleRemoteRename(
+		fileId: string,
+		oldPath: string,
+		newPath: string,
+		admission: RemoteProjectionAdmissionLease | null =
+			this.captureRemoteProjectionAdmission([oldPath, newPath]),
+	): Promise<void> {
 		const oldNormalized = normalizePath(oldPath);
 		const newNormalized = normalizePath(newPath);
 		if (oldNormalized === newNormalized) return;
+		if (!admission || !this.isRemoteProjectionAdmissionCurrent(admission)) {
+			this.log(
+				`remote rename: policy not ready for "${oldNormalized}" -> "${newNormalized}"`,
+			);
+			return;
+		}
 		if (!this.isMarkdownPathSyncable(oldNormalized) || !this.isMarkdownPathSyncable(newNormalized)) {
 			this.log(`remote rename: skipping excluded path "${oldNormalized}" -> "${newNormalized}"`);
 			return;
@@ -2063,7 +2507,8 @@ export class DiskMirror {
 				: null;
 			const isIntentCurrent = (): boolean => {
 				const currentMeta = this.vaultSync.meta.get(fileId);
-				return !!currentMeta &&
+				return this.isRemoteProjectionAdmissionCurrent(admission) &&
+					!!currentMeta &&
 					!isFileMetaDeletedValue(currentMeta) &&
 					normalizePath(getMetaPath(currentMeta) ?? "") === newNormalized;
 			};
@@ -2168,7 +2613,14 @@ export class DiskMirror {
 					if (!isIntentCurrent()) return;
 					const dir = newNormalized.substring(0, newNormalized.lastIndexOf("/"));
 					if (dir && !this.app.vault.getAbstractFileByPath(normalizePath(dir))) {
-						await this.app.vault.createFolder(dir);
+						const releaseProjectionCommit =
+							this.enterRemoteProjectionCriticalSection(admission);
+						if (!releaseProjectionCommit) return;
+						try {
+							await this.app.vault.createFolder(dir);
+						} finally {
+							releaseProjectionCommit();
+						}
 					}
 					if (!isIntentCurrent()) return;
 					const finalSource = this.app.vault.getAbstractFileByPath(oldNormalized);
@@ -2192,7 +2644,21 @@ export class DiskMirror {
 						newPath: newNormalized,
 						file: finalSource,
 					});
-					await this.app.fileManager.renameFile(finalSource, newNormalized);
+					const releaseProjectionCommit =
+						this.enterRemoteProjectionCriticalSection(admission);
+					if (!releaseProjectionCommit) {
+						this.retirePendingRemoteRename(
+							oldNormalized,
+							newNormalized,
+							finalSource,
+						);
+						return;
+					}
+					try {
+						await this.app.fileManager.renameFile(finalSource, newNormalized);
+					} finally {
+						releaseProjectionCommit();
+					}
 					// Obsidian emits the matching vault event while renameFile is in
 					// flight. If it did not, retire the token now; carrying it into a
 					// later user operation would be unsafe.
@@ -2255,8 +2721,7 @@ export class DiskMirror {
 			this.log(`handleRemoteRename: "${oldNormalized}" -> "${newNormalized}"`);
 			if (scheduleTargetWrite) {
 				if (authorizeTargetCreate) this.authorizeRemoteCreate(newNormalized);
-				if (wasOpen) this.scheduleOpenWrite(newNormalized);
-				else this.scheduleWrite(newNormalized);
+				this.scheduleRemoteWrite(newNormalized);
 			}
 		});
 	}
@@ -2278,6 +2743,7 @@ export class DiskMirror {
 		}
 		this.writeQueue.delete(oldPath);
 		this.forcedWritePaths.delete(oldPath);
+		this.remoteProjectionWriteAdmissions.delete(oldPath);
 		this.remoteCreateAuthorizations.delete(oldPath);
 		this.unobserveText(oldPath);
 		this.editorBindings.updatePathsAfterRename(new Map([[oldPath, newPath]]));
@@ -2337,6 +2803,7 @@ export class DiskMirror {
 	private async deleteLocalReplica(
 		file: TFile,
 		isExactDeleteCurrent: (phase: "before" | "after") => boolean = () => true,
+		admission?: RemoteProjectionAdmissionLease,
 	): Promise<"trash" | "stale"> {
 		const failures: string[] = [];
 		const fileManager = (this.app as unknown as {
@@ -2346,6 +2813,9 @@ export class DiskMirror {
 		}).fileManager;
 		if (fileManager?.trashFile) {
 			if (!isExactDeleteCurrent("before")) return "stale";
+			const releaseProjectionCommit =
+				this.enterRemoteProjectionCriticalSection(admission);
+			if (!releaseProjectionCommit) return "stale";
 			try {
 				await fileManager.trashFile(file, true);
 				return isExactDeleteCurrent("after") ? "trash" : "stale";
@@ -2356,6 +2826,8 @@ export class DiskMirror {
 				if (isExactDeleteCurrent("after")) return "trash";
 				if (!isExactDeleteCurrent("before")) return "stale";
 				failures.push(`fileManager.trashFile: ${formatUnknown(err)}`);
+			} finally {
+				releaseProjectionCommit();
 			}
 		} else {
 			failures.push("fileManager.trashFile: unavailable");
@@ -2367,6 +2839,9 @@ export class DiskMirror {
 		).trash;
 		if (typeof vaultTrash === "function") {
 			if (!isExactDeleteCurrent("before")) return "stale";
+			const releaseProjectionCommit =
+				this.enterRemoteProjectionCriticalSection(admission);
+			if (!releaseProjectionCommit) return "stale";
 			try {
 				await vaultTrash.call(this.app.vault, file, false);
 				return isExactDeleteCurrent("after") ? "trash" : "stale";
@@ -2374,6 +2849,8 @@ export class DiskMirror {
 				if (isExactDeleteCurrent("after")) return "trash";
 				if (!isExactDeleteCurrent("before")) return "stale";
 				failures.push(`vault.trash: ${formatUnknown(err)}`);
+			} finally {
+				releaseProjectionCommit();
 			}
 		} else {
 			failures.push("vault.trash: unavailable");
@@ -2412,7 +2889,10 @@ export class DiskMirror {
 	): Promise<string | null> {
 		if (!this.isObservedDiskRevisionCurrent(file, revision)) return null;
 		try {
-			const content = await this.app.vault.read(file);
+			// Vault.read is a document API and strips a UTF-8 BOM. The modify-event
+			// proof needs the exact disk representation so byte-size validation and
+			// conflict preservation remain lossless for BOM/mixed-EOL files.
+			const content = await this.app.vault.adapter.read(file.path);
 			if (!this.isObservedDiskRevisionCurrent(file, revision)) return null;
 			if (
 				revision.size !== null &&
@@ -2475,8 +2955,25 @@ export class DiskMirror {
 		return this.shouldSuppressWriteEvent(file, "create");
 	}
 
-	async suppressLocalCreate(path: string, content: string): Promise<void> {
-		await this.suppressWrite(path, content);
+	async suppressLocalCreate(
+		path: string,
+		content: string,
+	): Promise<LocalCreateSuppressionHandle> {
+		return this.suppressWrite(path, content);
+	}
+
+	rollbackLocalCreateSuppression(handle: LocalCreateSuppressionHandle): boolean {
+		const normalized = normalizePath(handle.path);
+		let rolledBack = false;
+		if (this.suppressedPaths.get(normalized)?.token === handle.token) {
+			this.suppressedPaths.delete(normalized);
+			rolledBack = true;
+		}
+		if (this.recentWriteFingerprints.get(normalized)?.token === handle.token) {
+			this.recentWriteFingerprints.delete(normalized);
+			rolledBack = true;
+		}
+		return rolledBack;
 	}
 
 	consumeDeleteSuppression(path: string): boolean {
@@ -2604,6 +3101,7 @@ export class DiskMirror {
 		this.pendingOpenWrites.delete(normalized);
 		this.writeQueue.delete(normalized);
 		this.forcedWritePaths.delete(normalized);
+		this.remoteProjectionWriteAdmissions.delete(normalized);
 		this.remoteCreateAuthorizations.delete(normalized);
 		for (const timers of [this.debounceTimers, this.openWriteTimers]) {
 			const timer = timers.get(normalized);
@@ -2687,9 +3185,11 @@ export class DiskMirror {
 		path: string,
 		generation: number,
 		expectedFingerprint: string,
+		admission: RemoteProjectionAdmissionLease,
 	): boolean {
 		const normalized = normalizePath(path);
-		return this.remoteDeleteGenerations.get(normalized) === generation
+		return this.isRemoteProjectionAdmissionCurrent(admission)
+			&& this.remoteDeleteGenerations.get(normalized) === generation
 			&& this.getAuthoritativeMarkdownDeleteFingerprint(normalized) === expectedFingerprint;
 	}
 
@@ -2828,7 +3328,18 @@ export class DiskMirror {
 		this.openWriteTimers.clear();
 		this.pendingOpenWrites.clear();
 		if (openPending.size > 0) {
-			await Promise.all([...openPending].map((p) => this.flushWrite(p, true)));
+			await Promise.all([...openPending].map((p) => {
+				const remoteProjectionAdmission =
+					this.remoteProjectionWriteAdmissions.get(p);
+				if (remoteProjectionAdmission) {
+					this.remoteProjectionWriteAdmissions.delete(p);
+				}
+				return this.flushWrite(p, true, {
+					requireRemoteProjectionAdmission:
+						remoteProjectionAdmission !== undefined,
+					remoteProjectionAdmission,
+				});
+			}));
 		}
 
 		// 2. Also flush anything sitting in the debounce timer queue (those
@@ -2866,7 +3377,16 @@ export class DiskMirror {
 			pendingFinalWrites.add(path);
 		}
 		for (const path of pendingFinalWrites) {
-			void this.flushWrite(path, true);
+			const remoteProjectionAdmission =
+				this.remoteProjectionWriteAdmissions.get(path);
+			if (remoteProjectionAdmission) {
+				this.remoteProjectionWriteAdmissions.delete(path);
+			}
+			void this.flushWrite(path, true, {
+				requireRemoteProjectionAdmission:
+					remoteProjectionAdmission !== undefined,
+				remoteProjectionAdmission,
+			});
 		}
 
 		for (const cleanup of this.mapObserverCleanups) {
@@ -2892,6 +3412,7 @@ export class DiskMirror {
 		this.pendingOpenWrites.clear();
 		this.openPaths.clear();
 		this.forcedWritePaths.clear();
+		this.remoteProjectionWriteAdmissions.clear();
 		this.suppressedPaths.clear();
 		this.preservedUnresolved.clear();
 		this.pathWriteLocks.clear();
@@ -3048,21 +3569,27 @@ export class DiskMirror {
 		return null;
 	}
 
-	private async suppressWrite(path: string, content: string): Promise<void> {
+	private async suppressWrite(
+		path: string,
+		content: string,
+	): Promise<LocalCreateSuppressionHandle> {
 		// Record the exact content we wrote so vault modify/create events can
 		// acknowledge our own write by observed state, not just timing.
 		const fingerprint = await this.fingerprintContent(content);
-		this.suppressedPaths.set(normalizePath(path), {
+		const normalized = normalizePath(path);
+		const token = Object.freeze({});
+		this.suppressedPaths.set(normalized, {
 			kind: "write",
 			expiresAt: Date.now() + SUPPRESS_MS,
 			expectedBytes: fingerprint.bytes,
 			expectedHash: fingerprint.hash,
+			token,
 		});
-		const normalized = normalizePath(path);
 		const recentFingerprint: RecentWriteFingerprint = {
 			recordedAt: Date.now(),
 			expectedBytes: fingerprint.bytes,
 			expectedHash: fingerprint.hash,
+			token,
 		};
 		this.recentWriteFingerprints.delete(normalized);
 		while (this.recentWriteFingerprints.size >= RECENT_WRITE_FINGERPRINT_MAX_ENTRIES) {
@@ -3071,6 +3598,7 @@ export class DiskMirror {
 			this.recentWriteFingerprints.delete(oldestPath);
 		}
 		this.recentWriteFingerprints.set(normalized, recentFingerprint);
+		return Object.freeze({ path: normalized, token });
 	}
 
 	private suppressDelete(path: string): void {
@@ -3150,7 +3678,7 @@ export class DiskMirror {
 		try {
 			// Read back the file only when a suppression candidate exists. This
 			// keeps the hot path cheap while making self-event detection causal.
-			const content = await this.app.vault.read(file);
+			const content = await this.app.vault.adapter.read(file.path);
 			const fingerprint = await this.fingerprintContent(content);
 			if (
 				fingerprint.bytes === entry.expectedBytes

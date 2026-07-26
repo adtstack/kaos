@@ -1368,6 +1368,13 @@ export class VaultSync {
 		isPathSyncable: (path: string) => boolean = () => true,
 		/** Final synchronous freshness fence for a disk-only seed snapshot. */
 		canSeedSnapshot: (path: string, content: string) => boolean = () => true,
+		/**
+		 * Provider-policy admission for CRDT-to-disk projection only.
+		 *
+		 * This must not be folded into `isPathSyncable`: a closed provider gate
+		 * still permits local disk-only paths to seed into the CRDT.
+		 */
+		isRemoteProjectionAllowed: (path: string) => boolean = () => true,
 	): ReconcileResult {
 		const createdOnDisk: string[] = [];
 		const updatedOnDisk: string[] = [];
@@ -1379,6 +1386,9 @@ export class VaultSync {
 		this.ensurePathIndexes();
 		const crdtPaths = new Set<string>(
 			[...this._pathIndex.keys()].filter((path) => isPathSyncable(path)),
+		);
+		const projectableCrdtPaths = new Set<string>(
+			[...crdtPaths].filter((path) => isRemoteProjectionAllowed(path)),
 		);
 		const activePathCollisionPaths = new Set<string>(
 			[...this._activePathCollisions.keys()].filter((path) => isPathSyncable(path)),
@@ -1393,7 +1403,7 @@ export class VaultSync {
 		// CRDT files not on disk → create on disk
 		// IMPORTANT: use diskPresentPaths (all known disk paths), not
 		// diskFiles (only the subset whose content was read this run).
-		for (const path of crdtPaths) {
+		for (const path of projectableCrdtPaths) {
 			if (!syncableDiskPresentPaths.has(path)) {
 				createdOnDisk.push(path);
 			}
@@ -1404,6 +1414,11 @@ export class VaultSync {
 		// flushed to disk so reopened clients converge reliably.
 		if (mode === "authoritative") {
 			for (const [path, diskContent] of syncableDiskFiles) {
+				// Classify every syncable overlap even while remote projection is
+				// closed. The controller's three-way planner may legitimately choose
+				// disk-to-CRDT import, a clean merge, or conflict preservation. Remote
+				// admission is required only after the planner chooses a physical
+				// CRDT-to-disk mutation.
 				if (!crdtPaths.has(path)) continue;
 				const ytext = this.getTextForPath(path);
 				if (!ytext) continue;

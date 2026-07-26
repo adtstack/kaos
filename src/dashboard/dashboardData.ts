@@ -97,9 +97,25 @@ export function collectDashboardAttention(
 		| "frontmatterQuarantineEntries"
 		| "reconciliationState"
 		| "remoteDeleteResolutionState"
+		| "remoteProjectionPolicyError"
 	>,
 ): DashboardAttentionItem[] {
 	const items: DashboardAttentionItem[] = [];
+	if (input.remoteProjectionPolicyError) {
+		items.push({
+			kind: "remote-projection-policy",
+			title: "Shared exclude policy needs attention",
+			path: null,
+			detail:
+				`${input.remoteProjectionPolicyError}. Local and editor changes remain active; ` +
+				"remote projection remains paused until a valid shared policy syncs.",
+			structuralChange: null,
+			firstSeenAt: null,
+			lastSeenAt: null,
+			tone: "error",
+			resolution: null,
+		});
+	}
 	const structuralPaths = new Set(
 		input.reconciliationState.unresolvedStructuralChangePaths,
 	);
@@ -261,7 +277,10 @@ function buildStructuralChangeTitle(
 export function getDashboardAttentionTotalCount(
 	input: Pick<
 		KaosDashboardCollectorInput,
-		"preservedUnresolvedEntries" | "frontmatterQuarantineEntries" | "reconciliationState"
+		| "preservedUnresolvedEntries"
+		| "frontmatterQuarantineEntries"
+		| "reconciliationState"
+		| "remoteProjectionPolicyError"
 	>,
 ): number {
 	const structuralPaths = new Set(
@@ -274,7 +293,8 @@ export function getDashboardAttentionTotalCount(
 	return standalonePaths.size
 		+ input.frontmatterQuarantineEntries.length
 		+ input.reconciliationState.unresolvedStructuralChangeGroupCount
-		+ input.reconciliationState.blockedDivergenceCount;
+		+ input.reconciliationState.blockedDivergenceCount
+		+ (input.remoteProjectionPolicyError ? 1 : 0);
 }
 
 function getDashboardLocalFileIdentity(

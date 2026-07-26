@@ -32,6 +32,11 @@ interface LineChange {
 	lines: string[];
 }
 
+interface BaseRange {
+	start: number;
+	end: number;
+}
+
 interface EncodedLines {
 	base: string;
 	variant: string;
@@ -54,7 +59,14 @@ export function mergeTexts3(
 	const leftChanges = buildLineChanges(baseLines, leftLines);
 	const rightChanges = buildLineChanges(baseLines, rightLines);
 
-	const conflictRanges = collectConflictRanges(leftChanges, rightChanges);
+	const conflictRanges = mergeBaseRanges([
+		...collectConflictRanges(leftChanges, rightChanges),
+		...collectAmbiguousRepeatedLineAlignmentRanges(
+			baseLines,
+			leftChanges,
+			rightChanges,
+		),
+	]);
 	if (conflictRanges.length === 0) {
 		return {
 			kind: "clean-merge",
@@ -152,24 +164,129 @@ function decodeTokenText(lines: string[], tokenText: string): string[] {
 function collectConflictRanges(
 	leftChanges: LineChange[],
 	rightChanges: LineChange[],
-): Array<{ start: number; end: number }> {
-	const ranges: Array<{ start: number; end: number }> = [];
+): BaseRange[] {
+	const ranges: BaseRange[] = [];
 	for (const left of leftChanges) {
 		for (const right of rightChanges) {
+			// Both variants may already contain the same delta, or one replacement
+			// may structurally subsume the other at the exact same base range. Keep
+			// only the complete textual superset. Empty replacements are excluded
+			// so delete-vs-modify remains a conflict.
+			if (lineChangesCompatible(left, right)) continue;
 			if (!rangesTouch(left, right)) continue;
-			const next = {
+			ranges.push({
 				start: Math.min(left.baseStart, right.baseStart),
 				end: Math.max(left.baseEnd, right.baseEnd),
-			};
-			const last = ranges[ranges.length - 1];
-			if (last && next.start <= last.end) {
-				last.end = Math.max(last.end, next.end);
-			} else {
-				ranges.push(next);
+			});
+		}
+	}
+	return mergeBaseRanges(ranges);
+}
+
+function lineChangesEqual(left: LineChange, right: LineChange): boolean {
+	return left.baseStart === right.baseStart &&
+		left.baseEnd === right.baseEnd &&
+		left.lines.length === right.lines.length &&
+		left.lines.every((line, index) => line === right.lines[index]);
+}
+
+function lineChangesCompatible(left: LineChange, right: LineChange): boolean {
+	return lineChangesEqual(left, right) ||
+		lineChangeStrictlySubsumes(left, right) ||
+		lineChangeStrictlySubsumes(right, left);
+}
+
+function lineChangeStrictlySubsumes(
+	container: LineChange,
+	candidate: LineChange,
+): boolean {
+	if (
+		container.baseStart !== candidate.baseStart ||
+		container.baseEnd !== candidate.baseEnd ||
+		candidate.lines.length === 0 ||
+		container.lines.length <= candidate.lines.length
+	) {
+		return false;
+	}
+	return containsLineSubsequence(container.lines, candidate.lines);
+}
+
+function containsLineSubsequence(container: string[], candidate: string[]): boolean {
+	if (candidate.length === 0) return true;
+	let candidateIndex = 0;
+	for (const line of container) {
+		if (line !== candidate[candidateIndex]) continue;
+		candidateIndex++;
+		if (candidateIndex === candidate.length) return true;
+	}
+	return false;
+}
+
+function collectAmbiguousRepeatedLineAlignmentRanges(
+	baseLines: string[],
+	leftChanges: LineChange[],
+	rightChanges: LineChange[],
+): BaseRange[] {
+	const ranges: BaseRange[] = [];
+	for (const left of leftChanges) {
+		for (const right of rightChanges) {
+			const bridgeRange = baseBridgeRangeBetween(left, right);
+			if (!bridgeRange) continue;
+			const bridge = baseLines.slice(bridgeRange.start, bridgeRange.end);
+			if (
+				containsLineSubsequence(left.lines, bridge) &&
+				containsLineSubsequence(right.lines, bridge)
+			) {
+				ranges.push({
+					start: Math.min(left.baseStart, right.baseStart),
+					end: Math.max(left.baseEnd, right.baseEnd),
+				});
 			}
 		}
 	}
-	return ranges;
+	return mergeBaseRanges(ranges);
+}
+
+function baseBridgeRangeBetween(
+	left: LineChange,
+	right: LineChange,
+): BaseRange | null {
+	if (left.baseEnd < right.baseStart) {
+		return { start: left.baseEnd, end: right.baseStart };
+	}
+	if (right.baseEnd < left.baseStart) {
+		return { start: right.baseEnd, end: left.baseStart };
+	}
+	return null;
+}
+
+function mergeBaseRanges(ranges: BaseRange[]): BaseRange[] {
+	const sorted = ranges
+		.map((range) => ({ ...range }))
+		.sort((left, right) => left.start - right.start || left.end - right.end);
+	const merged: BaseRange[] = [];
+	for (const range of sorted) {
+		const last = merged[merged.length - 1];
+		if (last && range.start <= last.end) {
+			last.end = Math.max(last.end, range.end);
+		} else {
+			merged.push(range);
+		}
+	}
+	return merged;
+}
+
+function combineDistinctChanges(
+	leftChanges: LineChange[],
+	rightChanges: LineChange[],
+): LineChange[] {
+	const candidates = [...leftChanges, ...rightChanges];
+	return candidates.filter((candidate, index) => {
+		if (candidates.some((other) => lineChangeStrictlySubsumes(other, candidate))) {
+			return false;
+		}
+		return candidates.findIndex((other) => lineChangesEqual(other, candidate)) === index;
+	});
 }
 
 function rangesTouch(left: LineChange, right: LineChange): boolean {
@@ -181,7 +298,7 @@ function applyNonConflictingChanges(
 	leftChanges: LineChange[],
 	rightChanges: LineChange[],
 ): string {
-	const changes = [...leftChanges, ...rightChanges]
+	const changes = combineDistinctChanges(leftChanges, rightChanges)
 		.sort((a, b) => a.baseStart - b.baseStart || a.baseEnd - b.baseEnd);
 	const output: string[] = [];
 	let cursor = 0;
@@ -198,17 +315,25 @@ function buildConflictResult(
 	baseLines: string[],
 	leftChanges: LineChange[],
 	rightChanges: LineChange[],
-	conflictRanges: Array<{ start: number; end: number }>,
+	conflictRanges: BaseRange[],
 ): Extract<ThreeWayMergeResult, { kind: "conflict" }> {
 	const segments: ThreeWayMergeSegment[] = [];
 	const hunks: ThreeWayMergeConflictHunk[] = [];
+	const safeLeftChanges = excludeConflictChanges(leftChanges, conflictRanges);
+	const safeRightChanges = excludeConflictChanges(rightChanges, conflictRanges);
 	let cursor = 0;
 
 	for (const range of conflictRanges) {
 		if (cursor < range.start) {
 			segments.push({
 				kind: "text",
-				text: applyRegion(baseLines, leftChanges, rightChanges, cursor, range.start),
+				text: applyRegion(
+					baseLines,
+					safeLeftChanges,
+					safeRightChanges,
+					cursor,
+					range.start,
+				),
 			});
 		}
 
@@ -228,7 +353,13 @@ function buildConflictResult(
 	if (cursor < baseLines.length) {
 		segments.push({
 			kind: "text",
-			text: applyRegion(baseLines, leftChanges, rightChanges, cursor, baseLines.length),
+			text: applyRegion(
+				baseLines,
+				safeLeftChanges,
+				safeRightChanges,
+				cursor,
+				baseLines.length,
+			),
 		});
 	}
 
@@ -249,6 +380,14 @@ function buildConflictResult(
 	return { kind: "conflict", partialMergedText, hunks, segments };
 }
 
+function excludeConflictChanges(
+	changes: LineChange[],
+	conflictRanges: BaseRange[],
+): LineChange[] {
+	return changes.filter((change) => !conflictRanges.some((range) =>
+		range.start <= change.baseStart && change.baseEnd <= range.end));
+}
+
 function applyRegion(
 	baseLines: string[],
 	leftChanges: LineChange[],
@@ -256,7 +395,7 @@ function applyRegion(
 	start: number,
 	end: number,
 ): string {
-	const regionChanges = [...leftChanges, ...rightChanges]
+	const regionChanges = combineDistinctChanges(leftChanges, rightChanges)
 		.filter((change) => start <= change.baseStart && change.baseEnd <= end)
 		.sort((a, b) => a.baseStart - b.baseStart || a.baseEnd - b.baseEnd);
 	const output: string[] = [];

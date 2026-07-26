@@ -17,9 +17,13 @@
 
 import { cp, mkdir, rm, writeFile, readFile } from "fs/promises";
 import { existsSync } from "fs";
-import { join, resolve } from "path";
+import { dirname, join, resolve } from "path";
+import { fileURLToPath } from "url";
 
-const REPO_ROOT = resolve(import.meta.dir, "../..");
+const SCRIPT_DIR = typeof import.meta.dir === "string"
+	? import.meta.dir
+	: dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = resolve(SCRIPT_DIR, "../..");
 const FIXTURES_DIR = join(REPO_ROOT, "qa", "fixtures", "vaults");
 const HARNESS_BUILD = join(REPO_ROOT, "qa", "obsidian-harness", "main.js");
 const HARNESS_MANIFEST = join(REPO_ROOT, "qa", "obsidian-harness", "manifest.json");
@@ -139,7 +143,8 @@ async function main(): Promise<void> {
 		frontmatterGuardEnabled: true,
 		excludePatterns: "",
 		maxFileSizeKB: 2048,
-		externalEditPolicy: "closed-only",
+		externalEditPolicy: "always",
+		externalEditPolicySafetyMigrationVersion: 1,
 		enableAttachmentSync: true,
 		attachmentSyncExplicitlyConfigured: false,
 		maxAttachmentSizeKB: 10240,

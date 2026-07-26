@@ -31,6 +31,7 @@ import {
 	ORIGIN_EDITOR_AUTHORITY_SHIELD,
 	ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT,
 	ORIGIN_EDITOR_HEALTH_HEAL,
+	ORIGIN_OPEN_EXTERNAL_EDIT_MERGE,
 	ORIGIN_SEED,
 	ORIGIN_RESTORE,
 } from "../src/sync/origins";
@@ -58,6 +59,7 @@ const REQUIRED_LOCAL_ORIGINS = [
 	ORIGIN_EDITOR_HEALTH_HEAL,
 	ORIGIN_EDITOR_AUTHORITY_SHIELD,
 	ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT,
+	ORIGIN_OPEN_EXTERNAL_EDIT_MERGE,
 	ORIGIN_RESTORE,
 ] as const;
 
@@ -80,6 +82,10 @@ assert(
 	ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT === "editor-external-reload-reject",
 	"ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT",
 );
+assert(
+	ORIGIN_OPEN_EXTERNAL_EDIT_MERGE === "open-external-edit-merge",
+	"ORIGIN_OPEN_EXTERNAL_EDIT_MERGE",
+);
 assert(ORIGIN_SEED === "vault-crdt-seed", "ORIGIN_SEED === 'vault-crdt-seed'");
 assert(ORIGIN_RESTORE === "snapshot-restore", "ORIGIN_RESTORE === 'snapshot-restore'");
 
@@ -89,6 +95,15 @@ console.log("\n--- Test 3: behavioral dispatch — local repair origins do NOT s
 // exercises isLocalOrigin() directly from the authoritative module to prove
 // the correct dispatch decision for every registered repair origin.
 const provider = { __sentinel: "provider" };
+
+assert(
+	LOCAL_REPAIR_ORIGINS.includes(ORIGIN_OPEN_EXTERNAL_EDIT_MERGE),
+	"LOCAL_REPAIR_ORIGINS contains the open external edit merge origin",
+);
+assert(
+	isLocalOrigin(ORIGIN_OPEN_EXTERNAL_EDIT_MERGE, provider) === true,
+	"open external edit merge origin is local (no write scheduled)",
+);
 
 for (const origin of REQUIRED_LOCAL_ORIGINS) {
 	assert(
@@ -126,6 +141,7 @@ const callSiteOrigins: ReadonlyArray<string> = [
 	ORIGIN_EDITOR_HEALTH_HEAL,
 	ORIGIN_EDITOR_AUTHORITY_SHIELD,
 	ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT,
+	ORIGIN_OPEN_EXTERNAL_EDIT_MERGE,
 	ORIGIN_SEED,
 	ORIGIN_RESTORE,
 ];

@@ -1,4 +1,4 @@
-import type { ExternalEditPolicy, VaultSyncSettings } from "../settings";
+import type { VaultSyncSettings } from "../settings";
 import { parseExcludePatterns } from "../sync/exclude";
 
 export interface RuntimeConfig {
@@ -11,7 +11,6 @@ export interface RuntimeConfig {
 	excludePatterns: string[];
 	maxFileSizeBytes: number;
 	maxFileSizeKB: number;
-	externalEditPolicy: ExternalEditPolicy;
 	enableAttachmentSync: boolean;
 	attachmentSyncExplicitlyConfigured: boolean;
 	maxAttachmentSizeKB: number;
@@ -37,7 +36,6 @@ export function buildRuntimeConfig(
 		excludePatterns: parseExcludePatterns(settings.excludePatterns),
 		maxFileSizeBytes: settings.maxFileSizeKB * 1024,
 		maxFileSizeKB: settings.maxFileSizeKB,
-		externalEditPolicy: settings.externalEditPolicy,
 		enableAttachmentSync: settings.enableAttachmentSync,
 		attachmentSyncExplicitlyConfigured: settings.attachmentSyncExplicitlyConfigured,
 		maxAttachmentSizeKB: settings.maxAttachmentSizeKB,

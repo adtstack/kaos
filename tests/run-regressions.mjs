@@ -55,7 +55,6 @@ const NODE = "node";
 
 const suites = [
 	[JITI, "tests/diff-regressions.mjs"],
-	[JITI, "tests/external-edit-policy-regressions.mjs"],
 	[JITI, "tests/remote-typing-guard.ts"],
 	[JITI, "tests/bound-recovery-regressions.mjs"],
 	[JITI, "tests/editor-binding-recent-activity.ts"],
@@ -112,6 +111,8 @@ const suites = [
 	[JITI, "tests/server-hardening.ts"],
 	[JITI, "tests/server-claim-security.ts"],
 	[JITI, "tests/settings-hardening.ts"],
+	[JITI, "tests/external-edit-settings-boundary.ts"],
+	[JITI, "tests/plugin-teardown-authority-wiring.ts"],
 	[JITI, "tests/connection-controller-startup-sync.ts"],
 	[JITI, "tests/stable-markdown-reader.ts"],
 	[JITI, "tests/setup-link-controller.ts"],
@@ -191,6 +192,10 @@ const suites = [
 	[JITI, "tests/canonical-path.ts"],
 	[JITI, "tests/path-collision.ts"],
 	[JITI, "tests/path-category.ts"],
+	[JITI, "tests/exclude-file.ts"],
+	[JITI, "tests/remote-projection-policy-gate.ts"],
+	[JITI, "tests/provider-policy-bootstrap-wiring.ts"],
+	[JITI, "tests/provider-policy-settlement-coordinator.ts"],
 	[JITI, "tests/conflict-artifact-path.ts"],
 	[NODE, "tests/kaos-conflict-resolver.mjs"],
 	[NODE, "tests/kaos-file-history-cli.mjs"],
@@ -201,11 +206,13 @@ const suites = [
 	[JITI, "tests/dashboard-data.ts"],
 	[JITI, "tests/recovery-history-selection.ts"],
 	[JITI, "tests/text-diff.ts"],
+	[JITI, "tests/open-external-edit-planner.ts"],
 	[JITI, "tests/three-way-merge.ts"],
 	// Autophagy: TraceSink dependency inversion
 	[JITI, "tests/trace-sink.ts"],
 	// Autophagy: QA port fencing
 	[JITI, "tests/qa-port-fencing.ts"],
+	[JITI, "tests/obsidian-client-page-selection.ts"],
 	// Autophagy: ReconciliationController planner/executor
 	[JITI, "tests/closed-file-planner.ts"],
 	[JITI, "tests/open-bound-file-planner.ts"],

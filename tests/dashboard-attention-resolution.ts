@@ -8,6 +8,11 @@ import {
 	isRemoteDeletePreservedUnresolvedEntry,
 } from "../src/sync/preservedUnresolved";
 
+Object.defineProperty(globalThis, "__KAOS_QA_HARNESS_ENABLED__", {
+	configurable: true,
+	value: false,
+});
+
 class FakeTFile extends TFile {
 	constructor(
 		readonly path: string,
@@ -100,7 +105,6 @@ function makeMarkdownFixture(options: FixtureOptions = {}) {
 			maxFileSizeBytes: options.maxFileSizeBytes ?? 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => diskMirror as any,

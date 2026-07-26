@@ -9,8 +9,9 @@ Live editor overwrite protection is intentionally narrower than general
 conflict resolution. See
 [`live-editor-authority-policy.md`](live-editor-authority-policy.md) for the
 active rule: shield destructive non-user editor patches only during recent
-local typing, never merely because a file is open, and never by performing
-live string-level auto-merge.
+local typing, never merely because a file is open, and never by performing a
+string-level merge inside the editor binding. Open-file three-way planning is
+owned by reconciliation and accepted targets enter through Y.Text.
 
 ## 1. Markdown ambiguous divergence
 
@@ -45,6 +46,26 @@ genuinely new divergences create fresh artifacts.
 copies. The create event is suppressed when the artifact is written, and the
 durable `"(KAOS conflict ...)"` filename marker is excluded from markdown sync
 classification so restart reconciliation does not seed it into CRDT.
+
+### Open external-edit reconciliation
+
+An external disk write to an open Markdown note is not a separate conflict
+class and does not make disk authoritative. The binding intercepts only the
+correlated whole-document reload and hands the exact candidate to
+`ReconciliationController`, which compares:
+
+- `B`: the exact durable baseline body;
+- `L`: the single current editor authority, which must agree with current
+  Y.Text;
+- `D`: the stable external disk candidate.
+
+If only one side changed, or both sides changed in non-overlapping hunks, the
+selected target is applied in one targeted Y.Text transaction. Same or adjacent
+hunks, a missing baseline, multiple pane authorities, editor read failure, or
+frontmatter rejection cause no partial primary-file mutation. The current
+Y.Text remains primary and the complete raw external candidate is preserved as
+a local-only conflict artifact. Stale calculations replan without creating an
+artifact merely because authority advanced.
 
 ## 2. Blob download conflict
 

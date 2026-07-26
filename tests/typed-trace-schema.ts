@@ -1,4 +1,10 @@
 import { readFileSync } from "node:fs";
+import {
+	PreservedUnresolvedRegistry,
+	isRemoteDeletePreservedUnresolvedReason,
+	type PreservedUnresolvedEntry,
+	type PreservedUnresolvedReason,
+} from "../src/sync/preservedUnresolved";
 
 let passed = 0;
 let failed = 0;
@@ -69,6 +75,7 @@ console.log("\n--- Test 3: source-grep static guard for recovery.skipped frontma
 {
 	const reconciliation = file("src/runtime/reconciliationController.ts");
 	const flight = file("src/telemetry/debug/flightEvents.ts");
+	const recoveryTypes = file("src/observability/recoveryEventTypes.ts");
 
 	// Typed taxonomy exports live in src/telemetry/debug/flightEvents.ts (the helper
 	// imports them; the test asserts they exist there, not in the
@@ -98,7 +105,7 @@ console.log("\n--- Test 3: source-grep static guard for recovery.skipped frontma
 		"bound-file-local-only-divergence",
 		"bound-file-local-only-seed",
 		"bound-file-open-idle-disk-recovery",
-		"bound-file-open-idle-seed",
+		"bound-file-open-safe-external-merge",
 	];
 	for (const literal of branchLiterals) {
 		assert(
@@ -110,6 +117,26 @@ console.log("\n--- Test 3: source-grep static guard for recovery.skipped frontma
 			`controller wires frontmatter-ingest branch "${literal}"`,
 		);
 	}
+	const productBranchTypeMatch = recoveryTypes.match(
+		/export type FrontmatterIngestBlockBranch =\s*([\s\S]*?);/,
+	);
+	assert(
+		productBranchTypeMatch !== null,
+		"product FrontmatterIngestBlockBranch declaration parses",
+	);
+	const productBranchSrc = productBranchTypeMatch?.[1] ?? "";
+	for (const literal of branchLiterals) {
+		assert(
+			productBranchSrc.includes(`"${literal}"`),
+			`product FrontmatterIngestBlockBranch includes "${literal}"`,
+		);
+	}
+	const extractLiterals = (source: string): string[] =>
+		Array.from(source.matchAll(/"([^"]+)"/g), (match) => match[1]!).sort();
+	assert(
+		JSON.stringify(extractLiterals(branchSrc)) === JSON.stringify(extractLiterals(productBranchSrc)),
+		"telemetry and product FrontmatterIngestBlockBranch unions stay synchronized",
+	);
 
 	// RecoverySkippedReason carries every reason the controller emits today.
 	const reasonTypeMatch = flight.match(
@@ -143,6 +170,14 @@ console.log("\n--- Test 3: source-grep static guard for recovery.skipped frontma
 		!reconciliation.includes("type FrontmatterIngestBlockBranch ="),
 		"controller does NOT redeclare FrontmatterIngestBlockBranch locally",
 	);
+	assert(
+		!reconciliation.includes("as FrontmatterIngestBlockBranch"),
+		"controller does not cast around the closed frontmatter branch union",
+	);
+	assert(
+		!reconciliation.includes('"open-external-targeted-diff-failed" as never'),
+		"controller does not cast around the preserved-unresolved reason union",
+	);
 
 	// Helper exists and the helper is the only emitter of the new reason
 	// value (one declaration of the literal in the helper plus the typed
@@ -171,6 +206,50 @@ console.log("\n--- Test 3: source-grep static guard for recovery.skipped frontma
 			"FLIGHT_TAXONOMY_VERSION at 11",
 		);
 	}
+
+console.log("\n--- Test 4: targeted-diff failure is an ordinary persisted markdown reason ---");
+{
+	const unresolvedSource = file("src/sync/preservedUnresolved.ts");
+	const reasonTypeMatch = unresolvedSource.match(
+		/export type PreservedUnresolvedReason =\s*([\s\S]*?);/,
+	);
+	assert(reasonTypeMatch !== null, "PreservedUnresolvedReason declaration parses");
+	assert(
+		(reasonTypeMatch?.[1] ?? "").includes('"open-external-targeted-diff-failed"'),
+		"PreservedUnresolvedReason includes the targeted-diff failure literal",
+	);
+
+	const reason: PreservedUnresolvedReason = "open-external-targeted-diff-failed";
+	const persistedEntry: PreservedUnresolvedEntry = {
+		path: "Notes/targeted-diff-failure.md",
+		kind: "markdown",
+		reason,
+		firstSeenAt: Date.parse("2026-07-25T01:00:00Z"),
+		lastSeenAt: Date.parse("2026-07-25T01:01:00Z"),
+	};
+	const persistedJson = JSON.stringify([persistedEntry]);
+	const registry = new PreservedUnresolvedRegistry(
+		JSON.parse(persistedJson) as PreservedUnresolvedEntry[],
+	);
+	assert(
+		registry.get(persistedEntry.path)?.reason === reason,
+		"targeted-diff failure survives ordinary unresolved persistence hydration",
+	);
+	const summary = registry.getSummary();
+	assert(summary.markdownCount === 1, "targeted-diff failure counts as markdown Attention");
+	assert(
+		summary.reasons[reason] === 1,
+		"targeted-diff failure appears in the ordinary unresolved reason summary",
+	);
+	assert(
+		summary.samples[0]?.reason === reason,
+		"targeted-diff failure appears in the ordinary markdown unresolved sample",
+	);
+	assert(
+		!isRemoteDeletePreservedUnresolvedReason(reason),
+		"targeted-diff failure is not misclassified as a remote-delete reason",
+	);
+}
 
 console.log("\n──────────────────────────────────────────────────");
 console.log(`Results: ${passed} passed, ${failed} failed`);

@@ -754,6 +754,8 @@ export class KaosDashboardView extends ItemView {
 			case "structural-change":
 			case "blocked-divergence":
 				return "This condition must be reviewed and reconciled before KAOS can choose a safe file operation.";
+			case "remote-projection-policy":
+				return "Correct the shared exclude policy; local and editor changes remain active while remote projection is paused.";
 		}
 	}
 

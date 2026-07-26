@@ -134,6 +134,11 @@ import {
 // Assertion harness (matches tests/reconciliation-safety-brake.ts)
 // -------------------------------------------------------------------
 
+Object.defineProperty(globalThis, "__KAOS_QA_HARNESS_ENABLED__", {
+	configurable: true,
+	value: false,
+});
+
 let passed = 0;
 let failed = 0;
 
@@ -386,7 +391,6 @@ function buildFixture(opts: {
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as never,
 		getVaultSync: () => vaultSync,
 		getDiskMirror: () => diskMirror as never,
