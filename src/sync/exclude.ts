@@ -1,4 +1,6 @@
 /** Paths that are always excluded, regardless of user settings. */
+export const KAOS_EXCLUDE_FILE_PATH = "SYSTEM/SETTING/kaos-exclude.md";
+
 const GENERATED_DIRECTORY_NAMES = new Set([
 	"node_modules",
 	"bower_components",
@@ -36,6 +38,15 @@ function normalizePrefix(path: string): string {
 		.replace(/\/{2,}/g, "/")
 		.replace(/^\.\//, "")
 		.replace(/^\/+/, "");
+}
+
+/**
+ * The exclude control file is ordinary vault content so KAOS can distribute
+ * one shared policy to every device. It must remain syncable even when a
+ * broader user prefix (for example `SYSTEM/SETTING/`) would otherwise match.
+ */
+export function isKaosExcludeFilePath(path: string): boolean {
+	return normalizePrefix(path) === KAOS_EXCLUDE_FILE_PATH;
 }
 
 function alwaysExcludedPrefixes(configDir: string): string[] {
@@ -89,6 +100,7 @@ function isToolOrGeneratedPath(path: string): boolean {
  */
 export function isExcluded(path: string, patterns: string[], configDir: string): boolean {
 	const normalizedPath = normalizePrefix(path);
+	if (isKaosExcludeFilePath(normalizedPath)) return false;
 	// Obsidian does not index hidden paths (including a nested/sample vault's
 	// config directory) as ordinary TFiles. Treating them as attachments can
 	// create an unrecoverable "File already exists" download race.
@@ -111,8 +123,39 @@ export function isExcluded(path: string, patterns: string[], configDir: string):
  * trimmed, non-empty prefixes.
  */
 export function parseExcludePatterns(raw: string): string[] {
-	return raw
-		.split(",")
-		.map((p) => p.trim())
-		.filter((p) => p.length > 0);
+	return mergeExcludePatterns(raw.split(","));
+}
+
+/**
+ * Parse the shared exclude control file.
+ *
+ * Each non-empty, non-comment line is a vault-relative path prefix. A UTF-8
+ * BOM and CRLF line endings are accepted so the same file works across every
+ * supported desktop/headless environment.
+ */
+export function parseKaosExcludeFile(raw: string): string[] {
+	return mergeExcludePatterns(
+		raw
+			.replace(/^\uFEFF/, "")
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.filter((line) => line.length > 0 && !line.startsWith("#")),
+	);
+}
+
+/** Stable, normalized union used for legacy settings plus the shared file. */
+export function mergeExcludePatterns(
+	...groups: ReadonlyArray<readonly string[]>
+): string[] {
+	const merged: string[] = [];
+	const seen = new Set<string>();
+	for (const group of groups) {
+		for (const rawPattern of group) {
+			const pattern = normalizePrefix(rawPattern.trim());
+			if (!pattern || seen.has(pattern)) continue;
+			seen.add(pattern);
+			merged.push(pattern);
+		}
+	}
+	return merged;
 }

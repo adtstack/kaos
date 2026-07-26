@@ -13,6 +13,7 @@ import type { EditorWorkspaceOrchestrator } from "../../src/runtime/editorWorksp
 import type { DiagnosticsService } from "../../src/telemetry/diagnostics/diagnosticsService";
 import type { BlobSyncManager } from "../../src/sync/blobSync";
 import type { TraceHttpContext } from "../../src/telemetry/debug/trace";
+import { EXTERNAL_EDIT_BEHAVIOR } from "../../src/sync/externalEditBehavior";
 
 export interface VfsTortureTestContext {
 	app: App;
@@ -183,7 +184,7 @@ export const runVfsTortureTest = async (context: VfsTortureTestContext): Promise
 			vaultId: context.settings.vaultId,
 			deviceName: context.settings.deviceName,
 			enableAttachmentSync: context.settings.enableAttachmentSync,
-			externalEditPolicy: context.settings.externalEditPolicy,
+			externalEditBehavior: EXTERNAL_EDIT_BEHAVIOR,
 			debug: context.settings.debug,
 		},
 		syncState: {

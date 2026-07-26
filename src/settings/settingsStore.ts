@@ -1,12 +1,22 @@
 import { randomBase64Url } from "../utils/base64url";
 
-/** Controls how external disk edits (git, other editors) are imported into CRDT. */
-export type ExternalEditPolicy = "always" | "closed-only" | "never";
 export const MAX_ATTACHMENT_SIZE_KB = 10 * 1024;
 export const MAX_TEXT_FILE_SIZE_KB = 50 * 1024;
 export const MIN_ATTACHMENT_CONCURRENCY = 1;
 export const MAX_ATTACHMENT_CONCURRENCY = 5;
-export const EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION = 1;
+export const EXTERNAL_EDIT_POLICY_COMPAT_VALUE = "always" as const;
+export const EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION = 1 as const;
+
+export interface ExternalEditPolicyCompatibilityFields {
+	externalEditPolicy?: unknown;
+	externalEditPolicySafetyMigrationVersion?: unknown;
+}
+
+export interface CanonicalExternalEditPolicyCompatibilityFields {
+	externalEditPolicy: typeof EXTERNAL_EDIT_POLICY_COMPAT_VALUE;
+	externalEditPolicySafetyMigrationVersion:
+		typeof EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION;
+}
 
 export function attachmentSizeCapKB(serverMaxBlobUploadBytes?: number | null): number {
 	if (
@@ -32,19 +42,10 @@ export interface VaultSyncSettings {
 	debug: boolean;
 	/** Pause propagation of suspicious YAML frontmatter transitions. */
 	frontmatterGuardEnabled: boolean;
-	/** Comma-separated path prefixes to exclude from sync. */
+	/** Legacy device-local prefixes retained for backward compatibility. */
 	excludePatterns: string;
 	/** Maximum file size in KB to sync via CRDT. Files larger are skipped. */
 	maxFileSizeKB: number;
-	/**
-	 * How to handle external disk modifications (git pull, other editors).
-	 *   "closed-only" — import only for files not open in an editor (default)
-	 *   "always"      — consider open files too, without overriding visible editor authority
-	 *   "never"       — never import (CRDT is sole source of truth)
-	 */
-	externalEditPolicy: ExternalEditPolicy;
-	/** Hidden marker: old "always" defaults have been migrated to the safer closed-only policy. */
-	externalEditPolicySafetyMigrationVersion: number;
 	/** Enable attachment (non-markdown) sync via R2 blob store. */
 	enableAttachmentSync: boolean;
 	/** True once the user has explicitly changed the attachment sync toggle. */
@@ -80,8 +81,6 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	frontmatterGuardEnabled: true,
 	excludePatterns: "",
 	maxFileSizeKB: 2048,
-	externalEditPolicy: "closed-only",
-	externalEditPolicySafetyMigrationVersion: EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION,
 	enableAttachmentSync: true,
 	attachmentSyncExplicitlyConfigured: false,
 	maxAttachmentSizeKB: MAX_ATTACHMENT_SIZE_KB,
@@ -172,23 +171,49 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
 
+function hasCanonicalExternalEditPolicyCompatibilityFields(
+	data: ExternalEditPolicyCompatibilityFields | null | undefined,
+): boolean {
+	return data?.externalEditPolicy === EXTERNAL_EDIT_POLICY_COMPAT_VALUE &&
+		data.externalEditPolicySafetyMigrationVersion ===
+			EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION;
+}
+
+function stripExternalEditPolicyCompatibilityFields(
+	data: Record<string, unknown>,
+): Record<string, unknown> {
+	const liveData = { ...data };
+	Reflect.deleteProperty(liveData, "externalEditPolicy");
+	Reflect.deleteProperty(liveData, "externalEditPolicySafetyMigrationVersion");
+	return liveData;
+}
+
+function canonicalizeExternalEditPolicyCompatibilityFields<
+	T extends object,
+>(state: T): T & CanonicalExternalEditPolicyCompatibilityFields {
+	return {
+		...state,
+		externalEditPolicy: EXTERNAL_EDIT_POLICY_COMPAT_VALUE,
+		externalEditPolicySafetyMigrationVersion:
+			EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION,
+	};
+}
+
 function readPersistedState<TState extends Partial<VaultSyncSettings>>(value: unknown): TState {
 	return isRecord(value) ? { ...value } as TState : {} as TState;
 }
 
 export function readVaultSyncSettings(
-	data: Partial<VaultSyncSettings> | null | undefined,
+	data: (Partial<VaultSyncSettings> & ExternalEditPolicyCompatibilityFields) | null | undefined,
 ): { settings: VaultSyncSettings; migrated: boolean } {
-	const rawExternalEditPolicy = (data as { externalEditPolicy?: unknown } | null | undefined)?.externalEditPolicy;
-	const rawExternalEditPolicySafetyMigrationVersion =
-		(data as { externalEditPolicySafetyMigrationVersion?: unknown } | null | undefined)
-			?.externalEditPolicySafetyMigrationVersion;
+	const rawRecord = isRecord(data) ? data : {};
+	const liveRecord = stripExternalEditPolicyCompatibilityFields(rawRecord);
 	const settings = Object.assign(
 		{},
 		DEFAULT_SETTINGS,
-		data as Partial<VaultSyncSettings>,
-	);
-	let migrated = false;
+		liveRecord,
+	) as VaultSyncSettings;
+	let migrated = !hasCanonicalExternalEditPolicyCompatibilityFields(rawRecord);
 	const repairString = (key: keyof VaultSyncSettings): void => {
 		if (typeof settings[key] === "string") return;
 		(settings as unknown as Record<keyof VaultSyncSettings, unknown>)[key] =
@@ -227,25 +252,6 @@ export function readVaultSyncSettings(
 		&& settings.qaTraceMode !== "local-private"
 	) {
 		settings.qaTraceMode = DEFAULT_SETTINGS.qaTraceMode;
-		migrated = true;
-	}
-	if (
-		settings.externalEditPolicy !== "always"
-		&& settings.externalEditPolicy !== "closed-only"
-		&& settings.externalEditPolicy !== "never"
-	) {
-		settings.externalEditPolicy = DEFAULT_SETTINGS.externalEditPolicy;
-		migrated = true;
-	}
-	if (
-		rawExternalEditPolicy === "always" &&
-		rawExternalEditPolicySafetyMigrationVersion !== EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION
-	) {
-		settings.externalEditPolicy = "closed-only";
-		settings.externalEditPolicySafetyMigrationVersion = EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION;
-		migrated = true;
-	} else if (settings.externalEditPolicySafetyMigrationVersion !== EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION) {
-		settings.externalEditPolicySafetyMigrationVersion = EXTERNAL_EDIT_POLICY_SAFETY_MIGRATION_VERSION;
 		migrated = true;
 	}
 	if (typeof data?.attachmentSyncExplicitlyConfigured !== "boolean") {
@@ -319,13 +325,15 @@ export class SettingsStore<TState extends Partial<VaultSyncSettings>> {
 	}
 
 	async save(state: TState): Promise<void> {
-		await this.persistence.saveData({ ...state });
+		await this.persistence.saveData(
+			canonicalizeExternalEditPolicyCompatibilityFields({ ...state }),
+		);
 	}
 
 	withSettings(state: TState, settings: VaultSyncSettings): TState {
-		return {
+		return canonicalizeExternalEditPolicyCompatibilityFields({
 			...state,
 			...settings,
-		};
+		}) as TState;
 	}
 }

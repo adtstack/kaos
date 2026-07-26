@@ -27,7 +27,7 @@ export type BaselineActionKind =
 	| "defer-to-crdt-flush"        // Open/bound/non-authoritative, flushed
 	// Live-sync actions (future use)
 	| "live-disk-to-crdt"          // External edit imported
-	| "live-stat-only"             // Policy-never/quarantine/frontmatter block
+	| "live-stat-only"             // Quarantine/frontmatter/safety block
 	// Error/safety actions
 	| "conflict-artifact-failed"   // Artifact creation threw
 	| "safety-brake";              // Safety brake blocked writes

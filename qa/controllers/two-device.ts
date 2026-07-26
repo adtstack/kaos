@@ -363,7 +363,7 @@ function makeCdpDeviceHandle(client: AnyObsidianClient, deviceId: string): Devic
 		ingestDiskFileNow: (p, r) => client.evalRaw(`window.__KAOS_DEBUG__?.ingestDiskFileNow(${JSON.stringify(p)}, ${JSON.stringify(r)})`),
 		pauseEditorPropagation: (p) => client.evalRaw(`window.__KAOS_DEBUG__?.pauseEditorPropagation(${JSON.stringify(p)})`),
 		resumeEditorPropagation: (p) => client.evalRaw(`window.__KAOS_DEBUG__?.resumeEditorPropagation(${JSON.stringify(p)})`),
-		setExternalEditPolicyOverride: (p) => client.evalRaw(`window.__KAOS_DEBUG__?.setExternalEditPolicyOverride(${JSON.stringify(p)})`),
+		setDiskIngestSuspended: (suspended) => client.evalRaw(`window.__KAOS_DEBUG__?.setDiskIngestSuspended(${JSON.stringify(suspended)})`),
 		__qaOnlyEmitPhaseUnsafe: (p) => client.evalRaw(`window.__KAOS_DEBUG__?.__qaOnlyEmitPhaseUnsafe(${JSON.stringify(p)})`),
 		witnessDeviceSettled: (p, o) => client.evalRaw(`window.__KAOS_DEBUG__?.witnessDeviceSettled(${JSON.stringify(p)}, ${JSON.stringify(o)})`),
 		computeWitnessStateHash: (c) => client.evalRaw(`window.__KAOS_DEBUG__?.computeWitnessStateHash(${JSON.stringify(c)})`),

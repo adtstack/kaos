@@ -18,6 +18,7 @@ export const ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER = "disk-sync-open-idle-recover" 
 export const ORIGIN_EDITOR_HEALTH_HEAL = "editor-health-heal" as const;
 export const ORIGIN_EDITOR_AUTHORITY_SHIELD = "editor-authority-shield" as const;
 export const ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT = "editor-external-reload-reject" as const;
+export const ORIGIN_OPEN_EXTERNAL_EDIT_MERGE = "open-external-edit-merge" as const;
 
 /**
  * Internal set — not exported directly to prevent mutable cast-away access.
@@ -35,6 +36,7 @@ const LOCAL_STRING_ORIGIN_SET = new Set<string>([
 	ORIGIN_EDITOR_HEALTH_HEAL,
 	ORIGIN_EDITOR_AUTHORITY_SHIELD,
 	ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT,
+	ORIGIN_OPEN_EXTERNAL_EDIT_MERGE,
 	ORIGIN_RESTORE,
 ]);
 

@@ -45,6 +45,7 @@
 
 import * as Y from "yjs";
 import { applyDiffToYText } from "../src/sync/diff";
+import { EditorBindingManager } from "../src/sync/editorBinding";
 import {
 	isLocalOrigin,
 	isLocalStringOrigin,
@@ -420,6 +421,54 @@ console.log("\n--- Test 9: controller-shaped disk/CRDT/editor recovery is stable
 	assert(scheduledWrites.length === 0, "second pass: still no disk write scheduled");
 
 	doc.destroy();
+}
+
+// ── Test 10: undo capture separation only touches matching live bindings ─────
+
+console.log("\n--- Test 10: undo capture separation targets matching live bindings ---");
+{
+	const manager = new EditorBindingManager(
+		{} as never,
+		false,
+		() => true,
+	);
+	type BindingFixture = {
+		path: string;
+		view: { file: { path: string } | null };
+		undoManager: { stopCapturing(): void };
+	};
+	type ManagerFixture = {
+		bindings: Map<string, BindingFixture>;
+		separateUndoCaptureForPath?: (path: string) => number;
+	};
+	const fixture = manager as unknown as ManagerFixture;
+	const stopCounts = new Map<string, number>();
+	const binding = (name: string, path: string, liveViewPath: string | null): BindingFixture => ({
+		path,
+		view: { file: liveViewPath == null ? null : { path: liveViewPath } },
+		undoManager: {
+			stopCapturing(): void {
+				stopCounts.set(name, (stopCounts.get(name) ?? 0) + 1);
+			},
+		},
+	});
+	fixture.bindings.set("matching", binding("matching", "note.md", "note.md"));
+	fixture.bindings.set("stale-view", binding("stale-view", "note.md", "renamed.md"));
+	fixture.bindings.set("different-binding", binding("different-binding", "other.md", "note.md"));
+	fixture.bindings.set("closed-view", binding("closed-view", "note.md", null));
+
+	assert(
+		typeof fixture.separateUndoCaptureForPath === "function",
+		"EditorBindingManager exposes separateUndoCaptureForPath",
+	);
+	if (typeof fixture.separateUndoCaptureForPath === "function") {
+		const separated = fixture.separateUndoCaptureForPath.call(manager, "note.md");
+		assert(separated === 1, "returns the number of matching live bindings");
+		assert(stopCounts.get("matching") === 1, "stops capture for the matching live binding");
+		assert(!stopCounts.has("stale-view"), "does not touch a stale view path");
+		assert(!stopCounts.has("different-binding"), "does not touch a different binding path");
+		assert(!stopCounts.has("closed-view"), "does not touch a closed view");
+	}
 }
 
 // ── Summary ───────────────────────────────────────────────────────────────────

@@ -14,6 +14,7 @@ import {
 	buildFrontmatterQuarantineDebugLines,
 	type FrontmatterQuarantineEntry,
 } from "../../sync/frontmatterQuarantine";
+import { EXTERNAL_EDIT_BEHAVIOR } from "../../sync/externalEditBehavior";
 import {
 	createPassthroughRedactor,
 	createPathRedactor,
@@ -60,7 +61,6 @@ export interface DiagnosticsBundleInput {
 		deviceName: string;
 		debug: boolean;
 		enableAttachmentSync: boolean;
-		externalEditPolicy: string;
 	};
 	stateSnapshot: {
 		reconciled: boolean;
@@ -159,7 +159,7 @@ export async function buildDiagnosticsBundle(
 			deviceName: options.includeFilenames ? settings.deviceName : "(redacted)",
 			debug: settings.debug,
 			enableAttachmentSync: settings.enableAttachmentSync,
-			externalEditPolicy: settings.externalEditPolicy,
+			externalEditBehavior: EXTERNAL_EDIT_BEHAVIOR,
 		},
 		state: {
 			reconciled: s.reconciled,

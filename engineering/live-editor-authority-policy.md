@@ -1,6 +1,6 @@
 # Live Editor Authority Policy
 
-Status: active policy as of 2026-07-24.
+Status: active policy as of 2026-07-25.
 
 This document records the policy for protecting an open CodeMirror/Yjs editor
 from stale whole-document style patches while preserving normal live
@@ -9,10 +9,13 @@ collaboration.
 ## Decision
 
 Use recent local typing as the protection boundary for Y.Text-origin repair
-patches. Treat an external disk reload as a separate, policy-controlled input.
+patches. Treat an external disk reload as a separate candidate that always
+enters reconciliation, including while the note is open.
 
 Do not use "the file is open" as the boundary.
-Do not auto-merge live editor strings outside Yjs.
+Do not merge inside the CodeMirror binding or make disk a second live
+authority. Baseline-aware planning belongs to `ReconciliationController`, and
+any accepted result enters the editor through a targeted Y.Text transaction.
 Do not remove editor binding or cursor state unless the recent-typing shield
 still fails in production.
 
@@ -29,9 +32,9 @@ Current Yjs policy:
    the patch.
 6. Provider-origin patches are never converted into whole-document editor
    writebacks by this shield.
-7. If conflict preservation is needed, use existing conflict artifact /
-   reconciliation paths outside the live editor. The live editor does not do
-   automatic 3-way merges.
+7. If conflict preservation or a three-way decision is needed, use the
+   reconciliation path outside the binding. The binding never chooses a merge
+   winner.
 
 Current external-disk policy:
 
@@ -41,9 +44,9 @@ Current external-disk policy:
 2. A plugin change made through the live editor/CodeMirror API remains an
    editor-origin change. Its Yjs propagation and following autosave continue
    through the normal editor flow.
-3. `closed-only` (the default) and `never` do not let an unsuppressed external
-   `vault.modify` event become an editor-origin Y.Text update while the note is
-   open.
+3. A correlated external reload never becomes an editor-origin Y.Text update.
+   The raw reload is intercepted and its exact disk candidate is handed to
+   `ReconciliationController` for baseline-aware planning.
 4. A timing-based `writerGuess` is diagnostics only. If a modify event lands
 	inside KAOS's self-write window, that event's exact TFile identity/stat
 	revision and bytes must match the recent intended-write fingerprint. A later
@@ -60,9 +63,16 @@ Current external-disk policy:
 	snapshots must remain unchanged. If newer state prevents rollback, the disk
 	candidate is still preserved. Ambiguous coarse-mtime cases keep the
 	editor/API change rather than risk rolling it back.
-7. The rejected external bytes are preserved as a disk-sourced conflict note.
-8. `always` leaves this interception disabled and uses the existing open-file
-   reconciliation lane.
+7. Reconciliation compares durable baseline `B`, current editor/Y.Text
+   authority `L`, and stable disk candidate `D`. Non-overlapping changes enter
+   one targeted Y.Text transaction; overlapping or adjacent hunks do not
+   partially apply.
+8. When a safe mutation cannot be proven, the complete external bytes remain
+   recoverable as a disk-sourced local conflict note and the primary Y.Text is
+   left unchanged.
+9. There is no user-facing or production-runtime external-edit policy. The
+   only behavior is `include-open-files-safely`; serialized `always`/`1` fields
+   exist solely for downgrade compatibility.
 
 ## Why "open" Is Not Enough
 
@@ -77,7 +87,7 @@ even one character.
 The correct signal is not visibility. The correct signal is recent user
 document activity on that device.
 
-## Why Not Live 3-Way Auto-Merge
+## Why the Binding Does Not Merge
 
 Closed-file reconciliation can use 3-way text merge because it owns a clear
 authority decision: disk, CRDT, and baseline are explicit inputs.
@@ -87,14 +97,13 @@ The live editor already has two sophisticated state machines:
 - Yjs CRDT merge semantics
 - CodeMirror document, selection, and undo semantics
 
-Adding a separate string-level auto-merge inside the live editor creates a
-third authority. Even when a line-level merge is clean on paper, it can be
-wrong for cursor placement, undo history, same-line intent, delete intent, and
-provider-origin classification.
-
-Therefore live editor auto-merge is a non-goal. If two live states cannot be
-accepted by normal Yjs propagation, KAOS should preserve or defer rather than
-invent a merged document in the editor binding layer.
+Adding a separate string-level auto-merge inside the live editor would create a
+third authority. Instead, the controller performs an asynchronous three-way
+plan from stable `B/L/D` inputs. A clean target is applied to Y.Text with a
+dedicated local reconciliation origin, so y-codemirror maps the delta while
+preserving selections, scroll state, and user undo boundaries. If the plan is
+ambiguous or any captured authority advances, KAOS preserves or replans rather
+than inventing a document in the binding layer.
 
 ## Policy Matrix
 
@@ -106,9 +115,9 @@ invent a merged document in the editor binding layer.
 | Destructive named local-repair patch, recent local typing | Shield | Prevent a stale local recovery decision from overwriting active input. |
 | Provider-origin Y.Text patch, including destructive content | Allow | Preserve Yjs collaboration semantics; never turn it into whole-document local writeback. |
 | Plugin writes through the editor/CodeMirror API | Allow normal editor/Yjs flow and autosave | This is an editor-origin operation even though it is non-user/programmatic. |
-| Script, plugin `Vault.modify`, or separate editor writes disk while the note is open, `closed-only` or `never` | Cancel the correlated reload and preserve the disk candidate | These are legitimate disk-origin changes, but they must not silently replace the open editor. |
-| Correlated external disk reload, `closed-only` or `never` | Cancel and preserve disk candidate | Keep the open editor/Y.Text authoritative without losing the external version. |
-| Correlated external disk reload, `always` | Allow existing open-file lane | This is the explicit opt-in policy. |
+| Script, plugin `Vault.modify`, or separate editor writes disk while the note is open | Intercept the correlated reload and route the exact candidate to controller reconciliation | These are legitimate disk-origin changes, but they must not silently replace the open editor. |
+| External and editor changes touch separate hunks | Apply the clean target as one targeted Y.Text transaction | Y.Text remains the live authority and every pane receives the mapped CRDT delta. |
+| External and editor changes overlap, are adjacent, or lack an exact baseline | Keep current Y.Text and preserve the complete external candidate | No partial primary-file application without proof. |
 | Same note open on another idle device | Allow remote updates | Open-only blocking causes cross-device deadlock. |
 | Same note actively typed on both devices | Let Yjs handle normal collaboration; shield only an eligible named local-repair replacement | Avoid replacing CRDT semantics with plugin string merge. |
 
@@ -157,9 +166,9 @@ external bytes are still preserved exactly once.
 Event order is recorded synchronously before the asynchronous exact-content
 read, and the read revalidates path, TFile identity, ctime, mtime, and size
 before and after I/O. Out-of-order completions cannot replace a newer marker;
-their proven bytes are preserved off-path. Closing the last bound pane, opting
-into `always`, or resetting the runtime invalidates the guard state, so an
-older asynchronous proof cannot arm a reopened editor or a new policy lifetime.
+their proven bytes are preserved off-path. Closing the last bound pane or
+resetting the runtime invalidates the guard state, so an older asynchronous
+proof cannot arm a reopened editor or a new runtime lifetime.
 
 Rollback uses `ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT`, which is registered as a
 local repair origin so DiskMirror does not echo the rejection back to disk.
@@ -173,8 +182,8 @@ optimistic mutation ticket:
 
 1. Capture the visible view set, file path, CodeMirror instance/document,
    editor revision and content, binding epoch, and decision-time CRDT content.
-2. Perform any asynchronous reads or conflict-artifact preservation required
-   by the existing policy.
+2. Load the exact durable baseline, stable disk candidate, and any preservation
+   evidence required by the controller-owned plan.
 3. Immediately before mutating Y.Text, verify that the complete ticket and the
    CRDT content are unchanged.
 4. If any part changed, do not commit the stale decision. Defer the path and
@@ -268,7 +277,11 @@ The policy is covered by:
   - temporarily missing CodeMirror state uses the activity fallback, and
     deferred markers retain no live editor/view/document references
 - `tests/controller-recovery-orchestration.ts`
-  - rejected external bytes are deduplicated and preserved as a disk conflict note
+  - clean external/editor changes merge through a targeted Y.Text transaction
+  - overlapping, missing-baseline, and ambiguous candidates are preserved
+    without mutating the primary Y.Text
+  - stale editor, provider, disk, lifecycle, and pane authorities replan with
+    no stale artifact or baseline advancement
 - `tests/disk-mirror-origin-classification.ts`
   - external reload rejection is a registered local origin
 - `tests/trace-event-behavior.ts`
@@ -276,7 +289,8 @@ The policy is covered by:
 	  reconciliation suppressor
 	- a same-size later disk revision cannot prove an older event was a self-write
 - `tests/editor-binding-health-regressions.mjs`
-  - filtering does not attempt live 3-way auto-merge
+  - filtering captures candidates but does not attempt a three-way merge
+  - main routes every captured candidate to the canonical controller lane
   - destructive patch shielding depends on recent editor activity
   - patch capture does not store a live merge base
   - timing attribution cannot hide a suppression-window external write
@@ -284,6 +298,6 @@ The policy is covered by:
   - editor or CRDT changes after an authority decision abort the stale commit
 - `tests/controller-recovery-orchestration.ts`
 	- create events wait when the live editor is ahead of the disk snapshot
-	- reset cancels in-flight rejected-reload conflict preservation
+	- teardown/reset revokes in-flight startup and external-candidate authority
 
 When changing this policy, update this document and those tests together.

@@ -6,6 +6,11 @@ import {
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
 } from "../src/sync/origins";
 
+Object.defineProperty(globalThis, "__KAOS_QA_HARNESS_ENABLED__", {
+	configurable: true,
+	value: false,
+});
+
 let passed = 0;
 let failed = 0;
 
@@ -1517,7 +1522,6 @@ console.log("\n--- Test 5: bound recovery aborts when CRDT changes after authori
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => null,
@@ -1652,7 +1656,6 @@ console.log("\n--- Test 6: bound ambiguous divergence creates a conflict artifac
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => null,
@@ -1763,7 +1766,6 @@ console.log("\n--- Test 7: repeated identical recovery fingerprint is quarantine
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => null,
@@ -1880,7 +1882,6 @@ console.log("\n--- Test 8: successful recovery clears quarantine fingerprint ---
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => null,
@@ -2015,7 +2016,6 @@ console.log("\n--- Test 9: convergence failure does not create infinite conflict
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => null,
@@ -2072,7 +2072,6 @@ console.log("\n--- Test 9: convergence failure does not create infinite conflict
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => restartVaultSync as any,
 		getDiskMirror: () => null,
@@ -2177,7 +2176,6 @@ console.log("\n--- Test 10: second reconcile after successful convergence does n
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => null,
@@ -2279,7 +2277,6 @@ console.log("\n--- Test 11: artifact creation failure does NOT trigger convergen
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => null,
@@ -2327,7 +2324,6 @@ console.log("\n--- Test 12: recovery fingerprint TTL prevents stale accumulation
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => null,
 		getDiskMirror: () => null,

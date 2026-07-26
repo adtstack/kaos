@@ -223,7 +223,6 @@ export interface KaosDashboardData {
 		deviceName: string;
 		vaultId: string;
 		attachmentSyncEnabled: boolean;
-		externalEditPolicy: string;
 	};
 	overview: DashboardMetric[];
 	snapshotStatus: DashboardSnapshotStatus;

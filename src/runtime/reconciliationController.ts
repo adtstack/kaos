@@ -2,6 +2,8 @@ import { App, MarkdownView, Notice, TFile } from "obsidian";
 import type { BlobSyncManager } from "../sync/blobSync";
 import type {
 	DiskMirror,
+	DiskFileRevision,
+	DiskWriteAuthorityPhase,
 	DiskWriteResult,
 	PreservedUnresolvedRedirectResult,
 } from "../sync/diskMirror";
@@ -18,6 +20,7 @@ import type { VaultSyncSettings } from "../settings";
 import type { RuntimeConfig } from "./runtimeConfig";
 import type {
 	EditorBindingManager,
+	InterceptedExternalDiskMutation,
 	OpenEditorMutationTicket,
 } from "../sync/editorBinding";
 import type {
@@ -31,17 +34,19 @@ import type {
 	RecoverySkippedFrontmatterData,
 } from "../observability/recoveryEventTypes";
 import {
+	applyExactDiffToYText,
 	applyDiffToYText,
 	applyDiffToYTextWithPostcondition,
 	type DiffPostconditionResult,
+	type ExactDiffResult,
 } from "../sync/diff";
-import { decideExternalEditImport } from "../sync/externalEditPolicy";
 import { yTextToString } from "../utils/format";
 import { mergeTexts3 } from "../utils/threeWayMerge";
 import {
 	ORIGIN_DISK_SYNC,
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
 	ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
+	ORIGIN_OPEN_EXTERNAL_EDIT_MERGE,
 } from "../sync/origins";
 import { planClosedFileReconcile } from "./reconcile/closedFilePlanner";
 import {
@@ -49,6 +54,7 @@ import {
 	type OpenBoundEditorAuthority,
 	type OpenBoundFileReconcileAction,
 } from "./reconcile/openBoundFilePlanner";
+import { planOpenExternalEdit } from "./reconcile/openExternalEditPlanner";
 import { planBaselineAdvancement, type BaselineActionKind } from "./reconcile/baselineAdvancementPolicy";
 import { evaluateSafetyBrake } from "./reconcile/safetyBrakePolicy";
 import {
@@ -82,6 +88,9 @@ import {
 	type PreservedUnresolvedEntry,
 	type RemoteDeletePreservedUnresolvedReason,
 } from "../sync/preservedUnresolved";
+import { normalizeEditorText } from "../utils/editorTextNormalization";
+
+declare const __KAOS_QA_HARNESS_ENABLED__: boolean;
 
 export interface ReconciliationStats {
 	at: string;
@@ -143,6 +152,11 @@ export type StableMarkdownReadResult =
 	| { kind: "missing" }
 	| { kind: "unstable" };
 
+type ExternalCandidatePreservationResult =
+	| { kind: "preserved" }
+	| { kind: "failed-retained" }
+	| { kind: "invalidated" };
+
 interface ActiveMarkdownIngest {
 	path: string;
 	entry: MarkdownDirtyEntry;
@@ -203,6 +217,28 @@ interface DeferredVisibleEditorAuthority {
 	capturedAt: number;
 }
 
+interface StartupOpenFileAuthoritySnapshot {
+	path: string;
+	file: TFile | null;
+	diskStat: {
+		ctime: number | null;
+		mtime: number | null;
+		size: number | null;
+	} | null;
+	baselineHash: string | null;
+	baselineRevision: number;
+	lifecycleGeneration: number;
+	expectedYText: ReturnType<VaultSync["getTextForPath"]>;
+	expectedCrdtContent: string;
+	editorTicket: OpenEditorMutationTicket | null;
+	diskRevision: number;
+	visibleAuthorityMarker: DeferredVisibleEditorAuthority | null;
+	interceptedCandidate: InterceptedExternalDiskMutation | null;
+	candidateIdentityEpoch: number;
+	attentionGeneration: number;
+	syncScopeGeneration: number;
+}
+
 type VisibleAuthorityTicketProgressKind =
 	| "successor"
 	| "not-successor"
@@ -247,9 +283,86 @@ type OpenEditorSettleReason =
 
 type BoundFileSyncGapOutcome =
 	| { kind: "not-handled" }
-	| { kind: "handled"; settledContent?: string }
+	| {
+		kind: "handled";
+		settlement?: {
+			content: string;
+			expectedYText: ReturnType<VaultSync["getTextForPath"]>;
+			expectedCrdtContent: string | null;
+			expectedEditorTicket?: OpenEditorMutationTicket;
+			expectedOpenEditorContent: string;
+		};
+	}
 	| { kind: "deferred"; deferUntil: number; reason: string }
-	| { kind: "flush-crdt-to-disk"; provisionalBaseline?: boolean; reason: string };
+	| {
+		kind: "flush-crdt-to-disk";
+		provisionalBaseline?: boolean;
+		reason: string;
+		authorityLease: OpenFlushAuthorityLease;
+	};
+
+/**
+ * Controller-owned authority for one open-file Y.Text -> disk flush.
+ *
+ * DiskMirror deliberately receives only the synchronous predicate plus the
+ * file CAS fields. It remains a filesystem bridge and never learns merge or
+ * editor policy semantics.
+ */
+interface OpenFlushAuthorityLease {
+	readonly path: string;
+	readonly stage: string;
+	readonly expectedDiskFile: TFile;
+	readonly expectedDiskStat: { ctime: number | null; mtime: number | null; size: number | null };
+	readonly expectedDiskFileRevision?: DiskFileRevision;
+	readonly expectedDiskEventRevision: number;
+	readonly expectedBaselineHash: string | null;
+	readonly expectedBaselineRevision: number;
+	readonly expectedLifecycleGeneration: number;
+	readonly expectedYText: ReturnType<VaultSync["getTextForPath"]>;
+	readonly expectedCrdtContent: string | null;
+	readonly expectedEditorTicket: OpenEditorMutationTicket | null;
+	readonly expectedVisibleAuthorityMarker: DeferredVisibleEditorAuthority | null;
+	readonly expectedInterceptedCandidate: InterceptedExternalDiskMutation | null;
+	readonly expectedCandidateIdentityEpoch: number;
+	readonly shouldAbort: () => boolean;
+}
+
+type OpenExternalTraceMessage =
+	| "open-external-candidate-captured"
+	| "open-external-recent-typing-deferred"
+	| "open-external-clean-merge-applied"
+	| "open-external-overlapping-hunk-preserved"
+	| "open-external-frontmatter-blocked"
+	| "open-external-disk-settled"
+	| "open-external-baseline-advanced";
+
+type OpenExternalTraceReason =
+	| "intercepted-external-disk-mutation"
+	| "recent-editor-activity"
+	| "recent-editor-activity-local-only"
+	| "apply-external"
+	| "apply-clean-merge"
+	| "overlapping-hunks"
+	| "bound-file-open-safe-external-merge"
+	| "already-settled"
+	| "open-external-representation-normalized"
+	| "open-external-current-only"
+	| "open-external-overlapping-hunks"
+	| "open-external-missing-baseline";
+
+interface OpenExternalTraceDetails extends Record<string, unknown> {
+	path: string;
+	reason: OpenExternalTraceReason;
+	sequence?: number;
+	contentLength?: number;
+	diskLength?: number;
+	currentLength?: number | null;
+	targetLength?: number;
+	hunkCount?: number;
+	deferMs?: number;
+	artifactCreated?: boolean;
+	contentHashPrefix?: string | null;
+}
 
 type OpenEditorDiskMutationCommit<T> =
 	| { kind: "committed"; value: T }
@@ -278,6 +391,8 @@ interface ReconciliationControllerDeps {
 	recordBaselineText?(contentHash: string, text: string): void;
 	recordConflictMergeBase?(artifactPath: string, baseHash: string): void;
 	isMarkdownPathSyncable(path: string): boolean;
+	getMarkdownAttentionGeneration?(): number;
+	getMarkdownSyncScopeGeneration?(): number;
 	/** True only for built-in system/generated paths, never a user preference. */
 	shouldTombstoneIntrinsicMarkdownPath?(path: string): boolean;
 	/** True only for built-in system/generated paths, never a user preference. */
@@ -320,15 +435,8 @@ interface ReconciliationControllerDeps {
 	 * Returns null if no trace is active or hash computation fails.
 	 */
 	computeRecoveryStateHash?(path: string, content: string): Promise<string | null>;
-	/**
-	 * Optional: override the external edit policy used inside syncFileFromDisk.
-	 * Absent in production. Supplied by the QA harness to set a transient
-	 * in-memory override without persisting or pushing settings metadata.
-	 * When present, this callback is called with the runtime policy and may
-	 * return a different value; returning null/undefined falls back to the
-	 * runtime policy.
-	 */
-	getEffectiveExternalEditPolicy?(runtimePolicy: import("../settings").ExternalEditPolicy): import("../settings").ExternalEditPolicy | null | undefined;
+	/** True only while the explicit QA disk-ingest control is suspended. */
+	isDiskIngestSuspendedForQa?(): boolean;
 	/**
 	 * Optional: harness registration hook for disk-ingest control.
 	 * Called once during reconciliation setup. The callback receives a
@@ -502,13 +610,32 @@ export class ReconciliationController {
 	private diskBaselineRevisions = new Map<string, number>();
 	/** Exact live editor authority that must survive an open -> closed race. */
 	private visibleAuthorityDeferredPaths = new Map<string, DeferredVisibleEditorAuthority>();
-	/** Serialize conflict-copy preservation for rejected external editor reloads. */
-	private externalEditorReloadPreservationByPath = new Map<string, Promise<void>>();
+	/**
+	 * Exact open-file flush leases currently inside DiskMirror. This registry
+	 * scopes marker identity preservation to the active flush window; it never
+	 * attributes an event by timing or relaxes editor/CRDT/baseline authority.
+	 */
+	private activeOpenFlushAuthorityLeases =
+		new Map<string, Set<OpenFlushAuthorityLease>>();
+	/** Exact raw intercepted disk revisions awaiting safe open-file reconciliation. */
+	private interceptedExternalDiskMutations = new Map<string, InterceptedExternalDiskMutation>();
+	/** FIFO revisions that must reach a durable artifact before retirement. */
+	private pendingSupersededExternalDiskMutations =
+		new Map<string, InterceptedExternalDiskMutation[]>();
+	/** At most one superseded-candidate artifact drain may write for a path. */
+	private supersededExternalPreservationByPath =
+		new Map<string, Promise<ExternalCandidatePreservationResult>>();
+	/** Exact Attention episode owned by a failed superseded-candidate write. */
+	private supersededExternalPreservationFailures = new Map<string, {
+		candidate: InterceptedExternalDiskMutation;
+		episodeId: string;
+	}>();
+	/** Monotonic path-identity fence for intercepted external disk candidates. */
+	private externalCandidateIdentityEpochs = new Map<string, number>();
 	/** Invalidates fire-and-forget preservation work across reset/reinitialization. */
 	private lifecycleGeneration = 0;
 	/** At most one Keep/Accept resolution may own a Markdown path. */
 	private markdownRemoteDeleteResolutions = new Map<string, InternalMarkdownResolutionLease>();
-	private closedOnlyDeferredImports = new Set<string>();
 	private markdownDrainPromise: Promise<void> | null = null;
 	private markdownDrainTimer: ReturnType<typeof setTimeout> | null = null;
 	private lastMarkdownDirtyAt = 0;
@@ -541,6 +668,16 @@ export class ReconciliationController {
 		// In normal production, registerDiskIngestHarnessPort is absent.
 		deps.registerDiskIngestPort?.({
 			ingestDiskFileNow: async (path, reason) => {
+				if (
+					__KAOS_QA_HARNESS_ENABLED__ &&
+					this.deps.isDiskIngestSuspendedForQa?.() === true
+				) {
+					this.deps.trace("qa", "disk-ingest-suspended", {
+						path,
+						reason: "qa-disk-ingest-suspended",
+					});
+					return;
+				}
 				const abstractFile = this.deps.app.vault.getAbstractFileByPath(path);
 				if (!(abstractFile instanceof TFile)) {
 					throw new Error(`ingestDiskFileNow: not a file: ${path}`);
@@ -621,8 +758,17 @@ export class ReconciliationController {
 		this.reconcilePending = true;
 	}
 
-	reset(): void {
+	/**
+	 * Synchronously invalidate every async authority snapshot owned by this
+	 * controller. Teardown calls this before any awaited cleanup; it deliberately
+	 * performs no I/O, scheduling, or state cleanup of its own.
+	 */
+	revokeAsyncAuthority(): void {
 		this.lifecycleGeneration += 1;
+	}
+
+	reset(): void {
+		this.revokeAsyncAuthority();
 		if (this.reconcileCooldownTimer) {
 			clearTimeout(this.reconcileCooldownTimer);
 			this.reconcileCooldownTimer = null;
@@ -646,8 +792,14 @@ export class ReconciliationController {
 		this.markdownRemoteDeleteResolutions.clear();
 		this.markdownDiskRevisions.clear();
 		this.visibleAuthorityDeferredPaths.clear();
-		this.externalEditorReloadPreservationByPath.clear();
-		this.closedOnlyDeferredImports.clear();
+		this.activeOpenFlushAuthorityLeases.clear();
+		this.interceptedExternalDiskMutations.clear();
+		this.pendingSupersededExternalDiskMutations.clear();
+		this.supersededExternalPreservationByPath.clear();
+		this.supersededExternalPreservationFailures.clear();
+		// lifecycleGeneration advances before epochs reset, so old async work cannot
+		// become current again when a cleared path starts at epoch zero.
+		this.externalCandidateIdentityEpochs.clear();
 		this.markdownDrainPromise = null;
 		this.lastMarkdownDirtyAt = 0;
 		this.recoveryFingerprints.clear();
@@ -737,6 +889,7 @@ export class ReconciliationController {
 			result?.kind === "deferred" &&
 			(result.reason === "disk-changed-during-write" ||
 				result.reason === "crdt-changed-during-write" ||
+				result.reason === "authority-stale" ||
 				result.reason === "open-editor-mismatch" ||
 				result.reason === "active-editor-unflushed" ||
 				result.reason === "recent-editor-activity")
@@ -1256,6 +1409,32 @@ export class ReconciliationController {
 				crdtPathCount: vaultSync.getActiveMarkdownPaths().length,
 			});
 
+			// An intercepted open-file revision may be older than the stable bytes
+			// observed by this full scan. Preserve that exact revision before the
+			// snapshot enters VaultSync's synchronous classification lanes.
+			for (const [path, content] of Array.from(diskFiles.entries())) {
+				const hasCandidateState =
+					this.interceptedExternalDiskMutations.has(path) ||
+					this.pendingSupersededExternalDiskMutations.has(path);
+				if (!hasCandidateState || this.getOpenMarkdownViewsForPath(path).length === 0) {
+					continue;
+				}
+				const candidateAdmission = await this.admitStableExternalDiskMutation(path, content);
+				if (candidateAdmission.kind === "preserved") continue;
+
+				diskFiles.delete(path);
+				diskSnapshotRevisions.delete(path);
+				const reason = candidateAdmission.kind === "failed-retained"
+					? "external-candidate-preservation-failed"
+					: "external-candidate-admission-invalidated";
+				this.requestReconciliationFollowup(path, reason);
+				this.deps.trace("reconcile", "external-candidate-admission-deferred", {
+					path,
+					stage: "full-reconcile-open-file",
+					reason,
+				});
+			}
+
 			// No-event rename inference is observation-only. It may conservatively
 			// block an old/new pair for this pass, but it never mutates CRDT identity.
 			// Explicit vault/provider rename events retain their normal path.
@@ -1431,6 +1610,8 @@ export class ReconciliationController {
 			let flushedUpdates = 0;
 			let safetyBrakeTriggered = false;
 			let safetyBrakeReason: string | null = null;
+			const interceptedCandidatesToClearAfterIndexSave =
+				new Set<InterceptedExternalDiskMutation>();
 
 			// Evaluate safety brake using pure policy function.
 			const safetyBrakeDecision = evaluateSafetyBrake({
@@ -1693,6 +1874,10 @@ export class ReconciliationController {
 							this.requestReconciliationFollowup(path, "open-file-disk-advanced-after-scan");
 							continue;
 						}
+						const interceptedCandidate = this.getMatchingInterceptedExternalDiskMutation(
+							path,
+							diskContent,
+						);
 						const editorSettleDefer =
 							await this.getOpenEditorReconcileSettleDefer({
 								path,
@@ -1721,24 +1906,61 @@ export class ReconciliationController {
 							openViews,
 							eligibleFileByPath.get(path) ?? null,
 						);
-						const currentOpenCrdtContent = yTextToString(
-							vaultSync.getTextForPath(path),
-						);
-						const currentEditorAuthority = this.getOpenEditorAuthority(openViews);
-						if (
-							currentOpenCrdtContent === diskContent &&
-							currentEditorAuthority.kind === "single" &&
-							currentEditorAuthority.content === diskContent
-						) {
+						const currentOpenYText = vaultSync.getTextForPath(path);
+						const openSettlement = currentOpenYText
+							? this.captureBoundFileSettlement(
+								path,
+								diskContent,
+								currentOpenYText,
+								openViews,
+							)
+							: undefined;
+						if (openSettlement !== undefined) {
+							const baselineSettled = await this.updateDiskIndexForPath(
+								path,
+								openSettlement.content,
+								allStats.get(path) ?? null,
+								{
+									expectedDiskFile: openFile,
+									expectedYText: openSettlement.expectedYText,
+									expectedCrdtContent: openSettlement.expectedCrdtContent,
+									expectedEditorTicket: openSettlement.expectedEditorTicket,
+									expectedOpenEditorContent: openSettlement.expectedOpenEditorContent,
+								},
+							);
+							if (!baselineSettled) {
+								deferredOpenEditorIndexPaths.add(path);
+								this.requestReconciliationFollowup(
+									path,
+									"open-file-reconcile-settlement-stale",
+								);
+								continue;
+							}
+							if (interceptedCandidate) {
+								const contentHashPrefix =
+									this.deps.getDiskIndex()[path]?.contentHash?.slice(0, 12) ?? null;
+								this.traceOpenExternalEvent("open-external-disk-settled", {
+									path,
+									reason: "already-settled",
+									contentLength: openSettlement.content.length,
+									contentHashPrefix,
+								});
+								this.traceOpenExternalEvent("open-external-baseline-advanced", {
+									path,
+									reason: "already-settled",
+									contentLength: openSettlement.content.length,
+									contentHashPrefix,
+								});
+							}
 							this.resolveConvergedVisibleAuthority(path);
-							const settledHash = await contentBaselineHash(diskContent);
-							recordSettledBaseline(path, settledHash, diskContent);
+							if (interceptedCandidate) {
+								interceptedCandidatesToClearAfterIndexSave.add(interceptedCandidate);
+							}
 							continue;
 						}
 						// Re-plan unresolved open state through the open-bound authority
-						// planner directly. A generic dirty import is unsafe under the default
-						// closed-only policy: it is skipped while open, then can import stale
-						// disk content after close and visibly revert the editor.
+						// planner directly. A generic dirty import would discard the captured
+						// B/L/D authority relationship and could apply stale disk content.
 						const liveFile = openFile;
 						const currentYText = vaultSync.getTextForPath(path);
 						if (!liveFile || !currentYText) {
@@ -1758,9 +1980,46 @@ export class ReconciliationController {
 								this.getMarkdownDiskRevision(path),
 						);
 						if (openReplan.kind === "handled") {
-							if (openReplan.settledContent !== undefined) {
-								const settledHash = await contentBaselineHash(openReplan.settledContent);
-								recordSettledBaseline(path, settledHash, openReplan.settledContent);
+							if (openReplan.settlement !== undefined) {
+								const baselineSettled = await this.updateDiskIndexForPath(
+									path,
+									openReplan.settlement.content,
+									allStats.get(path) ?? null,
+									{
+										expectedDiskFile: liveFile,
+										expectedYText: openReplan.settlement.expectedYText,
+										expectedCrdtContent: openReplan.settlement.expectedCrdtContent,
+										expectedEditorTicket: openReplan.settlement.expectedEditorTicket,
+										expectedOpenEditorContent: openReplan.settlement.expectedOpenEditorContent,
+									},
+								);
+								if (!baselineSettled) {
+									deferredOpenEditorIndexPaths.add(path);
+									this.requestReconciliationFollowup(
+										path,
+										"open-bound-replan-settlement-stale",
+									);
+									continue;
+								}
+								if (interceptedCandidate) {
+									const contentHashPrefix =
+										this.deps.getDiskIndex()[path]?.contentHash?.slice(0, 12) ?? null;
+									this.traceOpenExternalEvent("open-external-disk-settled", {
+										path,
+										reason: "already-settled",
+										contentLength: openReplan.settlement.content.length,
+										contentHashPrefix,
+									});
+									this.traceOpenExternalEvent("open-external-baseline-advanced", {
+										path,
+										reason: "already-settled",
+										contentLength: openReplan.settlement.content.length,
+										contentHashPrefix,
+									});
+								}
+								if (interceptedCandidate) {
+									interceptedCandidatesToClearAfterIndexSave.add(interceptedCandidate);
+								}
 							} else {
 								deferredOpenEditorIndexPaths.add(path);
 								this.requestReconciliationFollowup(
@@ -1778,13 +2037,36 @@ export class ReconciliationController {
 							continue;
 						}
 						if (openReplan.kind === "flush-crdt-to-disk") {
-							const writeResult = await diskMirror.flushWrite(path, true, {
-								recordBaseline: true,
-								expectedDiskContent: diskContent,
-							});
+							const openExternalTraceReason =
+								this.getOpenExternalSettlementTraceReason(openReplan.reason);
+							const writeResult = await this.flushWithOpenAuthorityLease(
+								diskMirror,
+								path,
+								diskContent,
+								openReplan.authorityLease,
+							);
 							if (this.isDiskWriteSettled(writeResult)) {
 								if (writeResult.kind === "written") flushedUpdates++;
+								if (openExternalTraceReason !== null) {
+									this.traceOpenExternalEvent("open-external-disk-settled", {
+										path,
+										reason: openExternalTraceReason,
+										contentLength: writeResult.content.length,
+										contentHashPrefix: writeResult.contentHash.slice(0, 12),
+									});
+								}
 								recordSettledBaseline(path, writeResult.contentHash, writeResult.content);
+								if (openExternalTraceReason !== null) {
+									this.traceOpenExternalEvent("open-external-baseline-advanced", {
+										path,
+										reason: openExternalTraceReason,
+										contentLength: writeResult.content.length,
+										contentHashPrefix: writeResult.contentHash.slice(0, 12),
+									});
+								}
+								if (interceptedCandidate) {
+									interceptedCandidatesToClearAfterIndexSave.add(interceptedCandidate);
+								}
 							} else {
 								if (openReplan.reason !== "bound-file-disk-at-baseline") {
 									deferredOpenEditorIndexPaths.add(path);
@@ -2301,6 +2583,11 @@ export class ReconciliationController {
 
 			this.untrackedFiles = result.untracked;
 			await this.deps.saveDiskIndex();
+			if (!safetyBrakeTriggered) {
+				for (const candidate of interceptedCandidatesToClearAfterIndexSave) {
+					this.clearInterceptedExternalDiskMutation(candidate);
+				}
+			}
 			// Local attachment delete/rename events can arrive while provider sync
 			// or startup reconciliation is still pending. Commit their durable,
 			// disk-verified intent before declaring reconciliation complete and
@@ -2560,117 +2847,299 @@ export class ReconciliationController {
 		// an editor snapshot captured for the previous occupant authorize it.
 		if (reason === "create") {
 			this.visibleAuthorityDeferredPaths.delete(file.path);
+			this.invalidateExternalCandidateIdentity(file.path);
 		}
+		const preserveActiveFlushMarker =
+			reason === "modify" && this.canPreserveMarkerForActiveOpenFlush(file.path);
 		// Every new vault event invalidates any older async stable-read/recovery
 		// ticket for this path before the replacement work is queued.
 		this.noteMarkdownDiskMutation(file.path);
-		this.captureVisibleAuthorityAtDirtyAdmission(file.path, reason);
+		if (preserveActiveFlushMarker) {
+			this.deps.trace("reconcile", "open-flush-active-marker-preserved", {
+				path: file.path,
+				reason,
+				diskRevision: this.getMarkdownDiskRevision(file.path),
+			});
+		} else {
+			this.captureVisibleAuthorityAtDirtyAdmission(file.path, reason);
+		}
 		this.queueDirtyMarkdownPath(file.path, reason, opId);
 	}
 
-	/**
-	 * Preserve bytes from another app when its attempted CodeMirror reload was
-	 * rejected to keep an open editor authoritative. The primary path remains
-	 * untouched here; ordinary reconciliation decides its eventual winner.
-	 */
-	preserveRejectedExternalEditorReload(path: string, externalContent: string): Promise<void> {
-		const generation = this.lifecycleGeneration;
-		const previous = this.externalEditorReloadPreservationByPath.get(path)
-			?? Promise.resolve();
-		const current = previous
-			.catch(() => undefined)
-			.then(() => {
-				if (generation !== this.lifecycleGeneration) return;
-				return this.preserveRejectedExternalEditorReloadNow(
-					path,
-					externalContent,
-					generation,
-				);
-			});
-		this.externalEditorReloadPreservationByPath.set(path, current);
-		return current.finally(() => {
-			if (this.externalEditorReloadPreservationByPath.get(path) === current) {
-				this.externalEditorReloadPreservationByPath.delete(path);
-			}
-		});
-	}
-
-	private async preserveRejectedExternalEditorReloadNow(
-		path: string,
-		externalContent: string,
-		generation: number,
-	): Promise<void> {
-		const isCurrent = () => generation === this.lifecycleGeneration;
-		if (!isCurrent()) return;
-		if (!this.deps.isMarkdownPathSyncable(path)) return;
-		let preservedContent = externalContent;
-		const currentFile = this.deps.app.vault.getAbstractFileByPath(path);
-		if (currentFile instanceof TFile) {
-			try {
-				const currentDiskContent = await this.deps.app.vault.read(currentFile);
-				if (!isCurrent()) return;
-				if (
-					currentDiskContent === externalContent ||
-					currentDiskContent.replace(/\r\n?/g, "\n") === externalContent
-				) {
-					// CodeMirror normalizes line endings. Prefer the matching on-disk
-					// representation so a CRLF external edit is preserved faithfully.
-					preservedContent = currentDiskContent;
-				}
-			} catch {
-				// The transaction snapshot still preserves the rejected text candidate.
-			}
-		}
-		const currentCrdtContent = yTextToString(
-			this.deps.getVaultSync()?.getTextForPath(path),
-		);
-		const currentEditorAuthority = this.getOpenEditorAuthority(
-			this.getOpenMarkdownViewsForPath(path),
-		);
-		if (
-			currentCrdtContent === externalContent &&
-			(
-				currentEditorAuthority.kind !== "single" ||
-				currentEditorAuthority.content === externalContent
-			)
-		) {
+	noteInterceptedExternalDiskMutation(candidate: InterceptedExternalDiskMutation): void {
+		const current = this.interceptedExternalDiskMutations.get(candidate.path);
+		if (current?.sequence === candidate.sequence) {
+			void this.startSupersededExternalPreservationDrain(candidate.path);
 			return;
 		}
-
-		try {
-			const artifact = await this.createMarkdownConflictArtifact(
-				path,
-				preservedContent,
-				"external-editor-reload-rejected",
-				"disk",
-				isCurrent,
-			);
-			if (!isCurrent()) return;
-			this.deps.trace("conflict", "external-editor-reload-preserved", {
-				path,
-				conflictPath: artifact.path,
-				created: artifact.created,
-				externalLength: preservedContent.length,
-				crdtLength: currentCrdtContent?.length ?? null,
-				editorAuthorityKind: currentEditorAuthority.kind,
-			});
-			if (artifact.created) {
-				this.showConflictNotice(
-					`External change detected for "${path.split("/").pop()}" — ` +
-					"the open editor was kept and the external version was preserved as a conflict note.",
-				);
+		if (current && current.sequence > candidate.sequence) {
+			if (current.content !== candidate.content) {
+				void this.enqueueSupersededExternalDiskMutation(candidate);
 			}
-		} catch (err) {
-			if (!isCurrent()) return;
-			this.deps.getDiskMirror()?.recordPreservedUnresolved?.(
-				path,
-				"conflict-artifact-write-failed",
-			);
-			this.deps.trace("conflict", "external-editor-reload-preserve-failed", {
-				path,
-				externalLength: preservedContent.length,
-				error: err instanceof Error ? err.message : String(err),
+			return;
+		}
+		if (
+			current &&
+			candidate.sequence > current.sequence &&
+			current.content !== candidate.content
+		) {
+			void this.enqueueSupersededExternalDiskMutation(current);
+		}
+		this.interceptedExternalDiskMutations.set(candidate.path, candidate);
+		this.traceOpenExternalEvent("open-external-candidate-captured", {
+			path: candidate.path,
+			reason: "intercepted-external-disk-mutation",
+			sequence: candidate.sequence,
+			contentLength: candidate.content.length,
+		});
+		this.queueDirtyMarkdownPath(candidate.path, "modify");
+	}
+
+	private isSameExternalCandidate(
+		left: InterceptedExternalDiskMutation,
+		right: InterceptedExternalDiskMutation,
+	): boolean {
+		return left.sequence === right.sequence && left.content === right.content;
+	}
+
+	private externalCandidateMatchesStableDisk(
+		candidateContent: string,
+		stableDiskContent: string,
+	): boolean {
+		return candidateContent === stableDiskContent ||
+			normalizeEditorText(candidateContent) === normalizeEditorText(stableDiskContent);
+	}
+
+	private enqueueSupersededExternalDiskMutation(
+		candidate: InterceptedExternalDiskMutation,
+	): Promise<ExternalCandidatePreservationResult> {
+		const pending = this.pendingSupersededExternalDiskMutations.get(candidate.path) ?? [];
+		if (!pending.some((queued) => this.isSameExternalCandidate(queued, candidate))) {
+			pending.push(candidate);
+			this.pendingSupersededExternalDiskMutations.set(candidate.path, pending);
+		}
+		return this.startSupersededExternalPreservationDrain(candidate.path);
+	}
+
+	private startSupersededExternalPreservationDrain(
+		path: string,
+	): Promise<ExternalCandidatePreservationResult> {
+		const existing = this.supersededExternalPreservationByPath.get(path);
+		if (existing) {
+			// A candidate from a replacement path identity may arrive while stale work
+			// is still unwinding. Chain its drain rather than racing the old writer.
+			return existing.then((result) => {
+				if (!this.pendingSupersededExternalDiskMutations.has(path)) {
+					return result;
+				}
+				return this.startSupersededExternalPreservationDrain(path);
 			});
+		}
+
+		const lifecycleGeneration = this.lifecycleGeneration;
+		const pathIdentityEpoch = this.getExternalCandidateIdentityEpoch(path);
+		const drain = this.drainSupersededExternalDiskMutations(
+			path,
+			lifecycleGeneration,
+			pathIdentityEpoch,
+		);
+		this.supersededExternalPreservationByPath.set(path, drain);
+		const clearIfCurrent = () => {
+			if (this.supersededExternalPreservationByPath.get(path) === drain) {
+				this.supersededExternalPreservationByPath.delete(path);
+			}
+		};
+		void drain.then(clearIfCurrent, clearIfCurrent);
+		return drain;
+	}
+
+	private async drainSupersededExternalDiskMutations(
+		path: string,
+		lifecycleGeneration: number,
+		pathIdentityEpoch: number,
+	): Promise<ExternalCandidatePreservationResult> {
+		const isCurrent = () =>
+			lifecycleGeneration === this.lifecycleGeneration &&
+			pathIdentityEpoch === this.getExternalCandidateIdentityEpoch(path) &&
+			this.deps.isMarkdownPathSyncable(path);
+		if (!isCurrent()) return { kind: "invalidated" };
+
+		while (isCurrent()) {
+			const pending = this.pendingSupersededExternalDiskMutations.get(path);
+			const candidate = pending?.[0];
+			if (!pending || !candidate) return { kind: "preserved" };
+			try {
+				await this.createMarkdownConflictArtifact(
+					candidate.path,
+					candidate.content,
+					"superseded-external-revision",
+					"disk",
+					isCurrent,
+				);
+			} catch (error) {
+				if (!isCurrent()) return { kind: "invalidated" };
+				this.deps.getDiskMirror()?.recordPreservedUnresolved?.(
+					candidate.path,
+					"conflict-artifact-write-failed",
+				);
+				this.deps.trace("conflict", "superseded-external-revision-preserve-failed", {
+					path: candidate.path,
+					sequence: candidate.sequence,
+					errorCategory: error instanceof Error ? "exception" : "non-error-throw",
+				});
+				const failureEntry = this.getPreservedUnresolvedMarkdownEntries()
+					.find((entry) =>
+						entry.path === path && entry.reason === "conflict-artifact-write-failed"
+					);
+				if (failureEntry) {
+					this.supersededExternalPreservationFailures.set(path, {
+						candidate,
+						episodeId: getPreservedUnresolvedEpisodeId(failureEntry),
+					});
+				}
+				return { kind: "failed-retained" };
+			}
+
+			if (!isCurrent()) return { kind: "invalidated" };
+			const ownedFailure = this.supersededExternalPreservationFailures.get(path);
+			if (
+				ownedFailure &&
+				this.isSameExternalCandidate(ownedFailure.candidate, candidate)
+			) {
+				const currentEntry = this.getPreservedUnresolvedMarkdownEntries()
+					.find((entry) => entry.path === path);
+				if (
+					currentEntry?.reason === "conflict-artifact-write-failed" &&
+					getPreservedUnresolvedEpisodeId(currentEntry) === ownedFailure.episodeId
+				) {
+					this.deps.getDiskMirror()?.clearPreservedUnresolved?.(path);
+				}
+				this.supersededExternalPreservationFailures.delete(path);
+			}
+			if (this.pendingSupersededExternalDiskMutations.get(path) !== pending) {
+				return { kind: "invalidated" };
+			}
+			const currentIndex = pending.findIndex((queued) =>
+				this.isSameExternalCandidate(queued, candidate)
+			);
+			if (currentIndex >= 0) pending.splice(currentIndex, 1);
+			if (pending.length === 0) {
+				this.pendingSupersededExternalDiskMutations.delete(path);
+			}
+		}
+		return { kind: "invalidated" };
+	}
+
+	private hasPendingSupersededExternalDiskMutation(
+		candidate: InterceptedExternalDiskMutation,
+	): boolean {
+		return this.pendingSupersededExternalDiskMutations.get(candidate.path)
+			?.some((queued) => this.isSameExternalCandidate(queued, candidate)) ?? false;
+	}
+
+	/**
+	 * Fence a stable disk snapshot behind every exact intercepted revision that
+	 * would otherwise be lost. This helper mutates neither primary authority nor
+	 * baseline; callers may process the stable snapshot only after `preserved`.
+	 */
+	private async admitStableExternalDiskMutation(
+		path: string,
+		stableDiskContent: string,
+	): Promise<ExternalCandidatePreservationResult> {
+		const lifecycleGeneration = this.lifecycleGeneration;
+		const pathIdentityEpoch = this.getExternalCandidateIdentityEpoch(path);
+		const isCurrent = () =>
+			lifecycleGeneration === this.lifecycleGeneration &&
+			pathIdentityEpoch === this.getExternalCandidateIdentityEpoch(path) &&
+			this.deps.isMarkdownPathSyncable(path);
+		if (!isCurrent()) return { kind: "invalidated" };
+
+		const latestBeforePendingDrain = this.interceptedExternalDiskMutations.get(path) ?? null;
+		const latestWasPendingMismatch = latestBeforePendingDrain !== null &&
+			!this.externalCandidateMatchesStableDisk(
+				latestBeforePendingDrain.content,
+				stableDiskContent,
+			) &&
+			this.hasPendingSupersededExternalDiskMutation(latestBeforePendingDrain);
+		if (this.pendingSupersededExternalDiskMutations.has(path)) {
+			const pendingResult = await this.startSupersededExternalPreservationDrain(path);
+			if (pendingResult.kind !== "preserved") return pendingResult;
+			if (!isCurrent()) return { kind: "invalidated" };
+			if (latestWasPendingMismatch) {
+				if (
+					latestBeforePendingDrain === null ||
+					this.interceptedExternalDiskMutations.get(path) !== latestBeforePendingDrain
+				) {
+					return { kind: "invalidated" };
+				}
+				this.interceptedExternalDiskMutations.delete(path);
+			}
+		}
+
+		const latest = this.interceptedExternalDiskMutations.get(path) ?? null;
+		if (
+			!latest ||
+			this.externalCandidateMatchesStableDisk(latest.content, stableDiskContent)
+		) {
+			return { kind: "preserved" };
+		}
+
+		const preservationResult = await this.enqueueSupersededExternalDiskMutation(latest);
+		if (preservationResult.kind !== "preserved") return preservationResult;
+		if (!isCurrent()) return { kind: "invalidated" };
+		if (this.interceptedExternalDiskMutations.get(path) !== latest) {
+			return { kind: "invalidated" };
+		}
+		this.interceptedExternalDiskMutations.delete(path);
+		return { kind: "preserved" };
+	}
+
+	private getExternalCandidateIdentityEpoch(path: string): number {
+		return this.externalCandidateIdentityEpochs.get(path) ?? 0;
+	}
+
+	private clearInvalidatedExternalCandidateAttention(path: string): void {
+		const ownedFailure = this.supersededExternalPreservationFailures.get(path);
+		if (!ownedFailure) return;
+		const currentEntry = this.getPreservedUnresolvedMarkdownEntries()
+			.find((entry) => entry.path === path);
+		if (
+			currentEntry?.reason === "conflict-artifact-write-failed" &&
+			getPreservedUnresolvedEpisodeId(currentEntry) === ownedFailure.episodeId
+		) {
+			this.deps.getDiskMirror()?.clearPreservedUnresolved?.(path);
+		}
+	}
+
+	private invalidateExternalCandidateIdentity(path: string): void {
+		// Fence in-flight artifact work before inspecting or clearing its Attention
+		// ownership, so a stale catch cannot publish a replacement episode afterward.
+		this.externalCandidateIdentityEpochs.set(
+			path,
+			this.getExternalCandidateIdentityEpoch(path) + 1,
+		);
+		this.clearInvalidatedExternalCandidateAttention(path);
+		this.interceptedExternalDiskMutations.delete(path);
+		this.pendingSupersededExternalDiskMutations.delete(path);
+		this.supersededExternalPreservationFailures.delete(path);
+	}
+
+	private getMatchingInterceptedExternalDiskMutation(
+		path: string,
+		diskContent: string,
+	): InterceptedExternalDiskMutation | null {
+		const candidate = this.interceptedExternalDiskMutations.get(path) ?? null;
+		return candidate && this.externalCandidateMatchesStableDisk(candidate.content, diskContent)
+			? candidate
+			: null;
+	}
+
+	private clearInterceptedExternalDiskMutation(
+		candidate: InterceptedExternalDiskMutation | null,
+	): void {
+		if (!candidate) return;
+		if (this.interceptedExternalDiskMutations.get(candidate.path) === candidate) {
+			this.interceptedExternalDiskMutations.delete(candidate.path);
 		}
 	}
 
@@ -2811,6 +3280,7 @@ export class ReconciliationController {
 		const lease = Object.freeze({ path, operation, generation }) as InternalMarkdownResolutionLease;
 		this.markdownRemoteDeleteResolutions.set(path, lease);
 		const droppedQueued = this.dirtyMarkdownPaths.delete(path);
+		this.invalidateExternalCandidateIdentity(path);
 		this.deps.trace("reconcile", "markdown-remote-delete-resolution-began", {
 			path,
 			operation,
@@ -3369,6 +3839,8 @@ export class ReconciliationController {
 		oldPath: string,
 		newPath: string,
 	): PreservedUnresolvedRedirectResult {
+		this.invalidateExternalCandidateIdentity(oldPath);
+		this.invalidateExternalCandidateIdentity(newPath);
 		// Attention ownership follows the filesystem identity. This is deliberately
 		// invoked even when no dirty ingest is queued: local rename callbacks are the
 		// authoritative opportunity to move a path-scoped unresolved episode.
@@ -3454,39 +3926,10 @@ export class ReconciliationController {
 	 */
 	dropDirtyPath(path: string): void {
 		this.visibleAuthorityDeferredPaths.delete(path);
+		this.invalidateExternalCandidateIdentity(path);
 		if (this.dirtyMarkdownPaths.delete(path)) {
 			this.deps.log(`dropDirtyPath: dropped excluded dirty entry for "${path}"`);
 		}
-	}
-
-	maybeImportDeferredClosedOnlyPath(path: string, reason: string): void {
-		if (!this.reconciled) return;
-		if (this.deps.getRuntimeConfig().externalEditPolicy !== "closed-only") return;
-		if (!this.deps.isMarkdownPathSyncable(path)) return;
-		if (this.closedOnlyDeferredImports.has(path)) return;
-		if (this.getOpenMarkdownViewsForPath(path).length > 0) return;
-		const file = this.deps.app.vault.getAbstractFileByPath(path);
-		if (!(file instanceof TFile)) return;
-
-		this.closedOnlyDeferredImports.add(path);
-		this.deps.trace("trace", "closed-only-deferred-import-queued", {
-			path,
-			reason,
-		});
-
-		const deferredOpId = `op-deferred-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-		void this.processDirtyMarkdownPath(path, {
-			reason: "modify",
-			primaryOpId: deferredOpId,
-			coalescedOpIds: [deferredOpId],
-			retryCount: 0,
-		})
-			.catch((err) => {
-				console.error(`[kaos] closed-only deferred import failed for "${path}" (${reason}):`, err);
-			})
-			.finally(() => {
-				this.closedOnlyDeferredImports.delete(path);
-			});
 	}
 
 	private scheduleMarkdownDrain(): void {
@@ -3563,6 +4006,16 @@ export class ReconciliationController {
 		path: string,
 		entry: MarkdownDirtyEntry,
 	): Promise<void> {
+		if (
+			__KAOS_QA_HARNESS_ENABLED__ &&
+			this.deps.isDiskIngestSuspendedForQa?.() === true
+		) {
+			this.deps.trace("qa", "disk-ingest-suspended", {
+				path,
+				reason: "qa-disk-ingest-suspended",
+			});
+			return;
+		}
 		if (
 			this.isMarkdownResolutionActive(path)
 			|| (
@@ -3658,6 +4111,32 @@ export class ReconciliationController {
 			const stableDiskRevision = this.getMarkdownDiskRevision(path);
 			if (!this.deps.isMarkdownPathSyncable(path)) return;
 
+			const externalCandidateAdmission = await this.admitStableExternalDiskMutation(
+				path,
+				content,
+			);
+			if (this.shouldAbortActiveMarkdownIngest(active)) return;
+			if (externalCandidateAdmission.kind === "invalidated") {
+				this.deps.trace("reconcile", "external-candidate-admission-invalidated", {
+					path,
+					stage: "dirty-ingest",
+				});
+				return;
+			}
+			if (externalCandidateAdmission.kind === "failed-retained") {
+				const notBeforeMs = Date.now() + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS;
+				this.mergeDirtyEntryIntoPath(path, {
+					...entry,
+					notBeforeMs: Math.max(entry.notBeforeMs ?? 0, notBeforeMs),
+				});
+				this.deps.trace("reconcile", "external-candidate-admission-deferred", {
+					path,
+					stage: "dirty-ingest",
+					notBeforeMs,
+				});
+				return;
+			}
+
 			const editorBindings = this.deps.getEditorBindings();
 			let wasBound = editorBindings?.isBound(path) ?? false;
 			const openViews = this.getOpenMarkdownViewsForPath(path);
@@ -3671,10 +4150,6 @@ export class ReconciliationController {
 				wasBound = false;
 			}
 
-			const effectivePolicy =
-				this.deps.getEffectiveExternalEditPolicy?.(runtimeConfig.externalEditPolicy)
-				?? runtimeConfig.externalEditPolicy;
-			const policyDecision = decideExternalEditImport(effectivePolicy, isOpenInEditor);
 			const diskMirror = this.deps.getDiskMirror();
 			const preservedEntry = this.getPreservedUnresolvedMarkdownEntries()
 				.find((candidate) => candidate.path === path);
@@ -3685,7 +4160,6 @@ export class ReconciliationController {
 					admittedEpisodeId !== undefined && admittedEpisodeId === currentEpisodeId;
 				if (
 					!canTreatAsFreshLocalResolution ||
-					!policyDecision.allowImport ||
 					isOpenInEditor ||
 					preservedEntry.reason === "path-collision" ||
 					preservedEntry.reason === "unknown"
@@ -3695,7 +4169,6 @@ export class ReconciliationController {
 						reason: preservedEntry.reason,
 						currentEpisodeId,
 						admittedEpisodeId: admittedEpisodeId ?? null,
-						policyReason: policyDecision.reason,
 						isOpenInEditor,
 					});
 					return;
@@ -3722,37 +4195,6 @@ export class ReconciliationController {
 					coalescedOpIds,
 					active,
 				});
-				return;
-			}
-			if (!policyDecision.allowImport) {
-				const reason = policyDecision.reason === "policy-never"
-					? "external edit policy: never"
-					: "external edit policy: closed-only (file is open; deferred)";
-				this.deps.log(`syncFileFromDisk: skipping "${path}" (${reason})`);
-				if (policyDecision.reason === "policy-never") {
-					await this.updateDiskIndexForPath(path, undefined, stableRead.stat);
-				} else {
-					// Obsidian autosave for a normal local y-codemirror edit arrives while
-					// the note is open. closed-only must not import the event, but when all
-					// three visible replicas already agree it is a clean settlement and the
-					// durable baseline must advance. Otherwise the next remote update is
-					// mistaken for an overwrite of an unknown local disk edit and can stall.
-					const currentYText = vaultSync.getTextForPath(path);
-					const editorAuthority = this.getOpenEditorAuthority(openViews);
-					if (
-						currentYText &&
-						yTextToString(currentYText) === content &&
-						editorAuthority.kind === "single" &&
-						editorAuthority.content === content
-					) {
-						await this.updateDiskIndexForPath(path, content, stableRead.stat);
-						this.deps.trace("reconcile", "open-autosave-clean-baseline-observed", {
-							path,
-							contentLength: content.length,
-							openViewCount: openViews.length,
-						});
-					}
-				}
 				return;
 			}
 			if (this.shouldAbortActiveMarkdownIngest(active)) return;
@@ -3796,6 +4238,10 @@ export class ReconciliationController {
 			// `wasBound` views through the open-file planner let the generic disk
 			// importer overwrite the visible editor during that transition.
 			if (isOpenInEditor) {
+				const interceptedCandidate = this.getMatchingInterceptedExternalDiskMutation(
+					path,
+					content,
+				);
 				const boundOutcome = await this.handleBoundFileSyncGap(
 					file,
 					content,
@@ -3807,8 +4253,46 @@ export class ReconciliationController {
 				);
 				if (this.shouldAbortActiveMarkdownIngest(active)) return;
 				if (boundOutcome.kind === "handled") {
-					if (boundOutcome.settledContent !== undefined) {
-						await this.updateDiskIndexForPath(path, boundOutcome.settledContent, stableRead.stat);
+					if (boundOutcome.settlement !== undefined) {
+						const baselineSettled = await this.updateDiskIndexForPath(
+							path,
+							boundOutcome.settlement.content,
+							stableRead.stat,
+							{
+								expectedDiskFile: file,
+								expectedYText: boundOutcome.settlement.expectedYText,
+								expectedCrdtContent: boundOutcome.settlement.expectedCrdtContent,
+								expectedEditorTicket: boundOutcome.settlement.expectedEditorTicket,
+								expectedOpenEditorContent: boundOutcome.settlement.expectedOpenEditorContent,
+							},
+						);
+						if (baselineSettled) {
+							if (interceptedCandidate) {
+								const contentHashPrefix =
+									this.deps.getDiskIndex()[path]?.contentHash?.slice(0, 12) ?? null;
+								this.traceOpenExternalEvent("open-external-disk-settled", {
+									path,
+									reason: "already-settled",
+									contentLength: boundOutcome.settlement.content.length,
+									contentHashPrefix,
+								});
+								this.traceOpenExternalEvent("open-external-baseline-advanced", {
+									path,
+									reason: "already-settled",
+									contentLength: boundOutcome.settlement.content.length,
+									contentHashPrefix,
+								});
+							}
+							this.clearInterceptedExternalDiskMutation(interceptedCandidate);
+						} else {
+							this.mergeDirtyEntryIntoPath(path, {
+								...entry,
+								notBeforeMs: Math.max(
+									entry.notBeforeMs ?? 0,
+									Date.now() + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS,
+								),
+							});
+						}
 					}
 					return;
 				}
@@ -3820,13 +4304,17 @@ export class ReconciliationController {
 					return;
 				}
 				if (boundOutcome.kind === "flush-crdt-to-disk") {
-					const writeResult = await diskMirror?.flushWrite(path, true, {
-						// DiskMirror's atomic result is now the settlement proof even for a
-						// conflict winner; publish it durably instead of leaving a provisional
-						// baseline that can block the next remote update.
-						recordBaseline: true,
-						expectedDiskContent: content,
-					});
+					const openExternalTraceReason =
+						this.getOpenExternalSettlementTraceReason(boundOutcome.reason);
+					// DiskMirror's atomic result is now the settlement proof even for a
+					// conflict winner; publish it durably instead of leaving a provisional
+					// baseline that can block the next remote update.
+					const writeResult = await this.flushWithOpenAuthorityLease(
+						diskMirror,
+						path,
+						content,
+						boundOutcome.authorityLease,
+					);
 					if (!this.isDiskWriteSettled(writeResult)) {
 						this.traceDiskWriteNotSettled(path, writeResult, boundOutcome.reason);
 						this.requestFollowupForUnsettledDiskWrite(
@@ -3847,10 +4335,32 @@ export class ReconciliationController {
 							);
 						}
 					} else {
+						if (openExternalTraceReason !== null) {
+							this.traceOpenExternalEvent("open-external-disk-settled", {
+								path,
+								reason: openExternalTraceReason,
+								contentLength: writeResult.content.length,
+								contentHashPrefix: writeResult.contentHash.slice(0, 12),
+							});
+						}
 						// Even provisional conflict winners are settled once DiskMirror's
 						// compare-and-swap succeeds. Record the exact committed snapshot,
 						// never a later live Y.Text value.
-						await this.updateDiskIndexForPath(path, writeResult.content);
+						const baselineSettled = await this.updateDiskIndexForPath(
+							path,
+							writeResult.content,
+						);
+						if (baselineSettled) {
+							if (openExternalTraceReason !== null) {
+								this.traceOpenExternalEvent("open-external-baseline-advanced", {
+									path,
+									reason: openExternalTraceReason,
+									contentLength: writeResult.content.length,
+									contentHashPrefix: writeResult.contentHash.slice(0, 12),
+								});
+							}
+							this.clearInterceptedExternalDiskMutation(interceptedCandidate);
+						}
 					}
 					return;
 				}
@@ -4006,10 +4516,6 @@ export class ReconciliationController {
 				const baselineHash = this.deps.getDiskIndex()[path]?.contentHash ?? null;
 				const diskHash = await contentBaselineHash(content);
 				const crdtHash = await contentBaselineHash(crdtContent);
-				if (baselineHash === null && effectivePolicy === "closed-only") {
-					this.requestReconciliationFollowup(path, "closed-dirty-missing-baseline");
-					return;
-				}
 				const diskChanged = baselineHash === null ? true : diskHash !== baselineHash;
 				const crdtChanged = baselineHash === null ? false : crdtHash !== baselineHash;
 				if (baselineHash !== null && !diskChanged && crdtChanged) {
@@ -4577,6 +5083,137 @@ export class ReconciliationController {
 		return false;
 	}
 
+	private getStartupOpenFileAuthorityStaleReason(
+		snapshot: StartupOpenFileAuthoritySnapshot,
+	): string | null {
+		const expectedFile = snapshot.file;
+		if (
+			!expectedFile ||
+			expectedFile.path !== snapshot.path ||
+			this.deps.app.vault.getAbstractFileByPath(snapshot.path) !== expectedFile
+		) {
+			return "disk-file-identity-changed";
+		}
+		if (snapshot.diskStat !== null) {
+			const currentStat = {
+				ctime: typeof expectedFile.stat?.ctime === "number" ? expectedFile.stat.ctime : null,
+				mtime: typeof expectedFile.stat?.mtime === "number" ? expectedFile.stat.mtime : null,
+				size: typeof expectedFile.stat?.size === "number" ? expectedFile.stat.size : null,
+			};
+			if (
+				currentStat.ctime !== snapshot.diskStat.ctime ||
+				currentStat.mtime !== snapshot.diskStat.mtime ||
+				currentStat.size !== snapshot.diskStat.size
+			) {
+				return "disk-stat-changed";
+			}
+		}
+		if (
+			(this.deps.getDiskIndex()[snapshot.path]?.contentHash ?? null) !==
+			snapshot.baselineHash
+		) {
+			return "baseline-hash-changed";
+		}
+		if (
+			(this.diskBaselineRevisions.get(snapshot.path) ?? 0) !==
+			snapshot.baselineRevision
+		) {
+			return "baseline-revision-changed";
+		}
+		if (this.lifecycleGeneration !== snapshot.lifecycleGeneration) {
+			return "lifecycle-generation-changed";
+		}
+		if (this.getMarkdownDiskRevision(snapshot.path) !== snapshot.diskRevision) {
+			return "disk-event-generation-changed";
+		}
+		if (
+			(this.visibleAuthorityDeferredPaths.get(snapshot.path) ?? null) !==
+			snapshot.visibleAuthorityMarker
+		) {
+			return "visible-authority-marker-changed";
+		}
+		if (
+			(this.interceptedExternalDiskMutations.get(snapshot.path) ?? null) !==
+			snapshot.interceptedCandidate
+		) {
+			return "external-candidate-changed";
+		}
+		if (
+			this.getExternalCandidateIdentityEpoch(snapshot.path) !==
+			snapshot.candidateIdentityEpoch
+		) {
+			return "external-candidate-identity-changed";
+		}
+		if (
+			(this.deps.getMarkdownAttentionGeneration?.() ?? 0) !== snapshot.attentionGeneration
+		) return "attention-generation-changed";
+		if (
+			(this.deps.getMarkdownSyncScopeGeneration?.() ?? 0) !== snapshot.syncScopeGeneration
+		) return "sync-scope-generation-changed";
+		if (this.isMarkdownPreservedUnresolved(snapshot.path)) {
+			return "preserved-unresolved";
+		}
+		if (!this.deps.isMarkdownPathSyncable(snapshot.path)) {
+			return "path-not-syncable";
+		}
+
+		const currentViews = this.getOpenMarkdownViewsForPath(snapshot.path);
+		const validation = snapshot.editorTicket
+			? this.deps.getEditorBindings()?.validateOpenEditorMutationTicket?.(
+				snapshot.editorTicket,
+				currentViews,
+			) ?? {
+				current: false as const,
+				reason: "binding-manager-unavailable",
+			}
+			: { current: true as const, reason: "no-ticket" };
+		const currentYText = this.deps.getVaultSync()?.getTextForPath(snapshot.path) ?? null;
+		if (currentYText !== snapshot.expectedYText) return "crdt-text-replaced";
+		if (yTextToString(currentYText) !== snapshot.expectedCrdtContent) {
+			return "crdt-content-changed";
+		}
+		if (!validation.current) return validation.reason;
+		return null;
+	}
+
+	/**
+	 * Startup authorities not already covered by commitOpenEditorDiskMutation's
+	 * exact file/disk/baseline/lifecycle/candidate/Y.Text/editor checks. The
+	 * monotonic generations detect Attention and sync-scope ABA, while the live
+	 * predicate rejects a path that is currently outside the effective scope.
+	 */
+	private getStartupOpenFileSupplementalStaleReason(
+		snapshot: StartupOpenFileAuthoritySnapshot,
+	): string | null {
+		if (
+			(this.deps.getMarkdownAttentionGeneration?.() ?? 0) !== snapshot.attentionGeneration
+		) return "attention-generation-changed";
+		if (
+			(this.deps.getMarkdownSyncScopeGeneration?.() ?? 0) !== snapshot.syncScopeGeneration
+		) return "sync-scope-generation-changed";
+		if (!this.deps.isMarkdownPathSyncable(snapshot.path)) return "path-not-syncable";
+		return null;
+	}
+
+	private traceStartupOpenFileAuthorityStale(
+		snapshot: StartupOpenFileAuthoritySnapshot,
+		reason: string,
+		stage: string,
+	): void {
+		this.deps.trace("recovery", "open-editor-mutation-ticket-stale", {
+			path: snapshot.path,
+			stage,
+			reason,
+			expectedDiskRevision: snapshot.diskRevision,
+			currentDiskRevision: this.getMarkdownDiskRevision(snapshot.path),
+			expectedCrdtLength: snapshot.expectedCrdtContent.length,
+			currentCrdtLength:
+				yTextToString(this.deps.getVaultSync()?.getTextForPath(snapshot.path) ?? null)
+					?.length ?? null,
+			openViewCount: this.getOpenMarkdownViewsForPath(snapshot.path).length,
+		});
+	}
+
 	/**
 	 * Final async compare-and-commit fence for every open-file CRDT mutation.
 	 *
@@ -4591,18 +5228,32 @@ export class ReconciliationController {
 		path: string;
 		file: TFile | null;
 		expectedDiskContent: string;
+		expectedDiskStat?: {
+			ctime?: number | null;
+			mtime: number | null;
+			size: number | null;
+		} | null;
+		expectedBaselineHash?: string | null;
+		expectedBaselineRevision?: number;
+		expectedLifecycleGeneration?: number;
 		expectedYText: ReturnType<VaultSync["getTextForPath"]>;
 		expectedCrdtContent: string | null;
 		ticket: OpenEditorMutationTicket | null;
 		expectedDiskRevision: number;
 		expectedVisibleAuthorityMarker: DeferredVisibleEditorAuthority | null;
+		expectedInterceptedCandidate?: InterceptedExternalDiskMutation | null;
+		expectedCandidateIdentityEpoch?: number;
 		shouldAbort?: () => boolean;
+		additionalAuthorityStaleReason?: () => string | null;
 		stage: string;
 		commit: () => T;
 	}): Promise<OpenEditorDiskMutationCommit<T>> {
 		const expectedFile = input.file;
-		const expectedStat = expectedFile
+		const expectedStat = input.expectedDiskStat !== undefined
+			? input.expectedDiskStat
+			: expectedFile
 			? {
+				ctime: typeof expectedFile.stat?.ctime === "number" ? expectedFile.stat.ctime : null,
 				mtime: typeof expectedFile.stat?.mtime === "number" ? expectedFile.stat.mtime : null,
 				size: typeof expectedFile.stat?.size === "number" ? expectedFile.stat.size : null,
 			}
@@ -4646,31 +5297,58 @@ export class ReconciliationController {
 		};
 
 		const callerAborted = input.shouldAbort?.() ?? false;
+		const additionalAuthorityStaleReason =
+			input.additionalAuthorityStaleReason?.() ?? null;
 		const currentDiskRevision = this.getMarkdownDiskRevision(input.path);
+		const currentBaselineHash = this.deps.getDiskIndex()[input.path]?.contentHash ?? null;
+		const currentBaselineRevision = this.diskBaselineRevisions.get(input.path) ?? 0;
+		const currentLifecycleGeneration = this.lifecycleGeneration;
 		const currentVisibleAuthorityMarker =
 			this.visibleAuthorityDeferredPaths.get(input.path) ?? null;
 		const preservedUnresolved = this.isMarkdownPreservedUnresolved(input.path);
 		const diskStatChanged = !!expectedFile && !!expectedStat && (
-			(typeof expectedFile.stat?.mtime === "number" ? expectedFile.stat.mtime : null) !== expectedStat.mtime
+			(expectedStat.ctime !== undefined &&
+				(typeof expectedFile.stat?.ctime === "number" ? expectedFile.stat.ctime : null) !== expectedStat.ctime)
+			|| (typeof expectedFile.stat?.mtime === "number" ? expectedFile.stat.mtime : null) !== expectedStat.mtime
 			|| (typeof expectedFile.stat?.size === "number" ? expectedFile.stat.size : null) !== expectedStat.size
 		);
-		const reason = diskStatChanged
-			? "disk-stat-changed"
-			: diskIdentityChanged
-				? "disk-file-identity-changed"
-				: diskReadFailed
-					? "disk-read-failed"
-					: currentDiskContent !== input.expectedDiskContent
-						? "disk-content-changed"
-						: callerAborted
-							? "caller-aborted"
-							: currentDiskRevision !== input.expectedDiskRevision
-								? "disk-event-generation-changed"
-								: currentVisibleAuthorityMarker !== input.expectedVisibleAuthorityMarker
-									? "visible-authority-marker-changed"
-									: preservedUnresolved
-										? "preserved-unresolved"
-										: null;
+		const currentInterceptedCandidate =
+			this.interceptedExternalDiskMutations.get(input.path) ?? null;
+		const currentCandidateIdentityEpoch = this.getExternalCandidateIdentityEpoch(input.path);
+		let reason: string | null = null;
+		if (diskStatChanged) reason = "disk-stat-changed";
+		else if (diskIdentityChanged) reason = "disk-file-identity-changed";
+		else if (diskReadFailed) reason = "disk-read-failed";
+		else if (currentDiskContent !== input.expectedDiskContent) reason = "disk-content-changed";
+		else if (
+			input.expectedBaselineHash !== undefined &&
+			currentBaselineHash !== input.expectedBaselineHash
+		) reason = "baseline-hash-changed";
+		else if (
+			input.expectedBaselineRevision !== undefined &&
+			currentBaselineRevision !== input.expectedBaselineRevision
+		) reason = "baseline-revision-changed";
+		else if (
+			input.expectedLifecycleGeneration !== undefined &&
+			currentLifecycleGeneration !== input.expectedLifecycleGeneration
+		) reason = "lifecycle-generation-changed";
+		else if (currentDiskRevision !== input.expectedDiskRevision) {
+			reason = "disk-event-generation-changed";
+		} else if (currentVisibleAuthorityMarker !== input.expectedVisibleAuthorityMarker) {
+			reason = "visible-authority-marker-changed";
+		} else if (
+			input.expectedInterceptedCandidate !== undefined &&
+			currentInterceptedCandidate !== input.expectedInterceptedCandidate
+		) reason = "external-candidate-changed";
+		else if (
+			input.expectedCandidateIdentityEpoch !== undefined &&
+			currentCandidateIdentityEpoch !== input.expectedCandidateIdentityEpoch
+		) reason = "external-candidate-identity-changed";
+		else if (preservedUnresolved) reason = "preserved-unresolved";
+		else if (callerAborted) reason = "caller-aborted";
+		else if (additionalAuthorityStaleReason !== null) {
+			reason = additionalAuthorityStaleReason;
+		}
 		if (reason !== null) {
 			return reject(reason, {
 				expectedDiskRevision: input.expectedDiskRevision,
@@ -4693,36 +5371,64 @@ export class ReconciliationController {
 		// exact Y.Text immediately before invoking the mutation callback. No Promise
 		// is resolved between this check and the CRDT transaction.
 		const finalCallerAborted = input.shouldAbort?.() ?? false;
+		const finalAdditionalAuthorityStaleReason =
+			input.additionalAuthorityStaleReason?.() ?? null;
 		const finalPreservedUnresolved = this.isMarkdownPreservedUnresolved(input.path);
 		const finalYText = this.deps.getVaultSync()?.getTextForPath(input.path) ?? null;
 		const finalCrdtContent = yTextToString(finalYText);
 		const finalDiskRevision = this.getMarkdownDiskRevision(input.path);
+		const finalBaselineHash = this.deps.getDiskIndex()[input.path]?.contentHash ?? null;
+		const finalBaselineRevision = this.diskBaselineRevisions.get(input.path) ?? 0;
+		const finalLifecycleGeneration = this.lifecycleGeneration;
 		const finalVisibleAuthorityMarker =
 			this.visibleAuthorityDeferredPaths.get(input.path) ?? null;
+		const finalInterceptedCandidate =
+			this.interceptedExternalDiskMutations.get(input.path) ?? null;
+		const finalCandidateIdentityEpoch = this.getExternalCandidateIdentityEpoch(input.path);
 		const finalDiskStatChanged = !!expectedFile && !!expectedStat && (
-			(typeof expectedFile.stat?.mtime === "number" ? expectedFile.stat.mtime : null) !== expectedStat.mtime
+			(expectedStat.ctime !== undefined &&
+				(typeof expectedFile.stat?.ctime === "number" ? expectedFile.stat.ctime : null) !== expectedStat.ctime)
+			|| (typeof expectedFile.stat?.mtime === "number" ? expectedFile.stat.mtime : null) !== expectedStat.mtime
 			|| (typeof expectedFile.stat?.size === "number" ? expectedFile.stat.size : null) !== expectedStat.size
 		);
-		const finalReason =
-			finalDiskStatChanged
-				? "disk-stat-changed"
-				: !expectedFile ||
-					expectedFile.path !== input.path ||
-					this.deps.app.vault.getAbstractFileByPath(input.path) !== expectedFile
-					? "disk-file-identity-changed"
-					: finalCallerAborted
-						? "caller-aborted"
-						: finalDiskRevision !== input.expectedDiskRevision
-							? "disk-event-generation-changed"
-							: finalVisibleAuthorityMarker !== input.expectedVisibleAuthorityMarker
-								? "visible-authority-marker-changed"
-								: finalPreservedUnresolved
-									? "preserved-unresolved"
-									: finalYText !== input.expectedYText
-										? "crdt-text-replaced"
-										: finalCrdtContent !== input.expectedCrdtContent
-											? "crdt-content-changed"
-											: null;
+		let finalReason: string | null = null;
+		if (finalDiskStatChanged) finalReason = "disk-stat-changed";
+		else if (
+			!expectedFile ||
+			expectedFile.path !== input.path ||
+			this.deps.app.vault.getAbstractFileByPath(input.path) !== expectedFile
+		) finalReason = "disk-file-identity-changed";
+		else if (
+			input.expectedBaselineHash !== undefined &&
+			finalBaselineHash !== input.expectedBaselineHash
+		) finalReason = "baseline-hash-changed";
+		else if (
+			input.expectedBaselineRevision !== undefined &&
+			finalBaselineRevision !== input.expectedBaselineRevision
+		) finalReason = "baseline-revision-changed";
+		else if (
+			input.expectedLifecycleGeneration !== undefined &&
+			finalLifecycleGeneration !== input.expectedLifecycleGeneration
+		) finalReason = "lifecycle-generation-changed";
+		else if (finalDiskRevision !== input.expectedDiskRevision) {
+			finalReason = "disk-event-generation-changed";
+		} else if (finalVisibleAuthorityMarker !== input.expectedVisibleAuthorityMarker) {
+			finalReason = "visible-authority-marker-changed";
+		} else if (
+			input.expectedInterceptedCandidate !== undefined &&
+			finalInterceptedCandidate !== input.expectedInterceptedCandidate
+		) finalReason = "external-candidate-changed";
+		else if (
+			input.expectedCandidateIdentityEpoch !== undefined &&
+			finalCandidateIdentityEpoch !== input.expectedCandidateIdentityEpoch
+		) finalReason = "external-candidate-identity-changed";
+		else if (finalPreservedUnresolved) finalReason = "preserved-unresolved";
+		else if (finalYText !== input.expectedYText) finalReason = "crdt-text-replaced";
+		else if (finalCrdtContent !== input.expectedCrdtContent) finalReason = "crdt-content-changed";
+		else if (finalCallerAborted) finalReason = "caller-aborted";
+		else if (finalAdditionalAuthorityStaleReason !== null) {
+			finalReason = finalAdditionalAuthorityStaleReason;
+		}
 		if (finalReason !== null) {
 			return reject(finalReason, {
 				expectedDiskRevision: input.expectedDiskRevision,
@@ -4735,12 +5441,179 @@ export class ReconciliationController {
 		return { kind: "committed", value: input.commit() };
 	}
 
+	private canPreserveMarkerForActiveOpenFlush(path: string): boolean {
+		const leases = this.activeOpenFlushAuthorityLeases.get(path);
+		if (!leases || leases.size === 0) return false;
+		const currentMarker = this.visibleAuthorityDeferredPaths.get(path) ?? null;
+		// Use the post-commit view of the lease: a vault.modify callback observes
+		// the write's new stat/disk-event epoch, but every non-disk authority fence
+		// must still be exact. An unrelated pre-commit event is rejected by the
+		// normal disk epoch/CAS; a post-commit disk change is rejected by DiskMirror's
+		// exact committed-file readback.
+		for (const lease of leases) {
+			if (lease.expectedVisibleAuthorityMarker !== currentMarker) continue;
+			if (this.isOpenFlushAuthorityLeaseCurrent(lease, "after-commit")) return true;
+		}
+		return false;
+	}
+
+	private async withActiveOpenFlushAuthorityLease(
+		lease: OpenFlushAuthorityLease,
+		flush: () => Promise<DiskWriteResult | undefined> | DiskWriteResult | undefined,
+	): Promise<DiskWriteResult | undefined> {
+		let leases = this.activeOpenFlushAuthorityLeases.get(lease.path);
+		if (!leases) {
+			leases = new Set<OpenFlushAuthorityLease>();
+			this.activeOpenFlushAuthorityLeases.set(lease.path, leases);
+		}
+		leases.add(lease);
+		try {
+			return await flush();
+		} finally {
+			leases.delete(lease);
+			if (
+				leases.size === 0 &&
+				this.activeOpenFlushAuthorityLeases.get(lease.path) === leases
+			) {
+				this.activeOpenFlushAuthorityLeases.delete(lease.path);
+			}
+		}
+	}
+
+	private flushWithOpenAuthorityLease(
+		diskMirror: DiskMirror | null | undefined,
+		path: string,
+		expectedDiskContent: string,
+		lease: OpenFlushAuthorityLease,
+	): Promise<DiskWriteResult | undefined> {
+		return this.withActiveOpenFlushAuthorityLease(
+			lease,
+			() => diskMirror?.flushWrite(path, true, {
+				recordBaseline: true,
+				expectedDiskContent,
+				expectedDiskFile: lease.expectedDiskFile,
+				expectedDiskRevision: lease.expectedDiskFileRevision,
+				isAuthorityCurrent: (phase) =>
+					this.isOpenFlushAuthorityLeaseCurrent(lease, phase),
+			}),
+		);
+	}
+
+	private isOpenFlushAuthorityLeaseCurrent(
+		lease: OpenFlushAuthorityLease,
+		phase: DiskWriteAuthorityPhase,
+	): boolean {
+		const currentFile = this.deps.app.vault.getAbstractFileByPath(lease.path);
+		const exactFileCurrent =
+			currentFile === lease.expectedDiskFile && lease.expectedDiskFile.path === lease.path;
+		const requirePreCommitDiskEpoch = phase === "before-commit";
+		const stat = lease.expectedDiskFile.stat;
+		const diskStatCurrent = !requirePreCommitDiskEpoch || (
+			(typeof stat?.ctime === "number" ? stat.ctime : null) === lease.expectedDiskStat.ctime
+			&& (typeof stat?.mtime === "number" ? stat.mtime : null) === lease.expectedDiskStat.mtime
+			&& (typeof stat?.size === "number" ? stat.size : null) === lease.expectedDiskStat.size
+		);
+		const currentBaselineHash = this.deps.getDiskIndex()[lease.path]?.contentHash ?? null;
+		const currentBaselineRevision = this.diskBaselineRevisions.get(lease.path) ?? 0;
+		const currentYText = this.deps.getVaultSync()?.getTextForPath(lease.path) ?? null;
+		const currentCrdtContent = yTextToString(currentYText);
+		const currentViews = this.getOpenMarkdownViewsForPath(lease.path);
+		const editorValidation = lease.expectedEditorTicket
+			? this.deps.getEditorBindings()?.validateOpenEditorMutationTicket?.(
+				lease.expectedEditorTicket,
+				currentViews,
+			) ?? {
+				current: false as const,
+				reason: "binding-manager-unavailable" as const,
+			}
+			: {
+				current: false as const,
+				reason: "ticket-unavailable" as const,
+			};
+		const currentVisibleAuthorityMarker =
+			this.visibleAuthorityDeferredPaths.get(lease.path) ?? null;
+		const currentInterceptedCandidate =
+			this.interceptedExternalDiskMutations.get(lease.path) ?? null;
+		const currentCandidateIdentityEpoch = this.getExternalCandidateIdentityEpoch(lease.path);
+		const callerAborted = requirePreCommitDiskEpoch && lease.shouldAbort();
+		const currentDiskEventRevision = this.getMarkdownDiskRevision(lease.path);
+		let reason: string | null = null;
+		if (!exactFileCurrent) reason = "disk-file-identity-changed";
+		else if (!diskStatCurrent) reason = "disk-stat-changed";
+		else if (
+			requirePreCommitDiskEpoch &&
+			currentDiskEventRevision !== lease.expectedDiskEventRevision
+		) reason = "disk-event-generation-changed";
+		else if (currentBaselineHash !== lease.expectedBaselineHash) reason = "baseline-hash-changed";
+		else if (currentBaselineRevision !== lease.expectedBaselineRevision) {
+			reason = "baseline-revision-changed";
+		} else if (this.lifecycleGeneration !== lease.expectedLifecycleGeneration) {
+			reason = "lifecycle-generation-changed";
+		} else if (currentVisibleAuthorityMarker !== lease.expectedVisibleAuthorityMarker) {
+			reason = "visible-authority-marker-changed";
+		} else if (currentInterceptedCandidate !== lease.expectedInterceptedCandidate) {
+			reason = "external-candidate-changed";
+		} else if (currentCandidateIdentityEpoch !== lease.expectedCandidateIdentityEpoch) {
+			reason = "external-candidate-identity-changed";
+		} else if (this.isMarkdownPreservedUnresolved(lease.path)) {
+			reason = "preserved-unresolved";
+		} else if (currentYText !== lease.expectedYText) reason = "crdt-text-replaced";
+		else if (currentCrdtContent !== lease.expectedCrdtContent) reason = "crdt-content-changed";
+		else if (!editorValidation.current) reason = `editor-${editorValidation.reason}`;
+		else if (callerAborted) reason = "caller-aborted";
+		if (reason === null) return true;
+
+		this.deps.trace("reconcile", "open-flush-authority-stale", {
+			path: lease.path,
+			stage: lease.stage,
+			phase,
+			reason,
+			expectedDiskEventRevision: lease.expectedDiskEventRevision,
+			currentDiskEventRevision,
+			openViewCount: currentViews.length,
+		});
+		return false;
+	}
+
 	private deferStaleOpenEditorMutation(stage: string): BoundFileSyncGapOutcome {
+		this.deps.trace(
+			"reconcile",
+			stage.startsWith("open-external-")
+				? "open-external-stale-replan"
+				: "open-editor-stale-replan",
+			{
+				reason: stage,
+				deferMs: OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS,
+			},
+		);
 		return {
 			kind: "deferred",
 			deferUntil: Date.now() + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS,
 			reason: `stale-open-editor-mutation-ticket:${stage}`,
 		};
+	}
+
+	private traceOpenExternalEvent(
+		message: OpenExternalTraceMessage,
+		details: OpenExternalTraceDetails,
+	): void {
+		this.deps.trace("reconcile", message, details);
+	}
+
+	private getOpenExternalSettlementTraceReason(
+		reason: string,
+	): OpenExternalTraceReason | null {
+		switch (reason) {
+			case "apply-external":
+			case "apply-clean-merge":
+			case "open-external-representation-normalized":
+			case "open-external-current-only":
+			case "open-external-overlapping-hunks":
+			case "open-external-missing-baseline":
+				return reason;
+			default:
+				return null;
+		}
 	}
 
 	private getOpenEditorAuthority(openViews: MarkdownView[]): OpenEditorAuthority {
@@ -4759,6 +5632,52 @@ export class ReconciliationController {
 		if (distinct.length === 0) return { kind: "none" };
 		if (distinct.length > 1) return { kind: "multiple" };
 		return { kind: "single", content: distinct[0]! };
+	}
+
+	private captureBoundFileSettlement(
+		path: string,
+		diskContent: string,
+		expectedYText: ReturnType<VaultSync["getTextForPath"]>,
+		openViews: MarkdownView[],
+	): Extract<BoundFileSyncGapOutcome, { kind: "handled" }>["settlement"] {
+		const currentYText = this.deps.getVaultSync()?.getTextForPath(path) ?? null;
+		if (currentYText !== expectedYText) return undefined;
+		const currentCrdtContent = yTextToString(currentYText);
+		if (currentCrdtContent === null) return undefined;
+		const editorAuthority = this.getOpenEditorAuthority(openViews);
+		if (editorAuthority.kind !== "single") return undefined;
+
+		const normalizedTarget = normalizeEditorText(diskContent);
+		if (
+			normalizeEditorText(currentCrdtContent) !== normalizedTarget ||
+			normalizeEditorText(editorAuthority.content) !== normalizedTarget
+		) {
+			return undefined;
+		}
+		// Disk/Y.Text equality is only a snapshot. Carry the exact live editor
+		// lineage so the final post-read baseline commit cannot cross a later
+		// editor revision, rebind, or pane-set change.
+		const expectedEditorTicket = this.captureOpenEditorMutationTicket(path, openViews);
+		if (
+			expectedEditorTicket !== null &&
+			!this.canCommitOpenEditorMutation({
+				path,
+				ticket: expectedEditorTicket,
+				expectedYText: currentYText,
+				expectedCrdtContent: currentCrdtContent,
+				stage: "bound-file-settlement-capture",
+			})
+		) {
+			return undefined;
+		}
+
+		return {
+			content: diskContent,
+			expectedYText: currentYText,
+			expectedCrdtContent: currentCrdtContent,
+			...(expectedEditorTicket ? { expectedEditorTicket } : {}),
+			expectedOpenEditorContent: editorAuthority.content,
+		};
 	}
 
 	private decideDeferredVisibleAuthority(
@@ -5140,10 +6059,31 @@ export class ReconciliationController {
 		file: TFile | null,
 	): Promise<boolean> {
 		if (!ytext) return false;
+		// This startup shortcut can await hashing and conflict-artifact writes.
+		// Capture every non-editor authority before the first await so a later
+		// baseline settlement, lifecycle change, or same-TFile disk epoch cannot
+		// authorize an obsolete editor snapshot.
+		const baselineAuthority = {
+			hash: this.deps.getDiskIndex()[path]?.contentHash ?? null,
+			revision: this.diskBaselineRevisions.get(path) ?? 0,
+		};
+		const lifecycleGeneration = this.lifecycleGeneration;
+		const diskFileStat = file
+			? {
+				ctime: typeof file.stat?.ctime === "number" ? file.stat.ctime : null,
+				mtime: typeof file.stat?.mtime === "number" ? file.stat.mtime : null,
+				size: typeof file.stat?.size === "number" ? file.stat.size : null,
+			}
+			: null;
 		const crdtContent = yTextToString(ytext) ?? "";
 		const mutationTicket = this.captureOpenEditorMutationTicket(path, openViews);
 		const visibleAuthorityTicket = this.compactVisibleAuthorityTicket(mutationTicket);
 		const diskMutationRevision = this.getMarkdownDiskRevision(path);
+		const interceptedCandidate =
+			this.interceptedExternalDiskMutations.get(path) ?? null;
+		const candidateIdentityEpoch = this.getExternalCandidateIdentityEpoch(path);
+		const attentionGeneration = this.deps.getMarkdownAttentionGeneration?.() ?? 0;
+		const syncScopeGeneration = this.deps.getMarkdownSyncScopeGeneration?.() ?? 0;
 		let visibleAuthorityMarker = this.visibleAuthorityDeferredPaths.get(path) ?? null;
 		const viewStates: Array<{ view: MarkdownView; editorContent: string }> = [];
 		let editorReadFailed = false;
@@ -5226,6 +6166,74 @@ export class ReconciliationController {
 		if (editorAuthority === crdtContent) {
 			return false;
 		}
+		const startupAuthoritySnapshot: StartupOpenFileAuthoritySnapshot = Object.freeze({
+			path,
+			file,
+			diskStat: diskFileStat,
+			baselineHash: baselineAuthority.hash,
+			baselineRevision: baselineAuthority.revision,
+			lifecycleGeneration,
+			expectedYText: ytext,
+			expectedCrdtContent: crdtContent,
+			editorTicket: mutationTicket,
+			diskRevision: diskMutationRevision,
+			visibleAuthorityMarker,
+			interceptedCandidate,
+			candidateIdentityEpoch,
+			attentionGeneration,
+			syncScopeGeneration,
+		});
+		const getStartupAuthorityStaleReason = () =>
+			this.getStartupOpenFileAuthorityStaleReason(startupAuthoritySnapshot);
+		const getStartupSupplementalStaleReason = () =>
+			this.getStartupOpenFileSupplementalStaleReason(startupAuthoritySnapshot);
+		let artifactAuthorityStaleReason: string | null = null;
+		let artifactAdmissionRejected = false;
+		const startupAuthorityCurrent = () => {
+			const reason = getStartupAuthorityStaleReason();
+			if (reason !== null && artifactAuthorityStaleReason === null) {
+				artifactAuthorityStaleReason = reason;
+			}
+			return reason === null;
+		};
+		const queueStartupReplan = () => {
+			this.mergeDirtyEntryIntoPath(path, {
+				reason: "modify",
+				primaryOpId: undefined,
+				coalescedOpIds: [],
+				retryCount: 0,
+				notBeforeMs: Date.now() + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS,
+			});
+		};
+		const createStartupArtifactWithinAdmission = async (
+			startCreate: () => Promise<TFile>,
+		): Promise<boolean> => {
+			const admission = await this.commitOpenEditorDiskMutation({
+				path,
+				file,
+				expectedDiskContent: diskContent,
+				expectedDiskStat: diskFileStat,
+				expectedBaselineHash: baselineAuthority.hash,
+				expectedBaselineRevision: baselineAuthority.revision,
+				expectedLifecycleGeneration: lifecycleGeneration,
+				ticket: mutationTicket,
+				expectedYText: ytext,
+				expectedCrdtContent: crdtContent,
+				expectedDiskRevision: diskMutationRevision,
+				expectedVisibleAuthorityMarker: visibleAuthorityMarker,
+				expectedInterceptedCandidate: interceptedCandidate,
+				expectedCandidateIdentityEpoch: candidateIdentityEpoch,
+				additionalAuthorityStaleReason: getStartupSupplementalStaleReason,
+				stage: "startup-open-editor-artifact-admission",
+				commit: startCreate,
+			});
+			if (admission.kind === "stale") {
+				artifactAdmissionRejected = true;
+				return false;
+			}
+			await admission.value;
+			return true;
+		};
 
 		// Do not let this legacy startup shortcut pre-empt the three-way open-file
 		// planner.  In the provider patch window E=D=C1 while CRDT already holds
@@ -5233,7 +6241,7 @@ export class ReconciliationController {
 		// the still-visible C1 as an "editor winner" would undo the remote update.
 		const diskHash = await contentBaselineHash(diskContent);
 		const crdtHash = await contentBaselineHash(crdtContent);
-		const baselineHash = this.deps.getDiskIndex()[path]?.contentHash ?? null;
+		const baselineHash = baselineAuthority.hash;
 		const editorMatchesDisk = editorAuthority === diskContent;
 		const editorMatchesCrdt = editorAuthority === crdtContent;
 		const preflightAction = planOpenBoundFileReconcile({
@@ -5309,6 +6317,8 @@ export class ReconciliationController {
 				crdtContent,
 				"open-file-reconcile-editor-wins",
 				"crdt",
+				startupAuthorityCurrent,
+				createStartupArtifactWithinAdmission,
 			);
 			crdtConflictPath = crdtConflict.path;
 			conflictArtifactCreated ||= crdtConflict.created;
@@ -5318,14 +6328,30 @@ export class ReconciliationController {
 					diskContent,
 					"open-file-reconcile-editor-wins",
 					"disk",
+					startupAuthorityCurrent,
+					createStartupArtifactWithinAdmission,
 				);
 				diskConflictPath = diskConflict.path;
 				conflictArtifactCreated ||= diskConflict.created;
 			}
 		} catch (err) {
+			if (artifactAdmissionRejected) {
+				queueStartupReplan();
+				return true;
+			}
+			const staleReason = artifactAuthorityStaleReason ?? getStartupAuthorityStaleReason();
+			if (staleReason !== null) {
+				this.traceStartupOpenFileAuthorityStale(
+					startupAuthoritySnapshot,
+					staleReason,
+					"startup-open-editor-artifact",
+				);
+				queueStartupReplan();
+				return true;
+			}
 			this.deps.trace("conflict", "open-file-reconcile-preserve-failed", {
 				path,
-				error: err instanceof Error ? err.message : String(err),
+				errorCategory: err instanceof Error ? "exception" : "non-error-throw",
 			});
 			return true;
 		}
@@ -5334,11 +6360,18 @@ export class ReconciliationController {
 			path,
 			file,
 			expectedDiskContent: diskContent,
+			expectedDiskStat: diskFileStat,
+			expectedBaselineHash: baselineAuthority.hash,
+			expectedBaselineRevision: baselineAuthority.revision,
+			expectedLifecycleGeneration: lifecycleGeneration,
 			ticket: mutationTicket,
 			expectedYText: ytext,
 			expectedCrdtContent: crdtContent,
 			expectedDiskRevision: diskMutationRevision,
 			expectedVisibleAuthorityMarker: visibleAuthorityMarker,
+			expectedInterceptedCandidate: interceptedCandidate,
+			expectedCandidateIdentityEpoch: candidateIdentityEpoch,
+			additionalAuthorityStaleReason: getStartupSupplementalStaleReason,
 			stage: "startup-open-editor-convergence",
 			commit: () => {
 				const result = applyDiffToYTextWithPostcondition(
@@ -5351,13 +6384,7 @@ export class ReconciliationController {
 			},
 		});
 		if (convergenceAttempt.kind === "stale") {
-			this.mergeDirtyEntryIntoPath(path, {
-				reason: "modify",
-				primaryOpId: undefined,
-				coalescedOpIds: [],
-				retryCount: 0,
-				notBeforeMs: Date.now() + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS,
-			});
+			queueStartupReplan();
 			return true;
 		}
 		const convergenceApplied = convergenceAttempt.value;
@@ -5562,28 +6589,144 @@ export class ReconciliationController {
 		const mutationTicket = this.captureOpenEditorMutationTicket(file.path, openViews);
 		const visibleAuthorityTicket = this.compactVisibleAuthorityTicket(mutationTicket);
 		const diskMutationRevision = this.getMarkdownDiskRevision(file.path);
+		const lifecycleGeneration = this.lifecycleGeneration;
+		const baselineAuthority = {
+			hash: this.deps.getDiskIndex()[file.path]?.contentHash ?? null,
+			revision: this.diskBaselineRevisions.get(file.path) ?? 0,
+		};
+		const interceptedCandidate =
+			this.interceptedExternalDiskMutations.get(file.path) ?? null;
+		const candidateIdentityEpoch = this.getExternalCandidateIdentityEpoch(file.path);
+		const diskFileStat =
+			typeof file.stat?.mtime === "number" || typeof file.stat?.size === "number"
+				? {
+					ctime: typeof file.stat?.ctime === "number" ? file.stat.ctime : null,
+					mtime: typeof file.stat?.mtime === "number" ? file.stat.mtime : 0,
+					size: typeof file.stat?.size === "number" ? file.stat.size : content.length,
+				}
+				: null;
+		const diskFileRevision =
+			typeof file.stat?.ctime === "number" &&
+			typeof file.stat?.mtime === "number" &&
+			typeof file.stat?.size === "number"
+				? {
+					ctime: file.stat.ctime,
+					mtime: file.stat.mtime,
+					size: file.stat.size,
+				}
+				: undefined;
 		let visibleAuthorityMarker = this.visibleAuthorityDeferredPaths.get(file.path) ?? null;
 		let mutationTicketStale = false;
 		const commitMutation = async <T>(
 			stage: string,
 			expectedCrdtContent: string | null,
 			commit: () => T,
+			expectedBaseline?: {
+				hash: string | null;
+				revision: number;
+			},
+			ticket: OpenEditorMutationTicket | null = mutationTicket,
 		): Promise<OpenEditorDiskMutationCommit<T>> => {
 			const attempt = await this.commitOpenEditorDiskMutation({
 				path: file.path,
 				file,
 				expectedDiskContent: content,
-				ticket: mutationTicket,
+				expectedDiskStat: diskFileStat,
+				expectedBaselineHash: expectedBaseline?.hash,
+				expectedBaselineRevision: expectedBaseline?.revision,
+				expectedLifecycleGeneration: lifecycleGeneration,
+				ticket,
 				expectedYText: existingText,
 				expectedCrdtContent,
 				expectedDiskRevision: diskMutationRevision,
 				expectedVisibleAuthorityMarker: visibleAuthorityMarker,
+				expectedInterceptedCandidate: interceptedCandidate,
+				expectedCandidateIdentityEpoch: candidateIdentityEpoch,
 				shouldAbort,
 				stage,
 				commit,
 			});
 			mutationTicketStale ||= attempt.kind === "stale";
 			return attempt;
+		};
+		const admitOpenFlush = async (input: {
+			stage: string;
+			reason: string;
+			expectedCrdtContent: string | null;
+			provisionalBaseline?: boolean;
+			ticket?: OpenEditorMutationTicket | null;
+			publishVisibleAuthorityContent?: string;
+		}): Promise<BoundFileSyncGapOutcome> => {
+			const ticket = input.ticket === undefined ? mutationTicket : input.ticket;
+			const attempt = await commitMutation(
+				input.stage,
+				input.expectedCrdtContent,
+				() => {
+					if (input.publishVisibleAuthorityContent !== undefined) {
+						const currentAuthority = this.getOpenEditorAuthority(openViews);
+						const compactTicket = this.compactVisibleAuthorityTicket(ticket);
+						if (
+							!ticket ||
+							!compactTicket ||
+							currentAuthority.kind !== "single" ||
+							currentAuthority.content !== input.publishVisibleAuthorityContent
+						) {
+							return null;
+						}
+						const targetMarker: DeferredVisibleEditorAuthority = {
+							editorContents: [input.publishVisibleAuthorityContent],
+							readComplete: true,
+							capturedDiskContent: content,
+							capturedCrdtContent: input.expectedCrdtContent,
+							capturedDiskRevision: this.getMarkdownDiskRevision(file.path),
+							capturedEditorActivity:
+								editorBindings?.getLastEditorActivityForPath(file.path) ?? null,
+							capturedEditorTicket: compactTicket,
+							capturedAt: Date.now(),
+						};
+						this.visibleAuthorityDeferredPaths.set(file.path, targetMarker);
+						visibleAuthorityMarker = targetMarker;
+						this.deps.trace("reconcile", "open-external-target-authority-recaptured", {
+							path: file.path,
+							stage: input.stage,
+							targetLength: input.publishVisibleAuthorityContent.length,
+						});
+					}
+					return Object.freeze<OpenFlushAuthorityLease>({
+						path: file.path,
+						stage: input.stage,
+						expectedDiskFile: file,
+						expectedDiskStat: diskFileStat ?? {
+							ctime: null,
+							mtime: null,
+							size: null,
+						},
+						expectedDiskFileRevision: diskFileRevision,
+						expectedDiskEventRevision: diskMutationRevision,
+						expectedBaselineHash: baselineAuthority.hash,
+						expectedBaselineRevision: baselineAuthority.revision,
+						expectedLifecycleGeneration: lifecycleGeneration,
+						expectedYText: existingText,
+						expectedCrdtContent: input.expectedCrdtContent,
+						expectedEditorTicket: ticket,
+						expectedVisibleAuthorityMarker: visibleAuthorityMarker,
+						expectedInterceptedCandidate: interceptedCandidate,
+						expectedCandidateIdentityEpoch: candidateIdentityEpoch,
+						shouldAbort,
+					});
+				},
+				baselineAuthority,
+				ticket,
+			);
+			if (attempt.kind === "stale" || attempt.value === null) {
+				return this.deferStaleOpenEditorMutation(input.stage);
+			}
+			return {
+				kind: "flush-crdt-to-disk",
+				reason: input.reason,
+				provisionalBaseline: input.provisionalBaseline,
+				authorityLease: attempt.value,
+			};
 		};
 		let deferredVisibleAuthority = this.visibleAuthorityDeferredPaths.get(file.path);
 		if (deferredVisibleAuthority) {
@@ -5698,7 +6841,15 @@ export class ReconciliationController {
 			});
 			// Convergence reached: amplification detector is reset.
 			this.amplificationHistory.delete(file.path);
-			return { kind: "handled", settledContent: content };
+			return {
+				kind: "handled",
+				settlement: this.captureBoundFileSettlement(
+					file.path,
+					content,
+					existingText,
+					openViews,
+				),
+			};
 		}
 
 		let editorReadFailed = false;
@@ -5750,11 +6901,280 @@ export class ReconciliationController {
 		const hasRecentEditorActivityForPlanner =
 			lastEditorActivityForPlanner != null &&
 			(now - lastEditorActivityForPlanner) < OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS;
+		const canPlanOpenExternalEdit =
+			sourceReason === "modify" &&
+			existingText !== null &&
+			crdtContent !== null &&
+			plannerEditorAuthority.kind === "single" &&
+			plannerEditorAuthority.relation === "crdt" &&
+			!hasRecentEditorActivityForPlanner;
+		if (
+			canPlanOpenExternalEdit &&
+			existingText !== null &&
+			crdtContent !== null
+		) {
+			const baselineHash = baselineAuthority.hash;
+			const baselineRevision = baselineAuthority.revision;
+			const baselineText = baselineHash === null
+				? null
+				: await this.deps.getBaselineText?.(baselineHash) ?? null;
+			const externalPlan = planOpenExternalEdit({
+				baselineText: baselineText === null ? null : normalizeEditorText(baselineText),
+				currentText: normalizeEditorText(crdtContent),
+				externalText: normalizeEditorText(content),
+			});
+			this.deps.trace("reconcile", "open-external-edit-planned", {
+				path: file.path,
+				kind: externalPlan.kind,
+				reason: externalPlan.kind,
+				baselineHashPrefix: baselineHash?.slice(0, 12) ?? null,
+				rawDiskLength: content.length,
+				currentLength: crdtContent.length,
+			});
+
+			switch (externalPlan.kind) {
+				case "already-settled":
+					if (content === externalPlan.targetText) {
+						return {
+							kind: "handled",
+							settlement: this.captureBoundFileSettlement(
+								file.path,
+								externalPlan.targetText,
+								existingText,
+								openViews,
+							),
+						};
+					}
+					return admitOpenFlush({
+						stage: "open-external-representation-normalized",
+						reason: "open-external-representation-normalized",
+						expectedCrdtContent: crdtContent,
+					});
+				case "keep-current":
+					return admitOpenFlush({
+						stage: "open-external-current-only",
+						reason: "open-external-current-only",
+						expectedCrdtContent: crdtContent,
+					});
+				case "apply-external":
+				case "apply-clean-merge": {
+					type FrontmatterAwareMergeResult =
+						| { kind: "blocked" }
+						| {
+							kind: "guard-failed";
+							errorCategory: "exception" | "non-error-throw";
+						}
+						| {
+							kind: "observability-failed";
+							errorCategory: "exception" | "non-error-throw";
+						}
+						| { kind: "diff"; result: ExactDiffResult };
+					let mergeAttempt: OpenEditorDiskMutationCommit<FrontmatterAwareMergeResult>;
+					try {
+						mergeAttempt = await commitMutation(
+							"open-external-clean-merge",
+							crdtContent,
+							() => {
+								let blocked: boolean;
+								try {
+									blocked = this.deps.shouldBlockFrontmatterIngest(
+										file.path,
+										crdtContent,
+										externalPlan.targetText,
+										"bound-file-open-safe-external-merge",
+									);
+								} catch (error) {
+									return {
+										kind: "guard-failed" as const,
+										errorCategory: error instanceof Error
+											? "exception" as const
+											: "non-error-throw" as const,
+									};
+								}
+								if (blocked) {
+									try {
+										this.traceOpenExternalEvent("open-external-frontmatter-blocked", {
+											path: file.path,
+											reason: "bound-file-open-safe-external-merge",
+											diskLength: content.length,
+											currentLength: crdtContent.length,
+											targetLength: externalPlan.targetText.length,
+										});
+										this.recordFrontmatterIngestBlocked(
+											file.path,
+											true,
+											"bound-file-open-safe-external-merge",
+										);
+										this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
+										return { kind: "blocked" as const };
+									} catch (error) {
+										return {
+											kind: "observability-failed" as const,
+											errorCategory: error instanceof Error
+												? "exception" as const
+												: "non-error-throw" as const,
+										};
+									}
+								}
+								editorBindings?.separateUndoCaptureForPath(file.path);
+								try {
+									return {
+										kind: "diff" as const,
+										result: applyExactDiffToYText(
+											existingText,
+											crdtContent,
+											externalPlan.targetText,
+											ORIGIN_OPEN_EXTERNAL_EDIT_MERGE,
+										),
+									};
+								} finally {
+									editorBindings?.separateUndoCaptureForPath(file.path);
+								}
+							},
+							{ hash: baselineHash, revision: baselineRevision },
+						);
+					} catch (error) {
+						const reason = "open-external-targeted-diff-failed";
+						this.deps.getDiskMirror()?.recordPreservedUnresolved?.(
+							file.path,
+							reason,
+						);
+						this.deps.trace("reconcile", "open-external-targeted-diff-failed", {
+							path: file.path,
+							reason,
+							errorCategory: error instanceof Error ? "exception" : "non-error-throw",
+						});
+						return { kind: "handled" };
+					}
+					if (mergeAttempt.kind === "stale") {
+						return this.deferStaleOpenEditorMutation("open-external-clean-merge");
+					}
+					if (mergeAttempt.value.kind === "guard-failed") {
+						this.deps.trace("reconcile", "open-external-frontmatter-guard-failed", {
+							path: file.path,
+							reason: "bound-file-open-safe-external-merge",
+							errorCategory: mergeAttempt.value.errorCategory,
+						});
+						return this.deferStaleOpenEditorMutation(
+							"open-external-frontmatter-guard-failed",
+						);
+					}
+					if (mergeAttempt.value.kind === "observability-failed") {
+						try {
+							this.deps.trace(
+								"reconcile",
+								"open-external-frontmatter-observability-failed",
+								{
+									path: file.path,
+									reason: "bound-file-open-safe-external-merge",
+									errorCategory: mergeAttempt.value.errorCategory,
+								},
+							);
+						} catch {
+							// Observability failure must not escape into the mutation path.
+						}
+						return this.deferStaleOpenEditorMutation(
+							"open-external-frontmatter-observability-failed",
+						);
+					}
+					if (mergeAttempt.value.kind === "blocked") {
+						return { kind: "handled" };
+					}
+					switch (mergeAttempt.value.result.kind) {
+						case "stale-base":
+							return this.deferStaleOpenEditorMutation("open-external-clean-merge");
+						case "postcondition-failed":
+							this.deps.getDiskMirror()?.recordPreservedUnresolved?.(
+								file.path,
+								"open-external-targeted-diff-failed",
+							);
+							return { kind: "handled" };
+						case "unchanged":
+						case "applied":
+							this.traceOpenExternalEvent("open-external-clean-merge-applied", {
+								path: file.path,
+								reason: externalPlan.kind,
+								diskLength: content.length,
+								currentLength: crdtContent.length,
+								targetLength: externalPlan.targetText.length,
+							});
+							return admitOpenFlush({
+								stage: "open-external-clean-merge-flush",
+								reason: externalPlan.kind,
+								expectedCrdtContent: externalPlan.targetText,
+								ticket: this.captureOpenEditorMutationTicket(file.path, openViews),
+								publishVisibleAuthorityContent: externalPlan.targetText,
+							});
+						}
+					throw new Error("unreachable open-external exact diff result");
+				}
+				case "preserve-conflict": {
+					let artifact: MarkdownConflictArtifactResult;
+					try {
+						const artifactContent =
+							interceptedCandidate &&
+							this.externalCandidateMatchesStableDisk(
+								interceptedCandidate.content,
+								content,
+							)
+								? interceptedCandidate.content
+								: content;
+						artifact = await this.createMarkdownConflictArtifact(
+							file.path,
+							artifactContent,
+							`open-external-${externalPlan.reason}`,
+							"disk",
+						);
+						if (baselineHash !== null) {
+							this.deps.recordConflictMergeBase?.(artifact.path, baselineHash);
+						}
+					} catch (error) {
+						this.deps.getDiskMirror()?.recordPreservedUnresolved?.(
+							file.path,
+							"conflict-artifact-write-failed",
+						);
+						this.deps.trace("conflict", "open-external-conflict-preserve-failed", {
+							path: file.path,
+							reason: externalPlan.reason,
+							errorCategory: error instanceof Error ? "exception" : "non-error-throw",
+						});
+						return { kind: "handled" };
+					}
+					const conflictAdmission = await commitMutation(
+						"open-external-conflict-settlement",
+						crdtContent,
+						() => undefined,
+						{ hash: baselineHash, revision: baselineRevision },
+					);
+					if (conflictAdmission.kind === "stale") {
+						return this.deferStaleOpenEditorMutation(
+							"open-external-conflict-settlement",
+						);
+					}
+					if (externalPlan.reason === "overlapping-hunks") {
+						this.traceOpenExternalEvent("open-external-overlapping-hunk-preserved", {
+							path: file.path,
+							reason: "overlapping-hunks",
+							diskLength: content.length,
+							currentLength: crdtContent.length,
+							hunkCount: externalPlan.hunkCount,
+							artifactCreated: artifact.created,
+						});
+					}
+					return admitOpenFlush({
+						stage: "open-external-conflict-flush",
+						provisionalBaseline: true,
+						reason: `open-external-${externalPlan.reason}`,
+						expectedCrdtContent: crdtContent,
+					});
+				}
+			}
+		}
 		let openBoundAction: OpenBoundFileReconcileAction | null = null;
 		if (existingText && crdtContent != null) {
 			const diskHash = await contentBaselineHash(content);
 			const crdtHash = await contentBaselineHash(crdtContent);
-			const baselineHash = this.deps.getDiskIndex()[file.path]?.contentHash ?? null;
+			const baselineHash = baselineAuthority.hash;
 			const rawLastSave = this.deps.getLastSaveDiskIndexAt?.();
 			const lastDiskIndexPersistedAt =
 				typeof rawLastSave === "number" &&
@@ -5792,6 +7212,7 @@ export class ReconciliationController {
 			(state) => state.editorMatchesCrdt && !state.editorMatchesDisk,
 		);
 		let plannerConflictPreserved = false;
+		let settlementYText = existingText;
 		if (
 			plannerEditorAuthority.kind === "multiple" ||
 			plannerEditorAuthority.kind === "read-failed" ||
@@ -5853,6 +7274,13 @@ export class ReconciliationController {
 					idleMs,
 				},
 			});
+			this.traceOpenExternalEvent("open-external-recent-typing-deferred", {
+				path: file.path,
+				reason: "recent-editor-activity-local-only",
+				diskLength: content.length,
+				currentLength: crdtContent?.length ?? null,
+				deferMs: Math.max(0, deferUntil - Date.now()),
+			});
 			this.amplificationHistory.delete(file.path);
 			return {
 				kind: "deferred",
@@ -5902,11 +7330,12 @@ export class ReconciliationController {
 					plannerConflictPreserved = true;
 				}
 				this.deps.scheduleTraceStateSnapshot("bound-file-open-planner-crdt-wins");
-				return {
-					kind: "flush-crdt-to-disk",
+				return admitOpenFlush({
+					stage: "bound-file-local-only-planner-crdt-flush",
 					provisionalBaseline: plannerConflictPreserved,
 					reason: `bound-file-${openBoundAction.reason}`,
-				};
+					expectedCrdtContent: crdtContent,
+				});
 			}
 
 			if (existingText && openBoundAction?.kind === "editor-wins-preserve") {
@@ -5996,6 +7425,16 @@ export class ReconciliationController {
 							reason: "recent-editor-activity-local-only",
 							idleMs,
 						},
+						});
+						this.traceOpenExternalEvent("open-external-recent-typing-deferred", {
+							path: file.path,
+							reason: "recent-editor-activity-local-only",
+							diskLength: content.length,
+							currentLength: crdtContent?.length ?? null,
+							deferMs: Math.max(
+								0,
+								lastEditorActivityLocalOnly + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS - Date.now(),
+							),
 						});
 						// Pauses reset the amplification detector. See spec R3.8.
 						this.amplificationHistory.delete(file.path);
@@ -6210,18 +7649,28 @@ export class ReconciliationController {
 				if (seedAttempt.kind === "stale") {
 					return this.deferStaleOpenEditorMutation("bound-file-local-only-seed");
 				}
-				const recoveredContent = yTextToString(vaultSync?.getTextForPath(file.path));
+				const seededText = seedAttempt.value ?? null;
+				const currentSeededText = vaultSync?.getTextForPath(file.path) ?? null;
+				const recoveredContent = yTextToString(currentSeededText);
+				const seedSettled =
+					seededText !== null &&
+					currentSeededText === seededText &&
+					recoveredContent === content;
 				this.deps.trace("recovery", "recovery-postcondition-observed", {
 					path: file.path,
 					reason: "bound-file-local-only-seed",
 					origin: "ensureFile",
 					expectedLength: content.length,
 					actualLength: recoveredContent?.length ?? null,
-					matchesExpected: recoveredContent === content,
-					matchesAfterDiff: recoveredContent === content,
-					enforced: false,
+					matchesExpected: seedSettled,
+					matchesAfterDiff: seedSettled,
+					enforced: true,
 					forceReplaceApplied: false,
 				});
+				if (!seedSettled) {
+					return this.deferStaleOpenEditorMutation("bound-file-local-only-seed");
+				}
+				settlementYText = seededText;
 			}
 			this.boundRecoveryLocks.set(file.path, Date.now() + BOUND_RECOVERY_LOCK_MS);
 
@@ -6274,14 +7723,31 @@ export class ReconciliationController {
 			this.deps.scheduleTraceStateSnapshot("bound-file-desync-recovery");
 			return {
 				kind: "handled",
-				settledContent: !plannerConflictPreserved &&
-					yTextToString(vaultSync?.getTextForPath(file.path)) === content
-					? content
+				settlement: !plannerConflictPreserved
+					? this.captureBoundFileSettlement(
+						file.path,
+						content,
+						settlementYText,
+						openViews,
+					)
 					: undefined,
 			};
 		}
 
 		if (crdtOnlyViews.length > 0) {
+			// `crdtOnlyViews` is derived from editor===CRDT, so this branch must
+			// always retain one exact live Y.Text authority. If that classification
+			// invariant is ever violated, fail closed and let a fresh plan reclassify
+			// the replicas; never manufacture a replacement CRDT authority here.
+			if (existingText === null || crdtContent === null) {
+				this.deps.trace("recovery", "bound-file-crdt-only-invariant-violated", {
+					path: file.path,
+					reason: "missing-live-crdt-authority",
+				});
+				return this.deferStaleOpenEditorMutation(
+					"bound-file-crdt-only-missing-authority",
+				);
+			}
 			if (
 				existingText &&
 				openBoundAction?.kind === "import-disk-to-crdt" &&
@@ -6322,11 +7788,12 @@ export class ReconciliationController {
 				});
 				if (!preserved) return { kind: "handled" };
 				this.deps.scheduleTraceStateSnapshot("bound-file-visible-editor-authority");
-				return {
-					kind: "flush-crdt-to-disk",
+				return admitOpenFlush({
+					stage: "bound-file-visible-editor-authority-flush",
 					provisionalBaseline: true,
 					reason: "bound-file-visible-editor-authority",
-				};
+					expectedCrdtContent: crdtContent,
+				});
 			}
 			if (existingText && openBoundAction?.kind === "apply-crdt-to-disk") {
 				if (openBoundAction.preserveDisk) {
@@ -6349,11 +7816,12 @@ export class ReconciliationController {
 					plannerConflictPreserved = true;
 				}
 				this.deps.scheduleTraceStateSnapshot("bound-file-open-planner-crdt-wins");
-				return {
-					kind: "flush-crdt-to-disk",
+				return admitOpenFlush({
+					stage: "bound-file-crdt-only-planner-crdt-flush",
 					provisionalBaseline: plannerConflictPreserved,
 					reason: `bound-file-${openBoundAction.reason}`,
-				};
+					expectedCrdtContent: crdtContent,
+				});
 			}
 
 			if (existingText && openBoundAction?.kind === "editor-wins-preserve") {
@@ -6375,11 +7843,12 @@ export class ReconciliationController {
 				}
 				plannerConflictPreserved = true;
 				this.deps.scheduleTraceStateSnapshot("bound-file-open-planner-editor-crdt-wins");
-				return {
-					kind: "flush-crdt-to-disk",
+				return admitOpenFlush({
+					stage: "bound-file-crdt-only-editor-winner-flush",
 					provisionalBaseline: true,
 					reason: `bound-file-${openBoundAction.reason}`,
-				};
+					expectedCrdtContent: crdtContent,
+				});
 			}
 
 			if (existingText && openBoundAction?.kind === "import-disk-to-crdt" && openBoundAction.preserveCrdt) {
@@ -6419,8 +7888,18 @@ export class ReconciliationController {
 						data: {
 							reason: "recent-editor-activity",
 							idleMs: Date.now() - lastEditorActivity,
-						},
-						});
+					},
+					});
+					this.traceOpenExternalEvent("open-external-recent-typing-deferred", {
+						path: file.path,
+						reason: "recent-editor-activity",
+						diskLength: content.length,
+						currentLength: crdtContent?.length ?? null,
+						deferMs: Math.max(
+							0,
+							lastEditorActivity + OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS - Date.now(),
+						),
+					});
 					return {
 						kind: "deferred",
 						deferUntil: lastEditorActivity + OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS,
@@ -6530,83 +8009,18 @@ export class ReconciliationController {
 						forceReplaceApplied: recoveryResult.forceReplaceApplied,
 					},
 				});
-			} else {
-				if (this.deps.shouldBlockFrontmatterIngest(
-					file.path,
-					null,
-					content,
-					"bound-file-open-idle-seed",
-					)) {
-						this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-open-idle-seed");
-						this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
-						return { kind: "handled" };
-					}
-				this.deps.log(
-					`syncFileFromDisk: recovering "${file.path}" ` +
-					`(editor-bound idle disk edit, missing CRDT text: seeding ${content.length} chars)`,
-				);
-				const _rsh4 = await this.deps.computeRecoveryStateHash?.(file.path, content) ?? undefined;
-				this.deps.recordFlightPathEvent?.({
-					priority: "important",
-					kind: PRODUCT_EVENT_KIND.recoveryDecision,
-					severity: "info",
-					scope: "file",
-					source: "reconciliationController",
-					layer: "recovery",
-					path: file.path,
-					data: {
-						reason: "bound-file-open-idle-seed",
-						signature: computeRecoveryFingerprint("bound-file-open-idle-seed", "", content),
-						action: "seed-crdt-from-disk",
-						diskLength: content.length,
-						...(_rsh4 ? { recoveryStateHash: _rsh4 } : {}),
-					},
-				});
-				if (this.shouldQuarantineRepeatedRecovery(
-					file.path,
-					"bound-file-open-idle-seed",
-					"",
-					content,
-				)) {
-					return { kind: "handled" };
-				}
-				if (shouldAbort()) return { kind: "handled" };
-				const seedAttempt = await commitMutation(
-					"bound-file-open-idle-seed",
-					null,
-					() => vaultSync?.ensureFile(
-						file.path,
-						content,
-						this.deps.getSettings().deviceName,
-						{
-							reviveTombstone: sourceReason === "create",
-							reviveReason: sourceReason === "create" ? "local-create-event" : undefined,
-						},
-					),
-				);
-				if (seedAttempt.kind === "stale") {
-					return this.deferStaleOpenEditorMutation("bound-file-open-idle-seed");
-				}
-				const recoveredContent = yTextToString(vaultSync?.getTextForPath(file.path));
-				this.deps.trace("recovery", "recovery-postcondition-observed", {
-					path: file.path,
-					reason: "bound-file-open-idle-seed",
-					origin: "ensureFile",
-					expectedLength: content.length,
-					actualLength: recoveredContent?.length ?? null,
-					matchesExpected: recoveredContent === content,
-					matchesAfterDiff: recoveredContent === content,
-					enforced: false,
-					forceReplaceApplied: false,
-				});
 			}
 			this.boundRecoveryLocks.set(file.path, Date.now() + BOUND_RECOVERY_LOCK_MS);
 			this.deps.scheduleTraceStateSnapshot("bound-file-open-idle-disk-recovery");
 			return {
 				kind: "handled",
-				settledContent: !plannerConflictPreserved &&
-					yTextToString(vaultSync?.getTextForPath(file.path)) === content
-					? content
+				settlement: !plannerConflictPreserved
+					? this.captureBoundFileSettlement(
+						file.path,
+						content,
+						existingText,
+						openViews,
+					)
 					: undefined,
 			};
 		}
@@ -7031,6 +8445,9 @@ export class ReconciliationController {
 		reason: string,
 		source?: "crdt" | "disk" | "editor",
 		isCurrent: () => boolean = () => true,
+		postSuppressCreate?: (
+			startCreate: () => Promise<TFile>,
+		) => Promise<boolean>,
 	): Promise<MarkdownConflictArtifactResult> {
 		if (!isCurrent()) throw new Error("stale reconciliation work");
 		const existing = await this.findExistingMarkdownConflictArtifact(path, content, source);
@@ -7054,9 +8471,25 @@ export class ReconciliationController {
 			if (!isCurrent()) throw new Error("stale reconciliation work");
 			const candidate = buildMarkdownConflictArtifactCopyPath(basePath, i + 1);
 			if (this.deps.app.vault.getAbstractFileByPath(candidate)) continue;
-			await this.deps.getDiskMirror()?.suppressLocalCreate(candidate, content);
-			if (!isCurrent()) throw new Error("stale reconciliation work");
-			await this.deps.app.vault.create(candidate, content);
+			const diskMirror = this.deps.getDiskMirror();
+			const suppressionHandle = await diskMirror?.suppressLocalCreate(candidate, content);
+			try {
+				if (postSuppressCreate) {
+					const created = await postSuppressCreate(() => {
+						if (!isCurrent()) throw new Error("stale reconciliation work");
+						return this.deps.app.vault.create(candidate, content);
+					});
+					if (!created) throw new Error("stale reconciliation work");
+				} else {
+					if (!isCurrent()) throw new Error("stale reconciliation work");
+					await this.deps.app.vault.create(candidate, content);
+				}
+			} catch (error) {
+				if (suppressionHandle) {
+					diskMirror?.rollbackLocalCreateSuppression(suppressionHandle);
+				}
+				throw error;
+			}
 			this.deps.trace("conflict", "conflict-artifact-created", {
 				path,
 				conflictPath: candidate,
@@ -7084,7 +8517,12 @@ export class ReconciliationController {
 		for (const file of candidates) {
 			if (!isMarkdownConflictArtifactForOriginalPath(file.path, path, source)) continue;
 			try {
-				const existingContent = await this.deps.app.vault.read(file);
+				// Conflict artifacts preserve the exact competing disk representation.
+				// Vault.read strips a leading UTF-8 BOM, so replay dedupe must inspect
+				// adapter text or it will create a duplicate for the same raw artifact.
+				const existingContent = typeof this.deps.app.vault.adapter.read === "function"
+					? await this.deps.app.vault.adapter.read(file.path)
+					: await this.deps.app.vault.read(file);
 				if (contentFingerprint(existingContent) === targetFingerprint && existingContent === content) {
 					return file.path;
 				}
@@ -7105,6 +8543,8 @@ export class ReconciliationController {
 			expectedDiskFile?: TFile;
 			expectedYText?: ReturnType<VaultSync["getTextForPath"]>;
 			expectedCrdtContent?: string | null;
+			expectedEditorTicket?: OpenEditorMutationTicket;
+			expectedOpenEditorContent?: string;
 		} = {},
 	): Promise<boolean> {
 		const startingContentHash = this.deps.getDiskIndex()[path]?.contentHash;
@@ -7143,8 +8583,26 @@ export class ReconciliationController {
 						: preservedEntry === undefined;
 					const currentContentHash = this.deps.getDiskIndex()[path]?.contentHash;
 					const currentBaselineRevision = this.diskBaselineRevisions.get(path) ?? 0;
+					const editorTicketValidation = options.expectedEditorTicket === undefined
+						? { current: true as const }
+						: this.deps.getEditorBindings()?.validateOpenEditorMutationTicket?.(
+							options.expectedEditorTicket,
+							this.getOpenMarkdownViewsForPath(path),
+						) ?? {
+							current: false as const,
+							reason: "binding-manager-unavailable" as const,
+						};
+					const currentEditorAuthority = options.expectedOpenEditorContent === undefined
+						? null
+						: this.getOpenEditorAuthority(this.getOpenMarkdownViewsForPath(path));
+					const editorContentCurrent = options.expectedOpenEditorContent === undefined || (
+						currentEditorAuthority?.kind === "single" &&
+						currentEditorAuthority.content === options.expectedOpenEditorContent
+					);
 					if (
 						!fileIdentityCurrent ||
+						!editorTicketValidation.current ||
+						!editorContentCurrent ||
 						!crdtAuthorityCurrent ||
 						!preservedStateCurrent ||
 						currentDiskContent !== settledContent ||
@@ -7158,13 +8616,20 @@ export class ReconciliationController {
 							path,
 							reason: !fileIdentityCurrent
 								? "file-identity-changed"
-								: !crdtAuthorityCurrent
-									? "crdt-authority-changed"
-								: !preservedStateCurrent
-									? "preserved-unresolved-changed"
-									: currentDiskContent !== settledContent
-								? "disk-content-advanced"
-								: "newer-baseline-already-recorded",
+								: !editorTicketValidation.current
+									? "editor-authority-changed"
+									: !editorContentCurrent
+										? "editor-content-changed"
+										: !crdtAuthorityCurrent
+											? "crdt-authority-changed"
+											: !preservedStateCurrent
+												? "preserved-unresolved-changed"
+												: currentDiskContent !== settledContent
+													? "disk-content-advanced"
+													: "newer-baseline-already-recorded",
+							...(!editorTicketValidation.current && {
+								editorReason: editorTicketValidation.reason,
+							}),
 							expectedLength: settledContent.length,
 							currentDiskLength: currentDiskContent.length,
 						});

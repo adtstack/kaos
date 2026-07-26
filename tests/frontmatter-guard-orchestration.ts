@@ -8,9 +8,9 @@
  * branch discriminator. Scenarios A through E cover the four
  * handleBoundFileSyncGap block sites and the two syncFileFromDisk block
  * sites by way of the helper-call invariant; the bound branches are
- * exercised end-to-end through __qaOnlyForceSyncFileFromDiskUnsafe.
+ * exercised end-to-end through the QA-only ingestDiskFileNow control.
  *
- * In-scope (ingest direction, six sites in src/runtime/reconciliationController.ts,
+ * In-scope (ingest direction, six branch discriminators in src/runtime/reconciliationController.ts,
  * identified by enclosing function and predicate `reason` literal):
  *   1. syncFileFromDisk, unbound disk-to-CRDT existing-text branch
  *      (predicate reason: "disk-to-crdt"; emit branch: "disk-to-crdt-existing")
@@ -25,9 +25,9 @@
  *   5. handleBoundFileSyncGap, crdtOnly recovery existing-text branch
  *      (predicate reason: "bound-file-open-idle-disk-recovery";
  *       emit branch: "bound-file-open-idle-disk-recovery")
- *   6. handleBoundFileSyncGap, crdtOnly recovery seed branch
- *      (predicate reason: "bound-file-open-idle-seed";
- *       emit branch: "bound-file-open-idle-seed")
+ *   6. handleBoundFileSyncGap, safe external edit/merge branch
+ *      (predicate reason: "bound-file-open-safe-external-merge";
+ *       emit branch: "bound-file-open-safe-external-merge")
  *
  * Out-of-scope (egress direction):
  *   - DiskMirror.shouldBlockFrontmatterWrite at src/sync/diskMirror.ts. The
@@ -52,6 +52,7 @@ import { MarkdownView, TFile } from "obsidian";
 import * as Y from "yjs";
 import { ReconciliationController } from "../src/runtime/reconciliationController";
 import type { DiskIngestPort } from "../src/runtime/engineControlPort";
+import type { InterceptedExternalDiskMutation } from "../src/sync/editorBinding";
 import {
 	FLIGHT_KIND,
 	type FlightEventInput,
@@ -59,8 +60,13 @@ import {
 } from "../src/telemetry/debug/flightEvents";
 import {
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
-	ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
+	ORIGIN_OPEN_EXTERNAL_EDIT_MERGE,
 } from "../src/sync/origins";
+
+Object.defineProperty(globalThis, "__KAOS_QA_HARNESS_ENABLED__", {
+	configurable: true,
+	value: false,
+});
 
 let passed = 0;
 let failed = 0;
@@ -154,6 +160,11 @@ interface FrontmatterFixture {
 	setDiskContent(content: string): void;
 	setEditorContent(content: string): void;
 	setShouldBlock(predicate: BlockPredicate): void;
+	setFrontmatterBlocked(blocked: boolean): void;
+	getFrontmatterReasons(): string[];
+	getDiskContent(): string;
+	getFlushWriteCount(): number;
+	getBaselineAdvanceCount(): number;
 	clearBoundRecoveryLock(): void;
 	ingestDiskFileNow(reason?: "create" | "modify"): Promise<void>;
 }
@@ -169,6 +180,7 @@ interface FixtureOptions {
 	path: string;
 	disk: string;
 	editor: string;
+	baseline?: string;
 	/**
 	 * Initial CRDT content. When `null`, the fixture starts with no Y.Text
 	 * for the path (vaultSync.getTextForPath returns null) — used to drive
@@ -188,15 +200,20 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 	let diskContent = options.disk;
 	let editorContent = options.editor;
 	let blockPredicate: BlockPredicate = options.shouldBlock;
+	let frontmatterBlocked = false;
+	const frontmatterReasons: string[] = [];
+	let flushWriteCount = 0;
+	let baselineAdvanceCount = 0;
 	let diskIngestPort: DiskIngestPort | null = null;
+	const indexedBaseline = options.baseline ?? options.crdt;
 	let diskIndex: Record<string, { mtime: number; size: number; contentHash?: string }> =
 		options.crdt === null
 			? {}
 			: {
 				[path]: {
 					mtime: 0,
-					size: options.crdt.length,
-					contentHash: baselineHashSync(options.crdt),
+					size: indexedBaseline!.length,
+					contentHash: baselineHashSync(indexedBaseline!),
 				},
 			};
 
@@ -332,7 +349,6 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as never,
 		getVaultSync: () => vaultSync as never,
 		getDiskMirror: () => ({
@@ -340,7 +356,9 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 			shouldSuppressModify: async () => false,
 			isPreservedUnresolved: () => false,
 			clearPreservedUnresolved: () => {},
-			flushWrite: async () => {},
+			flushWrite: async () => {
+				flushWriteCount++;
+			},
 		}) as never,
 		getBlobSync: () => null,
 		getEditorBindings: () => editorBindings as never,
@@ -348,13 +366,24 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 		setDiskIndex: (next: Record<string, { mtime: number; size: number; contentHash?: string }>) => {
 			diskIndex = next;
 		},
+		getBaselineText: async (hash: string) => (
+			options.baseline !== undefined && hash === baselineHashSync(options.baseline)
+				? options.baseline
+				: null
+		),
+		recordBaselineText: () => {
+			baselineAdvanceCount++;
+		},
 		isMarkdownPathSyncable: () => true,
 		shouldBlockFrontmatterIngest: (
 			p: string,
 			previousContent: string | null,
 			nextContent: string,
 			reason: string,
-		) => blockPredicate(p, previousContent, nextContent, reason),
+		) => {
+			frontmatterReasons.push(reason);
+			return frontmatterBlocked || blockPredicate(p, previousContent, nextContent, reason);
+		},
 		refreshServerCapabilities: async () => {},
 		validateOpenEditorBindings: () => {},
 		onReconciled: () => {},
@@ -393,6 +422,11 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 		setDiskContent: (c) => { diskContent = c; },
 		setEditorContent: (c) => { editorContent = c; },
 		setShouldBlock: (p) => { blockPredicate = p; },
+		setFrontmatterBlocked: (blocked) => { frontmatterBlocked = blocked; },
+		getFrontmatterReasons: () => [...frontmatterReasons],
+		getDiskContent: () => diskContent,
+		getFlushWriteCount: () => flushWriteCount,
+		getBaselineAdvanceCount: () => baselineAdvanceCount,
 		clearBoundRecoveryLock: () => {
 			(controller as unknown as { boundRecoveryLocks: Map<string, number> })
 				.boundRecoveryLocks.clear();
@@ -402,6 +436,24 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 			return diskIngestPort.ingestDiskFileNow(path, reason);
 		},
 	};
+}
+
+function clearMarkdownDrainTimer(controller: ReconciliationController): void {
+	const internals = controller as never as {
+		markdownDrainTimer: ReturnType<typeof setTimeout> | null;
+	};
+	if (internals.markdownDrainTimer) {
+		clearTimeout(internals.markdownDrainTimer);
+		internals.markdownDrainTimer = null;
+	}
+}
+
+function getInterceptedCandidates(
+	controller: ReconciliationController,
+): Map<string, InterceptedExternalDiskMutation> {
+	return (controller as never as {
+		interceptedExternalDiskMutations: Map<string, InterceptedExternalDiskMutation>;
+	}).interceptedExternalDiskMutations;
 }
 
 // -------------------------------------------------------------------
@@ -481,22 +533,38 @@ await await scenarioAFix.ingestDiskFileNow("modify");
 }
 
 // -------------------------------------------------------------------
-// Scenario B — crdtOnly recovery branch blocked by frontmatter
+// Scenario B — safe external merge branch blocked by frontmatter
 // -------------------------------------------------------------------
 
-console.log("\n--- Scenario B: crdtOnly recovery branch blocked by frontmatter ---");
+console.log("\n--- Scenario B: safe external merge branch blocked by frontmatter ---");
+const scenarioBBaseline = "---\nstatus: base\n---\nbase body\n";
+const scenarioBLocal = "---\nstatus: base\n---\nlocal body\n";
+const scenarioBRawDisk = "---\nstatus: external\n---\nbase body\n";
 const scenarioBFix = buildFrontmatterFixture({
 	path: "Notes/scenario-b.md",
-	// Editor matches CRDT C; disk is D — crdtOnly precondition.
-	disk: "DDDD",
-	editor: "CCCC",
-	crdt: "CCCC",
-	shouldBlock: (_path, _prev, _next, reason) =>
-		reason === "bound-file-open-idle-disk-recovery",
-	// lastEditorActivityAgoMs unset -> null -> idle-grace bail does NOT fire.
+	baseline: scenarioBBaseline,
+	// Editor/CRDT carry a local body edit while disk carries a non-overlapping
+	// external frontmatter edit, producing a clean merged target whose
+	// frontmatter differs from the current editor authority.
+	disk: scenarioBRawDisk,
+	editor: scenarioBLocal,
+	crdt: scenarioBLocal,
+	shouldBlock: () => false,
 });
 
-await await scenarioBFix.ingestDiskFileNow("modify");
+scenarioBFix.setFrontmatterBlocked(true);
+scenarioBFix.controller.noteInterceptedExternalDiskMutation(Object.freeze({
+	path: scenarioBFix.path,
+	content: scenarioBRawDisk,
+	sequence: 1,
+	observedAt: 1,
+	ctime: 1,
+	mtime: 1,
+	size: scenarioBRawDisk.length,
+}));
+clearMarkdownDrainTimer(scenarioBFix.controller);
+
+await scenarioBFix.ingestDiskFileNow("modify");
 
 {
 	const skipped = scenarioBFix.captured.filter(
@@ -511,8 +579,8 @@ await await scenarioBFix.ingestDiskFileNow("modify");
 	assertEq(skipped[0]?.data.wasBound, true, "Scenario B: data.wasBound === true");
 	assertEq(
 		skipped[0]?.data.branch,
-		"bound-file-open-idle-disk-recovery",
-		"Scenario B: data.branch === 'bound-file-open-idle-disk-recovery'",
+		"bound-file-open-safe-external-merge",
+		"Scenario B: data.branch === 'bound-file-open-safe-external-merge'",
 	);
 
 	// Negative invariants.
@@ -533,12 +601,32 @@ await await scenarioBFix.ingestDiskFileNow("modify");
 
 	// Y.Text unchanged.
 	const ytext = scenarioBFix.getYText();
-	assertEq(ytext?.toString(), "CCCC", "Scenario B: Y.Text still equals CRDT content C");
-
-	// No transaction with the open-idle-recover origin.
+	assertEq(ytext?.toString(), scenarioBLocal, "Scenario B: Y.Text still equals local CRDT content");
+	assertEq(
+		scenarioBFix.getDiskContent(),
+		scenarioBRawDisk,
+		"Scenario B: raw disk candidate remains byte-identical",
+	);
+	assertEq(scenarioBFix.getFlushWriteCount(), 0, "Scenario B: disk flush is not attempted");
+	assertEq(
+		scenarioBFix.getBaselineAdvanceCount(),
+		0,
+		"Scenario B: baseline is not advanced",
+	);
 	assert(
-		!scenarioBFix.transactionOrigins.includes(ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER),
-		"Scenario B: no Y.Doc transaction with ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER",
+		scenarioBFix.getFrontmatterReasons().includes("bound-file-open-safe-external-merge"),
+		"Scenario B: exact frontmatter reason is observed",
+	);
+	assertEq(
+		getInterceptedCandidates(scenarioBFix.controller).get(scenarioBFix.path)?.content,
+		scenarioBRawDisk,
+		"Scenario B: blocked merge retains the exact intercepted candidate bytes",
+	);
+
+	// No transaction with the open-external merge origin.
+	assert(
+		!scenarioBFix.transactionOrigins.includes(ORIGIN_OPEN_EXTERNAL_EDIT_MERGE),
+		"Scenario B: no Y.Doc transaction with ORIGIN_OPEN_EXTERNAL_EDIT_MERGE",
 	);
 }
 

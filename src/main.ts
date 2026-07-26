@@ -3,10 +3,11 @@ import {
 	DEFAULT_SETTINGS,
 	VaultSyncSettingTab,
 	generateVaultId,
-	type ExternalEditPolicy,
 	type VaultSyncSettings,
 } from "./settings";
+import { EXTERNAL_EDIT_BEHAVIOR } from "./sync/externalEditBehavior";
 import {
+	type ExternalEditPolicyCompatibilityFields,
 	persistSettingsMutation,
 	SettingsMutationQueue,
 	SettingsStore,
@@ -168,6 +169,14 @@ import {
 	type RuntimeConfig,
 } from "./runtime/runtimeConfig";
 import {
+	readKaosExcludeFile,
+} from "./runtime/excludeFile";
+import {
+	isKaosExcludeFilePath,
+	mergeExcludePatterns,
+	parseExcludePatterns,
+} from "./sync/exclude";
+import {
 	ReconciliationController,
 	type MarkdownDirtyReason,
 	type StableMarkdownReadResult,
@@ -244,7 +253,7 @@ type PendingBlobReplayApplyResult =
 	| PendingBlobReplayPrecondition
 	| PendingBlobReplayMutation;
 
-type PersistedPluginState = Partial<VaultSyncSettings> & {
+type PersistedPluginState = Partial<VaultSyncSettings> & ExternalEditPolicyCompatibilityFields & {
 	_diskIndex?: DiskIndex;
 	_baselineTexts?: BaselineTextStore;
 	_conflictMergeBases?: ConflictMergeBaseStore;
@@ -310,7 +319,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	// ---------------------------------------------------------------------------
 	private _qaState: {
 		diskIngestPort: DiskIngestPort | null;
-		externalEditPolicyOverride: import("./settings").ExternalEditPolicy | null;
+		diskIngestSuspended: boolean;
 		pausedEditorPropagationPaths: Set<string>;
 		bindingReconfigureHook: ((path: string, deviceName: string, action: "pause" | "resume") => void) | null;
 		controlPort: EngineControlPort;
@@ -322,8 +331,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private recoverySnapshotInterval: ReturnType<typeof setInterval> | null = null;
 	private crdtSnapshotInterval: ReturnType<typeof setInterval> | null = null;
 
-	/** Parsed exclude patterns from settings. */
+	/** Effective union of the shared exclude file and legacy device settings. */
 	private excludePatterns: string[] = [];
+	private excludeFilePatterns: string[] = [];
+	private markdownAttentionGeneration = 0;
+	private markdownSyncScopeGeneration = 0;
+	private markdownSyncScopeFingerprint: string | null = null;
+	/** undefined = not read yet, null = confirmed absent, string = exact file body. */
+	private excludeFileRaw: string | null | undefined;
+	private excludeFileRefreshInFlight: Promise<void> | null = null;
+	private excludeFileLastError: string | null = null;
 
 	/** Max file size in characters (derived from settings KB). */
 	private maxFileSize = 0;
@@ -439,6 +456,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (previousHash && previousHash !== baseHash) this.baselineTextDeleteCandidates.add(previousHash);
 			},
 			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
+			getMarkdownAttentionGeneration: () => this.markdownAttentionGeneration,
+			getMarkdownSyncScopeGeneration: () => this.markdownSyncScopeGeneration,
 			shouldTombstoneIntrinsicMarkdownPath: (path) => this.isIntrinsicMarkdownPathExcluded(path),
 			shouldTombstoneIntrinsicBlobPath: (path) => this.isIntrinsicBlobPathExcluded(path),
 			shouldBlockFrontmatterIngest: (path, previousContent, nextContent, reason) =>
@@ -480,8 +499,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			computeRecoveryStateHash: async (_path, content) => {
 				return this.lab?.computeWitnessStateHash(content) ?? null;
 			},
-			getEffectiveExternalEditPolicy: (runtimePolicy) =>
-				this.getEffectiveExternalEditPolicy(runtimePolicy),
+			...(__KAOS_QA_HARNESS_ENABLED__ ? {
+				isDiskIngestSuspendedForQa: () =>
+					this._qaState?.diskIngestSuspended === true,
+			} : {}),
 			registerDiskIngestPort: (port) => {
 				if (__KAOS_QA_HARNESS_ENABLED__ && this._qaState) {
 					this._qaState.diskIngestPort = port;
@@ -495,12 +516,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return isMarkdownSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
 	}
 
-	private getEffectiveExternalEditPolicy(runtimePolicy: ExternalEditPolicy): ExternalEditPolicy {
-		if (__KAOS_QA_HARNESS_ENABLED__) {
-			const override = this._qaState?.externalEditPolicyOverride;
-			if (override != null) return override;
+	private updateMarkdownSyncScopeGeneration(runtimeConfig: RuntimeConfig): void {
+		const nextFingerprint = JSON.stringify([
+			runtimeConfig.vaultConfigDir,
+			[...runtimeConfig.excludePatterns].sort(),
+		]);
+		if (
+			this.markdownSyncScopeFingerprint !== null &&
+			this.markdownSyncScopeFingerprint !== nextFingerprint
+		) {
+			this.markdownSyncScopeGeneration++;
 		}
-		return runtimePolicy;
+		this.markdownSyncScopeFingerprint = nextFingerprint;
 	}
 
 	/** MarkdownView/y-codemirror binding remains `.md`-only. */
@@ -535,7 +562,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private getRuntimeConfig(): RuntimeConfig {
 		if (!this.runtimeConfig) {
-			this.runtimeConfig = buildRuntimeConfig(this.settings, this.app.vault.configDir);
+			this.runtimeConfig = this.buildEffectiveRuntimeConfig();
 		}
 		return this.runtimeConfig;
 	}
@@ -2799,7 +2826,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (__KAOS_QA_HARNESS_ENABLED__) {
 			this._qaState = {
 				diskIngestPort: null,
-				externalEditPolicyOverride: null,
+				diskIngestSuspended: false,
 				pausedEditorPropagationPaths: new Set(),
 				bindingReconfigureHook: null,
 				controlPort: {
@@ -2821,10 +2848,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						this._qaState.bindingReconfigureHook?.(path, this.settings.deviceName, "resume");
 						return true;
 					},
-					setExternalEditPolicyOverride: (policy) => {
+					setDiskIngestSuspended: (suspended) => {
 						if (!this._qaState) throw new Error("QA state not initialised");
-						const previous = this._qaState.externalEditPolicyOverride ?? this.getRuntimeConfig().externalEditPolicy;
-						this._qaState.externalEditPolicyOverride = policy;
+						const previous = this._qaState.diskIngestSuspended;
+						this._qaState.diskIngestSuspended = suspended;
 						return previous;
 					},
 				},
@@ -2940,6 +2967,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 		await this.loadSettings();
 		this.applyRuntimeSettings("load-settings");
+		await this.refreshExcludeFile("startup", false);
 			const isFrontmatterGuardEnabled = () => this.settings.frontmatterGuardEnabled;
 			this.frontmatterGuardCoordinator = new FrontmatterGuardCoordinator({
 				get frontmatterGuardEnabled() { return isFrontmatterGuardEnabled(); },
@@ -2957,8 +2985,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getEditorBindings: () => this.editorBindings,
 			getDiskMirror: () => this.diskMirror,
 			isMarkdownPathSyncable: (path) => this.isMarkdownEditorPathSyncable(path),
-			maybeImportDeferredClosedOnlyPath: (path, reason) =>
-				this.reconciliationController.maybeImportDeferredClosedOnlyPath(path, reason),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
 			log: (message) => this.log(message),
 		});
@@ -3246,6 +3272,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 		try {
 			this.idbDegradedHandled = false;
+			await this.refreshExcludeFile("init-sync", false);
 			this.applyRuntimeSettings("init-sync");
 			const initPersistenceAuthority = this.blobAuthorityScopeGuard.capture();
 			await this.ensurePendingBlobIntentPersistence();
@@ -3359,21 +3386,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				(event) => this.recordFlightPathEvent(event),
 				bindingPropagationGate,
 				() => this.settings.remoteTypingGuardEnabled,
-				(path, externalContent) => {
-					void this.reconciliationController.preserveRejectedExternalEditorReload(
-						path,
-						externalContent,
-					).catch((err) => {
-						this.trace("conflict", "external-editor-reload-preservation-failed", {
-							path,
-							error: formatUnknown(err),
-						});
-					});
+				(candidate) => {
+					this.reconciliationController.noteInterceptedExternalDiskMutation(candidate);
 				},
-				() =>
-					this.getEffectiveExternalEditPolicy(
-						this.getRuntimeConfig().externalEditPolicy,
-					) !== "always",
+				() => true,
 			);
 
 			// 3. Global CM6 extension
@@ -3400,7 +3416,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					),
 				() => this.settings.deviceName,
 				this.preservedUnresolvedEntries,
-				() => this.persistPreservedUnresolvedState(),
+				() => this.handleMarkdownAttentionStateChanged(),
 			);
 			this.diskMirror.setMarkdownPathSyncabilityPredicate((path) => this.isMarkdownPathSyncable(path));
 			this.diskMirror.setDiskBaselineHashProvider(
@@ -3536,6 +3552,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			});
 			const statusInterval = setInterval(() => {
 				if (!isCurrentInitBlobAuthority()) return;
+				void this.refreshExcludeFile("status-tick");
 				if (
 					vaultSync.localReady
 					&& !vaultSync.idbError
@@ -3829,6 +3846,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("modify", (file) => {
+				if (file instanceof TFile && isKaosExcludeFilePath(file.path)) {
+					void this.refreshExcludeFile("vault-modify");
+				}
 				if (!this.reconciliationController.isReconciled) {
 					if (file instanceof TFile && this.isMarkdownPathSyncable(file.path)) {
 						this.reconciliationController.noteMarkdownDiskMutation(file.path);
@@ -3869,10 +3889,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					} else {
 						writerGuess = "external";
 					}
-					const externalReloadGuardEnabled =
-						this.getEffectiveExternalEditPolicy(
-							this.getRuntimeConfig().externalEditPolicy,
-						) !== "always";
 					const observedAt = Date.now();
 					const diskMutationRevision: ObservedDiskMutationRevision = {
 						path: file.path,
@@ -3881,10 +3897,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						size: typeof file.stat?.size === "number" ? file.stat.size : null,
 					};
 					const editorBindingsAtEvent = this.editorBindings;
-					if (
-						externalReloadGuardEnabled &&
-						editorBindingsAtEvent?.isBound(file.path)
-					) {
+					if (editorBindingsAtEvent?.isBound(file.path)) {
 						const sequence = ++this.externalDiskMutationSequence;
 						editorBindingsAtEvent.beginExternalDiskMutation(file.path, sequence);
 						void (async () => {
@@ -3912,13 +3925,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 							// A result belongs only to the runtime and binding manager that
 							// observed the event. Reset/reinit must not arm a new editor.
 							if (this.diskMirror !== dm || this.editorBindings !== editorBindingsAtEvent) {
-								return;
-							}
-							if (
-								this.getEffectiveExternalEditPolicy(
-									this.getRuntimeConfig().externalEditPolicy,
-								) === "always"
-							) {
 								return;
 							}
 							editorBindingsAtEvent.noteExternalDiskMutation({
@@ -3964,6 +3970,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
 				if (!(file instanceof TFile)) return;
+				if (
+					isKaosExcludeFilePath(oldPath)
+					|| isKaosExcludeFilePath(file.path)
+				) {
+					void this.refreshExcludeFile("vault-rename");
+				}
 				if (this.attachmentOrchestrator?.consumeRemoteOverwriteBackupRename(file, oldPath)) {
 					this.log(
 						`Consumed operation-owned attachment backup rename: "${oldPath}" -> "${file.path}"`,
@@ -4155,6 +4167,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("delete", (file) => {
+				if (file instanceof TFile && isKaosExcludeFilePath(file.path)) {
+					void this.refreshExcludeFile("vault-delete");
+				}
 				if (!this.reconciliationController.isReconciled) {
 					if (file instanceof TFile) {
 						if (this.isMarkdownPathSyncable(file.path)) {
@@ -4325,6 +4340,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("create", (file) => {
+				if (file instanceof TFile && isKaosExcludeFilePath(file.path)) {
+					void this.refreshExcludeFile("vault-create");
+				}
 				if (!this.reconciliationController.isReconciled) {
 					if (file instanceof TFile && this.isMarkdownPathSyncable(file.path)) {
 						this.reconciliationController.dropDirtyPath(file.path);
@@ -4378,6 +4396,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * After this, the plugin is in the same state as before initSync().
 	 */
 	private async teardownSync(): Promise<void> {
+		this.reconciliationController.revokeAsyncAuthority();
 		this.log("teardownSync: tearing down all sync state");
 
 		// Safe teardown ordering for disk index baseline persistence:
@@ -4778,7 +4797,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				deviceName: this.settings.deviceName || "unknown-device",
 				vaultId: this.settings.vaultId || "unknown-vault",
 				attachmentSyncEnabled: this.settings.enableAttachmentSync,
-				externalEditPolicy: this.settings.externalEditPolicy,
 			},
 			syncStatusLabel: status.label,
 			connectionLabel: connection.label,
@@ -5569,7 +5587,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				deviceName: this.settings.deviceName,
 				debug: this.settings.debug,
 				enableAttachmentSync: this.settings.enableAttachmentSync,
-				externalEditPolicy: this.settings.externalEditPolicy,
+				externalEditBehavior: EXTERNAL_EDIT_BEHAVIOR,
 			},
 			state: {
 				reconciled: this.reconciliationController.getState().reconciled,
@@ -5877,7 +5895,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// intentionally guard-only: the first applyRuntimeSettings() call must not
 		// mistake startup hydration for a live scope transition and erase a valid
 		// same-scope transfer queue that was just restored from data.json.
-		this.runtimeConfig = buildRuntimeConfig(this.settings, this.app.vault.configDir);
+		this.runtimeConfig = this.buildEffectiveRuntimeConfig();
 		this.blobAuthorityScopeGuard.activate(this.getBlobIntentScope());
 		// Load disk index from plugin data (stored under _diskIndex key)
 		if (data && typeof data._diskIndex === "object" && data._diskIndex !== null) {
@@ -5975,7 +5993,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private applyRuntimeSettings(reason: string): void {
-		this.runtimeConfig = buildRuntimeConfig(this.settings, this.app.vault.configDir);
+		this.runtimeConfig = this.buildEffectiveRuntimeConfig();
+		this.updateMarkdownSyncScopeGeneration(this.runtimeConfig);
 		this.activateBlobAuthorityScope(`runtime-settings:${reason}`);
 		this.excludePatterns = this.runtimeConfig.excludePatterns;
 		this.maxFileSize = this.runtimeConfig.maxFileSizeBytes;
@@ -5986,10 +6005,88 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			hostConfigured: !!this.runtimeConfig.host,
 			vaultIdConfigured: !!this.runtimeConfig.vaultId,
 			enableAttachmentSync: this.runtimeConfig.enableAttachmentSync,
-			externalEditPolicy: this.runtimeConfig.externalEditPolicy,
+			externalEditBehavior: EXTERNAL_EDIT_BEHAVIOR,
 			maxFileSizeKB: this.runtimeConfig.maxFileSizeKB,
 			excludePatternCount: this.runtimeConfig.excludePatterns.length,
+			legacyExcludePatternCount: parseExcludePatterns(this.settings.excludePatterns).length,
+			excludeFilePatternCount: this.excludeFilePatterns.length,
 		});
+	}
+
+	private buildEffectiveRuntimeConfig(): RuntimeConfig {
+		const runtimeConfig = buildRuntimeConfig(this.settings, this.app.vault.configDir);
+		return {
+			...runtimeConfig,
+			excludePatterns: mergeExcludePatterns(
+				runtimeConfig.excludePatterns,
+				this.excludeFilePatterns,
+			),
+		};
+	}
+
+	private refreshExcludeFile(
+		reason: string,
+		reconcileOnChange = true,
+	): Promise<void> {
+		if (this.excludeFileRefreshInFlight) return this.excludeFileRefreshInFlight;
+		const refresh = this.loadExcludeFile(reason, reconcileOnChange).finally(() => {
+			if (this.excludeFileRefreshInFlight === refresh) {
+				this.excludeFileRefreshInFlight = null;
+			}
+		});
+		this.excludeFileRefreshInFlight = refresh;
+		return refresh;
+	}
+
+	private async loadExcludeFile(
+		reason: string,
+		reconcileOnChange: boolean,
+	): Promise<void> {
+		let snapshot;
+		try {
+			snapshot = await readKaosExcludeFile(this.app.vault.adapter);
+		} catch (err) {
+			const message = formatUnknown(err);
+			if (message !== this.excludeFileLastError) {
+				this.excludeFileLastError = message;
+				this.log(`Exclude file read failed; retaining the previous policy: ${message}`);
+				this.trace("reconcile", "exclude-file-read-failed", { reason, error: message });
+			}
+			return;
+		}
+
+		this.excludeFileLastError = null;
+		if (snapshot.raw === this.excludeFileRaw) return;
+
+		const previousPatterns = this.excludePatterns;
+		this.excludeFileRaw = snapshot.raw;
+		this.excludeFilePatterns = snapshot.patterns;
+		this.applyRuntimeSettings(`exclude-file:${reason}`);
+		const effectiveChanged = previousPatterns.length !== this.excludePatterns.length
+			|| previousPatterns.some((pattern, index) => pattern !== this.excludePatterns[index]);
+
+		this.log(
+			snapshot.present
+				? `Exclude file loaded (${snapshot.patterns.length} pattern(s))`
+				: "Exclude file not present; shared exclusions are empty",
+		);
+		this.trace("reconcile", "exclude-file-reloaded", {
+			reason,
+			present: snapshot.present,
+			filePatternCount: snapshot.patterns.length,
+			effectivePatternCount: this.excludePatterns.length,
+			effectiveChanged,
+		});
+
+		const vaultSync = this.vaultSync;
+		if (
+			reconcileOnChange
+			&& effectiveChanged
+			&& vaultSync
+			&& this.reconciliationController?.isReconciled
+		) {
+			void this.runReconciliation(vaultSync.getSafeReconcileMode());
+		}
 	}
 
 	get serverAuthMode(): ServerCapabilities["authMode"] | "unknown" {
@@ -6296,6 +6393,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			_blobHashCache: this.blobHashCache,
 			...(this.lastDiskIndexPersistedAt > 0 && { _lastDiskIndexPersistedAt: this.lastDiskIndexPersistedAt }),
 		};
+		// New installs use the shared vault file. Keep reading a non-empty legacy
+		// value for compatibility, but do not persist an empty device-local field.
+		if (!this.settings.excludePatterns.trim()) delete nextState.excludePatterns;
 		delete nextState._blobSettledRefs;
 		delete nextState._blobSettledRefsByDevice;
 		applyPersistedBaselineTextFields(
@@ -6358,6 +6458,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private persistPreservedUnresolvedState(): void {
 		void this.persistPreservedUnresolvedStateDurably();
+	}
+
+	private handleMarkdownAttentionStateChanged(): void {
+		this.markdownAttentionGeneration++;
+		this.persistPreservedUnresolvedState();
 	}
 
 	private async persistPreservedUnresolvedStateDurably(): Promise<void> {

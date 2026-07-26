@@ -8,6 +8,11 @@ import {
 } from "../src/runtime/reconciliationController";
 import type { DiskIngestPort } from "../src/runtime/engineControlPort";
 
+Object.defineProperty(globalThis, "__KAOS_QA_HARNESS_ENABLED__", {
+	configurable: true,
+	value: false,
+});
+
 class FakeTFile extends TFile {
 	constructor(
 		readonly path: string,
@@ -132,7 +137,6 @@ function makeFixture(options: FixtureOptions = {}) {
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => diskMirror as any,

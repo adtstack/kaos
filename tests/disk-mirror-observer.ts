@@ -81,6 +81,7 @@ function makeHarness(options: {
 	onAfterRename?: () => void | Promise<void>;
 	onBeforeTrash?: () => void | Promise<void>;
 	onAfterTrash?: () => void | Promise<void>;
+	stripBomOnVaultRead?: boolean;
 	trashBehavior?: "success" | "throw" | "missing";
 	ensureFileBehavior?: "settle" | "throw" | "null" | "mismatch";
 	onAfterEnsureFileSettle?: () => void;
@@ -177,13 +178,17 @@ function makeHarness(options: {
 	const workspaceView = options.opaqueOpenFileView
 		? { file: { path: filePath } }
 		: markdownView;
+	const byteLength = (content: string): number => new TextEncoder().encode(content).byteLength;
 	const makeDiskFileIdentity = (path: string, contentLength: number) => Object.assign(new TFile(), {
 		path,
 		stat: { ctime: 1, mtime: 1, size: contentLength },
 	});
 	const diskFileIdentities = new Map<string, TFile>();
 	const nonFilePathOccupants = new Map<string, { path: string }>();
-	let currentDiskFile = makeDiskFileIdentity(filePath, options.initialDiskContent?.length ?? 0);
+	let currentDiskFile = makeDiskFileIdentity(
+		filePath,
+		options.initialDiskContent === undefined ? 0 : byteLength(options.initialDiskContent),
+	);
 	if (options.initialDiskContent !== undefined) diskFileIdentities.set(filePath, currentDiskFile);
 	const getDiskFileIdentity = (path: string): TFile | null => {
 		const nonFile = nonFilePathOccupants.get(path);
@@ -194,7 +199,7 @@ function makeHarness(options: {
 		}
 		let file = diskFileIdentities.get(path);
 		if (!file) {
-			file = makeDiskFileIdentity(path, diskFiles.get(path)?.length ?? 0);
+			file = makeDiskFileIdentity(path, byteLength(diskFiles.get(path) ?? ""));
 			diskFileIdentities.set(path, file);
 		}
 		return file;
@@ -216,7 +221,12 @@ function makeHarness(options: {
 			read: async (file: { path: string }) => {
 				const content = diskFiles.get(file.path) ?? "";
 				await options.onRead?.();
-				return content;
+				return options.stripBomOnVaultRead && content.charCodeAt(0) === 0xfeff
+					? content.slice(1)
+					: content;
+			},
+			adapter: {
+				read: async (path: string) => diskFiles.get(path) ?? "",
 			},
 			modify: async (file: { path: string }, content: string) => {
 				modifyCalls++;
@@ -239,7 +249,7 @@ function makeHarness(options: {
 				await options.onBeforeCreate?.();
 				if (diskFiles.has(path)) throw new Error(`File already exists: ${path}`);
 				diskFiles.set(path, content);
-				const file = makeDiskFileIdentity(path, content.length);
+				const file = makeDiskFileIdentity(path, byteLength(content));
 				diskFileIdentities.set(path, file);
 				if (path === filePath) currentDiskFile = file;
 				await options.onAfterCreate?.();
@@ -315,13 +325,13 @@ function makeHarness(options: {
 			// Model delete + recreate at the same path. The bytes can be identical,
 			// but Obsidian exposes a new TFile object for the new filesystem entry.
 			diskFiles.set(filePath, content);
-			currentDiskFile = makeDiskFileIdentity(filePath, content.length);
+			currentDiskFile = makeDiskFileIdentity(filePath, byteLength(content));
 			diskFileIdentities.set(filePath, currentDiskFile);
 		},
 		replaceDiskFileIdentityAt: (path: string, content: string) => {
 			// Same ABA model for rename destinations and arbitrary vault paths.
 			diskFiles.set(path, content);
-			const replacement = makeDiskFileIdentity(path, content.length);
+			const replacement = makeDiskFileIdentity(path, byteLength(content));
 			diskFileIdentities.set(path, replacement);
 			if (path === filePath) currentDiskFile = replacement;
 			return replacement;
@@ -724,6 +734,92 @@ console.log("\n--- Test 12: expectedDiskContent rejects a stale reconciliation p
 	);
 	assert(fixture.getProcessCalls() === 0, "snapshot mismatch is rejected before atomic commit");
 	assert(fixture.getModifyCalls() === 0, "snapshot mismatch performs no fallback modify");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 12a: Vault.process accepts the same document snapshot with a raw BOM ---");
+{
+	const rawDiskContent = "\ufeffsame logical authority\r\nsecond line\r\n";
+	const documentDiskContent = rawDiskContent.slice(1);
+	const settledCrdtContent = "same logical authority\nsecond line\n";
+	const fixture = makeHarness({
+		initialDiskContent: rawDiskContent,
+		stripBomOnVaultRead: true,
+	});
+	fixture.ytext.insert(0, settledCrdtContent);
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: documentDiskContent,
+	});
+
+	assert(
+		result.kind === "written",
+		"atomic CAS recognizes Vault.read's BOM-stripped snapshot inside raw Vault.process",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === settledCrdtContent,
+		"representation-only raw disk bytes settle to the authoritative Y.Text snapshot",
+	);
+	assert(fixture.getProcessCalls() === 1, "representation settlement uses one atomic process");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 12a1: a meaningful raw edit at process entry still aborts the CAS ---");
+{
+	const rawDiskContent = "\ufeffsame logical authority\r\nsecond line\r\n";
+	const newerRawExternal = "\ufeffdifferent external authority\r\nsecond line\r\n";
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: rawDiskContent,
+		stripBomOnVaultRead: true,
+		onBeforeProcess: () => {
+			fixture.diskFiles.set(FILE_PATH, newerRawExternal);
+		},
+	});
+	fixture.ytext.insert(0, "same logical authority\nsecond line\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: rawDiskContent.slice(1),
+	});
+
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"BOM-aware atomic CAS rejects a meaningful external change at process entry",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === newerRawExternal,
+		"the newer raw external candidate remains byte-for-byte intact",
+	);
+	assert(fixture.getProcessCalls() === 1, "process-entry race is detected inside the atomic callback");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 12a2: raw-process equivalence never erases a CRLF content precondition ---");
+{
+	const rawDiskContent = "\ufeffsame logical authority\r\nsecond line\r\n";
+	const staleLfPlan = "same logical authority\nsecond line\n";
+	const fixture = makeHarness({
+		initialDiskContent: rawDiskContent,
+		stripBomOnVaultRead: true,
+	});
+	fixture.ytext.insert(0, "new CRDT content\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: staleLfPlan,
+	});
+
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"BOM compatibility does not normalize CRLF away from the exact document CAS",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === rawDiskContent,
+		"a line-ending mismatch preserves the raw external disk snapshot",
+	);
+	assert(fixture.getProcessCalls() === 0, "line-ending mismatch is rejected before atomic commit");
 
 	fixture.doc.destroy();
 }
@@ -1578,6 +1674,41 @@ console.log("\n--- Test 14l: post-process disk change blocks baseline settlement
 	fixture.doc.destroy();
 }
 
+console.log("\n--- Test 14l2: post-process same-file stat ABA blocks baseline settlement ---");
+{
+	const expectedDiskContent = "DISK_BEFORE_SAME_FILE_ABA\n";
+	const committedContent = "REMOTE_WRITE_BEFORE_SAME_FILE_ABA\n";
+	let readCount = 0;
+	let baselinePublished = false;
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		initialDiskContent: expectedDiskContent,
+		onRead: () => {
+			readCount++;
+			if (readCount === 2) fixture.advanceDiskFileRevision();
+		},
+	});
+	fixture.mirror.setDiskWriteCallback(() => { baselinePublished = true; });
+	fixture.ytext.insert(0, committedContent);
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent,
+	});
+
+	assert(readCount === 2, "written settlement reaches the final disk readback boundary");
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"same-file stat advance during written readback is not reported settled",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === committedContent,
+		"same-file ABA leaves the atomically committed bytes intact for a fresh plan",
+	);
+	assert(!baselinePublished, "same-file post-commit ABA publishes no durable baseline");
+
+	fixture.doc.destroy();
+}
+
 console.log("\n--- Test 14m: post-create same-bytes ABA blocks baseline settlement ---");
 {
 	const createdContent = "REMOTE_CREATE_C1\n";
@@ -2324,6 +2455,188 @@ console.log("\n--- Test 17c: a conflict discovered at Vault.process entry aborts
 		"atomic-process blocking preserves both candidates",
 	);
 	assert(fixture.getProcessCalls() === 1, "the process callback runs once and aborts before commit");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 17d: caller authority is checked inside Vault.process before bytes commit ---");
+{
+	const diskContent = "DISK_BEFORE_AUTHORITY_RACE\n";
+	const crdtContent = "CRDT_FROM_ORIGINAL_PLAN\n";
+	let authorityCurrent = true;
+	let baselineCalls = 0;
+	const fixture = makeHarness({
+		initialDiskContent: diskContent,
+		onBeforeProcess: () => {
+			authorityCurrent = false;
+		},
+	});
+	fixture.mirror.setDiskWriteCallback(() => { baselineCalls++; });
+	fixture.ytext.insert(0, crdtContent);
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: diskContent,
+		recordBaseline: true,
+		isAuthorityCurrent: () => authorityCurrent,
+	} as Parameters<DiskMirror["flushWrite"]>[2]);
+
+	assert(
+		result.kind === "deferred" && result.reason === "authority-stale",
+		"authority invalidation at process entry returns a bounded stale deferral",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === diskContent,
+		"authority invalidation inside Vault.process returns no replacement bytes",
+	);
+	assert(fixture.getProcessCalls() === 1, "authority is rechecked inside the atomic callback");
+	assert(baselineCalls === 0, "atomic authority rejection publishes no baseline callback");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 17e: unchanged settlement rechecks caller authority before baseline callback ---");
+{
+	const settledContent = "UNCHANGED_AUTHORITY_SNAPSHOT\n";
+	let authorityCurrent = true;
+	let readCount = 0;
+	let baselineCalls = 0;
+	const fixture = makeHarness({
+		initialDiskContent: settledContent,
+		onRead: () => {
+			readCount++;
+			if (readCount === 2) authorityCurrent = false;
+		},
+	});
+	fixture.mirror.setDiskWriteCallback(() => { baselineCalls++; });
+	fixture.ytext.insert(0, settledContent);
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: settledContent,
+		recordBaseline: true,
+		isAuthorityCurrent: () => authorityCurrent,
+	} as Parameters<DiskMirror["flushWrite"]>[2]);
+
+	assert(readCount === 2, "unchanged settlement reaches the final disk readback boundary");
+	assert(
+		result.kind === "deferred" && result.reason === "authority-stale",
+		"authority invalidation during unchanged readback is not reported settled",
+	);
+	assert(baselineCalls === 0, "stale unchanged snapshot publishes no baseline callback");
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === settledContent,
+		"unchanged authority rejection leaves disk bytes untouched",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 17f: a successful create consumes remote-create authority before stale settlement ---");
+{
+	const createdContent = "REMOTE_CREATE_THEN_STALE\n";
+	const fixture = makeHarness({
+		baselineHashProvider: () => "durable-prior-baseline",
+	});
+	fixture.ytext.insert(0, createdContent);
+	(fixture.mirror as unknown as {
+		authorizeRemoteCreate(path: string): void;
+	}).authorizeRemoteCreate(FILE_PATH);
+
+	const first = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		isAuthorityCurrent: (phase: "before-commit" | "after-commit") =>
+			phase === "before-commit",
+	} as Parameters<DiskMirror["flushWrite"]>[2]);
+
+	assert(
+		first.kind === "deferred" && first.reason === "authority-stale",
+		"a post-create authority change defers settlement after the file was created",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === createdContent,
+		"the stale settlement accurately reports that create already committed",
+	);
+	assert(
+		!(fixture.mirror as unknown as {
+			remoteCreateAuthorizations: Map<string, number>;
+		}).remoteCreateAuthorizations.has(FILE_PATH),
+		"the one-shot remote-create authorization is consumed by the committed create",
+	);
+
+	// Model a local delete after that committed-but-unsettled create. A normal
+	// retry must respect the durable baseline instead of borrowing stale create
+	// authority and resurrecting the path.
+	fixture.diskFiles.delete(FILE_PATH);
+	const retry = await fixture.mirror.flushWrite(FILE_PATH, true);
+	assert(
+		retry.kind === "deferred" && retry.reason === "disk-changed-during-write",
+		"an ordinary retry cannot reuse the consumed create authority after local delete",
+	);
+	assert(
+		!fixture.diskFiles.has(FILE_PATH),
+		"the local delete remains intact after the ordinary retry",
+	);
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 17g: raw BOM artifact create is acknowledged by exact suppression ---");
+{
+	const rawArtifact = "\ufeffexternal conflict\r\n";
+	const fixture = makeHarness({
+		initialDiskContent: rawArtifact,
+		stripBomOnVaultRead: true,
+	});
+	const file = fixture.getCurrentDiskFile();
+	if (!file) throw new Error("fixture must expose the raw artifact file");
+
+	await fixture.mirror.suppressLocalCreate(FILE_PATH, rawArtifact);
+	const suppressed = await fixture.mirror.shouldSuppressCreate(file);
+
+	assert(
+		suppressed,
+		"self-create suppression fingerprints the exact adapter bytes instead of Vault.read text",
+	);
+	assert(!fixture.mirror.isSuppressed(FILE_PATH), "exact raw acknowledgement consumes suppression");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 18: exact local-create suppression handles roll back without ABA ---");
+{
+	type SuppressionHandle = Readonly<{ path: string; token: unknown }>;
+	type CancellableSuppressionContract = {
+		suppressLocalCreate(path: string, content: string): Promise<SuppressionHandle | void>;
+		rollbackLocalCreateSuppression?: (handle: SuppressionHandle) => boolean;
+	};
+	const fixture = makeHarness();
+	const contract = fixture.mirror as unknown as CancellableSuppressionContract;
+	const recentFingerprints = (fixture.mirror as unknown as {
+		recentWriteFingerprints: Map<string, unknown>;
+	}).recentWriteFingerprints;
+	const first = await contract.suppressLocalCreate(FILE_PATH, "stale conflict candidate\n");
+	const rollback = contract.rollbackLocalCreateSuppression;
+
+	assert(first !== undefined, "local-create suppression returns an exact rollback handle");
+	assert(typeof rollback === "function", "DiskMirror exposes exact local-create suppression rollback");
+	assert(fixture.mirror.isSuppressed(FILE_PATH), "registered create suppression is initially active");
+	assert(recentFingerprints.has(FILE_PATH), "registered create suppression publishes recent proof");
+	if (first !== undefined && rollback) {
+		assert(rollback.call(contract, first), "current suppression handle rolls back owned state");
+		assert(!fixture.mirror.isSuppressed(FILE_PATH), "rollback removes active suppression residue");
+		assert(!recentFingerprints.has(FILE_PATH), "rollback removes recent fingerprint residue");
+
+		const older = await contract.suppressLocalCreate(FILE_PATH, "older candidate\n");
+		const newer = await contract.suppressLocalCreate(FILE_PATH, "newer candidate\n");
+		assert(older !== undefined && newer !== undefined, "same-path replacements each return handles");
+		if (older !== undefined && newer !== undefined) {
+			assert(
+				!rollback.call(contract, older),
+				"an older handle cannot erase a newer same-path suppression",
+			);
+			assert(fixture.mirror.isSuppressed(FILE_PATH), "newer suppression remains active after old rollback");
+			assert(recentFingerprints.has(FILE_PATH), "newer recent proof remains after old rollback");
+			assert(rollback.call(contract, newer), "newer exact handle can clean up its own state");
+		}
+	}
 
 	fixture.doc.destroy();
 }

@@ -16,6 +16,7 @@
  *   merge, or silently overwrite them.
  */
 
+import { MarkdownView } from "obsidian";
 import type { QaScenario } from "../types";
 
 const FOLDER = "QA-s07";
@@ -217,6 +218,8 @@ export const s07bDelayedTemplateWrites: QaScenario = {
 // This confirms that #25 fixes cover the Templater-trigger class.
 // -----------------------------------------------------------------------
 
+let s07cPathForCleanup: string | null = null;
+
 export const s07cOpenEditorTemplateMutation: QaScenario = {
 	id: "s07c-open-editor-template-mutation",
 	title: "S07c: Template mutates open file (confirms #25 open-idle recovery coverage)",
@@ -230,8 +233,35 @@ export const s07cOpenEditorTemplateMutation: QaScenario = {
 
 	async run(ctx): Promise<void> {
 		const path = p("s07c-editor-mutation");
-		const initial = FULL_NOTE("S07c Initial", "draft");
-		const afterTemplate = FULL_NOTE("S07c After Template", "in-progress");
+		s07cPathForCleanup = path;
+		const initial = [
+			"## 업무",
+			"",
+			"## 일상",
+			"",
+		].join("\n");
+		const afterTemplate = [
+			"## 업무",
+			"",
+			"## 일상",
+			"QuickAdd Vault.modify로 추가한 일상",
+			"",
+		].join("\n");
+		const afterEditor = [
+			"## 업무",
+			"편집기에서 추가한 업무",
+			"",
+			"## 일상",
+			"",
+		].join("\n");
+		const expectedMerged = [
+			"## 업무",
+			"편집기에서 추가한 업무",
+			"",
+			"## 일상",
+			"QuickAdd Vault.modify로 추가한 일상",
+			"",
+		].join("\n");
 
 		// 1. Create and open.
 		await ctx.createFile(path, initial);
@@ -244,8 +274,31 @@ export const s07cOpenEditorTemplateMutation: QaScenario = {
 		const baselineHash = await ctx.kaos.getDiskHash(path);
 		console.log("[S07c] baseline (editor open)", { baselineHash });
 
-		// 2. Template mutates the file via vault API while editor is open.
-		//    This simulates: Templater runs tp.file.cursor_append() or modifies metadata.
+		// 2. Create local authority through the active editor, then let a
+		//    QuickAdd-class Vault.modify write change only the other section.
+		const view = ctx.app.workspace.getActiveViewOfType(MarkdownView);
+		if (!view || view.file?.path !== path) {
+			throw new Error(`S07c: active editor is not bound to ${path}`);
+		}
+		view.editor.replaceRange("편집기에서 추가한 업무\n", { line: 1, ch: 0 });
+		let editorAuthorityReady = false;
+		const editorAuthorityDeadline = Date.now() + 5000;
+		while (Date.now() < editorAuthorityDeadline) {
+			const crdtHash = await ctx.kaos.getCrdtHash(path);
+			const editorHash = await ctx.kaos.getEditorHash(path);
+			if (
+				view.editor.getValue() === afterEditor &&
+				crdtHash !== null &&
+				crdtHash === editorHash
+			) {
+				editorAuthorityReady = true;
+				break;
+			}
+			await ctx.sleep(50);
+		}
+		if (!editorAuthorityReady) {
+			throw new Error("S07c: editor edit did not become CRDT authority before Vault.modify");
+		}
 		await ctx.modifyFile(path, afterTemplate);
 
 		// 3. Wait for the open-idle recovery path to run.
@@ -258,27 +311,39 @@ export const s07cOpenEditorTemplateMutation: QaScenario = {
 		const editorFinal = await ctx.kaos.getEditorHash(path);
 		console.log("[S07c] final state", { diskFinal, crdtFinal, editorFinal });
 
-		if (!diskFinal || !crdtFinal) {
+		if (!diskFinal || !crdtFinal || !editorFinal) {
 			throw new Error("S07c: could not read final hashes");
 		}
-		if (diskFinal !== crdtFinal) {
-			throw new Error(`S07c: disk != CRDT after template mutation\n  disk: ${diskFinal}\n  crdt: ${crdtFinal}`);
+		if (diskFinal !== crdtFinal || diskFinal !== editorFinal) {
+			throw new Error(
+				`S07c: disk/CRDT/editor diverged after template mutation` +
+				`\n  disk: ${diskFinal}\n  crdt: ${crdtFinal}\n  editor: ${editorFinal}`,
+			);
 		}
-		// Content must reflect the template write, not the original.
-		if (diskFinal === baselineHash) {
-			throw new Error("S07c: disk/CRDT did not update after template mutation — still initial content");
+		const finalFile = ctx.app.vault.getFileByPath(path);
+		if (!finalFile) throw new Error(`S07c: missing ${path}`);
+		const finalContent = await ctx.app.vault.read(finalFile);
+		if (finalContent !== expectedMerged) {
+			throw new Error(`S07c: unexpected merged content: ${JSON.stringify(finalContent)}`);
 		}
+		if (view.editor.getValue() !== expectedMerged) {
+			throw new Error(
+				`S07c: stale editor content: ${JSON.stringify(view.editor.getValue())}`,
+			);
+		}
+		await ctx.assert.diskEqualsCrdt(path);
+		await ctx.assert.noConflictCopies(FOLDER);
 
 		// 5. File must not have grown unboundedly (no loop).
-		const finalFile = ctx.app.vault.getAbstractFileByPath(path);
 		const finalSize = (finalFile as unknown as { stat?: { size?: number } })?.stat?.size ?? 0;
-		const expectedSize = new TextEncoder().encode(afterTemplate).length;
+		const expectedSize = new TextEncoder().encode(expectedMerged).length;
 		if (finalSize > expectedSize + 512) {
 			throw new Error(`S07c: file size grew beyond expected (${finalSize} > ${expectedSize} + 512) — possible loop`);
 		}
 
 		await ctx.closeFile(path);
 		await ctx.deleteFile(path);
+		s07cPathForCleanup = null;
 	},
 
 	async assert(ctx): Promise<void> {
@@ -286,6 +351,15 @@ export const s07cOpenEditorTemplateMutation: QaScenario = {
 	},
 
 	async cleanup(ctx): Promise<void> {
+		const path = s07cPathForCleanup;
+		s07cPathForCleanup = null;
+		if (path) {
+			try {
+				await ctx.closeFile(path);
+			} finally {
+				await ctx.deleteFile(path);
+			}
+		}
 		await ctx.waitForIdle(5000);
 	},
 };

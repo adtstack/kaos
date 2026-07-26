@@ -32,6 +32,11 @@ import {
 	type FlightPathEventInput,
 } from "../src/telemetry/debug/flightEvents";
 
+Object.defineProperty(globalThis, "__KAOS_QA_HARNESS_ENABLED__", {
+	configurable: true,
+	value: false,
+});
+
 let passed = 0;
 let failed = 0;
 
@@ -129,6 +134,7 @@ function buildFixture(initial: {
 	const path = initial.path;
 	let diskContent = initial.disk;
 	let editorContent = initial.editor;
+	let editorRevision = 0;
 	let diskIngestPort: DiskIngestPort | null = null;
 	let lastEditorActivity: number | null = initial.lastEditorActivity ?? null;
 	let bindingHealthy = initial.bindingHealthy ?? true;
@@ -205,6 +211,43 @@ function buildFixture(initial: {
 		rebind: () => {},
 		unbindByPath: () => {},
 		getLastEditorActivityForPath: () => lastEditorActivity,
+		captureOpenEditorMutationTicket: (
+			ticketPath: string,
+			ticketViews: readonly MarkdownView[],
+		) => ({
+			path: ticketPath,
+			views: ticketViews.map((ticketView, index) => ({
+				view: ticketView,
+				viewId: `stub-view-${index + 1}`,
+				leafId: `stub-leaf-${index + 1}`,
+				cm: null,
+				cmId: null,
+				bindingEpoch: 0,
+				editorRevision,
+				editorAuthorityRevision: editorRevision,
+				editorAuthorityContent: editorContent,
+				editorDocument: editorRevision,
+				editorContent,
+			})),
+		}),
+		validateOpenEditorMutationTicket: (
+			ticket: {
+				path: string;
+				views: ReadonlyArray<{ view: MarkdownView; editorRevision: number }>;
+			},
+			currentViews: readonly MarkdownView[],
+		) => {
+			if (
+				ticket.path !== path ||
+				ticket.views.length !== currentViews.length ||
+				ticket.views.some((snapshot, index) => snapshot.view !== currentViews[index])
+			) {
+				return { current: false as const, reason: "view-set-changed" as const };
+			}
+			return ticket.views.some((snapshot) => snapshot.editorRevision !== editorRevision)
+				? { current: false as const, reason: "editor-revision-changed" as const }
+				: { current: true as const };
+		},
 	};
 
 	const app = {
@@ -241,7 +284,6 @@ function buildFixture(initial: {
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "always",
 		}) as never,
 		getVaultSync: () => vaultSync as never,
 		getDiskMirror: () => ({
@@ -285,7 +327,10 @@ function buildFixture(initial: {
 		transactionOrigins,
 		controller,
 		setDiskContent: (c) => { diskContent = c; },
-		setEditorContent: (c) => { editorContent = c; },
+		setEditorContent: (c) => {
+			editorContent = c;
+			editorRevision++;
+		},
 		setLastEditorActivity: (v) => { lastEditorActivity = v; },
 		setBindingHealthy: (h) => { bindingHealthy = h; },
 		setBaselineContent: (c) => {

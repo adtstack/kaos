@@ -23,7 +23,11 @@ function sliceBetween(source, startMarker, endMarker) {
 }
 
 const workspaceSource = readFileSync(new URL("../src/runtime/editorWorkspaceOrchestrator.ts", import.meta.url), "utf8");
-const bindingSource = readFileSync(new URL("../src/sync/editorBinding.ts", import.meta.url), "utf8");
+const editorBindingSource = readFileSync(
+	new URL("../src/sync/editorBinding.ts", import.meta.url),
+	"utf8",
+);
+const bindingSource = editorBindingSource;
 const mainSource = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
 
 console.log("\n--- Test 1: validateOpenBindings delegates repair to guarded audit ---");
@@ -227,10 +231,8 @@ console.log("\n--- Test 9b: live editor patch filtering has no 3-way merge state
 		"private shouldShieldYTextPatch(input: {",
 	);
 	assert(section !== null, "createYTextOriginCaptureExtension section found");
-	assert(
-		!bindingSource.includes("mergeTexts3"),
-		"EditorBindingManager does not import or call mergeTexts3",
-	);
+	assert(!editorBindingSource.includes("mergeTexts3"), "binding layer never performs three-way merge");
+	assert(!editorBindingSource.includes("partialMergedText"), "binding layer never applies partial merges");
 	assert(
 		!section?.includes("beforeContentByTransaction"),
 		"Y.Text patch capture does not store pre-patch base content for live merge",
@@ -243,31 +245,71 @@ console.log("\n--- Test 9b: live editor patch filtering has no 3-way merge state
 
 console.log("\n--- Test 9c: modify attribution cannot hide suppression-window external writes ---");
 {
-	const section = sliceBetween(
+	const modifySection = sliceBetween(
 		mainSource,
-		"const externalReloadGuardEnabled =",
-		"this.traceSink.recordPath({",
+		'this.app.vault.on("modify", (file) => {',
+		'this.app.vault.on("rename", (file, oldPath) => {',
 	);
-	assert(section !== null, "modify-event external reload guard section found");
+	const bindingWiringSection = sliceBetween(
+		mainSource,
+		"this.editorBindings = new EditorBindingManager(",
+		"// 3. Global CM6 extension",
+	);
+	assert(modifySection !== null, "vault modify handler section found");
+	assert(bindingWiringSection !== null, "EditorBindingManager wiring section found");
 	assert(
-		section?.includes("editorBindingsAtEvent.beginExternalDiskMutation"),
-		"every candidate modify event records synchronous ordering before async proof",
+		modifySection?.includes("editorBindingsAtEvent?.isBound(file.path)"),
+		"every bound external modify event enters mutation attribution",
 	);
 	assert(
-		section?.includes("dm.probeRecentWriteFingerprint("),
+		(modifySection?.indexOf("editorBindingsAtEvent.beginExternalDiskMutation") ?? Infinity) <
+			(modifySection?.indexOf("void (async () => {") ?? -1),
+		"bound modify events record synchronous ordering before asynchronous proof",
+	);
+	assert(
+		modifySection?.includes("dm.probeRecentWriteFingerprint("),
 		"timing-attributed KAOS writes are verified against their exact event revision",
 	);
 	assert(
-		section?.includes('if (probe.kind === "self-write") return;'),
+		modifySection?.includes('if (probe.kind === "self-write") return;'),
 		"only an exact self-write fingerprint bypasses the external reload guard",
 	);
 	assert(
-		section?.includes("this.diskMirror !== dm || this.editorBindings !== editorBindingsAtEvent"),
+		modifySection?.includes("this.diskMirror !== dm || this.editorBindings !== editorBindingsAtEvent"),
 		"late proof is fenced to the runtime and binding manager that observed the event",
 	);
 	assert(
-		section?.includes(') === "always"'),
-		"the explicit always policy still bypasses late asynchronous guard admission",
+		(modifySection?.indexOf("this.diskMirror !== dm || this.editorBindings !== editorBindingsAtEvent") ?? Infinity) <
+			(modifySection?.indexOf("editorBindingsAtEvent.noteExternalDiskMutation({") ?? -1),
+		"stable runtime proof is checked before external mutation admission",
+	);
+	assert(
+		modifySection?.includes("editorBindingsAtEvent.noteExternalDiskMutation({"),
+		"proven bound external writes are admitted to EditorBindingManager",
+	);
+	assert(
+		!modifySection?.includes("getEffectiveExternalEditPolicy(") &&
+			!modifySection?.includes("externalEditPolicy"),
+		"vault modify admission has no explicit always-policy bypass",
+	);
+	assert(
+		bindingWiringSection?.includes("() => true,"),
+		"EditorBindingManager external reload guard is fixed enabled at wiring",
+	);
+	assert(
+		bindingWiringSection?.includes(
+			"this.reconciliationController.noteInterceptedExternalDiskMutation(candidate)",
+		),
+		"every intercepted candidate routes directly to the controller safe lane",
+	);
+	assert(
+		!bindingWiringSection?.includes("effectivePolicy") &&
+			!bindingWiringSection?.includes("externalEditPolicy"),
+		"intercepted-candidate wiring has no runtime policy branch",
+	);
+	assert(
+		!bindingWiringSection?.includes("preserveRejectedExternalEditorReload"),
+		"intercepted-candidate wiring has no legacy rejected-reload preservation path",
 	);
 }
 

@@ -72,7 +72,6 @@ const baseInput: KaosDashboardCollectorInput = {
 		deviceName: "device-local",
 		vaultId: "vault-1",
 		attachmentSyncEnabled: true,
-		externalEditPolicy: "always",
 	},
 	syncStatusLabel: "connected",
 	connectionLabel: "online",
@@ -551,6 +550,10 @@ console.log("\n--- Test 4: dashboard data preserves snapshot unavailable and rec
 	assert(data.recentChanges.status === "ready" && data.recentChanges.lastAttempt?.status === "created", "last file history attempt preserved");
 	assert(data.recentChanges.status === "ready" && data.recentChanges.changes[0]?.previousContentHash === "oldhash", "previous content hash preserved for dashboard history navigation");
 	assert(data.actions.snapshotsAvailable === false, "snapshot action disabled state represented");
+	assert(
+		!("externalEditPolicy" in data.settings),
+		"dashboard model exposes no raw external-edit policy",
+	);
 	assert(data.attentionTotalCount === 6, "attention total includes the active blob conflict and entries hidden by collapsed/sample rows");
 	assert(data.overview.some((metric) => metric.label === "Server receipt" && metric.value === "confirmed"), "server receipt metric built");
 }

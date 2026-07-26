@@ -6,6 +6,7 @@ import {
 	type TraceHttpContext,
 } from "../observability/traceContext";
 import type { VaultSyncSettings } from "../settings";
+import { EXTERNAL_EDIT_BEHAVIOR } from "../sync/externalEditBehavior";
 import { obsidianRequest } from "../utils/http";
 
 interface TraceRuntimeDeps {
@@ -50,7 +51,7 @@ export class TraceRuntimeController {
 		this.record("trace", "trace-session-start", {
 			host: settings.host,
 			enableAttachmentSync: settings.enableAttachmentSync,
-			externalEditPolicy: settings.externalEditPolicy,
+			externalEditBehavior: EXTERNAL_EDIT_BEHAVIOR,
 		});
 
 		this.stateInterval = setInterval(() => {

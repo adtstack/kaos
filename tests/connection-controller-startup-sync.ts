@@ -2,6 +2,11 @@ import assert from "node:assert/strict";
 import { ConnectionController } from "../src/runtime/connectionController";
 import { ReconciliationController } from "../src/runtime/reconciliationController";
 
+Object.defineProperty(globalThis, "__KAOS_QA_HARNESS_ENABLED__", {
+	configurable: true,
+	value: false,
+});
+
 type Listener = () => void;
 
 function eventTarget() {
@@ -187,7 +192,6 @@ console.log("\n--- Startup pending sync is consumed by authoritative reconciliat
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
-			externalEditPolicy: "closed-only",
 		}) as any,
 		getVaultSync: () => sync,
 		getDiskMirror: () => ({}) as any,

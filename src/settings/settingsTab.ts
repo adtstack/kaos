@@ -3,12 +3,15 @@ import { PairDeviceModal } from "./PairDeviceModal";
 import { RecoveryKitModal } from "./RecoveryKitModal";
 import {
 	attachmentSizeCapKB,
-	type ExternalEditPolicy,
 	type VaultSyncSettings,
 } from "./settingsStore";
 import type { RecoveryStorageAuditReport } from "../sync/recoverySnapshotClient";
 import { randomBase64Url } from "../utils/base64url";
 import { SettingsCapabilityRefreshSession } from "./settingsCapabilityRefresh";
+import {
+	KAOS_EXCLUDE_FILE_PATH,
+	parseExcludePatterns,
+} from "../sync/exclude";
 
 type SettingsAuthMode = "env" | "claim" | "unclaimed" | "unknown";
 type SettingsStatusState = "disconnected" | "loading" | "syncing" | "connected" | "offline" | "error" | "unauthorized";
@@ -427,23 +430,22 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			);
 
 		addSectionHeading(containerEl, "What syncs");
-			new Setting(containerEl)
-				.setName("Exclude paths")
-				.setDesc("Comma-separated path prefixes to skip. Example: templates/, .trash/, daily-notes/")
-				.addText((text) =>
-					text
-						.setPlaceholder("Example: templates/, daily-notes/")
-						.setValue(this.host.settings.excludePatterns)
-						.onChange(async (value) => {
-							await this.host.updateSettings((settings) => {
-								settings.excludePatterns = value;
-							}, "settings:exclude-patterns");
-					}),
+		const legacyExcludeCount = parseExcludePatterns(
+			this.host.settings.excludePatterns,
+		).length;
+		new Setting(containerEl)
+			.setName("Exclude file")
+			.setDesc(
+				`Edit ${KAOS_EXCLUDE_FILE_PATH}. Add one vault-relative file or folder prefix per line; `
+				+ "blank lines and lines beginning with # are ignored. The file is synced to every device."
+				+ (legacyExcludeCount > 0
+					? ` ${legacyExcludeCount} legacy device-local pattern(s) also remain active.`
+					: ""),
 			);
 
-			new Setting(containerEl)
-				.setName("Max text file size in kilobytes")
-				.setDesc("Text files larger than this are skipped for live document sync.")
+		new Setting(containerEl)
+			.setName("Max text file size in kilobytes")
+			.setDesc("Text files larger than this are skipped for live document sync.")
 			.addText((text) =>
 				text
 					.setPlaceholder("2048")
@@ -647,22 +649,6 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 							}, "settings:vault-id");
 							this.redisplayIfVisible();
 					}),
-			);
-
-			new Setting(advancedBody)
-				.setName("Edits from other apps")
-				.setDesc("Open notes always keep visible editor authority. The broader option considers external changes only when the open editor agrees with them.")
-				.addDropdown((dropdown) =>
-					dropdown
-						.addOption("closed-only", "Closed files only")
-						.addOption("always", "Include open files safely")
-						.addOption("never", "Never import")
-						.setValue(this.host.settings.externalEditPolicy)
-						.onChange(async (value) => {
-							await this.host.updateSettings((settings) => {
-								settings.externalEditPolicy = value as ExternalEditPolicy;
-							}, "settings:external-edit-policy");
-						}),
 			);
 
 		new Setting(advancedBody)

@@ -9,7 +9,6 @@ interface EditorWorkspaceOrchestratorDeps {
 	getEditorBindings(): EditorBindingManager | null;
 	getDiskMirror(): DiskMirror | null;
 	isMarkdownPathSyncable(path: string): boolean;
-	maybeImportDeferredClosedOnlyPath(path: string, reason: string): void;
 	scheduleTraceStateSnapshot(reason: string): void;
 	log(message: string): void;
 }
@@ -190,7 +189,6 @@ export class EditorWorkspaceOrchestrator {
 				this.deps.getDiskMirror()?.notifyFileClosed(tracked);
 				this.openFilePaths.delete(tracked);
 				this.deps.log(`${reason}: closed observer for "${tracked}"`);
-				this.deps.maybeImportDeferredClosedOnlyPath(tracked, reason);
 			}
 		}
 	}
