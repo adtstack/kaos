@@ -41,6 +41,11 @@ import {
 import { RemoteProjectionPolicyGate } from "../src/runtime/remoteProjectionPolicyGate";
 import { contentBaselineHash } from "../src/sync/diskIndex";
 import type { MetaChangeBatch } from "../src/sync/fileMeta";
+import type { EnsureFileResult } from "../src/sync/vaultSync";
+import type {
+	EditorAuthorityLease,
+	PathEditorAuthority,
+} from "../src/sync/pathEditorAuthority";
 import {
 	ORIGIN_DISK_SYNC,
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
@@ -87,13 +92,20 @@ function makeHarness(options: {
 	onAfterTrash?: () => void | Promise<void>;
 	stripBomOnVaultRead?: boolean;
 	trashBehavior?: "success" | "throw" | "missing";
-	ensureFileBehavior?: "settle" | "throw" | "null" | "mismatch";
+	ensureFileBehavior?: "settle" | "throw" | "replan" | "blocked" | "mismatch";
 	onAfterEnsureFileSettle?: () => void;
 	supportsAtomicProcess?: boolean;
 	baselineHashProvider?: (path: string) => string | null | undefined;
 	baselineTextProvider?: (path: string) => Promise<string | null> | string | null;
 	isMarkdownPathSyncable?: (path: string) => boolean;
 	isRemoteProjectionAllowed?: (path: string) => boolean;
+	editorAuthorityKind?:
+		| "auto"
+		| "none"
+		| "transitioning"
+		| "multiple"
+		| "read-failed"
+		| "unmanaged-view";
 	captureRemoteProjectionAdmission?: (
 		paths: readonly string[],
 	) => RemoteProjectionAdmissionLease | null;
@@ -140,12 +152,17 @@ function makeHarness(options: {
 			: { fingerprint: authoritativeDeleteFingerprint },
 		getActiveFileIdsForPath: () => authoritativeDeleteFingerprint === null ? [FILE_ID] : [],
 		isPathTombstoned: () => authoritativeDeleteFingerprint !== null,
-		ensureFile: (path: string, content: string) => {
+		ensureFile: (path: string, content: string): EnsureFileResult => {
 			ensureFileCalls++;
 			if (options.ensureFileBehavior === "throw") {
 				throw new Error("deterministic ensureFile failure");
 			}
-			if (options.ensureFileBehavior === "null") return null;
+			if (options.ensureFileBehavior === "blocked") {
+				return { kind: "blocked", reason: "tombstone" };
+			}
+			if (options.ensureFileBehavior === "replan") {
+				return { kind: "replan", reason: "active-set-changed" };
+			}
 			doc.transact(() => {
 				ytext.delete(0, ytext.length);
 				ytext.insert(
@@ -155,7 +172,7 @@ function makeHarness(options: {
 			});
 			authoritativeDeleteFingerprint = null;
 			options.onAfterEnsureFileSettle?.();
-			return ytext;
+			return { kind: "created", fileId: FILE_ID, ytext };
 		},
 		// v3: semantic change subscription used by DiskMirror.startMapObservers().
 		observeMetaChanges: (cb: (batch: MetaChangeBatch) => void) => {
@@ -164,12 +181,6 @@ function makeHarness(options: {
 				if (metaChangeObserver === cb) metaChangeObserver = null;
 			};
 		},
-	};
-
-	const fakeEditorBindings = {
-		getLastEditorActivityForPath: () => null,
-		unbindByPath: () => {},
-		updatePathsAfterRename: () => {},
 	};
 
 	const markdownView = options.openEditorContent === undefined
@@ -186,6 +197,48 @@ function makeHarness(options: {
 	const workspaceView = options.opaqueOpenFileView
 		? { file: { path: filePath } }
 		: markdownView;
+	let editorAuthorityEpoch = 0;
+	let editorAuthorityLeaseSequence = 0;
+	const editorAuthorityLeases = new Map<
+		string,
+		{ epoch: number; content: string }
+	>();
+	const readConfiguredEditorAuthority = (): PathEditorAuthority | { kind: "content"; content: string } => {
+		const configured = options.editorAuthorityKind ?? "auto";
+		if (configured === "none") return { kind: "none" };
+		if (configured !== "auto") return { kind: "blocked", reason: configured };
+		if (options.opaqueOpenFileView) {
+			return { kind: "blocked", reason: "unmanaged-view" };
+		}
+		if (options.openEditorContent === undefined) return { kind: "none" };
+		const value = options.openEditorContent;
+		return {
+			kind: "content",
+			content: typeof value === "function" ? value() : value,
+		};
+	};
+	const fakeEditorBindings = {
+		getLastEditorActivityForPath: () => null,
+		unbindByPath: () => {},
+		updatePathsAfterRename: () => {},
+		capturePathEditorAuthority: (_path: string): PathEditorAuthority => {
+			const current = readConfiguredEditorAuthority();
+			if (current.kind !== "content") return current;
+			const leaseId = `test-editor-authority-${++editorAuthorityLeaseSequence}`;
+			const lease = { leaseId } as EditorAuthorityLease;
+			editorAuthorityLeases.set(leaseId, {
+				epoch: editorAuthorityEpoch,
+				content: current.content,
+			});
+			return { kind: "proven-single", content: current.content, lease };
+		},
+		isPathEditorAuthorityLeaseCurrent: (lease: EditorAuthorityLease): boolean => {
+			const captured = editorAuthorityLeases.get(lease.leaseId);
+			if (!captured || captured.epoch !== editorAuthorityEpoch) return false;
+			const current = readConfiguredEditorAuthority();
+			return current.kind === "content" && current.content === captured.content;
+		},
+	};
 	const byteLength = (content: string): number => new TextEncoder().encode(content).byteLength;
 	const makeDiskFileIdentity = (path: string, contentLength: number) => Object.assign(new TFile(), {
 		path,
@@ -364,6 +417,9 @@ function makeHarness(options: {
 		hasNonFilePathOccupant: () => nonFilePathOccupants.has(filePath),
 		setAuthoritativeDeleteFingerprint: (fingerprint: string | null) => {
 			authoritativeDeleteFingerprint = fingerprint;
+		},
+		invalidateEditorAuthority: () => {
+			editorAuthorityEpoch++;
 		},
 		emitMetaChanges: (batch: MetaChangeBatch) => {
 			if (!metaChangeObserver) throw new Error("metadata observer is not started");
@@ -840,7 +896,7 @@ console.log("\n--- Test 6: provider update to workspace-open file schedules open
 	doc.destroy();
 }
 
-console.log("\n--- Test 6b: an open Base receives a content update without any rename/backup path ---");
+console.log("\n--- Test 6b: an opaque open Base blocks an unprovable content update ---");
 {
 	const basePath = "BACKLOG/BACKLOG.base";
 	const clean = "views:\n  - type: table\n    name: Local\n";
@@ -855,9 +911,12 @@ console.log("\n--- Test 6b: an open Base receives a content update without any r
 	fixture.ytext.insert(0, remote);
 
 	const result = await fixture.mirror.flushWrite(basePath, true);
-	assert(result.kind === "written", "open Base content is updated through the text-document writer");
-	assert(fixture.diskFiles.get(basePath) === remote, "open Base receives the exact validated YAML bytes");
-	assert(fixture.getProcessCalls() === 1, "open Base update commits through Vault.process CAS");
+	assert(
+		result.kind === "deferred" && result.reason === "open-editor-mismatch",
+		"opaque open Base defers until its host authority can be proven absent",
+	);
+	assert(fixture.diskFiles.get(basePath) === clean, "opaque open Base preserves its local YAML bytes");
+	assert(fixture.getProcessCalls() === 0, "opaque open Base never reaches Vault.process");
 	assert(fixture.getModifyCalls() === 0, "open Base update never uses the racy modify fallback");
 	assert(fixture.getRenameCalls() === 0, "open Base update performs zero visible backup renames");
 
@@ -913,11 +972,60 @@ console.log("\n--- Test 8: forced open flush rechecks editor after async read --
 		"force flush does not write stale CRDT content when the editor changes during read",
 	);
 	assert(
-		result.kind === "deferred" && result.reason === "open-editor-mismatch",
-		"async editor race reports open-editor mismatch deferral",
+		result.kind === "deferred" && result.reason === "authority-stale",
+		"async editor race reports exact lease invalidation",
 	);
 
 	doc.destroy();
+}
+
+console.log("\n--- Test 8b: forced write rejects a lease invalidated at atomic commit ---");
+{
+	let fixture!: ReturnType<typeof makeHarness>;
+	fixture = makeHarness({
+		openEditorContent: "REMOTE_FROM_CRDT\n",
+		initialDiskContent: "DISK_BEFORE\n",
+		onBeforeProcess: () => fixture.invalidateEditorAuthority(),
+	});
+	fixture.ytext.insert(0, "REMOTE_FROM_CRDT\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: "DISK_BEFORE\n",
+	});
+
+	assert(
+		result.kind === "deferred" && result.reason === "authority-stale",
+		"forced write rejects the exact editor authority lease after invalidation",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === "DISK_BEFORE\n",
+		"stale editor authority writes zero disk bytes",
+	);
+	fixture.doc.destroy();
+}
+
+for (const editorAuthorityKind of ["transitioning", "multiple"] as const) {
+	console.log(`\n--- Test 8c: ${editorAuthorityKind} authority blocks forced writes ---`);
+	const fixture = makeHarness({
+		openEditorContent: "REMOTE_FROM_CRDT\n",
+		initialDiskContent: "DISK_BEFORE\n",
+		editorAuthorityKind,
+	});
+	fixture.ytext.insert(0, "REMOTE_FROM_CRDT\n");
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: "DISK_BEFORE\n",
+	});
+
+	assert(
+		result.kind === "deferred" && result.reason === "open-editor-mismatch",
+		`${editorAuthorityKind} authority fails closed instead of borrowing raw editor bytes`,
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === "DISK_BEFORE\n",
+		`${editorAuthorityKind} authority permits zero disk mutation`,
+	);
+	fixture.doc.destroy();
 }
 
 // ── Test 9: async read race — CRDT changes after the write snapshot ──────────
@@ -1406,6 +1514,77 @@ console.log("\n--- Test 13c: remote edit+delete compares disk with the durable b
 	fixture.doc.destroy();
 }
 
+console.log("\n--- Test 13c2: remote delete rejects an editor lease invalidated during inspection ---");
+{
+	const cleanDiskBaseline = "CLEAN_EDITOR_LEASE_BASELINE\n";
+	let fixture!: ReturnType<typeof makeHarness>;
+	let readCount = 0;
+	fixture = makeHarness({
+		openEditorContent: cleanDiskBaseline,
+		initialDiskContent: cleanDiskBaseline,
+		onRead: () => {
+			readCount++;
+			if (readCount === 1) fixture.invalidateEditorAuthority();
+		},
+	});
+	fixture.ytext.insert(0, cleanDiskBaseline);
+	fixture.setAuthoritativeDeleteFingerprint("remote-delete-stale-editor-lease");
+	fixture.mirror.recordPreservedUnresolved(FILE_PATH, "remote-delete-missing-baseline");
+
+	await (
+		fixture.mirror as unknown as {
+			handleRemoteDelete: (
+				path: string,
+				options: { baselineText?: string | null },
+			) => Promise<void>;
+		}
+	).handleRemoteDelete(FILE_PATH, { baselineText: cleanDiskBaseline });
+
+	assert(readCount === 1, "stale editor lease stops remote delete after its first asynchronous read");
+	assert(fixture.deleteCalls.length === 0, "stale editor lease reaches zero trash/delete calls");
+	assert(fixture.getEnsureFileCalls() === 0, "stale editor lease reaches zero revival calls");
+	assert(fixture.diskFiles.get(FILE_PATH) === cleanDiskBaseline, "stale editor lease preserves disk bytes");
+	assert(fixture.mirror.isPreservedUnresolved(FILE_PATH), "stale editor lease clears no prior marker");
+
+	fixture.doc.destroy();
+}
+
+for (const editorAuthorityKind of ["transitioning", "multiple"] as const) {
+	console.log(`\n--- Test 13c3: ${editorAuthorityKind} authority blocks remote delete ---`);
+	const cleanDiskBaseline = `CLEAN_${editorAuthorityKind.toUpperCase()}_BASELINE\n`;
+	const fixture = makeHarness({
+		openEditorContent: cleanDiskBaseline,
+		initialDiskContent: cleanDiskBaseline,
+		editorAuthorityKind,
+	});
+	fixture.ytext.insert(0, cleanDiskBaseline);
+	fixture.setAuthoritativeDeleteFingerprint(`remote-delete-${editorAuthorityKind}`);
+
+	await (
+		fixture.mirror as unknown as {
+			handleRemoteDelete: (
+				path: string,
+				options: { baselineText?: string | null },
+			) => Promise<void>;
+		}
+	).handleRemoteDelete(FILE_PATH, { baselineText: cleanDiskBaseline });
+
+	assert(fixture.deleteCalls.length === 0, `${editorAuthorityKind} authority permits zero delete calls`);
+	assert(fixture.getEnsureFileCalls() === 0, `${editorAuthorityKind} authority permits zero revival calls`);
+	assert(fixture.diskFiles.get(FILE_PATH) === cleanDiskBaseline, `${editorAuthorityKind} authority preserves disk`);
+	assert(fixture.mirror.isPreservedUnresolved(FILE_PATH), `${editorAuthorityKind} authority quarantines the path`);
+	assert(
+		fixture.mirror.getPreservedUnresolvedEntries()[0]?.reason === (
+			editorAuthorityKind === "multiple"
+				? "remote-delete-multiple-open-editor-authorities"
+				: "remote-delete-open-editor-read-failed"
+		),
+		`${editorAuthorityKind} authority retains the existing bounded quarantine reason`,
+	);
+
+	fixture.doc.destroy();
+}
+
 console.log("\n--- Test 13d: same-bytes delete/recreate during final delete read is preserved ---");
 {
 	const cleanDiskBaseline = "CLEAN_DISK_IDENTITY_A\n";
@@ -1538,12 +1717,13 @@ console.log("\n--- Test 13f: successful trash resolves marker only after trash s
 }
 
 console.log("\n--- Test 13g: failed dirty revival keeps the exact prior marker ---");
-{
+
+for (const ensureFileBehavior of ["throw", "replan", "blocked"] as const) {
 	const baseline = "REVIVE_BASELINE\n";
 	const localDirty = "LOCAL_DIRTY_TO_PRESERVE\n";
 	const fixture = makeHarness({
 		initialDiskContent: localDirty,
-		ensureFileBehavior: "throw",
+		ensureFileBehavior,
 	});
 	fixture.ytext.insert(0, baseline);
 	fixture.setAuthoritativeDeleteFingerprint("remote-delete-revive-failure");
@@ -1560,12 +1740,12 @@ console.log("\n--- Test 13g: failed dirty revival keeps the exact prior marker -
 	).handleRemoteDelete(FILE_PATH, { baselineText: baseline });
 
 	const after = fixture.mirror.getPreservedUnresolvedEntries()[0];
-	assert(fixture.getEnsureFileCalls() === 1, "dirty preservation attempts one tombstone revival");
-	assert(fixture.diskFiles.get(FILE_PATH) === localDirty, "revive failure preserves local disk authority");
-	assert(fixture.mirror.isPreservedUnresolved(FILE_PATH), "revive failure keeps the path quarantined");
+	assert(fixture.getEnsureFileCalls() === 1, `${ensureFileBehavior}: dirty preservation attempts one tombstone revival`);
+	assert(fixture.diskFiles.get(FILE_PATH) === localDirty, `${ensureFileBehavior}: revive failure preserves local disk authority`);
+	assert(fixture.mirror.isPreservedUnresolved(FILE_PATH), `${ensureFileBehavior}: revive failure keeps the path quarantined`);
 	assert(
 		before?.episodeId === after?.episodeId && before?.reason === after?.reason,
-		"revive failure does not replace or clear the prior unresolved episode",
+		`${ensureFileBehavior}: revive failure does not replace or clear the prior unresolved episode`,
 	);
 
 	fixture.doc.destroy();

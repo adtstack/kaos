@@ -119,7 +119,10 @@ function buildFixture(opts: {
 		events.push(asAnyEvent(event));
 	};
 	const vaultSync = makeVaultSync(recordFlightPathEvent);
-	vaultSync.ensureFile(opts.oldPath, opts.oldContent, "TestDevice");
+	const initialSeed = vaultSync.ensureFile(opts.oldPath, opts.oldContent, "TestDevice");
+	if (initialSeed.kind !== "created") {
+		throw new Error("no-event fixture failed to create its initial typed CRDT identity");
+	}
 	const oldFileId = vaultSync.getFileId(opts.oldPath);
 	const eventBoundary = events.length;
 

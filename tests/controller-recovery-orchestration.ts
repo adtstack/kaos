@@ -15,14 +15,15 @@
  *
  * Plus targeted source-grep regressions on src/sync/editorBinding.ts
  * verifying that the real EditorBindingManager emits editor.repair.applied
- * from applyBinding() (action==="repair") and editor.heal.applied from
- * heal() after applyDiffToYText.
+ * from applyBinding() (action==="repair") while heal() remains attach-only
+ * and performs no editor-to-Y.Text mutation.
  */
 
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { MarkdownView, TFile } from "obsidian";
+import ts from "typescript";
 import * as Y from "yjs";
 import {
 	ReconciliationController,
@@ -31,6 +32,7 @@ import {
 } from "../src/runtime/reconciliationController";
 import type { DiskIngestPort } from "../src/runtime/engineControlPort";
 import type { InterceptedExternalDiskMutation } from "../src/sync/editorBinding";
+import type { EnsureFileResult } from "../src/sync/vaultSync";
 import { contentBaselineHash } from "../src/sync/diskIndex";
 import type {
 	PreservedUnresolvedEntry,
@@ -344,7 +346,59 @@ function buildFixture(initial: {
 	// localOnly recovery branch's binding-health-conditional repair fires.
 	// Healthy-binding behavior (no repair on every recovery) is exercised
 	// by tests/controller-recovery-orchestration-amplifier.ts.
+	let pathEditorAuthorityLeaseSequence = 0;
+	const pathEditorAuthorityLeases = new Map<object, Readonly<{
+		bindingEpoch: number;
+		ticketRevision: number;
+		views: readonly MarkdownView[];
+		contents: readonly string[];
+	}>>();
 	const editorBindings = {
+		capturePathEditorAuthority: (candidatePath: string) => {
+			if (candidatePath !== path || !isOpen) return { kind: "none" as const };
+			const contents: string[] = [];
+			try {
+				for (const candidateView of views) contents.push(candidateView.editor.getValue());
+			} catch {
+				return { kind: "blocked" as const, reason: "read-failed" as const };
+			}
+			const distinct = new Set(contents);
+			if (distinct.size !== 1) {
+				return { kind: "blocked" as const, reason: "multiple" as const };
+			}
+			const lease = {
+				leaseId: `controller-recovery-${++pathEditorAuthorityLeaseSequence}`,
+			};
+			pathEditorAuthorityLeases.set(lease, {
+				bindingEpoch,
+				ticketRevision,
+				views: [...views],
+				contents: [...contents],
+			});
+			return {
+				kind: "proven-single" as const,
+				content: contents[0]!,
+				lease,
+			};
+		},
+		isPathEditorAuthorityLeaseCurrent: (lease: object) => {
+			const captured = pathEditorAuthorityLeases.get(lease);
+			if (
+				!captured
+				|| !isOpen
+				|| captured.bindingEpoch !== bindingEpoch
+				|| captured.ticketRevision !== ticketRevision
+				|| captured.views.length !== views.length
+				|| captured.views.some((candidateView, index) => candidateView !== views[index])
+			) return false;
+			try {
+				return captured.views.every(
+					(candidateView, index) => candidateView.editor.getValue() === captured.contents[index],
+				);
+			} catch {
+				return false;
+			}
+		},
 		isBound: () => isBound,
 		getBindingDebugInfoForView: () => ({
 			leafId: "stub-leaf-1",
@@ -1033,7 +1087,7 @@ function buildUnboundIngestFixture(initial: {
 		ensureFile: (_path: string, content: string) => {
 			ytext.delete(0, ytext.length);
 			ytext.insert(0, content);
-			return ytext;
+			return { kind: "created" as const, fileId: "unbound-file-id", ytext };
 		},
 		isPendingRenameTarget: () => false,
 	};
@@ -1091,6 +1145,43 @@ function buildUnboundIngestFixture(initial: {
 		},
 		flushWrite: async () => {},
 	};
+	let pathEditorAuthorityLeaseSequence = 0;
+	const pathEditorAuthorityLeases = new Map<object, Readonly<{
+		content: string;
+		path: string;
+		file: TFile;
+	}>>();
+	const editorBindings = {
+		capturePathEditorAuthority: (candidatePath: string) => {
+			if (!isOpen || candidatePath !== currentFilePath) return { kind: "none" as const };
+			const lease = {
+				leaseId: `unbound-recovery-${++pathEditorAuthorityLeaseSequence}`,
+			};
+			pathEditorAuthorityLeases.set(lease, {
+				content: editorContent,
+				path: currentFilePath,
+				file: view.file,
+			});
+			return {
+				kind: "proven-single" as const,
+				content: editorContent,
+				lease,
+			};
+		},
+		isPathEditorAuthorityLeaseCurrent: (lease: object) => {
+			const captured = pathEditorAuthorityLeases.get(lease);
+			return !!captured
+				&& isOpen
+				&& captured.content === editorContent
+				&& captured.path === currentFilePath
+				&& captured.file === view.file;
+		},
+		getLastEditorActivityForPath: () => null,
+		isBound: () => false,
+		getBindingDebugInfoForView: () => null,
+		getCollabDebugInfoForView: () => null,
+		unbindByPath: () => {},
+	};
 
 	const controller = new ReconciliationController({
 		app: app as never,
@@ -1103,7 +1194,7 @@ function buildUnboundIngestFixture(initial: {
 		getVaultSync: () => vaultSync as never,
 		getDiskMirror: () => diskMirror as never,
 		getBlobSync: () => null,
-		getEditorBindings: () => null,
+		getEditorBindings: () => editorBindings as never,
 		getDiskIndex: () => diskIndex,
 		setDiskIndex: (next: typeof diskIndex) => { diskIndex = next; },
 		isMarkdownPathSyncable: () => true,
@@ -1460,6 +1551,61 @@ console.log("\n--- Test 0a: async lifecycle authority can be revoked synchronous
 		fix.controller.reset();
 	}
 	fix.doc.destroy();
+}
+
+console.log("\n--- Test 0a2: editor admission lifecycle is wired before awaited teardown ---");
+{
+	const mainSource = readFileSync(
+		fileURLToPath(new URL("../src/main.ts", import.meta.url)),
+		"utf8",
+	);
+	const bindingSource = readFileSync(
+		fileURLToPath(new URL("../src/sync/editorBinding.ts", import.meta.url)),
+		"utf8",
+	);
+	const teardownStart = mainSource.indexOf("private async teardownSync(): Promise<void>");
+	const teardownEnd = mainSource.indexOf("\n\tprivate ", teardownStart + 1);
+	const teardown = mainSource.slice(teardownStart, teardownEnd);
+	const editorDrainStart = teardown.indexOf(
+		"this.editorBindings?.beginOwnedSaveDrainForTeardown()",
+	);
+	const controllerRevoke = teardown.indexOf("this.reconciliationController.revokeAsyncAuthority()");
+	const editorRevoke = teardown.indexOf("this.editorBindings?.revokeAsyncAuthority()");
+	const editorDrainAwait = teardown.indexOf("await editorSaveDrain");
+	const firstAwait = teardown.indexOf("await ");
+	const unbind = teardown.indexOf("this.editorBindings?.unbindAll()");
+	assert(
+		bindingSource.includes("export interface EditorAuthorityControllerPort"),
+		"binding manager exposes a typed controller-owned admission dependency",
+	);
+	for (const method of [
+		"requestTargetPresentation",
+		"consumeTargetPresentationPermit",
+		"completeTargetPresentation",
+		"requestOpenPathAdmission",
+		"isAuthorityFreshnessCurrent",
+		"consumeBindPermit",
+	]) {
+		assert(
+			bindingSource.includes(method),
+			`binding manager consumes controller capability ${method}`,
+		);
+	}
+	assert(
+		mainSource.includes(
+			"this.reconciliationController,\n\t\t\t\tthis.handoffRecoveryCoordinator,",
+		),
+		"production manager construction receives admission and the explicit Recovery escape port",
+	);
+	assert(
+		editorDrainStart >= 0
+			&& controllerRevoke > editorDrainStart
+			&& editorRevoke > controllerRevoke
+			&& editorDrainAwait > editorRevoke
+			&& firstAwait === editorDrainAwait
+			&& unbind > firstAwait,
+		"owned saves enter before both revocations, then drain before teardown and unbind",
+	);
 }
 
 console.log("\n--- Test 0b: QA suspension consumes explicit disk ingest without state changes ---");
@@ -4032,10 +4178,15 @@ console.log("\n--- Test 5e: create waits when the live editor is ahead of disk -
 		// editor already contains the user's next input composition.
 		disk: "created partial",
 		editor: "created partial 한글",
+		additionalEditors: ["created partial 한글"],
 		crdt: "base",
 	});
 	const internals = fix.controller as never as {
 		dirtyMarkdownPaths: Map<string, { reason: MarkdownDirtyReason; notBeforeMs?: number }>;
+		visibleAuthorityDeferredPaths: Map<string, {
+			readComplete: boolean;
+			editorContents: string[];
+		}>;
 	};
 
 	fix.controller.markMarkdownDirty(fix.file, "create", "op-create-editor-ahead");
@@ -4049,6 +4200,13 @@ console.log("\n--- Test 5e: create waits when the live editor is ahead of disk -
 		"create is retried after the editor/disk settle window",
 	);
 	assertEq(fix.ytext.toString(), "base", "stale create snapshot does not overwrite CRDT");
+	const marker = internals.visibleAuthorityDeferredPaths.get(fix.path);
+	assert(
+		marker?.readComplete === true
+		&& marker.editorContents.length === 1
+		&& marker.editorContents[0] === "created partial 한글",
+		"identical managed panes remain one complete composite editor authority",
+	);
 	assertEq(
 		fix.captured.filter((e) => e.kind === FLIGHT_KIND.recoveryDecision).length,
 		0,
@@ -4060,6 +4218,46 @@ console.log("\n--- Test 5e: create waits when the live editor is ahead of disk -
 		"editor-ahead create emits no recovery.apply.start",
 	);
 	clearMarkdownDrainTimer(fix.controller);
+}
+
+console.log("\n--- Test 5e2: identical panes remain complete during authoritative settle ---");
+{
+	const editorContent = "two panes share one current successor";
+	const fix = buildFixture({
+		path: "Notes/settling-identical-panes.md",
+		disk: "older disk snapshot",
+		editor: editorContent,
+		additionalEditors: [editorContent],
+		crdt: "older CRDT snapshot",
+	});
+	const internals = fix.controller as never as {
+		deps: {
+			getEditorBindings(): {
+				getLastEditorActivityForPath: (path: string) => number | null;
+			};
+		};
+		visibleAuthorityDeferredPaths: Map<string, {
+			readComplete: boolean;
+			editorContents: string[];
+		}>;
+	};
+	const editorBindings = internals.deps.getEditorBindings();
+	const original = editorBindings.getLastEditorActivityForPath.bind(editorBindings);
+	editorBindings.getLastEditorActivityForPath = () => Date.now() - 100;
+	try {
+		await fix.controller.runReconciliation("authoritative");
+		const marker = internals.visibleAuthorityDeferredPaths.get(fix.path);
+		assert(
+			marker?.readComplete === true
+			&& marker.editorContents.length === 1
+			&& marker.editorContents[0] === editorContent,
+			"a composite lease for identical panes remains a complete single authority",
+		);
+	} finally {
+		editorBindings.getLastEditorActivityForPath = original;
+		fix.controller.reset();
+		fix.doc.destroy();
+	}
 }
 
 // -------------------------------------------------------------------
@@ -4358,6 +4556,11 @@ console.log("\n--- Test 5f4c1: failed superseded preservation retries durably an
 	await waitForAsyncCondition(
 		() => Array.from(fix.getCreatedFiles().values()).filter((content) => content === olderRaw).length === 1,
 		"successful superseded preservation retry",
+	);
+	await waitForAsyncCondition(
+		() => getPendingSupersededCandidates(fix.controller)
+			.filter((candidate) => candidate === older).length === 0,
+		"durable superseded preservation settlement",
 	);
 	assertEq(
 		getPendingSupersededCandidates(fix.controller).filter((candidate) => candidate === older).length,
@@ -5282,7 +5485,7 @@ console.log("\n--- Test 5g6: seed is blocked when CRDT appears during recovery h
 		deps: {
 			getVaultSync(): {
 				getTextForPath(path: string): Y.Text | null;
-				ensureFile(path: string, content: string, deviceName: string, options: unknown): Y.Text;
+				ensureFile(path: string, content: string, deviceName: string, options: unknown): EnsureFileResult;
 			};
 			computeRecoveryStateHash?: (path: string, content: string) => Promise<string | null>;
 		};
@@ -5293,7 +5496,7 @@ console.log("\n--- Test 5g6: seed is blocked when CRDT appears during recovery h
 		ensureFileCalls++;
 		replacementText.delete(0, replacementText.length);
 		replacementText.insert(0, content);
-		return replacementText;
+		return { kind: "created", fileId: "replacement-file-id", ytext: replacementText };
 	};
 	internals.deps.computeRecoveryStateHash = async () => {
 		currentText = replacementText;
@@ -5338,7 +5541,7 @@ console.log("\n--- Test 5g6a: successful missing-Y.Text seed settles with the ex
 					content: string,
 					deviceName: string,
 					options: unknown,
-				): Y.Text | undefined;
+				): EnsureFileResult;
 			};
 		};
 	};
@@ -5347,7 +5550,7 @@ console.log("\n--- Test 5g6a: successful missing-Y.Text seed settles with the ex
 	vaultSync.ensureFile = (_path, content) => {
 		seededText.insert(0, content);
 		currentText = seededText;
-		return seededText;
+		return { kind: "created", fileId: "seeded-file-id", ytext: seededText };
 	};
 
 	const outcome = await invokeBoundFileSyncGap(fix, null);
@@ -5372,9 +5575,10 @@ console.log("\n--- Test 5g6a: successful missing-Y.Text seed settles with the ex
 	seededDoc.destroy();
 }
 
-type InvalidSeedPostcondition = "null" | "replacement" | "content-mismatch";
+type InvalidSeedPostcondition = "replan" | "blocked" | "replacement" | "content-mismatch";
 for (const invalidPostcondition of [
-	"null",
+	"replan",
+	"blocked",
 	"replacement",
 	"content-mismatch",
 ] as InvalidSeedPostcondition[]) {
@@ -5405,14 +5609,19 @@ for (const invalidPostcondition of [
 					content: string,
 					deviceName: string,
 					options: unknown,
-				): Y.Text | undefined;
+				): EnsureFileResult;
 			};
 		};
 	};
 	const vaultSync = internals.deps.getVaultSync();
 	vaultSync.getTextForPath = (path) => path === fix.path ? currentText : null;
 	vaultSync.ensureFile = (_path, content) => {
-		if (invalidPostcondition === "null") return undefined;
+		if (invalidPostcondition === "replan") {
+			return { kind: "replan", reason: "active-set-changed" };
+		}
+		if (invalidPostcondition === "blocked") {
+			return { kind: "blocked", reason: "collision" };
+		}
 		returnedText.insert(
 			0,
 			invalidPostcondition === "content-mismatch" ? "wrong seeded content\n" : content,
@@ -5423,7 +5632,7 @@ for (const invalidPostcondition of [
 		} else {
 			currentText = returnedText;
 		}
-		return returnedText;
+		return { kind: "created", fileId: "returned-file-id", ytext: returnedText };
 	};
 
 	const outcome = await invokeBoundFileSyncGap(fix, null);
@@ -5634,6 +5843,24 @@ console.log("\n--- Test 8: source-grep regressions on EditorBindingManager emit 
 		new URL("../src/sync/editorBinding.ts", import.meta.url),
 	);
 	const src = readFileSync(bindingSourcePath, "utf8");
+	const sourceFile = ts.createSourceFile(
+		bindingSourcePath,
+		src,
+		ts.ScriptTarget.Latest,
+		true,
+		ts.ScriptKind.TS,
+	);
+	const methodSource = (methodName: string): string => {
+		const editorBindingClass = sourceFile.statements.find((statement) =>
+			ts.isClassDeclaration(statement) && statement.name?.text === "EditorBindingManager"
+		);
+		if (!editorBindingClass || !ts.isClassDeclaration(editorBindingClass)) return "";
+		const method = editorBindingClass.members.find((member) =>
+			ts.isMethodDeclaration(member)
+			&& member.name.getText(sourceFile) === methodName
+		);
+		return method ? method.getText(sourceFile) : "";
+	};
 
 	// Constructor accepts the optional flight callback.
 	assert(
@@ -5646,11 +5873,8 @@ console.log("\n--- Test 8: source-grep regressions on EditorBindingManager emit 
 	);
 
 	// applyBinding emits editor.repair.applied for action==="repair" only.
-	const applyBindingIdx = src.indexOf(
-		"private applyBinding(",
-	);
-	assert(applyBindingIdx > 0, "applyBinding method present");
-	const applyBindingTail = src.slice(applyBindingIdx, applyBindingIdx + 4500);
+	const applyBindingTail = methodSource("applyBinding");
+	assert(applyBindingTail.length > 0, "applyBinding method present");
 	assert(
 		applyBindingTail.includes("PRODUCT_EVENT_KIND.editorRepairApplied"),
 		"applyBinding emits PRODUCT_EVENT_KIND.editorRepairApplied",
@@ -5660,54 +5884,23 @@ console.log("\n--- Test 8: source-grep regressions on EditorBindingManager emit 
 		"applyBinding gates emission on action===\"repair\"",
 	);
 
-	// heal() emits editor.heal.applied on every successful entry that
-	// resolves a binding target (not gated on the diff branch). Carries
-	// diffApplied: boolean so absence of the event proves heal() was not
-	// invoked.
-	const healIdx = src.indexOf(
-		"heal(view: MarkdownView, deviceName: string, reason: string): boolean {",
-	);
-	assert(healIdx > 0, "heal method present");
-	const healBody = src.slice(healIdx, healIdx + 2500);
-	const applyDiffIdx = healBody.indexOf("applyDiffToYText(target.ytext, crdtContent, currentContent, ORIGIN_EDITOR_HEALTH_HEAL)");
-	const healEmitIdx = healBody.indexOf("PRODUCT_EVENT_KIND.editorHealApplied");
-	assert(applyDiffIdx > 0, "heal() calls applyDiffToYText with ORIGIN_EDITOR_HEALTH_HEAL");
-	assert(healEmitIdx > 0, "heal() emits PRODUCT_EVENT_KIND.editorHealApplied");
+	// Path-scoped binding makes heal() attach-only. It may validate the exact
+	// existing target and delegate to repair(), but it must never rewrite Y.Text
+	// from an editor facade or emit the retired mutation-success event.
+	const healBody = methodSource("heal");
+	assert(healBody.length > 0, "heal method present");
 	assert(
-		healEmitIdx > applyDiffIdx,
-		"PRODUCT_EVENT_KIND.editorHealApplied emit follows applyDiffToYText",
-	);
-	// editor.heal.applied is NOT gated on the diff branch — the emit must
-	// be after the if (diffApplied) block, not inside it. We assert this by
-	// checking that the emit index is past the closing brace of the diff
-	// branch. The diff branch is short (just the log + applyDiffToYText) so
-	// we can detect it textually.
-	assert(
-		healBody.includes("const diffApplied = crdtContent !== currentContent"),
-		"heal() computes diffApplied flag",
+		healBody.includes("return this.repair(view, deviceName, reason)"),
+		"heal() delegates an already-certified existing target to repair()",
 	);
 	assert(
-		healBody.includes("diffApplied,"),
-		"heal() emit data carries diffApplied flag",
+		!healBody.includes("applyDiffToYText")
+			&& !healBody.includes("ORIGIN_EDITOR_HEALTH_HEAL"),
+		"heal() performs no editor-to-Y.Text mutation",
 	);
-	const ifBranchIdx = healBody.indexOf("if (diffApplied) {");
-	assert(ifBranchIdx > 0, "heal() has if(diffApplied) block");
-	// The emit must NOT be inside the if(diffApplied) block. Find the
-	// closing brace of that block by walking braces.
-	let depth = 0;
-	let closeIdx = -1;
-	for (let i = ifBranchIdx + "if (diffApplied) {".length - 1; i < healBody.length; i++) {
-		const ch = healBody[i];
-		if (ch === "{") depth++;
-		else if (ch === "}") {
-			depth--;
-			if (depth === 0) { closeIdx = i; break; }
-		}
-	}
-	assert(closeIdx > 0, "heal() if(diffApplied) block closing brace found");
 	assert(
-		healEmitIdx > closeIdx,
-		"PRODUCT_EVENT_KIND.editorHealApplied emit is OUTSIDE if(diffApplied) block (fires on every successful entry)",
+		!healBody.includes("PRODUCT_EVENT_KIND.editorHealApplied"),
+		"heal() emits no retired editor.heal.applied mutation event",
 	);
 }
 

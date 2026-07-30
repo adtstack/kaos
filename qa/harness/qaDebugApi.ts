@@ -23,6 +23,15 @@ import type { EditorBindingManager } from "../../src/sync/editorBinding";
 import { FLIGHT_KIND } from "../../src/telemetry/debug/flightEvents";
 import { yTextToString } from "../../src/utils/format";
 import { forceReplaceYText } from "../../src/sync/diff";
+import type {
+	EditorHandoffDebugSnapshot,
+	HandoffRecoveryQaFault,
+	HandoffRecoveryQaInventory,
+	HandoffRecoveryQaManualRow,
+	HandoffRecoveryQaSnapshot,
+} from "../../src/runtime/engineControlPort";
+
+declare const __KAOS_QA_HARNESS_ENABLED__: boolean;
 
 /**
  * Health report for the CRDT editor binding on a given path.
@@ -115,6 +124,21 @@ export interface KaosQaDebugApi {
 		opts: { originClass: "local" | "remote"; createIfMissing?: boolean },
 	): Promise<{ beforeHash: string | null; afterHash: string | null; fileExisted: boolean }>;
 
+	/** QA-ONLY. Clear persisted Markdown Attention for a harness-owned fixture path. */
+	__qaOnlyClearMarkdownAttentionUnsafe(path: string): void;
+
+	holdNextHostLoad(path: string, stage?: "load-entry" | "clear-load"): void;
+	releaseHeldHostLoad(): void;
+	holdNextNativeSave(path: string): void;
+	releaseHeldNativeSave(): void;
+	getEditorHandoffDebugSnapshot(): EditorHandoffDebugSnapshot;
+	getContentFreeSnapshot(): EditorHandoffDebugSnapshot;
+	__qaOnlyArmHandoffRecoveryFaultUnsafe(fault: HandoffRecoveryQaFault): void;
+	__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe(operationId: string): void;
+	getHandoffRecoveryQaSnapshot(): HandoffRecoveryQaSnapshot;
+	getHandoffRecoveryQaManualRows(): Promise<readonly HandoffRecoveryQaManualRow[]>;
+	getHandoffRecoveryQaInventory(): Promise<HandoffRecoveryQaInventory>;
+
 	// Path sets
 	getActiveMarkdownPaths(): string[];
 	getDiskMarkdownPaths(): string[];
@@ -154,6 +178,8 @@ export interface KaosQaDebugApi {
 	pauseEditorPropagation(path: string): Promise<boolean>;
 	/** QA-ONLY. Unsafe. Resume editor->CRDT propagation for a bound path. */
 	resumeEditorPropagation(path: string): Promise<boolean>;
+	/** QA-ONLY. Inject an exact host API version for unsupported-adapter acceptance. */
+	setEditorHandoffHostApiVersionOverride(version: string | null): void;
 
 	/**
 	 * QA-ONLY. Unsafe.
@@ -339,6 +365,8 @@ interface PluginHandle {
 	getQaTraceSecretHash?(): string | null;
 	/** Engine control port — present when Puppeteer harness is active. */
 	getEngineControlPort(): import("../../src/runtime/engineControlPort").EngineControlPort;
+	/** Remove a harness-owned path from the live Markdown Attention registry. */
+	clearMarkdownAttentionForQa(path: string): void;
 }
 
 // -----------------------------------------------------------------------
@@ -545,6 +573,16 @@ export function buildQaDebugApi(plugin: PluginHandle): KaosQaDebugApi {
 			content: string,
 			opts: { originClass: "local" | "remote"; createIfMissing?: boolean },
 		): Promise<{ beforeHash: string | null; afterHash: string | null; fileExisted: boolean }> {
+			function assertNever(value: never): never {
+				throw new Error(`Unhandled EnsureFileResult: ${JSON.stringify(value)}`);
+			}
+
+			if (
+				typeof __KAOS_QA_HARNESS_ENABLED__ === "undefined"
+				|| !__KAOS_QA_HARNESS_ENABLED__
+			) {
+				return { beforeHash: null, afterHash: null, fileExisted: false };
+			}
 			const vaultSync = plugin.getVaultSync();
 			if (!vaultSync) return { beforeHash: null, afterHash: null, fileExisted: false };
 
@@ -555,8 +593,21 @@ export function buildQaDebugApi(plugin: PluginHandle): KaosQaDebugApi {
 				return { beforeHash: null, afterHash: null, fileExisted: false };
 			}
 
-			const ytext = existingText ?? vaultSync.ensureFile(path, content, "qa");
-			if (!ytext) return { beforeHash: null, afterHash: null, fileExisted };
+			let ytext = existingText;
+			if (!ytext) {
+				const ensureResult = vaultSync.ensureFile(path, content, "qa");
+				switch (ensureResult.kind) {
+					case "created":
+					case "existing":
+						ytext = ensureResult.ytext;
+						break;
+					case "replan":
+					case "blocked":
+						return { beforeHash: null, afterHash: null, fileExisted };
+					default:
+						assertNever(ensureResult);
+				}
+			}
 
 			// Compute before hash from current Y.Text content.
 			const beforeContent = yTextToString(ytext);
@@ -574,6 +625,14 @@ export function buildQaDebugApi(plugin: PluginHandle): KaosQaDebugApi {
 			const afterContent = yTextToString(ytext);
 			const afterHash = afterContent !== null ? await sha256(afterContent) : null;
 			return { beforeHash, afterHash, fileExisted };
+		},
+
+		__qaOnlyClearMarkdownAttentionUnsafe(path: string): void {
+			if (
+				typeof __KAOS_QA_HARNESS_ENABLED__ === "undefined"
+				|| !__KAOS_QA_HARNESS_ENABLED__
+			) return;
+			plugin.clearMarkdownAttentionForQa(path);
 		},
 
 		// -- Path sets ----------------------------------------------------------
@@ -697,6 +756,42 @@ export function buildQaDebugApi(plugin: PluginHandle): KaosQaDebugApi {
 		},
 		async resumeEditorPropagation(path: string): Promise<boolean> {
 			return plugin.getEngineControlPort().resumeEditorPropagation(path);
+		},
+		setEditorHandoffHostApiVersionOverride(version: string | null): void {
+			plugin.getEngineControlPort().setEditorHandoffHostApiVersionOverride(version);
+		},
+		holdNextHostLoad(path: string, stage?: "load-entry" | "clear-load"): void {
+			plugin.getEngineControlPort().holdNextHostLoad(path, stage);
+		},
+		releaseHeldHostLoad(): void {
+			plugin.getEngineControlPort().releaseHeldHostLoad();
+		},
+		holdNextNativeSave(path: string): void {
+			plugin.getEngineControlPort().holdNextNativeSave(path);
+		},
+		releaseHeldNativeSave(): void {
+			plugin.getEngineControlPort().releaseHeldNativeSave();
+		},
+		getEditorHandoffDebugSnapshot(): EditorHandoffDebugSnapshot {
+			return plugin.getEngineControlPort().getEditorHandoffDebugSnapshot();
+		},
+		getContentFreeSnapshot(): EditorHandoffDebugSnapshot {
+			return plugin.getEngineControlPort().getContentFreeSnapshot();
+		},
+		__qaOnlyArmHandoffRecoveryFaultUnsafe(fault: HandoffRecoveryQaFault): void {
+			plugin.getEngineControlPort().__qaOnlyArmHandoffRecoveryFaultUnsafe(fault);
+		},
+		__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe(operationId: string): void {
+			plugin.getEngineControlPort().__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe(operationId);
+		},
+		getHandoffRecoveryQaSnapshot(): HandoffRecoveryQaSnapshot {
+			return plugin.getEngineControlPort().getHandoffRecoveryQaSnapshot();
+		},
+		getHandoffRecoveryQaManualRows(): Promise<readonly HandoffRecoveryQaManualRow[]> {
+			return plugin.getEngineControlPort().getHandoffRecoveryQaManualRows();
+		},
+		getHandoffRecoveryQaInventory(): Promise<HandoffRecoveryQaInventory> {
+			return plugin.getEngineControlPort().getHandoffRecoveryQaInventory();
 		},
 		async setDiskIngestSuspended(suspended: boolean): Promise<{ previous: boolean }> {
 			const previous = plugin.getEngineControlPort().setDiskIngestSuspended(suspended);

@@ -5,6 +5,9 @@
 import type { App } from "obsidian";
 import type { KaosQaDebugApi } from "../../src/qaDebugApi";
 
+export type { ExactHandoffReplayExternalPhase } from "../contracts/exact-handoff-replay";
+export type { SamePathAdoptionExternalPhase } from "../contracts/same-path-adoption";
+
 // -----------------------------------------------------------------------
 // Manifest
 // -----------------------------------------------------------------------
@@ -40,6 +43,33 @@ export interface QaRunOptions {
 	role?: "A" | "B" | "C";
 }
 
+export type EditorHandoffExternalPhaseName =
+	| "save-entered-before-switch"
+	| "ascii-input-after-switch-intent"
+	| "completed-ime-after-switch-intent"
+	| "ime-and-click-while-composing"
+	| "input-while-host-load-held"
+	| "supersede-b-with-c";
+
+export type HandoffRecoveryExternalPhaseName =
+	| "quota-failed-retry"
+	| "hung-put-copy-failure"
+	| "hung-put-copy-success"
+	| "release-copy-late-put"
+	| "verified-export"
+	| "confirmed-discard";
+
+export type HandoffRecoveryReloadExternalPhaseName =
+	| "hydrated-dashboard-review";
+
+export type QaExternalPhaseTicket<Name extends string = string> = Readonly<{
+	runId: string;
+	sequence: number;
+	scenarioId: string;
+	name: Name;
+	state: "waiting" | "resumed";
+}>;
+
 /**
  * Phase marker emitted into the trace so the analyzer can scope events.
  * setup → run → assert → (trace export + analyze) → cleanup
@@ -62,6 +92,8 @@ export interface QaResult {
 export interface QaContext {
 	app: App;
 	kaos: KaosQaDebugApi;
+	signal: AbortSignal;
+	awaitExternalPhase<Name extends string>(name: Name): Promise<QaExternalPhaseTicket<Name>>;
 
 	/**
 	 * Emit a qa.phase flight event marking the start of a scenario lifecycle
@@ -160,6 +192,9 @@ export interface QaConsoleApi {
 	help(): void;
 	scenarios(): string[];
 	run(id: string, opts?: QaRunOptions): Promise<QaResult>;
+	getExternalPhaseTicket(): QaExternalPhaseTicket | null;
+	resumeExternalPhase(runId: string, sequence: number): boolean;
+	rebindKaosDebugApi(): boolean;
 
 	// Vault operations
 	createFile(path: string, content: string): Promise<void>;

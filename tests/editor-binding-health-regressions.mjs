@@ -29,6 +29,11 @@ const editorBindingSource = readFileSync(
 );
 const bindingSource = editorBindingSource;
 const mainSource = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+const diskMirrorSource = readFileSync(new URL("../src/sync/diskMirror.ts", import.meta.url), "utf8");
+const reconciliationSource = readFileSync(
+	new URL("../src/runtime/reconciliationController.ts", import.meta.url),
+	"utf8",
+);
 
 console.log("\n--- Test 1: validateOpenBindings delegates repair to guarded audit ---");
 {
@@ -313,7 +318,7 @@ console.log("\n--- Test 9c: modify attribution cannot hide suppression-window ex
 	);
 }
 
-console.log("\n--- Test 10: editor-health-heal origin remains manual-only ---");
+console.log("\n--- Test 10: editor-health heal is attach-only ---");
 {
 	const healSection = sliceBetween(
 		bindingSource,
@@ -321,21 +326,13 @@ console.log("\n--- Test 10: editor-health-heal origin remains manual-only ---");
 		"rebind(view: MarkdownView, deviceName: string, reason: string): void {",
 	);
 	assert(healSection !== null, "heal section found");
-	// After the origin-constants refactor the call site uses ORIGIN_EDITOR_HEALTH_HEAL
-	// (imported from src/sync/origins.ts) instead of the raw string. Check for the
-	// constant name rather than the literal.
 	assert(
-		healSection?.includes("ORIGIN_EDITOR_HEALTH_HEAL"),
-		"editor-health-heal origin used via named constant in heal() implementation",
+		!healSection?.includes("applyDiffToYText("),
+		"heal does not write editor content into Y.Text",
 	);
-	// Strip the heal section then check that applyDiffToYText is NOT called
-	// with ORIGIN_EDITOR_HEALTH_HEAL outside it. The import declaration
-	// is allowed to remain (it's not a call site). Use [^\n)]* to stay
-	// on the same line and avoid spurious cross-line matches.
-	const strippedSource = bindingSource.replace(healSection ?? "", "");
 	assert(
-		!strippedSource.match(/applyDiffToYText[^\n)]*ORIGIN_EDITOR_HEALTH_HEAL/),
-		"ORIGIN_EDITOR_HEALTH_HEAL not passed to applyDiffToYText outside heal()",
+		!bindingSource.match(/applyDiffToYText[^\n)]*ORIGIN_EDITOR_HEALTH_HEAL/),
+		"editor-health-heal origin is never a binding-layer writer",
 	);
 }
 
@@ -388,8 +385,8 @@ console.log("\n--- Test 12: excluded Markdown is fenced before editor binding an
 	);
 	assert(
 		(targetSection?.indexOf("this.isMarkdownPathSyncable(file.path)") ?? Infinity) <
-			(targetSection?.indexOf("this.vaultSync.ensureFile(") ?? -1),
-		"binding target checks syncability before ensureFile",
+			(targetSection?.indexOf("this.requestOpenPathAdmission(") ?? -1),
+		"binding target checks syncability before admission",
 	);
 	assert(
 		(workspaceBindSection?.indexOf("this.deps.isMarkdownPathSyncable(path)") ?? Infinity) <
@@ -401,6 +398,119 @@ console.log("\n--- Test 12: excluded Markdown is fenced before editor binding an
 			(workspaceBindSection?.indexOf("this.trackOpenFile(path)") ?? -1),
 		"workspace skips excluded views before open-file tracking",
 	);
+}
+
+console.log("\n--- Test 13: binding is attach-only and every bind site is managed ---");
+{
+	const bindSection = sliceBetween(
+		bindingSource,
+		"bind(view: MarkdownView, deviceName: string): void {",
+		"repair(view: MarkdownView, deviceName: string, reason: string): boolean {",
+	);
+	const repairSection = sliceBetween(
+		bindingSource,
+		"repair(view: MarkdownView, deviceName: string, reason: string): boolean {",
+		"heal(view: MarkdownView, deviceName: string, reason: string): boolean {",
+	);
+	const healSection = sliceBetween(
+		bindingSource,
+		"heal(view: MarkdownView, deviceName: string, reason: string): boolean {",
+		"rebind(view: MarkdownView, deviceName: string, reason: string): void {",
+	);
+	const rebindSection = sliceBetween(
+		bindingSource,
+		"rebind(view: MarkdownView, deviceName: string, reason: string): void {",
+		"/**\n\t * Unbind a MarkdownView's editor",
+	);
+	const staleUserSection = sliceBetween(
+		bindingSource,
+		"private fenceStaleUserBinding(transaction: Transaction): TransactionSpec | null {",
+		"private hasRecentUserDocumentEdit(",
+	);
+	const healthSection = sliceBetween(
+		bindingSource,
+		"private maybeHealBinding(",
+		"private scheduleCmResolveRetry(",
+	);
+	const workspaceBindSection = sliceBetween(
+		workspaceSource,
+		"private bindView(view: MarkdownView): void {",
+		"private trackOpenFile(path: string): void {",
+	);
+	const validateSection = sliceBetween(
+		workspaceSource,
+		"validateOpenBindings(reason: string): void {",
+		"auditBindings(reason: string): number {",
+	);
+
+	assert(!bindingSource.includes(".ensureFile("), "editor binding contains no ensureFile writer");
+	assert(
+		(bindingSource.match(/this\.requestOpenPathAdmission\(/g) ?? []).length === 1,
+		"editor binding has one exact admission request invocation",
+	);
+	assert(
+		!healSection?.includes("applyDiffToYText("),
+		"heal is attach-only and never writes editor bytes into Y.Text",
+	);
+	for (const [name, section] of [
+		["bind", bindSection],
+		["repair", repairSection],
+		["heal", healSection],
+		["rebind", rebindSection],
+		["stale user", staleUserSection],
+		["health", healthSection],
+	]) {
+		assert(section !== null, `${name} section found for handoff routing`);
+		assert(
+			section?.includes("this.beginPathHandoff("),
+			`${name} path mismatch routes through beginPathHandoff`,
+		);
+	}
+	assert(workspaceBindSection !== null, "workspace bind section found for managed ordering");
+	assert(
+		(workspaceBindSection?.indexOf("bindings?.manageView(view)") ?? Infinity) <
+			(workspaceBindSection?.indexOf("bindings?.bind(") ?? -1),
+		"workspace bindView manages the view before bind",
+	);
+	assert(validateSection !== null, "workspace validation section found for managed ordering");
+	assert(
+		(validateSection?.indexOf("editorBindings.manageView(leaf.view)") ?? Infinity) <
+			(validateSection?.indexOf("editorBindings.bind(leaf.view") ?? -1),
+		"workspace validation manages the view before bind",
+	);
+	assert(
+		!workspaceSource.includes("editorBindings.unbind(leaf.view)"),
+		"layout validation never performs a direct mismatch detach",
+	);
+}
+
+console.log("\n--- Test 14: reconciliation authority has one shared editor-read boundary ---");
+{
+	for (const [name, source] of [
+		["DiskMirror", diskMirrorSource],
+		["ReconciliationController", reconciliationSource],
+	]) {
+		assert(
+			!source.includes(".editor.getValue()"),
+			`${name} performs no raw editor facade authority read`,
+		);
+		assert(
+			!source.includes("getOpenEditorAuthority("),
+			`${name} has no duplicate open-editor authority helper`,
+		);
+		assert(
+			!source.includes("type OpenEditorAuthority"),
+			`${name} has no duplicate open-editor authority type`,
+		);
+		assert(
+			source.includes("capturePathEditorAuthority("),
+			`${name} consumes the shared path-scoped authority port`,
+		);
+		assert(
+			source.includes("isPathEditorAuthorityLeaseCurrent("),
+			`${name} revalidates shared editor-authority leases`,
+		);
+	}
 }
 
 console.log(`\n${"-".repeat(50)}`);

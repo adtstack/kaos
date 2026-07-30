@@ -18,13 +18,18 @@ const executableBody = teardownBody
 console.log("\n--- Plugin teardown authority wiring ---");
 
 assert.ok(
-	executableBody.startsWith("this.reconciliationController.revokeAsyncAuthority();"),
-	"teardown synchronously revokes reconciliation authority as its first executable statement",
+	executableBody.startsWith(
+		"const editorSaveDrain = this.editorBindings?.beginOwnedSaveDrainForTeardown();",
+	),
+	"teardown synchronously starts pending owned saves as its first executable statement",
 );
 
 const orderedOperations = [
+	"const editorSaveDrain = this.editorBindings?.beginOwnedSaveDrainForTeardown();",
 	"this.reconciliationController.revokeAsyncAuthority();",
+	"this.editorBindings?.revokeAsyncAuthority();",
 	'this.log("teardownSync: tearing down all sync state");',
+	"await editorSaveDrain;",
 	"await this.diskMirror.flushAllPendingWrites();",
 	"await this.saveDiskIndex();",
 	"this.diskMirror?.destroy();",
@@ -53,8 +58,8 @@ assert.equal(
 	"teardown revokes reconciliation authority exactly once before reset cleanup",
 );
 assert.ok(
-	operationOffsets[0]! < teardownBody.indexOf("await "),
-	"authority revocation occurs before teardown's first asynchronous boundary",
+	operationOffsets[2]! < teardownBody.indexOf("await "),
+	"both authority revocations occur after save entry and before teardown's first async boundary",
 );
 
-console.log("  PASS  teardown revokes stale async work without changing cleanup ordering");
+console.log("  PASS  teardown enters owned saves, revokes stale async work, then drains cleanup");

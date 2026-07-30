@@ -6,6 +6,7 @@
  */
 
 import { MarkdownView, normalizePath, type App } from "obsidian";
+import { isMarkdownEditorView } from "../../src/runtime/markdownEditorView";
 import { sleep, waitForCondition } from "./wait";
 
 export async function openFile(app: App, path: string): Promise<void> {
@@ -27,10 +28,10 @@ export async function closeFile(app: App, path: string): Promise<void> {
 	app.workspace.iterateAllLeaves((leaf) => {
 		// Match by path, also detach leaves whose file was deleted (file=null)
 		// but whose last path matched — avoids stale binding-health-failed loops.
-		const leafPath = leaf.view instanceof MarkdownView
+		const leafPath = isMarkdownEditorView(leaf.view)
 			? (leaf.view.file?.path ?? (leaf.view as unknown as { _filePath?: string })._filePath)
 			: null;
-		if (leaf.view instanceof MarkdownView && leafPath === normalized) {
+		if (isMarkdownEditorView(leaf.view) && leafPath === normalized) {
 			toDetach.push(leaf);
 		}
 	});
@@ -44,7 +45,7 @@ function getViewForPath(app: App, path: string): MarkdownView {
 	let found: MarkdownView | null = null;
 	app.workspace.iterateAllLeaves((leaf) => {
 		if (found) return;
-		if (leaf.view instanceof MarkdownView && leaf.view.file?.path === normalized) {
+		if (isMarkdownEditorView(leaf.view) && leaf.view.file?.path === normalized) {
 			found = leaf.view;
 		}
 	});

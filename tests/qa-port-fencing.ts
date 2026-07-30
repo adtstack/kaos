@@ -9,7 +9,7 @@
 
 import type { KaosDebugPort } from "../src/telemetry/debug/ports/kaosDebugPort";
 import type { KaosUnsafeQaPort } from "../qa/harness/ports/kaosUnsafeQaPort";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 let passed = 0;
 let failed = 0;
@@ -76,9 +76,67 @@ console.log("\n--- Test 2: KaosUnsafeQaPort interface shape ---");
 {
 	const mockUnsafePort: KaosUnsafeQaPort = {
 		__qaOnlyForceCrdtContentUnsafe: async () => ({ beforeHash: null, afterHash: "abc", fileExisted: false }),
+		__qaOnlyClearMarkdownAttentionUnsafe: () => {},
 		ingestDiskFileNow: async () => {},
 		pauseEditorPropagation: async () => true,
 		resumeEditorPropagation: async () => true,
+		setEditorHandoffHostApiVersionOverride: () => {},
+		holdNextHostLoad: () => {},
+		releaseHeldHostLoad: () => {},
+		holdNextNativeSave: () => {},
+		releaseHeldNativeSave: () => {},
+		getEditorHandoffDebugSnapshot: () => ({
+			hostLoad: null,
+			nativeSave: null,
+			leaves: [],
+			qaReplayObservation: {
+				phase: "none",
+				planCount: 0,
+				witnessStoredCount: 0,
+				permitConsumedCount: 0,
+				dispatchAttemptCount: 0,
+				dispatchAppliedCount: 0,
+				dispatchUncertainCount: 0,
+				settlementObservationCount: 0,
+				lastOutcome: null,
+				lastClassification: null,
+				selectionNonEmpty: false,
+				mappedScrollAnchor: null,
+				liveScrollAnchor: null,
+			},
+		}),
+		getContentFreeSnapshot: () => ({
+			hostLoad: null,
+			nativeSave: null,
+			leaves: [],
+			qaReplayObservation: {
+				phase: "none",
+				planCount: 0,
+				witnessStoredCount: 0,
+				permitConsumedCount: 0,
+				dispatchAttemptCount: 0,
+				dispatchAppliedCount: 0,
+				dispatchUncertainCount: 0,
+				settlementObservationCount: 0,
+				lastOutcome: null,
+				lastClassification: null,
+				selectionNonEmpty: false,
+				mappedScrollAnchor: null,
+				liveScrollAnchor: null,
+			},
+		}),
+		__qaOnlyArmHandoffRecoveryFaultUnsafe: () => {},
+		__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe: () => {},
+		getHandoffRecoveryQaSnapshot: () => ({
+			armedFault: null,
+			heldOperationId: null,
+			putStartedCount: 0,
+			putSettledCount: 0,
+			lastCategoricalOutcome: null,
+			lastAcceptedState: null,
+		}),
+		getHandoffRecoveryQaManualRows: async () => [],
+		getHandoffRecoveryQaInventory: async () => ({ active: [], terminal: [] }),
 		setQaNetworkHold: () => {},
 		__qaOnlySetScenarioRunIdUnsafe: () => {},
 		__qaOnlyAdvanceScenarioStepUnsafe: () => {},
@@ -90,6 +148,10 @@ console.log("\n--- Test 2: KaosUnsafeQaPort interface shape ---");
 	};
 
 	assert(typeof mockUnsafePort.__qaOnlyForceCrdtContentUnsafe === "function", "forceCrdt exists");
+	assert(
+		typeof mockUnsafePort.__qaOnlyClearMarkdownAttentionUnsafe === "function",
+		"fixture-owned Markdown Attention cleanup exists only on the unsafe QA port",
+	);
 	assert(typeof mockUnsafePort.setQaNetworkHold === "function", "network hold exists");
 	assert(typeof mockUnsafePort.__qaOnlySetScenarioRunIdUnsafe === "function", "scenario run id exists");
 	assert(typeof mockUnsafePort.__qaOnlyAdvanceScenarioStepUnsafe === "function", "scenario step exists");
@@ -110,7 +172,19 @@ console.log("\n--- Test 2: KaosUnsafeQaPort interface shape ---");
 		"ingestDiskFileNow",
 		"pauseEditorPropagation",
 		"resumeEditorPropagation",
+		"setEditorHandoffHostApiVersionOverride",
 		"setDiskIngestSuspended",
+		"holdNextHostLoad",
+		"releaseHeldHostLoad",
+		"holdNextNativeSave",
+		"releaseHeldNativeSave",
+		"getEditorHandoffDebugSnapshot",
+		"getContentFreeSnapshot",
+		"__qaOnlyArmHandoffRecoveryFaultUnsafe",
+		"__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe",
+		"getHandoffRecoveryQaSnapshot",
+		"getHandoffRecoveryQaManualRows",
+		"getHandoffRecoveryQaInventory",
 	];
 	const unsafeOnlyKeys = unsafeKeys.filter(k => !safeReadKeys.includes(k));
 	assert(
@@ -159,6 +233,10 @@ console.log("\n--- Test 5: product policy is absent and QA suspension is build-g
 		new URL(`../${relativePath}`, import.meta.url),
 		"utf8",
 	);
+	const readOptional = (relativePath: string) => {
+		const url = new URL(`../${relativePath}`, import.meta.url);
+		return existsSync(url) ? readFileSync(url, "utf8") : "";
+	};
 	const enginePortSource = read("src/runtime/engineControlPort.ts");
 	const mainSource = read("src/main.ts");
 	const reconciliationControllerSource = read("src/runtime/reconciliationController.ts");
@@ -170,17 +248,119 @@ console.log("\n--- Test 5: product policy is absent and QA suspension is build-g
 	const s10dSource = read("qa/obsidian-harness/scenarios/s10d-recovery-amplifier-orchestration.ts");
 	const prepareVaultSource = read("qa/scripts/prepare-vault.ts");
 	const productionGuardSource = read("scripts/guard-production-bundles.mjs");
+	const qaScenarioSource = read(
+		"qa/obsidian-harness/scenarios/s13a-editor-handoff-host-fences.ts",
+	);
+	const qaControllerSource = read("qa/controllers/editor-handoff-host-fences.ts");
+	const controllerClientSource = read("qa/controllers/obsidian-client.ts");
+	const packageSource = read("package.json");
+	const harnessMainSource = read("qa/obsidian-harness/main.ts");
+	const harnessBuildSource = read("qa/obsidian-harness/esbuild.mjs");
+	const harnessApiSource = read("qa/obsidian-harness/api.ts");
+	const harnessTypesSource = read("qa/obsidian-harness/types.ts");
+	const recoveryScenarioSource = readOptional(
+		"qa/obsidian-harness/scenarios/s13b-editor-handoff-recovery.ts",
+	);
+	const recoveryReloadScenarioSource = readOptional(
+		"qa/obsidian-harness/scenarios/s13c-editor-handoff-recovery-reload.ts",
+	);
+	const recoveryControllerSource = readOptional(
+		"qa/controllers/editor-handoff-recovery.ts",
+	);
+	const exactReplayContractSource = readOptional(
+		"qa/contracts/exact-handoff-replay.ts",
+	);
+	const exactReplayScenarioSource = readOptional(
+		"qa/obsidian-harness/scenarios/s13d-editor-handoff-exact-replay.ts",
+	);
+	const exactReplayControllerSource = readOptional(
+		"qa/controllers/exact-handoff-replay.ts",
+	);
+	const samePathAdoptionContractSource = readOptional(
+		"qa/contracts/same-path-adoption.ts",
+	);
+	const samePathAdoptionScenarioSource = readOptional(
+		"qa/obsidian-harness/scenarios/s13e-same-path-adoption.ts",
+	);
+	const samePathAdmissionFixtureSource = readOptional(
+		"qa/obsidian-harness/same-path-admission-fixture.ts",
+	);
+	const samePathAdoptionControllerSource = readOptional(
+		"qa/controllers/same-path-adoption.ts",
+	);
+	const livePreflightSources = [
+		qaScenarioSource,
+		recoveryScenarioSource,
+		exactReplayScenarioSource,
+		exactReplayControllerSource,
+	];
 
 	assert(
 		enginePortSource.includes("setDiskIngestSuspended(suspended: boolean): boolean") &&
+			enginePortSource.includes(
+				'holdNextHostLoad(path: string, stage?: "load-entry" | "clear-load"): void',
+			) &&
+			enginePortSource.includes("getEditorHandoffDebugSnapshot(): EditorHandoffDebugSnapshot") &&
+			enginePortSource.includes("getContentFreeSnapshot(): EditorHandoffDebugSnapshot") &&
+			enginePortSource.includes("setEditorHandoffHostApiVersionOverride(version: string | null): void") &&
+			enginePortSource.includes("managed: true") &&
+			enginePortSource.includes("active: boolean") &&
+			enginePortSource.includes('clearLoadCapability: "observable" | "clear-load-not-observable"') &&
+			enginePortSource.includes("readonly adoption: SamePathAdoptionDebugSnapshot") &&
+			enginePortSource.includes("readonly qaReplayObservation") &&
+			enginePortSource.includes("dispatchUncertainCount: number") &&
+			enginePortSource.includes("settlementObservationCount: number") &&
+			enginePortSource.includes(
+				'commitFailureReason?: CodeMirrorHandoffGuardSnapshot["commitFailureReason"]',
+			) &&
+			enginePortSource.includes("hostPostDelegationFailureReason?: string | null") &&
+			enginePortSource.includes(
+				"lastClassification: HandoffReplayClassificationQaObservation | null",
+			) &&
+			enginePortSource.includes("export type HandoffRecoveryQaFault") &&
+			enginePortSource.includes("recoveryOperationEpoch: number | null") &&
+			enginePortSource.includes("__qaOnlyArmHandoffRecoveryFaultUnsafe(fault: HandoffRecoveryQaFault): void") &&
+			enginePortSource.includes("getHandoffRecoveryQaSnapshot(): HandoffRecoveryQaSnapshot") &&
+			enginePortSource.includes("lastAcceptedState: HandoffRecoveryQaAcceptedState | null") &&
+			enginePortSource.includes(
+				"getHandoffRecoveryQaManualRows(): Promise<readonly HandoffRecoveryQaManualRow[]>",
+			) &&
+			enginePortSource.includes(
+				"getHandoffRecoveryQaInventory(): Promise<HandoffRecoveryQaInventory>",
+			) &&
 			!enginePortSource.includes("setExternalEditPolicyOverride"),
-		"EngineControlPort exposes suspension instead of a product-policy override",
+		"EngineControlPort exposes closed build-gated handoff fault controls without a product-policy override",
+	);
+	assert(
+		livePreflightSources.every((source) =>
+			!source.includes("requestSaveCancellable")
+			&& !source.includes("request-save-not-cancellable")
+		) && livePreflightSources.every((source) =>
+			source.includes("getContentFreeSnapshot")
+			&& source.includes("hostCapabilityState")
+			&& source.includes("clearLoadCapability")
+		),
+		"live handoff preflights use managed content-free capability evidence, never requestSave.cancel",
 	);
 	assert(
 		mainSource.includes("isDiskIngestSuspendedForQa") &&
 			mainSource.includes("...(__KAOS_QA_HARNESS_ENABLED__ ? {") &&
-			mainSource.includes("diskIngestSuspended"),
-		"main wires the suspension getter through a removable QA build boundary",
+			mainSource.includes("diskIngestSuspended") &&
+			mainSource.includes("installEditorHandoffHostQaBarrier") &&
+			mainSource.includes("getEditorHandoffQaDebugSnapshot") &&
+			mainSource.includes("beforePutBeforeStorage") &&
+			mainSource.includes("afterVerifiedPutBeforeFence") &&
+			mainSource.includes("handoffRecoveryLastAcceptedState") &&
+			mainSource.includes("observeAcceptedIntentState") &&
+			mainSource.includes("clipboard-rejected"),
+		"main wires suspension and the closed Recovery fault vocabulary through removable QA boundaries",
+	);
+	assert(
+		mainSource.includes("const result = await observeSettlement(request);") &&
+		mainSource.includes(
+			'if (result.kind !== "pending") replayObservation.settlementObservationCount += 1;',
+		),
+		"replay QA counts only terminal settlement observations, not pending retries",
 	);
 	assert(
 		mainSource.includes(
@@ -197,9 +377,31 @@ console.log("\n--- Test 5: product policy is absent and QA suspension is build-g
 	);
 	assert(
 		unsafePortSource.includes("setDiskIngestSuspended") &&
+			unsafePortSource.includes("__qaOnlyClearMarkdownAttentionUnsafe(path: string): void") &&
+			unsafePortSource.includes("setEditorHandoffHostApiVersionOverride") &&
+			unsafePortSource.includes("__qaOnlyArmHandoffRecoveryFaultUnsafe") &&
+			unsafePortSource.includes("getHandoffRecoveryQaSnapshot") &&
+			unsafePortSource.includes("getHandoffRecoveryQaManualRows") &&
+			unsafePortSource.includes("getHandoffRecoveryQaInventory") &&
 			qaApiSource.includes("setDiskIngestSuspended") &&
+			qaApiSource.includes("__qaOnlyClearMarkdownAttentionUnsafe(path: string): void") &&
+			qaApiSource.includes("plugin.clearMarkdownAttentionForQa(path)") &&
+			qaApiSource.includes("__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe") &&
+			qaApiSource.includes("getHandoffRecoveryQaSnapshot") &&
+			qaApiSource.includes("getHandoffRecoveryQaManualRows") &&
+			qaApiSource.includes("getHandoffRecoveryQaInventory") &&
+			qaApiSource.includes("setEditorHandoffHostApiVersionOverride") &&
 			twoDeviceSource.includes("setDiskIngestSuspended"),
-		"QA ports and CDP bridge expose the suspension seam",
+		"QA ports expose fixture cleanup, suspension, and content-free Recovery fault seams",
+	);
+	assert(
+		harnessMainSource.includes("clearMarkdownAttentionForQa: (path: string)") &&
+			harnessMainSource.includes("diskMirror?.clearPreservedUnresolved(path)"),
+		"QA harness wires fixture Attention cleanup directly to the QA product registry",
+	);
+	assert(
+		harnessBuildSource.includes('"__KAOS_QA_HARNESS_ENABLED__": "true"'),
+		"QA harness build explicitly enables its build-gated mutation fixtures",
 	);
 	assert(
 		(reconciliationControllerSource.match(/isDiskIngestSuspendedForQa\?\.\(\)/g) ?? []).length >= 2,
@@ -231,9 +433,366 @@ console.log("\n--- Test 5: product policy is absent and QA suspension is build-g
 	);
 	assert(
 		productionGuardSource.includes('"setDiskIngestSuspended"') &&
+			productionGuardSource.includes('"setEditorHandoffHostApiVersionOverride"') &&
+			productionGuardSource.includes('"holdNextHostLoad"') &&
+			productionGuardSource.includes('"getEditorHandoffDebugSnapshot"') &&
+			productionGuardSource.includes('"getContentFreeSnapshot"') &&
+			productionGuardSource.includes('"qaReplayObservation"') &&
+			productionGuardSource.includes('"__qaOnlyArmHandoffRecoveryFaultUnsafe"') &&
+			productionGuardSource.includes('"beforePutBeforeStorage"') &&
+			productionGuardSource.includes('"clipboard-rejected"') &&
+			productionGuardSource.includes("QA_PRODUCT_REQUIRED") &&
+			productionGuardSource.includes('"associateEditorHandoffHostQaBarrier"') &&
 			productionGuardSource.includes('"setExternalEditPolicyOverride"'),
 		"production bundle guard bans both new and legacy unsafe controls",
 	);
+	assert(
+		qaScenarioSource.includes('id: EDITOR_HANDOFF_HOST_FENCES_SCENARIO_ID') &&
+			qaScenarioSource.includes('"save-entered-before-switch"') &&
+			qaScenarioSource.includes('"supersede-b-with-c"') &&
+			qaScenarioSource.includes("holdNextHostLoad(") &&
+			qaScenarioSource.includes('EDITOR_HANDOFF_HOST_FENCE_PATHS.b,') &&
+			qaScenarioSource.includes('"clear-load"') &&
+			!qaScenarioSource.includes("typeIntoFile(") &&
+			!qaScenarioSource.includes("replaceFileContent(") &&
+			!qaScenarioSource.includes("setValue("),
+		"S13a uses the six-phase host protocol without renderer text mutation helpers",
+	);
+	assert(
+		controllerClientSource.includes('type: "rawKeyDown"') &&
+			controllerClientSource.includes('type: "char"') &&
+			controllerClientSource.includes('type: "keyUp"') &&
+			controllerClientSource.includes('"Input.imeSetComposition"') &&
+			controllerClientSource.includes('"Input.dispatchMouseEvent"') &&
+			qaControllerSource.includes("waitForExternalPhase") &&
+			qaControllerSource.includes("resumeExternalPhase") &&
+			qaControllerSource.includes("setImeCompositionSequence") &&
+			!qaControllerSource.includes("setImeComposition(") &&
+			qaControllerSource.includes("activeCompositionCapturedUpdates === 2"),
+		"controller uses direct CDP key, IME, click, and exact external-phase primitives",
+	);
+	const imeCommitSource = controllerClientSource.slice(
+		controllerClientSource.indexOf("async commitImeText"),
+		controllerClientSource.indexOf("/** Combine active DOM focus"),
+	);
+	assert(
+		imeCommitSource.includes('cdp.send("Input.insertText", { text })')
+			&& !imeCommitSource.includes("Input.imeSetComposition"),
+		"IME commit uses one native insertText completion without opening a second composition epoch",
+	);
+	assert(
+		packageSource.includes(
+			'"qa:handoff-host-fences": "bun run qa/controllers/editor-handoff-host-fences.ts"',
+		),
+		"dedicated handoff host-fence controller entry point is registered",
+	);
+	assert(
+		recoveryScenarioSource.includes('id: HANDOFF_RECOVERY_SCENARIO_ID') &&
+			recoveryScenarioSource.includes('"quota-failed-retry"') &&
+			recoveryScenarioSource.includes('"hung-put-copy-failure"') &&
+			recoveryScenarioSource.includes('"hung-put-copy-success"') &&
+			recoveryScenarioSource.includes('"release-copy-late-put"') &&
+			recoveryScenarioSource.includes('"verified-export"') &&
+			recoveryScenarioSource.includes('"confirmed-discard"') &&
+			!recoveryScenarioSource.includes("typeIntoFile(") &&
+			!recoveryScenarioSource.includes("replaceFileContent(") &&
+			!recoveryScenarioSource.includes("setValue("),
+		"S13b declares the six exact Recovery phases without renderer mutation shortcuts",
+	);
+	const recoverySetupSource = recoveryScenarioSource.slice(
+		recoveryScenarioSource.indexOf("async setup(ctx)"),
+		recoveryScenarioSource.indexOf("async run(ctx)"),
+	);
+	assert(
+		recoverySetupSource.indexOf("assertSupportedHostPreflight(ctx)") >= 0 &&
+			recoverySetupSource.indexOf("assertSupportedHostPreflight(ctx)")
+				< recoverySetupSource.indexOf("waitForCrdtFile"),
+		"S13b reports an unsupported host before provider-dependent CRDT setup",
+	);
+	assert(
+		recoveryScenarioSource.includes("getHandoffRecoveryQaManualRows()") &&
+			recoveryScenarioSource.includes('snapshot.qaReplayObservation.phase !== "needs-review"') &&
+			recoveryControllerSource.includes('leaf.phase === "stable"') &&
+			recoveryControllerSource.includes('handoff.qaReplayObservation.phase === "needs-review"') &&
+			recoveryControllerSource.includes("acceptedStateMatches") &&
+			recoveryControllerSource.includes("terminalLeafReleased") &&
+			recoveryControllerSource.includes('code !== "ENOENT"') &&
+			recoveryControllerSource.includes("export verification timed out") &&
+			recoveryScenarioSource.includes("no exact transient or settled intent receipt"),
+		"S13b accepts a durable manual row after its leaf handoff settles without weakening row identity",
+	);
+	assert(
+		recoveryReloadScenarioSource.includes('id: HANDOFF_RECOVERY_RELOAD_SCENARIO_ID') &&
+			recoveryReloadScenarioSource.includes('"hydrated-dashboard-review"') &&
+			recoveryReloadScenarioSource.includes("getRetainedManualRecoveryEvidence"),
+		"S13c owns a fresh-context dashboard hydration review",
+	);
+	assert(
+		recoveryControllerSource.includes('runScenario("s13b-editor-handoff-recovery", { timeoutMs: 300_000 })') &&
+			recoveryControllerSource.includes('runScenario("s13c-editor-handoff-recovery-reload", { timeoutMs: 180_000 })') &&
+			recoveryControllerSource.includes("disableProductPlugin") &&
+			recoveryControllerSource.includes("enableProductPlugin") &&
+			recoveryControllerSource.includes("rebindKaosDebugApi") &&
+			recoveryControllerSource.includes("waitForExternalPhase") &&
+			recoveryControllerSource.includes("resumeExternalPhase"),
+		"Recovery controller owns both bounded runs and the product reload/rebind boundary",
+	);
+	assert(
+		recoveryControllerSource.includes("captureRecoveryInventory") &&
+			recoveryControllerSource.includes("assertUnrelatedRecoveryInventoryPreserved") &&
+			recoveryControllerSource.includes(
+				"inventoryBaseline.unrelatedTerminalFingerprints.length + 1",
+			) &&
+			!recoveryControllerSource.includes(
+				'"1 content-free completion receipt(s) retained."',
+			) &&
+			recoveryControllerSource.includes('"after-compare"') &&
+			recoveryControllerSource.includes('"after-copy"') &&
+			recoveryControllerSource.includes('"after-export"') &&
+			recoveryControllerSource.includes('"after-resolve"') &&
+			recoveryControllerSource.includes('"after-product-reload"'),
+		"S13c proves every unrelated active and terminal Recovery identity survives each action and reload",
+	);
+	assert(
+		controllerClientSource.includes("clickExactVisibleButton") &&
+			controllerClientSource.includes("clickExactVisibleModalButton") &&
+			controllerClientSource.includes("fillVisibleHandoffRecoveryExportPath") &&
+			controllerClientSource.includes("clickKaosDashboardRibbon") &&
+			controllerClientSource.includes("disableProductPlugin") &&
+			controllerClientSource.includes("enableProductPlugin") &&
+			controllerClientSource.includes("rebindKaosDebugApi") &&
+			controllerClientSource.includes("visible.length !== 1"),
+		"ObsidianClient exposes narrow single-visible-match Recovery and reload helpers",
+	);
+	assert(
+		harnessMainSource.includes("rebindKaosDebugApi") &&
+			harnessApiSource.includes("rebindKaosDebugApi") &&
+			harnessTypesSource.includes("rebindKaosDebugApi(): boolean"),
+		"only the harness console wrapper can remount a fresh product debug API",
+	);
+	assert(
+		packageSource.includes(
+			'"qa:handoff-recovery": "bun run qa/controllers/editor-handoff-recovery.ts"',
+		),
+		"dedicated two-stage handoff Recovery controller is registered",
+	);
+	const exactReplayPhases = [
+		"exact-ascii-selection-scroll",
+		"native-undo",
+		"native-redo",
+		"exact-completed-ime",
+		"manual-switch-spanning-ime",
+		"manual-different-base",
+		"exact-missing-ytext",
+		"exact-same-content-held-load",
+		"supersede-b-with-c",
+	];
+	assert(
+		exactReplayContractSource.includes(
+			'EXACT_HANDOFF_REPLAY_SCENARIO_ID =\n\t"s13d-editor-handoff-exact-replay"',
+		) && exactReplayPhases.every((phase) =>
+			exactReplayContractSource.includes(`| "${phase}"`)) &&
+			exactReplayContractSource.includes("EXACT_HANDOFF_REPLAY_PATHS") &&
+			!exactReplayContractSource.includes('from "obsidian"'),
+		"S13d owns one pure closed nine-phase contract and shared path table",
+	);
+	assert(
+		exactReplayScenarioSource.includes("EXACT_HANDOFF_REPLAY_PATHS") &&
+			exactReplayScenarioSource.includes("getContentFreeSnapshot") &&
+			exactReplayScenarioSource.includes("holdNextHostLoad") &&
+			exactReplayScenarioSource.includes('phase === "supersede-b-with-c"') &&
+			exactReplayScenarioSource.includes('"clear-load"') &&
+			exactReplayScenarioSource.includes("setDiskIngestSuspended") &&
+			exactReplayPhases.every((phase) => exactReplayScenarioSource.includes(`"${phase}"`)) &&
+			!exactReplayScenarioSource.includes("typeIntoFile(") &&
+			!exactReplayScenarioSource.includes("replaceFileContent(") &&
+			!exactReplayScenarioSource.includes("setValue(") &&
+			!exactReplayScenarioSource.includes("openLinkText("),
+		"S13d scenario uses the closed content-free protocol and a non-serializing supersession barrier",
+	);
+	assert(
+		exactReplayScenarioSource.includes("captureRiskCounts") &&
+			exactReplayScenarioSource.includes("attentionCount") &&
+			exactReplayScenarioSource.includes("conflictArtifactCount") &&
+			exactReplayScenarioSource.includes("assertNoRiskCounts") &&
+			exactReplayScenarioSource.includes('querySelectorAll(".status-bar-item")'),
+		"S13d records and rejects Attention/conflict count drift for every phase",
+	);
+	assert(
+		exactReplayControllerSource.includes("EXACT_HANDOFF_REPLAY_PATHS") &&
+			exactReplayControllerSource.includes("waitForExternalPhase") &&
+			exactReplayControllerSource.includes("resumeExternalPhase") &&
+			exactReplayControllerSource.includes("scrollActiveCodeMirror") &&
+			exactReplayControllerSource.includes("dragActiveCodeMirrorSelection") &&
+			exactReplayControllerSource.includes("dispatchNativeShortcut") &&
+			exactReplayControllerSource.includes("setImeComposition") &&
+			exactReplayControllerSource.includes("commitImeText") &&
+			exactReplayControllerSource.includes("canonicalLiveVault !== expectedVault") &&
+			exactReplayControllerSource.includes('const PREFLIGHT_MARKDOWN_PATH = "README.md"') &&
+			exactReplayControllerSource.includes("client.clickVaultFile(PREFLIGHT_MARKDOWN_PATH)") &&
+			exactReplayControllerSource.includes("getContentFreeSnapshot") &&
+			exactReplayControllerSource.includes("hostCapabilityState") &&
+			exactReplayControllerSource.includes("clearLoadCapability") &&
+			!exactReplayControllerSource.includes("request-save-not-cancellable"),
+		"S13d controller owns exact CDP input, vault identity, and pre-input host preflight",
+	);
+	assert(
+		exactReplayControllerSource.includes("isHeldTargetHostSettled") &&
+			exactReplayControllerSource.includes('snapshot.hostLoad?.state === "released"') &&
+			exactReplayControllerSource.includes("leaf.viewPath === input.targetPath") &&
+			exactReplayControllerSource.includes("leaf.displayedPath === input.targetPath") &&
+			exactReplayControllerSource.includes("leaf.bindingPath === input.targetPath") &&
+			exactReplayControllerSource.includes("!leaf.gateClosed"),
+		"S13d never advances to the next physical navigation before the released host load fully settles",
+	);
+	assert(
+		controllerClientSource.includes("scrollActiveCodeMirror") &&
+			controllerClientSource.includes("dragActiveCodeMirrorSelection") &&
+			controllerClientSource.includes("dispatchNativeShortcut") &&
+			controllerClientSource.includes('type: "mouseWheel"') &&
+			controllerClientSource.includes('type: "mouseMoved"') &&
+			controllerClientSource.includes('type: "rawKeyDown"') &&
+			controllerClientSource.includes('type: "keyUp"'),
+		"ObsidianClient adds only physical scroll, selection, and native-shortcut helpers",
+	);
+	assert(
+		harnessMainSource.includes("s13dEditorHandoffExactReplay") &&
+			packageSource.includes(
+				'"qa:handoff-exact-replay": "bun run qa/controllers/exact-handoff-replay.ts"',
+			),
+		"S13d is registered once with a dedicated controller entry point",
+	);
+
+	const samePathAdoptionPhases = [
+		"clean-merge-during-planning",
+		"native-undo-local",
+		"native-redo-local",
+		"held-save-reload",
+		"overlap-conflict-evidence",
+		"artifact-failure",
+		"artifact-retry",
+		"identical-multi-pane",
+		"distinct-multi-pane",
+		"distinct-multi-pane-observed",
+		"unsupported-host-fallback",
+	];
+	assert(
+		samePathAdoptionContractSource.includes(
+			'SAME_PATH_ADOPTION_SCENARIO_ID = "s13e-same-path-adoption"',
+		) && samePathAdoptionPhases.every((phase) =>
+			samePathAdoptionContractSource.includes(`| "${phase}"`)) &&
+			samePathAdoptionContractSource.includes("SAME_PATH_ADOPTION_PATHS") &&
+			!samePathAdoptionContractSource.includes('from "obsidian"'),
+		"S13e owns ten evidence phases plus one closed conflict-observation ACK",
+	);
+	assert(
+		samePathAdoptionScenarioSource.includes("getContentFreeSnapshot") &&
+			samePathAdoptionScenarioSource.includes("stable-line-") &&
+			samePathAdoptionScenarioSource.includes("Array.from({ length: 96 }") &&
+			samePathAdoptionScenarioSource.includes("adoption.kind") &&
+			samePathAdoptionScenarioSource.includes("setDiskIngestSuspended") &&
+			samePathAdoptionScenarioSource.includes("pauseEditorPropagation") &&
+			samePathAdoptionScenarioSource.includes("__qaOnlyForceCrdtContentUnsafe") &&
+			samePathAdoptionScenarioSource.includes("__qaOnlyClearMarkdownAttentionUnsafe(path)") &&
+			samePathAdoptionScenarioSource.includes("waitForReceiptAfter") &&
+			samePathAdoptionPhases.every((phase) =>
+				samePathAdoptionScenarioSource.includes(`"${phase}"`)) &&
+			!samePathAdoptionScenarioSource.includes("typeIntoFile(") &&
+			!samePathAdoptionScenarioSource.includes("replaceFileContent(") &&
+			!samePathAdoptionScenarioSource.includes("setValue(") &&
+			!samePathAdoptionScenarioSource.includes("openLinkText("),
+		"S13e scenario observes content-free adoption evidence without renderer text mutation helpers",
+	);
+	assert(
+		samePathAdoptionScenarioSource.includes("atomicallyReadmitDistinctPanesForQa") &&
+			samePathAdmissionFixtureSource.includes("atomicallyReadmitSamePathPanesForQa") &&
+			samePathAdmissionFixtureSource.includes("freezeSamePathPaneProjectionForQa") &&
+			samePathAdmissionFixtureSource.includes("input.manager.unbind") &&
+			samePathAdmissionFixtureSource.includes("input.manager.bind(panes[0]!") &&
+			!samePathAdmissionFixtureSource.includes('from "../../../src/'),
+		"S13e distinct-pane fixture atomically removes every live binding before one coordinator admission",
+	);
+	assert(
+		samePathAdoptionControllerSource.includes("waitForExternalPhase") &&
+			samePathAdoptionControllerSource.includes("resumeExternalPhase") &&
+			samePathAdoptionControllerSource.includes("dispatchPhysicalKey") &&
+			samePathAdoptionControllerSource.includes("readActiveEditorGeometry") &&
+			samePathAdoptionControllerSource.includes("assertDistinctMarkdownPaneLocals") &&
+			!samePathAdoptionControllerSource.includes("dragActiveCodeMirrorSelection") &&
+			samePathAdoptionControllerSource.includes("dispatchNativeShortcut") &&
+			samePathAdoptionControllerSource.includes("disableProductPlugin") &&
+			samePathAdoptionControllerSource.includes("enableProductPlugin") &&
+			samePathAdoptionControllerSource.includes("rebindKaosDebugApi") &&
+			samePathAdoptionControllerSource.includes("apiVersion") &&
+			samePathAdoptionControllerSource.includes("canonicalLiveVault !== expectedVault"),
+		"S13e controller owns physical input, reload, host-version injection, and vault identity",
+	);
+	assert(
+		samePathAdoptionControllerSource.includes("snapshot.pendingOwnedSave?.file !== view.file") &&
+			samePathAdoptionControllerSource.includes("view.dirty !== true") &&
+			samePathAdoptionControllerSource.includes("__KAOS_S13E_OWNED_SAVE_PROBE__") &&
+			samePathAdoptionControllerSource.includes("waitForPendingOwnedSaveDrain") &&
+			samePathAdoptionControllerSource.includes("pending owned save drain timed out") &&
+			samePathAdoptionControllerSource.includes("pending owned save advanced past one drain") &&
+			samePathAdoptionControllerSource.includes("drained.saveEpochDelta !== 3") &&
+			samePathAdoptionControllerSource.includes("drained.dirty") &&
+			samePathAdoptionControllerSource.includes("late native save mutated the new boot session") &&
+			!samePathAdoptionControllerSource.includes("holdNextNativeSave"),
+		"S13e waits through async unload settlement, proves one drain, and rejects a late native tail",
+	);
+	assert(
+		harnessMainSource.includes("s13eSamePathAdoption") &&
+			packageSource.includes(
+				'"qa:same-path-adoption": "bun run qa/controllers/same-path-adoption.ts"',
+			),
+		"S13e is registered once with a dedicated controller entry point",
+	);
+	assert(
+		productionGuardSource.includes('"baseRetained"') &&
+			productionGuardSource.includes("QA_PRODUCT_REQUIRED"),
+		"production bundle fencing covers the content-free adoption snapshot vocabulary",
+	);
+
+	const productionBundleUrl = new URL("../main.js", import.meta.url);
+	const qaProductBundleUrl = new URL("../qa/obsidian-harness/product-main.js", import.meta.url);
+	if (existsSync(productionBundleUrl) && existsSync(qaProductBundleUrl)) {
+		const productionBundle = readFileSync(productionBundleUrl, "utf8");
+		const qaProductBundle = readFileSync(qaProductBundleUrl, "utf8");
+		const fencedSymbols = [
+			"holdNextHostLoad",
+			"releaseHeldHostLoad",
+			"holdNextNativeSave",
+			"releaseHeldNativeSave",
+			"getEditorHandoffDebugSnapshot",
+			"getContentFreeSnapshot",
+			"setEditorHandoffHostApiVersionOverride",
+			"baseRetained",
+			"qaReplayObservation",
+			"dispatchUncertainCount",
+			"settlementObservationCount",
+			"installEditorHandoffHostQaBarrier",
+			"getEditorHandoffQaDebugSnapshot",
+			"associateEditorHandoffHostQaBarrier",
+			"__qaOnlyArmHandoffRecoveryFaultUnsafe",
+			"__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe",
+			"getHandoffRecoveryQaSnapshot",
+			"getHandoffRecoveryQaManualRows",
+			"getHandoffRecoveryQaInventory",
+			"lastAcceptedState",
+			"clipboard-rejected",
+			"hold-next-post-verify-put",
+			"beforePutBeforeStorage",
+			"afterVerifiedPutBeforeFence",
+		];
+		assert(
+			fencedSymbols.every((symbol) => !productionBundle.includes(symbol)),
+			"production main.js erases every editor handoff QA symbol",
+		);
+		assert(
+			fencedSymbols.every((symbol) => qaProductBundle.includes(symbol)),
+			"QA product bundle retains every editor handoff barrier/control symbol",
+		);
+	}
 }
 
 console.log(`\n${"─".repeat(55)}`);

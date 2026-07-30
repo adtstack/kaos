@@ -140,8 +140,11 @@ console.log("\n--- Controller quarantine: persisted markers block every full-rec
 		[divergedPath, makeEntry(divergedPath, "persisted-diverged")],
 	]);
 	const vaultSync = makeVaultSync();
-	vaultSync.ensureFile(crdtOnlyPath, crdtOnlyContent, "QuarantineTest");
-	vaultSync.ensureFile(divergedPath, divergedCrdtContent, "QuarantineTest");
+	const crdtOnlySeed = vaultSync.ensureFile(crdtOnlyPath, crdtOnlyContent, "QuarantineTest");
+	const divergedSeed = vaultSync.ensureFile(divergedPath, divergedCrdtContent, "QuarantineTest");
+	if (crdtOnlySeed.kind !== "created" || divergedSeed.kind !== "created") {
+		throw new Error("quarantine fixture failed to create its initial typed CRDT identities");
+	}
 	let ensureCallsAfterRestart = 0;
 	const originalEnsureFile = vaultSync.ensureFile.bind(vaultSync);
 	vaultSync.ensureFile = ((...args: Parameters<VaultSync["ensureFile"]>) => {
@@ -988,6 +991,8 @@ console.log("\n--- Open reconcile: programmatic editor successor replaces a defe
 	const flushWrites: string[] = [];
 	let activeAttentionReason: string | null = null;
 	let attentionClearCalls = 0;
+	let pathAuthorityLeaseSequence = 0;
+	const pathAuthorityLeases = new Map<string, { ticket: unknown; content: string }>();
 
 	const controller = new ReconciliationController({
 		app: {
@@ -1041,6 +1046,24 @@ console.log("\n--- Open reconcile: programmatic editor successor replaces a defe
 		getEditorBindings: () => ({
 			isBound: () => true,
 			getLastEditorActivityForPath: () => null,
+			capturePathEditorAuthority: (candidate: string) => {
+				if (candidate !== path) return { kind: "none" as const };
+				const leaseId = `open-authority-${++pathAuthorityLeaseSequence}`;
+				pathAuthorityLeases.set(leaseId, {
+					ticket: currentTicket,
+					content: liveEditorContent,
+				});
+				return {
+					kind: "proven-single" as const,
+					content: liveEditorContent,
+					lease: { leaseId },
+				};
+			},
+			isPathEditorAuthorityLeaseCurrent: (lease: { leaseId: string }) => {
+				const captured = pathAuthorityLeases.get(lease.leaseId);
+				return captured?.ticket === currentTicket
+					&& captured.content === liveEditorContent;
+			},
 			captureOpenEditorMutationTicket: () => currentTicket,
 			validateOpenEditorMutationTicket: () => ({ current: true }),
 		}) as never,
@@ -1319,6 +1342,102 @@ console.log("\n--- Open reconcile: programmatic editor successor replaces a defe
 	);
 	controller.reset();
 	doc.destroy();
+}
+
+console.log("\n--- Dirty admission: transitioning editor bytes are deferred, not path authority ---");
+{
+	const path = "Handoff/transitioning-source.md";
+	const diskContent = "saved source bytes\n";
+	const unprovenEditorContent = "";
+	const file = makeTFile(path, diskContent);
+	const view = new MarkdownView() as MarkdownView & {
+		file: TFile;
+		editor: { getValue(): string };
+	};
+	view.file = file;
+	view.editor = { getValue: () => unprovenEditorContent };
+	let blockedReason: "transitioning" | "read-failed" = "transitioning";
+	const ticket = {
+		path,
+		views: [{
+			view,
+			viewId: "transitioning-view",
+			leafId: "transitioning-leaf",
+			cm: null,
+			cmId: null,
+			bindingEpoch: 4,
+			editorRevision: 0,
+			editorAuthorityRevision: 0,
+			editorAuthorityContent: null,
+			editorContent: unprovenEditorContent,
+		}],
+	};
+	const controller = new ReconciliationController({
+		app: {
+			vault: {
+				getMarkdownFiles: () => [file],
+				getAbstractFileByPath: () => file,
+				adapter: { stat: async () => file.stat },
+			},
+			workspace: {
+				iterateAllLeaves: (callback: (leaf: { view: MarkdownView }) => void) => {
+					callback({ view });
+				},
+			},
+		} as any,
+		getSettings: () => ({ deviceName: "Device" }) as any,
+		getRuntimeConfig: () => ({
+			maxFileSizeBytes: 0,
+			maxFileSizeKB: 0,
+			excludePatterns: [],
+		}) as any,
+		getVaultSync: () => ({ getTextForPath: () => null }) as any,
+		getDiskMirror: () => null,
+		getBlobSync: () => null,
+		getEditorBindings: () => ({
+			captureOpenEditorMutationTicket: () => ticket,
+			capturePathEditorAuthority: () => ({ kind: "blocked", reason: blockedReason }),
+			isPathEditorAuthorityLeaseCurrent: () => false,
+			getLastEditorActivityForPath: () => null,
+		}) as any,
+		getDiskIndex: () => ({}),
+		setDiskIndex: () => {},
+		isMarkdownPathSyncable: () => true,
+		shouldBlockFrontmatterIngest: () => false,
+		refreshServerCapabilities: async () => {},
+		validateOpenEditorBindings: () => {},
+		onReconciled: () => {},
+		getAwaitingFirstProviderSyncAfterStartup: () => false,
+		setAwaitingFirstProviderSyncAfterStartup: () => {},
+		saveDiskIndex: async () => {},
+		refreshStatusBar: () => {},
+		trace: () => {},
+		scheduleTraceStateSnapshot: () => {},
+		log: () => {},
+	});
+	const internals = controller as unknown as {
+		visibleAuthorityDeferredPaths: Map<string, {
+			editorContents: string[];
+			readComplete: boolean;
+		}>;
+		captureVisibleAuthorityAtDirtyAdmission(path: string, reason: "modify"): void;
+	};
+
+	internals.captureVisibleAuthorityAtDirtyAdmission(path, "modify");
+	assert(
+		!internals.visibleAuthorityDeferredPaths.has(path),
+		"blocked:transitioning does not assign cleared or stale host bytes to the path",
+	);
+
+	blockedReason = "read-failed";
+	internals.captureVisibleAuthorityAtDirtyAdmission(path, "modify");
+	const readFailureMarker = internals.visibleAuthorityDeferredPaths.get(path);
+	assert(
+		readFailureMarker?.readComplete === false &&
+		readFailureMarker.editorContents.includes(unprovenEditorContent),
+		"a non-transition read failure retains its existing preservation behavior",
+	);
+	controller.reset();
 }
 
 console.log("\n──────────────────────────────────────────────────");

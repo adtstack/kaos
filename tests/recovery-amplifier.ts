@@ -434,6 +434,7 @@ console.log("\n--- Test 10: undo capture separation targets matching live bindin
 	);
 	type BindingFixture = {
 		path: string;
+		file: { path: string };
 		view: { file: { path: string } | null };
 		undoManager: { stopCapturing(): void };
 	};
@@ -443,15 +444,25 @@ console.log("\n--- Test 10: undo capture separation targets matching live bindin
 	};
 	const fixture = manager as unknown as ManagerFixture;
 	const stopCounts = new Map<string, number>();
-	const binding = (name: string, path: string, liveViewPath: string | null): BindingFixture => ({
-		path,
-		view: { file: liveViewPath == null ? null : { path: liveViewPath } },
-		undoManager: {
-			stopCapturing(): void {
-				stopCounts.set(name, (stopCounts.get(name) ?? 0) + 1);
+	const binding = (name: string, path: string, liveViewPath: string | null): BindingFixture => {
+		const file = { path };
+		return {
+			path,
+			file,
+			view: {
+				file: liveViewPath == null
+					? null
+					: liveViewPath === path
+						? file
+						: { path: liveViewPath },
 			},
-		},
-	});
+			undoManager: {
+				stopCapturing(): void {
+					stopCounts.set(name, (stopCounts.get(name) ?? 0) + 1);
+				},
+			},
+		};
+	};
 	fixture.bindings.set("matching", binding("matching", "note.md", "note.md"));
 	fixture.bindings.set("stale-view", binding("stale-view", "note.md", "renamed.md"));
 	fixture.bindings.set("different-binding", binding("different-binding", "other.md", "note.md"));

@@ -100,8 +100,87 @@ const MAIN_FORBIDDEN = [
 	"getEngineControlPort",
 	"pauseEditorPropagation",
 	"resumeEditorPropagation",
+	"setEditorHandoffHostApiVersionOverride",
 	"setDiskIngestSuspended",
+	"holdNextHostLoad",
+	"releaseHeldHostLoad",
+	"holdNextNativeSave",
+	"releaseHeldNativeSave",
+	"getEditorHandoffDebugSnapshot",
+	"getContentFreeSnapshot",
+	"qaReplayObservation",
+	"planCount",
+	"witnessStoredCount",
+	"permitConsumedCount",
+	"dispatchAttemptCount",
+	"dispatchAppliedCount",
+	"dispatchUncertainCount",
+	"settlementObservationCount",
+	"lastClassification",
+	"associateHandoffReplayClassificationObserverForQa",
+	"observeHandoffReplayClassificationForQa",
+	"selectionNonEmpty",
+	"liveScrollAnchor",
+	"commitFailureReason",
+	"gateAuthorityAdvanceFailureReason",
+	"inputAuthorityAdvanceFailureReason",
+	"hostPostDelegationFailureReason",
+	"baseRetained",
+	"installEditorHandoffHostQaBarrier",
+	"getEditorHandoffQaDebugSnapshot",
+	"associateEditorHandoffHostQaBarrier",
+	"__qaOnlyArmHandoffRecoveryFaultUnsafe",
+	"__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe",
+	"getHandoffRecoveryQaSnapshot",
+	"getHandoffRecoveryQaManualRows",
+	"getHandoffRecoveryQaInventory",
+	"lastAcceptedState",
+	"clipboard-rejected",
+	"hold-next-post-verify-put",
+	"beforePutBeforeStorage",
+	"afterVerifiedPutBeforeFence",
 	"setExternalEditPolicyOverride",
+];
+
+const QA_PRODUCT_REQUIRED = [
+	"holdNextHostLoad",
+	"releaseHeldHostLoad",
+	"holdNextNativeSave",
+	"releaseHeldNativeSave",
+	"setEditorHandoffHostApiVersionOverride",
+	"getEditorHandoffDebugSnapshot",
+	"getContentFreeSnapshot",
+	"qaReplayObservation",
+	"planCount",
+	"witnessStoredCount",
+	"permitConsumedCount",
+	"dispatchAttemptCount",
+	"dispatchAppliedCount",
+	"dispatchUncertainCount",
+	"settlementObservationCount",
+	"lastClassification",
+	"associateHandoffReplayClassificationObserverForQa",
+	"observeHandoffReplayClassificationForQa",
+	"selectionNonEmpty",
+	"liveScrollAnchor",
+	"commitFailureReason",
+	"gateAuthorityAdvanceFailureReason",
+	"inputAuthorityAdvanceFailureReason",
+	"hostPostDelegationFailureReason",
+	"baseRetained",
+	"installEditorHandoffHostQaBarrier",
+	"getEditorHandoffQaDebugSnapshot",
+	"associateEditorHandoffHostQaBarrier",
+	"__qaOnlyArmHandoffRecoveryFaultUnsafe",
+	"__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe",
+	"getHandoffRecoveryQaSnapshot",
+	"getHandoffRecoveryQaManualRows",
+	"getHandoffRecoveryQaInventory",
+	"lastAcceptedState",
+	"clipboard-rejected",
+	"hold-next-post-verify-put",
+	"beforePutBeforeStorage",
+	"afterVerifiedPutBeforeFence",
 ];
 
 // P2 regression guard — these seams were removed in P2 and must never return.
@@ -166,6 +245,22 @@ function checkBundle(bundlePath, forbidden, deferred, bundleName) {
 	return 0;
 }
 
+function checkRequiredBundleSymbols(bundlePath, required, bundleName) {
+	if (!existsSync(bundlePath)) {
+		console.warn(`SKIP [${bundleName}]: QA product bundle not found; run 'npm run build:qa-product'.`);
+		return 0;
+	}
+	const content = readFileSync(bundlePath, "utf8");
+	const missing = required.filter((symbol) => !content.includes(symbol));
+	if (missing.length > 0) {
+		console.error(`FAIL [${bundleName}]: required QA-only symbols missing:`);
+		missing.forEach((symbol) => console.error(`  - ${symbol}`));
+		return missing.length;
+	}
+	console.log(`PASS [${bundleName}]: all ${required.length} QA-only handoff symbols present.`);
+	return 0;
+}
+
 // ---------------------------------------------------------------------------
 // src/ → qa/ isolation
 // ---------------------------------------------------------------------------
@@ -214,6 +309,11 @@ if (TRANSITIONAL) {
 
 failures += checkBundle("main.js", MAIN_FORBIDDEN, MAIN_FORBIDDEN_DEFERRED, "main.js");
 failures += checkBundle("telemetry.js", TELEMETRY_FORBIDDEN, [], "telemetry.js");
+failures += checkRequiredBundleSymbols(
+	"qa/obsidian-harness/product-main.js",
+	QA_PRODUCT_REQUIRED,
+	"qa product-main.js",
+);
 
 const srcQaViolations = scanSrcForQaImports("src");
 if (srcQaViolations > 0) {

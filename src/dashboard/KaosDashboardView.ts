@@ -5,6 +5,8 @@ import type {
 	DashboardBlobConflictResolutionResult,
 	DashboardBlobConflictResolutionTarget,
 	DashboardConflictArtifact,
+	DashboardHandoffRecovery,
+	DashboardHandoffRecoveryItem,
 	DashboardMetric,
 	DashboardRecentChange,
 	DashboardRecentChanges,
@@ -21,6 +23,10 @@ import type {
 	DashboardTone,
 	KaosDashboardData,
 } from "./dashboardTypes";
+import type {
+	ActiveHandoffRecoveryRecord,
+	ClearHandoffRecoveryScopeResult,
+} from "../sync/handoffRecoveryStore";
 import {
 	deriveDashboardHealth,
 	resolveKaosDashboardMode,
@@ -37,6 +43,7 @@ import {
 	type ThreeWayMergeSegment,
 } from "../utils/threeWayMerge";
 import { ConfirmModal } from "../ui/ConfirmModal";
+import { requestHandoffRecoveryExportPath } from "../ui/HandoffRecoveryExportModal";
 import {
 	captureConflictResolutionSnapshot,
 	resolveConflictArtifactWithCas,
@@ -68,6 +75,19 @@ export interface KaosDashboardActions {
 		target: DashboardBlobConflictResolutionTarget,
 		choice: DashboardBlobConflictResolutionChoice,
 	): Promise<DashboardBlobConflictResolutionResult>;
+	loadHandoffRecovery(
+		recordId: string,
+		expectedChecksum: string,
+	): Promise<ActiveHandoffRecoveryRecord>;
+	copyHandoffRecovery(recordId: string, expectedChecksum: string): Promise<void>;
+	exportHandoffRecovery(
+		recordId: string,
+		expectedChecksum: string,
+		requestedPath: string,
+	): Promise<{ path: string }>;
+	resolveHandoffRecovery(recordId: string, expectedChecksum: string): Promise<void>;
+	discardHandoffRecovery(recordId: string, expectedChecksum: string): Promise<void>;
+	clearHandoffRecoveryScope(): Promise<ClearHandoffRecoveryScopeResult>;
 }
 
 export interface KaosDashboardViewDeps {
@@ -165,6 +185,13 @@ export class KaosDashboardView extends ItemView {
 		}
 		if (this.data.conflicts.length > 0) {
 			this.renderConflicts(root, this.data.conflicts, this.data.settings.deviceName);
+		}
+		if (
+			this.data.handoffRecovery.activeCount > 0
+			|| this.data.handoffRecovery.terminalCount > 0
+			|| this.data.handoffRecovery.issues.length > 0
+		) {
+			this.renderHandoffRecovery(root, this.data.handoffRecovery);
 		}
 		this.renderRecentActivity(root, this.data, mode === "phone" ? 10 : 40);
 		this.renderRecovery(root, this.data);
@@ -339,6 +366,200 @@ export class KaosDashboardView extends ItemView {
 		for (const change of data.recentChanges.changes.slice(0, changeLimit)) {
 			this.renderRecentChange(list, change, data.settings.deviceName);
 		}
+	}
+
+	private renderHandoffRecovery(
+		root: HTMLElement,
+		recovery: DashboardHandoffRecovery,
+	): void {
+		const section = this.section(
+			root,
+			`Handoff Recovery (${recovery.activeCount})`,
+			"kaos-dashboard-handoff-recovery-section",
+		);
+		section.createDiv({
+			text: "Device-local interrupted input. These items are separate from Attention and do not block sync.",
+			cls: "kaos-dashboard-muted kaos-dashboard-section-copy",
+		});
+		if (recovery.issues.length > 0) {
+			section.createDiv({
+				text: `${recovery.issues.length} Recovery storage issue(s) need review.`,
+				cls: "kaos-dashboard-error",
+			});
+		}
+		if (recovery.terminalCount > 0) {
+			section.createDiv({
+				text: `${recovery.terminalCount} content-free completion receipt(s) retained.`,
+				cls: "kaos-dashboard-muted",
+			});
+		}
+		const list = section.createDiv({ cls: "kaos-dashboard-list" });
+		for (const item of recovery.items) {
+			const row = list.createDiv({
+				cls: "kaos-dashboard-row kaos-dashboard-handoff-recovery-row",
+			});
+			row.createDiv({
+				text: `${item.fromPath ?? "Unknown source"} → ${item.targetPath}`,
+				cls: "kaos-dashboard-path",
+			});
+			row.createDiv({
+				text: `${item.originKind} · ${item.afterLength} characters · ${formatDateTime(new Date(item.storedAt).toISOString())}`,
+				cls: "kaos-dashboard-muted",
+			});
+			const actions = row.createDiv({ cls: "kaos-dashboard-row-actions" });
+			this.button(
+				actions,
+				"Compare / apply manually",
+				() => this.openHandoffRecoveryCompare(item),
+			);
+			if (item.fromPath) {
+				const fromPath = item.fromPath;
+				this.button(actions, "Open A", () => this.openPath(fromPath));
+			}
+			this.button(
+				actions,
+				"Copy",
+				() => this.deps.actions.copyHandoffRecovery(
+					item.recordId,
+					item.expectedChecksum,
+				),
+			);
+			this.button(actions, "Export", () => this.exportHandoffRecovery(item));
+			this.button(
+				actions,
+				"Resolve",
+				() => this.confirmResolveHandoffRecovery(item),
+			);
+			const discard = this.button(
+				actions,
+				"Discard",
+				() => this.confirmDiscardHandoffRecovery(item),
+			);
+			discard.addClass("mod-warning");
+		}
+		if (recovery.activeCount > 0 || recovery.terminalCount > 0 || recovery.issues.length > 0) {
+			const scopeActions = section.createDiv({ cls: "kaos-dashboard-row-actions" });
+			const clear = this.button(
+				scopeActions,
+				"Clear device-local Recovery",
+				() => this.confirmClearHandoffRecovery(),
+			);
+			clear.addClass("mod-warning");
+		}
+	}
+
+	private async openHandoffRecoveryCompare(
+		item: DashboardHandoffRecoveryItem,
+	): Promise<void> {
+		const record = await this.deps.actions.loadHandoffRecovery(
+			item.recordId,
+			item.expectedChecksum,
+		);
+		if (record.recordId !== item.recordId || record.checksum !== item.expectedChecksum) {
+			throw new Error("Handoff Recovery record changed before comparison");
+		}
+		new HandoffRecoveryCompareModal(this.app, {
+			record,
+			onCopy: () => this.deps.actions.copyHandoffRecovery(
+				item.recordId,
+				item.expectedChecksum,
+			),
+		}).open();
+	}
+
+	private async exportHandoffRecovery(item: DashboardHandoffRecoveryItem): Promise<void> {
+		const path = await requestHandoffRecoveryExportPath(
+			this.app,
+			`Handoff Recovery ${new Date().toISOString().replace(/[:.]/g, "-")}.txt`,
+		);
+		if (path === null) return;
+		const result = await this.deps.actions.exportHandoffRecovery(
+			item.recordId,
+			item.expectedChecksum,
+			path,
+		);
+		new Notice(`Recovery exported to ${result.path}.`);
+	}
+
+	private confirmResolveHandoffRecovery(
+		item: DashboardHandoffRecoveryItem,
+	): Promise<void> {
+		return new Promise((resolve, reject) => {
+			new ConfirmModal(
+				this.app,
+				"Resolve handoff Recovery",
+				"Confirm that manual handling is complete. The stored body will be removed and a content-free receipt retained.",
+				async () => {
+					try {
+						await this.deps.actions.resolveHandoffRecovery(
+							item.recordId,
+							item.expectedChecksum,
+						);
+						new Notice("Handoff recovery resolved.");
+						resolve();
+					} catch (error) {
+						reject(error instanceof Error ? error : new Error(String(error)));
+					}
+				},
+				"Resolve",
+				"Cancel",
+				resolve,
+				"mod-cta",
+			).open();
+		});
+	}
+
+	private confirmDiscardHandoffRecovery(
+		item: DashboardHandoffRecoveryItem,
+	): Promise<void> {
+		return new Promise((resolve, reject) => {
+			new ConfirmModal(
+				this.app,
+				"Discard handoff Recovery",
+				"Remove this stored body without modifying either note? This cannot be undone.",
+				async () => {
+					try {
+						await this.deps.actions.discardHandoffRecovery(
+							item.recordId,
+							item.expectedChecksum,
+						);
+						new Notice("Handoff recovery discarded.");
+						resolve();
+					} catch (error) {
+						reject(error instanceof Error ? error : new Error(String(error)));
+					}
+				},
+				"Discard",
+				"Cancel",
+				resolve,
+			).open();
+		});
+	}
+
+	private confirmClearHandoffRecovery(): Promise<void> {
+		return new Promise((resolve, reject) => {
+			new ConfirmModal(
+				this.app,
+				"Clear device-local Recovery",
+				`Delete active bodies and receipts for vault ${this.data?.settings.vaultId ?? "unknown"} on this device? Other vault/device scopes are not changed.`,
+				async () => {
+					try {
+						const result = await this.deps.actions.clearHandoffRecoveryScope();
+						if (result.kind === "blocked") {
+							new Notice("Recovery clear is waiting for settlement review.", 7000);
+						} else {
+							new Notice(`Cleared ${result.deletedCount} Recovery record(s).`);
+						}
+						resolve();
+					} catch (error) {
+						reject(error instanceof Error ? error : new Error(String(error)));
+					}
+				},
+				"Clear",
+				"Cancel",
+				resolve,
+			).open();
+		});
 	}
 
 	private renderRecovery(root: HTMLElement, data: KaosDashboardData): void {
@@ -1126,6 +1347,81 @@ export class KaosDashboardView extends ItemView {
 	private async copyPath(path: string): Promise<void> {
 		await navigator.clipboard.writeText(path);
 		new Notice("Path copied.");
+	}
+}
+
+interface HandoffRecoveryCompareModalData {
+	record: ActiveHandoffRecoveryRecord;
+	onCopy(): Promise<void>;
+}
+
+class HandoffRecoveryCompareModal extends Modal {
+	constructor(
+		app: App,
+		private readonly data: HandoffRecoveryCompareModalData,
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.contentEl.empty();
+		this.contentEl.addClass("kaos-handoff-recovery-compare-modal");
+		this.contentEl.createEl("h3", { text: "Handoff recovery comparison" });
+		this.contentEl.createDiv({
+			text: `${this.data.record.fromPath ?? "Unknown source"} → ${this.data.record.targetPath}`,
+			cls: "kaos-dashboard-path",
+		});
+		this.contentEl.createDiv({
+			text: "Slice 2 never applies this content automatically. Review the captured change, then handle it manually in the appropriate note.",
+			cls: "kaos-dashboard-muted kaos-dashboard-section-copy",
+		});
+		const actions = this.contentEl.createDiv({
+			cls: "modal-button-container kaos-conflict-diff-actions",
+		});
+		const copy = actions.createEl("button", { text: "Copy successor" });
+		copy.addEventListener("click", () => {
+			copy.disabled = true;
+			void this.data.onCopy()
+				.then(() => new Notice("Recovery successor copied."))
+				.catch((error) => {
+					new Notice(`Recovery copy failed: ${formatUnknown(error)}`, 7000);
+				})
+				.finally(() => { copy.disabled = false; });
+		});
+		actions.createEl("button", { text: "Close" }).addEventListener("click", () => {
+			this.close();
+		});
+		const legend = this.contentEl.createDiv({ cls: "kaos-conflict-diff-legend" });
+		legend.createEl("span", { text: "- captured start", cls: "kaos-conflict-diff-delete" });
+		legend.createEl("span", { text: "+ captured successor", cls: "kaos-conflict-diff-insert" });
+		const diffBody = this.contentEl.createDiv({ cls: "kaos-conflict-diff-body" });
+		this.renderDiffLines(
+			diffBody,
+			buildTextDiffLines(
+				this.data.record.body.startContent,
+				this.data.record.body.afterContent,
+				{ maxSegments: 80, maxLinesPerSegment: 20, contextLines: 15 },
+			),
+		);
+	}
+
+	onClose(): void {
+		this.contentEl.removeClass("kaos-handoff-recovery-compare-modal");
+		this.contentEl.empty();
+	}
+
+	private renderDiffLines(parent: HTMLElement, lines: RenderedDiffLine[]): void {
+		for (const line of lines) {
+			const prefix = line.kind === "delete" ? "- " : line.kind === "insert" ? "+ " : "  ";
+			const cls = line.kind === "delete"
+				? "kaos-conflict-diff-line is-delete"
+				: line.kind === "insert"
+					? "kaos-conflict-diff-line is-insert"
+					: line.kind === "context"
+						? "kaos-conflict-diff-line is-context"
+						: "kaos-conflict-diff-line";
+			parent.createDiv({ text: `${prefix}${line.text}` || " ", cls });
+		}
 	}
 }
 

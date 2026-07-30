@@ -36,10 +36,16 @@ export async function createFile(app: App, path: string, content: string): Promi
 		}
 	}
 	const existing = app.vault.getFileByPath(normalized);
-	if (existing) {
-		await app.vault.modify(existing, content);
-	} else {
-		await app.vault.create(normalized, content);
+	try {
+		if (existing) {
+			await app.vault.modify(existing, content);
+		} else {
+			await app.vault.create(normalized, content);
+		}
+	} catch (error) {
+		throw new Error(
+			`createFile(${normalized}): ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
 }
 

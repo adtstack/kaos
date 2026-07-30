@@ -30,6 +30,27 @@ function makeTFile(path: string): TFile {
 	return file;
 }
 
+let editorAuthorityLeaseCounter = 0;
+
+function stableEditorAuthority(
+	path: string,
+	readContent: () => string,
+	isOpen: () => boolean = () => true,
+) {
+	const lease = Object.freeze({
+		leaseId: `reconciliation-safety:${++editorAuthorityLeaseCounter}`,
+	});
+	return {
+		getBindingDebugInfoForView: () => null,
+		getCollabDebugInfoForView: () => null,
+		capturePathEditorAuthority: (candidate: string) => candidate === path && isOpen()
+			? { kind: "proven-single" as const, content: readContent(), lease }
+			: { kind: "none" as const },
+		isPathEditorAuthorityLeaseCurrent: (candidate: unknown) =>
+			candidate === lease && isOpen(),
+	};
+}
+
 console.log("\n--- Test 1: updateIndex removes blocked paths from the index ---");
 {
 	const index: DiskIndex = {
@@ -161,6 +182,132 @@ console.log("\n--- Test 2b: clean equal disk/CRDT paths get a settled baseline -
 	assert(diskIndex[path]?.mtime === 5, "equal path keeps fresh disk stats");
 	assert(flushed.length === 0, "equal path does not need a disk flush");
 	assert(saveDiskIndexCalls === 1, "disk index save is attempted after clean baseline recording");
+}
+
+console.log("\n--- Test 2b-a: closed equal authorities retire only provisional visible-authority attention ---");
+{
+	async function runClosedEqualWithAttention(
+		reason: "conflict-winner-flush-deferred" | "three-way-preserve-failed",
+	) {
+		const path = `closed-equal-${reason}.md`;
+		const content = "settled editor content\n";
+		const file = makeTFile(path);
+		let diskIndex: DiskIndex = {};
+		let activeReason: typeof reason | null = reason;
+		let clearCalls = 0;
+		const stats = new Map<string, { mtime: number; size: number }>([
+			[path, { mtime: 7, size: content.length }],
+		]);
+
+		const controller = new ReconciliationController({
+			app: {
+				vault: {
+					getMarkdownFiles: () => [file],
+					read: async () => content,
+					adapter: {
+						stat: async (candidate: string) => stats.get(candidate) ?? null,
+					},
+					getAbstractFileByPath: () => file,
+				},
+				workspace: { iterateAllLeaves: () => {} },
+			} as any,
+			getSettings: () => ({ deviceName: "device" }) as any,
+			getRuntimeConfig: () => ({
+				maxFileSizeBytes: 0,
+				maxFileSizeKB: 0,
+				excludePatterns: [],
+			}) as any,
+			getVaultSync: () => ({
+				connected: true,
+				providerSynced: true,
+				getTextForPath: (candidate: string) =>
+					candidate === path ? { toJSON: () => content } : null,
+				getActiveMarkdownPaths: () => [path],
+				reconcileVault: () => ({
+					mode: "authoritative",
+					createdOnDisk: [],
+					updatedOnDisk: [],
+					seededToCrdt: [],
+					untracked: [],
+					skipped: 0,
+				}),
+				runIntegrityChecks: () => ({ duplicateIds: 0, orphansCleaned: 0 }),
+			}) as any,
+			getDiskMirror: () => ({
+				isPreservedUnresolved: (candidate: string) =>
+					candidate === path && activeReason !== null,
+				getPreservedUnresolvedEntries: () => activeReason === null ? [] : [{
+					path,
+					kind: "markdown",
+					reason: activeReason,
+					episodeId: `episode-${reason}`,
+					firstSeenAt: 1,
+					lastSeenAt: 1,
+					localHash: null,
+					knownRemoteHash: null,
+				}],
+				clearPreservedUnresolved: (candidate: string) => {
+					if (candidate !== path) return;
+					clearCalls++;
+					activeReason = null;
+				},
+			}) as any,
+			getBlobSync: () => null,
+			getEditorBindings: () => null,
+			getDiskIndex: () => diskIndex,
+			setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
+			isMarkdownPathSyncable: () => true,
+			shouldBlockFrontmatterIngest: () => false,
+			refreshServerCapabilities: async () => {},
+			validateOpenEditorBindings: () => {},
+			onReconciled: () => {},
+			getAwaitingFirstProviderSyncAfterStartup: () => false,
+			setAwaitingFirstProviderSyncAfterStartup: () => {},
+			saveDiskIndex: async () => {},
+			refreshStatusBar: () => {},
+			trace: () => {},
+			scheduleTraceStateSnapshot: () => {},
+			log: () => {},
+		});
+		const internals = controller as unknown as {
+			visibleAuthorityDeferredPaths: Map<string, unknown>;
+		};
+		internals.visibleAuthorityDeferredPaths.set(path, {
+			editorContents: [content],
+			readComplete: true,
+			capturedDiskContent: content,
+			capturedCrdtContent: content,
+			capturedDiskRevision: 0,
+			capturedEditorActivity: null,
+			capturedEditorTicket: null,
+			capturedAt: 1,
+		});
+
+		await controller.runReconciliation("authoritative");
+		const result = {
+			activeReason,
+			clearCalls,
+			markerPresent: internals.visibleAuthorityDeferredPaths.has(path),
+			baselineHash: diskIndex[path]?.contentHash,
+		};
+		controller.reset();
+		return result;
+	}
+
+	const provisional = await runClosedEqualWithAttention("conflict-winner-flush-deferred");
+	assert(provisional.clearCalls === 1, "settled authorities clear the exact provisional warning");
+	assert(provisional.activeReason === null, "provisional attention is no longer self-blocking");
+	assert(!provisional.markerPresent, "settled visible-authority capture is retired");
+	assert(
+		typeof provisional.baselineHash === "string" && provisional.baselineHash.length === 64,
+		"settled path advances its durable baseline",
+	);
+
+	const stronger = await runClosedEqualWithAttention("three-way-preserve-failed");
+	assert(stronger.clearCalls === 0, "stronger preservation attention is never auto-cleared");
+	assert(stronger.activeReason === "three-way-preserve-failed", "stronger attention remains visible");
+	assert(stronger.markerPresent, "stronger unresolved episode retains its captured authority");
+	assert(stronger.baselineHash === undefined, "stronger unresolved episode cannot advance baseline");
 }
 
 console.log("\n--- Test 2b0: projection-blocked missing disk preserves local-deletion baseline ---");
@@ -458,6 +605,7 @@ console.log("\n--- Test 2c: fenced disk conflict winner settles its baseline imm
 		[path, { mtime: 2_000, size: diskContent.length }],
 	]);
 	const createdFiles = new Map<string, string>();
+	const createdFileObjects = new Map<string, TFile>();
 	const flushed: string[] = [];
 	let reconcileCallCount = 0;
 
@@ -471,6 +619,9 @@ console.log("\n--- Test 2c: fenced disk conflict winner settles its baseline imm
 			create: async (createdPath: string, content: string) => {
 				if (createdFiles.has(createdPath)) throw new Error("exists");
 				createdFiles.set(createdPath, content);
+				const createdFile = makeTFile(createdPath);
+				createdFileObjects.set(createdPath, createdFile);
+				return createdFile;
 			},
 			adapter: {
 				stat: async (candidate: string) => stats.get(candidate) ?? null,
@@ -478,7 +629,7 @@ console.log("\n--- Test 2c: fenced disk conflict winner settles its baseline imm
 			getAbstractFileByPath: (candidate: string) =>
 				candidate === path
 					? file
-					: (createdFiles.has(candidate) ? ({ path: candidate }) : null),
+					: (createdFileObjects.get(candidate) ?? null),
 		},
 		workspace: {
 			iterateAllLeaves: () => {},
@@ -594,6 +745,7 @@ console.log("\n--- Test 2c1: closed-file stale decision cannot overwrite a newer
 						ytext.insert(0, newestCrdtContent);
 					}, providerOrigin);
 				}
+				return makeTFile(createdPath);
 			},
 			adapter: {
 				stat: async (candidate: string) => stats.get(candidate) ?? null,
@@ -712,6 +864,7 @@ console.log("\n--- Test 2c2: pending local create wins missing-baseline reconcil
 			create: async (createdPath: string, content: string) => {
 				if (createdFiles.has(createdPath)) throw new Error("exists");
 				createdFiles.set(createdPath, content);
+				return makeTFile(createdPath);
 			},
 			adapter: {
 				stat: async (candidate: string) => stats.get(candidate) ?? null,
@@ -800,12 +953,14 @@ console.log("\n--- Test 2c2: pending local create wins missing-baseline reconcil
 	doc.destroy();
 }
 
-console.log("\n--- Test 2d: startup open editor content wins before binding can overwrite it ---");
+console.log("\n--- Test 2d: startup open editor adoption is held before reconciliation ---");
 {
 	const path = "open-reenable.md";
 	const diskContent = "LOCAL_ON_EDITOR\n";
 	const editorContent = "LOCAL_ON_EDITOR\n";
 	const crdtContent = "REMOTE_FROM_CRDT\n";
+	const baselineContent = "SETTLED_BASE\n";
+	const baselineHash = await contentBaselineHash(baselineContent);
 	const file = makeTFile(path);
 	const doc = new Y.Doc();
 	const ytext = doc.getText("content");
@@ -813,7 +968,13 @@ console.log("\n--- Test 2d: startup open editor content wins before binding can 
 	const transactionOrigins: unknown[] = [];
 	doc.on("afterTransaction", (txn) => transactionOrigins.push(txn.origin));
 
-	let diskIndex: DiskIndex = {};
+	let diskIndex: DiskIndex = {
+		[path]: {
+			mtime: 1,
+			size: baselineContent.length,
+			contentHash: baselineHash,
+		},
+	};
 	const stats = new Map<string, { mtime: number; size: number }>([
 		[path, { mtime: 12, size: diskContent.length }],
 	]);
@@ -821,6 +982,8 @@ console.log("\n--- Test 2d: startup open editor content wins before binding can 
 	const flushed: string[] = [];
 	const decisions: Array<Record<string, unknown>> = [];
 	const traces: Array<{ source: string; msg: string; details?: Record<string, unknown> }> = [];
+	let adoptionHeld = false;
+	let reconcileObservedPreflight = false;
 
 	const view = new MarkdownView() as MarkdownView & {
 		file: TFile;
@@ -828,6 +991,7 @@ console.log("\n--- Test 2d: startup open editor content wins before binding can 
 	};
 	view.file = file;
 	view.editor = { getValue: () => editorContent };
+	const editorAuthority = stableEditorAuthority(path, () => editorContent);
 
 	const app = {
 		vault: {
@@ -842,6 +1006,7 @@ console.log("\n--- Test 2d: startup open editor content wins before binding can 
 			create: async (createdPath: string, content: string) => {
 				if (createdFiles.has(createdPath)) throw new Error("exists");
 				createdFiles.set(createdPath, content);
+				return makeTFile(createdPath);
 			},
 			adapter: {
 				stat: async (candidate: string) => stats.get(candidate) ?? null,
@@ -863,15 +1028,18 @@ console.log("\n--- Test 2d: startup open editor content wins before binding can 
 		providerSynced: true,
 		getTextForPath: (candidate: string) => candidate === path ? ytext : null,
 		getActiveMarkdownPaths: () => [path],
-		reconcileVault: () => ({
-			mode: "authoritative",
-			createdOnDisk: [],
-			updatedOnDisk: [path],
-			seededToCrdt: [],
-			untracked: [],
-			tombstonedDiskConflicts: [],
-			skipped: 0,
-		}),
+		reconcileVault: () => {
+			reconcileObservedPreflight = adoptionHeld;
+			return {
+				mode: "authoritative",
+				createdOnDisk: [],
+				updatedOnDisk: [path],
+				seededToCrdt: [],
+				untracked: [],
+				tombstonedDiskConflicts: [],
+				skipped: 0,
+			};
+		},
 		runIntegrityChecks: () => ({ duplicateIds: 0, orphansCleaned: 0 }),
 	};
 
@@ -891,13 +1059,21 @@ console.log("\n--- Test 2d: startup open editor content wins before binding can 
 		getBlobSync: () => null,
 		getEditorBindings: () => ({
 			isBound: () => false,
+			isSamePathAdoptionProjectionHeld: (candidate: string) =>
+				adoptionHeld && candidate === path,
+			getLastEditorActivityForPath: () => null,
+			repair: () => true,
+			rebind: () => {},
+			...editorAuthority,
 		}) as any,
 		getDiskIndex: () => diskIndex,
 		setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
 		isMarkdownPathSyncable: () => true,
 		shouldBlockFrontmatterIngest: () => false,
 		refreshServerCapabilities: async () => {},
-		validateOpenEditorBindings: () => {},
+		validateOpenEditorBindings: () => {
+			adoptionHeld = true;
+		},
 		onReconciled: () => {},
 		getAwaitingFirstProviderSyncAfterStartup: () => false,
 		setAwaitingFirstProviderSyncAfterStartup: () => {},
@@ -915,25 +1091,24 @@ console.log("\n--- Test 2d: startup open editor content wins before binding can 
 
 	await controller.runReconciliation("authoritative");
 
-	const artifactPath = Array.from(createdFiles.keys()).find((candidate) =>
-		candidate.startsWith("open-reenable (KAOS conflict - crdt from Device ") &&
-		candidate.endsWith(".md")
-	);
-	assert(ytext.toString() === editorContent, "open editor content is applied to CRDT before binding");
-	assert(!!artifactPath, "remote CRDT content is preserved as a conflict artifact");
-	assert(artifactPath ? createdFiles.get(artifactPath) === crdtContent : false, "conflict artifact contains remote CRDT content");
-	assert(flushed.length === 0, "open editor reconcile does not write remote CRDT over disk");
+	assert(reconcileObservedPreflight, "open editor adoption hold is established before CRDT classification");
+	assert(ytext.toString() === crdtContent, "preflight hold leaves remote CRDT authority untouched");
+	assert(createdFiles.size === 0, "preflight hold leaves conflict preservation to same-path adoption");
+	assert(flushed.length === 0, "preflight hold does not project remote CRDT over the local editor disk");
+	assert(transactionOrigins.length === 0, "preflight hold performs no premature CRDT repair transaction");
 	assert(
-		transactionOrigins.includes(ORIGIN_DISK_SYNC_RECOVER_BOUND),
-		"open editor reconcile uses a known local repair origin",
-	);
-	assert(
-		decisions.some((decision) => decision.decision === "open-editor-wins"),
-		"open editor reconcile emits an explicit decision",
+		diskIndex[path]?.mtime === 1
+			&& diskIndex[path]?.size === baselineContent.length
+			&& diskIndex[path]?.contentHash === baselineHash,
+		"preflight hold preserves the exact settled baseline without advancing its stat",
 	);
 	assert(
-		traces.some((event) => event.msg === "open-file-reconcile-editor-wins"),
-		"open editor reconcile traces editor-wins convergence",
+		!decisions.some((decision) => decision.decision === "open-editor-wins"),
+		"preflight hold never promotes unadopted editor bytes as the winner",
+	);
+	assert(
+		!traces.some((event) => event.msg === "open-file-reconcile-editor-wins"),
+		"preflight hold bypasses the legacy editor-wins fallback",
 	);
 	doc.destroy();
 }
@@ -967,6 +1142,7 @@ console.log("\n--- Test 2d1: remote C2 cannot be reverted by the stale open edit
 	};
 	view.file = file;
 	view.editor = { getValue: () => editorContent };
+	const editorAuthority = stableEditorAuthority(path, () => editorContent);
 
 	const app = {
 		vault: {
@@ -981,6 +1157,7 @@ console.log("\n--- Test 2d1: remote C2 cannot be reverted by the stale open edit
 			create: async (createdPath: string, content: string) => {
 				if (createdFiles.has(createdPath)) throw new Error("exists");
 				createdFiles.set(createdPath, content);
+				return makeTFile(createdPath);
 			},
 			adapter: {
 				stat: async (candidate: string) => stats.get(candidate) ?? null,
@@ -1041,6 +1218,9 @@ console.log("\n--- Test 2d1: remote C2 cannot be reverted by the stale open edit
 			getLastEditorActivityForPath: () => null,
 			getBindingDebugInfoForView: () => null,
 			getCollabDebugInfoForView: () => null,
+			repair: () => true,
+			rebind: () => {},
+			...editorAuthority,
 		}) as any,
 		getDiskIndex: () => diskIndex,
 		setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
@@ -1149,6 +1329,7 @@ console.log("\n--- Test 2e: recent startup typing defers open editor conflict cr
 	};
 	view.file = file;
 	view.editor = { getValue: () => editorContent };
+	const editorAuthority = stableEditorAuthority(path, () => editorContent, () => isOpen);
 
 	const app = {
 		vault: {
@@ -1163,6 +1344,7 @@ console.log("\n--- Test 2e: recent startup typing defers open editor conflict cr
 			create: async (createdPath: string, content: string) => {
 				if (createdFiles.has(createdPath)) throw new Error("exists");
 				createdFiles.set(createdPath, content);
+				return makeTFile(createdPath);
 			},
 			adapter: {
 				stat: async (candidate: string) => stats.get(candidate) ?? null,
@@ -1213,6 +1395,9 @@ console.log("\n--- Test 2e: recent startup typing defers open editor conflict cr
 			isBound: () => isOpen,
 			getLastEditorActivityForPath: (candidate: string) =>
 				candidate === path ? Date.now() - 100 : null,
+			repair: () => true,
+			rebind: () => {},
+			...editorAuthority,
 		}) as any,
 		getDiskIndex: () => diskIndex,
 		setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
@@ -1315,6 +1500,7 @@ console.log("\n--- Test 2f: startup editor ahead of disk and CRDT defers without
 	};
 	view.file = file;
 	view.editor = { getValue: () => editorContent };
+	const editorAuthority = stableEditorAuthority(path, () => editorContent, () => isOpen);
 
 	const app = {
 		vault: {
@@ -1329,6 +1515,7 @@ console.log("\n--- Test 2f: startup editor ahead of disk and CRDT defers without
 			create: async (createdPath: string, content: string) => {
 				if (createdFiles.has(createdPath)) throw new Error("exists");
 				createdFiles.set(createdPath, content);
+				return makeTFile(createdPath);
 			},
 			adapter: {
 				stat: async (candidate: string) => stats.get(candidate) ?? null,
@@ -1378,6 +1565,9 @@ console.log("\n--- Test 2f: startup editor ahead of disk and CRDT defers without
 		getEditorBindings: () => ({
 			isBound: () => isOpen,
 			getLastEditorActivityForPath: () => null,
+			repair: () => true,
+			rebind: () => {},
+			...editorAuthority,
 		}) as any,
 		getDiskIndex: () => diskIndex,
 		setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
@@ -1671,7 +1861,14 @@ console.log("\n--- Test 5: bound recovery aborts when CRDT changes after authori
 
 	const app = {
 		vault: {
-			read: async () => diskContent,
+			getMarkdownFiles: () => [
+				file,
+				...Array.from(createdFiles.keys()).map(makeTFile),
+			],
+			read: async (readFile: TFile & { path: string }) =>
+				readFile.path === path
+					? diskContent
+					: (createdFiles.get(readFile.path) ?? ""),
 			getAbstractFileByPath: (candidate: string) => candidate === path ? file : null,
 			adapter: {
 				stat: async () => ({ mtime: 10, size: diskContent.length }),
@@ -1690,6 +1887,7 @@ console.log("\n--- Test 5: bound recovery aborts when CRDT changes after authori
 
 	let editorTicketCurrent = true;
 	const editorBindings = {
+		...stableEditorAuthority(path, () => diskContent),
 		isBound: () => true,
 		captureOpenEditorMutationTicket: () => ({ path, views: [] }),
 		validateOpenEditorMutationTicket: () => editorTicketCurrent
@@ -1807,6 +2005,7 @@ console.log("\n--- Test 6: bound ambiguous divergence creates a conflict artifac
 			create: async (createdPath: string, content: string) => {
 				if (createdFiles.has(createdPath)) throw new Error("exists");
 				createdFiles.set(createdPath, content);
+				return makeTFile(createdPath);
 			},
 			getAbstractFileByPath: (candidate: string) =>
 				candidate === path
@@ -1828,6 +2027,7 @@ console.log("\n--- Test 6: bound ambiguous divergence creates a conflict artifac
 	};
 
 	const editorBindings = {
+		...stableEditorAuthority(path, () => editorContent),
 		isBound: () => true,
 		getBindingDebugInfoForView: () => null,
 		getCollabDebugInfoForView: () => null,
@@ -1938,6 +2138,7 @@ console.log("\n--- Test 7: repeated identical recovery fingerprint is quarantine
 	};
 
 	const editorBindings = {
+		...stableEditorAuthority(path, () => diskContent),
 		isBound: () => true,
 		getBindingDebugInfoForView: () => null,
 		getCollabDebugInfoForView: () => null,
@@ -2054,6 +2255,7 @@ console.log("\n--- Test 8: successful recovery clears quarantine fingerprint ---
 	};
 
 	const editorBindings = {
+		...stableEditorAuthority(path, () => "disk version A"),
 		isBound: () => true,
 		getBindingDebugInfoForView: () => null,
 		getCollabDebugInfoForView: () => null,
@@ -2160,6 +2362,7 @@ console.log("\n--- Test 9: convergence failure does not create infinite conflict
 			create: async (createdPath: string, content: string) => {
 				if (createdFiles.has(createdPath)) throw new Error("exists");
 				createdFiles.set(createdPath, content);
+				return makeTFile(createdPath);
 			},
 			getAbstractFileByPath: (candidate: string) =>
 				candidate === path
@@ -2188,6 +2391,7 @@ console.log("\n--- Test 9: convergence failure does not create infinite conflict
 	};
 
 	const editorBindings = {
+		...stableEditorAuthority(path, () => editorContent),
 		isBound: () => true,
 		getBindingDebugInfoForView: () => null,
 		getCollabDebugInfoForView: () => null,
@@ -2323,10 +2527,18 @@ console.log("\n--- Test 10: second reconcile after successful convergence does n
 
 	const app = {
 		vault: {
-			read: async () => diskContent,
+			getMarkdownFiles: () => [
+				file,
+				...Array.from(createdFiles.keys()).map(makeTFile),
+			],
+			read: async (readFile: TFile & { path: string }) =>
+				readFile.path === path
+					? diskContent
+					: (createdFiles.get(readFile.path) ?? ""),
 			create: async (createdPath: string, content: string) => {
 				if (createdFiles.has(createdPath)) throw new Error("exists");
 				createdFiles.set(createdPath, content);
+				return makeTFile(createdPath);
 			},
 			getAbstractFileByPath: (candidate: string) =>
 				candidate === path
@@ -2348,6 +2560,7 @@ console.log("\n--- Test 10: second reconcile after successful convergence does n
 	};
 
 	const editorBindings = {
+		...stableEditorAuthority(path, () => editorContent),
 		isBound: () => true,
 		getBindingDebugInfoForView: () => null,
 		getCollabDebugInfoForView: () => null,
@@ -2399,9 +2612,17 @@ console.log("\n--- Test 10: second reconcile after successful convergence does n
 	ytext.insert(0, "new-crdt-version");
 	await (controller as any).syncFileFromDisk(file, "modify");
 
-	// This is a genuinely new divergence (different CRDT content), so a
-	// new artifact should be created.
-	assert(createdFiles.size === 4, "genuinely new divergence creates new CRDT and disk conflict artifacts");
+	// This is a genuinely new CRDT divergence, while the disk candidate is
+	// byte-identical to the already-preserved disk artifact. Create only the
+	// new CRDT artifact and reuse the durable disk artifact.
+	assert(
+		createdFiles.size === 3,
+		"new CRDT divergence creates one artifact and reuses the unchanged disk artifact",
+	);
+	assert(
+		Array.from(createdFiles.values()).filter((content) => content === "new-crdt-version").length === 1,
+		"new CRDT bytes are preserved exactly once",
+	);
 
 	doc.destroy();
 }
@@ -2449,6 +2670,7 @@ console.log("\n--- Test 11: artifact creation failure does NOT trigger convergen
 	};
 
 	const editorBindings = {
+		...stableEditorAuthority(path, () => editorContent),
 		isBound: () => true,
 		getBindingDebugInfoForView: () => null,
 		getCollabDebugInfoForView: () => null,

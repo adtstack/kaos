@@ -19,7 +19,16 @@ import {
 	type ReconcileMode,
 } from "./sync/vaultSync";
 import { SCHEMA_VERSION } from "./sync/vaultSync";
-import { EditorBindingManager } from "./sync/editorBinding";
+import {
+	EditorBindingManager,
+	getEditorHandoffQaDebugSnapshot,
+	holdNextEditorHostLoadForQa,
+	holdNextEditorNativeSaveForQa,
+	installEditorHandoffHostQaBarrier,
+	releaseHeldEditorHostLoadForQa,
+	releaseHeldEditorNativeSaveForQa,
+	setEditorHandoffHostApiVersionOverrideForQa,
+} from "./sync/editorBinding";
 import {
 	DiskMirror,
 	type ObservedDiskMutationRevision,
@@ -193,6 +202,7 @@ import {
 } from "./runtime/reconciliationController";
 import { AttachmentOrchestrator } from "./runtime/attachmentOrchestrator";
 import { EditorWorkspaceOrchestrator } from "./runtime/editorWorkspaceOrchestrator";
+import { isMarkdownEditorView } from "./runtime/markdownEditorView";
 import { SetupLinkController } from "./runtime/setupLinkController";
 import { TraceRuntimeController } from "./runtime/traceRuntimeController";
 import { registerCommands } from "./commands";
@@ -210,6 +220,7 @@ import type {
 	DashboardBlobConflictResolutionChoice,
 	DashboardBlobConflictResolutionResult,
 	DashboardBlobConflictResolutionTarget,
+	DashboardHandoffRecovery,
 	DashboardLegacyMissingBlobResolutionChoice,
 	DashboardLegacyMissingBlobResolutionTarget,
 	DashboardRemoteDeleteResolutionChoice,
@@ -230,9 +241,29 @@ import { randomBase64Url } from "./utils/base64url";
 import { ConfirmModal } from "./ui/ConfirmModal";
 import { runSchemaMigrationToV2 } from "./migrations/schemaV2";
 import type { TelemetryRuntimeHandle } from "./telemetry/installTelemetryRuntime";
-import type { EngineControlPort, DiskIngestPort } from "./runtime/engineControlPort";
+import type {
+	EngineControlPort,
+	DiskIngestPort,
+	EditorHandoffReplayQaObservation,
+	HandoffRecoveryQaAcceptedState,
+	HandoffRecoveryQaFault,
+} from "./runtime/engineControlPort";
 import type { BindingPropagationGate } from "./sync/editorBinding";
 import { getOrCreateLocalDeviceIdentity } from "./sync/indexedDbCandidateStore";
+import { IndexedDbHandoffRecoveryStore } from "./sync/indexedDbHandoffRecoveryStore";
+import {
+	HANDOFF_RECOVERY_SCHEMA_VERSION,
+	buildHandoffRecoveryScopeKey,
+	isActiveHandoffRecoveryRecord,
+	type ActiveHandoffRecoveryRecord,
+	type ClearHandoffRecoveryScopeResult,
+	type HandoffRecoveryHydrationResult,
+} from "./sync/handoffRecoveryStore";
+import { ManualHandoffRecoveryCoordinator } from "./runtime/handoffRecoveryCoordinator";
+import { HandoffReplayCoordinator } from "./runtime/handoffReplayCoordinator";
+import { associateHandoffReplayClassificationObserverForQa } from "./runtime/handoffReplayQaObserver";
+import { exportHandoffRecoveryBody } from "./sync/handoffRecoveryExport";
+import { requestHandoffRecoveryExportPath } from "./ui/HandoffRecoveryExportModal";
 
 // Build-time constant injected by esbuild.
 //   production build (main.js):          define __KAOS_QA_HARNESS_ENABLED__ = false
@@ -332,7 +363,19 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		diskIngestSuspended: boolean;
 		pausedEditorPropagationPaths: Set<string>;
 		bindingReconfigureHook: ((path: string, deviceName: string, action: "pause" | "resume") => void) | null;
-		controlPort: EngineControlPort;
+		handoffRecoveryFault: HandoffRecoveryQaFault | null;
+		heldHandoffRecoveryPut: Readonly<{
+			operationId: string;
+			release(): void;
+		}> | null;
+		handoffRecoveryPutStartedCount: number;
+		handoffRecoveryPutSettledCount: number;
+		handoffRecoveryLastCategoricalOutcome: string | null;
+	handoffRecoveryAcceptedStateSequence: number;
+	handoffRecoveryLastAcceptedState: HandoffRecoveryQaAcceptedState | null;
+	handoffReplayLastClassification:
+		EditorHandoffReplayQaObservation["lastClassification"];
+	controlPort: EngineControlPort;
 	} | null = null;
 	/** Domain-level trace sink. Routes to lab when active, noop otherwise. */
 	private traceSink: TraceSink = new NoopTraceSink();
@@ -411,6 +454,23 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private readonly blobIntentSessionId = randomBase64Url(16);
 	private blobIntentLocalDeviceId: string | null = null;
 	private blobLocalDeviceIdentityStatus: LocalDeviceIdentityStatus = "unknown";
+	private handoffRecoveryStore: IndexedDbHandoffRecoveryStore | null = null;
+	private handoffRecoveryCoordinator: ManualHandoffRecoveryCoordinator | null = null;
+	private handoffReplayCoordinator: HandoffReplayCoordinator | null = null;
+	private handoffRecoveryScopeKey: string | null = null;
+	private handoffRecoveryActivationEpoch = 0;
+	private handoffRecoveryReady = false;
+	private handoffRecoveryOperationalError:
+		| "identity-unavailable"
+		| "indexeddb-unavailable"
+		| null = null;
+	private handoffRecoveryHydration: HandoffRecoveryHydrationResult = {
+		status: "missing",
+		active: [],
+		terminal: [],
+		issues: [],
+		totalBytes: 0,
+	};
 	private pendingBlobIntentStore: IndexedDbPendingBlobIntentStore | null = null;
 	private pendingBlobIntentStoreKey: string | null = null;
 	private pendingBlobIntentPersistChain: Promise<void> = Promise.resolve();
@@ -477,6 +537,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				const previousHash = this.conflictMergeBases[artifactPath];
 				this.conflictMergeBases[artifactPath] = baseHash;
 				if (previousHash && previousHash !== baseHash) this.baselineTextDeleteCandidates.add(previousHash);
+				this.scheduleDiskIndexSave("conflict-merge-base");
 			},
 			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
 			isRemoteProjectionAllowed: (path) =>
@@ -2854,12 +2915,217 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// BindingPropagationGate hooks can store into _qaState.
 		// In production this block is dead code — esbuild eliminates it entirely.
 		if (__KAOS_QA_HARNESS_ENABLED__) {
+			type MutableReplayObservation = {
+				-readonly [Key in keyof EditorHandoffReplayQaObservation]:
+					EditorHandoffReplayQaObservation[Key];
+			};
+			const replayObservation: MutableReplayObservation = {
+				phase: "none",
+				planCount: 0,
+				witnessStoredCount: 0,
+				permitConsumedCount: 0,
+				dispatchAttemptCount: 0,
+				dispatchAppliedCount: 0,
+				dispatchUncertainCount: 0,
+				dispatchReason: null,
+				dispatchScrollEpochBefore: null,
+				dispatchScrollEpochAfter: null,
+				settlementObservationCount: 0,
+				lastOutcome: null,
+				lastClassification: null,
+				selectionNonEmpty: false,
+				mappedScrollAnchor: null,
+				liveScrollAnchor: null,
+			};
+			let observedReplayController: ReconciliationController | null = null;
+			let observedRecoveryStore: IndexedDbHandoffRecoveryStore | null = null;
+			let observedEditorBindings: EditorBindingManager | null = null;
+			const observeRecoveryStatus = (status: string): void => {
+				switch (status) {
+					case "stored": replayObservation.phase = "stored"; break;
+					case "replay-pending": replayObservation.phase = "replay-pending"; break;
+					case "replayed-awaiting-settlement":
+						replayObservation.phase = "awaiting-settlement";
+						break;
+					case "needs-review": replayObservation.phase = "needs-review"; break;
+					case "resolved":
+					case "discarded": replayObservation.phase = "resolved"; break;
+				}
+			};
+			const ensureReplayObservation = (): void => {
+				const controller = this.reconciliationController as
+					| ReconciliationController
+					| undefined;
+				if (controller && observedReplayController !== controller) {
+					observedReplayController = controller;
+					const requestPlan = controller.requestExactHandoffReplayPlan.bind(controller);
+					controller.requestExactHandoffReplayPlan = async (request) => {
+						const result = await requestPlan(request);
+						replayObservation.planCount += 1;
+						replayObservation.lastOutcome = `plan:${result.kind}`;
+						if (result.kind === "planned") {
+							replayObservation.selectionNonEmpty = request.intent.selectionBefore.ranges
+								.some((range) => !range.empty);
+							replayObservation.mappedScrollAnchor = result.plan.mappedScrollAnchor;
+						}
+						return result;
+					};
+					const consumePermit = controller.consumeExactHandoffReplayPermit.bind(controller);
+					controller.consumeExactHandoffReplayPermit = (request) => {
+						const result = consumePermit(request);
+						replayObservation.lastOutcome = `permit:${result.kind}`;
+						if (result.kind === "accepted") replayObservation.permitConsumedCount += 1;
+						return result;
+					};
+					const observeSettlement = controller.observeExactHandoffReplaySettlement
+						.bind(controller);
+					controller.observeExactHandoffReplaySettlement = async (request) => {
+						const result = await observeSettlement(request);
+						if (result.kind !== "pending") replayObservation.settlementObservationCount += 1;
+						replayObservation.lastOutcome = `settlement:${result.kind}`;
+						return result;
+					};
+				}
+
+				const store = this.handoffRecoveryStore;
+				if (store && observedRecoveryStore !== store) {
+					observedRecoveryStore = store;
+					const putIntent = store.putIntent.bind(store);
+					store.putIntent = async (intent) => {
+						const result = await putIntent(intent);
+						replayObservation.selectionNonEmpty = false;
+						replayObservation.mappedScrollAnchor = null;
+						replayObservation.liveScrollAnchor = null;
+						replayObservation.lastOutcome = `put:${result.kind}`;
+						if ((result.kind === "stored" || result.kind === "existing")
+							&& isActiveHandoffRecoveryRecord(result.record)) {
+							observeRecoveryStatus(result.record.status);
+						}
+						return result;
+					};
+					const storeWitness = store.storeApplyWitness.bind(store);
+					store.storeApplyWitness = async (...args) => {
+						const result = await storeWitness(...args);
+						replayObservation.lastOutcome = `witness:${result.kind}`;
+						if (result.kind === "updated"
+							&& isActiveHandoffRecoveryRecord(result.record)
+							&& result.record.status === "replay-pending") {
+							replayObservation.witnessStoredCount += 1;
+							observeRecoveryStatus(result.record.status);
+						}
+						return result;
+					};
+					const storeReceipt = store.storeDispatchReceipt.bind(store);
+					store.storeDispatchReceipt = async (...args) => {
+						const result = await storeReceipt(...args);
+						replayObservation.lastOutcome = `receipt:${result.kind}`;
+						if ((result.kind === "updated" || result.kind === "unchanged")
+							&& isActiveHandoffRecoveryRecord(result.record)) {
+							observeRecoveryStatus(result.record.status);
+						}
+						return result;
+					};
+					const compareStatus = store.compareAndSetStatus.bind(store);
+					store.compareAndSetStatus = async (...args) => {
+						const result = await compareStatus(...args);
+						replayObservation.lastOutcome = `cas:${result.kind}`;
+						if ((result.kind === "updated" || result.kind === "unchanged")
+							&& isActiveHandoffRecoveryRecord(result.record)) {
+							observeRecoveryStatus(result.record.status);
+						}
+						return result;
+					};
+					const resolveRecord = store.resolveRecord.bind(store);
+					store.resolveRecord = async (request) => {
+						const result = await resolveRecord(request);
+						replayObservation.lastOutcome = `resolve:${result.kind}`;
+						if (result.kind === "updated" || result.kind === "unchanged") {
+							observeRecoveryStatus(result.record.status);
+						}
+						return result;
+					};
+				}
+
+				const bindings = this.editorBindings;
+				if (bindings && observedEditorBindings !== bindings) {
+					observedEditorBindings = bindings;
+					const applyReplay = bindings.applyExactHandoffReplay.bind(bindings);
+					bindings.applyExactHandoffReplay = (request) => {
+						replayObservation.dispatchAttemptCount += 1;
+						replayObservation.dispatchScrollEpochBefore =
+							request.plan.expectedTargetScrollEpoch;
+						const result = applyReplay(request);
+						replayObservation.lastOutcome = `dispatch:${result.kind}`;
+						replayObservation.dispatchReason = "reason" in result
+							? result.reason
+							: null;
+						try {
+							const liveBindings = Reflect.get(bindings, "bindings") as Map<
+								string,
+								Readonly<{
+									path: string;
+									cm: { scrollSnapshot(): { value: { range: { head: number } } } };
+								}>
+							>;
+							const targetBindings = Array.from(liveBindings.values()).filter(
+								(binding) => binding.path === request.record.targetPath,
+							);
+							if (targetBindings.length === 1) {
+								const liveRuntimes = Reflect.get(bindings, "managedSessions") as Map<
+									string,
+									Readonly<{ cmGuard?: { snapshot(): { view: unknown; scrollEpoch: number } } }>
+								>;
+								const targetCm = targetBindings[0]?.cm;
+								const targetRuntime = Array.from(liveRuntimes.values()).find(
+									(runtime) => runtime.cmGuard?.snapshot().view === targetCm,
+								);
+								replayObservation.dispatchScrollEpochAfter =
+									targetRuntime?.cmGuard?.snapshot().scrollEpoch ?? null;
+								replayObservation.liveScrollAnchor =
+									targetBindings[0]?.cm.scrollSnapshot().value.range.head ?? null;
+							}
+						} catch {
+							replayObservation.liveScrollAnchor = null;
+						}
+						if (result.kind === "applied") {
+							replayObservation.dispatchAppliedCount += 1;
+							replayObservation.liveScrollAnchor = result.postcondition.scrollAnchor;
+						} else if (result.kind === "dispatched-uncertain") {
+							replayObservation.dispatchUncertainCount += 1;
+						}
+						return result;
+					};
+				}
+			};
+			const contentFreeSnapshot = () => {
+				if (!this.editorBindings) throw new Error("EditorBindingManager not ready");
+				ensureReplayObservation();
+				return Object.freeze({
+					...getEditorHandoffQaDebugSnapshot(this.editorBindings),
+					qaReplayObservation: Object.freeze({
+						...replayObservation,
+						lastClassification:
+							this._qaState?.handoffReplayLastClassification ?? null,
+					}),
+				});
+			};
 			this._qaState = {
 				diskIngestPort: null,
 				diskIngestSuspended: false,
 				pausedEditorPropagationPaths: new Set(),
 				bindingReconfigureHook: null,
+				handoffRecoveryFault: null,
+				heldHandoffRecoveryPut: null,
+				handoffRecoveryPutStartedCount: 0,
+				handoffRecoveryPutSettledCount: 0,
+				handoffRecoveryLastCategoricalOutcome: null,
+				handoffRecoveryAcceptedStateSequence: 0,
+				handoffRecoveryLastAcceptedState: null,
+				handoffReplayLastClassification: null,
 				controlPort: {
+					setEditorHandoffHostApiVersionOverride: (version) => {
+						setEditorHandoffHostApiVersionOverrideForQa(version);
+					},
 					ingestDiskFileNow: async (path, reason = "modify") => {
 						if (!this._qaState?.diskIngestPort) throw new Error("DiskIngestPort not registered (reconciliation controller not started?)");
 						await this._qaState.diskIngestPort.ingestDiskFileNow(path, reason);
@@ -2883,6 +3149,152 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						const previous = this._qaState.diskIngestSuspended;
 						this._qaState.diskIngestSuspended = suspended;
 						return previous;
+					},
+					holdNextHostLoad: (path, stage) => {
+						if (!this.editorBindings) throw new Error("EditorBindingManager not ready");
+						holdNextEditorHostLoadForQa(this.editorBindings, path, stage);
+					},
+					releaseHeldHostLoad: () => {
+						if (!this.editorBindings) throw new Error("EditorBindingManager not ready");
+						releaseHeldEditorHostLoadForQa(this.editorBindings);
+					},
+					holdNextNativeSave: (path) => {
+						if (!this.editorBindings) throw new Error("EditorBindingManager not ready");
+						holdNextEditorNativeSaveForQa(this.editorBindings, path);
+					},
+					releaseHeldNativeSave: () => {
+						if (!this.editorBindings) throw new Error("EditorBindingManager not ready");
+						releaseHeldEditorNativeSaveForQa(this.editorBindings);
+					},
+					getEditorHandoffDebugSnapshot: contentFreeSnapshot,
+					getContentFreeSnapshot: contentFreeSnapshot,
+					__qaOnlyArmHandoffRecoveryFaultUnsafe: (fault) => {
+						const state = this._qaState;
+						if (!state) throw new Error("QA state not initialised");
+						if (!fault || typeof fault !== "object") {
+							throw new Error("Choose a valid handoff Recovery QA fault");
+						}
+						const keys = Object.keys(fault).sort().join(",");
+						switch (fault.kind) {
+							case "fail-next-put":
+								if (
+									keys !== "kind,reason"
+									|| (fault.reason !== "quota-exceeded"
+										&& fault.reason !== "indexeddb-blocked")
+								) throw new Error("Choose a valid fail-next-put reason");
+								break;
+							case "hold-next-post-verify-put":
+								if (
+									keys !== "kind,operationId"
+									|| typeof fault.operationId !== "string"
+									|| fault.operationId.length === 0
+									|| fault.operationId.length > 128
+								) throw new Error("Choose a valid held-put operation ID");
+								break;
+							case "fail-next-copy":
+								if (keys !== "kind,reason" || fault.reason !== "clipboard-rejected") {
+									throw new Error("Choose a valid fail-next-copy reason");
+								}
+								break;
+							default:
+								throw new Error("Unknown handoff Recovery QA fault");
+						}
+						if (state.handoffRecoveryFault) {
+							throw new Error("A handoff Recovery fault is already armed");
+						}
+						if (
+							state.heldHandoffRecoveryPut
+							&& fault.kind !== "fail-next-copy"
+						) {
+							throw new Error("A handoff Recovery put is already held");
+						}
+						state.handoffRecoveryFault = Object.freeze({ ...fault });
+						state.handoffRecoveryLastCategoricalOutcome = `armed:${fault.kind}`;
+					},
+					__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe: (operationId) => {
+						const state = this._qaState;
+						const held = state?.heldHandoffRecoveryPut;
+						if (!state || !held || held.operationId !== operationId) {
+							throw new Error("No matching handoff Recovery put is held");
+						}
+						state.heldHandoffRecoveryPut = null;
+						state.handoffRecoveryPutSettledCount += 1;
+						state.handoffRecoveryLastCategoricalOutcome = "put-released-post-verify";
+						held.release();
+					},
+					getHandoffRecoveryQaSnapshot: () => {
+						const state = this._qaState;
+						if (!state) throw new Error("QA state not initialised");
+						return Object.freeze({
+							armedFault: state.handoffRecoveryFault?.kind ?? null,
+							heldOperationId: state.heldHandoffRecoveryPut?.operationId ?? null,
+							putStartedCount: state.handoffRecoveryPutStartedCount,
+							putSettledCount: state.handoffRecoveryPutSettledCount,
+							lastCategoricalOutcome:
+								state.handoffRecoveryLastCategoricalOutcome,
+							lastAcceptedState: state.handoffRecoveryLastAcceptedState
+								? Object.freeze({ ...state.handoffRecoveryLastAcceptedState })
+								: null,
+						});
+					},
+					getHandoffRecoveryQaManualRows: async () => {
+						const state = this._qaState;
+						if (!state) throw new Error("QA state not initialised");
+						const coordinator = this.handoffRecoveryCoordinator;
+						const scopeKey = this.handoffRecoveryScopeKey;
+						if (!this.handoffRecoveryReady || !coordinator || !scopeKey) {
+							return Object.freeze([]);
+						}
+						const dashboard = await coordinator.collectDashboardHandoffRecovery();
+						if (
+							this.handoffRecoveryCoordinator !== coordinator
+							|| this.handoffRecoveryScopeKey !== scopeKey
+						) throw new Error("Handoff Recovery scope changed during QA row read");
+						return Object.freeze(dashboard.items.map((item) => Object.freeze({
+							recordId: item.recordId,
+							intentId: item.intentId,
+							fromPath: item.fromPath,
+							targetPath: item.targetPath,
+							status: item.status,
+							startContentHash: item.startContentHash,
+							afterContentHash: item.afterContentHash,
+							startLength: item.startLength,
+							afterLength: item.afterLength,
+						})));
+					},
+					getHandoffRecoveryQaInventory: async () => {
+						const coordinator = this.handoffRecoveryCoordinator;
+						const scopeKey = this.handoffRecoveryScopeKey;
+						if (!this.handoffRecoveryReady || !coordinator || !scopeKey) {
+							return Object.freeze({ active: Object.freeze([]), terminal: Object.freeze([]) });
+						}
+						const hydration = await coordinator.hydrateScope();
+						if (
+							this.handoffRecoveryCoordinator !== coordinator
+							|| this.handoffRecoveryScopeKey !== scopeKey
+						) throw new Error("Handoff Recovery scope changed during QA inventory read");
+						const project = (
+							record: (typeof hydration.active)[number] | (typeof hydration.terminal)[number],
+						) => Object.freeze({
+							recordId: record.recordId,
+							intentId: record.intentId,
+							intentEnvelopeHash: record.intentEnvelopeHash,
+							fromPath: record.fromPath,
+							targetPath: record.targetPath,
+							status: record.status,
+							disposition: "disposition" in record ? record.disposition : null,
+							startContentHash: record.startContentHash,
+							afterContentHash: record.afterContentHash,
+						});
+						const byIdentity = <T extends Readonly<{ recordId: string; status: string }>>(
+							left: T,
+							right: T,
+						): number => left.recordId.localeCompare(right.recordId)
+							|| left.status.localeCompare(right.status);
+						return Object.freeze({
+							active: Object.freeze(hydration.active.map(project).sort(byIdentity)),
+							terminal: Object.freeze(hydration.terminal.map(project).sort(byIdentity)),
+						});
 					},
 				},
 			};
@@ -2961,6 +3373,22 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.resolveLegacyMissingBlobAttention(target, choice),
 				resolveBlobConflict: (target, choice) =>
 					this.resolveBlobConflict(target, choice),
+				loadHandoffRecovery: (recordId, expectedChecksum) =>
+					this.loadHandoffRecoveryRecord(recordId, expectedChecksum)
+						.then(({ record }) => record),
+				copyHandoffRecovery: (recordId, expectedChecksum) =>
+					this.copyHandoffRecoveryRecord(recordId, expectedChecksum),
+				exportHandoffRecovery: (recordId, expectedChecksum, requestedPath) =>
+					this.exportHandoffRecoveryRecord(
+						recordId,
+						expectedChecksum,
+						requestedPath,
+					),
+				resolveHandoffRecovery: (recordId, expectedChecksum) =>
+					this.resolveHandoffRecoveryRecord(recordId, expectedChecksum),
+				discardHandoffRecovery: (recordId, expectedChecksum) =>
+					this.discardHandoffRecoveryRecord(recordId, expectedChecksum),
+				clearHandoffRecoveryScope: () => this.clearHandoffRecoveryScope(),
 			},
 		}));
 		this.addRibbonIcon("layout-dashboard", "Open dashboard", () => {
@@ -3443,7 +3871,76 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.reconciliationController.noteInterceptedExternalDiskMutation(candidate);
 				},
 				() => true,
+				(request) => {
+					this.editorWorkspace?.onOpenPathAdmissionWake(request.targetPath);
+				},
+				this.reconciliationController,
+				this.handoffRecoveryCoordinator,
+				{
+					writeClipboard: async (text) => {
+						if (__KAOS_QA_HARNESS_ENABLED__ && this._qaState) {
+							const fault = this._qaState.handoffRecoveryFault;
+							if (fault?.kind === "fail-next-copy") {
+								this._qaState.handoffRecoveryFault = null;
+								this._qaState.handoffRecoveryLastCategoricalOutcome =
+									"clipboard-rejected";
+								throw new Error("clipboard-rejected");
+							}
+						}
+						if (!navigator.clipboard?.writeText) {
+							throw new Error("Clipboard is unavailable");
+						}
+						await navigator.clipboard.writeText(text);
+						if (__KAOS_QA_HARNESS_ENABLED__ && this._qaState) {
+							this._qaState.handoffRecoveryLastCategoricalOutcome =
+								"clipboard-written";
+						}
+					},
+					chooseVerifiedExporter: async () => {
+						const path = await requestHandoffRecoveryExportPath(
+							this.app,
+							`Handoff Recovery ${new Date().toISOString().replace(/[:.]/g, "-")}.txt`,
+						);
+						if (path === null) return null;
+						return async (content: string) => {
+							await exportHandoffRecoveryBody(this.app, path, content);
+						};
+					},
+					confirmDiscard: () => new Promise<boolean>((resolve) => {
+						new ConfirmModal(
+							this.app,
+							"Discard handoff Recovery",
+							"Discard this interrupted input without applying it? This cannot be undone.",
+							() => resolve(true),
+							"Discard",
+							"Cancel",
+							() => resolve(false),
+						).open();
+					}),
+					...(__KAOS_QA_HARNESS_ENABLED__ ? {
+						observeAcceptedIntentState: (observation) => {
+							const state = this._qaState;
+							if (!state) return;
+							state.handoffRecoveryAcceptedStateSequence += 1;
+							state.handoffRecoveryLastAcceptedState = Object.freeze({
+								...observation,
+								sequence: state.handoffRecoveryAcceptedStateSequence,
+							});
+						},
+					} : {}),
+				},
+				(token) => this.handoffReplayCoordinator?.notifyTargetReady(token),
+				(path) =>
+					this.handoffReplayCoordinator?.notifySettlementMayHaveAdvanced(path),
+				(token) =>
+					this.handoffReplayCoordinator?.notifyTargetPresentationReady(token),
 			);
+			// Settings are applied before the editor manager exists on cold start.
+			// Retry the same scope now that both runtime ports can be constructed.
+			this.rotateHandoffRecoveryScope("editor-bindings-ready");
+			if (__KAOS_QA_HARNESS_ENABLED__) {
+				installEditorHandoffHostQaBarrier(this.editorBindings);
+			}
 
 			// 3. Global CM6 extension
 			this.registerEditorExtension(
@@ -3474,6 +3971,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.diskMirror.setMarkdownPathSyncabilityPredicate((path) => this.isMarkdownPathSyncable(path));
 			this.diskMirror.setRemoteProjectionAdmissionPredicate(
 				(path) => this.remoteProjectionPolicyGate.isRemoteProjectionAllowed(path),
+			);
+			this.diskMirror.setSamePathAdoptionProjectionHoldPredicate(
+				(path) => this.editorBindings?.isSamePathAdoptionProjectionHeld(path) ?? false,
 			);
 			this.diskMirror.setRemoteProjectionAdmissionProvider((paths) => {
 				const policyLease = this.remoteProjectionPolicyGate.captureLease(paths);
@@ -3513,9 +4013,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// Used by decideClosedFileConflict on startup/re-enable to determine
 			// which side actually changed from the last known stable state.
 			this.diskMirror.setDiskWriteCallback((path, contentHash, content) => {
-				this.reconciliationController.noteDiskBaselineSettlement(path, content);
+				const admission = this.reconciliationController
+					.captureDiskBaselineSettlementAdmission(path, contentHash, content);
+				if (!admission) return false;
 				const existing = this.diskIndex[path];
 				const previousHash = existing?.contentHash;
+				const normalizedContentHash = contentHash.toLowerCase();
+				const previousBaselineText = this.baselineTexts[normalizedContentHash];
+				const baselineTextWasDirty =
+					this.dirtyBaselineTextHashes.has(normalizedContentHash);
+				const previousHashWasDeleteCandidate = previousHash !== undefined
+					&& this.baselineTextDeleteCandidates.has(previousHash);
 				if (existing) {
 					existing.contentHash = contentHash;
 				} else {
@@ -3525,10 +4033,37 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.baselineTextDeleteCandidates.add(previousHash);
 				}
 				this.recordBaselineText(contentHash, content);
+				if (!this.reconciliationController.commitDiskBaselineSettlementAdmission(admission)) {
+					if (existing) {
+						if (previousHash === undefined) delete existing.contentHash;
+						else existing.contentHash = previousHash;
+					} else {
+						delete this.diskIndex[path];
+					}
+					if (previousHash !== undefined && previousHash !== contentHash) {
+						if (previousHashWasDeleteCandidate) {
+							this.baselineTextDeleteCandidates.add(previousHash);
+						} else {
+							this.baselineTextDeleteCandidates.delete(previousHash);
+						}
+					}
+					if (previousBaselineText === undefined) {
+						delete this.baselineTexts[normalizedContentHash];
+					} else {
+						this.baselineTexts[normalizedContentHash] = previousBaselineText;
+					}
+					if (baselineTextWasDirty) {
+						this.dirtyBaselineTextHashes.add(normalizedContentHash);
+					} else {
+						this.dirtyBaselineTextHashes.delete(normalizedContentHash);
+					}
+					return false;
+				}
 				this.scheduleDiskIndexSave("disk-write-baseline");
 				// Req 17.2: mark dirty after post-readback verification succeeds.
 				// contentHash is baselineHash-domain — NOT published as diskHash.
 				this.lab?.markWitnessDirty(path, "disk-write");
+				return true;
 			});
 
 			// 4b. BlobSyncManager (if attachment sync is enabled)
@@ -4502,8 +5037,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * After this, the plugin is in the same state as before initSync().
 	 */
 	private async teardownSync(): Promise<void> {
+		const editorSaveDrain = this.editorBindings?.beginOwnedSaveDrainForTeardown();
 		this.reconciliationController.revokeAsyncAuthority();
+		const replayDrain = this.handoffReplayCoordinator;
+		replayDrain?.invalidateForRecoveryClear();
+		this.editorBindings?.revokeAsyncAuthority();
 		this.log("teardownSync: tearing down all sync state");
+		await editorSaveDrain;
+		await replayDrain?.drainAndDemoteForRecoveryClear();
 
 		// Safe teardown ordering for disk index baseline persistence:
 		//   1. Flush all pending disk writes (callbacks fire, hashes recorded in memory)
@@ -4532,6 +5073,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.vaultSync = null;
 		this.connectionController = null;
 		this.editorBindings = null;
+		this.handoffRecoveryStore = null;
+		this.handoffRecoveryCoordinator = null;
+		this.handoffReplayCoordinator = null;
+		this.handoffRecoveryReady = false;
 		this.diskMirror = null;
 		this.externalDiskMutationSequence = 0;
 		this.awaitingFirstProviderSyncAfterStartup = false;
@@ -4887,6 +5432,119 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		};
 	}
 
+	private unavailableHandoffRecoveryDashboard(): DashboardHandoffRecovery {
+		return {
+			status: "unavailable",
+			activeCount: this.handoffRecoveryHydration.active.length,
+			terminalCount: this.handoffRecoveryHydration.terminal.length,
+			totalBytes: this.handoffRecoveryHydration.totalBytes,
+			issues: [{ kind: "operational-error", recordId: null }],
+			items: [],
+		};
+	}
+
+	private async collectDashboardHandoffRecovery(): Promise<DashboardHandoffRecovery> {
+		const coordinator = this.handoffRecoveryCoordinator;
+		if (!this.handoffRecoveryReady || !coordinator) {
+			return this.unavailableHandoffRecoveryDashboard();
+		}
+		try {
+			const recovery = await coordinator.collectDashboardHandoffRecovery();
+			if (
+				!this.handoffRecoveryReady
+				|| this.handoffRecoveryCoordinator !== coordinator
+			) return this.unavailableHandoffRecoveryDashboard();
+			return recovery;
+		} catch {
+			return this.unavailableHandoffRecoveryDashboard();
+		}
+	}
+
+	private async loadHandoffRecoveryRecord(
+		recordId: string,
+		expectedChecksum: string,
+	): Promise<Readonly<{
+		coordinator: ManualHandoffRecoveryCoordinator;
+		record: ActiveHandoffRecoveryRecord;
+	}>> {
+		const coordinator = this.handoffRecoveryCoordinator;
+		if (!this.handoffRecoveryReady || !coordinator) {
+			throw new Error("Handoff Recovery is unavailable");
+		}
+		const record = await coordinator.getRecord(recordId, expectedChecksum);
+		if (
+			!this.handoffRecoveryReady
+			|| this.handoffRecoveryCoordinator !== coordinator
+			|| !isActiveHandoffRecoveryRecord(record)
+			|| record.recordId !== recordId
+			|| record.checksum !== expectedChecksum
+		) {
+			throw new Error("Handoff Recovery record is missing or stale");
+		}
+		return { coordinator, record };
+	}
+
+	private async copyHandoffRecoveryRecord(
+		recordId: string,
+		expectedChecksum: string,
+	): Promise<void> {
+		const { record } = await this.loadHandoffRecoveryRecord(recordId, expectedChecksum);
+		if (!navigator.clipboard?.writeText) throw new Error("Clipboard is unavailable");
+		await navigator.clipboard.writeText(record.body.afterContent);
+	}
+
+	private async exportHandoffRecoveryRecord(
+		recordId: string,
+		expectedChecksum: string,
+		requestedPath: string,
+	): Promise<{ path: string }> {
+		const { record } = await this.loadHandoffRecoveryRecord(recordId, expectedChecksum);
+		const result = await exportHandoffRecoveryBody(
+			this.app,
+			requestedPath,
+			record.body.afterContent,
+		);
+		return { path: result.path };
+	}
+
+	private async resolveHandoffRecoveryRecord(
+		recordId: string,
+		expectedChecksum: string,
+	): Promise<void> {
+		const { coordinator, record } = await this.loadHandoffRecoveryRecord(
+			recordId,
+			expectedChecksum,
+		);
+		if (record.status !== "needs-review") {
+			throw new Error("Handoff Recovery record is not ready for manual resolution");
+		}
+		await coordinator.resolveManually(record.recordId, record.checksum);
+	}
+
+	private async discardHandoffRecoveryRecord(
+		recordId: string,
+		expectedChecksum: string,
+	): Promise<void> {
+		const { coordinator, record } = await this.loadHandoffRecoveryRecord(
+			recordId,
+			expectedChecksum,
+		);
+		await coordinator.discardRecord(record.recordId, record.checksum);
+	}
+
+	private async clearHandoffRecoveryScope(): Promise<ClearHandoffRecoveryScopeResult> {
+		const coordinator = this.handoffRecoveryCoordinator;
+		if (!this.handoffRecoveryReady || !coordinator) {
+			throw new Error("Handoff Recovery is unavailable");
+		}
+		const result = await coordinator.clearCurrentScope();
+		if (this.handoffRecoveryCoordinator !== coordinator) {
+			throw new Error("Handoff Recovery scope changed during clear");
+		}
+		this.handoffRecoveryHydration = await coordinator.hydrateScope();
+		return result;
+	}
+
 	private async collectDashboardData(): Promise<KaosDashboardData> {
 		const connection = this.getDashboardConnectionSummary();
 		const status = this.getSettingsStatusSummary();
@@ -4903,6 +5561,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const recoveryStorageStatus = this.snapshotService
 			? await this.snapshotService.getDashboardRecoveryStorageStatus()
 			: { status: "unavailable" as const, message: "File history storage service not initialized." };
+		const handoffRecovery = await this.collectDashboardHandoffRecovery();
 		const vaultSync = this.vaultSync;
 		const blobSync = this.getBlobSync();
 		return buildKaosDashboardData({
@@ -4952,6 +5611,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			diskIndex: this.diskIndex,
 			snapshotStatus,
 			recoveryStorageStatus,
+			handoffRecovery,
 			recentChanges,
 			openFileCount: this.editorWorkspace?.openFileCount ?? 0,
 			snapshotsAvailable: this.serverSupportsSnapshots,
@@ -5764,7 +6424,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const probes: Array<Record<string, unknown>> = [];
 		const leaves: MarkdownView[] = [];
 		this.app.workspace.iterateAllLeaves((leaf) => {
-			if (leaf.view instanceof MarkdownView && leaf.view.file) {
+			if (isMarkdownEditorView(leaf.view) && leaf.view.file) {
 				leaves.push(leaf.view);
 			}
 		});
@@ -5849,6 +6509,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	onunload() {
 		this.log("Unloading plugin");
+		const recoveryDrain = this.handoffRecoveryCoordinator?.drain();
+		if (recoveryDrain) {
+			void recoveryDrain.catch(() => {
+				this.log("Handoff Recovery write tail did not drain before unload");
+			});
+		}
 		this.lab?.dispose();   // dispose stops flight trace, witness, and QA API
 		const teardown = this.teardownSync().catch((err) => {
 			console.error("[kaos] Failed to teardown sync runtime during unload:", err);
@@ -6116,10 +6782,207 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 	}
 
+	private rotateHandoffRecoveryScope(reason: string): void {
+		const vaultId = this.settings.vaultId;
+		const localDeviceId = this.blobIntentLocalDeviceId;
+		const requestedScopeKey = vaultId && localDeviceId
+			? buildHandoffRecoveryScopeKey({
+				schemaVersion: HANDOFF_RECOVERY_SCHEMA_VERSION,
+				vaultId,
+				localDeviceId,
+			})
+			: null;
+		if (
+			requestedScopeKey === this.handoffRecoveryScopeKey
+			&& (
+				(requestedScopeKey !== null
+					&& this.handoffRecoveryCoordinator !== null
+					&& this.handoffReplayCoordinator !== null)
+				|| this.handoffRecoveryOperationalError === "identity-unavailable"
+			)
+		) return;
+		const activationEpoch = ++this.handoffRecoveryActivationEpoch;
+		this.handoffRecoveryReady = false;
+		this.handoffRecoveryScopeKey = requestedScopeKey;
+		this.handoffReplayCoordinator?.invalidateForRecoveryClear();
+		this.editorBindings?.replaceHandoffRecoveryPort(null, activationEpoch);
+		void this.initializeHandoffRecovery(activationEpoch, requestedScopeKey, reason);
+	}
+
+	private async initializeHandoffRecovery(
+		activationEpoch: number,
+		requestedScopeKey: string | null,
+		reason: string,
+	): Promise<void> {
+		const vaultId = this.settings.vaultId;
+		const localDeviceId = this.blobIntentLocalDeviceId;
+		if (
+			activationEpoch !== this.handoffRecoveryActivationEpoch
+			|| requestedScopeKey !== this.handoffRecoveryScopeKey
+		) return;
+		const previous = this.handoffRecoveryCoordinator;
+		const previousReplay = this.handoffReplayCoordinator;
+		if (!vaultId || !localDeviceId) {
+			this.handoffRecoveryStore = null;
+			this.handoffRecoveryCoordinator = null;
+			this.handoffReplayCoordinator = null;
+			this.handoffRecoveryReady = false;
+			this.handoffRecoveryScopeKey = null;
+			this.handoffRecoveryOperationalError = "identity-unavailable";
+			this.handoffRecoveryHydration = {
+				status: "missing",
+				active: [],
+				terminal: [],
+				issues: [],
+				totalBytes: 0,
+			};
+			void previousReplay?.drainAndDemoteForRecoveryClear().catch(() => undefined);
+			void previous?.drain().catch(() => undefined);
+			return;
+		}
+		const scope = {
+			schemaVersion: HANDOFF_RECOVERY_SCHEMA_VERSION,
+			vaultId,
+			localDeviceId,
+		};
+		const scopeKey = buildHandoffRecoveryScopeKey(scope);
+		if (scopeKey !== requestedScopeKey) return;
+		const store = __KAOS_QA_HARNESS_ENABLED__
+			? new IndexedDbHandoffRecoveryStore(
+				scope,
+				undefined,
+				undefined,
+				() => Date.now(),
+				{
+					beforePutBeforeStorage: async () => {
+						const state = this._qaState;
+						if (!state) return;
+						state.handoffRecoveryPutStartedCount += 1;
+						state.handoffRecoveryLastCategoricalOutcome = "put-started";
+						const fault = state.handoffRecoveryFault;
+						if (fault?.kind !== "fail-next-put") return;
+						state.handoffRecoveryFault = null;
+						state.handoffRecoveryPutSettledCount += 1;
+						state.handoffRecoveryLastCategoricalOutcome = fault.reason;
+						if (fault.reason === "quota-exceeded") {
+							throw new DOMException("quota-exceeded", "QuotaExceededError");
+						}
+						throw new Error("indexeddb-blocked");
+					},
+					afterVerifiedPutBeforeFence: async () => {
+						const state = this._qaState;
+						if (!state) return;
+						const fault = state.handoffRecoveryFault;
+						if (fault?.kind !== "hold-next-post-verify-put") {
+							state.handoffRecoveryPutSettledCount += 1;
+							state.handoffRecoveryLastCategoricalOutcome = "put-verified";
+							return;
+						}
+						state.handoffRecoveryFault = null;
+						state.handoffRecoveryLastCategoricalOutcome =
+							"put-held-post-verify";
+						await new Promise<void>((release) => {
+							state.heldHandoffRecoveryPut = Object.freeze({
+								operationId: fault.operationId,
+								release,
+							});
+						});
+					},
+				},
+			)
+			: new IndexedDbHandoffRecoveryStore(scope);
+		if (!this.editorBindings) {
+			void previousReplay?.drainAndDemoteForRecoveryClear().catch(() => undefined);
+			void previous?.drain().catch(() => undefined);
+			return;
+		}
+		const replayCoordinator = new HandoffReplayCoordinator({
+			store,
+			controller: this.reconciliationController,
+			editorBindings: this.editorBindings,
+			isScopeCurrent: () =>
+				activationEpoch === this.handoffRecoveryActivationEpoch
+				&& scopeKey === this.handoffRecoveryScopeKey,
+		});
+		if (__KAOS_QA_HARNESS_ENABLED__) {
+			if (this._qaState) this._qaState.handoffReplayLastClassification = null;
+			associateHandoffReplayClassificationObserverForQa(
+				replayCoordinator,
+				(observation) => {
+					if (!this._qaState) return;
+					this._qaState.handoffReplayLastClassification = observation;
+				},
+			);
+		}
+		const coordinator = new ManualHandoffRecoveryCoordinator({
+			store,
+			isScopeCurrent: () =>
+				activationEpoch === this.handoffRecoveryActivationEpoch
+				&& scopeKey === this.handoffRecoveryScopeKey,
+			classifyStoredIntent: replayCoordinator.classifyStoredIntent,
+			observeAwaitingSettlement:
+				replayCoordinator.observeHydratedAwaitingSettlement,
+			replayActions: {
+				continueWithoutAutomaticApply: (request, recordId, isActionCurrent) =>
+					replayCoordinator.continueWithoutAutomaticApply(
+						request,
+						recordId,
+						isActionCurrent,
+					),
+				retrySettlement: (recordId) =>
+					replayCoordinator.retrySettlement(recordId),
+			},
+			clearHooks: {
+				invalidateReplayAuthorityBeforeClear: () =>
+					replayCoordinator.invalidateForRecoveryClear(),
+				drainAndDemoteReplayRowsBeforeClear: () =>
+					replayCoordinator.drainAndDemoteForRecoveryClear(),
+			},
+		});
+		this.handoffRecoveryStore = store;
+		this.handoffRecoveryCoordinator = coordinator;
+		this.handoffReplayCoordinator = replayCoordinator;
+		try {
+			const hydration = await coordinator.hydrateScope();
+			if (
+				activationEpoch !== this.handoffRecoveryActivationEpoch
+				|| scopeKey !== this.handoffRecoveryScopeKey
+			) return;
+			this.handoffRecoveryHydration = hydration;
+			this.handoffRecoveryOperationalError = null;
+			this.handoffRecoveryReady = true;
+			this.editorBindings?.replaceHandoffRecoveryPort(coordinator, activationEpoch);
+		} catch {
+			if (activationEpoch !== this.handoffRecoveryActivationEpoch) return;
+			this.handoffRecoveryOperationalError = "indexeddb-unavailable";
+			this.handoffRecoveryReady = false;
+			// Keep the coordinator attached even when open/hydration fails. Its
+			// precommit Copy/Export/Discard lane is deliberately storage-free, so a
+			// failed IndexedDB cannot turn the visible Recovery gate into a dead end.
+			this.editorBindings?.replaceHandoffRecoveryPort(coordinator, activationEpoch);
+			this.handoffRecoveryHydration = {
+				status: "missing",
+				active: [],
+				terminal: [],
+				issues: [],
+				totalBytes: 0,
+			};
+		} finally {
+			this.trace("recovery", "handoff-recovery-scope-activation-finished", {
+				reason,
+				activationEpoch,
+				current: activationEpoch === this.handoffRecoveryActivationEpoch,
+			});
+			void previousReplay?.drainAndDemoteForRecoveryClear().catch(() => undefined);
+			void previous?.drain().catch(() => undefined);
+		}
+	}
+
 	private applyRuntimeSettings(reason: string): void {
 		this.runtimeConfig = this.buildEffectiveRuntimeConfig();
 		this.updateMarkdownSyncScopeGeneration(this.runtimeConfig);
 		this.activateBlobAuthorityScope(`runtime-settings:${reason}`);
+		this.rotateHandoffRecoveryScope(reason);
 		this.excludePatterns = this.runtimeConfig.excludePatterns;
 		this.maxFileSize = this.runtimeConfig.maxFileSizeBytes;
 		this.applyCursorVisibility();
