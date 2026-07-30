@@ -219,8 +219,13 @@ console.log("\n--- Reconciliation keeps local ingress separate from remote proje
 	const localOnlyPath = "LOCAL/draft.md";
 	fakeVaultSync._pathIndex = new Map();
 	const localSeeded: string[] = [];
-	fakeVaultSync.ensureFile = (path: string) => {
+	fakeVaultSync.ensureFile = (path: string, content: string) => {
 		localSeeded.push(path);
+		return {
+			kind: "created" as const,
+			fileId: "local-seeded-id",
+			ytext: { toJSON: () => content },
+		};
 	};
 	const localIngress = VaultSync.prototype.reconcileVault.call(
 		fakeVaultSync,

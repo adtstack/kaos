@@ -55,6 +55,9 @@ const sharedConfig = {
 if (qaProduct) {
 	const qaProductContext = await esbuild.context({
 		...sharedConfig,
+		// Preserve QA barrier function identities so bundle fencing can prove
+		// that the controls exist only in the non-release product artifact.
+		keepNames: true,
 		entryPoints: ["src/main.ts"],
 		outfile: "qa/obsidian-harness/product-main.js",
 		define: {

@@ -6,13 +6,14 @@
  *   - local modify event does NOT revive a tombstoned path (ensureFile with reviveTombstone: false)
  *   - importUntrackedFiles revives tombstoned paths (user explicitly placed file after deletion)
  *   - v2 deletedAt tombstone format is recognized
- *   - stale tombstones are cleared when a live entry exists
+ *   - a healthy live identity is returned without mutating stale tombstones
  *
  * Tested at the CRDT map level to avoid VaultSync's complex dependencies.
  * The CRDT map operations mirror VaultSync.ensureFile's internal behavior.
  */
 
 import * as Y from "yjs";
+import type { EnsureFileResult } from "../src/sync/vaultSync";
 
 Object.defineProperty(globalThis, "__KAOS_QA_HARNESS_ENABLED__", {
 	configurable: true,
@@ -57,7 +58,7 @@ function getMarkdownTombstoneIds(meta: Y.Map<FileMeta>, path: string): string[] 
 
 /**
  * Minimal ensureFile that mirrors VaultSync.ensureFile tombstone logic.
- * Returns the created Y.Text or null if tombstone-blocked.
+ * Returns the same closed typed result as the production integrity boundary.
  */
 function ensureFile(
 	doc: Y.Doc,
@@ -66,44 +67,45 @@ function ensureFile(
 	path: string,
 	content: string,
 	options?: { reviveTombstone?: boolean; reviveReason?: string },
-): Y.Text | null {
+): EnsureFileResult {
 	const reviveTombstone = options?.reviveTombstone === true;
 
-	// Check if already exists (live mapping)
-	let existingFileId: string | null = null;
+	const activeFileIds: string[] = [];
 	meta.forEach((m, fileId) => {
 		if (m.path === path && !isFileMetaDeleted(m)) {
-			existingFileId = fileId;
+			activeFileIds.push(fileId);
 		}
 	});
-	if (existingFileId) {
-		const existingText = idToText.get(existingFileId);
-		if (existingText) return existingText;
+	activeFileIds.sort();
+	if (activeFileIds.length > 1) return { kind: "blocked", reason: "collision" };
+	if (activeFileIds.length === 1) {
+		const fileId = activeFileIds[0]!;
+		const existingText = idToText.get(fileId);
+		return existingText
+			? { kind: "existing", fileId, ytext: existingText }
+			: { kind: "blocked", reason: "orphan" };
 	}
 
-	// Check tombstones
 	const tombstoneIds = getMarkdownTombstoneIds(meta, path);
-	if (tombstoneIds.length > 0) {
-		if (reviveTombstone) {
-			doc.transact(() => {
-				for (const id of tombstoneIds) {
-					meta.delete(id);
-				}
-			});
-		} else {
-			return null; // tombstone blocks creation
-		}
+	if (tombstoneIds.length > 0 && !reviveTombstone) {
+		return { kind: "blocked", reason: "tombstone" };
 	}
 
-	// Create new file
 	const fileId = `file-${Math.random().toString(36).slice(2, 8)}`;
 	const ytext = new Y.Text();
 	doc.transact(() => {
 		ytext.insert(0, content);
 		idToText.set(fileId, ytext);
 		meta.set(fileId, { path, mtime: Date.now() });
+		for (const id of tombstoneIds) {
+			meta.delete(id);
+		}
 	});
-	return ytext;
+	return { kind: "created", fileId, ytext };
+}
+
+function ensuredText(result: EnsureFileResult): Y.Text | null {
+	return result.kind === "created" || result.kind === "existing" ? result.ytext : null;
 }
 
 // ── Test 1: create event revives tombstoned path ──────────────────────────────
@@ -116,7 +118,7 @@ console.log("\n--- Test 1: create event revives tombstoned path ---");
 
 	// Create then tombstone
 	const original = ensureFile(doc, idToText, meta, "notes/revived.md", "original");
-	assert(original !== null, "original file created");
+	assert(original.kind === "created", "original file created");
 
 	// Tombstone it (v1 style)
 	let tombstoneFileId: string | null = null;
@@ -137,8 +139,8 @@ console.log("\n--- Test 1: create event revives tombstoned path ---");
 		reviveTombstone: true,
 		reviveReason: "local-create-event",
 	});
-	assert(revived !== null, "create event revives tombstoned path");
-	assert(revived!.toString() === "revived content", "revived file has correct content");
+	assert(revived.kind === "created", "create event revives tombstoned path");
+	assert(ensuredText(revived)?.toString() === "revived content", "revived file has correct content");
 	assert(getMarkdownTombstoneIds(meta, "notes/revived.md").length === 0, "tombstone entries cleared after revive");
 
 	doc.destroy();
@@ -165,7 +167,7 @@ console.log("\n--- Test 2: modify event does not revive tombstoned path ---");
 
 	// Modify event → reviveTombstone: false (default)
 	const result = ensureFile(doc, idToText, meta, "notes/blocked.md", "modified content");
-	assert(result === null, "modify event does not revive tombstoned path");
+	assert(result.kind === "blocked" && result.reason === "tombstone", "modify event does not revive tombstoned path");
 	assert(getMarkdownTombstoneIds(meta, "notes/blocked.md").length > 0, "tombstone entries remain");
 
 	doc.destroy();
@@ -195,14 +197,14 @@ console.log("\n--- Test 3: v2 deletedAt tombstone format is recognized ---");
 
 	// Without reviveTombstone → blocked
 	const blocked = ensureFile(doc, idToText, meta, "notes/v2-tombstone.md", "new");
-	assert(blocked === null, "v2 tombstone blocks ensureFile without reviveTombstone");
+	assert(blocked.kind === "blocked" && blocked.reason === "tombstone", "v2 tombstone blocks ensureFile without reviveTombstone");
 
 	// With reviveTombstone → revived
 	const revived = ensureFile(doc, idToText, meta, "notes/v2-tombstone.md", "revived", {
 		reviveTombstone: true,
 		reviveReason: "local-create-event",
 	});
-	assert(revived !== null, "v2 tombstone revived with reviveTombstone: true");
+	assert(revived.kind === "created", "v2 tombstone revived with reviveTombstone: true");
 
 	doc.destroy();
 }
@@ -235,16 +237,16 @@ console.log("\n--- Test 4: importUntrackedFiles should revive tombstoned paths -
 		reviveTombstone: true,
 		reviveReason: "import-untracked-local-file",
 	});
-	assert(result !== null, "importUntrackedFiles revives tombstoned path");
-	assert(result!.toString() === "reimported content", "reimported file has new content");
+	assert(result.kind === "created", "importUntrackedFiles revives tombstoned path");
+	assert(ensuredText(result)?.toString() === "reimported content", "reimported file has new content");
 	assert(getMarkdownTombstoneIds(meta, "notes/reimported.md").length === 0, "tombstone cleared after import revive");
 
 	doc.destroy();
 }
 
-// ── Test 5: stale tombstones are cleared when live entry exists ───────────────
+// ── Test 5: healthy live identity does not mutate stale tombstones ────────────
 
-console.log("\n--- Test 5: stale tombstones cleared when live entry exists ---");
+console.log("\n--- Test 5: healthy live identity preserves stale tombstones ---");
 {
 	const doc = new Y.Doc();
 	const idToText = doc.getMap("idToText") as Y.Map<Y.Text>;
@@ -252,7 +254,7 @@ console.log("\n--- Test 5: stale tombstones cleared when live entry exists ---")
 
 	// Create a live file
 	const live = ensureFile(doc, idToText, meta, "notes/has-stale.md", "live content");
-	assert(live !== null, "live file exists");
+	assert(live.kind === "created", "live file exists");
 
 	// Add a stale tombstone for the same path (different fileId)
 	doc.transact(() => {
@@ -264,10 +266,19 @@ console.log("\n--- Test 5: stale tombstones cleared when live entry exists ---")
 	assert(tombstones.length === 1, "stale tombstone exists alongside live entry");
 	assert(tombstones[0] === "stale-tombstone-id", "tombstone is the stale one");
 
-	// ensureFile on an existing live path returns the existing text
-	// (VaultSync.ensureFile also clears stale tombstones in this case)
+	// A healthy active identity wins before tombstone policy evaluation and is
+	// returned without opportunistic metadata cleanup.
 	const result = ensureFile(doc, idToText, meta, "notes/has-stale.md", "new content");
-	assert(result === live, "ensureFile returns existing live text");
+	assert(
+		result.kind === "existing"
+		&& live.kind === "created"
+		&& result.ytext === live.ytext,
+		"ensureFile returns existing live text",
+	);
+	assert(
+		getMarkdownTombstoneIds(meta, "notes/has-stale.md").length === 1,
+		"healthy lookup leaves stale tombstone repair to an explicit integrity owner",
+	);
 
 	doc.destroy();
 }
@@ -293,7 +304,7 @@ console.log("\n--- Test 6: multiple tombstones all cleared on revive ---");
 		reviveTombstone: true,
 		reviveReason: "local-create-event",
 	});
-	assert(revived !== null, "revive succeeds with multiple tombstones");
+	assert(revived.kind === "created", "revive succeeds with multiple tombstones");
 	assert(getMarkdownTombstoneIds(meta, "notes/multi-tomb.md").length === 0, "all three tombstones cleared");
 
 	doc.destroy();
@@ -319,7 +330,7 @@ console.log("\n--- Test 7: remote stale materialization does not revive tombston
 	const result = ensureFile(doc, idToText, meta, "notes/remote-stale.md", "stale remote content", {
 		reviveTombstone: false,
 	});
-	assert(result === null, "remote stale materialization does not revive tombstone");
+	assert(result.kind === "blocked" && result.reason === "tombstone", "remote stale materialization does not revive tombstone");
 	assert(getMarkdownTombstoneIds(meta, "notes/remote-stale.md").length === 1, "tombstone remains");
 
 	doc.destroy();
@@ -390,22 +401,22 @@ console.log("\n--- Test 8: importUntrackedFiles through real ReconciliationContr
 			});
 
 			if (tombstoneIds.length > 0 && !revive) {
-				return null; // blocked by tombstone
+				return { kind: "blocked" as const, reason: "tombstone" as const };
 			}
 
 			// Revive: clear tombstones and create text
+			const newId = "file-revived-" + Math.random().toString(36).slice(2, 8);
+			const text = new Y.Text();
 			doc.transact(() => {
 				for (const tid of tombstoneIds) {
 					metaMap.delete(tid);
 				}
-				const newId = "file-revived-" + Math.random().toString(36).slice(2, 8);
-				const text = new Y.Text();
 				text.insert(0, content);
 				idToText.set(newId, text);
 				metaMap.set(newId, { path, device: device || "test" });
 			});
 
-			return doc.getText("result"); // non-null means success
+			return { kind: "created" as const, fileId: newId, ytext: text };
 		},
 		getActiveMarkdownPaths: () => [],
 	};

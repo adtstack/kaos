@@ -37,6 +37,7 @@
 import { TFile } from "obsidian";
 import * as Y from "yjs";
 import { DiskMirror } from "../src/sync/diskMirror";
+import type { EnsureFileResult } from "../src/sync/vaultSync";
 
 let passed = 0;
 let failed = 0;
@@ -96,7 +97,10 @@ interface CallOrderEntry {
 
 interface Fixture {
 	mirror: DiskMirror;
-	vaultSync: { getTextForPath: (path: string) => Y.Text | null; ensureFile: (...args: unknown[]) => Y.Text | null };
+	vaultSync: {
+		getTextForPath: (path: string) => Y.Text | null;
+		ensureFile: (...args: unknown[]) => EnsureFileResult;
+	};
 	doc: Y.Doc;
 	ytext: Y.Text;
 	flightEvents: CapturedFlightEvent[];
@@ -159,7 +163,7 @@ function buildFixture(opts: FixtureOptions): Fixture {
 			ytext.delete(0, ytext.length);
 			ytext.insert(0, content);
 			tombstoned = false;
-			return ytext;
+			return { kind: "created" as const, fileId: "active-file", ytext };
 		},
 		getAuthoritativeMarkdownDeleteSnapshot: () => tombstoned
 			? { fingerprint: `markdown-delete:${opts.path}` }
@@ -177,6 +181,8 @@ function buildFixture(opts: FixtureOptions): Fixture {
 	};
 
 	const editorBindings = {
+		capturePathEditorAuthority: () => ({ kind: "none" as const }),
+		isPathEditorAuthorityLeaseCurrent: () => false,
 		unbindByPath: (): void => {},
 		updatePathsAfterRename: (): void => {},
 	};

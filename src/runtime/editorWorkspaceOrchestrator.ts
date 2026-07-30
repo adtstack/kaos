@@ -2,6 +2,7 @@ import { type App, MarkdownView, type WorkspaceLeaf } from "obsidian";
 import type { EditorBindingManager } from "../sync/editorBinding";
 import type { DiskMirror } from "../sync/diskMirror";
 import type { VaultSyncSettings } from "../settings";
+import { isMarkdownEditorView } from "./markdownEditorView";
 
 interface EditorWorkspaceOrchestratorDeps {
 	app: App;
@@ -16,6 +17,8 @@ interface EditorWorkspaceOrchestratorDeps {
 export class EditorWorkspaceOrchestrator {
 	private openFilePaths = new Set<string>();
 	private activeMarkdownPath: string | null = null;
+	private admissionWakeScheduled = false;
+	private lifecycleGeneration = 0;
 
 	constructor(private readonly deps: EditorWorkspaceOrchestratorDeps) {}
 
@@ -24,8 +27,21 @@ export class EditorWorkspaceOrchestrator {
 	}
 
 	reset(): void {
+		this.lifecycleGeneration += 1;
+		this.admissionWakeScheduled = false;
 		this.openFilePaths.clear();
 		this.activeMarkdownPath = null;
+	}
+
+	onOpenPathAdmissionWake(path: string): void {
+		if (this.admissionWakeScheduled) return;
+		this.admissionWakeScheduled = true;
+		const generation = this.lifecycleGeneration;
+		queueMicrotask(() => {
+			if (generation !== this.lifecycleGeneration) return;
+			this.admissionWakeScheduled = false;
+			this.validateOpenBindings(`editor-authority-admission:${path}`);
+		});
 	}
 
 	onReconciled(reason: string): void {
@@ -47,7 +63,7 @@ export class EditorWorkspaceOrchestrator {
 	}
 
 	onActiveLeafChange(leaf: WorkspaceLeaf | null): void {
-		const view = leaf?.view instanceof MarkdownView ? leaf.view : null;
+		const view = isMarkdownEditorView(leaf?.view) ? leaf.view : null;
 		const candidatePath = view?.file?.path ?? null;
 		const nextPath = candidatePath && this.deps.isMarkdownPathSyncable(candidatePath)
 			? candidatePath
@@ -100,11 +116,12 @@ export class EditorWorkspaceOrchestrator {
 		if (!editorBindings) return;
 
 		this.deps.app.workspace.iterateAllLeaves((leaf) => {
-			if (!(leaf.view instanceof MarkdownView) || !leaf.view.file) {
+			if (!isMarkdownEditorView(leaf.view) || !leaf.view.file) {
 				return;
 			}
+			editorBindings.manageView(leaf.view);
 			if (!this.deps.isMarkdownPathSyncable(leaf.view.file.path)) {
-				editorBindings.unbind(leaf.view);
+				editorBindings.excludeView(leaf.view, `validate:${reason}`);
 				return;
 			}
 
@@ -144,7 +161,7 @@ export class EditorWorkspaceOrchestrator {
 
 	private reconcileOpenEditors(): void {
 		this.deps.app.workspace.iterateAllLeaves((leaf) => {
-			if (leaf.view instanceof MarkdownView) {
+			if (isMarkdownEditorView(leaf.view)) {
 				this.bindView(leaf.view);
 			}
 		});
@@ -153,9 +170,10 @@ export class EditorWorkspaceOrchestrator {
 
 	private bindView(view: MarkdownView): void {
 		const bindings = this.deps.getEditorBindings();
+		bindings?.manageView(view);
 		const path = view.file?.path;
 		if (!path || !this.deps.isMarkdownPathSyncable(path)) {
-			bindings?.unbind(view);
+			bindings?.excludeView(view, "workspace-bind");
 			return;
 		}
 		bindings?.bind(view, this.deps.getSettings().deviceName);
@@ -174,15 +192,23 @@ export class EditorWorkspaceOrchestrator {
 
 	private reconcileTrackedOpenFiles(reason: string): void {
 		const currentlyOpen = new Set<string>();
-		this.deps.app.workspace.iterateAllLeaves((leaf) => {
+		const workspaceMarkdownViews: MarkdownView[] = [];
+		const addWorkspaceView = (view: unknown): void => {
 			if (
-				leaf.view instanceof MarkdownView
-				&& leaf.view.file
-				&& this.deps.isMarkdownPathSyncable(leaf.view.file.path)
-			) {
-				currentlyOpen.add(leaf.view.file.path);
+				!isMarkdownEditorView(view)
+				|| workspaceMarkdownViews.includes(view)
+			) return;
+			workspaceMarkdownViews.push(view);
+			if (view.file && this.deps.isMarkdownPathSyncable(view.file.path)) {
+				currentlyOpen.add(view.file.path);
 			}
-		});
+		};
+		addWorkspaceView(this.deps.app.workspace.getActiveViewOfType(MarkdownView));
+		this.deps.app.workspace.iterateAllLeaves((leaf) => addWorkspaceView(leaf.view));
+		this.deps.getEditorBindings()?.reconcileManagedWorkspaceViews(
+			workspaceMarkdownViews,
+			reason,
+		);
 
 		for (const tracked of this.openFilePaths) {
 			if (!currentlyOpen.has(tracked)) {

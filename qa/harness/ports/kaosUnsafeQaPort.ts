@@ -26,6 +26,8 @@ export interface KaosUnsafeQaPort {
 		content: string,
 		opts: { originClass: "local" | "remote"; createIfMissing?: boolean },
 	): Promise<{ beforeHash: string | null; afterHash: string | null; fileExisted: boolean }>;
+	/** Clear persisted Markdown Attention only for a QA-owned fixture path. */
+	__qaOnlyClearMarkdownAttentionUnsafe(path: string): void;
 
 	// --- Disk ingest control ---
 	ingestDiskFileNow(
@@ -34,8 +36,22 @@ export interface KaosUnsafeQaPort {
 	): Promise<void>;
 
 	// --- Editor binding control ---
+	setEditorHandoffHostApiVersionOverride(version: string | null): void;
 	pauseEditorPropagation(path: string): Promise<boolean>;
 	resumeEditorPropagation(path: string): Promise<boolean>;
+	holdNextHostLoad(path: string, stage?: "load-entry" | "clear-load"): void;
+	releaseHeldHostLoad(): void;
+	holdNextNativeSave(path: string): void;
+	releaseHeldNativeSave(): void;
+	getEditorHandoffDebugSnapshot(): import("../../../src/runtime/engineControlPort").EditorHandoffDebugSnapshot;
+	getContentFreeSnapshot(): import("../../../src/runtime/engineControlPort").EditorHandoffDebugSnapshot;
+	__qaOnlyArmHandoffRecoveryFaultUnsafe(
+		fault: import("../../../src/runtime/engineControlPort").HandoffRecoveryQaFault,
+	): void;
+	__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe(operationId: string): void;
+	getHandoffRecoveryQaSnapshot(): import("../../../src/runtime/engineControlPort").HandoffRecoveryQaSnapshot;
+	getHandoffRecoveryQaManualRows(): Promise<readonly import("../../../src/runtime/engineControlPort").HandoffRecoveryQaManualRow[]>;
+	getHandoffRecoveryQaInventory(): Promise<import("../../../src/runtime/engineControlPort").HandoffRecoveryQaInventory>;
 
 	// --- Network control ---
 	setQaNetworkHold(mode: "offline" | "online"): void;

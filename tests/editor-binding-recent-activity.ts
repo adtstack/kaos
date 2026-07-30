@@ -1,10 +1,14 @@
 import * as Y from "yjs";
+import { spawnSync } from "node:child_process";
 import { Annotation, EditorState, Transaction, type TransactionSpec } from "@codemirror/state";
 import { YSyncConfig, ySyncFacet } from "y-codemirror.next";
+import { MarkdownView } from "obsidian";
 import {
+	createEditorBindingBootSessionId,
 	EditorBindingManager,
 	type InterceptedExternalDiskMutation,
 } from "../src/sync/editorBinding";
+import { EditorWorkspaceOrchestrator } from "../src/runtime/editorWorkspaceOrchestrator";
 import {
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
 	ORIGIN_RESTORE,
@@ -12,10 +16,17 @@ import {
 import { PRODUCT_EVENT_KIND } from "../src/observability/productEventKinds";
 import {
 	buildTypingAwareness,
+	KAOS_ACTIVE_FILE_AWARENESS_FIELD,
 	KAOS_TYPING_AWARENESS_FIELD,
 } from "../src/sync/remoteTypingGuard";
 import { isMarkdownSyncable } from "../src/types";
 import { normalizeEditorText } from "../src/utils/editorTextNormalization";
+import {
+	reduceManagedLeafSession,
+	reserveManagedLeafInputStart,
+	type ManagedLeafSession,
+	type PendingHostLoadCandidate,
+} from "../src/sync/editorHandoffState";
 
 let passed = 0;
 let failed = 0;
@@ -87,6 +98,56 @@ function clearPendingHealthChecks(manager: unknown): void {
 		clearTimeout(timer);
 	}
 	pendingCm?.clear();
+
+	const pendingPresentation = (manager as {
+		pendingTargetPresentationRetries?: Map<string, ReturnType<typeof setTimeout>>;
+	}).pendingTargetPresentationRetries;
+	for (const timer of pendingPresentation?.values() ?? []) {
+		clearTimeout(timer);
+	}
+	pendingPresentation?.clear();
+	(manager as { targetPresentationRetryAttempts?: Map<string, number> })
+		.targetPresentationRetryAttempts?.clear();
+
+	const pendingTarget = (manager as {
+		pendingTargetBindingRetries?: Map<string, ReturnType<typeof setTimeout>>;
+	}).pendingTargetBindingRetries;
+	for (const timer of pendingTarget?.values() ?? []) {
+		clearTimeout(timer);
+	}
+	pendingTarget?.clear();
+	(manager as { targetBindingRetryAttempts?: Map<string, number> })
+		.targetBindingRetryAttempts?.clear();
+
+	const pendingUnmanage = (manager as {
+		pendingUnmanageRetries?: Map<string, ReturnType<typeof setTimeout>>;
+	}).pendingUnmanageRetries;
+	for (const timer of pendingUnmanage?.values() ?? []) {
+		clearTimeout(timer);
+	}
+	pendingUnmanage?.clear();
+}
+
+function captureSingleMicrotask(action: () => void): () => void {
+	const originalQueueMicrotask = globalThis.queueMicrotask;
+	let captured: (() => void) | null = null;
+	globalThis.queueMicrotask = (callback) => {
+		if (captured) throw new Error("Expected one queued microtask");
+		captured = callback;
+	};
+	try {
+		action();
+	} finally {
+		globalThis.queueMicrotask = originalQueueMicrotask;
+	}
+	if (!captured) throw new Error("Expected a queued microtask");
+	return captured;
+}
+
+function captureNodeTimerCallback(timer: unknown): () => void {
+	const callback = (timer as { _onTimeout?: () => void })._onTimeout;
+	if (typeof callback !== "function") throw new Error("Expected a Node timeout callback");
+	return () => callback.call(timer);
 }
 
 function recordExpectedEditorYTextPatch(
@@ -117,10 +178,79 @@ function recordExpectedEditorYTextPatch(
 	);
 }
 
+function installManagedBoundaryStubs(
+	manager: EditorBindingManager,
+	view: { leaf: { id: string } },
+	cm: unknown,
+): void {
+	manager.manageView(view as never);
+	const runtime = (manager as unknown as {
+		managedSessions: Map<string, { hostGuard: unknown; cmGuard: unknown }>;
+	}).managedSessions.get(view.leaf.id);
+	if (!runtime) throw new Error("Expected fixture managed runtime");
+	let hostMode: { kind: string; [key: string]: unknown } = { kind: "pass-through" };
+	let cmInert = false;
+	let gateClosed = false;
+	runtime.hostGuard = {
+		beginBlockingHandoff: (input: Record<string, unknown>) => {
+			hostMode = { kind: "blocking-handoff", ...input };
+		},
+		markTargetProven: () => true,
+		reportHostLoadCandidate: () => true,
+		reportHostLoadCompleted: () => true,
+		flushOwnedSave: () => Promise.resolve(),
+		cancelOwnedSave: () => {},
+		markInert: () => { hostMode = { kind: "inert-pass-through" }; },
+		restoreIfCurrent: () => { hostMode = { kind: "inert-pass-through" }; },
+		snapshot: () => ({
+			leafId: view.leaf.id,
+			view,
+			hostCapability: "public-cancellable",
+			hostCapabilityState: "ready",
+			saveEpoch: 0,
+			clearLoadCapability: "observable",
+			mode: hostMode,
+			inFlight: new Map(),
+			pendingTargetSave: false,
+			pendingOwnedSave: null,
+			sourceUnload: null,
+		}),
+	};
+	runtime.cmGuard = {
+		refreshGate: () => {
+			gateClosed = manager.getManagedSession(view as never)?.handoff !== null;
+			return true;
+		},
+		markInert: () => {
+			cmInert = true;
+			gateClosed = false;
+			return true;
+		},
+		restoreIfCurrent: () => {
+			cmInert = true;
+			gateClosed = false;
+			return true;
+		},
+		snapshot: () => ({
+			view: cm,
+			inert: cmInert,
+			gateClosed,
+			selectionEpoch: 0,
+			scrollEpoch: 0,
+			gateFailureReason: null,
+			commitState: "none",
+			pendingHostLoadCandidate: null,
+		}),
+	};
+	manager.manageView(view as never);
+}
+
 function buildManagerFixture(options: {
 	lastEditorChangeAgeMs: number;
 	lastEditorDocChangeAgeMs?: number | null;
 	externalReloadGuardEnabled?: () => boolean;
+	installManagedGuardStubs?: boolean;
+	onOpenPathAdmissionRequested?: (request: unknown) => void;
 	onExternalDiskReloadIntercepted?: (
 		candidate: InterceptedExternalDiskMutation,
 	) => void;
@@ -180,9 +310,15 @@ function buildManagerFixture(options: {
 		dispatch: () => {},
 	};
 
+	const workspace = {
+		iterateAllLeaves(callback: (leaf: { view: unknown }) => void) {
+			callback({ view });
+		},
+	};
 	const view = {
 		file: { path, stat: liveFileStat },
 		leaf: { id: "leaf-1" },
+		app: { workspace },
 		containerEl: { contains: (node: unknown) => node === cmDom },
 		editor: { getValue: () => liveEditorContent },
 	};
@@ -202,9 +338,11 @@ function buildManagerFixture(options: {
 			options.onExternalDiskReloadIntercepted?.(candidate);
 		},
 		options.externalReloadGuardEnabled,
+		options.onOpenPathAdmissionRequested,
 	);
 	const binding = {
 		view,
+		file: view.file,
 		path,
 		undoManager: new Y.UndoManager(expectedText),
 		ytext: expectedText,
@@ -223,6 +361,9 @@ function buildManagerFixture(options: {
 
 	(manager as unknown as { bindings: Map<string, unknown> }).bindings.set("leaf-1", binding);
 	(manager as unknown as { knownCmViews: Set<unknown> }).knownCmViews.add(cm);
+	if (options.installManagedGuardStubs !== false) {
+		installManagedBoundaryStubs(manager, view, cm);
+	}
 	return {
 		manager,
 		binding,
@@ -253,7 +394,45 @@ function installLiveCmReplacement(manager: unknown, binding: {
 	binding.cm.dom.isConnected = false;
 	binding.view.containerEl = { contains: (node: unknown) => node === liveDom };
 	(manager as { knownCmViews: Set<unknown> }).knownCmViews.add(liveCm);
+	installManagedBoundaryStubs(
+		manager as EditorBindingManager,
+		binding.view as never,
+		liveCm,
+	);
 	return liveCm;
+}
+
+console.log("\n--- Test 0: editor binding boot IDs require cryptographic uniqueness ---");
+{
+	let cryptoUnavailableRejected = false;
+	try {
+		createEditorBindingBootSessionId(null);
+	} catch (error) {
+		cryptoUnavailableRejected = error instanceof Error
+			&& error.message === "Secure editor binding boot-session ID is unavailable";
+	}
+	assertEq(
+		cryptoUnavailableRejected,
+		true,
+		"missing cryptographic randomness fails closed instead of using time or Math.random",
+	);
+
+	let boot = 0;
+	const cryptoSource = {
+		getRandomValues(bytes: Uint8Array): Uint8Array {
+			boot += 1;
+			bytes.fill(boot);
+			return bytes;
+		},
+	};
+	const firstBoot = createEditorBindingBootSessionId(cryptoSource);
+	const secondBoot = createEditorBindingBootSessionId(cryptoSource);
+	assertEq(firstBoot === secondBoot, false, "two secure boot sessions receive distinct IDs");
+	assertEq(
+		/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(firstBoot),
+		true,
+		"getRandomValues fallback produces a canonical random UUID",
+	);
 }
 
 console.log("\n--- Test 1: recent editor activity defers unhealthy binding repair ---");
@@ -1371,10 +1550,40 @@ console.log("\n--- Test 19a3b2: proven host merge waits for the CRDT reconciliat
 	});
 	manager.beginExternalDiskMutation(binding.path, notice.sequence);
 	manager.noteExternalDiskMutation(notice);
+	const hostInternals = manager as unknown as {
+		pendingExternalDiskMutationStarts: Map<string, {
+			views: Map<string, { continuation: unknown }>;
+		}>;
+		isManagedBindingContinuationCurrent: (
+			continuation: unknown,
+			binding: unknown,
+		) => boolean;
+		resolveExternalDiskHostProjectionProof: (input: unknown) => unknown;
+	};
+	const hostSnapshot = hostInternals.pendingExternalDiskMutationStarts
+		.get(binding.path)?.views.get("leaf-1");
+	assertEq(hostSnapshot !== undefined, true, "host merge captures an exact managed snapshot");
+	assertEq(
+		hostSnapshot
+			? hostInternals.isManagedBindingContinuationCurrent(hostSnapshot.continuation, binding)
+			: false,
+		true,
+		"host merge managed snapshot remains current before host projection",
+	);
 	Object.assign(binding.view, {
 		data: mergedContent,
 		lastSavedData: externalContent,
 	});
+	assertEq(
+		hostInternals.resolveExternalDiskHostProjectionProof({
+			leafId: "leaf-1",
+			binding,
+			currentText: localContent,
+			incomingText: mergedContent,
+		}) !== null,
+		true,
+		"host merge exact snapshot authorizes the matching host projection",
+	);
 	const transaction = state.update({
 		changes: { from: 0, to: state.doc.length, insert: mergedContent },
 		annotations: Transaction.userEvent.of("set"),
@@ -1712,6 +1921,7 @@ console.log("\n--- Test 19a3b3a2: early host proof coordinates held and pending 
 	const secondBinding = {
 		...binding,
 		view: secondView,
+		file: secondView.file,
 		cm: secondCm,
 		cmId: "cm-2",
 		undoManager: new Y.UndoManager(binding.ytext),
@@ -4009,6 +4219,7 @@ console.log("\n--- Test 19a13: multi-pane interception retains the complete noti
 	const secondBinding = {
 		...binding,
 		view: secondView,
+		file: secondView.file,
 		cm: secondCm,
 		cmId: "cm-2",
 		undoManager: new Y.UndoManager(binding.ytext),
@@ -4239,13 +4450,13 @@ console.log("\n--- Test 22: pre-bind user input invalidates an open-editor mutat
 	const after = manager.captureOpenEditorMutationTicket(path, [view as never]);
 	assertEq(
 		manager.validateOpenEditorMutationTicket(after, [view as never]).current,
-		true,
-		"a fresh ticket is valid after the pre-bind input",
+		false,
+		"a fresh editor read cannot replace missing target-presentation proof",
 	);
 	assertEq(
-		(manager.getLastEditorActivityForPath(path) ?? 0) > 0,
-		true,
-		"pre-bind input is carried to path activity when the view is resolved",
+		manager.getLastEditorActivityForPath(path),
+		null,
+		"pre-bind input is not assigned to a path before target presentation proof",
 	);
 	clearPendingHealthChecks(manager);
 }
@@ -4458,17 +4669,17 @@ console.log("\n--- Test 28: apply guard rejects a stale CM even when document by
 	});
 
 	assertEq(applied, false, "apply guard refuses the non-current CM identity");
-	assertEq(staleDispatches, 0, "stale CM is not reconfigured");
+	assertEq(staleDispatches, 1, "unsupported replacement detaches the stale CM exactly once");
 	assertEq(
 		(manager as unknown as { bindings: Map<string, unknown> }).bindings.get("leaf-1"),
-		binding,
-		"rejected stale apply leaves the previous binding untouched",
+		undefined,
+		"rejected stale apply leaves no unfenced previous binding",
 	);
 	nextDoc.destroy();
 	clearPendingHealthChecks(manager);
 }
 
-console.log("\n--- Test 29: rapid same-leaf switch binds the replacement without moving selection ---");
+console.log("\n--- Test 29: rapid same-leaf switch gates the replacement without moving selection ---");
 {
 	const { manager, binding } = buildManagerFixture({
 		lastEditorChangeAgeMs: 10_000,
@@ -4479,6 +4690,7 @@ console.log("\n--- Test 29: rapid same-leaf switch binds the replacement without
 	const nextDoc = new Y.Doc();
 	const nextText = nextDoc.getText("content");
 	nextText.insert(0, nextContent);
+	manager.manageView(binding.view as never);
 	const oldDom = binding.cm.dom;
 	const newDom = { isConnected: true };
 	const scrollDOM = { scrollTop: 840 };
@@ -4513,7 +4725,8 @@ console.log("\n--- Test 29: rapid same-leaf switch binds the replacement without
 	};
 	binding.cm.hasFocus = false;
 	binding.lastBoundAtMs = Date.now();
-	binding.view.file = { path: nextPath };
+	const nextFile = { path: nextPath };
+	binding.view.file = nextFile;
 	binding.view.editor = { getValue: () => nextContent };
 	binding.view.containerEl = {
 		contains: (node: unknown) => node === oldDom || node === newDom,
@@ -4521,6 +4734,7 @@ console.log("\n--- Test 29: rapid same-leaf switch binds the replacement without
 	const known = (manager as unknown as { knownCmViews: Set<unknown> }).knownCmViews;
 	known.add(binding.cm);
 	known.add(replacementCm);
+	installManagedBoundaryStubs(manager, binding.view, replacementCm);
 	const fixtureVaultSync = (manager as unknown as {
 		vaultSync: {
 			getTextForPath: (path: string) => Y.Text | null;
@@ -4537,18 +4751,3151 @@ console.log("\n--- Test 29: rapid same-leaf switch binds the replacement without
 	const rebound = (manager as unknown as {
 		bindings: Map<string, { path: string; cm: unknown; settleWindowMs: number }>;
 	}).bindings.get("leaf-1");
-	assertEq(rebound?.path, nextPath, "rapid switch binds the new file path");
-	assertEq(rebound?.cm, replacementCm, "rapid switch binds the focused replacement CM");
-	assertEq(rebound?.settleWindowMs, 1600, "rapid switch activates the extended settle window");
+	assertEq(rebound, undefined, "rapid switch remains detached until a presentation receipt");
 	assertEq(oldDispatches, 1, "old CM is detached exactly once");
-	assertEq(replacementTransactions.length, 1, "replacement CM is configured exactly once");
-	assertEq(replacementTransactions[0]?.docChanged, false, "binding reconfigure does not change document bytes");
-	assertEq(replacementTransactions[0]?.scrollIntoView, false, "binding reconfigure does not request scrolling");
+	assertEq(replacementTransactions.length, 0, "unproven replacement CM is not configured");
 	assertEq(replacementState.selection.main.anchor, 1100, "selection anchor survives binding reconfigure");
 	assertEq(replacementState.selection.main.head, 1125, "selection head survives binding reconfigure");
 	assertEq(scrollDOM.scrollTop, 840, "binding reconfigure leaves scrollTop untouched");
-	assertEq(replacementState.facet(ySyncFacet)?.ytext, nextText, "replacement CM receives the new file Y.Text");
+	assertEq(replacementState.facet(ySyncFacet), undefined, "unproven replacement receives no Y.Text");
+	const session = manager.getManagedSession(binding.view as never);
+	assertEq(session?.displayedLineage.kind, "known", "rapid switch keeps a known source lineage");
+	assertEq(
+		session?.displayedLineage.kind === "known" ? session.displayedLineage.path : null,
+		binding.path,
+		"rapid switch keeps A as displayed lineage",
+	);
+	assertEq(session?.handoff?.targetFile, nextFile, "rapid switch keeps the exact B target identity");
 	nextDoc.destroy();
+	clearPendingHealthChecks(manager);
+}
+
+type MissingTargetEntry = "bind" | "repair" | "heal" | "rebind" | "stale-user" | "health";
+
+async function exerciseMissingTargetEntry(entry: MissingTargetEntry): Promise<void> {
+	const sourcePath = `Notes/task6-${entry}-A.md`;
+	const targetPath = `Notes/task6-${entry}-B.md`;
+	const sourceFile = { path: sourcePath, stat: { ctime: 1, mtime: 1, size: 12 } };
+	const targetFile = { path: targetPath, stat: { ctime: 2, mtime: 2, size: 0 } };
+	const sourceDoc = new Y.Doc();
+	const sourceText = sourceDoc.getText("content");
+	const sourceContent = "source bytes";
+	sourceText.insert(0, sourceContent);
+	const admissionRequests: Array<Record<string, unknown>> = [];
+	const effectOrder: string[] = [];
+	let ensureFileCalls = 0;
+	let undoDestroyCalls = 0;
+	let cmDocumentMutationCalls = 0;
+	const awareness = { setLocalStateField: () => {} };
+	const vaultSync = {
+		provider: { awareness },
+		getTextForPath: (path: string) => path === sourcePath ? sourceText : null,
+		getFileId: (path: string) => path === sourcePath ? "source-file-id" : undefined,
+		getFileIdForText: (text: Y.Text) => text === sourceText ? "source-file-id" : undefined,
+		isPendingRenameTarget: () => false,
+		isMarkdownTombstoned: () => false,
+		ensureFile: () => {
+			ensureFileCalls += 1;
+			return null;
+		},
+	};
+	const Manager = EditorBindingManager as unknown as new (...args: unknown[]) => EditorBindingManager;
+	const manager = new Manager(
+		vaultSync,
+		false,
+		(path: string) => path.endsWith(".md"),
+		(_source: string, message: string, details?: Record<string, unknown>) => {
+			if (message === "handoff-effect-applied" && typeof details?.effect === "string") {
+				effectOrder.push(details.effect);
+			}
+		},
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		(request: Record<string, unknown>) => admissionRequests.push(request),
+	);
+	let cmState = EditorState.create({
+		doc: sourceContent,
+		extensions: [manager.compartment.of([])],
+	});
+	const cmDom = { isConnected: true };
+	const cm = {
+		dom: cmDom,
+		hasFocus: true,
+		get state() { return cmState; },
+		dispatch(spec: TransactionSpec) {
+			const transaction = cmState.update(spec);
+			if (transaction.docChanged) cmDocumentMutationCalls += 1;
+			cmState = transaction.state;
+		},
+	};
+	const requestSave = Object.assign(function requestSave() {}, {
+		cancel: () => {},
+	});
+	let hostData = sourceContent;
+	const leaf = {
+		id: `leaf-${entry}`,
+		workspace: {
+			activeLeaf: null as unknown,
+			iterateAllLeaves(callback: (candidate: { view: unknown }) => void) {
+				callback({ view });
+			},
+		},
+	};
+	const view = {
+		file: sourceFile,
+		leaf,
+		containerEl: { contains: (node: unknown) => node === cmDom },
+		editor: { getValue: () => sourceContent },
+		data: hostData,
+		dirty: false,
+		getViewData: () => hostData,
+		onUnloadFile: function onUnloadFile(_file: unknown) {},
+		onLoadFile: function onLoadFile(_file: unknown) {},
+		setViewData: function setViewData(data: string, _clear: boolean) {
+			hostData = data;
+			this.data = data;
+		},
+		requestSave,
+		save: function save() {},
+	};
+	leaf.workspace.activeLeaf = leaf;
+	const undoManager = new Y.UndoManager(sourceText);
+	undoManager.destroy = () => { undoDestroyCalls += 1; };
+	const binding = {
+		view,
+		file: sourceFile,
+		path: sourcePath,
+		undoManager,
+		ytext: sourceText,
+		cm,
+		cmId: `cm-${entry}`,
+		fileId: "source-file-id",
+		lastBoundAt: new Date().toISOString(),
+		lastBoundAtMs: Date.now() - 10_000,
+		lastEditorChangeAtMs: Date.now() - 10_000,
+		lastEditorDocChangeAtMs: Date.now() - 10_000,
+		settleWindowMs: 0,
+	};
+	const runtime = manager as unknown as {
+		manageView?: (managedView: unknown) => unknown;
+		getManagedSession?: (managedView: unknown) => {
+			displayedLineage: { kind: string; path?: string; file?: unknown };
+			generation: number;
+		} | null;
+		getBinding?: (managedView: unknown) => unknown;
+		beginPathHandoff?: (managedView: unknown, target: unknown, reason: string) => boolean;
+		bindings: Map<string, unknown>;
+		knownCmViews: Set<unknown>;
+		cmToLeafId: WeakMap<object, string>;
+		lastUserDocChangeAtByCm: WeakMap<object, number>;
+		lastEditorDocChangeAtByPath: Map<string, number>;
+		pathEditorAuthorityPort?: {
+			capturePathEditorAuthority: (path: string) => unknown;
+		};
+		fenceStaleUserBinding: (transaction: unknown) => unknown;
+		maybeHealBinding: (leafId: string, candidate: unknown, source: string) => void;
+		unmanageView?: (managedView: unknown, reason: string) => void;
+		managedSessions: Map<string, { cmGuard: unknown }>;
+	};
+	runtime.bindings.set(leaf.id, binding);
+	runtime.knownCmViews.add(cm);
+	runtime.cmToLeafId.set(cm, leaf.id);
+	runtime.lastUserDocChangeAtByCm.set(cm, Date.now());
+	runtime.lastEditorDocChangeAtByPath.set(sourcePath, Date.now());
+
+	assertEq(typeof runtime.manageView, "function", `${entry}: managed-view API exists`);
+	if (typeof runtime.manageView !== "function") {
+		undoManager.destroy();
+		sourceDoc.destroy();
+		clearPendingHealthChecks(manager);
+		return;
+	}
+	runtime.manageView(view);
+	const managedRuntime = runtime.managedSessions.get(leaf.id);
+	if (!managedRuntime) throw new Error(`Expected managed runtime for ${entry}`);
+	let cmGuardInert = false;
+	let cmGateClosed = false;
+	managedRuntime.cmGuard = {
+		refreshGate: () => {
+			cmGateClosed = true;
+			return true;
+		},
+		markInert: () => {
+			cmGuardInert = true;
+			cmGateClosed = false;
+			return true;
+		},
+		restoreIfCurrent: () => {
+			cmGuardInert = true;
+			cmGateClosed = false;
+			return true;
+		},
+		snapshot: () => ({
+			view: cm,
+			inert: cmGuardInert,
+			gateClosed: cmGateClosed,
+			selectionEpoch: 0,
+			scrollEpoch: 0,
+			gateFailureReason: null,
+			commitState: "none",
+			pendingHostLoadCandidate: null,
+		}),
+	};
+	let authorityObservedBeforeDetach = false;
+	let capturedAuthority: { kind?: unknown; reason?: unknown } | null = null;
+	const authorityPort = runtime.pathEditorAuthorityPort;
+	if (authorityPort) {
+		const originalCapture = authorityPort.capturePathEditorAuthority.bind(authorityPort);
+		authorityPort.capturePathEditorAuthority = (path: string) => {
+			if (path === sourcePath) {
+				authorityObservedBeforeDetach = runtime.bindings.get(leaf.id) === binding;
+			}
+			const authority = originalCapture(path) as { kind?: unknown; reason?: unknown };
+			if (path === sourcePath) capturedAuthority = authority;
+			return authority;
+		};
+	}
+
+	view.file = targetFile;
+	switch (entry) {
+		case "bind":
+			manager.bind(view as never, "TestDevice");
+			break;
+		case "repair":
+			manager.repair(view as never, "TestDevice", "task6-missing-target");
+			break;
+		case "heal":
+			manager.heal(view as never, "TestDevice", "task6-missing-target");
+			break;
+		case "rebind":
+			manager.rebind(view as never, "TestDevice", "task6-missing-target");
+			break;
+		case "stale-user": {
+			const transaction = cmState.update({
+				changes: { from: sourceContent.length, insert: "!" },
+				annotations: Transaction.userEvent.of("input.type"),
+			});
+			runtime.fenceStaleUserBinding(transaction);
+			break;
+		}
+		case "health":
+			runtime.maybeHealBinding(leaf.id, binding, "retry-health-check");
+			break;
+	}
+	await Promise.resolve();
+
+	assertEq(ensureFileCalls, 0, `${entry}: no binding-layer Y.Text creation`);
+	assertEq(admissionRequests.length, 1, `${entry}: one exact admission wake request`);
+	const request = admissionRequests[0];
+	assertEq(request?.targetFile, targetFile, `${entry}: admission keeps exact target TFile`);
+	assertEq(request?.targetPath, targetPath, `${entry}: admission keeps exact target path`);
+	assertEq("content" in (request ?? {}), false, `${entry}: admission carries no editor content`);
+	assertEq(runtime.getBinding?.(view) ?? runtime.bindings.get(leaf.id) ?? null, null, `${entry}: binding is detached`);
+	const session = runtime.getManagedSession?.(view) ?? null;
+	assertEq(session?.displayedLineage.kind, "known", `${entry}: displayed lineage remains known`);
+	assertEq(session?.displayedLineage.path, sourcePath, `${entry}: displayed lineage remains A`);
+	assertEq(session?.displayedLineage.file, sourceFile, `${entry}: displayed lineage keeps exact A TFile`);
+	assertEq(effectOrder.slice(0, 5).join("|"), [
+		"cancel-pending-save",
+		"block-save",
+		"install-input-gate",
+		"capture-authority-before-detach",
+		"detach-binding",
+	].join("|"), `${entry}: exact five-effect handoff prefix`);
+	assertEq(sourceText.toString(), sourceContent, `${entry}: source Y.Text is unchanged`);
+	assertEq(cmDocumentMutationCalls, 0, `${entry}: handoff performs no CM document mutation`);
+	assertEq(runtime.lastEditorDocChangeAtByPath.has(targetPath), false, `${entry}: A activity is not relabelled B`);
+	assertEq(undoDestroyCalls, 1, `${entry}: source UndoManager is destroyed exactly once`);
+	assertEq(authorityObservedBeforeDetach, true, `${entry}: source authority is captured before map deletion`);
+	assertEq(capturedAuthority?.kind, "blocked", `${entry}: late mismatch source authority is fail-closed`);
+	assertEq(capturedAuthority?.reason, "transitioning", `${entry}: late mismatch reports a transition`);
+	runtime.unmanageView?.(view, "teardown");
+	clearPendingHealthChecks(manager);
+	sourceDoc.destroy();
+}
+
+console.log("\n--- Test 30: every path-mismatch entry is a managed missing-target handoff ---");
+for (const entry of ["bind", "repair", "heal", "rebind", "stale-user", "health"] as const) {
+	await exerciseMissingTargetEntry(entry);
+}
+
+console.log("\n--- Test 30a: host load entry returns a ticket before view.file publishes the target ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const runtime = manager as unknown as {
+		beginPathHandoff: (
+			view: unknown,
+			targetFile: unknown,
+			reason: string,
+			provenance: "selected",
+			sourceUnloadReceiptId: string,
+		) => boolean;
+	};
+	const sourceFile = binding.view.file;
+	const targetFile = { path: "Notes/host-entry-target.md" };
+	const accepted = runtime.beginPathHandoff(
+		binding.view,
+		targetFile,
+		"host-load-entry",
+		"selected",
+		"source-unload:exact-host-entry",
+	);
+	const session = manager.getManagedSession(binding.view as never);
+
+	assertEq(
+		binding.view.file,
+		sourceFile,
+		"host callback still exposes the exact source file before native delegation",
+	);
+	assertEq(accepted, true, "selected host entry returns the ticket-producing handoff");
+	assertEq(session?.handoff?.targetFile, targetFile, "host entry retains the exact target TFile");
+	assertEq(
+		session?.handoff?.sourceUnloadReceiptId,
+		"source-unload:exact-host-entry",
+		"host entry retains the exact source-unload receipt",
+	);
+	manager.unbindAll();
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 30b: file-open before target CM mount retains the exact guarded source boundary ---");
+{
+	const { manager, binding, traceRecords } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	type TestRuntime = {
+		session: ManagedLeafSession;
+		hostGuard: {
+			snapshot(): Record<string, unknown>;
+			[key: string]: unknown;
+		} | null;
+		cmGuard: {
+			snapshot(): Readonly<{ gateClosed: boolean }>;
+		} | null;
+	};
+	const internals = manager as unknown as {
+		managedSessions: Map<string, TestRuntime>;
+	};
+	const runtime = internals.managedSessions.get("leaf-1");
+	if (!runtime?.hostGuard) throw new Error("Expected guarded source runtime");
+	const sourceFile = binding.view.file;
+	const sourceHostGuard = runtime.hostGuard;
+	const sourceHostSnapshot = sourceHostGuard.snapshot();
+	const sourceUnloadReceiptId = "source-unload:file-open-before-cm";
+	runtime.hostGuard = {
+		...sourceHostGuard,
+		snapshot: () => ({
+			...sourceHostSnapshot,
+			sourceUnload: {
+				receiptId: sourceUnloadReceiptId,
+				unloadId: 1,
+				file: sourceFile,
+				path: sourceFile.path,
+				state: "settled",
+				forcedSaveObserved: true,
+				cacheRetiredBeforeUnloadSettled: true,
+			},
+		}),
+	};
+	const targetFile = { path: "Notes/file-open-before-cm.md" };
+	(binding.view as unknown as {
+		file: unknown;
+		editor: { getValue(): string };
+	}).file = targetFile;
+	(binding.view as unknown as {
+		editor: { getValue(): string };
+	}).editor.getValue = () => "target host facade before CM mount";
+
+	manager.bind(binding.view as never, "TestDevice");
+
+	const retained = internals.managedSessions.get("leaf-1") ?? null;
+	assertEq(retained !== null, true, "unresolved target CM does not unmanage the guarded source runtime");
+	assertEq(retained?.session.handoff?.targetFile, targetFile, "the exact observed target is retained");
+	assertEq(
+		retained?.session.handoff?.sourceUnloadReceiptId,
+		sourceUnloadReceiptId,
+		"the file-open wake inherits only the exact source-unload receipt",
+	);
+	assertEq(
+		retained?.session.currentSwitchIntentSeq !== null,
+		true,
+		"the source-unload receipt mints selected-switch provenance before target CM mount",
+	);
+	assertEq(manager.getBinding(binding.view as never), null, "source Y.Text is detached during the retained transition");
+	assertEq(retained?.cmGuard?.snapshot().gateClosed, true, "the guarded source CM closes its input gate");
+	assertEq(
+		traceRecords.some((record) => record.msg === "managed-transition-boundary-retained"),
+		true,
+		"the exact transitional fallback emits a bounded trace",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 30c: a later exact host selection promotes the same observed target ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const runtime = manager as unknown as {
+		beginPathHandoff: (
+			view: unknown,
+			targetFile: unknown,
+			reason: string,
+			provenance?: "observed" | "selected",
+			sourceUnloadReceiptId?: string | null,
+		) => boolean;
+	};
+	const targetFile = { path: "Notes/observed-then-selected.md" };
+	(binding.view as unknown as { file: unknown }).file = targetFile;
+	assertEq(
+		runtime.beginPathHandoff(binding.view, targetFile, "file-open-observed"),
+		true,
+		"the public file-open wake records the observed target",
+	);
+	const observed = manager.getManagedSession(binding.view as never);
+	assertEq(observed?.handoff?.sourceUnloadReceiptId, null, "observation alone mints no unload authority");
+	assertEq(observed?.currentSwitchIntentSeq, null, "observation alone mints no switch sequence");
+	assertEq(observed?.binding.kind, "unbound", "observation completes the source detach");
+	assertEq(observed?.handoff?.phase, "awaiting-host-load", "observation waits for exact host selection");
+	assertEq(
+		observed?.completedDetachEpoch,
+		observed?.handoff?.bindingEpochAfterDetach,
+		"observation retains the exact completed detach epoch",
+	);
+	const observedGeneration = observed?.generation ?? -1;
+
+	assertEq(
+		runtime.beginPathHandoff(
+			binding.view,
+			targetFile,
+			"host-load-entry",
+			"selected",
+			"source-unload:observed-then-selected",
+		),
+		true,
+		"the exact host callback promotes the already-observed target",
+	);
+	const selected = manager.getManagedSession(binding.view as never);
+	assertEq(selected?.generation, observedGeneration + 1, "promotion advances the handoff generation");
+	assertEq(
+		selected?.handoff?.sourceUnloadReceiptId,
+		"source-unload:observed-then-selected",
+		"promotion retains the exact source-unload receipt",
+	);
+	assertEq(selected?.currentSwitchIntentSeq, 1, "promotion mints one exact switch sequence");
+	assertEq(selected?.handoff?.targetFile, targetFile, "promotion retains the exact target identity");
+	clearPendingHealthChecks(manager);
+}
+
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const runtime = manager as unknown as {
+		manageView: (view: unknown) => unknown;
+		beginPathHandoff: (view: unknown, targetFile: unknown, reason: string) => boolean;
+		managedSessions: Map<string, {
+			capturedSourceAuthority: {
+				kind: string;
+				content?: string;
+				lease?: unknown;
+			} | null;
+		}>;
+		unmanageView: (view: unknown, reason: string) => void;
+	};
+	runtime.manageView(binding.view);
+	const targetFile = { path: "Notes/proactive-target.md" };
+	runtime.beginPathHandoff(binding.view, targetFile, "host-load-entry");
+	const captured = runtime.managedSessions.get("leaf-1")?.capturedSourceAuthority ?? null;
+	assertEq(captured?.kind, "proven-single", "proactive source authority is captured before target state publication");
+	assertEq(captured?.content, "typing now", "proactive source authority retains exact source bytes");
+	assertEq(typeof captured?.lease, "object", "proactive source authority includes a nominal lease");
+	runtime.unmanageView(binding.view, "teardown");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 31: handoff generation rejects same-path/same-bytes ticket ABA ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const runtime = manager as unknown as {
+		manageView?: (view: unknown) => unknown;
+		beginPathHandoff?: (view: unknown, targetFile: unknown, reason: string) => boolean;
+	};
+	assertEq(typeof runtime.manageView, "function", "ticket ABA fixture has managed-view API");
+	assertEq(typeof runtime.beginPathHandoff, "function", "ticket ABA fixture has handoff API");
+	if (runtime.manageView && runtime.beginPathHandoff) {
+		const originalFile = binding.view.file;
+		runtime.manageView(binding.view);
+		const ticket = manager.captureOpenEditorMutationTicket(binding.path, [binding.view as never]);
+		const temporaryFile = { path: "Notes/temporary-B.md" };
+		binding.view.file = temporaryFile;
+		runtime.beginPathHandoff(binding.view, temporaryFile, "ticket-aba-B");
+		binding.view.file = originalFile;
+		runtime.beginPathHandoff(binding.view, originalFile, "ticket-aba-A");
+		const validation = manager.validateOpenEditorMutationTicket(ticket, [binding.view as never]);
+		assertEq(validation.current, false, "generation-only ABA invalidates the ticket");
+		assertEq(
+			validation.current ? null : validation.reason,
+			"handoff-generation-changed",
+			"generation-only ABA reports the handoff generation fence",
+		);
+	}
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the final guard ---");
+{
+	const repoRoot = new URL("..", import.meta.url).pathname;
+	const obsidianMockPath = new URL("./mocks/obsidian.ts", import.meta.url).pathname;
+	const browserEntry = String.raw`
+				import * as Y from "yjs";
+				import { Awareness } from "y-protocols/awareness";
+				import { EditorState, Transaction } from "@codemirror/state";
+				import { EditorView } from "@codemirror/view";
+				import { EditorBindingManager } from "./src/sync/editorBinding";
+
+				window.__TASK6_STALE_DISPATCH__ = (async () => {
+					const pathA = "Notes/browser-A.md";
+					const pathB = "Notes/browser-B.md";
+					const fileA = { path: pathA };
+					const fileB = { path: pathB };
+					const doc = new Y.Doc();
+					const ytext = doc.getText("content");
+					ytext.insert(0, "source");
+					const awareness = new Awareness(doc);
+					const admissions = [];
+					const vaultSync = {
+						provider: { awareness },
+						getTextForPath: (path) => path === pathA ? ytext : null,
+						getFileId: (path) => path === pathA ? "file-A" : undefined,
+						getFileIdForText: (text) => text === ytext ? "file-A" : undefined,
+						isPendingRenameTarget: () => false,
+						isMarkdownTombstoned: () => false,
+					};
+					const manager = new EditorBindingManager(
+						vaultSync,
+						false,
+						(path) => path.endsWith(".md"),
+						undefined,
+						undefined,
+						undefined,
+						undefined,
+						undefined,
+						undefined,
+						(request) => admissions.push(request),
+					);
+					const parent = document.createElement("div");
+					document.body.appendChild(parent);
+					const leaf = {
+						id: "browser-leaf",
+						workspace: {
+							activeLeaf: null,
+							iterateAllLeaves(callback) { callback({ view }); },
+						},
+					};
+					const requestSave = Object.assign(function requestSave() {}, { cancel() {} });
+					let hostData = "source";
+					let cm;
+					const view = {
+						file: fileA,
+						leaf,
+						containerEl: parent,
+						editor: { getValue: () => cm.state.doc.toString() },
+						data: hostData,
+						dirty: false,
+						getViewData: () => hostData,
+						onUnloadFile: function onUnloadFile(_file) {},
+						onLoadFile: function onLoadFile(_file) {},
+						setViewData: function setViewData(data, _clear) { hostData = data; this.data = data; },
+						requestSave,
+						save: function save() {},
+					};
+					leaf.workspace.activeLeaf = leaf;
+					cm = new EditorView({
+						parent,
+						state: EditorState.create({ doc: "source", extensions: [manager.getBaseExtension()] }),
+					});
+					manager.bindings.set("browser-leaf", {
+						view,
+						file: fileA,
+						path: pathA,
+						undoManager: new Y.UndoManager(ytext),
+						ytext,
+						cm,
+						cmId: "browser-source-cm",
+						fileId: "file-A",
+						lastBoundAt: new Date().toISOString(),
+						lastBoundAtMs: Date.now() - 10_000,
+						lastEditorChangeAtMs: Date.now() - 10_000,
+						lastEditorDocChangeAtMs: null,
+						settleWindowMs: 0,
+					});
+					manager.bind(view, "Browser");
+					const initiallyBound = manager.getBinding(view) !== null;
+					view.file = fileB;
+					cm.dispatch({
+						changes: { from: cm.state.doc.length, insert: "!" },
+						annotations: Transaction.userEvent.of("input.type"),
+					});
+					await Promise.resolve();
+					const session = manager.getManagedSession(view);
+					const result = {
+						initiallyBound,
+						cmContent: cm.state.doc.toString(),
+						yContent: ytext.toString(),
+						bindingDetached: manager.getBinding(view) === null,
+						lineagePath: session?.displayedLineage.kind === "known"
+							? session.displayedLineage.path
+							: null,
+						admissionCount: admissions.length,
+					};
+					manager.unbindAll();
+					cm.destroy();
+					doc.destroy();
+					return result;
+				})();
+
+				window.__TASK9_GUARDED_PRESENTATION__ = (async () => {
+					const runScenario = async ({
+						suffix,
+						contentA,
+						contentB,
+						contentC = null,
+						failFirstBindFreshness = false,
+						deferFirstPresentation = false,
+						replanFirstCompletion = false,
+					}) => {
+					const pathA = "Notes/task9-browser-" + suffix + "-A.md";
+					const pathB = "Notes/task9-browser-" + suffix + "-B.md";
+					const pathC = "Notes/task9-browser-" + suffix + "-C.md";
+					const fileA = { path: pathA };
+					const fileB = { path: pathB };
+					const fileC = { path: pathC };
+					const doc = new Y.Doc();
+					const ytextA = doc.getText("content-A");
+					const ytextB = doc.getText("content-B");
+					const ytextC = doc.getText("content-C");
+					ytextA.insert(0, contentA);
+					ytextB.insert(0, contentB);
+					if (contentC !== null) ytextC.insert(0, contentC);
+					const awareness = new Awareness(doc);
+					const controllerCalls = [];
+					const releasePresentationByPath = new Map();
+					const targetTokenByPath = new Map();
+					let bindFreshnessChecks = 0;
+					let presentationRequests = 0;
+					let presentationCompletions = 0;
+					let hostLoadDispatchActive = false;
+					let presentationRequestedInsideHostLoad = false;
+					const presentationReadyNotifications = [];
+					const targetForPath = (path) => path === pathC && contentC !== null
+						? { file: fileC, ytext: ytextC, content: contentC, fileId: "file-C", suffix: "C" }
+						: { file: fileB, ytext: ytextB, content: contentB, fileId: "file-B", suffix: "B" };
+					const controller = {
+						requestTargetPresentation(request) {
+							if (hostLoadDispatchActive) {
+								presentationRequestedInsideHostLoad = true;
+							}
+							controllerCalls.push("request-presentation");
+							presentationRequests += 1;
+							if (deferFirstPresentation && presentationRequests === 1) {
+								return Promise.resolve({
+									kind: "deferred",
+									reason: "authority-blocked",
+								});
+							}
+							return new Promise((resolve) => {
+								const target = targetForPath(request.targetPath);
+								releasePresentationByPath.set(request.targetPath, () => resolve({
+									kind: "planned",
+									plan: {
+										planId: "presentation-plan-" + target.suffix,
+										hostLoadTokenId: request.candidate.hostLoadTokenId,
+										switchIntentSeq: request.switchIntentSeq,
+										authorityFreshnessHandleId: "presentation-freshness-" + target.suffix,
+										expectedNativeHistoryEpoch: request.candidate.nativeHistoryEpochBefore,
+										presentationPermitId: "presentation-permit-" + target.suffix,
+									},
+								}));
+							});
+						},
+						consumeTargetPresentationPermit(_permitId, context) {
+							controllerCalls.push("consume-presentation");
+							const target = targetForPath(context.targetPath);
+							return context.targetFile === target.file
+								&& context.candidate.incomingContent === target.content;
+						},
+						completeTargetPresentation(receipt) {
+							controllerCalls.push("complete-presentation");
+							presentationCompletions += 1;
+							if (replanFirstCompletion && presentationCompletions === 1) {
+								return Promise.resolve({
+									kind: "replan",
+									reason: "authority-changed",
+								});
+							}
+							const target = targetForPath(receipt.targetPath);
+							const targetToken = Object.freeze({
+								tokenId: "target-ready-" + target.suffix,
+								sessionId: receipt.sessionId,
+								authorityFreshnessHandleId: "bind-freshness-" + target.suffix,
+								authorityFingerprint: "authority-" + target.suffix,
+								controllerLifecycleGeneration: 1,
+								leafId: receipt.leafId,
+								handoffGeneration: receipt.handoffGeneration,
+								switchIntentSeq: receipt.switchIntentSeq,
+								targetPath: receipt.targetPath,
+								targetFile: target.file,
+								targetAuthority: {
+									kind: "existing",
+									fileId: target.fileId,
+									ytextIdentity: "ytext-" + target.suffix,
+									ytextMutationEpoch: 0,
+									bindPermitId: "bind-permit-" + target.suffix,
+								},
+								hostLoadTokenId: receipt.hostLoadTokenId,
+								hostLoadCompletedEpoch: receipt.nativeHistoryEpoch,
+								hostLoadReceiptId: receipt.receiptId,
+								nativeHistoryEpoch: receipt.nativeHistoryEpoch,
+								targetSelectionEpoch: receipt.targetSelectionEpoch,
+								targetScrollEpoch: receipt.targetScrollEpoch,
+								certifiedBaseContent: target.content,
+								certifiedBaseHash: "hash-" + target.suffix,
+								openEditorTicketId: "ticket-" + target.suffix,
+							});
+							targetTokenByPath.set(receipt.targetPath, targetToken);
+							return Promise.resolve({
+								kind: "accepted",
+								receipt: {
+									receiptId: "presentation-receipt-" + target.suffix,
+									presentationPlanId: "presentation-plan-" + target.suffix,
+									hostLoadCompletionReceipt: receipt,
+									replacementTargetReadyToken: targetToken,
+								},
+							});
+						},
+						requestOpenPathAdmission(request) {
+							controllerCalls.push("request-open-admission");
+							const targetToken = targetTokenByPath.get(request.targetPath) ?? null;
+							return Promise.resolve(
+								request.presentation === "target-proven" && targetToken
+									? { kind: "existing", targetReadyToken: targetToken }
+									: { kind: "deferred", reason: "transitioning" },
+							);
+						},
+						seedMissingTarget() {
+							throw new Error("existing B must not enter the missing-target seed lane");
+						},
+						isAuthorityFreshnessCurrent(_handleId, context) {
+							controllerCalls.push("check-bind-freshness");
+							bindFreshnessChecks += 1;
+							if (failFirstBindFreshness && bindFreshnessChecks === 1) return false;
+							const targetToken = targetTokenByPath.get(context.targetFile.path) ?? null;
+							return context.targetFile === targetForPath(context.targetFile.path).file
+								&& context.hostLoadReceiptId === targetToken?.hostLoadReceiptId;
+						},
+						consumeBindPermit(_permitId, context) {
+							controllerCalls.push("consume-bind");
+							const target = targetForPath(context.targetFile.path);
+							return context.targetFile === target.file && context.ytext === target.ytext;
+						},
+					};
+					const vaultSync = {
+						provider: { awareness },
+						getTextForPath: (path) => path === pathA ? ytextA : path === pathB ? ytextB : path === pathC && contentC !== null ? ytextC : null,
+						getFileId: (path) => path === pathA ? "file-A" : path === pathB ? "file-B" : path === pathC && contentC !== null ? "file-C" : undefined,
+						getFileIdForText: (text) => text === ytextA ? "file-A" : text === ytextB ? "file-B" : text === ytextC && contentC !== null ? "file-C" : undefined,
+						isPendingRenameTarget: () => false,
+						isMarkdownTombstoned: () => false,
+					};
+					const manager = new EditorBindingManager(
+						vaultSync,
+						false,
+						(path) => path.endsWith(".md"),
+						undefined,
+						undefined,
+						undefined,
+						undefined,
+						undefined,
+						undefined,
+						undefined,
+						controller,
+						undefined,
+						undefined,
+						undefined,
+						undefined,
+						(token) => {
+							presentationReadyNotifications.push({
+								path: token.targetPath,
+								bindingPath: manager.getBinding(view)?.path ?? null,
+								presentation:
+									manager.getManagedSession(view)?.handoff?.presentation
+										?? null,
+							});
+						},
+					);
+					const parent = document.createElement("div");
+					document.body.appendChild(parent);
+					let cm;
+					let hostData = contentA;
+					let originalSaveCalls = 0;
+					const leaf = {
+						id: "task9-browser-leaf",
+						workspace: {
+							activeLeaf: null,
+							iterateAllLeaves(callback) { callback({ view }); },
+						},
+					};
+					const requestSave = Object.assign(function requestSave() {
+						originalSaveCalls += 1;
+					}, { cancel() {} });
+					const view = {
+						file: fileA,
+						leaf,
+						containerEl: parent,
+						editor: { getValue: () => cm.state.doc.toString() },
+						data: hostData,
+						dirty: false,
+						lastSavedData: hostData,
+						getViewData: () => hostData,
+						onUnloadFile: async function onUnloadFile(_file) {
+							await this.save(true);
+						},
+						onLoadFile: async function onLoadFile(targetFile) {
+							hostLoadDispatchActive = true;
+							try {
+								this.setViewData(targetFile === fileC ? contentC : contentB, true);
+							} finally {
+								hostLoadDispatchActive = false;
+							}
+							await Promise.resolve();
+						},
+						setViewData: function setViewData(data, _clear) {
+							hostData = data;
+							this.data = data;
+							this.lastSavedData = data;
+							cm.dispatch({
+								changes: { from: 0, to: cm.state.doc.length, insert: data },
+								selection: { anchor: data.length },
+								annotations: Transaction.addToHistory.of(false),
+							});
+						},
+						requestSave,
+						save: async function save(clear) {
+							originalSaveCalls += 1;
+							this.dirty = false;
+							if (clear === true) {
+								hostData = "";
+								this.data = "";
+								this.lastSavedData = null;
+							}
+							await Promise.resolve();
+						},
+					};
+					leaf.workspace.activeLeaf = leaf;
+					cm = new EditorView({
+						parent,
+						state: EditorState.create({ doc: contentA, extensions: [manager.getBaseExtension()] }),
+					});
+					let sourceUndoDestroyed = 0;
+					const sourceUndo = new Y.UndoManager(ytextA);
+					const originalDestroy = sourceUndo.destroy.bind(sourceUndo);
+					sourceUndo.destroy = () => { sourceUndoDestroyed += 1; originalDestroy(); };
+					manager.bindings.set(leaf.id, {
+						view,
+						file: fileA,
+						path: pathA,
+						undoManager: sourceUndo,
+						ytext: ytextA,
+						cm,
+						cmId: "task9-source-cm",
+						fileId: "file-A",
+						lastBoundAt: new Date().toISOString(),
+						lastBoundAtMs: Date.now() - 10_000,
+						lastEditorChangeAtMs: Date.now() - 10_000,
+						lastEditorDocChangeAtMs: null,
+						settleWindowMs: 0,
+					});
+					manager.bind(view, "Browser");
+					await view.onUnloadFile(fileA);
+					view.file = fileB;
+					const loadPromises = [view.onLoadFile(fileB)];
+					for (let index = 0; index < 40 && !releasePresentationByPath.has(pathB); index += 1) {
+						await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+					}
+					let finalPath = pathB;
+					let finalContent = contentB;
+					let finalYText = ytextB;
+					if (contentC !== null) {
+						await loadPromises[0];
+						await view.onUnloadFile(fileB);
+						view.file = fileC;
+						loadPromises.push(view.onLoadFile(fileC));
+						finalPath = pathC;
+						finalContent = contentC;
+						finalYText = ytextC;
+						for (let index = 0; index < 40 && !releasePresentationByPath.has(pathC); index += 1) {
+							await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+						}
+					}
+					view.requestSave();
+					const beforeReceipt = {
+						cmContent: cm.state.doc.toString(),
+						bindingDetached: manager.getBinding(view) === null,
+						gateInstalled: manager.getManagedSession(view)?.handoff?.inputGateInstalled === true,
+						originalSaveCalls,
+						activityTransferred: manager.getLastEditorActivityForPath(finalPath) !== null,
+						releaseReady: releasePresentationByPath.has(finalPath),
+					};
+					releasePresentationByPath.get(finalPath)?.();
+					await Promise.all(loadPromises);
+					for (let index = 0; index < 30 && manager.getBinding(view)?.path !== finalPath; index += 1) {
+						await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+						await Promise.resolve();
+					}
+					const targetBinding = manager.getBinding(view);
+					const beforeUndo = finalYText.toString();
+						targetBinding?.undoManager.undo();
+						await Promise.resolve();
+						view.requestSave();
+						await view.requestSave.flush();
+						const result = {
+						beforeReceipt,
+						cmContent: cm.state.doc.toString(),
+						yContent: finalYText.toString(),
+						boundPath: targetBinding?.path ?? null,
+						sourceUndoDestroyed,
+						targetLoadUndoable: finalYText.toString() !== beforeUndo,
+						originalSaveCalls,
+						controllerCalls,
+						presentationRequestedInsideHostLoad,
+						presentationReadyNotifications,
+						handoffCleared: manager.getManagedSession(view)?.handoff === null,
+						finalContent,
+					};
+					manager.unbindAll();
+					cm.destroy();
+					doc.destroy();
+					return result;
+					};
+					return {
+						different: await runScenario({
+							suffix: "different",
+							contentA: "source A",
+							contentB: "target B",
+						}),
+						identical: await runScenario({
+							suffix: "identical",
+							contentA: "same bytes",
+							contentB: "same bytes",
+						}),
+						retried: await runScenario({
+							suffix: "retried",
+							contentA: "source before stale bind proof",
+							contentB: "target after fresh bind proof",
+							failFirstBindFreshness: true,
+						}),
+						presentationRetried: await runScenario({
+							suffix: "presentation-retried",
+							contentA: "source before deferred presentation",
+							contentB: "target after fresh presentation proof",
+							deferFirstPresentation: true,
+						}),
+						completionRetried: await runScenario({
+							suffix: "completion-retried",
+							contentA: "source before completion replan",
+							contentB: "target after completion reproof",
+							replanFirstCompletion: true,
+						}),
+						superseded: await runScenario({
+							suffix: "superseded",
+							contentA: "source before supersession",
+							contentB: "stale target B",
+							contentC: "current target C",
+						}),
+					};
+				})();
+	`;
+	const childScript = `
+		import { build } from "esbuild";
+		import { chromium } from "playwright";
+		const repoRoot = ${JSON.stringify(repoRoot)};
+		const obsidianMockPath = ${JSON.stringify(obsidianMockPath)};
+		const browserEntry = ${JSON.stringify(browserEntry)};
+		const browserBundle = await build({
+			stdin: { resolveDir: repoRoot, loader: "ts", contents: browserEntry },
+			bundle: true,
+			format: "iife",
+			platform: "browser",
+			target: "chrome120",
+			write: false,
+			plugins: [{
+				name: "task6-obsidian-mock",
+				setup(esbuild) {
+					esbuild.onResolve({ filter: /^obsidian$/ }, () => ({ path: obsidianMockPath }));
+				},
+			}],
+		});
+		let browser = null;
+		for (const options of [{}, { channel: "chrome" }]) {
+			try {
+				browser = await chromium.launch({ ...options, headless: true });
+				break;
+			} catch {}
+		}
+		if (!browser) throw new Error("No supported Chromium could launch");
+		try {
+			const page = await browser.newPage();
+			await page.setContent("<!doctype html><html><body></body></html>");
+			await page.addScriptTag({ content: browserBundle.outputFiles[0]?.text ?? "" });
+			const result = await page.evaluate(async () => ({
+				task6: await window.__TASK6_STALE_DISPATCH__,
+				task9: await window.__TASK9_GUARDED_PRESENTATION__,
+			}));
+			console.log("TASK6_RESULT=" + JSON.stringify(result.task6));
+			console.log("TASK9_RESULT=" + JSON.stringify(result.task9));
+		} finally {
+			await browser.close();
+		}
+	`;
+	const child = spawnSync(
+		process.execPath,
+		["--input-type=module", "--eval", childScript],
+		{ cwd: repoRoot, encoding: "utf8", timeout: 30_000 },
+	);
+	if (child.status !== 0) {
+		console.error(child.stderr || child.error?.message || "browser subprocess failed without stderr");
+	}
+	assertEq(child.status, 0, "real guard browser subprocess completes");
+	if (child.status === 0) {
+		const resultLine = child.stdout.split("\n").find((line) => line.startsWith("TASK6_RESULT="));
+		const result = JSON.parse(resultLine?.slice("TASK6_RESULT=".length) ?? "null") as {
+			initiallyBound: boolean;
+			cmContent: string;
+			yContent: string;
+			bindingDetached: boolean;
+			lineagePath: string | null;
+			admissionCount: number;
+		};
+		assertEq(result.initiallyBound, true, "real guard fixture starts with A bound");
+		assertEq(result.cmContent, "source", "stale user dispatch never reaches CodeMirror");
+		assertEq(result.yContent, "source", "stale user dispatch never reaches Y.Text");
+		assertEq(result.bindingDetached, true, "stale user dispatch leaves the binding detached");
+		assertEq(result.lineagePath, "Notes/browser-A.md", "stale user dispatch preserves A lineage");
+		assertEq(result.admissionCount, 1, "stale user dispatch requests B admission exactly once");
+
+		const task9Line = child.stdout.split("\n").find((line) => line.startsWith("TASK9_RESULT="));
+		type Task9ScenarioResult = {
+			beforeReceipt: {
+				cmContent: string;
+				bindingDetached: boolean;
+				gateInstalled: boolean;
+				originalSaveCalls: number;
+				activityTransferred: boolean;
+				releaseReady: boolean;
+			};
+			cmContent: string;
+			yContent: string;
+			boundPath: string | null;
+			sourceUndoDestroyed: number;
+			targetLoadUndoable: boolean;
+			originalSaveCalls: number;
+			controllerCalls: string[];
+			presentationRequestedInsideHostLoad: boolean;
+			presentationReadyNotifications: Array<{
+				path: string;
+				bindingPath: string | null;
+				presentation: string | null;
+			}>;
+			handoffCleared: boolean;
+			finalContent: string;
+		};
+		const task9Scenarios = JSON.parse(
+			task9Line?.slice("TASK9_RESULT=".length) ?? "null",
+		) as {
+			different: Task9ScenarioResult;
+			identical: Task9ScenarioResult;
+			retried: Task9ScenarioResult;
+			presentationRetried: Task9ScenarioResult;
+			completionRetried: Task9ScenarioResult;
+			superseded: Task9ScenarioResult;
+		};
+		const task9 = task9Scenarios.different;
+		assertEq(task9.beforeReceipt.releaseReady, true, "target presentation proof is requested for held B");
+		assertEq(
+			task9.presentationReadyNotifications.length,
+			1,
+			"target presentation readiness is published exactly once",
+		);
+		assertEq(
+			task9.presentationReadyNotifications[0]?.path,
+			"Notes/task9-browser-different-B.md",
+			"presentation readiness carries the exact B path",
+		);
+		assertEq(
+			task9.presentationReadyNotifications[0]?.bindingPath,
+			null,
+			"presentation readiness is published before target binding",
+		);
+		assertEq(
+			task9.presentationReadyNotifications[0]?.presentation,
+			"target-proven",
+			"presentation readiness is published only after reducer proof",
+		);
+		assertEq(
+			task9.presentationRequestedInsideHostLoad,
+			false,
+			"target presentation admission starts only after the exact host load dispatch returns",
+		);
+		assertEq(task9.beforeReceipt.cmContent, "source A", "B does not enter CodeMirror before proof");
+		assertEq(task9.beforeReceipt.bindingDetached, true, "B remains unbound before proof");
+		assertEq(task9.beforeReceipt.gateInstalled, true, "input gate remains installed before proof");
+		assertEq(
+			task9.beforeReceipt.originalSaveCalls,
+			1,
+			"only the forced source-retirement save runs before proof",
+		);
+		assertEq(task9.beforeReceipt.activityTransferred, false, "A activity is not relabelled B before proof");
+		assertEq(task9.cmContent, "target B", "certified B host transaction is presented exactly once");
+		assertEq(task9.yContent, "target B", "B Y.Text remains authoritative after binding");
+		assertEq(task9.boundPath, "Notes/task9-browser-different-B.md", "replacement token binds exact B path");
+		assertEq(task9.sourceUndoDestroyed, 1, "A Y.UndoManager is destroyed exactly once");
+		assertEq(task9.targetLoadUndoable, false, "B host load is absent from the new Y undo history");
+		assertEq(
+			task9.originalSaveCalls,
+			2,
+			"ordinary save pass-through resumes only after target proof",
+		);
+		assertEq(task9.handoffCleared, true, "successful bind returns the managed leaf to stable state");
+		assertEq(task9.controllerCalls.join("|"), [
+			"request-presentation",
+			"consume-presentation",
+			"complete-presentation",
+			"request-open-admission",
+			"check-bind-freshness",
+			"consume-bind",
+		].join("|"), "presentation and bind permits are consumed in order");
+		const identical = task9Scenarios.identical;
+		assertEq(identical.beforeReceipt.cmContent, "same bytes", "equal A/B bytes still wait for identity proof");
+		assertEq(identical.beforeReceipt.bindingDetached, true, "equal bytes cannot retain A's binding as B");
+		assertEq(identical.boundPath, "Notes/task9-browser-identical-B.md", "equal bytes bind only the exact B token");
+		assertEq(identical.handoffCleared, true, "equal-byte handoff also returns to stable state");
+		assertEq(identical.controllerCalls.join("|"), task9.controllerCalls.join("|"), "equal bytes use the same one-shot permit sequence");
+		const retried = task9Scenarios.retried;
+		assertEq(
+			retried.boundPath,
+			"Notes/task9-browser-retried-B.md",
+			"a stale final freshness check schedules a fresh target admission and eventually binds B",
+		);
+		assertEq(
+			retried.controllerCalls.filter((call) => call === "request-open-admission").length,
+			2,
+			"stale final freshness performs exactly one fresh admission retry",
+		);
+		assertEq(
+			retried.controllerCalls.filter((call) => call === "check-bind-freshness").length,
+			2,
+			"the retry rechecks freshness instead of reusing the stale decision",
+		);
+		assertEq(
+			retried.controllerCalls.filter((call) => call === "consume-bind").length,
+			1,
+			"only the fresh retry consumes the one-shot bind permit",
+		);
+		assertEq(retried.handoffCleared, true, "successful retry closes the managed handoff");
+		const presentationRetried = task9Scenarios.presentationRetried;
+		assertEq(
+			presentationRetried.boundPath,
+			"Notes/task9-browser-presentation-retried-B.md",
+			"a deferred target presentation schedules a fresh proof and eventually binds B",
+		);
+		assertEq(
+			presentationRetried.controllerCalls.filter((call) => call === "request-presentation").length,
+			2,
+			"deferred presentation is retried with one fresh controller request",
+		);
+		assertEq(
+			presentationRetried.controllerCalls.filter((call) => call === "consume-presentation").length,
+			1,
+			"only the fresh presentation plan consumes a one-shot permit",
+		);
+		assertEq(presentationRetried.handoffCleared, true, "presentation retry closes the handoff");
+		const completionRetried = task9Scenarios.completionRetried;
+		assertEq(
+			completionRetried.boundPath,
+			"Notes/task9-browser-completion-retried-B.md",
+			"a transient completion replan retries the same host receipt and eventually binds B",
+		);
+		assertEq(
+			completionRetried.controllerCalls.filter((call) => call === "consume-presentation").length,
+			1,
+			"completion retry never consumes a second presentation permit",
+		);
+		assertEq(
+			completionRetried.controllerCalls.filter((call) => call === "complete-presentation").length,
+			2,
+			"completion retry revalidates the same completed host mutation",
+		);
+		assertEq(completionRetried.handoffCleared, true, "completion retry closes the handoff");
+		const superseded = task9Scenarios.superseded;
+		assertEq(superseded.beforeReceipt.cmContent, "source before supersession", "stale B never enters CM before C proof");
+		assertEq(superseded.cmContent, "current target C", "only the current C host load is presented");
+		assertEq(superseded.yContent, "current target C", "only C Y.Text becomes bound authority");
+		assertEq(superseded.boundPath, "Notes/task9-browser-superseded-C.md", "B presentation cannot bind across C supersession");
+		assertEq(superseded.sourceUndoDestroyed, 1, "A authority detaches once across B-to-C supersession");
+		assertEq(
+			superseded.beforeReceipt.originalSaveCalls,
+			1,
+			"only proven source A is saved while unproven B rolls its exact held receipt",
+		);
+		assertEq(superseded.handoffCleared, true, "C binding closes the superseded handoff");
+		assertEq(
+			superseded.controllerCalls.filter((call) => call === "request-presentation").length,
+			2,
+			"B and C each request proof without sharing a permit",
+		);
+		assertEq(
+			superseded.controllerCalls.filter((call) => call === "consume-presentation").length,
+			1,
+			"only C consumes a presentation permit",
+		);
+	}
+}
+
+console.log("\n--- Test 33: replacement TFile makes cache rollback continuation fail closed ---");
+{
+	const externalContent = "external bytes with a replacement TFile";
+	const { manager, binding, setLiveEditorContent } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	setLiveEditorContent(externalContent);
+	(binding.view as unknown as { file: unknown }).file = {
+		path: binding.path,
+		stat: binding.file.stat,
+	};
+	let dispatches = 0;
+	(binding.cm as unknown as { dispatch: (spec: TransactionSpec) => void }).dispatch = () => {
+		dispatches += 1;
+	};
+	const runtime = manager as unknown as {
+		deferExternalReloadFilterBypassRollback: (
+			cm: unknown,
+			bypass: {
+				path: string;
+				leafId: string;
+				bindingEpoch: number;
+				beforeContent: string;
+				externalContent: string;
+			},
+		) => void;
+	};
+	const callback = captureSingleMicrotask(() => {
+		runtime.deferExternalReloadFilterBypassRollback(binding.cm, {
+			path: binding.path,
+			leafId: "leaf-1",
+			bindingEpoch: 0,
+			beforeContent: "typing now",
+			externalContent,
+		});
+	});
+	callback();
+
+	assertEq(dispatches, 0, "replacement TFile authorizes zero CM/cache mutation");
+	assertEq(binding.ytext.toString(), "server text", "replacement TFile leaves Y.Text unchanged");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 34: A-to-B-to-C stale retries cannot consume C timer slots ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const runtime = manager as unknown as {
+		manageView: (view: unknown) => unknown;
+		beginPathHandoff: (view: unknown, file: unknown, reason: string) => boolean;
+		scheduleCmResolveRetry: (view: unknown, deviceName: string, leafId: string, source: string) => void;
+		scheduleHealthCheck: (leafId: string, delayMs: number, source: string) => void;
+		pendingCmResolveRetries: Map<string, unknown>;
+		pendingHealthChecks: Map<string, unknown>;
+		maybeHealBinding: (...args: unknown[]) => void;
+	};
+	const mutableView = binding.view as unknown as { file: unknown };
+	const fileB = { path: "Notes/retry-B.md" };
+	const fileC = { path: "Notes/retry-C.md" };
+	runtime.manageView(binding.view);
+	mutableView.file = fileB;
+	runtime.beginPathHandoff(binding.view, fileB, "retry-B");
+	runtime.scheduleCmResolveRetry(binding.view, "TestDevice", "leaf-1", "retry-B");
+	const staleCmTimer = runtime.pendingCmResolveRetries.get("leaf-1");
+	const runStaleCmTimer = staleCmTimer ? captureNodeTimerCallback(staleCmTimer) : null;
+	assertEq(staleCmTimer !== undefined, true, "B CM retry callback is scheduled");
+	if (staleCmTimer) {
+		clearTimeout(staleCmTimer as ReturnType<typeof setTimeout>);
+		runtime.pendingCmResolveRetries.delete("leaf-1");
+	}
+
+	mutableView.file = fileC;
+	runtime.beginPathHandoff(binding.view, fileC, "retry-C");
+	runtime.scheduleCmResolveRetry(binding.view, "TestDevice", "leaf-1", "retry-C");
+	const currentCmTimer = runtime.pendingCmResolveRetries.get("leaf-1");
+	let bindCalls = 0;
+	(manager as unknown as { bind: (...args: unknown[]) => void }).bind = () => {
+		bindCalls += 1;
+	};
+	runStaleCmTimer?.();
+	assertEq(bindCalls, 0, "stale B CM retry performs no C bind mutation");
+	assertEq(
+		runtime.pendingCmResolveRetries.get("leaf-1"),
+		currentCmTimer,
+		"stale B CM retry cannot delete C's timer slot",
+	);
+
+	if (currentCmTimer) {
+		clearTimeout(currentCmTimer as ReturnType<typeof setTimeout>);
+		runtime.pendingCmResolveRetries.delete("leaf-1");
+	}
+	mutableView.file = fileB;
+	runtime.beginPathHandoff(binding.view, fileB, "health-B");
+	runtime.scheduleHealthCheck("leaf-1", 60_000, "health-B");
+	const staleHealthTimer = runtime.pendingHealthChecks.get("leaf-1");
+	const runStaleHealthTimer = staleHealthTimer ? captureNodeTimerCallback(staleHealthTimer) : null;
+	assertEq(staleHealthTimer !== undefined, true, "B health callback is scheduled");
+	if (staleHealthTimer) {
+		clearTimeout(staleHealthTimer as ReturnType<typeof setTimeout>);
+		runtime.pendingHealthChecks.delete("leaf-1");
+	}
+	mutableView.file = fileC;
+	runtime.beginPathHandoff(binding.view, fileC, "health-C");
+	runtime.scheduleHealthCheck("leaf-1", 60_000, "health-C");
+	const currentHealthTimer = runtime.pendingHealthChecks.get("leaf-1");
+	let healCalls = 0;
+	runtime.maybeHealBinding = () => { healCalls += 1; };
+	runStaleHealthTimer?.();
+	assertEq(healCalls, 0, "stale B health callback performs no C repair mutation");
+	assertEq(
+		runtime.pendingHealthChecks.get("leaf-1"),
+		currentHealthTimer,
+		"stale B health callback cannot delete C's timer slot",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 35: A-to-B-to-C invalidates the provider shield continuation ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	const runtime = manager as unknown as {
+		manageView: (view: unknown) => unknown;
+		beginPathHandoff: (view: unknown, file: unknown, reason: string) => boolean;
+		pendingYTextPatches: WeakMap<Y.Text, unknown>;
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+		applyEditorAuthorityAfterShield: (...args: unknown[]) => void;
+	};
+	runtime.manageView(binding.view);
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "provider-boundary-C2");
+	runtime.pendingYTextPatches.set(binding.ytext, {
+		origin: ORIGIN_DISK_SYNC_RECOVER_BOUND,
+		path: binding.path,
+		leafId: "leaf-1",
+		at: Date.now(),
+	});
+	const transaction = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "provider-boundary-C2" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+	let applyCalls = 0;
+	runtime.applyEditorAuthorityAfterShield = () => { applyCalls += 1; };
+	const callback = captureSingleMicrotask(() => {
+		runtime.filterRiskyNonUserPatch(transaction);
+	});
+
+	// A provider successor and two target selections land before the old shield
+	// continuation. The old callback must not enter any leaf mutation routine.
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "provider-C3");
+	const mutableView = binding.view as unknown as { file: unknown };
+	const fileB = { path: "Notes/shield-B.md" };
+	const fileC = { path: "Notes/shield-C.md" };
+	mutableView.file = fileB;
+	runtime.beginPathHandoff(binding.view, fileB, "shield-B");
+	mutableView.file = fileC;
+	runtime.beginPathHandoff(binding.view, fileC, "shield-C");
+	callback();
+
+	assertEq(applyCalls, 0, "stale shield callback never enters editor/Y.Text apply code");
+	assertEq(binding.ytext.toString(), "provider-C3", "stale shield leaves provider authority unchanged");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 36: delayed cache rollback is generation scoped across A-to-B-to-C ---");
+{
+	const externalContent = "external A cache";
+	const { manager, binding, setLiveEditorContent } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const runtime = manager as unknown as {
+		manageView: (view: unknown) => unknown;
+		beginPathHandoff: (view: unknown, file: unknown, reason: string) => boolean;
+		deferExternalReloadFilterBypassRollback: (cm: unknown, bypass: {
+			path: string;
+			leafId: string;
+			bindingEpoch: number;
+			beforeContent: string;
+			externalContent: string;
+		}) => void;
+		bindingEpochByLeafId: Map<string, number>;
+	};
+	runtime.manageView(binding.view);
+	setLiveEditorContent(externalContent);
+	let dispatches = 0;
+	(binding.cm as unknown as { dispatch: (spec: TransactionSpec) => void }).dispatch = () => {
+		dispatches += 1;
+	};
+	const callback = captureSingleMicrotask(() => {
+		runtime.deferExternalReloadFilterBypassRollback(binding.cm, {
+			path: binding.path,
+			leafId: "leaf-1",
+			bindingEpoch: runtime.bindingEpochByLeafId.get("leaf-1") ?? 0,
+			beforeContent: "typing now",
+			externalContent,
+		});
+	});
+	const mutableView = binding.view as unknown as { file: unknown };
+	const fileB = { path: "Notes/cache-B.md" };
+	const fileC = { path: "Notes/cache-C.md" };
+	mutableView.file = fileB;
+	runtime.beginPathHandoff(binding.view, fileB, "cache-B");
+	mutableView.file = fileC;
+	runtime.beginPathHandoff(binding.view, fileC, "cache-C");
+	const dispatchesBeforeStaleCallback = dispatches;
+	callback();
+
+	assertEq(
+		dispatches,
+		dispatchesBeforeStaleCallback,
+		"stale A cache rollback performs no C CM mutation",
+	);
+	assertEq(binding.ytext.toString(), "server text", "stale cache rollback performs no Y.Text mutation");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 37: open-editor tickets validate every captured identity and authority value ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const runtime = manager as unknown as {
+		manageView: (view: unknown) => unknown;
+		viewIds: WeakMap<object, string>;
+		cmIds: WeakMap<object, string>;
+		editorAuthorityRevisionByCm: WeakMap<object, number>;
+		editorAuthorityContentByCm: WeakMap<object, string>;
+	};
+	runtime.manageView(binding.view);
+	const capture = () => manager.captureOpenEditorMutationTicket(binding.path, [binding.view as never]);
+	let ticket = capture();
+	assertEq(
+		manager.validateOpenEditorMutationTicket(ticket, [binding.view as never]).current,
+		true,
+		"baseline exact ticket is current",
+	);
+	runtime.viewIds.set(binding.view, `${ticket.views[0]!.viewId}-replacement`);
+	let validation = manager.validateOpenEditorMutationTicket(ticket, [binding.view as never]);
+	assertEq(validation.current ? null : validation.reason, "view-id-changed", "viewId value is validated");
+
+	ticket = capture();
+	runtime.cmIds.set(binding.cm, `${ticket.views[0]!.cmId}-replacement`);
+	validation = manager.validateOpenEditorMutationTicket(ticket, [binding.view as never]);
+	assertEq(validation.current ? null : validation.reason, "cm-id-changed", "cmId value is validated");
+
+	ticket = capture();
+	runtime.editorAuthorityRevisionByCm.set(
+		binding.cm,
+		ticket.views[0]!.editorAuthorityRevision + 1,
+	);
+	validation = manager.validateOpenEditorMutationTicket(ticket, [binding.view as never]);
+	assertEq(
+		validation.current ? null : validation.reason,
+		"editor-authority-revision-changed",
+		"editor authority revision is validated",
+	);
+
+	ticket = capture();
+	runtime.editorAuthorityContentByCm.set(binding.cm, "different editor authority bytes");
+	validation = manager.validateOpenEditorMutationTicket(ticket, [binding.view as never]);
+	assertEq(
+		validation.current ? null : validation.reason,
+		"editor-authority-content-changed",
+		"editor authority content is validated",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 38: workspace orchestration manages before bind and keeps layout validation-only ---");
+{
+	const calls: string[] = [];
+	const view = Object.assign(new MarkdownView(), {
+		file: { path: "Notes/orchestrator.md" },
+		leaf: { id: "orchestrator-leaf" },
+		editor: { getValue: () => "" },
+	});
+	const leaf = { view };
+	const fileContextSideView = Object.assign(new MarkdownView(), {
+		file: view.file,
+		leaf: { id: "orchestrator-outline-leaf" },
+		getViewType: () => "outline",
+	});
+	let exposeActiveLeafThroughIteration = true;
+	const bindings = {
+		manageView: () => { calls.push("manage"); },
+		excludeView: () => { calls.push("exclude"); },
+		getBindingDebugInfoForView: () => null,
+		getBindingHealthForView: () => ({ bound: false, healthy: false, settling: false, issues: [] }),
+		bind: () => { calls.push("bind"); },
+		auditBindings: () => { calls.push("audit"); return 0; },
+		reconcileManagedWorkspaceViews: (views: readonly unknown[], reason: string) => {
+			calls.push(`reconcile:${reason}:${views.length}`);
+			return 0;
+		},
+		clearLocalCursor: () => {},
+	};
+	const workspace = {
+		activeLeaf: leaf,
+		iterateAllLeaves: (callback: (candidate: typeof leaf) => void) => {
+			if (exposeActiveLeafThroughIteration) callback(leaf);
+			callback({ view: fileContextSideView } as typeof leaf);
+		},
+		getActiveViewOfType: () => view,
+	};
+	const orchestrator = new EditorWorkspaceOrchestrator({
+		app: { workspace } as never,
+		getSettings: () => ({ deviceName: "TestDevice" }) as never,
+		getEditorBindings: () => bindings as never,
+		getDiskMirror: () => null,
+		isMarkdownPathSyncable: (path: string) => path.endsWith(".md"),
+		scheduleTraceStateSnapshot: () => {},
+		log: () => {},
+	});
+
+	orchestrator.validateOpenBindings("behavioral-order");
+	assertEq(calls.indexOf("manage") < calls.indexOf("bind"), true, "validation manages the view before bind");
+	assertEq(
+		calls.filter((call) => call === "manage").length,
+		1,
+		"file-context sidebar views are never managed as Markdown editors",
+	);
+	assertEq(
+		calls.filter((call) => call === "bind").length,
+		1,
+		"file-context sidebar views never enter editor binding",
+	);
+	calls.length = 0;
+	orchestrator.onLayoutChange();
+	assertEq(calls.includes("bind"), false, "layout-change remains a validation/audit wake-up only");
+	assertEq(calls.includes("audit"), true, "layout-change performs its health audit");
+	assertEq(
+		calls.includes("reconcile:layout-change:1"),
+		true,
+		"layout-change reconciles exact workspace view ownership",
+	);
+	exposeActiveLeafThroughIteration = false;
+	calls.length = 0;
+	orchestrator.onLayoutChange();
+	assertEq(
+		calls.includes("reconcile:layout-change:1"),
+		true,
+		"active leaf identity survives a transient iterateAllLeaves omission",
+	);
+	exposeActiveLeafThroughIteration = true;
+	calls.length = 0;
+	orchestrator.onActiveLeafChange(leaf as never);
+	assertEq(calls.indexOf("manage") < calls.indexOf("bind"), true, "active-leaf binding manages before bind");
+}
+
+console.log("\n--- Test 38a: exact workspace view removal revokes managed ownership ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const reconcile = (manager as unknown as {
+		reconcileManagedWorkspaceViews?: (
+			views: readonly unknown[],
+			reason: string,
+		) => number;
+	}).reconcileManagedWorkspaceViews;
+	assertEq(typeof reconcile, "function", "manager exposes exact workspace-view reconciliation");
+	if (reconcile) {
+		assertEq(
+			reconcile.call(manager, [binding.view], "retained-test"),
+			0,
+			"the exact live workspace view retains managed ownership",
+		);
+		assertEq(
+			reconcile.call(manager, [], "closed-test"),
+			1,
+			"a view absent by exact identity is revoked once",
+		);
+		assertEq(
+			manager.getManagedSession(binding.view as never),
+			null,
+			"closed workspace view leaves no managed session",
+		);
+		assertEq(manager.getBinding(binding.view as never), null, "closed view leaves no binding");
+	}
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 39: exact TFile rename translates managed lineage without opening a handoff ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const runtime = manager as unknown as {
+		manageView: (view: unknown) => { generation: number };
+		vaultSync: {
+			getTextForPath: (path: string) => Y.Text | null;
+			getFileId: (path: string) => string | undefined;
+			getFileIdForText: (text: Y.Text) => string | undefined;
+		};
+		recordYTextPatch: (ytext: Y.Text, path: string, leafId: string, transaction: Y.Transaction) => void;
+		pendingYTextPatches: WeakMap<Y.Text, { path: string }>;
+	};
+	const oldPath = binding.path;
+	const renamedPath = "Notes/typing-renamed.md";
+	const before = runtime.manageView(binding.view);
+	(binding.file as unknown as { path: string }).path = renamedPath;
+	manager.bind(binding.view as never, "TestDevice");
+	const transientSession = manager.getManagedSession(binding.view as never);
+	assertEq(binding.path, oldPath, "generic bind cannot translate an in-place rename before batch proof");
+	assertEq(
+		transientSession?.displayedLineage.kind === "known"
+			? transientSession.displayedLineage.path
+			: null,
+		oldPath,
+		"transient in-place rename retains source displayed lineage",
+	);
+	assertEq(
+		(runtime as unknown as { getCodeMirrorHandoffContext: (leafId: string) => unknown })
+			.getCodeMirrorHandoffContext("leaf-1"),
+		null,
+		"stable CodeMirror context closes until rename proof translates the path",
+	);
+	runtime.vaultSync.getTextForPath = (path) => path === renamedPath ? binding.ytext : null;
+	runtime.vaultSync.getFileId = (path) => path === renamedPath ? binding.fileId : undefined;
+	runtime.vaultSync.getFileIdForText = (text) => text === binding.ytext ? binding.fileId : undefined;
+	manager.updatePathsAfterRename(new Map([[oldPath, renamedPath]]));
+	const session = manager.getManagedSession(binding.view as never);
+
+	assertEq(binding.path, renamedPath, "exact rename updates binding metadata");
+	assertEq(session?.generation, before.generation + 1, "exact rename advances managed generation once");
+	assertEq(session?.handoff, null, "exact rename does not create or retain a handoff");
+	assertEq(
+		session?.displayedLineage.kind === "known" ? session.displayedLineage.path : null,
+		renamedPath,
+		"exact rename translates displayed lineage path",
+	);
+	assertEq(
+		session?.binding.kind === "bound" ? session.binding.path : null,
+		renamedPath,
+		"exact rename translates managed binding path",
+	);
+	assertEq(
+		session?.displayedLineage.kind === "known" ? session.displayedLineage.file : null,
+		binding.file,
+		"exact rename preserves the exact TFile identity",
+	);
+	assertEq(
+		manager.capturePathEditorAuthority(renamedPath).kind,
+		"proven-single",
+		"exact rename remains eligible for path authority",
+	);
+
+	// The y-codemirror observer was installed under oldPath. A provider patch
+	// after the exact rename must resolve the current proven binding path.
+	runtime.recordYTextPatch(
+		binding.ytext,
+		oldPath,
+		"leaf-1",
+		{ origin: { provider: true } } as Y.Transaction,
+	);
+	assertEq(
+		runtime.pendingYTextPatches.get(binding.ytext)?.path,
+		renamedPath,
+		"provider provenance follows the exact renamed path",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 40: uncertain rename identity remains quarantined ---");
+{
+	const admissions: Array<{
+		targetFile: unknown;
+		targetPath: string;
+		handoffGeneration: number;
+	}> = [];
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		onOpenPathAdmissionRequested: (request) => admissions.push(request as never),
+	});
+	const oldPath = binding.path;
+	const renamedPath = "Notes/typing-uncertain.md";
+	manager.manageView(binding.view as never);
+	const replacementFile = { path: renamedPath };
+	(binding.view as unknown as { file: unknown }).file = replacementFile;
+	let undoDestroyCalls = 0;
+	const originalDestroy = binding.undoManager.destroy.bind(binding.undoManager);
+	(binding.undoManager as unknown as { destroy: () => void }).destroy = () => {
+		undoDestroyCalls += 1;
+		originalDestroy();
+	};
+	let oldYTextMutations = 0;
+	const observeOldYText = () => { oldYTextMutations += 1; };
+	binding.ytext.observe(observeOldYText);
+	manager.updatePathsAfterRename(new Map([[oldPath, renamedPath]]));
+	binding.ytext.unobserve(observeOldYText);
+	const session = manager.getManagedSession(binding.view as never);
+
+	assertEq(manager.getBinding(binding.view as never), null, "uncertain rename detaches old yCollab binding");
+	assertEq(undoDestroyCalls, 1, "uncertain rename destroys the old UndoManager exactly once");
+	assertEq(oldYTextMutations, 0, "uncertain rename performs no old-Y.Text mutation");
+	assertEq(
+		session?.displayedLineage.kind === "known" ? session.displayedLineage.path : null,
+		oldPath,
+		"unproven TFile replacement does not translate displayed lineage",
+	);
+	assertEq(session?.handoff?.targetFile, replacementFile, "uncertain rename retains exact target TFile");
+	assertEq(session?.handoff?.targetPath, renamedPath, "uncertain rename waits on target admission");
+	assertEq(admissions.length, 1, "uncertain rename requests one target admission");
+	assertEq(admissions[0]?.targetFile, replacementFile, "rename admission carries exact replacement TFile");
+	assertEq(
+		manager.capturePathEditorAuthority(renamedPath).kind,
+		"blocked",
+		"uncertain rename keeps the path authority gate closed",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 41: public A-to-B-to-C wakes supersede the detached B generation ---");
+{
+	const admissions: Array<{
+		targetFile: unknown;
+		targetPath: string;
+		handoffGeneration: number;
+		switchIntentSeq: number | null;
+	}> = [];
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		onOpenPathAdmissionRequested: (request) => admissions.push(request as never),
+	});
+	manager.manageView(binding.view as never);
+	let undoDestroyCalls = 0;
+	const originalDestroy = binding.undoManager.destroy.bind(binding.undoManager);
+	(binding.undoManager as unknown as { destroy: () => void }).destroy = () => {
+		undoDestroyCalls += 1;
+		originalDestroy();
+	};
+	const fileB = { path: "Notes/public-B.md" };
+	const fileC = { path: "Notes/public-C.md" };
+	(binding.view as unknown as { file: unknown }).file = fileB;
+	manager.bind(binding.view as never, "TestDevice");
+	const generationB = manager.getManagedSession(binding.view as never)?.generation ?? -1;
+	(binding.view as unknown as { file: unknown }).file = fileC;
+	manager.bind(binding.view as never, "TestDevice");
+	const current = manager.getManagedSession(binding.view as never);
+
+	assertEq(manager.getBinding(binding.view as never), null, "first public wake detaches A binding");
+	assertEq(undoDestroyCalls, 1, "A UndoManager is destroyed once across B-to-C supersession");
+	assertEq(admissions.length, 2, "B and C each request one exact admission wake");
+	assertEq(admissions[0]?.targetFile, fileB, "first wake carries exact B TFile");
+	assertEq(admissions[0]?.handoffGeneration, generationB, "B wake carries the B generation");
+	assertEq(admissions[1]?.targetFile, fileC, "second wake carries exact C TFile");
+	assertEq(
+		admissions[1]?.handoffGeneration,
+		current?.generation,
+		"C wake carries only the current C generation",
+	);
+	assertEq(
+		(admissions[1]?.handoffGeneration ?? -1) > generationB,
+		true,
+		"C never reuses the detached B generation",
+	);
+	assertEq(current?.handoff?.targetFile, fileC, "managed handoff retains only C target identity");
+	assertEq(
+		current?.displayedLineage.kind === "known" ? current.displayedLineage.file : null,
+		binding.file,
+		"B-to-C supersession retains source A displayed lineage",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 42: initial no-CM session waits for target presentation after CM resolves ---");
+{
+	const { manager, binding, setLiveEditorContent } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	setLiveEditorContent("server text");
+	manager.unbindAll();
+	(manager as unknown as { knownCmViews: Set<unknown> }).knownCmViews.delete(binding.cm);
+	const initial = manager.manageView(binding.view as never);
+	assertEq(initial.displayedLineage.kind, "unknown", "initial unresolved session starts unknown");
+	(manager as unknown as { knownCmViews: Set<unknown> }).knownCmViews.add(binding.cm);
+	installManagedBoundaryStubs(manager, binding.view, binding.cm);
+	manager.bind(binding.view as never, "TestDevice");
+	const settled = manager.getManagedSession(binding.view as never);
+
+	assertEq(manager.getBinding(binding.view as never), null, "CM resolution alone never attaches target Y.Text");
+	assertEq(settled?.displayedLineage.kind, "unknown", "resolved CM remains unknown before presentation");
+	assertEq(settled?.binding.kind, "unbound", "initial session remains unbound before presentation");
+	assertEq(settled?.handoff?.targetFile, binding.view.file, "resolved target waits in a closed handoff");
+	manager.unbindAll();
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 42a: exact stable presentation opens the initial null-context gate ---");
+{
+	const { manager, binding, setLiveEditorContent } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	setLiveEditorContent("server text");
+	manager.unbindAll();
+	Object.assign(binding.view, {
+		getViewData: () => binding.view.editor.getValue(),
+	});
+	const initial = manager.manageView(binding.view as never);
+	assertEq(initial.displayedLineage.kind, "unknown", "late-managed initial session starts unknown");
+	const runtime = (manager as unknown as {
+		managedSessions: Map<string, {
+			session: unknown;
+			hostGuard: unknown;
+			cmGuard: unknown;
+		}>;
+		admitStableInitialSamePathPresentation(
+			runtime: unknown,
+			cm: unknown,
+		): void;
+	}).managedSessions.get("leaf-1");
+	if (!runtime) throw new Error("Expected late-managed runtime");
+	const hostMethod = () => {};
+	runtime.hostGuard = {
+		markInert: () => true,
+		restoreIfCurrent: () => true,
+		snapshot: () => ({
+			leafId: "leaf-1",
+			view: binding.view,
+			originalRequestSave: hostMethod,
+			originalSave: hostMethod,
+			installedRequestSave: hostMethod,
+			installedSave: hostMethod,
+			hostCapability: "owned-scheduler-with-unload-flush",
+			hostCapabilityState: "ready",
+			saveEpoch: 0,
+			clearLoadCapability: "observable",
+			mode: { kind: "pass-through" },
+			inFlight: new Map(),
+			pendingTargetSave: false,
+			pendingOwnedSave: null,
+			sourceUnload: null,
+		}),
+	};
+	let gateClosed = true;
+	let refreshCalls = 0;
+	runtime.cmGuard = {
+		refreshGate: () => {
+			refreshCalls += 1;
+			gateClosed = false;
+			return true;
+		},
+		markInert: () => true,
+		restoreIfCurrent: () => true,
+		snapshot: () => ({
+			view: binding.cm,
+			inert: false,
+			gateClosed,
+			inputEpoch: 0,
+			compositionEpoch: 0,
+			nativeHistoryEpoch: 0,
+			selectionEpoch: 0,
+			scrollEpoch: 0,
+			activeComposition: null,
+			lastComposition: null,
+			gateFailureReason: null,
+			commitState: "none",
+			pendingHostLoadCandidate: null,
+		}),
+	};
+	(manager as unknown as {
+		admitStableInitialSamePathPresentation(
+			runtime: unknown,
+			cm: unknown,
+		): void;
+	}).admitStableInitialSamePathPresentation(runtime, binding.cm);
+	const admitted = manager.getManagedSession(binding.view as never);
+
+	assertEq(
+		admitted?.displayedLineage.kind,
+		"known",
+		"exact host/editor/CM proof publishes initial same-path lineage",
+	);
+	assertEq(refreshCalls, 1, "initial same-path admission refreshes the CM gate once");
+	assertEq(gateClosed, false, "same-path admission leaves normal editing unrestricted");
+	assertEq(admitted?.handoff, null, "initial same-path admission fabricates no handoff receipt");
+	manager.unbindAll();
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 43: same-path TFile replacement fences user, provider, and health lanes ---");
+{
+	const admissions: unknown[] = [];
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		onOpenPathAdmissionRequested: (request) => admissions.push(request),
+	});
+	manager.manageView(binding.view as never);
+	const replacementFile = { path: binding.path, stat: binding.file.stat };
+	(binding.view as unknown as { file: unknown }).file = replacementFile;
+	const health = (manager as unknown as {
+		inspectBindingHealth: (view: unknown, candidate: unknown) => { issues: string[] };
+	}).inspectBindingHealth(binding.view, binding);
+	assertEq(
+		health.issues.includes("file-identity-changed"),
+		true,
+		"health audit reports same-path TFile replacement",
+	);
+	let oldYTextMutations = 0;
+	const observeOld = () => { oldYTextMutations += 1; };
+	binding.ytext.observe(observeOld);
+	const userFence = (manager as unknown as {
+		fenceStaleUserBinding: (transaction: unknown) => unknown;
+	}).fenceStaleUserBinding({
+		docChanged: true,
+		startState: binding.cm.state,
+		annotation: () => "input.type",
+		isUserEvent: (event: string) => event === "input",
+	});
+	binding.ytext.unobserve(observeOld);
+	const userSession = manager.getManagedSession(binding.view as never);
+	assertEq(userFence !== null, true, "user extender removes old yCollab on same-path replacement");
+	assertEq(manager.getBinding(binding.view as never), null, "user lane detaches old binding");
+	assertEq(oldYTextMutations, 0, "user lane performs no old-Y.Text mutation");
+	assertEq(userSession?.handoff?.targetFile, replacementFile, "user handoff targets exact replacement TFile");
+	const handoffContext = (manager as unknown as {
+		getCodeMirrorHandoffContext: (leafId: string) => {
+			kind?: string;
+			targetFile?: unknown;
+		} | null;
+	}).getCodeMirrorHandoffContext("leaf-1");
+	assertEq(handoffContext?.kind, "handoff", "Task4 final context enters the closed handoff lane");
+	assertEq(handoffContext?.targetFile, replacementFile, "Task4 handoff context carries exact replacement TFile");
+	assertEq(admissions.length, 1, "same-path replacement waits for controller admission");
+	clearPendingHealthChecks(manager);
+}
+{
+	const admissions: unknown[] = [];
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		onOpenPathAdmissionRequested: (request) => admissions.push(request),
+	});
+	manager.manageView(binding.view as never);
+	const replacementFile = { path: binding.path, stat: binding.file.stat };
+	(binding.view as unknown as { file: unknown }).file = replacementFile;
+	const providerResult = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch({
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "provider must not cross file identity" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	});
+	assertEq(Array.isArray(providerResult), true, "provider patch is cancelled before old yCollab projection");
+	assertEq((providerResult as unknown[]).length, 0, "provider cancellation has no doc change");
+	assertEq(manager.getBinding(binding.view as never), null, "provider lane detaches old binding");
+	assertEq(binding.ytext.toString(), "server text", "provider lane leaves old Y.Text unchanged");
+	assertEq(admissions.length, 1, "provider replacement requests exact admission once");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 44: old external-host snapshot cannot restore a replacement TFile cache ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	Object.assign(binding.view, { data: "typing now", lastSavedData: "saved" });
+	manager.beginExternalDiskMutation(binding.path, 4401);
+	const internals = manager as unknown as {
+		pendingExternalDiskMutationStarts: Map<string, {
+			path: string;
+			sequence: number;
+			views: Map<string, unknown>;
+		}>;
+		restoreExternalDiskHostViewCache: (
+			proof: unknown,
+			currentText: string,
+			incomingText: string,
+			sequence: number,
+			retire: boolean,
+		) => boolean;
+	};
+	const start = internals.pendingExternalDiskMutationStarts.get(binding.path);
+	const snapshot = start?.views.get("leaf-1");
+	assertEq(snapshot !== undefined, true, "external host lane captures exact source TFile snapshot");
+	const replacementFile = { path: binding.path, stat: binding.file.stat };
+	(binding.view as unknown as { file: unknown }).file = replacementFile;
+	Object.assign(binding.view, { data: "incoming replacement cache", lastSavedData: "external" });
+	const restored = start && snapshot
+		? internals.restoreExternalDiskHostViewCache({
+			start,
+			snapshot,
+			runtimeView: binding.view,
+			externalLogicalContent: "external",
+		}, "typing now", "incoming replacement cache", 4401, false)
+		: true;
+	assertEq(restored, false, "old snapshot fails exact replacement-TFile CAS");
+	assertEq(
+		(binding.view as unknown as { data: string }).data,
+		"incoming replacement cache",
+		"stale snapshot performs no TextFileView cache assignment",
+	);
+	assertEq(binding.ytext.toString(), "server text", "stale snapshot performs no Y.Text mutation");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 45: applyBinding never publishes across awareness, dispatch, or host-read reentry ---");
+{
+	const { manager, binding, setLiveEditorContent } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	setLiveEditorContent("server text");
+	const liveCm = installLiveCmReplacement(manager, binding);
+	let liveDispatches = 0;
+	(liveCm as { dispatch: () => void }).dispatch = () => { liveDispatches += 1; };
+	const fileC = { path: "Notes/awareness-C.md" };
+	const runtime = manager as unknown as {
+		beginPathHandoff: (view: unknown, file: unknown, reason: string) => boolean;
+		vaultSync: { provider: { awareness: { setLocalStateField: () => void } } };
+		applyBinding: (options: unknown) => boolean;
+	};
+	runtime.vaultSync.provider.awareness.setLocalStateField = () => {
+		(binding.view as unknown as { file: unknown }).file = fileC;
+		runtime.beginPathHandoff(binding.view, fileC, "awareness-reentry-C");
+	};
+	const applied = runtime.applyBinding({
+		action: "repair",
+		deviceName: "TestDevice",
+		view: binding.view,
+		cm: liveCm,
+		cmId: "cm-reentry-awareness",
+		leafId: "leaf-1",
+		file: binding.file,
+		filePath: binding.path,
+		ytext: binding.ytext,
+		fileId: binding.fileId,
+		existing: binding,
+		reason: "awareness-reentry",
+	});
+	assertEq(applied, false, "awareness reentry invalidates binding publication");
+	assertEq(liveDispatches, 0, "stale awareness lease reaches no target CM dispatch");
+	assertEq(manager.getBinding(binding.view as never), null, "awareness reentry leaves old binding detached");
+	assertEq(binding.ytext.toString(), "server text", "awareness reentry mutates no Y.Text");
+	clearPendingHealthChecks(manager);
+}
+{
+	const { manager, binding, setLiveEditorContent } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	setLiveEditorContent("server text");
+	const liveCm = installLiveCmReplacement(manager, binding);
+	const runtime = manager as unknown as {
+		beginPathHandoff: (view: unknown, file: unknown, reason: string) => boolean;
+		vaultSync: {
+			provider: {
+				awareness: { setLocalStateField: (field: string, value: unknown) => void };
+			};
+		};
+		applyBinding: (options: unknown) => boolean;
+	};
+	const fileC = { path: "Notes/publication-awareness-C.md" };
+	runtime.vaultSync.provider.awareness.setLocalStateField = (field) => {
+		if (field !== KAOS_ACTIVE_FILE_AWARENESS_FIELD) return;
+		(binding.view as unknown as { file: unknown }).file = fileC;
+		runtime.beginPathHandoff(binding.view, fileC, "publication-awareness-C");
+	};
+	const applied = runtime.applyBinding({
+		action: "repair",
+		deviceName: "TestDevice",
+		view: binding.view,
+		cm: liveCm,
+		cmId: "cm-publication-awareness",
+		leafId: "leaf-1",
+		file: binding.file,
+		filePath: binding.path,
+		ytext: binding.ytext,
+		fileId: binding.fileId,
+		existing: binding,
+		reason: "publication-awareness-reentry",
+	});
+	assertEq(applied, false, "post-publication awareness reentry invalidates the outer apply");
+	assertEq(manager.getBinding(binding.view as never), null, "publication callback cannot retain stale binding");
+	assertEq(
+		manager.getManagedSession(binding.view as never)?.handoff?.targetFile,
+		fileC,
+		"publication callback leaves only the superseding C handoff",
+	);
+	assertEq(binding.ytext.toString(), "server text", "publication callback mutates no Y.Text");
+	clearPendingHealthChecks(manager);
+}
+{
+	const { manager, binding, setLiveEditorContent } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	setLiveEditorContent("server text");
+	const liveCm = installLiveCmReplacement(manager, binding);
+	let dispatches = 0;
+	(liveCm as { dispatch: () => void }).dispatch = () => {
+		dispatches += 1;
+		if (dispatches !== 1) return;
+		binding.ytext.doc?.transact(() => {
+			binding.ytext.delete(0, binding.ytext.length);
+			binding.ytext.insert(0, "provider successor during dispatch");
+		}, { provider: "dispatch-reentry" });
+	};
+	const applied = (manager as unknown as { applyBinding: (options: unknown) => boolean })
+		.applyBinding({
+			action: "repair",
+			deviceName: "TestDevice",
+			view: binding.view,
+			cm: liveCm,
+			cmId: "cm-reentry-provider",
+			leafId: "leaf-1",
+			file: binding.file,
+			filePath: binding.path,
+			ytext: binding.ytext,
+			fileId: binding.fileId,
+			existing: binding,
+			reason: "dispatch-provider-reentry",
+		});
+	assertEq(applied, false, "dispatch-time provider successor invalidates exact-content CAS");
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.get("leaf-1"),
+		binding,
+		"dispatch-time successor never publishes the attempted CM binding",
+	);
+	assertEq(
+		binding.ytext.toString(),
+		"provider successor during dispatch",
+		"dispatch-time provider authority is preserved",
+	);
+	assertEq(dispatches, 2, "failed publication removes the attempted collab extension once");
+	clearPendingHealthChecks(manager);
+}
+{
+	const { manager, binding, setLiveEditorContent } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	setLiveEditorContent("server text");
+	const liveCm = installLiveCmReplacement(manager, binding);
+	const runtime = manager as unknown as {
+		beginPathHandoff: (view: unknown, file: unknown, reason: string) => boolean;
+		applyBinding: (options: unknown) => boolean;
+	};
+	let dispatched = false;
+	(liveCm as { dispatch: () => void }).dispatch = () => { dispatched = true; };
+	const fileC = { path: "Notes/host-read-C.md" };
+	let reentered = false;
+	(binding.view.editor as unknown as { getValue: () => string }).getValue = () => {
+		if (dispatched && !reentered) {
+			reentered = true;
+			(binding.view as unknown as { file: unknown }).file = fileC;
+			runtime.beginPathHandoff(binding.view, fileC, "post-dispatch-host-read-C");
+		}
+		return "server text";
+	};
+	const applied = runtime.applyBinding({
+		action: "repair",
+		deviceName: "TestDevice",
+		view: binding.view,
+		cm: liveCm,
+		cmId: "cm-reentry-host-read",
+		leafId: "leaf-1",
+		file: binding.file,
+		filePath: binding.path,
+		ytext: binding.ytext,
+		fileId: binding.fileId,
+		existing: binding,
+		reason: "post-dispatch-host-read-reentry",
+	});
+	assertEq(reentered, true, "post-dispatch host read exercises synchronous reentry");
+	assertEq(applied, false, "final central continuation CAS rejects host-read reentry");
+	assertEq(manager.getBinding(binding.view as never), null, "host-read reentry publishes no stale binding");
+	assertEq(binding.ytext.toString(), "server text", "host-read reentry mutates no Y.Text");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 46: ticket and continuation final CAS reject callback reentry and mutable paths ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const runtime = manager as unknown as {
+		beginPathHandoff: (view: unknown, file: unknown, reason: string) => boolean;
+	};
+	manager.manageView(binding.view as never);
+	const ticket = manager.captureOpenEditorMutationTicket(binding.path, [binding.view as never]);
+	const fileC = { path: "Notes/ticket-final-C.md" };
+	let reads = 0;
+	let reentered = false;
+	(binding.view.editor as unknown as { getValue: () => string }).getValue = () => {
+		reads += 1;
+		if (reads === 2 && !reentered) {
+			reentered = true;
+			(binding.view as unknown as { file: unknown }).file = fileC;
+			runtime.beginPathHandoff(binding.view, fileC, "ticket-final-read-C");
+		}
+		return "typing now";
+	};
+	const validation = manager.validateOpenEditorMutationTicket(ticket, [binding.view as never]);
+	assertEq(reentered, true, "ticket's final editor read reenters the handoff state machine");
+	assertEq(validation.current, false, "ticket final CAS rejects the reentered generation");
+	clearPendingHealthChecks(manager);
+}
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const runtime = manager as unknown as {
+		captureManagedContinuation: (view: unknown) => unknown;
+		isManagedContinuationCurrent: (ticket: unknown) => boolean;
+		beginPathHandoff: (view: unknown, file: unknown, reason: string) => boolean;
+	};
+	manager.manageView(binding.view as never);
+	const continuation = runtime.captureManagedContinuation(binding.view);
+	const fileC = { path: "Notes/continuation-final-C.md" };
+	let reentered = false;
+	(binding.view.editor as unknown as { getValue: () => string }).getValue = () => {
+		if (!reentered) {
+			reentered = true;
+			(binding.view as unknown as { file: unknown }).file = fileC;
+			runtime.beginPathHandoff(binding.view, fileC, "continuation-host-read-C");
+		}
+		return "typing now";
+	};
+	assertEq(
+		runtime.isManagedContinuationCurrent(continuation),
+		false,
+		"central continuation callback ends with a read-free stale CAS",
+	);
+	clearPendingHealthChecks(manager);
+}
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	manager.manageView(binding.view as never);
+	const ticket = manager.captureOpenEditorMutationTicket(binding.path, [binding.view as never]);
+	(binding.file as unknown as { path: string }).path = "Notes/mutable-ticket-path.md";
+	assertEq(
+		manager.validateOpenEditorMutationTicket(ticket, [binding.view as never]).current,
+		false,
+		"mutable displayed TFile path cannot preserve an old ticket",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 47: excluded and tombstoned targets cancel all handoff authority safely ---");
+for (const targetKind of ["excluded", "tombstoned"] as const) {
+	const { manager, binding, traceRecords } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	let underlyingDispatches = 0;
+	(binding.cm as unknown as { dispatch: (spec: TransactionSpec) => void }).dispatch = () => {
+		underlyingDispatches += 1;
+	};
+	manager.manageView(binding.view as never);
+	const internals = manager as unknown as {
+		managedSessions: Map<string, {
+			cmGuard: { snapshot: () => { inert: boolean; gateClosed: boolean } } | null;
+		}>;
+		pendingAdmissionByLeafId: Map<string, unknown>;
+		vaultSync: {
+			getTextForPath: (path: string) => Y.Text | null;
+			isMarkdownTombstoned: (path: string) => boolean;
+			isPendingRenameTarget: (path: string) => boolean;
+		};
+	};
+	const managedRuntime = internals.managedSessions.get("leaf-1");
+	let guardInert = false;
+	let guardGateClosed = false;
+	const guard = {
+		refreshGate: () => {
+			guardGateClosed = !guardInert;
+			return true;
+		},
+		markInert: () => {
+			guardInert = true;
+			guardGateClosed = false;
+			return true;
+		},
+		restoreIfCurrent: () => {
+			guardInert = true;
+			guardGateClosed = false;
+			return true;
+		},
+		snapshot: () => ({
+			view: binding.cm,
+			inert: guardInert,
+			gateClosed: guardGateClosed,
+		}),
+	};
+	if (managedRuntime) managedRuntime.cmGuard = guard;
+	let undoDestroyCalls = 0;
+	const originalDestroy = binding.undoManager.destroy.bind(binding.undoManager);
+	(binding.undoManager as unknown as { destroy: () => void }).destroy = () => {
+		undoDestroyCalls += 1;
+		originalDestroy();
+	};
+	const targetFile = {
+		path: targetKind === "excluded" ? "Notes/not-synced.txt" : "Notes/deleted.md",
+	};
+	if (targetKind === "tombstoned") {
+		internals.vaultSync.getTextForPath = (path) => path === binding.path ? binding.ytext : null;
+		internals.vaultSync.isMarkdownTombstoned = (path) => path === targetFile.path;
+		internals.vaultSync.isPendingRenameTarget = () => false;
+	}
+	(binding.view as unknown as { file: unknown }).file = targetFile;
+	manager.bind(binding.view as never, "TestDevice");
+
+	const initialEffects = traceRecords
+		.filter((record) => record.msg === "handoff-effect-applied" && record.details?.reason === "bind")
+		.map((record) => record.details?.effect);
+	assertEq(initialEffects.length, 5, `${targetKind}: target selection applies five ordered effects`);
+	assertEq(initialEffects[0], "cancel-pending-save", `${targetKind}: pending save cancels first`);
+	assertEq(initialEffects[4], "detach-binding", `${targetKind}: binding detaches after authority capture`);
+	assertEq(undoDestroyCalls, 1, `${targetKind}: old UndoManager is destroyed once`);
+	assertEq(manager.getBinding(binding.view as never), null, `${targetKind}: old binding is absent`);
+	assertEq(manager.getManagedSession(binding.view as never), null, `${targetKind}: managed handoff is released`);
+	assertEq(
+		internals.pendingAdmissionByLeafId.has("leaf-1"),
+		false,
+		`${targetKind}: no admission gate remains retained`,
+	);
+	assertEq(guard?.snapshot().inert, true, `${targetKind}: CodeMirror guard becomes inert`);
+	assertEq(guard?.snapshot().gateClosed, false, `${targetKind}: inert guard leaves no closed input gate`);
+	const beforePassThrough = underlyingDispatches;
+	(binding.cm as unknown as { dispatch: (spec: TransactionSpec) => void }).dispatch({});
+	assertEq(
+		underlyingDispatches,
+		beforePassThrough + 1,
+		`${targetKind}: inert dispatch wrapper is pass-through`,
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 48: failed CodeMirror guard inerting retains its managed owner fail-closed ---");
+{
+	const { manager, binding, traceRecords } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	manager.manageView(binding.view as never);
+	const internals = manager as unknown as {
+		managedSessions: Map<string, {
+			cmGuard: unknown;
+			hostGuard: unknown;
+		}>;
+		pendingUnmanageRetries: Map<string, ReturnType<typeof setTimeout>>;
+	};
+	const runtime = internals.managedSessions.get("leaf-1");
+	if (!runtime) throw new Error("Expected managed runtime for inert failure test");
+	let hostInertCalls = 0;
+	let hostBlocked = true;
+	runtime.cmGuard = {
+		markInert: () => false,
+		snapshot: () => ({
+			gateClosed: true,
+			gateFailureReason: "pending-input-not-flushable",
+			commitState: "pending",
+		}),
+	};
+	runtime.hostGuard = {
+		markInert: () => {
+			hostInertCalls += 1;
+			hostBlocked = false;
+		},
+		restoreIfCurrent: () => {
+			hostInertCalls += 1;
+			hostBlocked = false;
+		},
+		beginBlockingHandoff: () => { hostBlocked = true; },
+	};
+	const unmanaged = manager.unmanageView(binding.view as never, "stub-inert-failure");
+
+	assertEq(unmanaged, false, "markInert=false reports deferred invalidation");
+	assertEq(
+		internals.managedSessions.get("leaf-1"),
+		runtime,
+		"failed inerting retains the exact managed runtime owner",
+	);
+	assertEq(hostInertCalls, 0, "failed CM inerting retains host blocking ownership");
+	assertEq(hostBlocked, true, "failed CM inerting leaves the host save block in place");
+	assertEq(
+		traceRecords.some((record) => record.msg === "managed-view-invalidation-deferred"),
+		true,
+		"failed inerting emits fail-closed recovery trace",
+	);
+	const retry = internals.pendingUnmanageRetries.get("leaf-1");
+	assertEq(retry !== undefined, true, "failed inerting schedules one bounded recovery retry");
+	runtime.cmGuard = null;
+	manager.unmanageView(binding.view as never, "stub-inert-cleanup");
+	assertEq(
+		internals.pendingUnmanageRetries.has("leaf-1"),
+		false,
+		"successful invalidation clears the pending recovery timer",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 49: unmanaged equal-bytes CM never becomes target lineage by observation ---");
+{
+	const { manager, binding, setLiveEditorContent } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	setLiveEditorContent("server text");
+	manager.unmanageView(binding.view as never, "reset-unmanaged-reuse");
+	(manager as unknown as { bindings: Map<string, unknown> }).bindings.delete("leaf-1");
+	const replacementFile = { path: binding.path, stat: binding.file.stat };
+	(binding.view as unknown as { file: unknown }).file = replacementFile;
+	const session = manager.manageView(binding.view as never);
+	installManagedBoundaryStubs(manager, binding.view, binding.cm);
+	const authority = manager.capturePathEditorAuthority(binding.path);
+	manager.bind(binding.view as never, "TestDevice");
+
+	assertEq(
+		session.displayedLineage.kind,
+		"unknown",
+		"an unbound reused CM stays unknown without target presentation proof",
+	);
+	assertEq(
+		authority.kind === "proven-single",
+		false,
+		"equal bytes cannot mint target authority for an unmanaged reused CM",
+	);
+	assertEq(
+		manager.getBinding(binding.view as never),
+		null,
+		"equal bytes cannot attach target Y.Text before presentation proof",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 50: unsupported managed guards fail closed before binding ---");
+{
+	const { manager, binding, traceRecords } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		installManagedGuardStubs: false,
+	});
+	manager.manageView(binding.view as never);
+	manager.bind(binding.view as never, "TestDevice");
+
+	assertEq(
+		manager.getBinding(binding.view as never),
+		null,
+		"a binding without live host and CodeMirror guards is detached",
+	);
+	assertEq(
+		manager.getManagedSession(binding.view as never),
+		null,
+		"unsupported guard installation releases the unsafe managed runtime",
+	);
+	assertEq(
+		traceRecords.some((record) => record.msg === "managed-boundary-unsupported"),
+		true,
+		"unsupported binding eligibility emits a fail-closed trace",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 51: workspace wakeups never fabricate switch-intent provenance ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	manager.manageView(binding.view as never);
+	const observedFile = { path: "Notes/observed-B.md" };
+	(binding.view as unknown as { file: unknown }).file = observedFile;
+	manager.bind(binding.view as never, "TestDevice");
+	const session = manager.getManagedSession(binding.view as never);
+
+	assertEq(session?.handoff?.targetFile, observedFile, "wake observation still closes the B handoff gate");
+	assertEq(
+		session?.currentSwitchIntentSeq ?? null,
+		null,
+		"bind wake observation does not claim a guarded host switch intent",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 52: path authority enumerates every real workspace pane ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const secondView = {
+		file: binding.file,
+		editor: { getValue: () => binding.cm.state.doc.toString() },
+	};
+	(binding.view as unknown as { app: unknown }).app = {
+		workspace: {
+			iterateAllLeaves(callback: (leaf: { view: unknown }) => void) {
+				callback({ view: binding.view });
+				callback({ view: secondView });
+			},
+		},
+	};
+	manager.manageView(binding.view as never);
+	const authority = manager.capturePathEditorAuthority(binding.path);
+
+	assertEq(authority.kind, "blocked", "an unmanaged second workspace pane blocks single-pane authority");
+	assertEq(
+		authority.kind === "blocked" ? authority.reason : null,
+		"unmanaged-view",
+		"the complete workspace pane set reports unmanaged-view",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 52a: file-context sidebar views are not editor authorities ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const fileContextSideView = {
+		file: binding.file,
+		getViewType: () => "outgoing-link",
+	};
+	(binding.view as unknown as { app: unknown }).app = {
+		workspace: {
+			iterateAllLeaves(callback: (leaf: { view: unknown }) => void) {
+				callback({ view: binding.view });
+				callback({ view: fileContextSideView });
+			},
+		},
+	};
+	manager.manageView(binding.view as never);
+	const authority = manager.capturePathEditorAuthority(binding.path);
+
+	assertEq(
+		authority.kind,
+		"proven-single",
+		"outgoing-link/outline file context cannot block the exact Markdown editor",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 53: stable same-path replacement cannot certify contradictory ticket identities ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	manager.manageView(binding.view as never);
+	const replacementFile = { path: binding.path, stat: binding.file.stat };
+	(binding.view as unknown as { file: unknown }).file = replacementFile;
+	const ticket = manager.captureOpenEditorMutationTicket(binding.path, [binding.view as never]);
+	const validation = manager.validateOpenEditorMutationTicket(ticket, [binding.view as never]);
+
+	assertEq(validation.current, false, "stable displayed A and target B identities never validate together");
+	assertEq(
+		validation.current ? null : validation.reason,
+		"displayed-lineage-changed",
+		"same-path replacement is rejected as contradictory stable lineage",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 54: stale outer cleanup cannot detach a published successor binding ---");
+{
+	const { manager, binding, setLiveEditorContent } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	setLiveEditorContent("server text");
+	const liveCm = installLiveCmReplacement(manager, binding);
+	(liveCm as { dispatch: () => void }).dispatch = () => {};
+	const runtime = manager as unknown as {
+		beginPathHandoff: (view: unknown, file: unknown, reason: string) => boolean;
+		bindings: Map<string, unknown>;
+		vaultSync: {
+			provider: {
+				awareness: { setLocalStateField: (field: string, value: unknown) => void };
+			};
+		};
+		applyBinding: (options: unknown) => boolean;
+	};
+	const successorFile = { path: "Notes/published-C.md" };
+	const successorDoc = new Y.Doc();
+	const successorText = successorDoc.getText("successor");
+	successorText.insert(0, "server text");
+	let successorUndoDestroyCalls = 0;
+	const successorUndo = new Y.UndoManager(successorText);
+	const originalSuccessorDestroy = successorUndo.destroy.bind(successorUndo);
+	successorUndo.destroy = () => {
+		successorUndoDestroyCalls += 1;
+		originalSuccessorDestroy();
+	};
+	const successorBinding = {
+		...binding,
+		file: successorFile,
+		path: successorFile.path,
+		ytext: successorText,
+		undoManager: successorUndo,
+		cm: liveCm,
+		cmId: "cm-successor-C",
+		fileId: "file-C",
+	};
+	runtime.vaultSync.provider.awareness.setLocalStateField = (field) => {
+		if (field !== KAOS_ACTIVE_FILE_AWARENESS_FIELD) return;
+		(binding.view as unknown as { file: unknown }).file = successorFile;
+		runtime.beginPathHandoff(binding.view, successorFile, "publish-successor-C");
+		runtime.bindings.set("leaf-1", successorBinding);
+	};
+	const applied = runtime.applyBinding({
+		action: "repair",
+		deviceName: "TestDevice",
+		view: binding.view,
+		cm: liveCm,
+		cmId: "cm-outer-B",
+		leafId: "leaf-1",
+		file: binding.file,
+		filePath: binding.path,
+		ytext: binding.ytext,
+		fileId: binding.fileId,
+		existing: binding,
+		reason: "outer-publication-cleanup",
+	});
+
+	assertEq(applied, false, "superseded outer publication rejects itself");
+	assertEq(
+		runtime.bindings.get("leaf-1"),
+		successorBinding,
+		"outer cleanup preserves the exact successor binding owner",
+	);
+	assertEq(successorUndoDestroyCalls, 0, "outer cleanup never destroys successor undo authority");
+	if (runtime.bindings.get("leaf-1") === successorBinding) {
+		runtime.bindings.delete("leaf-1");
+		successorUndo.destroy();
+	}
+	clearPendingHealthChecks(manager);
+	successorDoc.destroy();
+}
+
+console.log("\n--- Test 55: deferred guard teardown retries to completion ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	manager.manageView(binding.view as never);
+	const internals = manager as unknown as {
+		managedSessions: Map<string, { cmGuard: unknown; hostGuard: unknown }>;
+	};
+	const runtime = internals.managedSessions.get("leaf-1");
+	if (!runtime) throw new Error("Expected managed runtime for repeated teardown test");
+	let markInertCalls = 0;
+	let cmRestoreCalls = 0;
+	let hostRestoreCalls = 0;
+	runtime.cmGuard = {
+		markInert: () => {
+			markInertCalls += 1;
+			return markInertCalls >= 3;
+		},
+		restoreIfCurrent: () => {
+			cmRestoreCalls += 1;
+			return true;
+		},
+		snapshot: () => ({
+			view: binding.cm,
+			inert: markInertCalls >= 3,
+			gateClosed: markInertCalls < 3,
+			gateFailureReason: markInertCalls < 3 ? "pending-input-not-flushable" : null,
+			commitState: markInertCalls < 3 ? "pending" : "none",
+		}),
+	};
+	runtime.hostGuard = {
+		markInert: () => {},
+		restoreIfCurrent: () => { hostRestoreCalls += 1; },
+	};
+	manager.unmanageView(binding.view as never, "repeated-inert");
+	await new Promise((resolve) => setTimeout(resolve, 420));
+
+	assertEq(markInertCalls >= 3, true, "deferred teardown retries beyond the first failed callback");
+	assertEq(manager.getManagedSession(binding.view as never), null, "eventual gate settlement releases runtime ownership");
+	assertEq(cmRestoreCalls, 1, "successful CM teardown restores its owned wrappers once");
+	assertEq(hostRestoreCalls, 1, "successful host teardown restores its owned wrappers once");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 56: unload retains unresolved teardown ownership until settlement ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	manager.manageView(binding.view as never);
+	const internals = manager as unknown as {
+		managedSessions: Map<string, { cmGuard: unknown; hostGuard: unknown }>;
+	};
+	const runtime = internals.managedSessions.get("leaf-1");
+	if (!runtime) throw new Error("Expected managed runtime for unload teardown test");
+	let markInertCalls = 0;
+	runtime.cmGuard = {
+		markInert: () => {
+			markInertCalls += 1;
+			return markInertCalls >= 3;
+		},
+		restoreIfCurrent: () => true,
+		snapshot: () => ({
+			view: binding.cm,
+			inert: markInertCalls >= 3,
+			gateClosed: markInertCalls < 3,
+			gateFailureReason: markInertCalls < 3 ? "pending-input-not-flushable" : null,
+			commitState: markInertCalls < 3 ? "pending" : "none",
+		}),
+	};
+	runtime.hostGuard = {
+		markInert: () => {},
+		restoreIfCurrent: () => {},
+	};
+	manager.unbindAll();
+	await new Promise((resolve) => setTimeout(resolve, 420));
+
+	assertEq(markInertCalls >= 3, true, "unload does not cancel the owned teardown retry chain");
+	assertEq(manager.getManagedSession(binding.view as never), null, "unload cleanup eventually releases the runtime");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 57: settled state host load advances revision exactly once ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const internals = manager as unknown as {
+		authorityEpoch: number;
+		editorRevisionByCm: WeakMap<object, number>;
+		samePathAdoptionTransactionSeqByCm: WeakMap<object, number>;
+		advanceSettledHostStateRevision: (candidate: Readonly<{
+			applicationKind: "state" | "transaction";
+			cm: object;
+			editorRevisionBefore: number;
+		}>) => boolean;
+	};
+	const cm = binding.cm as object;
+	internals.editorRevisionByCm.set(cm, 4);
+	internals.samePathAdoptionTransactionSeqByCm.set(cm, 9);
+	const stateCandidate = Object.freeze({
+		applicationKind: "state" as const,
+		cm,
+		editorRevisionBefore: 4,
+	});
+	const authorityEpochBefore = internals.authorityEpoch;
+
+	assertEq(
+		internals.advanceSettledHostStateRevision(stateCandidate),
+		true,
+		"exact settled state load synthesizes the omitted document revision",
+	);
+	assertEq(internals.editorRevisionByCm.get(cm), 5, "state load advances editor revision once");
+	assertEq(
+		internals.samePathAdoptionTransactionSeqByCm.get(cm),
+		10,
+		"state load advances same-path transaction sequence once",
+	);
+	assertEq(internals.authorityEpoch, authorityEpochBefore + 1, "state load advances authority epoch once");
+
+	assertEq(
+		internals.advanceSettledHostStateRevision(stateCandidate),
+		true,
+		"already-observed expected revision is idempotently accepted",
+	);
+	assertEq(internals.editorRevisionByCm.get(cm), 5, "idempotent retry does not double-advance revision");
+	assertEq(
+		internals.samePathAdoptionTransactionSeqByCm.get(cm),
+		10,
+		"idempotent retry does not double-advance transaction sequence",
+	);
+	assertEq(internals.authorityEpoch, authorityEpochBefore + 1, "idempotent retry does not advance authority");
+
+	internals.editorRevisionByCm.set(cm, 7);
+	assertEq(
+		internals.advanceSettledHostStateRevision(stateCandidate),
+		false,
+		"unexpected intervening revision fails closed",
+	);
+	assertEq(internals.editorRevisionByCm.get(cm), 7, "failed-closed drift is never overwritten");
+	assertEq(
+		internals.samePathAdoptionTransactionSeqByCm.get(cm),
+		10,
+		"failed-closed drift does not mutate transaction sequence",
+	);
+	assertEq(internals.authorityEpoch, authorityEpochBefore + 1, "failed-closed drift does not advance authority");
+
+	const transactionCm = {};
+	internals.editorRevisionByCm.set(transactionCm, 12);
+	internals.samePathAdoptionTransactionSeqByCm.set(transactionCm, 3);
+	assertEq(
+		internals.advanceSettledHostStateRevision(Object.freeze({
+			applicationKind: "transaction",
+			cm: transactionCm,
+			editorRevisionBefore: 11,
+		})),
+		true,
+		"transaction host load relies on its normal ViewUpdate accounting",
+	);
+	assertEq(internals.editorRevisionByCm.get(transactionCm), 12, "transaction revision is not synthesized");
+	assertEq(
+		internals.samePathAdoptionTransactionSeqByCm.get(transactionCm),
+		3,
+		"transaction sequence is not synthesized",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 58: stable IME receipt certifies only the exact same-CM host pre-clear ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	type TestRuntime = {
+		session: ManagedLeafSession;
+		cmGuard: {
+			snapshot(): Readonly<{
+				view: unknown;
+				inert: boolean;
+				nativeHistoryEpoch: number;
+			}>;
+		} | null;
+		hostGuard: {
+			reportHostLoadCandidate(candidate: PendingHostLoadCandidate): boolean;
+			snapshot(): Readonly<{ sourceUnload: unknown }>;
+		} | null;
+	};
+	const internals = manager as unknown as {
+		managedSessions: Map<string, TestRuntime>;
+		editorRevisionByCm: WeakMap<object, number>;
+		acceptSamePathInputCompletion(
+			runtime: TestRuntime,
+			completion: Readonly<{
+				reservation: NonNullable<ManagedLeafSession["pendingInputStartReservation"]>;
+				cm: object;
+				startDocument: object;
+				finalDocument: object;
+			}>,
+		): boolean;
+		acceptHostLoadCandidate(candidate: PendingHostLoadCandidate): boolean;
+		applyHandoffEffects(
+			runtime: TestRuntime,
+			effects: readonly Readonly<{ type: string }>[],
+			reason: string,
+		): void;
+	};
+	const runtime = internals.managedSessions.get("leaf-1");
+	if (!runtime) throw new Error("Expected managed runtime for certified pre-clear test");
+	const displayedAtStart = runtime.session.displayedLineage;
+	if (displayedAtStart.kind !== "known") {
+		throw new Error("Expected known source presentation for certified pre-clear test");
+	}
+	const reserved = reserveManagedLeafInputStart(runtime.session, {
+		sessionId: runtime.session.sessionId,
+		expectedGeneration: runtime.session.generation,
+		inputEpoch: 1,
+		compositionEpoch: 1,
+	});
+	if (!reserved.accepted || reserved.state.pendingInputStartReservation === null) {
+		throw new Error("Expected exact IME reservation for certified pre-clear test");
+	}
+	const reservation = reserved.state.pendingInputStartReservation;
+	const finalState = EditorState.create({ doc: "typing now한" });
+	const cmState = (binding.cm as unknown as { state: Record<string, unknown> }).state;
+	(binding.cm as unknown as { state: Record<string, unknown> }).state = {
+		...cmState,
+		doc: finalState.doc,
+	};
+	runtime.session = {
+		...reserved.state,
+		displayedLineage: {
+			...displayedAtStart,
+			document: finalState.doc,
+			editorRevision: 1,
+		},
+	};
+	internals.editorRevisionByCm.set(binding.cm, 1);
+	assertEq(
+		internals.acceptSamePathInputCompletion(runtime, {
+			reservation,
+			cm: binding.cm,
+			startDocument: reservation.sourceDocumentAtStart!,
+			finalDocument: finalState.doc,
+		}),
+		true,
+		"manager accepts one exact stable same-path IME completion",
+	);
+	assertEq(
+		runtime.session.pendingInputStartReservation,
+		null,
+		"stable completion consumes the reducer reservation",
+	);
+	assertEq(
+		runtime.session.completedSamePathInput?.finalDocument,
+		finalState.doc,
+		"stable completion retains exact final source lineage",
+	);
+
+	const sourceFile = displayedAtStart.file;
+	const targetFile = { path: "Notes/after-ime.md" } as typeof sourceFile;
+	const sourceUnloadReceiptId = "source-unload:test-58";
+	const selected = reduceManagedLeafSession(runtime.session, {
+		type: "target-selected",
+		sessionId: runtime.session.sessionId,
+		expectedGeneration: runtime.session.generation,
+		targetFile,
+		switchIntentSeq: runtime.session.eventOrderSeq + 1,
+		sourceUnloadReceiptId,
+	});
+	const detached = reduceManagedLeafSession(selected.state, {
+		type: "detach-completed",
+		sessionId: selected.state.sessionId,
+		expectedGeneration: selected.state.generation,
+		bindingEpochAfterDetach: 9,
+	});
+	assertEq(selected.accepted && detached.accepted, true, "pre-clear fixture reaches detached handoff state");
+	runtime.session = detached.state;
+	(binding.view as unknown as { file: unknown; data: string }).file = targetFile;
+	(binding.view as unknown as { file: unknown; data: string }).data = "stale pre-IME host cache";
+	const emptyState = EditorState.create({ doc: "" });
+	(binding.cm as unknown as { state: Record<string, unknown> }).state = {
+		...(binding.cm as unknown as { state: Record<string, unknown> }).state,
+		doc: emptyState.doc,
+	};
+	let forcedSaveObserved = true;
+	let candidateReports = 0;
+	const observedNativeHistoryEpoch = runtime.session.nativeHistoryEpoch + 3;
+	runtime.cmGuard = {
+		snapshot: () => ({
+			view: binding.cm,
+			inert: false,
+			nativeHistoryEpoch: observedNativeHistoryEpoch,
+		}),
+	};
+	runtime.hostGuard = {
+		reportHostLoadCandidate: () => {
+			candidateReports += 1;
+			return true;
+		},
+		snapshot: () => ({
+			sourceUnload: {
+				receiptId: sourceUnloadReceiptId,
+				file: sourceFile,
+				path: sourceFile.path,
+				state: "settled",
+				forcedSaveObserved,
+			},
+		}),
+	};
+	const targetState = EditorState.create({ doc: "target after IME" });
+	const candidate: PendingHostLoadCandidate = {
+		hostLoadTokenId: "host-load:test-58",
+		hostLoadCompletedEpoch: null,
+		sourceUnloadReceiptId,
+		switchIntentSeq: runtime.session.currentSwitchIntentSeq!,
+		sessionId: runtime.session.sessionId,
+		leafId: runtime.session.leafId,
+		handoffGeneration: runtime.session.generation,
+		targetPathAtDispatch: targetFile.path,
+		cm: binding.cm as never,
+		runtimeView: binding.view as never,
+		startDocument: emptyState.doc,
+		targetDocument: targetState.doc,
+		incomingContent: targetState.doc.toString(),
+		applicationKind: "state",
+		heldTransaction: null,
+		heldState: targetState,
+		hostSetViewDataClear: true,
+		editorRevisionBefore: 1,
+		nativeHistoryEpochBefore: observedNativeHistoryEpoch,
+		proposedSelection: targetState.selection,
+		proposedScrollAnchor: null,
+		effectFingerprint: "state-effect:test-58",
+		runtimeViewDataBefore: "stale pre-IME host cache",
+		bindingEpoch: 9,
+	};
+	const appliedEffects: string[] = [];
+	internals.applyHandoffEffects = (_runtime, effects, reason) => {
+		appliedEffects.push(reason, ...effects.map((effect) => effect.type));
+	};
+	const exactPreclearState = runtime.session;
+	forcedSaveObserved = false;
+	assertEq(
+		internals.acceptHostLoadCandidate(candidate),
+		false,
+		"manager rejects a pre-clear without an observed forced source save",
+	);
+	assertEq(runtime.session, exactPreclearState, "rejected pre-clear retains exact reducer state");
+	assertEq(candidateReports, 0, "rejected pre-clear is never associated with the host guard");
+
+	forcedSaveObserved = true;
+	assertEq(
+		internals.acceptHostLoadCandidate(candidate),
+		true,
+		"manager admits the exact same-CM pre-clear after independent runtime checks",
+	);
+	assertEq(candidateReports, 1, "certified pre-clear is associated exactly once");
+	assertEq(
+		runtime.session.nativeHistoryEpoch,
+		observedNativeHistoryEpoch,
+		"certified pre-clear adopts the exact monotonic guard history epoch",
+	);
+	assertEq(
+		runtime.session.handoff?.pendingHostLoadCandidate,
+		candidate,
+		"certified pre-clear retains the exact held target candidate",
+	);
+	assertEq(runtime.session.completedSamePathInput, null, "certified pre-clear consumes its one-shot completion receipt");
+	assertEq(
+		appliedEffects.join(","),
+		"host-preclear-candidate-held,request-target-presentation",
+		"certified pre-clear uses the dedicated effect boundary",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 59: teardown starts pending owned saves before revoking editor authority ---");
+{
+	const { manager } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	type TeardownHostGuard = {
+		flushOwnedSave(): Promise<void>;
+		markInert(): void;
+		snapshot(): Record<string, unknown>;
+	};
+	const internals = manager as unknown as {
+		asyncAuthorityOpen: boolean;
+		managedSessions: Map<string, { hostGuard: TeardownHostGuard | null }>;
+		beginOwnedSaveDrainForTeardown?: () => Promise<void>;
+	};
+	const runtime = internals.managedSessions.get("leaf-1");
+	const guard = runtime?.hostGuard;
+	if (!guard) throw new Error("Expected managed host guard for teardown drain test");
+	const originalSnapshot = guard.snapshot.bind(guard);
+	guard.snapshot = () => ({
+		...originalSnapshot(),
+		pendingOwnedSave: {
+			jobId: 59,
+			sessionId: "test-59",
+			generation: 1,
+			file: { path: "Notes/typing.md" },
+			path: "Notes/typing.md",
+			displayedPath: "Notes/typing.md",
+			saveEpoch: 1,
+		},
+	});
+	let releaseSave!: () => void;
+	const pendingNativeSave = new Promise<void>((resolve) => {
+		releaseSave = resolve;
+	});
+	const events: string[] = [];
+	guard.flushOwnedSave = () => {
+		events.push(`flush:${String(internals.asyncAuthorityOpen)}`);
+		return pendingNativeSave.then(() => {
+			events.push("save-settled");
+		});
+	};
+	guard.markInert = () => {
+		events.push("mark-inert");
+	};
+
+	assertEq(
+		guard.snapshot().pendingOwnedSave !== null,
+		true,
+		"fixture has one owned save still pending before teardown",
+	);
+	const beginDrain = internals.beginOwnedSaveDrainForTeardown;
+	assertEq(
+		typeof beginDrain,
+		"function",
+		"binding manager exposes a synchronous teardown save-drain entry",
+	);
+	if (typeof beginDrain === "function") {
+		const drain = beginDrain.call(manager);
+		assertEq(
+			events.join(","),
+			"flush:true",
+			"pending native save enters while its exact editor authority is still current",
+		);
+		manager.revokeAsyncAuthority();
+		assertEq(
+			events.join(","),
+			"flush:true,mark-inert",
+			"editor authority becomes inert only after the owned save entered",
+		);
+		let drainSettled = false;
+		void drain.then(() => { drainSettled = true; });
+		await Promise.resolve();
+		assertEq(drainSettled, false, "teardown drain waits for the entered native save");
+		releaseSave();
+		await drain;
+		assertEq(
+			events.join(","),
+			"flush:true,mark-inert,save-settled",
+			"captured native save settles after authority revocation without cancellation",
+		);
+	}
 	clearPendingHealthChecks(manager);
 }
 

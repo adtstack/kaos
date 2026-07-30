@@ -138,6 +138,26 @@ const RENAME_BATCH_MS = 50;
 /** Reconciliation mode determines what operations are safe. */
 export type ReconcileMode = "conservative" | "authoritative";
 
+export type EnsureFileResult =
+	| { kind: "existing"; fileId: string; ytext: Y.Text }
+	| { kind: "created"; fileId: string; ytext: Y.Text }
+	| { kind: "replan"; reason: "active-set-changed" }
+	| { kind: "blocked"; reason: "orphan" | "collision" | "tombstone" | "policy" };
+
+type ActivePathClassification =
+	| { kind: "empty" }
+	| { kind: "healthy"; fileId: string; ytext: Y.Text }
+	| { kind: "orphan"; fileId: string }
+	| { kind: "collision"; fileIds: readonly string[] };
+
+interface EnsureFileOptions {
+	reviveTombstone?: boolean;
+	reviveReason?: string;
+	opId?: string;
+	/** Final caller-owned creation policy, evaluated without VaultSync mutation. */
+	canCreate?: () => boolean;
+}
+
 /** Canonical metadata for one Markdown tombstone in an authoritative delete snapshot. */
 export interface MarkdownRemoteDeleteTombstoneSnapshot {
 	readonly fileId: string;
@@ -1376,6 +1396,10 @@ export class VaultSync {
 		 */
 		isRemoteProjectionAllowed: (path: string) => boolean = () => true,
 	): ReconcileResult {
+		function assertNever(value: never): never {
+			throw new Error(`Unhandled EnsureFileResult: ${JSON.stringify(value)}`);
+		}
+
 		const createdOnDisk: string[] = [];
 		const updatedOnDisk: string[] = [];
 		const seededToCrdt: string[] = [];
@@ -1484,13 +1508,37 @@ export class VaultSync {
 					// without a preceding `reconcile.file.decision`. The
 					// path is also NOT appended to `seededToCrdt`.
 					const minted = mintAdmissionOpId?.(path);
-					if (minted) {
-						minted.emitDecision();
-						this.ensureFile(path, content, device, { opId: minted.opId });
-					} else {
-						this.ensureFile(path, content, device);
+					minted?.emitDecision();
+					const ensureResult = this.ensureFile(
+						path,
+						content,
+						device,
+						minted ? { opId: minted.opId } : undefined,
+					);
+					switch (ensureResult.kind) {
+						case "created":
+							seededToCrdt.push(path);
+							continue;
+						case "existing":
+							continue;
+						case "replan":
+							untracked.push(path);
+							this.log(`reconcile: "${path}" active set changed during seed, deferring`);
+							continue;
+						case "blocked":
+							if (ensureResult.reason === "collision") {
+								pathBindingConflicts.push(path);
+							} else {
+								untracked.push(path);
+							}
+							skipped++;
+							this.log(
+								`reconcile: "${path}" seed blocked (${ensureResult.reason}), preserving disk state`,
+							);
+							continue;
+						default:
+							assertNever(ensureResult);
 					}
-					seededToCrdt.push(path);
 					continue;
 				}
 
@@ -1534,57 +1582,146 @@ export class VaultSync {
 		return randomBase64Url(12);
 	}
 
+	private classifyActivePath(path: string): ActivePathClassification {
+		const normalizedPath = this.normPath(path);
+		const fileIds: string[] = [];
+		const legacyFileId = this.usesV2PathModel()
+			? undefined
+			: this.pathToId.get(normalizedPath);
+		if (legacyFileId !== undefined) {
+			fileIds.push(legacyFileId);
+		} else {
+			this.meta.forEach((value: unknown, fileId: string) => {
+				const metaPath = getMetaPath(value);
+				if (
+					metaPath
+					&& this.normPath(metaPath) === normalizedPath
+					&& !isFileMetaDeletedValue(value)
+				) {
+					fileIds.push(fileId);
+				}
+			});
+		}
+		fileIds.sort();
+
+		if (fileIds.length === 0) return { kind: "empty" };
+		if (fileIds.length > 1) return { kind: "collision", fileIds };
+
+		const fileId = fileIds[0]!;
+		const ytext = this.idToText.get(fileId);
+		return ytext instanceof Y.Text
+			? { kind: "healthy", fileId, ytext }
+			: { kind: "orphan", fileId };
+	}
+
 	ensureFile(
 		path: string,
 		currentContent: string,
 		device?: string,
-		options?: { reviveTombstone?: boolean; reviveReason?: string; opId?: string },
-	): Y.Text | null {
+		options?: EnsureFileOptions,
+	): EnsureFileResult {
 		path = this.normPath(path);
 		const reviveTombstone = options?.reviveTombstone === true;
 		const reviveReason = options?.reviveReason ?? "unknown";
 		const opId = options?.opId;
 
-		const existingId = this.getFileId(path);
-		if (!existingId) {
-			this.promotePendingRenameTarget(path, device);
-		}
-		const resolvedId = this.getFileId(path);
-		if (resolvedId) {
-			const existingText = this.idToText.get(resolvedId);
-			if (existingText) {
-				const cleared = this.clearMarkdownTombstonesForPath(path, resolvedId);
-				if (cleared > 0) {
-					this.log(`ensureFile: cleared ${cleared} stale tombstone(s) for "${path}"`);
-				}
-				this.log(`ensureFile: "${path}" already exists (id=${resolvedId})`);
-				this._textToFileId.set(existingText, resolvedId);
-				return existingText;
+		const resolveClassification = (
+			classification: ActivePathClassification,
+		): EnsureFileResult | null => {
+			switch (classification.kind) {
+				case "empty":
+					return null;
+				case "healthy":
+					this.log(`ensureFile: "${path}" already exists (id=${classification.fileId})`);
+					this._textToFileId.set(classification.ytext, classification.fileId);
+					return {
+						kind: "existing",
+						fileId: classification.fileId,
+						ytext: classification.ytext,
+					};
+				case "orphan":
+					this.log(`ensureFile: "${path}" has orphan metadata (id=${classification.fileId})`);
+					return { kind: "blocked", reason: "orphan" };
+				case "collision":
+					this.log(
+						`ensureFile: "${path}" has active fileId collision (${classification.fileIds.length})`,
+					);
+					return { kind: "blocked", reason: "collision" };
 			}
-			// Orphaned mapping — clean up old entries before recreating
-			this.log(
-				`ensureFile: "${path}" has id=${resolvedId} but no Y.Text — cleaning up orphan`,
-			);
-			this.ydoc.transact(() => {
-				if (this.shouldWriteLegacyPathMap()) {
-					this.pathToId.delete(path);
-				}
-				this.idToText.delete(resolvedId);
-				this.meta.delete(resolvedId);
-			}, ORIGIN_SEED);
+		};
+
+		const s0Result = resolveClassification(this.classifyActivePath(path));
+		if (s0Result) return s0Result;
+
+		const pendingOldPath = this.getPendingRenameOldPathForTarget(path);
+		if (pendingOldPath) {
+			const sourceClassification = this.classifyActivePath(pendingOldPath);
+			switch (sourceClassification.kind) {
+				case "collision":
+					this.log(
+						`ensureFile: pending rename source "${pendingOldPath}" has an active fileId collision`,
+					);
+					return { kind: "blocked", reason: "collision" };
+				case "orphan":
+					this.log(
+						`ensureFile: pending rename source "${pendingOldPath}" has orphan metadata`,
+					);
+					return { kind: "blocked", reason: "orphan" };
+				case "empty":
+					this.log(
+						`ensureFile: pending rename source "${pendingOldPath}" is not active, replanning`,
+					);
+					return { kind: "replan", reason: "active-set-changed" };
+				case "healthy":
+					break;
+			}
 		}
 
+		this.promotePendingRenameTarget(path, device);
+
+		const s1Result = resolveClassification(this.classifyActivePath(path));
+		if (s1Result) return s1Result;
+
 		// Check tombstones — never resurrect a deleted path unless it is already
-		// backed by a live pathToId entry handled above.
+		// backed by a healthy active metadata entry handled above.
 		const tombstoneIds = this.getMarkdownTombstoneIds(path);
+		if (tombstoneIds.length > 0 && !reviveTombstone) {
+			this.trace?.("sync", "ensureFile-tombstone-blocked", {
+				path,
+				tombstoneIds,
+				device: device ?? null,
+			});
+			this.log(`ensureFile: "${path}" is tombstoned, refusing to create`);
+			return { kind: "blocked", reason: "tombstone" };
+		}
+
+		if (options?.canCreate && !options.canCreate()) {
+			this.log(`ensureFile: "${path}" creation policy refused admission`);
+			return { kind: "blocked", reason: "policy" };
+		}
+
+		if (this.classifyActivePath(path).kind !== "empty") {
+			this.log(`ensureFile: "${path}" active set changed before commit, replanning`);
+			return { kind: "replan", reason: "active-set-changed" };
+		}
+
+		const fileId = this.generateFileId();
+		const ytext = new Y.Text();
+
+		this.ydoc.transact(() => {
+			ytext.insert(0, currentContent);
+			if (this.shouldWriteLegacyPathMap()) {
+				this.pathToId.set(path, fileId);
+			}
+			this.idToText.set(fileId, ytext);
+			this.setMetaActive(fileId, path, device);
+			for (const tombstoneId of tombstoneIds) {
+				this.meta.delete(tombstoneId);
+			}
+		}, ORIGIN_SEED);
+
+		this._pathIndexesDirty = true;
 		if (tombstoneIds.length > 0) {
-			if (reviveTombstone) {
-				this.ydoc.transact(() => {
-					for (const tombstoneId of tombstoneIds) {
-						this.meta.delete(tombstoneId);
-					}
-				}, ORIGIN_SEED);
-			this._pathIndexesDirty = true;
 			this.trace?.("sync", "ensureFile-tombstone-revived", {
 				path,
 				tombstoneIds,
@@ -1605,30 +1742,7 @@ export class VaultSync {
 			this.log(
 				`ensureFile: "${path}" revived from tombstone (${tombstoneIds.length}) due to ${reviveReason}`,
 			);
-			} else {
-				this.trace?.("sync", "ensureFile-tombstone-blocked", {
-					path,
-					tombstoneIds,
-					device: device ?? null,
-				});
-				this.log(`ensureFile: "${path}" is tombstoned, refusing to create`);
-				return null;
-			}
 		}
-
-		const fileId = this.generateFileId();
-		const ytext = new Y.Text();
-
-		this.ydoc.transact(() => {
-			ytext.insert(0, currentContent);
-			if (this.shouldWriteLegacyPathMap()) {
-				this.pathToId.set(path, fileId);
-			}
-			this.idToText.set(fileId, ytext);
-			this.setMetaActive(fileId, path, device);
-		}, ORIGIN_SEED);
-
-		this._pathIndexesDirty = true;
 		this.log(`ensureFile: created "${path}" (id=${fileId})`);
 		this._textToFileId.set(ytext, fileId);
 		this.onFlightPathEvent?.({
@@ -1642,7 +1756,7 @@ export class VaultSync {
 			fileId,
 			opId,
 		});
-		return ytext;
+		return { kind: "created", fileId, ytext };
 	}
 
 	isMarkdownTombstoned(path: string): boolean {
@@ -2380,11 +2494,14 @@ export class VaultSync {
 	}
 
 	private clearMarkdownTombstonesForPath(path: string, keepFileId?: string): number {
+		const normalizedPath = this.normPath(path);
 		const tombstonedIds: string[] = [];
 		this.meta.forEach((value: unknown, fileId: string) => {
+			const metaPath = getMetaPath(value);
 			if (
 				fileId !== keepFileId
-				&& getMetaPath(value) === path
+				&& metaPath
+				&& this.normPath(metaPath) === normalizedPath
 				&& isFileMetaDeletedValue(value)
 			) {
 				tombstonedIds.push(fileId);
@@ -2402,7 +2519,12 @@ export class VaultSync {
 		const normalizedPath = this.normPath(path);
 		const tombstonedIds: string[] = [];
 		this.meta.forEach((value: unknown, fileId: string) => {
-			if (getMetaPath(value) === normalizedPath && isFileMetaDeletedValue(value)) {
+			const metaPath = getMetaPath(value);
+			if (
+				metaPath
+				&& this.normPath(metaPath) === normalizedPath
+				&& isFileMetaDeletedValue(value)
+			) {
 				tombstonedIds.push(fileId);
 			}
 		});

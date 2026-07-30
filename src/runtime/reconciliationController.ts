@@ -23,7 +23,37 @@ import type {
 	EditorBindingManager,
 	InterceptedExternalDiskMutation,
 	OpenEditorMutationTicket,
+	OpenEditorMutationViewTicket,
 } from "../sync/editorBinding";
+import {
+	isExactHandoffReplayScrollDispatchPostcondition,
+	planExactHandoffReplay,
+	verifyFreshStoredHandoffClaim,
+	type CreateExactHandoffReplayDispatchReceiptRequest,
+	type ConsumeExactHandoffReplayPermitRequest,
+	type ConsumeExactHandoffReplayPermitResult,
+	type ExactHandoffReplayPlanRequest,
+	type ExactHandoffReplayPlanResult,
+	type HandoffCompositionProof,
+	type HandoffReplayDispatchReceipt,
+	type HandoffReplayPermit,
+	type HandoffReplayTargetSnapshot,
+	type ObserveExactHandoffReplaySettlementRequest,
+	type ObserveExactHandoffReplaySettlementResult,
+	type RedeemExactHandoffReplayDispatchPermitResult,
+} from "../sync/editorHandoffReplay";
+import {
+	canonicalHandoffRecoveryJson,
+	hashHandoffRecoveryDispatchReceipt,
+	sha256HandoffRecoveryHex,
+	validateHandoffRecoveryRecord,
+	type ActiveHandoffRecoveryRecord,
+	type HandoffRecoveryApplyWitness,
+} from "../sync/handoffRecoveryStore";
+import type {
+	EditorAuthorityLease,
+	PathEditorAuthority,
+} from "../sync/pathEditorAuthority";
 import type {
 	ProductFlightEventInput,
 	ProductFlightPathEventInput,
@@ -56,6 +86,7 @@ import {
 	type OpenBoundFileReconcileAction,
 } from "./reconcile/openBoundFilePlanner";
 import { planOpenExternalEdit } from "./reconcile/openExternalEditPlanner";
+import { planSamePathAdoption } from "./reconcile/samePathAdoptionPlanner";
 import { planBaselineAdvancement, type BaselineActionKind } from "./reconcile/baselineAdvancementPolicy";
 import { evaluateSafetyBrake } from "./reconcile/safetyBrakePolicy";
 import {
@@ -90,6 +121,47 @@ import {
 	type RemoteDeletePreservedUnresolvedReason,
 } from "../sync/preservedUnresolved";
 import { normalizeEditorText } from "../utils/editorTextNormalization";
+import type {
+	HostLoadCompletionReceipt,
+	HandoffReplayPlan,
+	MissingTargetSeedPlan,
+	MissingTargetSeedReceipt,
+	PendingHostLoadCandidate,
+	TargetPresentationPlan,
+	TargetPresentationReceipt,
+	TargetReadyToken,
+} from "../sync/editorHandoffState";
+import {
+	EditorAuthorityAdmissionRegistry,
+	type ActivePathAuthoritySnapshot,
+	type AuthorityFreshnessContext,
+	type BindPermitContext,
+	type HandoffReplayRecoveryAdmissionEvidence,
+	type HandoffReplayRecoveryClaim,
+	type HandoffReplayRecoveryOpenEditorMutationViewTicket,
+	type MissingTargetSeedResult,
+	type OpenPathAdmissionRequest,
+	type OpenPathAdmissionResult,
+	type TargetPresentationPermitContext,
+	type TargetPresentationRequest,
+	type TargetPresentationRequestResult,
+	type TargetPresentationResult,
+} from "./editorAuthorityAdmission";
+import { isMarkdownEditorView } from "./markdownEditorView";
+import type {
+	SamePathAdoptionBindContext,
+	SamePathAdoptionBindPermit,
+	SamePathAdoptionBindReceipt,
+	SamePathAdoptionConflictFailureReason,
+	SamePathAdoptionConflictReceipt,
+	SamePathAdoptionMutationContext,
+	SamePathAdoptionMutationPermit,
+	SamePathAdoptionProposal,
+	SamePathAdoptionRequest,
+	SamePathAdoptionRequestResult,
+	SamePathAdoptionSeedContext,
+	SamePathAdoptionSeedPermit,
+} from "../sync/samePathAdoption";
 
 declare const __KAOS_QA_HARNESS_ENABLED__: boolean;
 
@@ -170,6 +242,7 @@ export interface MarkdownRemoteDeleteResolutionLease {
 	readonly path: string;
 	readonly operation: "accept-remote-delete";
 	readonly generation: number;
+	readonly editorAuthority: PathEditorAuthority;
 }
 
 /**
@@ -192,13 +265,8 @@ type InternalMarkdownResolutionLease = MarkdownRemoteDeleteResolutionLease | {
 	readonly path: string;
 	readonly operation: "keep-local";
 	readonly generation: number;
+	readonly editorAuthority: PathEditorAuthority;
 };
-
-type OpenEditorAuthority =
-	| { kind: "none" }
-	| { kind: "single"; content: string }
-	| { kind: "multiple" }
-	| { kind: "read-failed" };
 
 /**
  * Exact visible-editor snapshots captured when startup reconciliation has to
@@ -232,6 +300,7 @@ interface StartupOpenFileAuthoritySnapshot {
 	expectedYText: ReturnType<VaultSync["getTextForPath"]>;
 	expectedCrdtContent: string;
 	editorTicket: OpenEditorMutationTicket | null;
+	editorAuthorityLease: EditorAuthorityLease;
 	diskRevision: number;
 	visibleAuthorityMarker: DeferredVisibleEditorAuthority | null;
 	interceptedCandidate: InterceptedExternalDiskMutation | null;
@@ -292,6 +361,7 @@ type BoundFileSyncGapOutcome =
 			expectedCrdtContent: string | null;
 			expectedEditorTicket?: OpenEditorMutationTicket;
 			expectedOpenEditorContent: string;
+			expectedEditorAuthorityLease: EditorAuthorityLease;
 		};
 	}
 	| { kind: "deferred"; deferUntil: number; reason: string }
@@ -322,6 +392,7 @@ interface OpenFlushAuthorityLease {
 	readonly expectedYText: ReturnType<VaultSync["getTextForPath"]>;
 	readonly expectedCrdtContent: string | null;
 	readonly expectedEditorTicket: OpenEditorMutationTicket | null;
+	readonly expectedEditorAuthorityLease: EditorAuthorityLease;
 	readonly expectedVisibleAuthorityMarker: DeferredVisibleEditorAuthority | null;
 	readonly expectedInterceptedCandidate: InterceptedExternalDiskMutation | null;
 	readonly expectedCandidateIdentityEpoch: number;
@@ -378,14 +449,42 @@ interface MarkdownConflictArtifactResult {
 	created: boolean;
 }
 
-interface ReconciliationControllerDeps {
+export type ReconciliationEditorBindingsPort = Pick<
+	EditorBindingManager,
+	| "captureHandoffCompositionProof"
+	| "captureCurrentTargetReadyToken"
+	| "captureHandoffReplayTargetSnapshot"
+	| "captureHandoffReplaySettlementSnapshot"
+	| "clearHandoffReplaySettlementProofs"
+	| "captureOpenEditorMutationTicket"
+	| "capturePathEditorAuthority"
+	| "getBindingDebugInfoForView"
+	| "getCollabDebugInfoForView"
+	| "getLastEditorActivityForPath"
+	| "getPendingHostLoadCandidate"
+	| "isBound"
+	| "isPathEditorAuthorityLeaseCurrent"
+	| "isSamePathAdoptionBindContextCurrent"
+	| "isSamePathAdoptionDiskSettlementCurrent"
+	| "isSamePathAdoptionProjectionHeld"
+	| "isSamePathAdoptionRequestCurrent"
+	| "completeSamePathAdoptionDiskSettlement"
+	| "invalidateSamePathAdoptionDiskSettlement"
+	| "rebind"
+	| "repair"
+	| "separateUndoCaptureForPath"
+	| "unbindByPath"
+	| "validateOpenEditorMutationTicket"
+>;
+
+export interface ReconciliationControllerDeps {
 	app: App;
 	getSettings(): VaultSyncSettings;
 	getRuntimeConfig(): RuntimeConfig;
 	getVaultSync(): VaultSync | null;
 	getDiskMirror(): DiskMirror | null;
 	getBlobSync(): BlobSyncManager | null;
-	getEditorBindings(): EditorBindingManager | null;
+	getEditorBindings(): ReconciliationEditorBindingsPort | null;
 	getDiskIndex(): DiskIndex;
 	setDiskIndex(index: DiskIndex): void;
 	getBaselineText?(contentHash: string): Promise<string | null> | string | null;
@@ -448,6 +547,8 @@ interface ReconciliationControllerDeps {
 	 * Must not be wired in production main.ts.
 	 */
 	registerDiskIngestPort?(port: DiskIngestPort): void;
+	/** Test-only deterministic source; production must use crypto.randomUUID(). */
+	handoffReplayLifecycleNonceFactory?(): string;
 }
 
 const RECONCILE_COOLDOWN_MS = 10_000;
@@ -483,6 +584,169 @@ function tracePathList(prefix: string, paths: string[]): Record<string, unknown>
 interface BindingHealthResult {
 	healthy: boolean;
 	reasons: string[];
+}
+
+interface EditorAdmissionAuthoritySnapshot {
+	readonly lifecycleGeneration: number;
+	readonly vaultSync: VaultSync;
+	readonly path: string;
+	readonly file: TFile;
+	readonly fileStat: Readonly<{
+		ctime: number | null;
+		mtime: number | null;
+		size: number | null;
+	}>;
+	readonly diskContent: string;
+	readonly certifiedBaseHash: string;
+	readonly diskRevision: number;
+	readonly baselineHash: string | null;
+	readonly baselineRevision: number;
+	readonly attentionGeneration: number;
+	readonly syncScopeGeneration: number;
+	readonly openEditorTicket: OpenEditorMutationTicket;
+	readonly openFileViews: readonly unknown[];
+	readonly activeAuthority: ActivePathAuthoritySnapshot;
+	readonly sessionId: string;
+	readonly leafId: string;
+	readonly handoffGeneration: number;
+	readonly switchIntentSeq: number;
+	readonly admissionReason:
+		| "open-editor-missing-target"
+		| "handoff-replay-target-bind";
+	readonly recoveryClaim: HandoffReplayRecoveryClaim | null;
+	readonly presentation: "target-candidate" | "target-proven";
+	readonly hostLoadTokenId: string | null;
+	readonly expectedEditorContent: string;
+	readonly requiresRemoteProjection: boolean;
+}
+
+type EditorAdmissionCaptureResult =
+	| Readonly<{ kind: "ready"; snapshot: EditorAdmissionAuthoritySnapshot }>
+	| Readonly<{
+		kind: "deferred";
+		reason:
+			| "transitioning"
+			| "unstable"
+			| "attention"
+			| "frontmatter"
+			| "tombstone"
+			| "multiple-authorities";
+	}>
+	| Readonly<{ kind: "replan"; reason: "authority-changed" }>;
+
+interface TargetPresentationPlanRecord {
+	readonly request: TargetPresentationRequest;
+	readonly plan: TargetPresentationPlan;
+	readonly snapshot: EditorAdmissionAuthoritySnapshot;
+	readonly presentationPermitId: string;
+	completion: TargetPresentationResult | null;
+}
+
+interface TargetReadyRecord {
+	readonly token: TargetReadyToken;
+	readonly context: AuthorityFreshnessContext;
+	readonly snapshot: EditorAdmissionAuthoritySnapshot;
+	readonly hostReceipt: HostLoadCompletionReceipt;
+	readonly candidate: PendingHostLoadCandidate;
+}
+
+interface MissingTargetSeedPlanRecord {
+	readonly plan: MissingTargetSeedPlan;
+	readonly anchor: TargetReadyRecord;
+	readonly snapshot: EditorAdmissionAuthoritySnapshot;
+	inFlight: boolean;
+	result: MissingTargetSeedResult | null;
+}
+
+interface SamePathAdoptionAuthoritySnapshot {
+	readonly request: SamePathAdoptionRequest;
+	readonly lifecycleGeneration: number;
+	readonly vaultSync: VaultSync;
+	readonly providerInstance: object | null;
+	readonly baselineHash: string | null;
+	readonly baselineRevision: number;
+	readonly baselineText: string | null;
+	readonly diskFile: TFile;
+	readonly diskStat: SamePathAdoptionProposal["diskStat"];
+	readonly diskContent: string;
+	readonly diskContentHash: string;
+	readonly diskRevision: number;
+	readonly activeAuthority: ActivePathAuthoritySnapshot;
+	readonly localText: string;
+	readonly localVersions: readonly Readonly<{
+		content: string;
+		leafIds: readonly string[];
+	}>[];
+	readonly remoteText: string | null;
+	readonly editorAuthority: PathEditorAuthority;
+	readonly editorAuthorityLease: EditorAuthorityLease | null;
+	readonly attentionGeneration: number;
+	readonly syncScopeGeneration: number;
+	readonly interceptedCandidate: InterceptedExternalDiskMutation | null;
+}
+
+interface SamePathAdoptionProposalRecord {
+	readonly request: SamePathAdoptionRequest;
+	readonly proposal: SamePathAdoptionProposal;
+	readonly snapshot: SamePathAdoptionAuthoritySnapshot;
+}
+
+export type DiskBaselineSettlementAdmission = Readonly<{
+	admissionId: string;
+	path: string;
+	contentHash: string;
+	content: string;
+}>;
+
+interface SamePathAdoptionDiskSettlement {
+	readonly settlementId: string;
+	readonly record: SamePathAdoptionProposalRecord;
+	readonly receipt: SamePathAdoptionBindReceipt;
+	readonly lifecycleGeneration: number;
+	readonly diskMirror: DiskMirror;
+}
+
+interface InternalDiskBaselineSettlementAdmission {
+	readonly admission: DiskBaselineSettlementAdmission;
+	readonly lifecycleGeneration: number;
+	readonly baselineRevision: number;
+	readonly adoptionSettlement: SamePathAdoptionDiskSettlement | null;
+}
+
+interface InternalHandoffReplayPlanEntry {
+	readonly plan: HandoffReplayPlan;
+	readonly intent: ExactHandoffReplayPlanRequest["intent"];
+	readonly storedRecordId: string;
+	readonly storedIntentEnvelopeHash: string;
+	readonly storedChecksum: string;
+	readonly replayPendingChecksum: string;
+	readonly recoveryOperationEpoch: number;
+	readonly targetReadyToken: TargetReadyToken;
+	readonly applyWitness: HandoffRecoveryApplyWitness;
+	readonly expectedSnapshot: HandoffReplayTargetSnapshot;
+	readonly expectedSnapshotFingerprint: string;
+}
+
+interface InternalHandoffReplayDispatchPermitEntry {
+	readonly permit: HandoffReplayPermit;
+	readonly plan: HandoffReplayPlan;
+	readonly record: ActiveHandoffRecoveryRecord & Readonly<{
+		status: "replay-pending";
+	}>;
+	readonly expectedSnapshot: HandoffReplayTargetSnapshot;
+	readonly expectedSnapshotFingerprint: string;
+	readonly targetReadyToken: TargetReadyToken;
+	readonly applyWitness: HandoffRecoveryApplyWitness;
+}
+
+interface InternalHandoffReplaySettlementAuthority {
+	readonly plan: HandoffReplayPlan;
+	readonly record: ActiveHandoffRecoveryRecord & Readonly<{
+		status: "replay-pending";
+	}>;
+	readonly expectedSnapshot: HandoffReplayTargetSnapshot;
+	readonly targetReadyToken: TargetReadyToken;
+	readonly applyWitness: HandoffRecoveryApplyWitness;
 }
 
 /**
@@ -591,6 +855,7 @@ function traceRecoveryPostcondition(
 }
 
 export class ReconciliationController {
+	private static readonly EDITOR_ADMISSION_RECORD_LIMIT = 512;
 	private reconciled = false;
 	private reconcileInFlight = false;
 	private reconcilePending = false;
@@ -637,6 +902,52 @@ export class ReconciliationController {
 	private externalCandidateIdentityEpochs = new Map<string, number>();
 	/** Invalidates fire-and-forget preservation work across reset/reinitialization. */
 	private lifecycleGeneration = 0;
+	private readonly handoffReplayLifecycleNonce: string;
+	private handoffReplayIdSequence = 0;
+	private readonly handoffReplayPlans = new Map<string, InternalHandoffReplayPlanEntry>();
+	private readonly consumedHandoffReplayPlanIds = new Set<string>();
+	private readonly handoffReplayDispatchPermits =
+		new Map<HandoffReplayPermit, InternalHandoffReplayDispatchPermitEntry>();
+	private readonly consumedHandoffReplayDispatchPermits =
+		new WeakSet<HandoffReplayPermit>();
+	private readonly handoffReplaySettlementAuthorities =
+		new Map<string, InternalHandoffReplaySettlementAuthority>();
+	/** Synchronous fence for Recovery Clear/manual invalidation of async planning. */
+	private handoffReplayRecoveryAuthorityEpoch = 0;
+	private readonly handoffReplayRecordAuthorityEpochs = new Map<string, number>();
+	/** Nominal controller-owned freshness and one-shot mutation capability store. */
+	private readonly editorAuthorityAdmission = new EditorAuthorityAdmissionRegistry();
+	private editorAuthorityAdmissionOpen = true;
+	private readonly openPathAdmissionRequests =
+		new Map<string, Readonly<{
+			request: OpenPathAdmissionRequest;
+			promise: Promise<OpenPathAdmissionResult>;
+		}>>();
+	private readonly targetPresentationRequests =
+		new Map<string, Readonly<{
+			request: TargetPresentationRequest;
+			promise: Promise<TargetPresentationRequestResult>;
+		}>>();
+	private readonly targetPresentationPlans = new Map<string, TargetPresentationPlanRecord>();
+	private readonly targetPresentationPlanByHostToken = new Map<string, TargetPresentationPlanRecord>();
+	private readonly targetPresentationCompletionByReceipt =
+		new Map<string, Readonly<{
+			receipt: HostLoadCompletionReceipt;
+			promise: Promise<TargetPresentationResult>;
+		}>>();
+	private readonly targetReadyBySession = new Map<string, TargetReadyRecord>();
+	private readonly missingTargetSeedPlans = new Map<string, MissingTargetSeedPlanRecord>();
+	private readonly samePathAdoptionRequests =
+		new Map<string, Readonly<{
+			request: SamePathAdoptionRequest;
+			promise: Promise<SamePathAdoptionRequestResult>;
+		}>>();
+	private readonly samePathAdoptionProposals =
+		new Map<string, SamePathAdoptionProposalRecord>();
+	private readonly samePathAdoptionDiskSettlements =
+		new Map<string, SamePathAdoptionDiskSettlement>();
+	private readonly diskBaselineSettlementAdmissions =
+		new WeakMap<DiskBaselineSettlementAdmission, InternalDiskBaselineSettlementAdmission>();
 	/** At most one Keep/Accept resolution may own a Markdown path. */
 	private markdownRemoteDeleteResolutions = new Map<string, InternalMarkdownResolutionLease>();
 	private markdownDrainPromise: Promise<void> | null = null;
@@ -667,6 +978,12 @@ export class ReconciliationController {
 	private static readonly AMPLIFICATION_NOTICE_COOLDOWN_MS = 60_000;
 
 	constructor(private readonly deps: ReconciliationControllerDeps) {
+		const nonce = deps.handoffReplayLifecycleNonceFactory?.()
+			?? globalThis.crypto?.randomUUID?.();
+		if (typeof nonce !== "string" || nonce.length === 0) {
+			throw new Error("Secure handoff replay lifecycle nonce is unavailable");
+		}
+		this.handoffReplayLifecycleNonce = nonce;
 		// If a QA harness is attached, register the disk-ingest control port now.
 		// In normal production, registerDiskIngestHarnessPort is absent.
 		deps.registerDiskIngestPort?.({
@@ -761,17 +1078,1258 @@ export class ReconciliationController {
 		this.reconcilePending = true;
 	}
 
+	requestOpenPathAdmission(
+		request: OpenPathAdmissionRequest,
+	): Promise<OpenPathAdmissionResult> {
+		if (!this.editorAuthorityAdmissionOpen) {
+			return Promise.resolve({ kind: "replan", reason: "authority-changed" });
+		}
+		const existing = this.openPathAdmissionRequests.get(request.requestId);
+		if (existing) {
+			return existing.request === request
+				? existing.promise
+				: Promise.resolve({ kind: "replan", reason: "authority-changed" });
+		}
+		const promise = this.planOpenPathAdmission(request);
+		this.trimEditorAdmissionMap(this.openPathAdmissionRequests);
+		this.openPathAdmissionRequests.set(request.requestId, { request, promise });
+		return promise;
+	}
+
+	requestTargetPresentation(
+		request: TargetPresentationRequest,
+	): Promise<TargetPresentationRequestResult> {
+		if (!this.editorAuthorityAdmissionOpen) {
+			return Promise.resolve({ kind: "replan", reason: "authority-changed" });
+		}
+		const existing = this.targetPresentationRequests.get(request.requestId);
+		if (existing) {
+			return existing.request === request
+				? existing.promise
+				: Promise.resolve({ kind: "replan", reason: "authority-changed" });
+		}
+		const promise = this.planTargetPresentation(request);
+		this.trimEditorAdmissionMap(this.targetPresentationRequests);
+		this.targetPresentationRequests.set(request.requestId, { request, promise });
+		return promise;
+	}
+
+	requestSamePathAdoption(
+		request: SamePathAdoptionRequest,
+	): Promise<SamePathAdoptionRequestResult> {
+		if (!this.editorAuthorityAdmissionOpen) {
+			return Promise.resolve({ kind: "replan", reason: "authority-changed" });
+		}
+		const existing = this.samePathAdoptionRequests.get(request.requestId);
+		if (existing) {
+			return existing.request === request
+				? existing.promise
+				: Promise.resolve({ kind: "replan", reason: "authority-changed" });
+		}
+		const promise = this.planSamePathAdoptionRequest(request);
+		this.trimEditorAdmissionMap(this.samePathAdoptionRequests);
+		this.samePathAdoptionRequests.set(request.requestId, { request, promise });
+		return promise;
+	}
+
+	consumeSamePathAdoptionMutationPermit(
+		permit: SamePathAdoptionMutationPermit,
+		context: SamePathAdoptionMutationContext,
+	): boolean {
+		return this.editorAuthorityAdmissionOpen
+			&& this.editorAuthorityAdmission.consumeSamePathAdoptionMutationPermit(
+				permit,
+				context,
+			);
+	}
+
+	consumeSamePathAdoptionBindPermit(
+		permit: SamePathAdoptionBindPermit,
+		context: SamePathAdoptionBindContext,
+	): boolean {
+		return this.editorAuthorityAdmissionOpen
+			&& this.editorAuthorityAdmission.consumeSamePathAdoptionBindPermit(
+				permit,
+				context,
+			);
+	}
+
+	private isSamePathAdoptionProjectionHeld(path: string): boolean {
+		const editorBindings = this.deps.getEditorBindings();
+		if (!editorBindings) return false;
+		const predicate = editorBindings.isSamePathAdoptionProjectionHeld;
+		if (typeof predicate !== "function") return false;
+		try {
+			return predicate.call(editorBindings, path);
+		} catch {
+			// A broken authority predicate must not open a baseline mutation lane.
+			return true;
+		}
+	}
+
+	private rejectSamePathAdoptionBoundReceipt(
+		receipt: SamePathAdoptionBindReceipt,
+		record: SamePathAdoptionProposalRecord | null,
+		reason: string,
+		queueFreshWork = true,
+	): void {
+		if (record !== null) {
+			if (this.samePathAdoptionProposals.get(receipt.proposalId) === record) {
+				this.samePathAdoptionProposals.delete(receipt.proposalId);
+			}
+			this.editorAuthorityAdmission.invalidateFreshness(
+				record.proposal.authorityFreshnessHandleId,
+			);
+		}
+		try {
+			this.deps.getEditorBindings()?.invalidateSamePathAdoptionDiskSettlement(
+				receipt,
+				reason,
+			);
+		} catch {
+			// The controller still retires its own receipt if the host disappeared.
+		}
+		if (
+			queueFreshWork
+			&& this.editorAuthorityAdmissionOpen
+			&& this.deps.app.vault.getAbstractFileByPath(receipt.path) === receipt.file
+			&& this.deps.isMarkdownPathSyncable(receipt.path)
+		) {
+			this.queueDirtyMarkdownPath(receipt.path, "modify");
+		}
+		this.deps.trace("reconcile", "same-path-adoption-disk-settlement-invalidated", {
+			path: receipt.path,
+			adoptionId: receipt.adoptionId,
+			proposalId: receipt.proposalId,
+			reason,
+		});
+	}
+
+	noteSamePathAdoptionBound(receipt: SamePathAdoptionBindReceipt): void {
+		const record = this.samePathAdoptionProposals.get(receipt.proposalId);
+		if (
+			!record
+			|| record.proposal.adoptionId !== receipt.adoptionId
+			|| record.proposal.path !== receipt.path
+			|| record.proposal.file !== receipt.file
+			|| record.proposal.fileId !== receipt.fileId
+			|| record.proposal.ytext !== receipt.ytext
+			|| record.proposal.ytextIdentity !== receipt.ytextIdentity
+			|| record.proposal.plan.kind === "preserve-conflict"
+			|| record.proposal.plan.targetText !== receipt.targetText
+		) {
+			this.rejectSamePathAdoptionBoundReceipt(
+				receipt,
+				record ?? null,
+				"bound-receipt-mismatch",
+			);
+			return;
+		}
+		const editorBindings = this.deps.getEditorBindings();
+		const diskMirror = this.deps.getDiskMirror();
+		let receiptCurrent = false;
+		try {
+			receiptCurrent =
+				!!editorBindings
+				&& editorBindings.isSamePathAdoptionDiskSettlementCurrent(receipt);
+		} catch {
+			// A host callback failure is a stale receipt, never settlement authority.
+		}
+		if (!diskMirror || !receiptCurrent) {
+			this.rejectSamePathAdoptionBoundReceipt(
+				receipt,
+				record,
+				!diskMirror ? "disk-mirror-unavailable" : "bound-receipt-stale",
+			);
+			return;
+		}
+		this.editorAuthorityAdmission.invalidateFreshness(
+			record.proposal.authorityFreshnessHandleId,
+		);
+		const settlement: SamePathAdoptionDiskSettlement = Object.freeze({
+			settlementId: this.editorAuthorityAdmission.nextId(
+				"same-path-adoption-disk-settlement",
+			),
+			record,
+			receipt,
+			lifecycleGeneration: this.lifecycleGeneration,
+			diskMirror,
+		});
+		this.samePathAdoptionDiskSettlements.set(receipt.path, settlement);
+		void this.flushSamePathAdoptionDiskSettlement(settlement);
+	}
+
+	private isSamePathAdoptionDiskSettlementCurrent(
+		settlement: SamePathAdoptionDiskSettlement,
+		options: Readonly<{ allowStagedBaselinePublication?: boolean }> = {},
+	): boolean {
+		const { record, receipt } = settlement;
+		const { proposal, snapshot } = record;
+		if (
+			!this.editorAuthorityAdmissionOpen
+			|| this.lifecycleGeneration !== settlement.lifecycleGeneration
+			|| this.samePathAdoptionDiskSettlements.get(receipt.path) !== settlement
+			|| this.samePathAdoptionProposals.get(receipt.proposalId) !== record
+			|| this.deps.getDiskMirror() !== settlement.diskMirror
+			|| this.deps.getVaultSync() !== snapshot.vaultSync
+			|| this.captureSamePathAdoptionProvider(snapshot.vaultSync)
+				!== snapshot.providerInstance
+			|| receipt.file.path !== receipt.path
+			|| this.deps.app.vault.getAbstractFileByPath(receipt.path) !== receipt.file
+			|| (
+				options.allowStagedBaselinePublication !== true
+				&& (this.deps.getDiskIndex()[receipt.path]?.contentHash ?? null)
+					!== proposal.baselineHash
+			)
+			|| (this.diskBaselineRevisions.get(receipt.path) ?? 0)
+				!== proposal.baselineRevision
+			|| (this.deps.getMarkdownAttentionGeneration?.() ?? 0)
+				!== proposal.attentionGeneration
+			|| (this.deps.getMarkdownSyncScopeGeneration?.() ?? 0)
+				!== proposal.syncScopeGeneration
+			|| (this.interceptedExternalDiskMutations.get(receipt.path) ?? null) !== null
+			|| !this.isSamePathAdoptionPolicyCurrent(receipt.path, snapshot.vaultSync)
+		) return false;
+		const active = this.editorAuthorityAdmission.captureActivePathAuthority(
+			snapshot.vaultSync,
+			receipt.path,
+		);
+		if (
+			active.activeFileIds.length !== 1
+			|| active.activeFileIds[0] !== receipt.fileId
+			|| active.fileId !== receipt.fileId
+			|| active.ytext !== receipt.ytext
+			|| active.ytextIdentity !== receipt.ytextIdentity
+			|| active.ytextMutationEpoch !== receipt.ytextMutationEpoch
+			|| normalizeEditorText(active.ytextContent ?? "") !== receipt.targetText
+		) return false;
+		try {
+			return this.deps.getEditorBindings()
+				?.isSamePathAdoptionDiskSettlementCurrent(receipt) === true;
+		} catch {
+			return false;
+		}
+	}
+
+	private async flushSamePathAdoptionDiskSettlement(
+		settlement: SamePathAdoptionDiskSettlement,
+	): Promise<void> {
+		const { proposal } = settlement.record;
+		const { receipt } = settlement;
+		const diskRevision = proposal.diskStat.ctime !== null
+			&& proposal.diskStat.mtime !== null
+			&& proposal.diskStat.size !== null
+			? {
+				ctime: proposal.diskStat.ctime,
+				mtime: proposal.diskStat.mtime,
+				size: proposal.diskStat.size,
+			}
+			: undefined;
+		let result: DiskWriteResult;
+		try {
+			result = await settlement.diskMirror.flushWrite(receipt.path, true, {
+				expectedDiskContent: proposal.diskContent,
+				expectedDiskFile: proposal.diskFile,
+				...(diskRevision ? { expectedDiskRevision: diskRevision } : {}),
+				isAuthorityCurrent: () =>
+					this.isSamePathAdoptionDiskSettlementCurrent(settlement),
+				isSamePathAdoptionSettlementCurrent: () =>
+					this.isSamePathAdoptionDiskSettlementCurrent(settlement),
+			});
+		} catch (error) {
+			this.abortSamePathAdoptionDiskSettlement(
+				settlement,
+				`flush-threw:${error instanceof Error ? error.name : "unknown"}`,
+			);
+			return;
+		}
+		if (this.samePathAdoptionDiskSettlements.get(receipt.path) !== settlement) {
+			return;
+		}
+		this.abortSamePathAdoptionDiskSettlement(
+			settlement,
+			`flush-${result.kind}${"reason" in result ? `:${result.reason}` : ""}`,
+		);
+	}
+
+	private abortSamePathAdoptionDiskSettlement(
+		settlement: SamePathAdoptionDiskSettlement,
+		reason: string,
+	): void {
+		const { receipt, record } = settlement;
+		if (this.samePathAdoptionDiskSettlements.get(receipt.path) !== settlement) return;
+		this.samePathAdoptionDiskSettlements.delete(receipt.path);
+		this.rejectSamePathAdoptionBoundReceipt(receipt, record, reason);
+	}
+
+	captureDiskBaselineSettlementAdmission(
+		path: string,
+		contentHash: string,
+		content: string,
+	): DiskBaselineSettlementAdmission | null {
+		if (!this.editorAuthorityAdmissionOpen) return null;
+		const adoptionSettlement = this.samePathAdoptionDiskSettlements.get(path) ?? null;
+		if (adoptionSettlement !== null) {
+			if (
+				content !== adoptionSettlement.receipt.targetText
+				|| !this.isSamePathAdoptionDiskSettlementCurrent(adoptionSettlement)
+			) return null;
+		} else {
+			if (this.isSamePathAdoptionProjectionHeld(path)) return null;
+		}
+		const admission = Object.freeze({
+			admissionId: this.editorAuthorityAdmission.nextId(
+				"disk-baseline-settlement-admission",
+			),
+			path,
+			contentHash,
+			content,
+		});
+		this.diskBaselineSettlementAdmissions.set(admission, Object.freeze({
+			admission,
+			lifecycleGeneration: this.lifecycleGeneration,
+			baselineRevision: this.diskBaselineRevisions.get(path) ?? 0,
+			adoptionSettlement,
+		}));
+		return admission;
+	}
+
+	commitDiskBaselineSettlementAdmission(
+		admission: DiskBaselineSettlementAdmission,
+	): boolean {
+		const record = this.diskBaselineSettlementAdmissions.get(admission);
+		this.diskBaselineSettlementAdmissions.delete(admission);
+		if (
+			!record
+			|| record.admission !== admission
+			|| !this.editorAuthorityAdmissionOpen
+			|| record.lifecycleGeneration !== this.lifecycleGeneration
+			|| (this.diskBaselineRevisions.get(admission.path) ?? 0)
+				!== record.baselineRevision
+		) return false;
+		if (record.adoptionSettlement !== null) {
+			const settlement = record.adoptionSettlement;
+			if (
+				!this.isSamePathAdoptionDiskSettlementCurrent(settlement, {
+					allowStagedBaselinePublication: true,
+				})
+				|| !this.deps.getEditorBindings()?.completeSamePathAdoptionDiskSettlement(
+					settlement.receipt,
+					admission.content,
+				)
+			) {
+				this.abortSamePathAdoptionDiskSettlement(settlement, "baseline-commit-stale");
+				return false;
+			}
+			this.samePathAdoptionDiskSettlements.delete(admission.path);
+			this.samePathAdoptionProposals.delete(settlement.receipt.proposalId);
+			this.editorAuthorityAdmission.invalidateFreshness(
+				settlement.record.proposal.authorityFreshnessHandleId,
+			);
+		} else {
+			if (this.isSamePathAdoptionProjectionHeld(admission.path)) return false;
+		}
+		this.noteDiskBaselineSettlement(admission.path, admission.content);
+		return true;
+	}
+
+	consumeTargetPresentationPermit(
+		permitId: string,
+		context: TargetPresentationPermitContext,
+	): boolean {
+		return this.editorAuthorityAdmissionOpen
+			&& this.editorAuthorityAdmission.consumePresentationPermit(permitId, context);
+	}
+
+	completeTargetPresentation(
+		receipt: HostLoadCompletionReceipt,
+	): Promise<TargetPresentationResult> {
+		if (!this.editorAuthorityAdmissionOpen) {
+			return Promise.resolve({ kind: "replan", reason: "authority-changed" });
+		}
+		const existing = this.targetPresentationCompletionByReceipt.get(receipt.receiptId);
+		if (existing) {
+			return existing.receipt === receipt
+				? existing.promise
+				: Promise.resolve({ kind: "replan", reason: "presentation-changed" });
+		}
+		const promise = this.finishTargetPresentation(receipt);
+		this.trimEditorAdmissionMap(this.targetPresentationCompletionByReceipt);
+		this.targetPresentationCompletionByReceipt.set(receipt.receiptId, { receipt, promise });
+		void promise.then(
+			(result) => {
+				const current = this.targetPresentationCompletionByReceipt.get(receipt.receiptId);
+				if (result.kind !== "accepted" && current?.promise === promise) {
+					this.targetPresentationCompletionByReceipt.delete(receipt.receiptId);
+				}
+			},
+			() => {
+				const current = this.targetPresentationCompletionByReceipt.get(receipt.receiptId);
+				if (current?.promise === promise) {
+					this.targetPresentationCompletionByReceipt.delete(receipt.receiptId);
+				}
+			},
+		);
+		return promise;
+	}
+
+	seedMissingTarget(plan: MissingTargetSeedPlan): Promise<MissingTargetSeedResult> {
+		if (!this.editorAuthorityAdmissionOpen) {
+			return Promise.resolve({ kind: "replan", reason: "authority-changed" });
+		}
+		const record = this.missingTargetSeedPlans.get(plan.planId);
+		if (!record || record.plan !== plan || record.result !== null) {
+			return Promise.resolve({ kind: "replan", reason: "authority-changed" });
+		}
+		return this.commitMissingTargetSeed(record);
+	}
+
+	isAuthorityFreshnessCurrent(
+		handleId: string,
+		context: AuthorityFreshnessContext,
+	): boolean {
+		return this.editorAuthorityAdmissionOpen
+			&& this.editorAuthorityAdmission.isFreshnessCurrent(handleId, context);
+	}
+
+	private nextHandoffReplayId(kind: "plan" | "permit" | "snapshot"): string {
+		this.handoffReplayIdSequence += 1;
+		return [
+			"handoff-replay",
+			kind,
+			this.handoffReplayLifecycleNonce,
+			this.lifecycleGeneration,
+			this.handoffReplayIdSequence,
+		].join(":");
+	}
+
+	private handoffReplayFreshnessContext(
+		snapshot: HandoffReplayTargetSnapshot,
+	): AuthorityFreshnessContext {
+		return Object.freeze({
+			sessionId: snapshot.sessionId,
+			leafId: snapshot.leafId,
+			handoffGeneration: snapshot.handoffGeneration,
+			targetReadyTokenId: snapshot.targetReadyTokenId,
+			targetFile: snapshot.targetFile,
+			hostLoadReceiptId: snapshot.hostLoadReceiptId,
+			cm: snapshot.cm,
+			editorRevision: snapshot.editorRevision,
+			nativeHistoryEpoch: snapshot.nativeHistoryEpoch,
+			selectionEpoch: snapshot.selectionEpoch,
+			scrollEpoch: snapshot.scrollEpoch,
+		});
+	}
+
+	private sameHandoffReplaySnapshot(
+		left: HandoffReplayTargetSnapshot,
+		right: HandoffReplayTargetSnapshot,
+	): boolean {
+		return left.sessionId === right.sessionId
+			&& left.leafId === right.leafId
+			&& left.handoffGeneration === right.handoffGeneration
+			&& left.recoveryOperationEpoch === right.recoveryOperationEpoch
+			&& left.targetReadyTokenId === right.targetReadyTokenId
+			&& left.hostLoadTokenId === right.hostLoadTokenId
+			&& left.hostLoadReceiptId === right.hostLoadReceiptId
+			&& left.targetPath === right.targetPath
+			&& left.targetFile === right.targetFile
+			&& left.targetFileId === right.targetFileId
+			&& left.cm === right.cm
+			&& left.ytext === right.ytext
+			&& left.ytextIdentity === right.ytextIdentity
+			&& left.ytextMutationEpoch === right.ytextMutationEpoch
+			&& left.bindingEpoch === right.bindingEpoch
+			&& left.editorRevision === right.editorRevision
+			&& left.nativeHistoryEpoch === right.nativeHistoryEpoch
+			&& left.selectionEpoch === right.selectionEpoch
+			&& left.scrollEpoch === right.scrollEpoch
+			&& left.selection.eq(right.selection)
+			&& Object.is(left.scrollAnchor, right.scrollAnchor)
+			&& left.cmDocument === right.cmDocument
+			&& left.cmDocument.toString() === right.cmDocument.toString()
+			&& left.editorFacadeContent === right.editorFacadeContent
+			&& left.runtimeCacheContent === right.runtimeCacheContent
+			&& left.ytextContent === right.ytextContent;
+	}
+
+	private async replayPendingChecksum(
+		request: ExactHandoffReplayPlanRequest,
+		witness: HandoffRecoveryApplyWitness,
+	): Promise<string> {
+		const storedWithoutChecksum: Record<string, unknown> = { ...request.record };
+		Reflect.deleteProperty(storedWithoutChecksum, "checksum");
+		return sha256HandoffRecoveryHex(canonicalHandoffRecoveryJson({
+			...storedWithoutChecksum,
+			applyWitness: witness,
+			status: "replay-pending",
+		}));
+	}
+
+	async requestExactHandoffReplayPlan(
+		request: ExactHandoffReplayPlanRequest,
+	): Promise<ExactHandoffReplayPlanResult> {
+		const recoveryAuthorityEpoch = this.handoffReplayRecoveryAuthorityEpoch;
+		const recordAuthorityEpoch =
+			this.handoffReplayRecordAuthorityEpochs.get(request.record.recordId) ?? 0;
+		if (
+			request.sessionId !== request.intent.sessionId
+			|| request.expectedGeneration !== request.intent.handoffGeneration
+		) {
+			return { kind: "replan", reason: request.sessionId !== request.intent.sessionId
+				? "session-stale"
+				: "generation-stale" };
+		}
+		if (
+			!Number.isSafeInteger(request.recoveryOperationEpoch)
+			|| request.recoveryOperationEpoch < 0
+		) {
+			return { kind: "replan", reason: "generation-stale" };
+		}
+		try {
+			const validated = await validateHandoffRecoveryRecord(request.record);
+			if (validated !== request.record || validated.status !== "stored") {
+				return { kind: "manual", reason: "stored-codec-invalid" };
+			}
+		} catch {
+			return { kind: "manual", reason: "stored-codec-invalid" };
+		}
+		const editorBindings = this.deps.getEditorBindings();
+		if (!editorBindings) {
+			return { kind: "replan", reason: "target-authority-stale" };
+		}
+		const capturedComposition =
+			editorBindings.captureHandoffCompositionProof(request.intent);
+		let compositionProof: HandoffCompositionProof | null = null;
+		if (request.intent.compositionEpoch === null) {
+			if (
+				request.record.body.eventProof.compositionEpoch !== null
+				|| request.compositionProof !== null
+				|| capturedComposition.kind !== "not-ime"
+			) {
+				return { kind: "manual", reason: "user-composition-invalid" };
+			}
+		} else {
+			if (
+				capturedComposition.kind !== "ready"
+				|| request.compositionProof !== capturedComposition.proof
+			) {
+				return { kind: "manual", reason: "ime-composition-missing" };
+			}
+			compositionProof = capturedComposition.proof;
+		}
+		const claimed = await verifyFreshStoredHandoffClaim(
+			request.intent,
+			request.record,
+			compositionProof,
+		);
+		if (claimed.kind !== "claimed") return claimed;
+		const currentToken = editorBindings.captureCurrentTargetReadyToken({
+			sessionId: request.sessionId,
+			expectedGeneration: request.expectedGeneration,
+			targetPath: request.intent.targetPath,
+			targetFile: request.intent.targetFile,
+		});
+		if (currentToken !== request.targetReadyToken) {
+			return { kind: "replan", reason: "target-token-stale" };
+		}
+		const captured = editorBindings.captureHandoffReplayTargetSnapshot({
+			sessionId: request.sessionId,
+			expectedGeneration: request.expectedGeneration,
+			recoveryOperationEpoch: request.recoveryOperationEpoch,
+			recoveryClaim: Object.freeze({
+				intentId: request.intent.intentId,
+				recordId: request.record.recordId,
+			}),
+			targetReadyToken: request.targetReadyToken,
+		});
+		if (captured.kind !== "ready") {
+			switch (captured.reason) {
+				case "session-stale":
+					return { kind: "replan", reason: "session-stale" };
+				case "generation-stale":
+					return { kind: "replan", reason: "generation-stale" };
+				case "target-token-stale":
+					return { kind: "replan", reason: "target-token-stale" };
+				case "target-not-proven":
+				case "binding-missing":
+				case "target-identity-stale":
+				case "editor-identity-stale":
+					return { kind: "replan", reason: "target-authority-stale" };
+			}
+		}
+		const snapshot = captured.snapshot;
+		if (snapshot.recoveryOperationEpoch !== request.recoveryOperationEpoch) {
+			return { kind: "replan", reason: "target-authority-stale" };
+		}
+		const freshness = this.handoffReplayFreshnessContext(snapshot);
+		if (!this.isAuthorityFreshnessCurrent(
+			request.targetReadyToken.authorityFreshnessHandleId,
+			freshness,
+		)) {
+			return { kind: "replan", reason: "target-authority-stale" };
+		}
+		const result = planExactHandoffReplay(
+			claimed.claim,
+			request.targetReadyToken,
+			snapshot,
+			{
+				planId: this.nextHandoffReplayId("plan"),
+				replayPermitId: this.nextHandoffReplayId("permit"),
+			},
+		);
+		if (result.kind !== "planned") return result;
+		const expectedSnapshotFingerprint = this.nextHandoffReplayId("snapshot");
+		const replayPendingChecksum = await this.replayPendingChecksum(
+			request,
+			result.applyWitness,
+		);
+		const finalToken = editorBindings.captureCurrentTargetReadyToken({
+			sessionId: request.sessionId,
+			expectedGeneration: request.expectedGeneration,
+			targetPath: request.intent.targetPath,
+			targetFile: request.intent.targetFile,
+		});
+		const finalCapture = editorBindings.captureHandoffReplayTargetSnapshot({
+			sessionId: request.sessionId,
+			expectedGeneration: request.expectedGeneration,
+			recoveryOperationEpoch: request.recoveryOperationEpoch,
+			recoveryClaim: Object.freeze({
+				intentId: request.intent.intentId,
+				recordId: request.record.recordId,
+			}),
+			targetReadyToken: request.targetReadyToken,
+		});
+		if (
+			recoveryAuthorityEpoch !== this.handoffReplayRecoveryAuthorityEpoch
+			|| recordAuthorityEpoch
+				!== (this.handoffReplayRecordAuthorityEpochs.get(request.record.recordId) ?? 0)
+			|| finalToken !== request.targetReadyToken
+			|| finalCapture.kind !== "ready"
+			|| !this.sameHandoffReplaySnapshot(snapshot, finalCapture.snapshot)
+			|| !this.isAuthorityFreshnessCurrent(
+				request.targetReadyToken.authorityFreshnessHandleId,
+				this.handoffReplayFreshnessContext(finalCapture.snapshot),
+			)
+		) {
+			return { kind: "replan", reason: "target-authority-stale" };
+		}
+		this.handoffReplayPlans.set(result.plan.planId, Object.freeze({
+			plan: result.plan,
+			intent: request.intent,
+			storedRecordId: request.record.recordId,
+			storedIntentEnvelopeHash: request.record.intentEnvelopeHash,
+			storedChecksum: request.record.checksum,
+			replayPendingChecksum,
+			recoveryOperationEpoch: request.recoveryOperationEpoch,
+			targetReadyToken: request.targetReadyToken,
+			applyWitness: result.applyWitness,
+			expectedSnapshot: snapshot,
+			expectedSnapshotFingerprint,
+		}));
+		return result;
+	}
+
+	consumeExactHandoffReplayPermit(
+		request: ConsumeExactHandoffReplayPermitRequest,
+	): ConsumeExactHandoffReplayPermitResult {
+		if (this.consumedHandoffReplayPlanIds.has(request.plan.planId)) {
+			return { kind: "rejected", reason: "plan-consumed" };
+		}
+		const entry = this.handoffReplayPlans.get(request.plan.planId);
+		if (!entry) return { kind: "rejected", reason: "plan-unknown" };
+		this.handoffReplayPlans.delete(request.plan.planId);
+		this.consumedHandoffReplayPlanIds.add(request.plan.planId);
+		if (entry.plan !== request.plan) {
+			return { kind: "rejected", reason: "record-mismatch" };
+		}
+		if (request.record.status !== "replay-pending") {
+			return { kind: "rejected", reason: "recovery-state-stale" };
+		}
+		if (request.recoveryOperationEpoch !== entry.recoveryOperationEpoch) {
+			return { kind: "rejected", reason: "recovery-operation-stale" };
+		}
+		let witnessMatches = false;
+		try {
+			witnessMatches = request.record.applyWitness !== null
+				&& request.record.applyWitness.dispatchReceiptHash === null
+				&& canonicalHandoffRecoveryJson(request.record.applyWitness)
+					=== canonicalHandoffRecoveryJson(entry.applyWitness);
+		} catch {
+			witnessMatches = false;
+		}
+		if (
+			!witnessMatches
+			|| request.record.recordId !== entry.storedRecordId
+			|| request.record.intentId !== entry.intent.intentId
+			|| request.record.intentEnvelopeHash !== entry.storedIntentEnvelopeHash
+			|| request.record.checksum !== entry.replayPendingChecksum
+			|| request.record.targetPath !== entry.expectedSnapshot.targetPath
+			|| request.record.applyWitness?.planId !== entry.plan.planId
+			|| request.record.applyWitness?.targetFileId
+				!== entry.expectedSnapshot.targetFileId
+			|| request.record.applyWitness?.targetYtextIdentity
+				!== entry.expectedSnapshot.ytextIdentity
+		) {
+			return { kind: "rejected", reason: "record-mismatch" };
+		}
+		const editorBindings = this.deps.getEditorBindings();
+		if (!editorBindings) {
+			return { kind: "rejected", reason: "target-snapshot-stale" };
+		}
+		const currentToken = editorBindings.captureCurrentTargetReadyToken({
+			sessionId: entry.expectedSnapshot.sessionId,
+			expectedGeneration: entry.expectedSnapshot.handoffGeneration,
+			targetPath: entry.expectedSnapshot.targetPath,
+			targetFile: entry.expectedSnapshot.targetFile,
+		});
+		const captured = editorBindings.captureHandoffReplayTargetSnapshot({
+			sessionId: entry.expectedSnapshot.sessionId,
+			expectedGeneration: entry.expectedSnapshot.handoffGeneration,
+			recoveryOperationEpoch: entry.recoveryOperationEpoch,
+			recoveryClaim: Object.freeze({
+				intentId: entry.intent.intentId,
+				recordId: entry.storedRecordId,
+			}),
+			targetReadyToken: entry.targetReadyToken,
+		});
+		if (
+			currentToken !== entry.targetReadyToken
+			|| captured.kind !== "ready"
+			|| !this.sameHandoffReplaySnapshot(entry.expectedSnapshot, captured.snapshot)
+		) {
+			return { kind: "rejected", reason: "target-snapshot-stale" };
+		}
+		if (!this.isAuthorityFreshnessCurrent(
+			entry.targetReadyToken.authorityFreshnessHandleId,
+			this.handoffReplayFreshnessContext(captured.snapshot),
+		)) {
+			return { kind: "rejected", reason: "authority-stale" };
+		}
+		const permit: HandoffReplayPermit = Object.freeze({
+			permitId: entry.plan.replayPermitId,
+			planId: entry.plan.planId,
+			recordId: request.record.recordId,
+			replayPendingChecksum: request.record.checksum,
+			recoveryOperationEpoch: entry.recoveryOperationEpoch,
+			expectedSnapshotFingerprint: entry.expectedSnapshotFingerprint,
+		});
+		this.handoffReplayDispatchPermits.set(permit, Object.freeze({
+			permit,
+			plan: request.plan,
+			record: request.record,
+			expectedSnapshot: entry.expectedSnapshot,
+			expectedSnapshotFingerprint: entry.expectedSnapshotFingerprint,
+			targetReadyToken: entry.targetReadyToken,
+			applyWitness: entry.applyWitness,
+		}));
+		return { kind: "accepted", permit };
+	}
+
+	redeemExactHandoffReplayDispatchPermit(
+		permit: HandoffReplayPermit,
+	): RedeemExactHandoffReplayDispatchPermitResult {
+		if (this.consumedHandoffReplayDispatchPermits.has(permit)) {
+			return { kind: "rejected", reason: "plan-already-consumed" };
+		}
+		const entry = this.handoffReplayDispatchPermits.get(permit);
+		if (
+			!entry
+			|| entry.permit !== permit
+			|| entry.expectedSnapshotFingerprint
+				!== permit.expectedSnapshotFingerprint
+		) {
+			return { kind: "rejected", reason: "permit-mismatch" };
+		}
+		this.handoffReplayDispatchPermits.delete(permit);
+		this.consumedHandoffReplayDispatchPermits.add(permit);
+		if (
+			this.handoffReplaySettlementAuthorities.size
+				>= ReconciliationController.EDITOR_ADMISSION_RECORD_LIMIT
+		) {
+			const oldestPlanId = this.handoffReplaySettlementAuthorities
+				.keys()
+				.next().value as string | undefined;
+			if (oldestPlanId !== undefined) {
+				this.handoffReplaySettlementAuthorities.delete(oldestPlanId);
+			}
+		}
+		this.handoffReplaySettlementAuthorities.set(
+			entry.plan.planId,
+			Object.freeze({
+				plan: entry.plan,
+				record: entry.record,
+				expectedSnapshot: entry.expectedSnapshot,
+				targetReadyToken: entry.targetReadyToken,
+				applyWitness: entry.applyWitness,
+			}),
+		);
+		return {
+			kind: "accepted",
+			snapshot: entry.expectedSnapshot,
+			plan: entry.plan,
+			record: entry.record,
+		};
+	}
+
+	createExactHandoffReplayDispatchReceipt(
+		request: CreateExactHandoffReplayDispatchReceiptRequest,
+	): HandoffReplayDispatchReceipt | null {
+		try {
+			const { plan, record, recoveryOperationEpoch, postcondition } = request;
+			const entry = this.handoffReplaySettlementAuthorities.get(plan.planId);
+			const witness = record.applyWitness;
+			if (
+				entry === undefined
+				|| entry.plan !== plan
+				|| entry.record !== record
+				|| witness === null
+				|| witness.dispatchReceiptHash !== null
+				|| canonicalHandoffRecoveryJson(witness)
+					!== canonicalHandoffRecoveryJson(entry.applyWitness)
+				|| !Number.isSafeInteger(request.appliedAt)
+				|| request.appliedAt < 0
+				|| !Number.isSafeInteger(recoveryOperationEpoch)
+				|| recoveryOperationEpoch < 0
+			) return null;
+			const snapshot = entry.expectedSnapshot;
+			const token = entry.targetReadyToken;
+			if (
+				token.targetAuthority.kind !== "existing"
+				|| plan.planId !== witness.planId
+				|| plan.kind !== witness.kind
+				|| plan.intentId !== record.intentId
+				|| snapshot.sessionId !== record.body.eventProof.sessionId
+				|| snapshot.handoffGeneration
+					!== record.body.eventProof.handoffGeneration
+				|| plan.switchIntentSeq !== record.body.eventProof.switchIntentSeq
+				|| plan.switchIntentSeq !== witness.switchIntentSeq
+				|| snapshot.targetPath !== record.targetPath
+				|| plan.targetReadyTokenId !== token.tokenId
+				|| plan.targetReadyTokenId !== snapshot.targetReadyTokenId
+				|| token.sessionId !== snapshot.sessionId
+				|| token.handoffGeneration !== snapshot.handoffGeneration
+				|| token.switchIntentSeq !== plan.switchIntentSeq
+				|| token.targetPath !== snapshot.targetPath
+				|| token.targetFile !== snapshot.targetFile
+				|| token.hostLoadTokenId !== snapshot.hostLoadTokenId
+				|| token.hostLoadReceiptId !== snapshot.hostLoadReceiptId
+				|| token.targetAuthority.fileId !== snapshot.targetFileId
+				|| token.targetAuthority.ytextIdentity !== snapshot.ytextIdentity
+				|| token.targetAuthority.ytextMutationEpoch
+					!== snapshot.ytextMutationEpoch
+			) return null;
+			const serializedSelection = canonicalHandoffRecoveryJson(
+				postcondition.selection.toJSON(),
+			);
+			const expectedSelectionEpoch = snapshot.selectionEpoch
+				+ (snapshot.selection.eq(plan.mappedSelection) ? 0 : 1);
+			if (
+				recoveryOperationEpoch !== postcondition.recoveryOperationEpoch
+				|| recoveryOperationEpoch !== snapshot.recoveryOperationEpoch
+				|| postcondition.planId !== plan.planId
+				|| postcondition.recordId !== record.recordId
+				|| postcondition.targetFileId !== snapshot.targetFileId
+				|| postcondition.ytextIdentity !== snapshot.ytextIdentity
+				|| postcondition.ytextMutationEpoch
+					!== snapshot.ytextMutationEpoch + 1
+				|| postcondition.bindingEpoch !== snapshot.bindingEpoch
+				|| postcondition.editorRevision !== snapshot.editorRevision + 1
+				|| postcondition.nativeHistoryEpoch
+					!== snapshot.nativeHistoryEpoch + 1
+				|| postcondition.selectionEpoch !== expectedSelectionEpoch
+				|| !isExactHandoffReplayScrollDispatchPostcondition({
+					beforeEpoch: snapshot.scrollEpoch,
+					afterEpoch: postcondition.scrollEpoch,
+					mappedAnchor: plan.mappedScrollAnchor,
+					observedAnchor: postcondition.scrollAnchor,
+				})
+				|| !postcondition.selection.eq(plan.mappedSelection)
+				|| postcondition.scrollAnchor !== plan.mappedScrollAnchor
+				|| witness.targetFileId !== snapshot.targetFileId
+				|| witness.targetYtextIdentity !== snapshot.ytextIdentity
+				|| witness.targetMutationEpochAtPlan
+					!== snapshot.ytextMutationEpoch
+				|| witness.nativeHistoryEpoch !== snapshot.nativeHistoryEpoch
+				|| witness.targetSelectionEpoch !== snapshot.selectionEpoch
+				|| witness.targetScrollEpoch !== snapshot.scrollEpoch
+				|| witness.hostLoadTokenId !== snapshot.hostLoadTokenId
+				|| witness.plannedStartHash !== record.startContentHash
+				|| witness.plannedResultContent !== record.body.afterContent
+				|| witness.plannedResultHash !== record.afterContentHash
+				|| witness.serializedMappedSelection !== serializedSelection
+			) return null;
+			return Object.freeze({
+				receiptSchemaVersion: 1,
+				planId: plan.planId,
+				intentId: record.intentId,
+				recordId: record.recordId,
+				sessionId: snapshot.sessionId,
+				handoffGeneration: snapshot.handoffGeneration,
+				recoveryOperationEpoch,
+				switchIntentSeq: plan.switchIntentSeq,
+				targetReadyTokenId: snapshot.targetReadyTokenId,
+				hostLoadTokenId: snapshot.hostLoadTokenId,
+				hostLoadReceiptId: snapshot.hostLoadReceiptId,
+				targetPath: snapshot.targetPath,
+				targetFileId: snapshot.targetFileId,
+				targetYtextIdentity: snapshot.ytextIdentity,
+				targetMutationEpochAtPlan: snapshot.ytextMutationEpoch,
+				targetMutationEpochAfter: postcondition.ytextMutationEpoch,
+				bindingEpochAfter: postcondition.bindingEpoch,
+				editorRevisionAfter: postcondition.editorRevision,
+				nativeHistoryEpochAfter: postcondition.nativeHistoryEpoch,
+				selectionEpochBefore: snapshot.selectionEpoch,
+				selectionEpochAfter: postcondition.selectionEpoch,
+				scrollEpochBefore: snapshot.scrollEpoch,
+				scrollEpochAfter: postcondition.scrollEpoch,
+				plannedStartHash: witness.plannedStartHash,
+				plannedResultHash: witness.plannedResultHash,
+				serializedMappedSelection: serializedSelection,
+				mappedScrollAnchor: postcondition.scrollAnchor,
+				appliedAt: request.appliedAt,
+			});
+		} catch {
+			return null;
+		}
+	}
+
+	async observeExactHandoffReplaySettlement(
+		request: ObserveExactHandoffReplaySettlementRequest,
+	): Promise<ObserveExactHandoffReplaySettlementResult> {
+		const { record, mode, receipt } = request;
+		let witness: HandoffRecoveryApplyWitness;
+		try {
+			const validated = await validateHandoffRecoveryRecord(record);
+			if (
+				validated !== record
+				|| validated.status !== "replayed-awaiting-settlement"
+				|| validated.applyWitness === null
+				|| validated.applyWitness.dispatchReceiptHash === null
+			) {
+				return { kind: "uncertain", reason: "witness-invalid" };
+			}
+			witness = validated.applyWitness;
+		} catch {
+			return { kind: "uncertain", reason: "witness-invalid" };
+		}
+		if (mode === "live" && receipt === null) {
+			return { kind: "uncertain", reason: "receipt-required" };
+		}
+		if (mode === "hydrated" && receipt !== null) {
+			return { kind: "uncertain", reason: "receipt-required" };
+		}
+		const authority = this.handoffReplaySettlementAuthorities.get(witness.planId);
+		if (mode === "live") {
+			if (receipt === null) {
+				return { kind: "uncertain", reason: "receipt-required" };
+			}
+			let receiptHash: string;
+			try {
+				receiptHash = await hashHandoffRecoveryDispatchReceipt(
+					receipt as unknown as Readonly<
+						Record<string, string | number | boolean | null>
+					>,
+				);
+			} catch {
+				return { kind: "uncertain", reason: "receipt-hash-mismatch" };
+			}
+			if (receiptHash !== witness.dispatchReceiptHash) {
+				return { kind: "uncertain", reason: "receipt-hash-mismatch" };
+			}
+			if (
+				authority === undefined
+				|| authority.plan.planId !== witness.planId
+				|| authority.record.recordId !== record.recordId
+				|| authority.record.intentId !== record.intentId
+				|| authority.record.intentEnvelopeHash !== record.intentEnvelopeHash
+				|| authority.applyWitness.planId !== witness.planId
+			) {
+				return { kind: "uncertain", reason: "plan-identity-mismatch" };
+			}
+			if (
+				receipt.receiptSchemaVersion !== 1
+				|| receipt.planId !== witness.planId
+				|| receipt.intentId !== record.intentId
+				|| receipt.recordId !== record.recordId
+				|| receipt.targetPath !== record.targetPath
+				|| receipt.plannedStartHash !== witness.plannedStartHash
+				|| receipt.plannedResultHash !== witness.plannedResultHash
+				|| receipt.serializedMappedSelection
+					!== witness.serializedMappedSelection
+				|| !Number.isSafeInteger(receipt.appliedAt)
+				|| receipt.appliedAt < 0
+			) {
+				return { kind: "uncertain", reason: "plan-identity-mismatch" };
+			}
+		}
+
+		const editorBindings = this.deps.getEditorBindings();
+		if (!editorBindings) {
+			return { kind: "uncertain", reason: "snapshot-unavailable" };
+		}
+		const captured = editorBindings.captureHandoffReplaySettlementSnapshot({
+			targetPath: record.targetPath,
+			planId: witness.planId,
+			mode,
+		});
+		if (captured.kind !== "ready") {
+			return { kind: "uncertain", reason: "snapshot-unavailable" };
+		}
+		const snapshot = captured.snapshot;
+		if (snapshot.planId !== witness.planId) {
+			return {
+				kind: "uncertain",
+				reason: snapshot.planId === null && mode === "hydrated"
+					? "receipt-required"
+					: "plan-identity-mismatch",
+			};
+		}
+		const eventProof = record.body.eventProof;
+		if (
+			snapshot.sessionId !== eventProof.sessionId
+			|| snapshot.leafId !== eventProof.leafId
+			|| snapshot.handoffGeneration !== eventProof.handoffGeneration
+			|| snapshot.recoveryOperationEpoch
+				!== (receipt?.recoveryOperationEpoch ?? snapshot.recoveryOperationEpoch)
+			|| snapshot.targetPath !== record.targetPath
+			|| snapshot.targetFile.path !== record.targetPath
+			|| snapshot.targetFileId !== witness.targetFileId
+			|| snapshot.ytextIdentity !== witness.targetYtextIdentity
+			|| snapshot.hostLoadTokenId !== witness.hostLoadTokenId
+		) {
+			return { kind: "uncertain", reason: "target-identity-mismatch" };
+		}
+		if (mode === "live") {
+			if (receipt === null || authority === undefined) {
+				return { kind: "uncertain", reason: "plan-identity-mismatch" };
+			}
+			const expected = authority.expectedSnapshot;
+			if (
+				snapshot.targetFile !== expected.targetFile
+				|| snapshot.cm !== expected.cm
+				|| snapshot.ytext !== expected.ytext
+				|| snapshot.sessionId !== expected.sessionId
+				|| snapshot.leafId !== expected.leafId
+				|| snapshot.handoffGeneration !== expected.handoffGeneration
+				|| snapshot.recoveryOperationEpoch
+					!== expected.recoveryOperationEpoch
+				|| snapshot.targetReadyTokenId !== expected.targetReadyTokenId
+				|| snapshot.hostLoadTokenId !== expected.hostLoadTokenId
+				|| snapshot.hostLoadReceiptId !== expected.hostLoadReceiptId
+				|| snapshot.targetPath !== expected.targetPath
+				|| snapshot.targetFileId !== expected.targetFileId
+				|| snapshot.ytextIdentity !== expected.ytextIdentity
+				|| snapshot.bindingEpoch !== receipt.bindingEpochAfter
+				|| snapshot.editorRevision !== receipt.editorRevisionAfter
+				|| receipt.sessionId !== expected.sessionId
+				|| receipt.handoffGeneration !== expected.handoffGeneration
+				|| receipt.recoveryOperationEpoch
+					!== expected.recoveryOperationEpoch
+				|| receipt.switchIntentSeq !== witness.switchIntentSeq
+				|| receipt.targetReadyTokenId !== expected.targetReadyTokenId
+				|| receipt.hostLoadTokenId !== expected.hostLoadTokenId
+				|| receipt.hostLoadReceiptId !== expected.hostLoadReceiptId
+				|| receipt.targetFileId !== expected.targetFileId
+				|| receipt.targetYtextIdentity !== expected.ytextIdentity
+				|| receipt.targetMutationEpochAtPlan
+					!== expected.ytextMutationEpoch
+			) {
+				return { kind: "uncertain", reason: "target-identity-mismatch" };
+			}
+		}
+		const expectedYtextEpoch = witness.targetMutationEpochAtPlan + 1;
+		if (
+			snapshot.ytextMutationEpoch !== expectedYtextEpoch
+			|| (receipt !== null
+				&& receipt.targetMutationEpochAfter !== expectedYtextEpoch)
+		) {
+			return { kind: "uncertain", reason: "ytext-epoch-mismatch" };
+		}
+		const expectedHistoryEpoch = witness.nativeHistoryEpoch + 1;
+		if (
+			snapshot.nativeHistoryEpoch !== expectedHistoryEpoch
+			|| (receipt !== null
+				&& receipt.nativeHistoryEpochAfter !== expectedHistoryEpoch)
+		) {
+			return { kind: "uncertain", reason: "history-mismatch" };
+		}
+		let serializedSelection: string;
+		try {
+			serializedSelection = canonicalHandoffRecoveryJson(
+				snapshot.selection.toJSON(),
+			);
+		} catch {
+			return { kind: "uncertain", reason: "selection-mismatch" };
+		}
+		if (
+			serializedSelection !== witness.serializedMappedSelection
+			|| (receipt !== null
+				&& (
+					snapshot.selectionEpoch !== receipt.selectionEpochAfter
+					|| receipt.selectionEpochBefore !== witness.targetSelectionEpoch
+					|| receipt.serializedMappedSelection !== serializedSelection
+				))
+			|| (receipt === null
+				&& snapshot.selectionEpoch !== witness.targetSelectionEpoch
+				&& snapshot.selectionEpoch !== witness.targetSelectionEpoch + 1)
+		) {
+			return { kind: "uncertain", reason: "selection-mismatch" };
+		}
+		if (
+			snapshot.scrollEpoch !== witness.targetScrollEpoch
+			|| (receipt !== null
+				&& (
+					receipt.scrollEpochBefore !== witness.targetScrollEpoch
+					|| snapshot.scrollEpoch !== receipt.scrollEpochAfter
+					|| snapshot.scrollAnchor !== receipt.mappedScrollAnchor
+				))
+		) {
+			return { kind: "uncertain", reason: "scroll-mismatch" };
+		}
+		let resultHash: string;
+		try {
+			resultHash = await sha256HandoffRecoveryHex(
+				witness.plannedResultContent,
+			);
+		} catch {
+			return { kind: "uncertain", reason: "witness-invalid" };
+		}
+		if (
+			resultHash !== witness.plannedResultHash
+			|| witness.plannedStartHash !== record.startContentHash
+			|| witness.plannedResultContent !== record.body.afterContent
+			|| witness.plannedResultHash !== record.afterContentHash
+		) {
+			return { kind: "uncertain", reason: "witness-invalid" };
+		}
+		if (
+			snapshot.cmDocument.toString() !== witness.plannedResultContent
+			|| snapshot.editorFacadeContent !== witness.plannedResultContent
+			|| snapshot.runtimeCacheContent !== witness.plannedResultContent
+		) {
+			return { kind: "uncertain", reason: "editor-content-mismatch" };
+		}
+		if (snapshot.ytextContent !== witness.plannedResultContent) {
+			return { kind: "uncertain", reason: "ytext-content-mismatch" };
+		}
+
+		const disk = await this.readStableMarkdownFile(
+			record.targetPath,
+			"modify",
+			snapshot.targetFile,
+		);
+		if (disk.kind === "unstable") {
+			return mode === "live"
+				? { kind: "pending", reason: "disk-unstable" }
+				: { kind: "uncertain", reason: "disk-content-mismatch" };
+		}
+		if (disk.kind === "missing") {
+			return { kind: "uncertain", reason: "disk-missing" };
+		}
+		if (disk.file !== snapshot.targetFile) {
+			return { kind: "uncertain", reason: "target-identity-mismatch" };
+		}
+		if (disk.content === witness.plannedResultContent) {
+			return { kind: "settled" };
+		}
+		if (mode === "live" && disk.content === record.body.startContent) {
+			return { kind: "pending", reason: "disk-not-yet-saved" };
+		}
+		return { kind: "uncertain", reason: "disk-content-mismatch" };
+	}
+
+	/**
+	 * Clear/manual Recovery actions use this narrower fence instead of reset():
+	 * retire every plan and unconsumed dispatch permit synchronously while
+	 * preserving the controller lifecycle nonce, ID sequence, and already-applied
+	 * settlement evidence.
+	 */
+	invalidateExactHandoffReplayForRecoveryClear(): void {
+		this.handoffReplayRecoveryAuthorityEpoch += 1;
+		for (const planId of this.handoffReplayPlans.keys()) {
+			this.consumedHandoffReplayPlanIds.add(planId);
+		}
+		this.handoffReplayPlans.clear();
+		for (const permit of this.handoffReplayDispatchPermits.keys()) {
+			this.consumedHandoffReplayDispatchPermits.add(permit);
+		}
+		this.handoffReplayDispatchPermits.clear();
+	}
+
+	/** Retire only one Recovery row; another leaf's executable replay stays live. */
+	invalidateExactHandoffReplayForRecord(recordId: string): void {
+		this.handoffReplayRecordAuthorityEpochs.set(
+			recordId,
+			(this.handoffReplayRecordAuthorityEpochs.get(recordId) ?? 0) + 1,
+		);
+		for (const [planId, entry] of this.handoffReplayPlans) {
+			if (entry.storedRecordId !== recordId) continue;
+			this.consumedHandoffReplayPlanIds.add(planId);
+			this.handoffReplayPlans.delete(planId);
+		}
+		for (const [permit, entry] of this.handoffReplayDispatchPermits) {
+			if (entry.record.recordId !== recordId) continue;
+			this.consumedHandoffReplayDispatchPermits.add(permit);
+			this.handoffReplayDispatchPermits.delete(permit);
+		}
+	}
+
+	consumeBindPermit(permitId: string, context: BindPermitContext): boolean {
+		return this.editorAuthorityAdmissionOpen
+			&& this.editorAuthorityAdmission.consumeBindPermit(permitId, context);
+	}
+
 	/**
 	 * Synchronously invalidate every async authority snapshot owned by this
 	 * controller. Teardown calls this before any awaited cleanup; it deliberately
 	 * performs no I/O, scheduling, or state cleanup of its own.
 	 */
 	revokeAsyncAuthority(): void {
+		this.handoffReplayRecoveryAuthorityEpoch += 1;
+		this.handoffReplayRecordAuthorityEpochs.clear();
+		for (const planId of this.handoffReplayPlans.keys()) {
+			this.consumedHandoffReplayPlanIds.add(planId);
+		}
+		this.handoffReplayPlans.clear();
+		for (const permit of this.handoffReplayDispatchPermits.keys()) {
+			this.consumedHandoffReplayDispatchPermits.add(permit);
+		}
+		this.handoffReplayDispatchPermits.clear();
+		this.handoffReplaySettlementAuthorities.clear();
+		const pendingAdoptionSettlements = Array.from(
+			this.samePathAdoptionDiskSettlements.values(),
+		);
+		this.samePathAdoptionDiskSettlements.clear();
+		for (const settlement of pendingAdoptionSettlements) {
+			this.rejectSamePathAdoptionBoundReceipt(
+				settlement.receipt,
+				settlement.record,
+				"controller-authority-revoked",
+				false,
+			);
+		}
+		try {
+			this.deps.getEditorBindings()?.clearHandoffReplaySettlementProofs();
+		} catch {
+			// Reset still retires controller authority if the observer owner is gone.
+		}
 		this.lifecycleGeneration += 1;
+		this.editorAuthorityAdmissionOpen = false;
+		this.editorAuthorityAdmission.reset();
 	}
 
 	reset(): void {
 		this.revokeAsyncAuthority();
+		this.openPathAdmissionRequests.clear();
+		this.targetPresentationRequests.clear();
+		this.targetPresentationPlans.clear();
+		this.targetPresentationPlanByHostToken.clear();
+		this.targetPresentationCompletionByReceipt.clear();
+		this.targetReadyBySession.clear();
+		this.missingTargetSeedPlans.clear();
+		this.samePathAdoptionRequests.clear();
+		this.samePathAdoptionProposals.clear();
 		if (this.reconcileCooldownTimer) {
 			clearTimeout(this.reconcileCooldownTimer);
 			this.reconcileCooldownTimer = null;
@@ -817,6 +2375,7 @@ export class ReconciliationController {
 		this.lastAmplificationNoticeAt = 0;
 		this.amplificationNoticeSuppressionCount = 0;
 		this.boundRecoveryLocks.clear();
+		this.editorAuthorityAdmissionOpen = true;
 	}
 
 	/**
@@ -1256,6 +2815,16 @@ export class ReconciliationController {
 		this.reconcileInFlight = true;
 
 		try {
+			// Open editors must establish their managed same-path adoption boundary
+			// before this pass reads disk or lets VaultSync classify a competing
+			// disk/CRDT pair.  Reconciliation used to validate editors only after the
+			// pass completed, which let startup/re-enable promote still-unadopted
+			// editor bytes through the legacy open-editor recovery lane first.
+			//
+			// Keep this call synchronous and fail closed: bind() publishes either an
+			// exact binding or a same-path adoption hold before it returns.  Every
+			// projection/baseline lane below already consults that hold.
+			this.deps.validateOpenEditorBindings(`reconcile-pre:${mode}`);
 			this.deps.recordFlightEvent?.({
 				priority: "important",
 				kind: PRODUCT_EVENT_KIND.reconcileStart,
@@ -1703,10 +3272,16 @@ export class ReconciliationController {
 				// next startup reconcile (after plugin disable/re-enable).
 				const settledHashes = new Map<string, string>();
 				const settledBaselineTexts = new Map<string, string>();
+				const deferredOpenEditorIndexPaths = new Set<string>();
+				const staleClosedDecisionIndexPaths = new Set<string>();
+				const projectionBlockedMissingDiskIndexPaths = new Set<string>();
 				const recordSettledBaseline = (path: string, hash: string, text: string) => {
+					if (this.isSamePathAdoptionProjectionHeld(path)) {
+						deferredOpenEditorIndexPaths.add(path);
+						return;
+					}
 					settledHashes.set(path, hash);
 					settledBaselineTexts.set(hash, text);
-					this.clearDeferredVisibleAuthorityIfSettled(path, text);
 				};
 
 				// Track paths that need CRDT→disk flush, along with the semantic reason.
@@ -1718,9 +3293,6 @@ export class ReconciliationController {
 					expectedDiskContent: string;
 					remoteProjectionAdmission: RemoteProjectionAdmissionLease;
 				}> = [];
-				const deferredOpenEditorIndexPaths = new Set<string>();
-				const staleClosedDecisionIndexPaths = new Set<string>();
-				const projectionBlockedMissingDiskIndexPaths = new Set<string>();
 				const actionPaths = new Set<string>([
 					...result.createdOnDisk,
 					...result.seededToCrdt,
@@ -1802,13 +3374,36 @@ export class ReconciliationController {
 					}
 				}
 				for (const [path, diskContent] of diskFiles) {
-					if (this.isMarkdownPreservedUnresolved(path)) {
+					if (this.isSamePathAdoptionProjectionHeld(path)) {
 						deferredOpenEditorIndexPaths.add(path);
-						this.deps.trace("reconcile", "reconcile-skipped-preserved-unresolved", {
-							path,
-							stage: "equal-baseline-observation",
-						});
 						continue;
+					}
+					if (this.isMarkdownPreservedUnresolved(path)) {
+						const preservedYText = vaultSync.getTextForPath(path);
+						const preservedCrdtContent = preservedYText
+							? yTextToString(preservedYText) ?? ""
+							: null;
+						const visibleDecision = preservedCrdtContent === diskContent
+							? this.decideDeferredVisibleAuthority(
+								path,
+								diskContent,
+								preservedCrdtContent,
+							)
+							: { kind: "none" as const };
+						if (
+							visibleDecision.kind === "settled" &&
+							this.hasProvisionalVisibleAuthorityAttention(path)
+						) {
+							this.resolveConvergedVisibleAuthority(path);
+						}
+						if (this.isMarkdownPreservedUnresolved(path)) {
+							deferredOpenEditorIndexPaths.add(path);
+							this.deps.trace("reconcile", "reconcile-skipped-preserved-unresolved", {
+								path,
+								stage: "equal-baseline-observation",
+							});
+							continue;
+						}
 					}
 					if (actionPaths.has(path)) {
 						continue;
@@ -1853,6 +3448,10 @@ export class ReconciliationController {
 					}
 				}
 				for (const path of result.updatedOnDisk) {
+					if (this.isSamePathAdoptionProjectionHeld(path)) {
+						deferredOpenEditorIndexPaths.add(path);
+						continue;
+					}
 					if (this.isMarkdownPreservedUnresolved(path)) {
 						deferredOpenEditorIndexPaths.add(path);
 						this.deps.trace("reconcile", "reconcile-skipped-preserved-unresolved", {
@@ -1944,8 +3543,9 @@ export class ReconciliationController {
 									expectedDiskFile: openFile,
 									expectedYText: openSettlement.expectedYText,
 									expectedCrdtContent: openSettlement.expectedCrdtContent,
-									expectedEditorTicket: openSettlement.expectedEditorTicket,
-									expectedOpenEditorContent: openSettlement.expectedOpenEditorContent,
+								expectedEditorTicket: openSettlement.expectedEditorTicket,
+								expectedOpenEditorContent: openSettlement.expectedOpenEditorContent,
+								expectedEditorAuthorityLease: openSettlement.expectedEditorAuthorityLease,
 								},
 							);
 							if (!baselineSettled) {
@@ -2009,8 +3609,10 @@ export class ReconciliationController {
 										expectedDiskFile: liveFile,
 										expectedYText: openReplan.settlement.expectedYText,
 										expectedCrdtContent: openReplan.settlement.expectedCrdtContent,
-										expectedEditorTicket: openReplan.settlement.expectedEditorTicket,
-										expectedOpenEditorContent: openReplan.settlement.expectedOpenEditorContent,
+									expectedEditorTicket: openReplan.settlement.expectedEditorTicket,
+									expectedOpenEditorContent: openReplan.settlement.expectedOpenEditorContent,
+									expectedEditorAuthorityLease:
+										openReplan.settlement.expectedEditorAuthorityLease,
 									},
 								);
 								if (!baselineSettled) {
@@ -2550,10 +4152,17 @@ export class ReconciliationController {
 
 				// Pass settled hashes to disk index so they survive plugin reload
 				// and serve as the three-way baseline next startup reconcile.
+				const indexBeforeCommit = this.deps.getDiskIndex();
+				const adoptionHeldIndexPaths = Array.from(new Set([
+					...Object.keys(indexBeforeCommit),
+					...allStats.keys(),
+					...settledHashes.keys(),
+				])).filter((path) => this.isSamePathAdoptionProjectionHeld(path));
 				const blockedIndexPathsInner = Array.from(new Set([
 					...deferredOpenEditorIndexPaths,
 					...staleClosedDecisionIndexPaths,
 					...projectionBlockedMissingDiskIndexPaths,
+					...adoptionHeldIndexPaths,
 					...this.getPreservedUnresolvedMarkdownEntries()
 						.map((entry) => entry.path),
 				]));
@@ -2575,11 +4184,19 @@ export class ReconciliationController {
 						...tracePathList("blocked", Array.from(staleClosedDecisionIndexPaths)),
 					});
 				}
-				const indexBeforeCommit = this.deps.getDiskIndex();
 				const nextDiskIndex = updateIndex(indexBeforeCommit, allStats, {
 					excludePaths: blockedIndexPathsInner,
 					settledHashes,
 				});
+				for (const path of adoptionHeldIndexPaths) {
+					const previousEntry = indexBeforeCommit[path];
+					if (previousEntry) {
+						// Same-path adoption still needs the last settled three-way
+						// base. Keep its old stat as well so a later reconcile must
+						// re-read the path instead of treating this hold as settlement.
+						nextDiskIndex[path] = { ...previousEntry };
+					}
+				}
 				for (const path of projectionBlockedMissingDiskIndexPaths) {
 					const previousEntry = indexBeforeCommit[path];
 					if (previousEntry) {
@@ -2614,12 +4231,30 @@ export class ReconciliationController {
 					});
 				}
 				this.deps.setDiskIndex(nextDiskIndex);
+				for (const [path, hash] of settledHashes) {
+					if (
+						this.isSamePathAdoptionProjectionHeld(path)
+						|| nextDiskIndex[path]?.contentHash !== hash
+					) continue;
+					const text = settledBaselineTexts.get(hash);
+					if (text !== undefined) {
+						this.clearDeferredVisibleAuthorityIfSettled(path, text);
+					}
+				}
 				for (const [hash, text] of settledBaselineTexts) {
 					this.deps.recordBaselineText?.(hash, text);
 				}
 			} else {
 				// Safety brake triggered: exclude all planned updates from index.
-				const blockedIndexPaths = result.updatedOnDisk;
+				const currentIndex = this.deps.getDiskIndex();
+				const adoptionHeldIndexPaths = Array.from(new Set([
+					...Object.keys(currentIndex),
+					...allStats.keys(),
+				])).filter((path) => this.isSamePathAdoptionProjectionHeld(path));
+				const blockedIndexPaths = Array.from(new Set([
+					...result.updatedOnDisk,
+					...adoptionHeldIndexPaths,
+				]));
 				this.blockedDivergenceCount = blockedIndexPaths.length;
 				this.lastBlockedDivergenceAt = new Date().toISOString();
 				this.blockedDivergenceSample = blockedIndexPaths.slice(0, 10).map((p) => {
@@ -2627,7 +4262,7 @@ export class ReconciliationController {
 					const ext = dot >= 0 ? p.slice(dot) : "(none)";
 					return { ext, hash: contentFingerprint(`${this.diagnosticPathSalt}:${p}`) };
 				});
-				this.deps.setDiskIndex(updateIndex(this.deps.getDiskIndex(), allStats, {
+				this.deps.setDiskIndex(updateIndex(currentIndex, allStats, {
 					excludePaths: blockedIndexPaths,
 				}));
 				this.deps.trace("reconcile", "reconcile-disk-index-advance-blocked", {
@@ -2740,6 +4375,10 @@ export class ReconciliationController {
 	}
 
 	async importUntrackedFiles(): Promise<void> {
+		function assertNever(value: never): never {
+			throw new Error(`Unhandled EnsureFileResult: ${JSON.stringify(value)}`);
+		}
+
 		const vaultSync = this.deps.getVaultSync();
 		if (!vaultSync) return;
 
@@ -2807,10 +4446,23 @@ export class ReconciliationController {
 						opId,
 					},
 				);
-				if (result) {
-					imported++;
-				} else {
-					this.deps.log(`importUntracked: "${path}" could not be imported (ensureFile returned null)`);
+				switch (result.kind) {
+					case "created":
+						imported++;
+						break;
+					case "existing":
+						this.deps.log(`importUntracked: "${path}" became active before import settled`);
+						break;
+					case "replan":
+						this.untrackedFiles.push(path);
+						this.deps.log(`importUntracked: "${path}" active set changed, queued for retry`);
+						break;
+					case "blocked":
+						this.untrackedFiles.push(path);
+						this.deps.log(`importUntracked: "${path}" blocked (${result.reason}), preserving local state`);
+						break;
+					default:
+						assertNever(result);
 				}
 			} catch (err) {
 				console.error(`[kaos] importUntracked failed for "${path}":`, err);
@@ -3231,23 +4883,41 @@ export class ReconciliationController {
 		const openViews = this.getOpenMarkdownViewsForPath(path);
 		if (openViews.length === 0) return;
 
-		let readComplete = true;
-		const currentContents: string[] = [];
-		for (const view of openViews) {
-			try {
-				currentContents.push(view.editor.getValue());
-			} catch {
-				readComplete = false;
-			}
-		}
-		const currentEditorContents = Array.from(new Set(currentContents));
-		const currentReadComplete =
-			readComplete && currentContents.length === openViews.length;
 		const editorBindings = this.deps.getEditorBindings();
+		const mutationTicket =
+			editorBindings?.captureOpenEditorMutationTicket?.(path, openViews) ?? null;
+		const pathEditorAuthority = this.capturePathEditorAuthority(path);
+		if (
+			pathEditorAuthority.kind === "blocked" &&
+			pathEditorAuthority.reason === "transitioning"
+		) {
+			// A path transition deliberately means the readable host/editor bytes
+			// cannot yet be attributed to this path. In particular, Obsidian's
+			// forced unload may synchronously clear the source view cache after its
+			// disk save. Preserve any older proven marker, but never turn those
+			// cleared or cross-path bytes into a fresh authority candidate. The
+			// queued dirty ingest remains responsible for retrying once lineage is
+			// stable.
+			this.deps.trace(
+				"reconcile",
+				"visible-editor-authority-capture-deferred-transitioning",
+				{
+					path,
+					reason,
+					openViewCount: openViews.length,
+				},
+			);
+			return;
+		}
+		const currentReadComplete = pathEditorAuthority.kind === "proven-single"
+			&& this.isPathEditorAuthorityLeaseCurrent(pathEditorAuthority.lease);
+		const currentEditorContents = currentReadComplete
+			? [pathEditorAuthority.content]
+			: this.getTicketEditorContentsForPreservation(path, openViews, mutationTicket);
 		const currentEditorActivity =
 			editorBindings?.getLastEditorActivityForPath?.(path) ?? null;
 		const currentEditorTicket = this.compactVisibleAuthorityTicket(
-			editorBindings?.captureOpenEditorMutationTicket?.(path, openViews) ?? null,
+			mutationTicket,
 		);
 		const previous = this.visibleAuthorityDeferredPaths.get(path);
 		const editorActivityAdvanced =
@@ -3352,13 +5022,19 @@ export class ReconciliationController {
 	private acquireMarkdownRemoteDeleteResolution(
 		path: string,
 		operation: InternalMarkdownResolutionLease["operation"],
+		editorAuthority: PathEditorAuthority,
 	): InternalMarkdownResolutionLease {
 		if (this.markdownRemoteDeleteResolutions.has(path)) {
 			throw new Error(`Another Attention action is already running for "${path}".`);
 		}
 
 		const generation = this.bumpMarkdownIngestGeneration(path);
-		const lease = Object.freeze({ path, operation, generation }) as InternalMarkdownResolutionLease;
+		const lease = Object.freeze({
+			path,
+			operation,
+			generation,
+			editorAuthority,
+		}) as InternalMarkdownResolutionLease;
 		this.markdownRemoteDeleteResolutions.set(path, lease);
 		const droppedQueued = this.dirtyMarkdownPaths.delete(path);
 		this.invalidateExternalCandidateIdentity(path);
@@ -3471,18 +5147,25 @@ export class ReconciliationController {
 		}
 	}
 
-	private assertEditorMatchesStableMarkdown(path: string, diskContent: string): void {
-		const editorAuthority = this.getOpenEditorAuthority(
-			this.getOpenMarkdownViewsForPath(path),
-		);
-		if (editorAuthority.kind === "multiple") {
+	private assertEditorMatchesStableMarkdown(
+		path: string,
+		diskContent: string,
+		editorAuthority: PathEditorAuthority = this.capturePathEditorAuthority(path),
+	): void {
+		if (
+			editorAuthority.kind === "blocked"
+			&& editorAuthority.reason === "multiple"
+		) {
 			throw new Error(`Multiple open editors disagree for "${path}". Close duplicates and try again.`);
 		}
-		if (editorAuthority.kind === "read-failed") {
+		if (editorAuthority.kind === "blocked") {
 			throw new Error(`Could not read the open editor for "${path}". Close it and try again.`);
 		}
+		if (!this.isCapturedPathEditorAuthorityCurrent(path, editorAuthority)) {
+			throw new Error(`The open editor authority changed for "${path}". Try again.`);
+		}
 		if (
-			editorAuthority.kind === "single"
+			editorAuthority.kind === "proven-single"
 			&& editorAuthority.content !== diskContent
 		) {
 			throw new Error(`The open editor has unsaved changes for "${path}". Wait for Obsidian to save, then try again.`);
@@ -3495,18 +5178,17 @@ export class ReconciliationController {
 	 * Attention entry actionable and require the user to close that view before
 	 * granting or consuming delete authority.
 	 */
-	assertNoOpaqueOpenFileViewForRemoteDelete(path: string): void {
-		const markdownViews = this.getOpenMarkdownViewsForPath(path);
-		const hasOpaqueView = getOpenFileViewsForPath(
-			this.deps.app.workspace as Parameters<typeof getOpenFileViewsForPath>[0],
-			path,
-			markdownViews,
-		).some((view) => !(view instanceof MarkdownView));
-		if (hasOpaqueView) {
+	assertNoOpaqueOpenFileViewForRemoteDelete(path: string): PathEditorAuthority {
+		const activeResolution = this.markdownRemoteDeleteResolutions.get(path);
+		const authority = activeResolution?.editorAuthority
+			?? this.capturePathEditorAuthority(path);
+		if (!this.isCapturedPathEditorAuthorityCurrent(path, authority)) {
 			throw new Error(
-				`The file view for "${path}" is still open. Close it before accepting the remote delete.`,
+				`The file view for "${path}" is still open, changed, or not safely readable. ` +
+					"Close it before accepting the remote delete.",
 			);
 		}
+		return authority;
 	}
 
 	private assertExpectedMarkdownLocalFile(
@@ -3567,10 +5249,11 @@ export class ReconciliationController {
 			expectedEpisode?.localFile,
 			abstractFile instanceof TFile ? abstractFile : null,
 		);
-		this.assertNoOpaqueOpenFileViewForRemoteDelete(path);
+		const editorAuthority = this.assertNoOpaqueOpenFileViewForRemoteDelete(path);
 		const lease = this.acquireMarkdownRemoteDeleteResolution(
 			path,
 			"accept-remote-delete",
+			editorAuthority,
 		) as MarkdownRemoteDeleteResolutionLease;
 		try {
 			if (abstractFile instanceof TFile) {
@@ -3582,7 +5265,11 @@ export class ReconciliationController {
 					if (stableRead.file.path !== path) {
 						throw new Error(`Local file changed path while resolving Attention: ${path}`);
 					}
-					this.assertEditorMatchesStableMarkdown(path, stableRead.content);
+					this.assertEditorMatchesStableMarkdown(
+						path,
+						stableRead.content,
+						lease.editorAuthority,
+					);
 					this.assertExpectedMarkdownLocalFile(
 						path,
 						expectedEpisode?.localFile,
@@ -3619,6 +5306,10 @@ export class ReconciliationController {
 		expectedReason: RemoteDeletePreservedUnresolvedReason,
 		expectedEpisode?: MarkdownRemoteDeleteEntryIdentity,
 	): Promise<void> {
+		function assertNever(value: never): never {
+			throw new Error(`Unhandled EnsureFileResult: ${JSON.stringify(value)}`);
+		}
+
 		const vaultSync = this.deps.getVaultSync();
 		const diskMirror = this.deps.getDiskMirror();
 		if (!vaultSync || !diskMirror) {
@@ -3643,7 +5334,12 @@ export class ReconciliationController {
 			expectedEpisode?.localFile,
 			abstractFile,
 		);
-		const lease = this.acquireMarkdownRemoteDeleteResolution(path, "keep-local");
+		const editorAuthority = this.assertNoOpaqueOpenFileViewForRemoteDelete(path);
+		const lease = this.acquireMarkdownRemoteDeleteResolution(
+			path,
+			"keep-local",
+			editorAuthority,
+		);
 		try {
 			this.assertSameRemoteDeletedMarkdownEntry(path, entry);
 			this.assertAuthoritativeMarkdownRemoteDelete(
@@ -3674,7 +5370,11 @@ export class ReconciliationController {
 				throw new Error(`File exceeds the configured size limit: ${path}`);
 			}
 
-			this.assertEditorMatchesStableMarkdown(path, stableRead.content);
+			this.assertEditorMatchesStableMarkdown(
+				path,
+				stableRead.content,
+				lease.editorAuthority,
+			);
 
 			const previousText = vaultSync.getTextForPath(path);
 			const previousContent = previousText ? yTextToString(previousText) ?? "" : null;
@@ -3697,11 +5397,16 @@ export class ReconciliationController {
 			if (this.markdownRemoteDeleteResolutions.get(path) !== lease) {
 				throw new Error(`Attention action expired for "${path}". Try again.`);
 			}
+			this.assertEditorMatchesStableMarkdown(
+				path,
+				stableRead.content,
+				lease.editorAuthority,
+			);
 
 			const opId = `op-attention-keep-local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 			let resolvedText: ReturnType<VaultSync["getTextForPath"]> = null;
 			const result = vaultSync.serverAckTracker.withActiveOpId(opId, () => {
-				const ytext = vaultSync.ensureFile(
+				const ensureResult = vaultSync.ensureFile(
 					path,
 					stableRead.content,
 					this.deps.getSettings().deviceName,
@@ -3711,14 +5416,25 @@ export class ReconciliationController {
 						opId,
 					},
 				);
-				if (!ytext) return null;
-				resolvedText = ytext;
-				return applyDiffToYTextWithPostcondition(
-					ytext,
-					yTextToString(ytext) ?? "",
-					stableRead.content,
-					ORIGIN_DISK_SYNC,
-				);
+				switch (ensureResult.kind) {
+					case "created":
+					case "existing":
+						resolvedText = ensureResult.ytext;
+						return applyDiffToYTextWithPostcondition(
+							ensureResult.ytext,
+							yTextToString(ensureResult.ytext) ?? "",
+							stableRead.content,
+							ORIGIN_DISK_SYNC,
+						);
+					case "replan":
+						this.deps.log(`keepLocal: "${path}" active set changed, preserving Attention`);
+						return null;
+					case "blocked":
+						this.deps.log(`keepLocal: "${path}" blocked (${ensureResult.reason}), preserving Attention`);
+						return null;
+					default:
+						return assertNever(ensureResult);
+				}
 			});
 			if (!result?.finalMatchesExpected || !resolvedText) {
 				throw new Error(`Failed to publish the local content for "${path}".`);
@@ -4151,6 +5867,10 @@ export class ReconciliationController {
 		entryOrReason: MarkdownDirtyEntry | MarkdownDirtyReason = "modify",
 		active?: ActiveMarkdownIngest,
 	): Promise<void> {
+		function assertNever(value: never): never {
+			throw new Error(`Unhandled EnsureFileResult: ${JSON.stringify(value)}`);
+		}
+
 		const entry: MarkdownDirtyEntry = typeof entryOrReason === "string"
 			? {
 				reason: entryOrReason,
@@ -4191,6 +5911,14 @@ export class ReconciliationController {
 			const content = stableRead.content;
 			const stableDiskRevision = this.getMarkdownDiskRevision(path);
 			if (!this.deps.isMarkdownPathSyncable(path)) return;
+			if (this.isSamePathAdoptionProjectionHeld(path)) {
+				this.deps.trace("reconcile", "markdown-dirty-held-for-adoption", {
+					path,
+					reason: sourceReason,
+					diskRevision: stableDiskRevision,
+				});
+				return;
+			}
 
 			const externalCandidateAdmission = await this.admitStableExternalDiskMutation(
 				path,
@@ -4288,6 +6016,7 @@ export class ReconciliationController {
 			const existingCrdtContent = existingText ? existingText.toJSON() : null;
 
 			const openEditorMismatchDeferUntil = this.getOpenEditorDiskMismatchDeferUntil({
+				path,
 				sourceReason,
 				cameFromDirtyQueue: typeof entryOrReason !== "string",
 				diskContent: content,
@@ -4345,6 +6074,8 @@ export class ReconciliationController {
 								expectedCrdtContent: boundOutcome.settlement.expectedCrdtContent,
 								expectedEditorTicket: boundOutcome.settlement.expectedEditorTicket,
 								expectedOpenEditorContent: boundOutcome.settlement.expectedOpenEditorContent,
+								expectedEditorAuthorityLease:
+									boundOutcome.settlement.expectedEditorAuthorityLease,
 							},
 						);
 						if (baselineSettled) {
@@ -4748,6 +6479,29 @@ export class ReconciliationController {
 					);
 					return;
 				}
+				switch (seedCommit.value.kind) {
+					case "created":
+					case "existing":
+						if (yTextToString(seedCommit.value.ytext) !== content) {
+							this.requestReconciliationFollowup(
+								path,
+								"closed-dirty-disk-seed-content-changed",
+							);
+							return;
+						}
+						break;
+					case "replan":
+						this.requestReconciliationFollowup(path, "closed-dirty-disk-seed-replan");
+						return;
+					case "blocked":
+						this.requestReconciliationFollowup(
+							path,
+							`closed-dirty-disk-seed-blocked-${seedCommit.value.reason}`,
+						);
+						return;
+					default:
+						assertNever(seedCommit.value);
+				}
 			}
 
 			const settledYText = vaultSync.getTextForPath(path);
@@ -4790,6 +6544,10 @@ export class ReconciliationController {
 		coalescedOpIds: string[];
 		active?: ActiveMarkdownIngest;
 	}): Promise<void> {
+		function assertNever(value: never): never {
+			throw new Error(`Unhandled EnsureFileResult: ${JSON.stringify(value)}`);
+		}
+
 		const {
 			file,
 			path,
@@ -4878,7 +6636,7 @@ export class ReconciliationController {
 					);
 					finalMatchesExpected = result.finalMatchesExpected;
 				} else {
-					finalText = vaultSync.serverAckTracker.withActiveOpId(opId, () =>
+					const ensureResult = vaultSync.serverAckTracker.withActiveOpId(opId, () =>
 						vaultSync.ensureFile(
 							path,
 							content,
@@ -4892,7 +6650,26 @@ export class ReconciliationController {
 							},
 						),
 					);
-					finalMatchesExpected = yTextToString(finalText) === content;
+					switch (ensureResult.kind) {
+						case "created":
+						case "existing":
+							finalText = ensureResult.ytext;
+							finalMatchesExpected = yTextToString(finalText) === content;
+							break;
+						case "replan":
+							finalText = null;
+							finalMatchesExpected = false;
+							break;
+						case "blocked":
+							this.deps.log(
+								`preservedUnresolved: "${path}" admission blocked (${ensureResult.reason})`,
+							);
+							finalText = null;
+							finalMatchesExpected = false;
+							break;
+						default:
+							assertNever(ensureResult);
+					}
 				}
 				return { finalText, finalMatchesExpected };
 			},
@@ -4951,12 +6728,2242 @@ export class ReconciliationController {
 		});
 	}
 
+	private async planOpenPathAdmission(
+		request: OpenPathAdmissionRequest,
+	): Promise<OpenPathAdmissionResult> {
+		if (!this.isOpenPathAdmissionRequestStructurallyValid(request)) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		if (request.presentation === "source") {
+			return { kind: "deferred", reason: "transitioning" };
+		}
+		if (request.presentation === "target-candidate") {
+			const primary = this.getAdmissionPrimaryTicket(
+				request.openEditorTicket,
+				request.leafId,
+			);
+			const candidate = primary
+				? this.deps.getEditorBindings()?.getPendingHostLoadCandidate?.(primary.view) ?? null
+				: null;
+			if (
+				!candidate
+				|| candidate.hostLoadTokenId !== request.hostLoadTokenId
+			) {
+				return { kind: "deferred", reason: "transitioning" };
+			}
+			const planned = await this.planTargetPresentation(Object.freeze({
+				requestId: `open-path:${request.requestId}`,
+				sessionId: request.sessionId,
+				leafId: request.leafId,
+				handoffGeneration: request.handoffGeneration,
+				switchIntentSeq: request.switchIntentSeq,
+				targetPath: request.targetPath,
+				targetFile: request.targetFile,
+				candidate,
+				openEditorTicket: request.openEditorTicket,
+			}));
+			if (planned.kind === "planned") {
+				return { kind: "presentation-required", plan: planned.plan };
+			}
+			if (planned.kind === "replan") {
+				return { kind: "replan", reason: "authority-changed" };
+			}
+			return { kind: "deferred", reason: "unstable" };
+		}
+
+		const anchor = this.targetReadyBySession.get(this.editorAdmissionSessionKey(
+			request.sessionId,
+			request.leafId,
+			request.handoffGeneration,
+			request.targetPath,
+		));
+		if (!anchor || !this.doesReadyRecordMatchOpenRequest(anchor, request)) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		const primary = this.getAdmissionPrimaryTicket(
+			request.openEditorTicket,
+			request.leafId,
+		);
+		if (
+			!primary
+			|| (
+				request.reason === "handoff-replay-target-bind"
+				&& (
+					primary.cm !== anchor.candidate.cm
+					|| primary.editorDocument !== anchor.candidate.cm.state.doc
+					|| primary.editorContent !== anchor.token.certifiedBaseContent
+				)
+			)
+		) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		const capture = await this.captureEditorAdmissionAuthority({
+			sessionId: request.sessionId,
+			leafId: request.leafId,
+			handoffGeneration: request.handoffGeneration,
+			switchIntentSeq: request.switchIntentSeq,
+			targetPath: request.targetPath,
+			targetFile: request.targetFile,
+			presentation: "target-proven",
+			hostLoadTokenId: null,
+			openEditorTicket: request.openEditorTicket,
+			expectedContent: request.reason === "handoff-replay-target-bind"
+				? anchor.token.certifiedBaseContent
+				: (primary.editorContent ?? ""),
+			admissionReason: request.reason,
+			recoveryClaim: request.reason === "handoff-replay-target-bind"
+				? request.recoveryClaim
+				: null,
+		});
+		if (capture.kind !== "ready") return capture;
+		const snapshot = capture.snapshot;
+		if (snapshot.activeAuthority.ytext) {
+			const ready = this.buildTargetReadyRecord(
+				snapshot,
+				anchor.hostReceipt,
+				anchor.candidate,
+			);
+			if (!ready || ready.token.targetAuthority.kind !== "existing") {
+				return { kind: "replan", reason: "authority-changed" };
+			}
+			this.publishTargetReadyRecord(ready);
+			return { kind: "existing", targetReadyToken: ready.token };
+		}
+		if (anchor.token.targetAuthority.kind !== "missing") {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		const planId = this.editorAuthorityAdmission.nextId("missing-target-seed-plan");
+		const seedPermitId = this.editorAuthorityAdmission.nextId("missing-target-seed-permit");
+		const freshnessHandleId = this.editorAuthorityAdmission.issueFreshness(
+			null,
+			() => this.isEditorAdmissionAuthorityCurrent(snapshot),
+		);
+		const plan: MissingTargetSeedPlan = Object.freeze({
+			planId,
+			targetReadyTokenId: anchor.token.tokenId,
+			switchIntentSeq: request.switchIntentSeq,
+			authorityFreshnessHandleId: freshnessHandleId,
+			seedPermitId,
+			certifiedBaseHash: snapshot.certifiedBaseHash,
+		});
+		this.editorAuthorityAdmission.issueSeedPermit(
+			seedPermitId,
+			planId,
+			freshnessHandleId,
+		);
+		this.trimEditorAdmissionMap(this.missingTargetSeedPlans);
+		this.missingTargetSeedPlans.set(planId, {
+			plan,
+			anchor,
+			snapshot,
+			inFlight: false,
+			result: null,
+		});
+		return { kind: "seed-required", plan };
+	}
+
+	private captureSamePathAdoptionLocalVersions(
+		request: SamePathAdoptionRequest,
+	): readonly Readonly<{ content: string; leafIds: readonly string[] }>[] | null {
+		if (request.openEditorTicket.views.length === 0) return null;
+		const grouped = new Map<string, string[]>();
+		for (const ticket of request.openEditorTicket.views) {
+			if (
+				ticket.targetFile !== request.file
+				|| ticket.targetFile.path !== request.path
+				|| ticket.displayedFile !== request.file
+				|| ticket.displayedPath !== request.path
+				|| !ticket.stableTargetIdentityProven
+				|| ticket.switchIntentSeq !== null
+				|| ticket.handoffPresentation !== "stable"
+				|| ticket.handoffPhase !== null
+				|| ticket.intentStateKind !== null
+				|| ticket.pendingHostLoadTokenId !== null
+				|| ticket.cm === null
+				|| ticket.editorDocument !== ticket.cm.state.doc
+				|| ticket.editorContent === null
+				|| ticket.editorContent !== ticket.cm.state.doc.toString()
+			) return null;
+			const content = normalizeEditorText(ticket.editorContent);
+			const leafIds = grouped.get(content) ?? [];
+			leafIds.push(ticket.leafId);
+			grouped.set(content, leafIds);
+		}
+		return Object.freeze(Array.from(grouped, ([content, leafIds]) => Object.freeze({
+			content,
+			leafIds: Object.freeze([...leafIds]),
+		})));
+	}
+
+	private isSamePathAdoptionRequestStructurallyValid(
+		request: SamePathAdoptionRequest,
+	): boolean {
+		const epochs = [
+			request.generation,
+			request.hostSaveEpoch,
+			request.editorRevision,
+			request.editorTransactionSeq,
+			request.bindingEpoch,
+			request.nativeHistoryEpoch,
+			request.inputEpoch,
+			request.compositionEpoch,
+			request.selectionEpoch,
+			request.scrollEpoch,
+		];
+		if (
+			request.requestId.length === 0
+			|| request.adoptionId.length === 0
+			|| request.sessionId.length === 0
+			|| request.leafId.length === 0
+			|| request.path.length === 0
+			|| epochs.some((epoch) => !Number.isSafeInteger(epoch) || epoch < 0)
+			|| request.activeCompositionEpoch !== null
+			|| request.file.path !== request.path
+			|| request.openEditorTicket.path !== request.path
+			|| request.startDocument !== request.cm.state.doc
+			|| (request.fileId === null) !== (request.ytext === null)
+			|| (
+				request.hostCapability !== "public-cancellable"
+				&& request.hostCapability !== "owned-scheduler-with-unload-flush"
+			)
+		) return false;
+		const localVersions = this.captureSamePathAdoptionLocalVersions(request);
+		if (localVersions === null) return false;
+		if (localVersions.length === 1) {
+			if (
+				request.editorAuthority.kind !== "proven-single"
+				|| normalizeEditorText(request.editorAuthority.content)
+					!== localVersions[0]?.content
+			) return false;
+		} else if (
+			request.editorAuthority.kind !== "blocked"
+			|| request.editorAuthority.reason !== "multiple"
+		) return false;
+		const primary = this.getAdmissionPrimaryTicket(
+			request.openEditorTicket,
+			request.leafId,
+		);
+		return !!primary
+			&& primary.sessionId === request.sessionId
+			&& primary.handoffGeneration === request.generation
+			&& primary.displayedFile === request.file
+			&& primary.displayedPath === request.path
+			&& primary.targetFile === request.file
+			&& primary.stableTargetIdentityProven
+			&& primary.switchIntentSeq === null
+			&& primary.nativeHistoryEpoch === request.nativeHistoryEpoch
+			&& primary.selectionEpoch === request.selectionEpoch
+			&& primary.scrollEpoch === request.scrollEpoch
+			&& primary.handoffPresentation === "stable"
+			&& primary.handoffPhase === null
+			&& primary.intentStateKind === null
+			&& primary.pendingHostLoadTokenId === null
+			&& primary.cm === request.cm
+			&& primary.bindingEpoch === request.bindingEpoch
+			&& primary.editorRevision === request.editorRevision
+			&& Number.isSafeInteger(primary.editorAuthorityRevision)
+			&& primary.editorAuthorityRevision >= 0
+			&& primary.editorAuthorityContent === primary.editorContent
+			&& primary.editorDocument === request.startDocument
+			&& primary.editorContent === request.startDocument.toString();
+	}
+
+	private isSamePathAdoptionRequestCurrent(request: SamePathAdoptionRequest): boolean {
+		if (!this.isSamePathAdoptionRequestStructurallyValid(request)) return false;
+		const editorBindings = this.deps.getEditorBindings();
+		if (!editorBindings) return false;
+		try {
+			if (!editorBindings.isSamePathAdoptionRequestCurrent(request)) return false;
+			const openViews = this.getOpenMarkdownViewsForPath(request.path);
+			if (
+				openViews.length === 0
+				|| openViews.length !== request.openEditorTicket.views.length
+			) {
+				return false;
+			}
+			const validation = editorBindings.validateOpenEditorMutationTicket(
+				request.openEditorTicket,
+				openViews,
+			);
+			if (!validation.current) return false;
+			const currentAuthority = editorBindings.capturePathEditorAuthority(request.path);
+			if (request.editorAuthority.kind === "proven-single") {
+				return currentAuthority.kind === "proven-single"
+					&& currentAuthority.lease === request.editorAuthority.lease
+					&& currentAuthority.content === request.editorAuthority.content
+					&& editorBindings.isPathEditorAuthorityLeaseCurrent(
+						request.editorAuthority.lease,
+					);
+			}
+			return request.editorAuthority.kind === "blocked"
+				&& request.editorAuthority.reason === "multiple"
+				&& currentAuthority.kind === "blocked"
+				&& currentAuthority.reason === "multiple";
+		} catch {
+			return false;
+		}
+	}
+
+	private captureSamePathAdoptionProvider(vaultSync: VaultSync): object | null {
+		const provider = (vaultSync as unknown as { provider?: unknown }).provider;
+		return typeof provider === "object" && provider !== null ? provider : null;
+	}
+
+	private isSamePathAdoptionPolicyCurrent(path: string, vaultSync: VaultSync): boolean {
+		return this.deps.isMarkdownPathSyncable(path)
+			&& !this.isMarkdownPreservedUnresolved(path)
+			&& !vaultSync.isPendingRenameTarget(path)
+			&& !this.isEditorAdmissionHardTombstone(vaultSync, path);
+	}
+
+	private isSamePathAdoptionCapturePrefixCurrent(input: Readonly<{
+		request: SamePathAdoptionRequest;
+		lifecycleGeneration: number;
+		vaultSync: VaultSync;
+		providerInstance: object | null;
+		baselineHash: string | null;
+		baselineRevision: number;
+		diskRevision: number;
+		attentionGeneration: number;
+		syncScopeGeneration: number;
+		interceptedCandidate: InterceptedExternalDiskMutation | null;
+	}>): boolean {
+		return this.editorAuthorityAdmissionOpen
+			&& this.lifecycleGeneration === input.lifecycleGeneration
+			&& this.deps.getVaultSync() === input.vaultSync
+			&& this.captureSamePathAdoptionProvider(input.vaultSync) === input.providerInstance
+			&& input.request.file.path === input.request.path
+			&& this.deps.app.vault.getAbstractFileByPath(input.request.path)
+				=== input.request.file
+			&& (this.deps.getDiskIndex()[input.request.path]?.contentHash ?? null)
+				=== input.baselineHash
+			&& (this.diskBaselineRevisions.get(input.request.path) ?? 0)
+				=== input.baselineRevision
+			&& this.getMarkdownDiskRevision(input.request.path) === input.diskRevision
+			&& (this.deps.getMarkdownAttentionGeneration?.() ?? 0)
+				=== input.attentionGeneration
+			&& (this.deps.getMarkdownSyncScopeGeneration?.() ?? 0)
+				=== input.syncScopeGeneration
+			&& (this.interceptedExternalDiskMutations.get(input.request.path) ?? null)
+				=== input.interceptedCandidate
+			&& input.interceptedCandidate === null
+			&& this.isSamePathAdoptionPolicyCurrent(input.request.path, input.vaultSync)
+			&& this.isSamePathAdoptionRequestCurrent(input.request);
+	}
+
+	private isSamePathAdoptionAuthorityCurrent(
+		snapshot: SamePathAdoptionAuthoritySnapshot,
+	): boolean {
+		if (
+			!this.isSamePathAdoptionSnapshotEnvelopeCurrent(snapshot)
+			|| !this.isSamePathAdoptionRequestCurrent(snapshot.request)
+		) return false;
+		if (
+			snapshot.diskFile !== snapshot.request.file
+			|| !this.sameEditorAdmissionFileStat(
+				this.captureEditorAdmissionFileStat(snapshot.diskFile),
+				snapshot.diskStat,
+			)
+		) return false;
+		const currentAuthority = this.capturePathEditorAuthority(snapshot.request.path);
+		if (snapshot.editorAuthority.kind === "proven-single") {
+			if (
+				currentAuthority.kind !== "proven-single"
+				|| snapshot.editorAuthorityLease === null
+				|| currentAuthority.lease !== snapshot.editorAuthorityLease
+				|| normalizeEditorText(currentAuthority.content) !== snapshot.localText
+				|| !this.isPathEditorAuthorityLeaseCurrent(snapshot.editorAuthorityLease)
+			) return false;
+		} else if (
+			snapshot.editorAuthority.kind !== "blocked"
+			|| snapshot.editorAuthority.reason !== "multiple"
+			|| currentAuthority.kind !== "blocked"
+			|| currentAuthority.reason !== "multiple"
+		) return false;
+		const currentActive = this.editorAuthorityAdmission.captureActivePathAuthority(
+			snapshot.vaultSync,
+			snapshot.request.path,
+		);
+		return this.sameActivePathAuthority(currentActive, snapshot.activeAuthority);
+	}
+
+	private isSamePathAdoptionSnapshotEnvelopeCurrent(
+		snapshot: SamePathAdoptionAuthoritySnapshot,
+	): boolean {
+		return this.editorAuthorityAdmissionOpen
+			&& this.lifecycleGeneration === snapshot.lifecycleGeneration
+			&& this.deps.getVaultSync() === snapshot.vaultSync
+			&& this.captureSamePathAdoptionProvider(snapshot.vaultSync)
+				=== snapshot.providerInstance
+			&& snapshot.request.file.path === snapshot.request.path
+			&& this.deps.app.vault.getAbstractFileByPath(snapshot.request.path)
+				=== snapshot.request.file
+			&& (this.deps.getDiskIndex()[snapshot.request.path]?.contentHash ?? null)
+				=== snapshot.baselineHash
+			&& (this.diskBaselineRevisions.get(snapshot.request.path) ?? 0)
+				=== snapshot.baselineRevision
+			&& this.getMarkdownDiskRevision(snapshot.request.path)
+				=== snapshot.diskRevision
+			&& (this.deps.getMarkdownAttentionGeneration?.() ?? 0)
+				=== snapshot.attentionGeneration
+			&& (this.deps.getMarkdownSyncScopeGeneration?.() ?? 0)
+				=== snapshot.syncScopeGeneration
+			&& (this.interceptedExternalDiskMutations.get(snapshot.request.path) ?? null)
+				=== snapshot.interceptedCandidate
+			&& snapshot.interceptedCandidate === null
+			&& this.isSamePathAdoptionPolicyCurrent(
+				snapshot.request.path,
+				snapshot.vaultSync,
+			)
+			&& snapshot.diskFile === snapshot.request.file
+			&& this.sameEditorAdmissionFileStat(
+				this.captureEditorAdmissionFileStat(snapshot.diskFile),
+				snapshot.diskStat,
+			);
+	}
+
+	private isSamePathAdoptionBindAuthorityCurrent(
+		record: SamePathAdoptionProposalRecord,
+		context: SamePathAdoptionBindContext,
+	): boolean {
+		const { proposal, request, snapshot } = record;
+		const post = context.postMutation;
+		if (typeof post !== "object" || post === null) return false;
+		if (
+			context.proposal !== proposal
+			|| context.request !== request
+			|| proposal.plan.kind === "preserve-conflict"
+			|| proposal.plan.targetText !== post.targetText
+			|| post.activeCompositionEpoch !== null
+			|| post.cm !== request.cm
+			|| post.editorDocument !== request.cm.state.doc
+			|| post.editorDocument.toString() !== post.targetText
+			|| post.editorAuthority.kind !== "proven-single"
+			|| normalizeEditorText(post.editorAuthority.content) !== post.targetText
+			|| post.openEditorTicket.path !== request.path
+			|| post.openEditorTicket.views.length === 0
+			|| post.hostCapability !== proposal.hostCapability
+			|| post.ytextIdentity !== proposal.ytextIdentity
+			|| !this.isSamePathAdoptionSnapshotEnvelopeCurrent(snapshot)
+		) return false;
+
+		const editorBindings = this.deps.getEditorBindings();
+		if (!editorBindings) return false;
+		try {
+			if (!editorBindings.isSamePathAdoptionBindContextCurrent(context)) return false;
+			const openViews = this.getOpenMarkdownViewsForPath(request.path);
+			const validation = editorBindings.validateOpenEditorMutationTicket(
+				post.openEditorTicket,
+				openViews,
+			);
+			if (!validation.current) return false;
+			const authority = editorBindings.capturePathEditorAuthority(request.path);
+			if (
+				authority.kind !== "proven-single"
+				|| authority.lease !== post.editorAuthority.lease
+				|| normalizeEditorText(authority.content) !== post.targetText
+				|| !editorBindings.isPathEditorAuthorityLeaseCurrent(
+					post.editorAuthority.lease,
+				)
+			) return false;
+		} catch {
+			return false;
+		}
+
+		const active = this.editorAuthorityAdmission.captureActivePathAuthority(
+			snapshot.vaultSync,
+			request.path,
+		);
+		return active.activeFileIds.length === 1
+			&& active.activeFileIds[0] === proposal.fileId
+			&& active.fileId === proposal.fileId
+			&& active.ytext === proposal.ytext
+			&& active.ytextIdentity === post.ytextIdentity
+			&& active.ytextMutationEpoch === post.ytextMutationEpoch
+			&& normalizeEditorText(active.ytextContent ?? "") === post.targetText;
+	}
+
+	private async commitSamePathAdoptionSeed(
+		snapshot: SamePathAdoptionAuthoritySnapshot,
+	): Promise<SamePathAdoptionRequestResult> {
+		const context: SamePathAdoptionSeedContext = Object.freeze({
+			kind: "seed",
+			request: snapshot.request,
+			file: snapshot.diskFile,
+			diskContent: snapshot.diskContent,
+		});
+		const permit: SamePathAdoptionSeedPermit =
+			this.editorAuthorityAdmission.issueSamePathAdoptionSeedPermit(
+				context,
+				() => this.isSamePathAdoptionAuthorityCurrent(snapshot),
+			);
+		const stableRead = await this.readStableMarkdownFile(
+			snapshot.request.path,
+			"modify",
+			snapshot.diskFile,
+		);
+		if (
+			stableRead.kind !== "ready"
+			|| stableRead.file !== snapshot.diskFile
+			|| stableRead.content !== snapshot.diskContent
+			|| !this.isSamePathAdoptionAuthorityCurrent(snapshot)
+		) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		if (this.deps.shouldBlockFrontmatterIngest(
+			snapshot.request.path,
+			null,
+			stableRead.content,
+			"same-path-adoption-seed",
+		)) {
+			return { kind: "replan", reason: "frontmatter-blocked" };
+		}
+		if (!this.editorAuthorityAdmission.consumeSamePathAdoptionSeedPermit(
+			permit,
+			context,
+		)) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		const vaultSync = this.deps.getVaultSync();
+		if (!vaultSync || vaultSync !== snapshot.vaultSync) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+
+		const ensureResult = vaultSync.ensureFile(
+			snapshot.request.path,
+			snapshot.diskContent,
+			this.deps.getSettings().deviceName,
+			{
+				reviveTombstone: false,
+				reviveReason: "same-path-adoption",
+				canCreate: () => this.isSamePathAdoptionAuthorityCurrent(snapshot),
+			},
+		);
+		switch (ensureResult.kind) {
+			case "created":
+			case "existing":
+				return { kind: "seeded-replan" };
+			case "replan":
+				return { kind: "replan", reason: "active-set-changed" };
+			case "blocked":
+				return { kind: "replan", reason: `seed-${ensureResult.reason}` };
+		}
+	}
+
+	private async preserveSamePathAdoptionConflict(
+		snapshot: SamePathAdoptionAuthoritySnapshot,
+	): Promise<SamePathAdoptionRequestResult> {
+		const receiptId = this.editorAuthorityAdmission.nextId(
+			"same-path-adoption-conflict",
+		);
+		const mergeBaseHash = snapshot.baselineHash !== null
+			&& snapshot.baselineText !== null
+			? snapshot.baselineHash
+			: null;
+		let crdtArtifactPath: string | null = null;
+		const editorArtifacts: Array<Readonly<{
+			path: string;
+			contentHash: string;
+			leafIds: readonly string[];
+		}>> = [];
+		const isCurrent = (): boolean => this.isSamePathAdoptionAuthorityCurrent(snapshot);
+		const buildReceipt = (
+			status: SamePathAdoptionConflictReceipt["status"],
+			failureReason: SamePathAdoptionConflictFailureReason | null,
+		): SamePathAdoptionConflictReceipt => {
+			const frozenEditorArtifacts = Object.freeze(editorArtifacts.map((artifact) =>
+				Object.freeze({
+					...artifact,
+					leafIds: Object.freeze([...artifact.leafIds]),
+				}),
+			));
+			const editorArtifactPaths = Object.freeze(
+				frozenEditorArtifacts.map((artifact) => artifact.path),
+			);
+			return Object.freeze({
+				receiptId,
+				adoptionId: snapshot.request.adoptionId,
+				path: snapshot.request.path,
+				status,
+				retryable: status === "preservation-failed",
+				mergeMode: mergeBaseHash === null ? "two-way" : "three-way",
+				baseHash: mergeBaseHash,
+				crdtArtifactPath,
+				editorArtifactPath: editorArtifactPaths[0] ?? null,
+				editorArtifactPaths,
+				editorArtifacts: frozenEditorArtifacts,
+				failureReason,
+			});
+		};
+
+		try {
+			if (snapshot.remoteText === null) {
+				throw new Error("same-path adoption conflict lost Remote authority");
+			}
+			const remoteArtifact = await this.createMarkdownConflictArtifact(
+				snapshot.request.path,
+				snapshot.remoteText,
+				"same-path-adoption-conflict",
+				"crdt",
+				isCurrent,
+			);
+			if (!isCurrent()) throw new Error("stale same-path adoption conflict");
+			crdtArtifactPath = remoteArtifact.path;
+			if (mergeBaseHash !== null) {
+				this.deps.recordConflictMergeBase?.(remoteArtifact.path, mergeBaseHash);
+			}
+
+			const normalizedDisk = normalizeEditorText(snapshot.diskContent);
+			for (const localVersion of snapshot.localVersions) {
+				if (localVersion.content === normalizedDisk) continue;
+				const localArtifact = await this.createMarkdownConflictArtifact(
+					snapshot.request.path,
+					localVersion.content,
+					"same-path-adoption-conflict",
+					"editor",
+					isCurrent,
+				);
+				if (!isCurrent()) throw new Error("stale same-path adoption conflict");
+				const localHash = await contentBaselineHash(localVersion.content);
+				if (!isCurrent()) throw new Error("stale same-path adoption conflict");
+				editorArtifacts.push(Object.freeze({
+					path: localArtifact.path,
+					contentHash: localHash,
+					leafIds: localVersion.leafIds,
+				}));
+				if (mergeBaseHash !== null) {
+					this.deps.recordConflictMergeBase?.(localArtifact.path, mergeBaseHash);
+				}
+			}
+
+			if (!isCurrent()) throw new Error("stale same-path adoption conflict");
+			const receipt = buildReceipt("preserved", null);
+			this.deps.trace("conflict", "same-path-adoption-conflict-preserved", {
+				path: snapshot.request.path,
+				adoptionId: snapshot.request.adoptionId,
+				mergeMode: receipt.mergeMode,
+				crdtArtifactPath: receipt.crdtArtifactPath,
+				editorArtifactCount: receipt.editorArtifacts.length,
+			});
+			return Object.freeze({ kind: "conflict-preserved", receipt });
+		} catch {
+			const reason: SamePathAdoptionConflictFailureReason =
+				"artifact-preservation-failed";
+			const receipt = buildReceipt("preservation-failed", reason);
+			this.deps.trace("conflict", "same-path-adoption-conflict-preservation-failed", {
+				path: snapshot.request.path,
+				adoptionId: snapshot.request.adoptionId,
+				reason,
+				crdtArtifactPath,
+				editorArtifactCount: editorArtifacts.length,
+			});
+			return Object.freeze({
+				kind: "conflict-preservation-failed",
+				reason,
+				receipt,
+			});
+		}
+	}
+
+	private async planSamePathAdoptionRequest(
+		request: SamePathAdoptionRequest,
+	): Promise<SamePathAdoptionRequestResult> {
+		if (!this.isSamePathAdoptionRequestStructurallyValid(request)) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		const editorAuthority = request.editorAuthority;
+		const lifecycleGeneration = this.lifecycleGeneration;
+		const vaultSync = this.deps.getVaultSync();
+		if (!this.editorAuthorityAdmissionOpen || !vaultSync) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		if (
+			!this.isSamePathAdoptionRequestCurrent(request)
+			|| !this.isSamePathAdoptionPolicyCurrent(request.path, vaultSync)
+			|| this.deps.app.vault.getAbstractFileByPath(request.path) !== request.file
+		) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		const interceptedCandidate =
+			this.interceptedExternalDiskMutations.get(request.path) ?? null;
+		if (interceptedCandidate !== null) {
+			return { kind: "replan", reason: "external-disk-candidate" };
+		}
+
+		const providerInstance = this.captureSamePathAdoptionProvider(vaultSync);
+		const baselineHash = this.deps.getDiskIndex()[request.path]?.contentHash ?? null;
+		const baselineRevision = this.diskBaselineRevisions.get(request.path) ?? 0;
+		const diskRevision = this.getMarkdownDiskRevision(request.path);
+		const attentionGeneration = this.deps.getMarkdownAttentionGeneration?.() ?? 0;
+		const syncScopeGeneration = this.deps.getMarkdownSyncScopeGeneration?.() ?? 0;
+		let baselineText = baselineHash === null
+			? null
+			: await this.deps.getBaselineText?.(baselineHash) ?? null;
+		if (
+			baselineHash !== null
+			&& baselineText !== null
+			&& await contentBaselineHash(baselineText) !== baselineHash
+		) {
+			baselineText = null;
+		}
+		if (!this.isSamePathAdoptionCapturePrefixCurrent({
+			request,
+			lifecycleGeneration,
+			vaultSync,
+			providerInstance,
+			baselineHash,
+			baselineRevision,
+			diskRevision,
+			attentionGeneration,
+			syncScopeGeneration,
+			interceptedCandidate,
+		})) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+
+		const stableRead = await this.readStableMarkdownFile(
+			request.path,
+			"modify",
+			request.file,
+		);
+		if (stableRead.kind !== "ready" || stableRead.file !== request.file) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		const diskStat = this.captureEditorAdmissionFileStat(request.file);
+		if (
+			stableRead.stat !== null
+			&& (
+				diskStat.mtime !== stableRead.stat.mtime
+				|| diskStat.size !== stableRead.stat.size
+			)
+		) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		const diskContentHash = await contentBaselineHash(stableRead.content);
+		if (!this.isSamePathAdoptionCapturePrefixCurrent({
+			request,
+			lifecycleGeneration,
+			vaultSync,
+			providerInstance,
+			baselineHash,
+			baselineRevision,
+			diskRevision,
+			attentionGeneration,
+			syncScopeGeneration,
+			interceptedCandidate,
+		})) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+
+		const activeAuthority = this.editorAuthorityAdmission.captureActivePathAuthority(
+			vaultSync,
+			request.path,
+		);
+		const remoteMissing = activeAuthority.activeFileIds.length === 0
+			&& activeAuthority.fileId === null
+			&& activeAuthority.ytext === null
+			&& activeAuthority.ytextIdentity === null
+			&& activeAuthority.ytextContent === null
+			&& request.fileId === null
+			&& request.ytext === null;
+		const remoteExisting = activeAuthority.activeFileIds.length === 1
+			&& activeAuthority.fileId !== null
+			&& activeAuthority.ytext !== null
+			&& activeAuthority.ytextIdentity !== null
+			&& activeAuthority.ytextContent !== null
+			&& activeAuthority.activeFileIds[0] === activeAuthority.fileId
+			&& activeAuthority.fileId === request.fileId
+			&& activeAuthority.ytext === request.ytext;
+		if (!remoteMissing && !remoteExisting) {
+			return { kind: "replan", reason: "active-set-changed" };
+		}
+		const localVersions = this.captureSamePathAdoptionLocalVersions(request);
+		if (localVersions === null) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		const primaryLocal = request.openEditorTicket.views.find(
+			(ticket) => ticket.leafId === request.leafId,
+		)?.editorContent;
+		if (primaryLocal === null || primaryLocal === undefined) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		const localText = normalizeEditorText(primaryLocal);
+		const remoteText = activeAuthority.ytextContent === null
+			? null
+			: normalizeEditorText(activeAuthority.ytextContent);
+		const normalizedBaselineText = baselineText === null
+			? null
+			: normalizeEditorText(baselineText);
+		const normalizedDiskText = normalizeEditorText(stableRead.content);
+		const snapshot: SamePathAdoptionAuthoritySnapshot = Object.freeze({
+			request,
+			lifecycleGeneration,
+			vaultSync,
+			providerInstance,
+			baselineHash,
+			baselineRevision,
+			baselineText: normalizedBaselineText,
+			diskFile: stableRead.file,
+			diskStat,
+			diskContent: stableRead.content,
+			diskContentHash,
+			diskRevision,
+			activeAuthority,
+			localText,
+			localVersions,
+			remoteText,
+			editorAuthority,
+			editorAuthorityLease:
+				editorAuthority.kind === "proven-single" ? editorAuthority.lease : null,
+			attentionGeneration,
+			syncScopeGeneration,
+			interceptedCandidate,
+		});
+		if (!this.isSamePathAdoptionAuthorityCurrent(snapshot)) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		if (remoteMissing) {
+			return this.commitSamePathAdoptionSeed(snapshot);
+		}
+		if (
+			remoteText === null
+			|| activeAuthority.fileId === null
+			|| activeAuthority.ytext === null
+			|| activeAuthority.ytextIdentity === null
+		) {
+			return { kind: "replan", reason: "active-set-changed" };
+		}
+		const plan = Object.freeze(localVersions.length > 1
+			? {
+				kind: "preserve-conflict" as const,
+				reason: "conflicting-hunks" as const,
+				hunkCount: 0,
+			}
+			: planSamePathAdoption({
+				baselineText: normalizedBaselineText,
+				localText,
+				remoteText,
+			}));
+		if (
+			plan.kind !== "preserve-conflict"
+			&& normalizedDiskText !== localText
+			&& normalizedDiskText !== remoteText
+			&& normalizedDiskText !== normalizedBaselineText
+		) {
+			this.deps.trace("reconcile", "same-path-adoption-disk-authority-unclassified", {
+				path: request.path,
+				diskLength: normalizedDiskText.length,
+				localLength: localText.length,
+				remoteLength: remoteText.length,
+			});
+			return { kind: "replan", reason: "disk-authority-unclassified" };
+		}
+		if (plan.kind === "preserve-conflict") {
+			return this.preserveSamePathAdoptionConflict(snapshot);
+		}
+		if (editorAuthority.kind !== "proven-single") {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		if (
+			plan.targetText !== remoteText
+			&& this.deps.shouldBlockFrontmatterIngest(
+				request.path,
+				remoteText,
+				plan.targetText,
+				`same-path-adoption-${plan.kind}`,
+			)
+		) {
+			return { kind: "replan", reason: "frontmatter-blocked" };
+		}
+
+		const proposalId = this.editorAuthorityAdmission.nextId("same-path-adoption-proposal");
+		const planId = this.editorAuthorityAdmission.nextId("same-path-adoption-plan");
+		let proposal: SamePathAdoptionProposal;
+		const isCurrent = (): boolean => {
+			const record = this.samePathAdoptionProposals.get(proposalId);
+			return record?.proposal === proposal
+				&& record.request === request
+				&& this.isSamePathAdoptionAuthorityCurrent(snapshot);
+		};
+		const authorityFreshnessHandleId = this.editorAuthorityAdmission.issueFreshness(
+			null,
+			isCurrent,
+		);
+		const proposalShell = {} as SamePathAdoptionProposal;
+		const mutationContext: SamePathAdoptionMutationContext = Object.freeze({
+			kind: "mutation",
+			proposal: proposalShell,
+			request,
+		});
+		const bindExpectation = Object.freeze({
+			kind: "bind",
+			proposal: proposalShell,
+			request,
+		});
+		const mutationPermit = this.editorAuthorityAdmission.issueSamePathAdoptionMutationPermit(
+			mutationContext,
+			isCurrent,
+		);
+		const bindPermit = this.editorAuthorityAdmission.issueSamePathAdoptionBindPermit(
+			bindExpectation,
+			(context) => {
+				const record = this.samePathAdoptionProposals.get(proposalId);
+				return record?.proposal === proposal
+					&& record.request === request
+					&& this.isSamePathAdoptionBindAuthorityCurrent(record, context);
+			},
+		);
+		Object.assign(proposalShell, {
+			proposalId,
+			planId,
+			authorityFreshnessHandleId,
+			request,
+			adoptionId: request.adoptionId,
+			path: request.path,
+			file: request.file,
+			baselineHash,
+			baselineRevision,
+			baselineText: normalizedBaselineText,
+			diskFile: stableRead.file,
+			diskStat,
+			diskContent: stableRead.content,
+			diskContentHash,
+			localText,
+			remoteText,
+			activeAuthority,
+			fileId: activeAuthority.fileId,
+			ytext: activeAuthority.ytext,
+			ytextIdentity: activeAuthority.ytextIdentity,
+			ytextMutationEpoch: activeAuthority.ytextMutationEpoch,
+			providerInstance,
+			editorAuthorityLease: editorAuthority.lease,
+			hostCapability: request.hostCapability,
+			hostSaveEpoch: request.hostSaveEpoch,
+			lifecycleGeneration,
+			attentionGeneration,
+			syncScopeGeneration,
+			plan,
+			mutationPermit,
+			bindPermit,
+		});
+		proposal = Object.freeze(proposalShell);
+		const record: SamePathAdoptionProposalRecord = Object.freeze({
+			request,
+			proposal,
+			snapshot,
+		});
+		this.trimEditorAdmissionMap(this.samePathAdoptionProposals);
+		this.samePathAdoptionProposals.set(proposalId, record);
+		if (!this.isSamePathAdoptionAuthorityCurrent(snapshot)) {
+			this.samePathAdoptionProposals.delete(proposalId);
+			this.editorAuthorityAdmission.invalidateFreshness(authorityFreshnessHandleId);
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		return Object.freeze({ kind: "planned", proposal });
+	}
+
+	private async planTargetPresentation(
+		request: TargetPresentationRequest,
+	): Promise<TargetPresentationRequestResult> {
+		if (!this.isTargetPresentationRequestStructurallyValid(request)) {
+			return { kind: "replan", reason: "presentation-changed" };
+		}
+		const existing = this.targetPresentationPlanByHostToken.get(
+			request.candidate.hostLoadTokenId,
+		);
+		if (existing) {
+			if (
+				existing.request.candidate === request.candidate
+				&& existing.request.openEditorTicket === request.openEditorTicket
+				&& !this.editorAuthorityAdmission.isPresentationPermitConsumed(
+					existing.presentationPermitId,
+				)
+				&& this.isEditorAdmissionAuthorityCurrent(existing.snapshot)
+			) {
+				return { kind: "planned", plan: existing.plan };
+			}
+			if (
+				existing.request.candidate !== request.candidate
+				|| this.editorAuthorityAdmission.isPresentationPermitConsumed(
+					existing.presentationPermitId,
+				)
+			) {
+				return { kind: "replan", reason: "presentation-changed" };
+			}
+			// A consumed presentation permit is never replaced. An unconsumed stale
+			// proof may be retired so a fresh editor ticket can certify the same held
+			// candidate; invalidating its freshness keeps the old permit unusable.
+			this.editorAuthorityAdmission.invalidateFreshness(
+				existing.plan.authorityFreshnessHandleId,
+			);
+			this.targetPresentationPlans.delete(existing.plan.planId);
+			this.targetPresentationPlanByHostToken.delete(
+				request.candidate.hostLoadTokenId,
+			);
+		}
+		const capture = await this.captureEditorAdmissionAuthority({
+			sessionId: request.sessionId,
+			leafId: request.leafId,
+			handoffGeneration: request.handoffGeneration,
+			switchIntentSeq: request.switchIntentSeq,
+			targetPath: request.targetPath,
+			targetFile: request.targetFile,
+			presentation: "target-candidate",
+			hostLoadTokenId: request.candidate.hostLoadTokenId,
+			openEditorTicket: request.openEditorTicket,
+			expectedContent: request.candidate.incomingContent,
+			admissionReason: "open-editor-missing-target",
+			recoveryClaim: null,
+		});
+		if (capture.kind === "replan") {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		if (capture.kind === "deferred") {
+			return {
+				kind: "deferred",
+				reason: capture.reason === "transitioning"
+					? "host-candidate-missing"
+					: "authority-blocked",
+			};
+		}
+		const snapshot = capture.snapshot;
+		const planId = this.editorAuthorityAdmission.nextId("target-presentation-plan");
+		const presentationPermitId = this.editorAuthorityAdmission.nextId(
+			"target-presentation-permit",
+		);
+		const freshnessHandleId = this.editorAuthorityAdmission.issueFreshness(
+			null,
+			() => this.isEditorAdmissionAuthorityCurrent(snapshot),
+		);
+		const plan: TargetPresentationPlan = Object.freeze({
+			planId,
+			hostLoadTokenId: request.candidate.hostLoadTokenId,
+			switchIntentSeq: request.switchIntentSeq,
+			authorityFreshnessHandleId: freshnessHandleId,
+			expectedNativeHistoryEpoch: request.candidate.nativeHistoryEpochBefore,
+			presentationPermitId,
+		});
+		const permitContext: TargetPresentationPermitContext = Object.freeze({
+			presentationPlanId: planId,
+			authorityFreshnessHandleId: freshnessHandleId,
+			sessionId: request.sessionId,
+			leafId: request.leafId,
+			handoffGeneration: request.handoffGeneration,
+			switchIntentSeq: request.switchIntentSeq,
+			targetPath: request.targetPath,
+			targetFile: request.targetFile,
+			hostLoadTokenId: request.candidate.hostLoadTokenId,
+			candidate: request.candidate,
+			openEditorTicket: request.openEditorTicket,
+		});
+		this.editorAuthorityAdmission.issuePresentationPermit(
+			presentationPermitId,
+			permitContext,
+		);
+		const record: TargetPresentationPlanRecord = {
+			request,
+			plan,
+			snapshot,
+			presentationPermitId,
+			completion: null,
+		};
+		this.trimEditorAdmissionMap(this.targetPresentationPlans);
+		this.trimEditorAdmissionMap(this.targetPresentationPlanByHostToken);
+		this.targetPresentationPlans.set(planId, record);
+		this.targetPresentationPlanByHostToken.set(request.candidate.hostLoadTokenId, record);
+		return { kind: "planned", plan };
+	}
+
+	private async finishTargetPresentation(
+		receipt: HostLoadCompletionReceipt,
+	): Promise<TargetPresentationResult> {
+		const record = this.targetPresentationPlanByHostToken.get(receipt.hostLoadTokenId);
+		if (!record || !this.isHostLoadReceiptStructurallyValid(record, receipt)) {
+			this.deps.trace("reconcile", "target-presentation-completion-replan", {
+				stage: "receipt-structure",
+				recordPresent: record !== undefined,
+			});
+			return { kind: "replan", reason: "presentation-changed" };
+		}
+		if (!this.editorAuthorityAdmission.isPresentationPermitConsumed(
+			record.presentationPermitId,
+		)) {
+			this.deps.trace("reconcile", "target-presentation-completion-replan", {
+				stage: "permit-not-consumed",
+			});
+			return { kind: "replan", reason: "presentation-changed" };
+		}
+		if (record.completion) return record.completion;
+		const currentTicket = this.captureCurrentAdmissionTicket(
+			record.request.targetPath,
+		);
+		if (!currentTicket) {
+			this.deps.trace("reconcile", "target-presentation-completion-replan", {
+				stage: "current-ticket-missing",
+			});
+			return { kind: "replan", reason: "presentation-changed" };
+		}
+		const capture = await this.captureEditorAdmissionAuthority({
+			sessionId: record.request.sessionId,
+			leafId: record.request.leafId,
+			handoffGeneration: record.request.handoffGeneration,
+			switchIntentSeq: record.request.switchIntentSeq,
+			targetPath: record.request.targetPath,
+			targetFile: record.request.targetFile,
+			presentation: "target-candidate",
+			hostLoadTokenId: record.request.candidate.hostLoadTokenId,
+			openEditorTicket: currentTicket,
+			expectedContent: record.request.candidate.incomingContent,
+			admissionReason: "open-editor-missing-target",
+			recoveryClaim: null,
+		});
+		if (capture.kind !== "ready") {
+			this.deps.trace("reconcile", "target-presentation-completion-replan", {
+				stage: "authority-capture",
+				captureKind: capture.kind,
+				captureReason: capture.reason,
+			});
+			return {
+				kind: "replan",
+				reason: capture.kind === "replan"
+					? "authority-changed"
+					: "presentation-changed",
+			};
+		}
+		const snapshot = capture.snapshot;
+		const primary = this.getAdmissionPrimaryTicket(
+			snapshot.openEditorTicket,
+			record.request.leafId,
+		);
+		if (
+			!primary
+			|| primary.cm !== record.request.candidate.cm
+			|| primary.editorDocument !== record.request.candidate.cm.state.doc
+			|| primary.editorContent !== record.request.candidate.incomingContent
+			|| primary.editorRevision
+				!== record.request.candidate.editorRevisionBefore + 1
+			|| primary.selectionEpoch !== receipt.targetSelectionEpoch
+			|| primary.scrollEpoch !== receipt.targetScrollEpoch
+		) {
+			this.deps.trace("reconcile", "target-presentation-completion-replan", {
+				stage: "primary-ticket",
+				primaryPresent: primary !== null,
+				cmIdentityMatches: primary?.cm === record.request.candidate.cm,
+				documentIdentityMatches:
+					primary?.editorDocument === record.request.candidate.cm.state.doc,
+				contentMatches:
+					primary?.editorContent === record.request.candidate.incomingContent,
+				editorRevision: primary?.editorRevision ?? null,
+				expectedEditorRevision:
+					record.request.candidate.editorRevisionBefore + 1,
+				selectionEpoch: primary?.selectionEpoch ?? null,
+				expectedSelectionEpoch: receipt.targetSelectionEpoch,
+				scrollEpoch: primary?.scrollEpoch ?? null,
+				expectedScrollEpoch: receipt.targetScrollEpoch,
+			});
+			return { kind: "replan", reason: "presentation-changed" };
+		}
+		const ready = this.buildTargetReadyRecord(
+			snapshot,
+			receipt,
+			record.request.candidate,
+		);
+		if (!ready) return { kind: "replan", reason: "authority-changed" };
+		const presentationReceipt: TargetPresentationReceipt = Object.freeze({
+			receiptId: this.editorAuthorityAdmission.nextId("target-presentation-receipt"),
+			presentationPlanId: record.plan.planId,
+			hostLoadCompletionReceipt: receipt,
+			replacementTargetReadyToken: ready.token,
+		});
+		const result: TargetPresentationResult = Object.freeze({
+			kind: "accepted",
+			receipt: presentationReceipt,
+		});
+		record.completion = result;
+		this.publishTargetReadyRecord(ready);
+		return result;
+	}
+
+	private async commitMissingTargetSeed(
+		record: MissingTargetSeedPlanRecord,
+	): Promise<MissingTargetSeedResult> {
+		if (record.inFlight || record.result !== null) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		record.inFlight = true;
+		try {
+			if (
+				!this.editorAuthorityAdmission.isOpaqueFreshnessCurrent(
+					record.plan.authorityFreshnessHandleId,
+				)
+				|| !this.isMissingTargetSeedAnchorCurrent(record)
+			) {
+				return this.finishMissingTargetSeedRecord(record, {
+					kind: "replan",
+					reason: "authority-changed",
+				});
+			}
+			const stableRead = await this.readStableMarkdownFile(
+				record.snapshot.path,
+				"modify",
+				record.snapshot.file,
+			);
+			if (
+				stableRead.kind !== "ready"
+				|| stableRead.file !== record.snapshot.file
+				|| stableRead.content !== record.snapshot.diskContent
+				|| !this.isEditorAdmissionAuthorityCurrent(record.snapshot)
+				|| !this.isMissingTargetSeedAnchorCurrent(record)
+			) {
+				return this.finishMissingTargetSeedRecord(record, {
+					kind: "replan",
+					reason: "authority-changed",
+				});
+			}
+			if (!this.editorAuthorityAdmission.consumeSeedPermit(
+				record.plan.seedPermitId,
+				record.plan.planId,
+			)) {
+				return this.finishMissingTargetSeedRecord(record, {
+					kind: "replan",
+					reason: "authority-changed",
+				});
+			}
+			const vaultSync = this.deps.getVaultSync();
+			if (!vaultSync || vaultSync !== record.snapshot.vaultSync) {
+				return this.finishMissingTargetSeedRecord(record, {
+					kind: "replan",
+					reason: "authority-changed",
+				});
+			}
+			const ensureResult = vaultSync.ensureFile(
+				record.snapshot.path,
+				record.snapshot.diskContent,
+				this.deps.getSettings().deviceName,
+				{
+					reviveTombstone: false,
+					reviveReason: "open-editor-missing-target",
+					canCreate: () =>
+						this.isEditorAdmissionAuthorityCurrent(record.snapshot)
+						&& this.isMissingTargetSeedAnchorCurrent(record),
+				},
+			);
+			if (ensureResult.kind === "blocked") {
+				return this.finishMissingTargetSeedRecord(record, ensureResult);
+			}
+			if (ensureResult.kind === "replan") {
+				return this.finishMissingTargetSeedRecord(record, {
+					kind: "replan",
+					reason: "active-set-changed",
+				});
+			}
+			if (!this.isMissingTargetSeedAnchorCurrent(record)) {
+				return this.finishMissingTargetSeedRecord(record, {
+					kind: "replan",
+					reason: "authority-changed",
+				});
+			}
+			const activeAuthority = this.editorAuthorityAdmission.captureActivePathAuthority(
+				vaultSync,
+				record.snapshot.path,
+			);
+			if (
+				activeAuthority.activeFileIds.length !== 1
+				|| activeAuthority.fileId !== ensureResult.fileId
+				|| activeAuthority.ytext !== ensureResult.ytext
+				|| activeAuthority.ytextContent !== record.snapshot.diskContent
+			) {
+				return this.finishMissingTargetSeedRecord(record, {
+					kind: "replan",
+					reason: "active-set-changed",
+				});
+			}
+			const postSeedSnapshot: EditorAdmissionAuthoritySnapshot = Object.freeze({
+				...record.snapshot,
+				activeAuthority,
+			});
+			if (
+				!this.isEditorAdmissionAuthorityCurrent(postSeedSnapshot)
+				|| !this.isMissingTargetSeedAnchorCurrent(record)
+			) {
+				return this.finishMissingTargetSeedRecord(record, {
+					kind: "replan",
+					reason: "authority-changed",
+				});
+			}
+			const ready = this.buildTargetReadyRecord(
+				postSeedSnapshot,
+				record.anchor.hostReceipt,
+				record.anchor.candidate,
+			);
+			if (!ready || ready.token.targetAuthority.kind !== "existing") {
+				return this.finishMissingTargetSeedRecord(record, {
+					kind: "replan",
+					reason: "authority-changed",
+				});
+			}
+			if (
+				!this.isEditorAdmissionAuthorityCurrent(postSeedSnapshot)
+				|| !this.isMissingTargetSeedAnchorCurrent(record)
+			) {
+				this.editorAuthorityAdmission.invalidateFreshness(
+					ready.token.authorityFreshnessHandleId,
+				);
+				return this.finishMissingTargetSeedRecord(record, {
+					kind: "replan",
+					reason: "authority-changed",
+				});
+			}
+			const receipt: MissingTargetSeedReceipt = Object.freeze({
+				receiptId: this.editorAuthorityAdmission.nextId("missing-target-seed-receipt"),
+				seedPlanId: record.plan.planId,
+				seededFileId: ensureResult.fileId,
+				seededYtextIdentity: ready.token.targetAuthority.ytextIdentity,
+				seededMutationEpoch: ready.token.targetAuthority.ytextMutationEpoch,
+				certifiedBaseHash: record.snapshot.certifiedBaseHash,
+				replacementTargetReadyToken: ready.token as TargetReadyToken & Readonly<{
+					targetAuthority: Extract<
+						TargetReadyToken["targetAuthority"],
+						{ kind: "existing" }
+					>;
+				}>,
+			});
+			this.publishTargetReadyRecord(ready);
+			const seededResult = this.finishMissingTargetSeedRecord(record, {
+				kind: "seeded",
+				receipt,
+			});
+			try {
+				this.deps.validateOpenEditorBindings("open-path-admission-seeded");
+			} catch (error) {
+				this.deps.trace("reconcile", "open-path-admission-wakeup-failed", {
+					path: record.snapshot.path,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			return seededResult;
+		} finally {
+			record.inFlight = false;
+		}
+	}
+
+	private finishMissingTargetSeedRecord(
+		record: MissingTargetSeedPlanRecord,
+		result: MissingTargetSeedResult,
+	): MissingTargetSeedResult {
+		record.result = Object.freeze(result);
+		return record.result;
+	}
+
+	private isMissingTargetSeedAnchorCurrent(
+		record: MissingTargetSeedPlanRecord,
+	): boolean {
+		return this.targetReadyBySession.get(this.editorAdmissionSessionKey(
+			record.anchor.token.sessionId,
+			record.anchor.token.leafId,
+			record.anchor.token.handoffGeneration,
+			record.anchor.token.targetPath,
+		)) === record.anchor;
+	}
+
+	private async captureEditorAdmissionAuthority(input: Readonly<{
+		sessionId: string;
+		leafId: string;
+		handoffGeneration: number;
+		switchIntentSeq: number;
+		targetPath: string;
+		targetFile: TFile;
+		presentation: "target-candidate" | "target-proven";
+		hostLoadTokenId: string | null;
+		openEditorTicket: OpenEditorMutationTicket;
+		expectedContent: string;
+		admissionReason:
+			| "open-editor-missing-target"
+			| "handoff-replay-target-bind";
+		recoveryClaim: HandoffReplayRecoveryClaim | null;
+	}>): Promise<EditorAdmissionCaptureResult> {
+		const authorityStartLifecycleGeneration = this.lifecycleGeneration;
+		const authorityStartVaultSync = this.deps.getVaultSync();
+		if (!this.editorAuthorityAdmissionOpen || !authorityStartVaultSync) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		const earlyPolicy = this.getEditorAdmissionPolicyBlock(
+			input.targetPath,
+			authorityStartVaultSync,
+		);
+		if (earlyPolicy) return earlyPolicy;
+		if (
+			input.targetFile.path !== input.targetPath
+			|| this.deps.app.vault.getAbstractFileByPath(input.targetPath) !== input.targetFile
+		) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		const openFileViews = getOpenFileViewsForPath(
+			this.deps.app.workspace as Parameters<typeof getOpenFileViewsForPath>[0],
+			input.targetPath,
+		);
+		const openMarkdownViews = this.getOpenMarkdownViewsForPath(input.targetPath);
+		if (
+			openFileViews.length !== openMarkdownViews.length
+			|| input.openEditorTicket.views.length !== openMarkdownViews.length
+			|| (input.presentation === "target-candidate" && openMarkdownViews.length !== 1)
+		) {
+			return { kind: "deferred", reason: "multiple-authorities" };
+		}
+		const editorBindings = this.deps.getEditorBindings();
+		const ticketValidation = editorBindings?.validateOpenEditorMutationTicket?.(
+			input.openEditorTicket,
+			openMarkdownViews,
+		);
+		if (!ticketValidation?.current) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		const primary = this.getAdmissionPrimaryTicket(input.openEditorTicket, input.leafId);
+		if (
+			!primary
+			|| primary.sessionId !== input.sessionId
+			|| primary.handoffGeneration !== input.handoffGeneration
+			|| primary.switchIntentSeq !== input.switchIntentSeq
+			|| primary.targetFile !== input.targetFile
+			|| primary.handoffPresentation !== input.presentation
+			|| primary.pendingHostLoadTokenId !== input.hostLoadTokenId
+			|| primary.editorContent === null
+		) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		if (
+			input.presentation === "target-proven"
+			&& (
+				input.admissionReason === "handoff-replay-target-bind"
+					? (
+						input.recoveryClaim === null
+						|| input.openEditorTicket.views.length !== 1
+						|| !this.isExactRecoveryAdmissionViewTicket(
+							primary,
+							input.recoveryClaim,
+							input.expectedContent,
+						)
+					)
+					: (
+						!this.isTargetProvenIntentSettled(primary.intentStateKind)
+						|| input.openEditorTicket.views.some((view) =>
+							view.targetFile !== input.targetFile
+								|| view.handoffPresentation !== "target-proven"
+								|| view.pendingHostLoadTokenId !== null
+								|| view.editorContent !== input.expectedContent
+								|| !this.isTargetProvenIntentSettled(view.intentStateKind)
+						)
+					)
+			)
+		) {
+			return { kind: "deferred", reason: "transitioning" };
+		}
+
+		const stableRead = await this.readStableMarkdownFile(
+			input.targetPath,
+			"modify",
+			input.targetFile,
+		);
+		if (stableRead.kind === "unstable") {
+			return { kind: "deferred", reason: "unstable" };
+		}
+		if (
+			stableRead.kind !== "ready"
+			|| !this.editorAuthorityAdmissionOpen
+			|| this.lifecycleGeneration !== authorityStartLifecycleGeneration
+			|| this.deps.getVaultSync() !== authorityStartVaultSync
+			|| stableRead.file !== input.targetFile
+			|| stableRead.file.path !== input.targetPath
+			|| this.deps.app.vault.getAbstractFileByPath(input.targetPath) !== input.targetFile
+		) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		if (stableRead.content !== input.expectedContent) {
+			return { kind: "deferred", reason: "unstable" };
+		}
+		const latePolicy = this.getEditorAdmissionPolicyBlock(
+			input.targetPath,
+			authorityStartVaultSync,
+		);
+		if (latePolicy) return latePolicy;
+		const vaultSync = authorityStartVaultSync;
+		const activeAuthority = this.editorAuthorityAdmission.captureActivePathAuthority(
+			vaultSync,
+			input.targetPath,
+		);
+		if (activeAuthority.activeFileIds.length > 1) {
+			return { kind: "deferred", reason: "multiple-authorities" };
+		}
+		if (
+			(activeAuthority.activeFileIds.length === 1
+				&& (
+					!activeAuthority.ytext
+					|| !activeAuthority.fileId
+					|| activeAuthority.activeFileIds[0] !== activeAuthority.fileId
+				))
+			|| (activeAuthority.activeFileIds.length === 0
+				&& (activeAuthority.ytext !== null || activeAuthority.fileId !== null))
+		) {
+			return { kind: "deferred", reason: "multiple-authorities" };
+		}
+		if (
+			activeAuthority.ytextContent !== null
+			&& activeAuthority.ytextContent !== stableRead.content
+		) {
+			return { kind: "deferred", reason: "unstable" };
+		}
+		if (this.deps.shouldBlockFrontmatterIngest(
+			input.targetPath,
+			activeAuthority.ytextContent,
+			stableRead.content,
+			"open-editor-missing-target",
+		)) {
+			return { kind: "deferred", reason: "frontmatter" };
+		}
+		const fileStat = this.captureEditorAdmissionFileStat(input.targetFile);
+		if (
+			stableRead.stat !== null
+			&& (
+				fileStat.mtime !== stableRead.stat.mtime
+				|| fileStat.size !== stableRead.stat.size
+			)
+		) {
+			return { kind: "replan", reason: "authority-changed" };
+		}
+		const snapshot: EditorAdmissionAuthoritySnapshot = Object.freeze({
+			lifecycleGeneration: authorityStartLifecycleGeneration,
+			vaultSync,
+			path: input.targetPath,
+			file: input.targetFile,
+			fileStat,
+			diskContent: stableRead.content,
+			certifiedBaseHash: await contentBaselineHash(stableRead.content),
+			diskRevision: this.getMarkdownDiskRevision(input.targetPath),
+			baselineHash: this.deps.getDiskIndex()[input.targetPath]?.contentHash ?? null,
+			baselineRevision: this.diskBaselineRevisions.get(input.targetPath) ?? 0,
+			attentionGeneration: this.deps.getMarkdownAttentionGeneration?.() ?? 0,
+			syncScopeGeneration: this.deps.getMarkdownSyncScopeGeneration?.() ?? 0,
+			openEditorTicket: input.openEditorTicket,
+			openFileViews: Object.freeze([...openFileViews]),
+			activeAuthority,
+			sessionId: input.sessionId,
+			leafId: input.leafId,
+			handoffGeneration: input.handoffGeneration,
+			switchIntentSeq: input.switchIntentSeq,
+			admissionReason: input.admissionReason,
+			recoveryClaim: input.recoveryClaim,
+			presentation: input.presentation,
+			hostLoadTokenId: input.hostLoadTokenId,
+			expectedEditorContent: input.expectedContent,
+			requiresRemoteProjection: false,
+		});
+		return this.isEditorAdmissionAuthorityCurrent(snapshot)
+			? { kind: "ready", snapshot }
+			: { kind: "replan", reason: "authority-changed" };
+	}
+
+	private getEditorAdmissionPolicyBlock(
+		path: string,
+		vaultSync = this.deps.getVaultSync(),
+	): Extract<EditorAdmissionCaptureResult, { kind: "deferred" }> | null {
+		if (!this.deps.isMarkdownPathSyncable(path)) {
+			return { kind: "deferred", reason: "unstable" };
+		}
+		if (this.isMarkdownPreservedUnresolved(path)) {
+			return { kind: "deferred", reason: "attention" };
+		}
+		if (vaultSync?.isPendingRenameTarget(path)) {
+			return { kind: "deferred", reason: "unstable" };
+		}
+		if (vaultSync && this.isEditorAdmissionHardTombstone(vaultSync, path)) {
+			return { kind: "deferred", reason: "tombstone" };
+		}
+		return null;
+	}
+
+	private isEditorAdmissionHardTombstone(
+		vaultSync: VaultSync,
+		path: string,
+	): boolean {
+		return (
+			vaultSync.isMarkdownTombstoned(path)
+			&& vaultSync.getActiveFileIdsForPath(path).length === 0
+			&& !vaultSync.isPendingRenameTarget(path)
+		);
+	}
+
+	private captureEditorAdmissionFileStat(file: TFile): Readonly<{
+		ctime: number | null;
+		mtime: number | null;
+		size: number | null;
+	}> {
+		return Object.freeze({
+			ctime: typeof file.stat?.ctime === "number" ? file.stat.ctime : null,
+			mtime: typeof file.stat?.mtime === "number" ? file.stat.mtime : null,
+			size: typeof file.stat?.size === "number" ? file.stat.size : null,
+		});
+	}
+
+	private isEditorAdmissionAuthorityCurrent(
+		snapshot: EditorAdmissionAuthoritySnapshot,
+		options: Readonly<{
+			allowTargetPresentedTransition?: boolean;
+			receipt?: HostLoadCompletionReceipt;
+			candidate?: PendingHostLoadCandidate;
+			recoveryPostBind?: Readonly<{
+				targetReadyToken: TargetReadyToken;
+				claim: HandoffReplayRecoveryClaim;
+			}>;
+		}> = {},
+	): boolean {
+		if (
+			!this.editorAuthorityAdmissionOpen
+			|| this.lifecycleGeneration !== snapshot.lifecycleGeneration
+			|| this.deps.getVaultSync() !== snapshot.vaultSync
+			|| snapshot.file.path !== snapshot.path
+			|| this.deps.app.vault.getAbstractFileByPath(snapshot.path) !== snapshot.file
+			|| !this.sameEditorAdmissionFileStat(
+				this.captureEditorAdmissionFileStat(snapshot.file),
+				snapshot.fileStat,
+			)
+			|| this.getMarkdownDiskRevision(snapshot.path) !== snapshot.diskRevision
+			|| (this.deps.getDiskIndex()[snapshot.path]?.contentHash ?? null)
+				!== snapshot.baselineHash
+			|| (this.diskBaselineRevisions.get(snapshot.path) ?? 0)
+				!== snapshot.baselineRevision
+			|| (this.deps.getMarkdownAttentionGeneration?.() ?? 0)
+				!== snapshot.attentionGeneration
+			|| (this.deps.getMarkdownSyncScopeGeneration?.() ?? 0)
+				!== snapshot.syncScopeGeneration
+			|| !this.deps.isMarkdownPathSyncable(snapshot.path)
+			|| this.isMarkdownPreservedUnresolved(snapshot.path)
+			|| snapshot.vaultSync.isPendingRenameTarget(snapshot.path)
+			|| this.isEditorAdmissionHardTombstone(snapshot.vaultSync, snapshot.path)
+			|| (snapshot.requiresRemoteProjection
+				&& !(this.deps.isRemoteProjectionAllowed?.(snapshot.path) ?? true))
+		) return false;
+		const currentOpenFileViews = getOpenFileViewsForPath(
+			this.deps.app.workspace as Parameters<typeof getOpenFileViewsForPath>[0],
+			snapshot.path,
+		);
+		if (
+			currentOpenFileViews.length !== snapshot.openFileViews.length
+			|| currentOpenFileViews.some((view) => !snapshot.openFileViews.includes(view))
+		) return false;
+		const currentActive = this.editorAuthorityAdmission.captureActivePathAuthority(
+			snapshot.vaultSync,
+			snapshot.path,
+		);
+		if (!this.sameActivePathAuthority(currentActive, snapshot.activeAuthority)) return false;
+		if (this.deps.shouldBlockFrontmatterIngest(
+			snapshot.path,
+			currentActive.ytextContent,
+			snapshot.diskContent,
+			"open-editor-missing-target",
+		)) return false;
+		const openMarkdownViews = this.getOpenMarkdownViewsForPath(snapshot.path);
+		const validation = this.deps.getEditorBindings()?.validateOpenEditorMutationTicket?.(
+			snapshot.openEditorTicket,
+			openMarkdownViews,
+		);
+		if (validation?.current) {
+			if (snapshot.admissionReason !== "handoff-replay-target-bind") return true;
+			const primary = this.getAdmissionPrimaryTicket(
+				snapshot.openEditorTicket,
+				snapshot.leafId,
+			);
+			return snapshot.recoveryClaim !== null
+				&& primary !== null
+				&& this.isExactRecoveryAdmissionViewTicket(
+					primary,
+					snapshot.recoveryClaim,
+					snapshot.expectedEditorContent,
+				);
+		}
+		const targetPresentedTransitionCurrent = options.allowTargetPresentedTransition === true
+			&& !!options.receipt
+			&& !!options.candidate
+			&& this.isTargetPresentedTicketTransitionCurrent(
+				snapshot,
+				options.receipt,
+				options.candidate,
+				openMarkdownViews,
+			);
+		if (targetPresentedTransitionCurrent) return true;
+		return snapshot.admissionReason === "handoff-replay-target-bind"
+			&& !!options.receipt
+			&& !!options.candidate
+			&& !!options.recoveryPostBind
+			&& this.isExactRecoveryPostBindAuthorityCurrent(
+				snapshot,
+				options.receipt,
+				options.candidate,
+				options.recoveryPostBind.targetReadyToken,
+				options.recoveryPostBind.claim,
+			);
+	}
+
+	private isExactRecoveryPostBindAuthorityCurrent(
+		snapshot: EditorAdmissionAuthoritySnapshot,
+		hostReceipt: HostLoadCompletionReceipt,
+		candidate: PendingHostLoadCandidate,
+		targetReadyToken: TargetReadyToken,
+		claim: HandoffReplayRecoveryClaim,
+	): boolean {
+		if (
+			snapshot.recoveryClaim === null
+			|| !this.sameHandoffReplayRecoveryClaim(snapshot.recoveryClaim, claim)
+			|| targetReadyToken.sessionId !== snapshot.sessionId
+			|| targetReadyToken.leafId !== snapshot.leafId
+			|| targetReadyToken.handoffGeneration !== snapshot.handoffGeneration
+			|| targetReadyToken.switchIntentSeq !== snapshot.switchIntentSeq
+			|| targetReadyToken.targetPath !== snapshot.path
+			|| targetReadyToken.targetFile !== snapshot.file
+			|| targetReadyToken.hostLoadTokenId !== candidate.hostLoadTokenId
+			|| targetReadyToken.hostLoadReceiptId !== hostReceipt.receiptId
+			|| targetReadyToken.targetAuthority.kind !== "existing"
+		) return false;
+		const primary = this.getAdmissionPrimaryTicket(
+			snapshot.openEditorTicket,
+			snapshot.leafId,
+		);
+		const active = snapshot.activeAuthority;
+		if (
+			!primary?.cm
+			|| !active.fileId
+			|| !active.ytext
+			|| !active.ytextIdentity
+			|| targetReadyToken.targetAuthority.fileId !== active.fileId
+			|| targetReadyToken.targetAuthority.ytextIdentity !== active.ytextIdentity
+			|| targetReadyToken.targetAuthority.ytextMutationEpoch
+				!== active.ytextMutationEpoch
+		) return false;
+		const editorBindings = this.deps.getEditorBindings();
+		const request = Object.freeze({
+			sessionId: snapshot.sessionId,
+			expectedGeneration: snapshot.handoffGeneration,
+			recoveryOperationEpoch: claim.recoveryOperationEpoch,
+			recoveryClaim: Object.freeze({
+				intentId: claim.intentId,
+				recordId: claim.recordId,
+			}),
+			targetReadyToken,
+		});
+		const captured = editorBindings?.captureHandoffReplayTargetSnapshot?.(request);
+		if (captured?.kind !== "ready") return false;
+		const current = captured.snapshot;
+		return current.sessionId === snapshot.sessionId
+			&& current.leafId === snapshot.leafId
+			&& current.handoffGeneration === snapshot.handoffGeneration
+			&& current.recoveryOperationEpoch === claim.recoveryOperationEpoch
+			&& current.targetReadyTokenId === targetReadyToken.tokenId
+			&& current.hostLoadTokenId === targetReadyToken.hostLoadTokenId
+			&& current.hostLoadReceiptId === targetReadyToken.hostLoadReceiptId
+			&& current.targetPath === snapshot.path
+			&& current.targetFile === snapshot.file
+			&& current.targetFileId === active.fileId
+			&& current.cm === primary.cm
+			&& current.ytext === active.ytext
+			&& current.ytextIdentity === active.ytextIdentity
+			&& current.ytextMutationEpoch === active.ytextMutationEpoch
+			&& current.bindingEpoch === primary.bindingEpoch + 1
+			&& current.editorRevision === primary.editorRevision
+			&& current.nativeHistoryEpoch === hostReceipt.nativeHistoryEpoch
+			&& current.selectionEpoch === hostReceipt.targetSelectionEpoch
+			&& current.scrollEpoch === hostReceipt.targetScrollEpoch
+			&& current.selection.eq(hostReceipt.targetSelection)
+			&& current.cmDocument === primary.editorDocument
+			&& current.editorFacadeContent === snapshot.expectedEditorContent
+			&& current.runtimeCacheContent === snapshot.expectedEditorContent
+			&& current.ytextContent === snapshot.expectedEditorContent;
+	}
+
+	private isTargetPresentedTicketTransitionCurrent(
+		snapshot: EditorAdmissionAuthoritySnapshot,
+		receipt: HostLoadCompletionReceipt,
+		candidate: PendingHostLoadCandidate,
+		openMarkdownViews: readonly MarkdownView[],
+	): boolean {
+		const currentTicket = this.deps.getEditorBindings()?.captureOpenEditorMutationTicket?.(
+			snapshot.path,
+			openMarkdownViews,
+		) ?? null;
+		if (!currentTicket) return false;
+		const validation = this.deps.getEditorBindings()?.validateOpenEditorMutationTicket?.(
+			currentTicket,
+			openMarkdownViews,
+		);
+		if (!validation?.current || currentTicket.views.length !== snapshot.openEditorTicket.views.length) {
+			return false;
+		}
+		const previous = this.getAdmissionPrimaryTicket(
+			snapshot.openEditorTicket,
+			snapshot.leafId,
+		);
+		const current = this.getAdmissionPrimaryTicket(currentTicket, snapshot.leafId);
+		if (!previous || !current) return false;
+		return currentTicket.path === snapshot.path
+			&& current.sessionId === snapshot.sessionId
+			&& current.handoffGeneration === snapshot.handoffGeneration
+			&& current.switchIntentSeq === snapshot.switchIntentSeq
+			&& current.targetFile === snapshot.file
+			&& current.displayedFile === snapshot.file
+			&& current.displayedPath === snapshot.path
+			&& current.stableTargetIdentityProven
+			&& current.handoffPresentation === "target-proven"
+			&& current.pendingHostLoadTokenId === null
+			&& this.isTargetProvenIntentSettled(current.intentStateKind)
+			&& current.cm === candidate.cm
+			&& current.cm === previous.cm
+			&& current.bindingEpoch === previous.bindingEpoch
+			&& current.editorRevision === previous.editorRevision
+			&& current.editorDocument === candidate.cm.state.doc
+			&& current.editorContent === snapshot.expectedEditorContent
+			&& current.nativeHistoryEpoch === receipt.nativeHistoryEpoch
+			&& current.selectionEpoch === receipt.targetSelectionEpoch
+			&& current.scrollEpoch === receipt.targetScrollEpoch
+			&& currentTicket.views.every((view) =>
+				view.targetFile === snapshot.file
+				&& view.handoffPresentation === "target-proven"
+				&& view.pendingHostLoadTokenId === null
+				&& view.editorContent === snapshot.expectedEditorContent
+				&& this.isTargetProvenIntentSettled(view.intentStateKind)
+			);
+	}
+
+	private buildTargetReadyRecord(
+		snapshot: EditorAdmissionAuthoritySnapshot,
+		hostReceipt: HostLoadCompletionReceipt,
+		candidate: PendingHostLoadCandidate,
+	): TargetReadyRecord | null {
+		const primary = this.getAdmissionPrimaryTicket(snapshot.openEditorTicket, snapshot.leafId);
+		if (
+			!primary
+			|| !primary.cm
+			|| primary.editorContent !== snapshot.expectedEditorContent
+			// The first presentation receipt must certify the exact held host load.
+			// A later target-proven admission may instead certify a current B
+			// successor after its exact bytes have settled to disk (and, when
+			// present, Y.Text). The original candidate/receipt still proves path
+			// lineage; it is no longer the content authority for that later pass.
+			|| (
+				snapshot.presentation === "target-candidate"
+				&& candidate.incomingContent !== snapshot.expectedEditorContent
+			)
+			|| hostReceipt.hostLoadTokenId !== candidate.hostLoadTokenId
+		) return null;
+		const tokenId = this.editorAuthorityAdmission.nextId("target-ready-token");
+		const context: AuthorityFreshnessContext = Object.freeze({
+			sessionId: snapshot.sessionId,
+			leafId: snapshot.leafId,
+			handoffGeneration: snapshot.handoffGeneration,
+			targetReadyTokenId: tokenId,
+			targetFile: snapshot.file,
+			hostLoadReceiptId: hostReceipt.receiptId,
+			cm: primary.cm,
+			editorRevision: primary.editorRevision,
+			nativeHistoryEpoch: hostReceipt.nativeHistoryEpoch,
+			selectionEpoch: hostReceipt.targetSelectionEpoch,
+			scrollEpoch: hostReceipt.targetScrollEpoch,
+		});
+		let issuedToken: TargetReadyToken | null = null;
+		const freshnessHandleId = this.editorAuthorityAdmission.issueFreshness(
+			context,
+			() => this.isEditorAdmissionAuthorityCurrent(snapshot, {
+				allowTargetPresentedTransition: true,
+				receipt: hostReceipt,
+				candidate,
+				recoveryPostBind:
+					snapshot.admissionReason === "handoff-replay-target-bind"
+						&& snapshot.recoveryClaim !== null
+						&& issuedToken !== null
+						? {
+							targetReadyToken: issuedToken,
+							claim: snapshot.recoveryClaim,
+						}
+						: undefined,
+			}),
+		);
+		const active = snapshot.activeAuthority;
+		let targetAuthority: TargetReadyToken["targetAuthority"];
+		if (active.ytext) {
+			if (
+				active.activeFileIds.length !== 1
+				|| !active.fileId
+				|| !active.ytextIdentity
+				|| active.ytextContent !== snapshot.expectedEditorContent
+			) {
+				this.editorAuthorityAdmission.invalidateFreshness(freshnessHandleId);
+				return null;
+			}
+			const bindPermitId = this.editorAuthorityAdmission.nextId("bind-permit");
+			targetAuthority = Object.freeze({
+				kind: "existing",
+				fileId: active.fileId,
+				ytextIdentity: active.ytextIdentity,
+				ytextMutationEpoch: active.ytextMutationEpoch,
+				bindPermitId,
+			});
+			const bindContext: BindPermitContext = Object.freeze({
+				...context,
+				fileId: active.fileId,
+				ytext: active.ytext,
+				ytextIdentity: active.ytextIdentity,
+				ytextMutationEpoch: active.ytextMutationEpoch,
+				bindingEpoch: primary.bindingEpoch,
+			});
+			this.editorAuthorityAdmission.issueBindPermit(
+				bindPermitId,
+				freshnessHandleId,
+				bindContext,
+			);
+		} else {
+			if (active.activeFileIds.length !== 0 || active.fileId !== null) {
+				this.editorAuthorityAdmission.invalidateFreshness(freshnessHandleId);
+				return null;
+			}
+			targetAuthority = Object.freeze({
+				kind: "missing",
+				activeIdSetEpoch: active.activeSetEpoch,
+			});
+		}
+		const token: TargetReadyToken = Object.freeze({
+			tokenId,
+			sessionId: snapshot.sessionId,
+			authorityFreshnessHandleId: freshnessHandleId,
+			authorityFingerprint: this.editorAuthorityAdmission.nextId("authority-fingerprint"),
+			controllerLifecycleGeneration: snapshot.lifecycleGeneration,
+			leafId: snapshot.leafId,
+			handoffGeneration: snapshot.handoffGeneration,
+			switchIntentSeq: snapshot.switchIntentSeq,
+			targetPath: snapshot.path,
+			targetFile: snapshot.file,
+			targetAuthority,
+			hostLoadTokenId: candidate.hostLoadTokenId,
+			hostLoadCompletedEpoch: hostReceipt.nativeHistoryEpoch,
+			hostLoadReceiptId: hostReceipt.receiptId,
+			nativeHistoryEpoch: hostReceipt.nativeHistoryEpoch,
+			targetSelectionEpoch: hostReceipt.targetSelectionEpoch,
+			targetScrollEpoch: hostReceipt.targetScrollEpoch,
+			certifiedBaseContent: snapshot.expectedEditorContent,
+			certifiedBaseHash: snapshot.certifiedBaseHash,
+			openEditorTicketId: this.editorAuthorityAdmission.getTicketId(
+				snapshot.openEditorTicket,
+			),
+		});
+		issuedToken = token;
+		return Object.freeze({ token, context, snapshot, hostReceipt, candidate });
+	}
+
+	private sameEditorAdmissionFileStat(
+		left: EditorAdmissionAuthoritySnapshot["fileStat"],
+		right: EditorAdmissionAuthoritySnapshot["fileStat"],
+	): boolean {
+		return left.ctime === right.ctime
+			&& left.mtime === right.mtime
+			&& left.size === right.size;
+	}
+
+	private sameActivePathAuthority(
+		left: ActivePathAuthoritySnapshot,
+		right: ActivePathAuthoritySnapshot,
+	): boolean {
+		return left.activeSetEpoch === right.activeSetEpoch
+			&& left.activeFileIds.length === right.activeFileIds.length
+			&& left.activeFileIds.every((fileId, index) => fileId === right.activeFileIds[index])
+			&& left.fileId === right.fileId
+			&& left.ytext === right.ytext
+			&& left.ytextIdentity === right.ytextIdentity
+			&& left.ytextMutationEpoch === right.ytextMutationEpoch
+			&& left.ytextContent === right.ytextContent;
+	}
+
+	private isOpenPathAdmissionRequestStructurallyValid(
+		request: OpenPathAdmissionRequest,
+	): boolean {
+		if (
+			request.requestId.length === 0
+			|| (
+				request.reason !== "open-editor-missing-target"
+				&& request.reason !== "handoff-replay-target-bind"
+			)
+			|| request.targetPath.length === 0
+			|| request.targetFile.path !== request.targetPath
+			|| request.openEditorTicket.path !== request.targetPath
+			|| request.openEditorTicket.views.length === 0
+		) return false;
+		const primary = this.getAdmissionPrimaryTicket(request.openEditorTicket, request.leafId);
+		if (
+			!primary
+			|| primary.sessionId !== request.sessionId
+			|| primary.handoffGeneration !== request.handoffGeneration
+			|| primary.switchIntentSeq !== request.switchIntentSeq
+			|| primary.targetFile !== request.targetFile
+			|| !primary.stableTargetIdentityProven
+		) return false;
+		if (
+			request.reason === "handoff-replay-target-bind"
+			&& (
+				request.presentation !== "target-proven"
+				|| request.hostLoadTokenId !== null
+				|| request.openEditorTicket.views.length !== 1
+				|| !this.isValidHandoffReplayRecoveryClaim(request.recoveryClaim)
+				|| !this.isExactRecoveryAdmissionViewTicket(
+					primary,
+					request.recoveryClaim,
+					primary.editorContent ?? "",
+				)
+			)
+		) return false;
+		switch (request.presentation) {
+			case "source":
+				return primary.handoffPresentation === "source";
+			case "target-candidate":
+				return primary.handoffPresentation === "target-candidate"
+					&& request.hostLoadTokenId !== null
+					&& primary.pendingHostLoadTokenId === request.hostLoadTokenId;
+			case "target-proven":
+				return primary.handoffPresentation === "target-proven"
+					&& request.hostLoadTokenId === null
+					&& primary.pendingHostLoadTokenId === null
+					&& primary.displayedFile === request.targetFile
+					&& primary.displayedPath === request.targetPath;
+		}
+	}
+
+	private isValidHandoffReplayRecoveryClaim(
+		claim: HandoffReplayRecoveryClaim | null | undefined,
+	): claim is HandoffReplayRecoveryClaim {
+		return typeof claim === "object"
+			&& claim !== null
+			&& Number.isSafeInteger(claim.recoveryOperationEpoch)
+			&& claim.recoveryOperationEpoch >= 0
+			&& claim.intentId.length > 0
+			&& claim.recordId.length > 0;
+	}
+
+	private sameHandoffReplayRecoveryClaim(
+		left: HandoffReplayRecoveryClaim,
+		right: HandoffReplayRecoveryClaim,
+	): boolean {
+		return left.recoveryOperationEpoch === right.recoveryOperationEpoch
+			&& left.intentId === right.intentId
+			&& left.recordId === right.recordId;
+	}
+
+	private getHandoffReplayRecoveryAdmissionEvidence(
+		view: OpenEditorMutationViewTicket,
+	): HandoffReplayRecoveryAdmissionEvidence | null {
+		const evidence = (
+			view as OpenEditorMutationViewTicket & Readonly<{
+				handoffReplayRecovery?: HandoffReplayRecoveryAdmissionEvidence;
+			}>
+		).handoffReplayRecovery;
+		return evidence ?? null;
+	}
+
+	private isExactRecoveryAdmissionViewTicket(
+		view: OpenEditorMutationViewTicket,
+		claim: HandoffReplayRecoveryClaim,
+		expectedContent: string,
+	): view is HandoffReplayRecoveryOpenEditorMutationViewTicket {
+		const evidence = this.getHandoffReplayRecoveryAdmissionEvidence(view);
+		if (
+			!evidence
+			|| evidence.purpose !== "handoff-replay-target-bind"
+			|| !this.isValidHandoffReplayRecoveryClaim(evidence.recoveryClaim)
+			|| !this.sameHandoffReplayRecoveryClaim(evidence.recoveryClaim, claim)
+			|| evidence.recoveryTargetBindingRequest === null
+			|| !this.sameHandoffReplayRecoveryClaim(
+				evidence.recoveryTargetBindingRequest,
+				claim,
+			)
+			|| evidence.inputGateInstalled !== true
+			|| evidence.saveGuardInstalled !== false
+			|| evidence.pendingHostLoadCandidate !== null
+			|| evidence.intentState.intentId !== claim.intentId
+			|| evidence.intentState.recordId !== claim.recordId
+			|| (
+				evidence.intentState.kind !== "stored"
+				&& evidence.intentState.kind !== "replay-pending"
+			)
+			|| evidence.binding.kind !== "unbound"
+			|| evidence.binding.bindingEpoch !== view.bindingEpoch
+			|| view.displayedFile !== view.targetFile
+			|| view.displayedPath !== view.targetFile.path
+			|| view.cm === null
+			|| view.handoffPresentation !== "target-proven"
+			|| view.pendingHostLoadTokenId !== null
+			|| view.intentStateKind !== evidence.intentState.kind
+			|| view.handoffPhase !== (
+				evidence.intentState.kind === "stored"
+					? "awaiting-recovery-commit"
+					: "awaiting-replay-settlement"
+			)
+			|| view.editorDocument !== view.cm.state.doc
+			|| view.editorContent !== expectedContent
+		) return false;
+		return true;
+	}
+
+	private isTargetPresentationRequestStructurallyValid(
+		request: TargetPresentationRequest,
+	): boolean {
+		const candidate = request.candidate;
+		const primary = this.getAdmissionPrimaryTicket(request.openEditorTicket, request.leafId);
+		return request.requestId.length > 0
+			&& request.targetPath.length > 0
+			&& request.targetFile.path === request.targetPath
+			&& request.openEditorTicket.path === request.targetPath
+			&& request.openEditorTicket.views.length === 1
+			&& !!primary
+			&& primary.sessionId === request.sessionId
+			&& primary.handoffGeneration === request.handoffGeneration
+			&& primary.switchIntentSeq === request.switchIntentSeq
+			&& primary.targetFile === request.targetFile
+			&& primary.stableTargetIdentityProven
+			&& primary.handoffPresentation === "target-candidate"
+			&& primary.pendingHostLoadTokenId === candidate.hostLoadTokenId
+			&& primary.cm === candidate.cm
+			&& primary.bindingEpoch === candidate.bindingEpoch
+			&& Number.isSafeInteger(candidate.editorRevisionBefore)
+			&& candidate.editorRevisionBefore >= 0
+			&& candidate.editorRevisionBefore < Number.MAX_SAFE_INTEGER
+			&& primary.editorRevision === candidate.editorRevisionBefore
+			&& primary.editorDocument === candidate.startDocument
+			&& primary.editorContent === candidate.startDocument.toString()
+			&& candidate.hostLoadCompletedEpoch === null
+			&& candidate.sourceUnloadReceiptId.length > 0
+			&& candidate.sessionId === request.sessionId
+			&& candidate.leafId === request.leafId
+			&& candidate.handoffGeneration === request.handoffGeneration
+			&& candidate.switchIntentSeq === request.switchIntentSeq
+			&& candidate.targetPathAtDispatch === request.targetPath
+			&& candidate.runtimeView === primary.view
+			&& candidate.hostSetViewDataClear === true
+			&& candidate.targetDocument.toString() === candidate.incomingContent
+			&& (
+				candidate.applicationKind === "transaction"
+					? candidate.heldTransaction.startState.doc === candidate.startDocument
+						&& candidate.heldTransaction.newDoc === candidate.targetDocument
+					: candidate.heldState.doc === candidate.targetDocument
+						&& candidate.heldState.selection === candidate.proposedSelection
+			);
+	}
+
+	private isHostLoadReceiptStructurallyValid(
+		record: TargetPresentationPlanRecord,
+		receipt: HostLoadCompletionReceipt,
+	): boolean {
+		const request = record.request;
+		const candidate = request.candidate;
+		return receipt.receiptId.length > 0
+			&& receipt.hostLoadTokenId === candidate.hostLoadTokenId
+			&& receipt.switchIntentSeq === request.switchIntentSeq
+			&& receipt.sessionId === request.sessionId
+			&& receipt.leafId === request.leafId
+			&& receipt.handoffGeneration === request.handoffGeneration
+			&& receipt.targetPath === request.targetPath
+			&& receipt.nativeHistoryEpoch > candidate.nativeHistoryEpochBefore
+			&& receipt.historyResetObserved === true
+			&& receipt.targetSelection === candidate.proposedSelection
+			&& receipt.targetSelectionEpoch > 0
+			&& receipt.targetScrollAnchor === candidate.proposedScrollAnchor
+			&& receipt.targetScrollEpoch > 0
+			&& receipt.effectFingerprint === candidate.effectFingerprint;
+	}
+
+	private isTargetProvenIntentSettled(
+		kind: OpenEditorMutationViewTicket["intentStateKind"],
+	): boolean {
+		switch (kind) {
+			case null:
+			case "none":
+			case "needs-review":
+			case "escaped":
+			case "resolved":
+			case "discarded":
+				return true;
+			case "persisting":
+			case "stored":
+			case "replay-pending":
+			case "replayed-awaiting-settlement":
+			case "escape-pending":
+			case "failed":
+				return false;
+		}
+	}
+
+	private getAdmissionPrimaryTicket(
+		ticket: OpenEditorMutationTicket,
+		leafId: string,
+	): OpenEditorMutationViewTicket | null {
+		return ticket.views.find((view) => view.leafId === leafId) ?? null;
+	}
+
+	private captureCurrentAdmissionTicket(path: string): OpenEditorMutationTicket | null {
+		const views = this.getOpenMarkdownViewsForPath(path);
+		if (views.length === 0) return null;
+		return this.deps.getEditorBindings()?.captureOpenEditorMutationTicket?.(
+			path,
+			views,
+		) ?? null;
+	}
+
+	private editorAdmissionSessionKey(
+		sessionId: string,
+		leafId: string,
+		handoffGeneration: number,
+		path: string,
+	): string {
+		return JSON.stringify([sessionId, leafId, handoffGeneration, path]);
+	}
+
+	private publishTargetReadyRecord(record: TargetReadyRecord): void {
+		for (const [key, previous] of this.targetReadyBySession) {
+			if (previous.token.leafId !== record.token.leafId) continue;
+			this.editorAuthorityAdmission.invalidateFreshness(
+				previous.token.authorityFreshnessHandleId,
+			);
+			this.targetReadyBySession.delete(key);
+		}
+		this.trimEditorAdmissionMap(this.targetReadyBySession);
+		this.targetReadyBySession.set(this.editorAdmissionSessionKey(
+			record.token.sessionId,
+			record.token.leafId,
+			record.token.handoffGeneration,
+			record.token.targetPath,
+		), record);
+	}
+
+	private trimEditorAdmissionMap<T>(map: Map<string, T>): void {
+		while (map.size >= ReconciliationController.EDITOR_ADMISSION_RECORD_LIMIT) {
+			const oldest = map.keys().next().value as string | undefined;
+			if (oldest === undefined) return;
+			map.delete(oldest);
+		}
+	}
+
+	private doesReadyRecordMatchOpenRequest(
+		record: TargetReadyRecord,
+		request: OpenPathAdmissionRequest,
+	): boolean {
+		const token = record.token;
+		return token.sessionId === request.sessionId
+			&& token.leafId === request.leafId
+			&& token.handoffGeneration === request.handoffGeneration
+			&& token.switchIntentSeq === request.switchIntentSeq
+			&& token.targetPath === request.targetPath
+			&& token.targetFile === request.targetFile
+			&& record.hostReceipt.hostLoadTokenId === token.hostLoadTokenId;
+	}
+
 	private getOpenMarkdownViewsForPath(path: string): MarkdownView[] {
 		const views: MarkdownView[] = [];
 		const activeView = (this.deps.app.workspace as {
 			getActiveViewOfType?: <T>(type: abstract new (...args: never[]) => T) => T | null;
 		}).getActiveViewOfType?.(MarkdownView) ?? null;
-		if (activeView?.file?.path === path) {
+		if (isMarkdownEditorView(activeView) && activeView.file?.path === path) {
 			views.push(activeView);
 		}
 
@@ -4965,7 +8972,7 @@ export class ReconciliationController {
 		};
 		workspace.iterateAllLeaves?.((leaf) => {
 			if (
-				leaf.view instanceof MarkdownView
+				isMarkdownEditorView(leaf.view)
 				&& leaf.view.file?.path === path
 				&& !views.includes(leaf.view)
 			) {
@@ -4982,6 +8989,35 @@ export class ReconciliationController {
 		if (openViews.length === 0) return null;
 		const editorBindings = this.deps.getEditorBindings();
 		return editorBindings?.captureOpenEditorMutationTicket?.(path, openViews) ?? null;
+	}
+
+	private capturePathEditorAuthority(path: string): PathEditorAuthority {
+		const editorBindings = this.deps.getEditorBindings();
+		if (!editorBindings) return { kind: "blocked", reason: "read-failed" };
+		try {
+			return editorBindings.capturePathEditorAuthority(path);
+		} catch {
+			return { kind: "blocked", reason: "read-failed" };
+		}
+	}
+
+	private isPathEditorAuthorityLeaseCurrent(lease: EditorAuthorityLease): boolean {
+		try {
+			return this.deps.getEditorBindings()?.isPathEditorAuthorityLeaseCurrent(lease) === true;
+		} catch {
+			return false;
+		}
+	}
+
+	private isCapturedPathEditorAuthorityCurrent(
+		path: string,
+		authority: PathEditorAuthority,
+	): boolean {
+		if (authority.kind === "proven-single") {
+			return this.isPathEditorAuthorityLeaseCurrent(authority.lease);
+		}
+		if (authority.kind === "blocked") return false;
+		return this.capturePathEditorAuthority(path).kind === "none";
 	}
 
 	/**
@@ -5006,6 +9042,30 @@ export class ReconciliationController {
 				editorContent: snapshot.editorContent,
 			})),
 		};
+	}
+
+	/**
+	 * A blocked path authority cannot authorize a mutation, but the ticket that
+	 * produced that classification may still carry readable pane snapshots worth
+	 * preserving off the original path. These bytes are never selected as a
+	 * winner: they are only copied into an unresolved marker/artifact lane.
+	 */
+	private getTicketEditorContentsForPreservation(
+		path: string,
+		openViews: readonly MarkdownView[],
+		ticket: OpenEditorMutationTicket | null,
+	): string[] {
+		if (
+			!ticket
+			|| ticket.path !== path
+			|| ticket.views.length !== openViews.length
+			|| ticket.views.some((snapshot) => !openViews.includes(snapshot.view))
+		) return [];
+		return Array.from(new Set(
+			ticket.views
+				.map((snapshot) => snapshot.editorContent)
+				.filter((content): content is string => content !== null),
+		));
 	}
 
 	/**
@@ -5276,6 +9336,9 @@ export class ReconciliationController {
 			return "crdt-content-changed";
 		}
 		if (!validation.current) return validation.reason;
+		if (!this.isPathEditorAuthorityLeaseCurrent(snapshot.editorAuthorityLease)) {
+			return "editor-authority-lease-stale";
+		}
 		return null;
 	}
 
@@ -5340,8 +9403,9 @@ export class ReconciliationController {
 		expectedBaselineRevision?: number;
 		expectedLifecycleGeneration?: number;
 		expectedYText: ReturnType<VaultSync["getTextForPath"]>;
-		expectedCrdtContent: string | null;
-		ticket: OpenEditorMutationTicket | null;
+			expectedCrdtContent: string | null;
+			ticket: OpenEditorMutationTicket | null;
+			editorAuthorityLease: EditorAuthorityLease;
 		expectedDiskRevision: number;
 		expectedVisibleAuthorityMarker: DeferredVisibleEditorAuthority | null;
 		expectedInterceptedCandidate?: InterceptedExternalDiskMutation | null;
@@ -5468,6 +9532,12 @@ export class ReconciliationController {
 		})) {
 			return { kind: "stale" };
 		}
+		if (!this.isPathEditorAuthorityLeaseCurrent(input.editorAuthorityLease)) {
+			return reject("editor-authority-lease-stale", {
+				expectedDiskRevision: input.expectedDiskRevision,
+				currentDiskRevision,
+			});
+		}
 
 		// Ticket validation and dependency callbacks above are synchronous but may
 		// themselves touch controller state. Recheck every non-byte fence and the
@@ -5528,6 +9598,9 @@ export class ReconciliationController {
 		else if (finalPreservedUnresolved) finalReason = "preserved-unresolved";
 		else if (finalYText !== input.expectedYText) finalReason = "crdt-text-replaced";
 		else if (finalCrdtContent !== input.expectedCrdtContent) finalReason = "crdt-content-changed";
+		else if (!this.isPathEditorAuthorityLeaseCurrent(input.editorAuthorityLease)) {
+			finalReason = "editor-authority-lease-stale";
+		}
 		else if (finalCallerAborted) finalReason = "caller-aborted";
 		else if (finalAdditionalAuthorityStaleReason !== null) {
 			finalReason = finalAdditionalAuthorityStaleReason;
@@ -5698,6 +9771,9 @@ export class ReconciliationController {
 		} else if (currentYText !== lease.expectedYText) reason = "crdt-text-replaced";
 		else if (currentCrdtContent !== lease.expectedCrdtContent) reason = "crdt-content-changed";
 		else if (!editorValidation.current) reason = `editor-${editorValidation.reason}`;
+		else if (!this.isPathEditorAuthorityLeaseCurrent(lease.expectedEditorAuthorityLease)) {
+			reason = "editor-authority-lease-stale";
+		}
 		else if (callerAborted) reason = "caller-aborted";
 		if (reason === null) return true;
 
@@ -5754,24 +9830,6 @@ export class ReconciliationController {
 		}
 	}
 
-	private getOpenEditorAuthority(openViews: MarkdownView[]): OpenEditorAuthority {
-		if (openViews.length === 0) return { kind: "none" };
-
-		const contents: string[] = [];
-		for (const view of openViews) {
-			try {
-				contents.push(view.editor.getValue());
-			} catch {
-				return { kind: "read-failed" };
-			}
-		}
-
-		const distinct = [...new Set(contents)];
-		if (distinct.length === 0) return { kind: "none" };
-		if (distinct.length > 1) return { kind: "multiple" };
-		return { kind: "single", content: distinct[0]! };
-	}
-
 	private captureBoundFileSettlement(
 		path: string,
 		diskContent: string,
@@ -5782,8 +9840,11 @@ export class ReconciliationController {
 		if (currentYText !== expectedYText) return undefined;
 		const currentCrdtContent = yTextToString(currentYText);
 		if (currentCrdtContent === null) return undefined;
-		const editorAuthority = this.getOpenEditorAuthority(openViews);
-		if (editorAuthority.kind !== "single") return undefined;
+		const editorAuthority = this.capturePathEditorAuthority(path);
+		if (
+			editorAuthority.kind !== "proven-single"
+			|| !this.isPathEditorAuthorityLeaseCurrent(editorAuthority.lease)
+		) return undefined;
 
 		const normalizedTarget = normalizeEditorText(diskContent);
 		if (
@@ -5815,6 +9876,7 @@ export class ReconciliationController {
 			expectedCrdtContent: currentCrdtContent,
 			...(expectedEditorTicket ? { expectedEditorTicket } : {}),
 			expectedOpenEditorContent: editorAuthority.content,
+			expectedEditorAuthorityLease: editorAuthority.lease,
 		};
 	}
 
@@ -5874,6 +9936,16 @@ export class ReconciliationController {
 			capturedEditorCandidateCount: marker.editorContents.length,
 			clearedAttention: attention?.reason === "conflict-winner-flush-deferred",
 		});
+	}
+
+	private hasProvisionalVisibleAuthorityAttention(path: string): boolean {
+		const diskMirror = this.deps.getDiskMirror() as
+			| (DiskMirror & { getPreservedUnresolvedEntries?: () => PreservedUnresolvedEntry[] })
+			| null;
+		return diskMirror?.getPreservedUnresolvedEntries?.()
+			.some((entry) =>
+				entry.path === path && entry.reason === "conflict-winner-flush-deferred"
+			) ?? false;
 	}
 
 	private async preserveUnresolvedVisibleAuthority(
@@ -5942,6 +10014,7 @@ export class ReconciliationController {
 	}
 
 	private getOpenEditorDiskMismatchDeferUntil(input: {
+		path: string;
 		sourceReason: MarkdownDirtyReason;
 		cameFromDirtyQueue: boolean;
 		diskContent: string;
@@ -5951,11 +10024,11 @@ export class ReconciliationController {
 	}): number | null {
 		if (input.openViews.length === 0) return null;
 
-		const authority = this.getOpenEditorAuthority(input.openViews);
+		const authority = this.capturePathEditorAuthority(input.path);
 		if (authority.kind === "none") return null;
 
 		const now = input.now ?? Date.now();
-		if (authority.kind === "multiple" || authority.kind === "read-failed") {
+		if (authority.kind === "blocked") {
 			return now + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS;
 		}
 		if (input.sourceReason === "create") {
@@ -6007,7 +10080,7 @@ export class ReconciliationController {
 			}
 		}
 
-		const authority = this.getOpenEditorAuthority(input.openViews);
+		const authority = this.capturePathEditorAuthority(input.path);
 		const vaultSync = this.deps.getVaultSync();
 		const lastRemoteUpdate = vaultSync?.lastRemoteUpdateAt ?? null;
 		if (
@@ -6030,7 +10103,7 @@ export class ReconciliationController {
 				// not new local authority.  Deferring it as a durable editor candidate
 				// would later quarantine the expected C1 -> C2 editor patch.
 				const captureVisibleAuthority = !(
-					authority.kind === "single" &&
+					authority.kind === "proven-single" &&
 					(
 						authority.content === input.crdtContent ||
 						(
@@ -6052,7 +10125,22 @@ export class ReconciliationController {
 			}
 		}
 
-		if (authority.kind !== "single") return null;
+		if (
+			authority.kind === "blocked"
+			&& (authority.reason === "transitioning" || authority.reason === "unmanaged-view")
+		) {
+			return {
+				reason: "editor-ahead-without-activity-timestamp",
+				lastEditorActivity: null,
+				lastRemoteUpdate: null,
+				idleMs: null,
+				deferUntil: now + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS,
+				captureVisibleAuthority: true,
+				retainSettledDiskIndex: false,
+			};
+		}
+		if (authority.kind === "blocked") return null;
+		if (authority.kind !== "proven-single") return null;
 		if (authority.content === input.diskContent) return null;
 		if (authority.content === input.crdtContent) return null;
 
@@ -6084,23 +10172,26 @@ export class ReconciliationController {
 		captureVisibleAuthority: boolean;
 		retainSettledDiskIndex: boolean;
 	}): void {
-		let readComplete = true;
-		const capturedEditorContents: string[] = [];
-		const editorStates = input.openViews.map((view) => {
-			let editorContent: string | null = null;
-			try {
-				editorContent = view.editor.getValue();
-			} catch {
-				readComplete = false;
-				editorContent = null;
-			}
-			if (editorContent !== null) capturedEditorContents.push(editorContent);
-			return {
-				editorLength: editorContent?.length ?? null,
-				editorMatchesDisk: editorContent === input.diskContent,
-				editorMatchesCrdt: editorContent === input.crdtContent,
-			};
-		});
+		const mutationTicket = this.captureOpenEditorMutationTicket(
+			input.path,
+			input.openViews,
+		);
+		const pathEditorAuthority = this.capturePathEditorAuthority(input.path);
+		const readComplete = pathEditorAuthority.kind === "proven-single"
+			&& this.isPathEditorAuthorityLeaseCurrent(pathEditorAuthority.lease);
+		const editorContent = readComplete ? pathEditorAuthority.content : null;
+		const capturedEditorContents = editorContent === null
+			? this.getTicketEditorContentsForPreservation(
+				input.path,
+				input.openViews,
+				mutationTicket,
+			)
+			: [editorContent];
+		const editorStates = input.openViews.map(() => ({
+			editorLength: editorContent?.length ?? null,
+			editorMatchesDisk: editorContent === input.diskContent,
+			editorMatchesCrdt: editorContent === input.crdtContent,
+		}));
 
 		this.deps.log(
 			`reconcile: deferring "${input.path}" ` +
@@ -6126,13 +10217,12 @@ export class ReconciliationController {
 		}
 		const previous = this.visibleAuthorityDeferredPaths.get(input.path);
 		const currentEditorContents = Array.from(new Set(capturedEditorContents));
-		const currentReadComplete =
-			readComplete && capturedEditorContents.length === input.openViews.length;
+		// A proven-single lease already covers the complete pane vector. The
+		// content list is intentionally de-duplicated, so comparing its length to
+		// the pane count would incorrectly downgrade two identical panes.
+		const currentReadComplete = readComplete;
 		const currentEditorTicket = this.compactVisibleAuthorityTicket(
-			this.captureOpenEditorMutationTicket(
-				input.path,
-				input.openViews,
-			),
+			mutationTicket,
 		);
 		const editorActivityAdvanced =
 			input.lastEditorActivity !== null &&
@@ -6223,27 +10313,61 @@ export class ReconciliationController {
 		const attentionGeneration = this.deps.getMarkdownAttentionGeneration?.() ?? 0;
 		const syncScopeGeneration = this.deps.getMarkdownSyncScopeGeneration?.() ?? 0;
 		let visibleAuthorityMarker = this.visibleAuthorityDeferredPaths.get(path) ?? null;
-		const viewStates: Array<{ view: MarkdownView; editorContent: string }> = [];
-		let editorReadFailed = false;
-		for (const view of openViews) {
-			try {
-				viewStates.push({ view, editorContent: view.editor.getValue() });
-			} catch {
-				editorReadFailed = true;
-			}
-		}
-		const distinctEditorContents = [...new Set(viewStates.map((state) => state.editorContent))];
-		if (editorReadFailed || distinctEditorContents.length !== 1) {
+		const pathEditorAuthority = this.capturePathEditorAuthority(path);
+		const pathEditorAuthorityCurrent = pathEditorAuthority.kind === "proven-single"
+			&& this.isPathEditorAuthorityLeaseCurrent(pathEditorAuthority.lease);
+		const distinctEditorContents = pathEditorAuthorityCurrent
+			? [pathEditorAuthority.content]
+			: this.getTicketEditorContentsForPreservation(path, openViews, mutationTicket);
+		if (!pathEditorAuthorityCurrent) {
 			this.deps.trace("conflict", "open-file-reconcile-multiple-editor-authorities", {
 				path,
 				editorViewCount: openViews.length,
 				distinctEditorContentCount: distinctEditorContents.length,
-				editorReadFailed,
+				editorReadFailed: pathEditorAuthority.kind === "blocked"
+					&& pathEditorAuthority.reason === "read-failed",
+				editorAuthorityKind: pathEditorAuthority.kind,
+				editorAuthorityReason: pathEditorAuthority.kind === "blocked"
+					? pathEditorAuthority.reason
+					: null,
 				diskLength: diskContent.length,
 				crdtLength: crdtContent.length,
 			});
-			return false;
+			const blockedMarker: DeferredVisibleEditorAuthority = {
+				editorContents: Array.from(new Set([
+					...this.getRetainedVisibleAuthorityContents(
+						visibleAuthorityMarker ?? undefined,
+						{
+							kind: "incompatible",
+							advancedEditorContents: [],
+							supersedesPreviousSingle: false,
+						},
+					),
+					...distinctEditorContents,
+				])),
+				readComplete: false,
+				capturedDiskContent: diskContent,
+				capturedCrdtContent: crdtContent,
+				capturedDiskRevision: diskMutationRevision,
+				capturedEditorActivity:
+					this.deps.getEditorBindings()?.getLastEditorActivityForPath?.(path) ?? null,
+				capturedEditorTicket: visibleAuthorityTicket,
+				capturedAt: Date.now(),
+			};
+			this.visibleAuthorityDeferredPaths.set(path, blockedMarker);
+			await this.preserveUnresolvedVisibleAuthority(
+				path,
+				blockedMarker,
+				diskContent,
+				crdtContent,
+				`open-authority-${pathEditorAuthority.kind === "blocked"
+					? pathEditorAuthority.reason
+					: "unavailable"}`,
+			);
+			return true;
 		}
+		if (pathEditorAuthority.kind !== "proven-single") return false;
+		const editorAuthorityLease = pathEditorAuthority.lease;
 
 		const editorAuthority = distinctEditorContents[0]!;
 		const lastEditorActivity = this.deps.getEditorBindings()
@@ -6314,6 +10438,7 @@ export class ReconciliationController {
 			expectedYText: ytext,
 			expectedCrdtContent: crdtContent,
 			editorTicket: mutationTicket,
+			editorAuthorityLease,
 			diskRevision: diskMutationRevision,
 			visibleAuthorityMarker,
 			interceptedCandidate,
@@ -6355,6 +10480,7 @@ export class ReconciliationController {
 				expectedBaselineRevision: baselineAuthority.revision,
 				expectedLifecycleGeneration: lifecycleGeneration,
 				ticket: mutationTicket,
+				editorAuthorityLease,
 				expectedYText: ytext,
 				expectedCrdtContent: crdtContent,
 				expectedDiskRevision: diskMutationRevision,
@@ -6503,6 +10629,7 @@ export class ReconciliationController {
 			expectedBaselineRevision: baselineAuthority.revision,
 			expectedLifecycleGeneration: lifecycleGeneration,
 			ticket: mutationTicket,
+			editorAuthorityLease,
 			expectedYText: ytext,
 			expectedCrdtContent: crdtContent,
 			expectedDiskRevision: diskMutationRevision,
@@ -6680,6 +10807,10 @@ export class ReconciliationController {
 		stableStat?: { mtime: number; size: number } | null,
 		shouldAbort: () => boolean = () => false,
 	): Promise<BoundFileSyncGapOutcome> {
+		function assertNever(value: never): never {
+			throw new Error(`Unhandled EnsureFileResult: ${JSON.stringify(value)}`);
+		}
+
 		if (shouldAbort()) return { kind: "handled" };
 		const editorBindings = this.deps.getEditorBindings();
 		const vaultSync = this.deps.getVaultSync();
@@ -6722,6 +10853,19 @@ export class ReconciliationController {
 			this.deps.log(`syncFileFromDisk: cleared stale bound state for "${file.path}" (no live view)`);
 			return { kind: "not-handled" };
 		}
+		const pathEditorAuthority = this.capturePathEditorAuthority(file.path);
+		if (
+			pathEditorAuthority.kind !== "proven-single"
+			|| !this.isPathEditorAuthorityLeaseCurrent(pathEditorAuthority.lease)
+		) {
+			return this.deferStaleOpenEditorMutation(
+				pathEditorAuthority.kind === "blocked"
+					? `path-editor-authority-${pathEditorAuthority.reason}`
+					: "path-editor-authority-unavailable",
+			);
+		}
+		const editorAuthorityLease = pathEditorAuthority.lease;
+		const provenEditorContent = pathEditorAuthority.content;
 
 		const crdtContent = yTextToString(existingText);
 		const mutationTicket = this.captureOpenEditorMutationTicket(file.path, openViews);
@@ -6764,6 +10908,7 @@ export class ReconciliationController {
 				revision: number;
 			},
 			ticket: OpenEditorMutationTicket | null = mutationTicket,
+			authorityLease: EditorAuthorityLease = editorAuthorityLease,
 		): Promise<OpenEditorDiskMutationCommit<T>> => {
 			const attempt = await this.commitOpenEditorDiskMutation({
 				path: file.path,
@@ -6774,6 +10919,7 @@ export class ReconciliationController {
 				expectedBaselineRevision: expectedBaseline?.revision,
 				expectedLifecycleGeneration: lifecycleGeneration,
 				ticket,
+				editorAuthorityLease: authorityLease,
 				expectedYText: existingText,
 				expectedCrdtContent,
 				expectedDiskRevision: diskMutationRevision,
@@ -6794,20 +10940,27 @@ export class ReconciliationController {
 			provisionalBaseline?: boolean;
 			ticket?: OpenEditorMutationTicket | null;
 			publishVisibleAuthorityContent?: string;
+			editorAuthority?: Readonly<{
+				content: string;
+				lease: EditorAuthorityLease;
+			}>;
 		}): Promise<BoundFileSyncGapOutcome> => {
 			const ticket = input.ticket === undefined ? mutationTicket : input.ticket;
+			const flushEditorAuthority = input.editorAuthority ?? {
+				content: provenEditorContent,
+				lease: editorAuthorityLease,
+			};
 			const attempt = await commitMutation(
 				input.stage,
 				input.expectedCrdtContent,
 				() => {
 					if (input.publishVisibleAuthorityContent !== undefined) {
-						const currentAuthority = this.getOpenEditorAuthority(openViews);
 						const compactTicket = this.compactVisibleAuthorityTicket(ticket);
 						if (
 							!ticket ||
 							!compactTicket ||
-							currentAuthority.kind !== "single" ||
-							currentAuthority.content !== input.publishVisibleAuthorityContent
+							!this.isPathEditorAuthorityLeaseCurrent(flushEditorAuthority.lease) ||
+							flushEditorAuthority.content !== input.publishVisibleAuthorityContent
 						) {
 							return null;
 						}
@@ -6847,6 +11000,7 @@ export class ReconciliationController {
 						expectedYText: existingText,
 						expectedCrdtContent: input.expectedCrdtContent,
 						expectedEditorTicket: ticket,
+						expectedEditorAuthorityLease: flushEditorAuthority.lease,
 						expectedVisibleAuthorityMarker: visibleAuthorityMarker,
 						expectedInterceptedCandidate: interceptedCandidate,
 						expectedCandidateIdentityEpoch: candidateIdentityEpoch,
@@ -6855,6 +11009,7 @@ export class ReconciliationController {
 				},
 				baselineAuthority,
 				ticket,
+				flushEditorAuthority.lease,
 			);
 			if (attempt.kind === "stale" || attempt.value === null) {
 				return this.deferStaleOpenEditorMutation(input.stage);
@@ -6868,17 +11023,17 @@ export class ReconciliationController {
 		};
 		let deferredVisibleAuthority = this.visibleAuthorityDeferredPaths.get(file.path);
 		if (deferredVisibleAuthority) {
-			const currentAuthority = this.getOpenEditorAuthority(openViews);
-			const currentEditorContents = currentAuthority.kind === "single"
-				? [currentAuthority.content]
-				: [];
+			if (!this.isPathEditorAuthorityLeaseCurrent(editorAuthorityLease)) {
+				return this.deferStaleOpenEditorMutation("deferred-visible-editor-authority");
+			}
+			const currentEditorContents = [provenEditorContent];
 			const currentEditorActivity =
 				editorBindings?.getLastEditorActivityForPath(file.path) ?? null;
 			const ticketProgress = this.classifyVisibleAuthorityTicketProgress(
 				deferredVisibleAuthority.capturedEditorTicket,
 				visibleAuthorityTicket,
 				currentEditorContents,
-				currentAuthority.kind === "single",
+				true,
 			);
 			const editorActivityAdvanced =
 				currentEditorActivity !== null &&
@@ -6887,14 +11042,13 @@ export class ReconciliationController {
 					currentEditorActivity > deferredVisibleAuthority.capturedEditorActivity
 				);
 			if (
-				currentAuthority.kind === "single" &&
 				(
 					ticketProgress.kind === "successor" ||
 					(ticketProgress.kind === "unavailable" && editorActivityAdvanced)
 				)
 			) {
 				const successorMarker: DeferredVisibleEditorAuthority = {
-					editorContents: [currentAuthority.content],
+					editorContents: [provenEditorContent],
 					readComplete: true,
 					capturedDiskContent: content,
 					capturedCrdtContent: crdtContent,
@@ -6911,7 +11065,7 @@ export class ReconciliationController {
 					stage: "bound-file-sync-gap",
 					ticketProgress: ticketProgress.kind,
 					editorActivityAdvanced,
-					editorLength: currentAuthority.content.length,
+					editorLength: provenEditorContent.length,
 				});
 			}
 			const hasDistinctInterveningEditorAuthority =
@@ -6921,8 +11075,7 @@ export class ReconciliationController {
 			const exactCapturedAuthorityStillVisible =
 				deferredVisibleAuthority.readComplete &&
 				deferredVisibleAuthority.editorContents.length === 1 &&
-				currentAuthority.kind === "single" &&
-				currentAuthority.content === deferredVisibleAuthority.editorContents[0] &&
+				provenEditorContent === deferredVisibleAuthority.editorContents[0] &&
 				!hasDistinctInterveningEditorAuthority;
 			if (!exactCapturedAuthorityStillVisible) {
 				const combinedMarker: DeferredVisibleEditorAuthority = {
@@ -6953,7 +11106,7 @@ export class ReconciliationController {
 				);
 				this.deps.trace("conflict", "open-captured-editor-authority-preserved", {
 					path: file.path,
-					currentAuthorityKind: currentAuthority.kind,
+					currentAuthorityKind: "proven-single",
 					capturedEditorCandidateCount: deferredVisibleAuthority.editorContents.length,
 					combinedEditorCandidateCount: combinedMarker.editorContents.length,
 				});
@@ -6990,14 +11143,8 @@ export class ReconciliationController {
 			};
 		}
 
-		let editorReadFailed = false;
 		const viewStates = openViews.map((view) => {
-			let editorContent: string | null = null;
-			try {
-				editorContent = view.editor.getValue();
-			} catch {
-				editorReadFailed = true;
-			}
+			const editorContent = provenEditorContent;
 			const binding = editorBindings?.getBindingDebugInfoForView(view) ?? null;
 			const collab = editorBindings?.getCollabDebugInfoForView(view) ?? null;
 			return {
@@ -7009,31 +11156,17 @@ export class ReconciliationController {
 				collab,
 			};
 		});
-		const distinctEditorContentsForPlanner = [...new Set(
-			viewStates
-				.map((state) => state.editorContent)
-				.filter((editorContent): editorContent is string => editorContent !== null),
-		)];
-		let plannerEditorAuthority: OpenBoundEditorAuthority;
-		if (editorReadFailed) {
-			plannerEditorAuthority = { kind: "read-failed" };
-		} else if (distinctEditorContentsForPlanner.length === 0) {
-			plannerEditorAuthority = { kind: "none" };
-		} else if (distinctEditorContentsForPlanner.length > 1) {
-			plannerEditorAuthority = { kind: "multiple" };
-		} else {
-			const editorContent = distinctEditorContentsForPlanner[0]!;
-			const editorMatchesDisk = editorContent === content;
-			const editorMatchesCrdt = crdtContent != null && editorContent === crdtContent;
-			plannerEditorAuthority = {
-				kind: "single",
-				relation: editorMatchesDisk && editorMatchesCrdt
-					? "both"
-					: (editorMatchesDisk
-						? "disk"
-						: (editorMatchesCrdt ? "crdt" : "distinct")),
-			};
-		}
+		const editorMatchesDisk = provenEditorContent === content;
+		const editorMatchesCrdt = crdtContent != null && provenEditorContent === crdtContent;
+		const distinctEditorContentsForPlanner = [provenEditorContent];
+		const plannerEditorAuthority: OpenBoundEditorAuthority = {
+			kind: "single",
+			relation: editorMatchesDisk && editorMatchesCrdt
+				? "both"
+				: (editorMatchesDisk
+					? "disk"
+					: (editorMatchesCrdt ? "crdt" : "distinct")),
+		};
 		const lastEditorActivityForPlanner =
 			editorBindings?.getLastEditorActivityForPath(file.path) ?? null;
 		const hasRecentEditorActivityForPlanner =
@@ -7228,7 +11361,20 @@ export class ReconciliationController {
 							);
 							return { kind: "handled" };
 						case "unchanged":
-						case "applied":
+						case "applied": {
+							const successorEditorAuthority =
+								this.capturePathEditorAuthority(file.path);
+							if (
+								successorEditorAuthority.kind !== "proven-single"
+								|| successorEditorAuthority.content !== externalPlan.targetText
+								|| !this.isPathEditorAuthorityLeaseCurrent(
+									successorEditorAuthority.lease,
+								)
+							) {
+								return this.deferStaleOpenEditorMutation(
+									"open-external-clean-merge",
+								);
+							}
 							this.traceOpenExternalEvent("open-external-clean-merge-applied", {
 								path: file.path,
 								reason: externalPlan.kind,
@@ -7242,7 +11388,9 @@ export class ReconciliationController {
 								expectedCrdtContent: externalPlan.targetText,
 								ticket: this.captureOpenEditorMutationTicket(file.path, openViews),
 								publishVisibleAuthorityContent: externalPlan.targetText,
+								editorAuthority: successorEditorAuthority,
 							});
+						}
 						}
 					throw new Error("unreachable open-external exact diff result");
 				}
@@ -7351,40 +11499,6 @@ export class ReconciliationController {
 		);
 		let plannerConflictPreserved = false;
 		let settlementYText = existingText;
-		if (
-			plannerEditorAuthority.kind === "multiple" ||
-			plannerEditorAuthority.kind === "read-failed" ||
-			plannerEditorAuthority.kind === "none"
-		) {
-			const marker: DeferredVisibleEditorAuthority = {
-				editorContents: distinctEditorContentsForPlanner,
-				readComplete: !editorReadFailed,
-				capturedDiskContent: content,
-				capturedCrdtContent: crdtContent,
-				capturedDiskRevision: this.getMarkdownDiskRevision(file.path),
-				capturedEditorActivity: lastEditorActivityForPlanner,
-				capturedEditorTicket: visibleAuthorityTicket,
-				capturedAt: Date.now(),
-			};
-			this.visibleAuthorityDeferredPaths.set(file.path, marker);
-			await this.preserveUnresolvedVisibleAuthority(
-				file.path,
-				marker,
-				content,
-				crdtContent ?? "",
-				`open-${plannerEditorAuthority.kind}`,
-			);
-			this.deps.trace("conflict", "open-multiple-editor-authority-failed-closed", {
-				path: file.path,
-				reason: openBoundAction?.reason ?? plannerEditorAuthority.kind,
-				openViewCount: viewStates.length,
-				editorCandidateCount: distinctEditorContentsForPlanner.length,
-				diskLength: content.length,
-				crdtLength: crdtContent?.length ?? null,
-			});
-			this.deps.scheduleTraceStateSnapshot("open-multiple-editor-authority-unresolved");
-			return { kind: "handled" };
-		}
 		if (
 			openBoundAction?.kind === "defer-recent-editor" &&
 			localOnlyViews.length === 0 &&
@@ -7787,7 +11901,26 @@ export class ReconciliationController {
 				if (seedAttempt.kind === "stale") {
 					return this.deferStaleOpenEditorMutation("bound-file-local-only-seed");
 				}
-				const seededText = seedAttempt.value ?? null;
+				const ensureResult = seedAttempt.value;
+				if (!ensureResult) {
+					return this.deferStaleOpenEditorMutation("bound-file-local-only-seed");
+				}
+				let seededText: NonNullable<ReturnType<VaultSync["getTextForPath"]>>;
+				switch (ensureResult.kind) {
+					case "created":
+					case "existing":
+						seededText = ensureResult.ytext;
+						break;
+					case "replan":
+						return this.deferStaleOpenEditorMutation("bound-file-local-only-seed-replan");
+					case "blocked":
+						this.deps.log(
+							`syncFileFromDisk: controller admission blocked for "${file.path}" (${ensureResult.reason})`,
+						);
+						return this.deferStaleOpenEditorMutation("bound-file-local-only-seed-blocked");
+					default:
+						assertNever(ensureResult);
+				}
 				const currentSeededText = vaultSync?.getTextForPath(file.path) ?? null;
 				const recoveredContent = yTextToString(currentSeededText);
 				const seedSettled =
@@ -8588,7 +12721,15 @@ export class ReconciliationController {
 		) => Promise<boolean>,
 	): Promise<MarkdownConflictArtifactResult> {
 		if (!isCurrent()) throw new Error("stale reconciliation work");
-		const existing = await this.findExistingMarkdownConflictArtifact(path, content, source);
+		const expectedContentHash = await contentBaselineHash(content);
+		if (!isCurrent()) throw new Error("stale reconciliation work");
+		const existing = await this.findExistingMarkdownConflictArtifact(
+			path,
+			content,
+			source,
+			expectedContentHash,
+			isCurrent,
+		);
 		if (!isCurrent()) throw new Error("stale reconciliation work");
 		if (existing !== null) {
 			this.deps.trace("conflict", "conflict-artifact-deduped", {
@@ -8611,19 +12752,43 @@ export class ReconciliationController {
 			if (this.deps.app.vault.getAbstractFileByPath(candidate)) continue;
 			const diskMirror = this.deps.getDiskMirror();
 			const suppressionHandle = await diskMirror?.suppressLocalCreate(candidate, content);
+			if (!isCurrent()) {
+				if (suppressionHandle) diskMirror?.rollbackLocalCreateSuppression(suppressionHandle);
+				throw new Error("stale reconciliation work");
+			}
+			let createdFile: TFile | null = null;
+			let created = false;
 			try {
 				if (postSuppressCreate) {
-					const created = await postSuppressCreate(() => {
+					const postCreateAccepted = await postSuppressCreate(async () => {
 						if (!isCurrent()) throw new Error("stale reconciliation work");
-						return this.deps.app.vault.create(candidate, content);
+						createdFile = await this.deps.app.vault.create(candidate, content);
+						created = true;
+						return createdFile;
 					});
-					if (!created) throw new Error("stale reconciliation work");
+					if (!postCreateAccepted) throw new Error("stale reconciliation work");
 				} else {
 					if (!isCurrent()) throw new Error("stale reconciliation work");
-					await this.deps.app.vault.create(candidate, content);
+					createdFile = await this.deps.app.vault.create(candidate, content);
+					created = true;
+				}
+				if (!isCurrent()) throw new Error("stale reconciliation work");
+				const artifactFile = createdFile
+					?? this.deps.app.vault.getAbstractFileByPath(candidate);
+				if (!(artifactFile instanceof TFile)) {
+					throw new Error(`conflict artifact missing after create for ${candidate}`);
+				}
+				const exactRead = typeof this.deps.app.vault.adapter.read === "function"
+					? await this.deps.app.vault.adapter.read(candidate)
+					: await this.deps.app.vault.read(artifactFile);
+				if (!isCurrent()) throw new Error("stale reconciliation work");
+				const exactReadHash = await contentBaselineHash(exactRead);
+				if (!isCurrent()) throw new Error("stale reconciliation work");
+				if (exactRead !== content || exactReadHash !== expectedContentHash) {
+					throw new Error(`conflict artifact readback mismatch for ${candidate}`);
 				}
 			} catch (error) {
-				if (suppressionHandle) {
+				if (!created && suppressionHandle) {
 					diskMirror?.rollbackLocalCreateSuppression(suppressionHandle);
 				}
 				throw error;
@@ -8634,6 +12799,7 @@ export class ReconciliationController {
 				reason,
 				source: source ?? null,
 				contentLength: content.length,
+				contentHash: expectedContentHash,
 			});
 			return { path: candidate, created: true };
 		}
@@ -8644,7 +12810,10 @@ export class ReconciliationController {
 		path: string,
 		content: string,
 		source?: "crdt" | "disk" | "editor",
+		expectedContentHash?: string,
+		isCurrent: () => boolean = () => true,
 	): Promise<string | null> {
+		if (!isCurrent()) throw new Error("stale reconciliation work");
 		const vault = this.deps.app.vault;
 		const candidates = typeof vault.getFiles === "function"
 			? vault.getFiles()
@@ -8652,7 +12821,10 @@ export class ReconciliationController {
 		if (candidates === null) return null;
 
 		const targetFingerprint = contentFingerprint(content);
+		const targetHash = expectedContentHash ?? await contentBaselineHash(content);
+		if (!isCurrent()) throw new Error("stale reconciliation work");
 		for (const file of candidates) {
+			if (!isCurrent()) throw new Error("stale reconciliation work");
 			if (!isMarkdownConflictArtifactForOriginalPath(file.path, path, source)) continue;
 			try {
 				// Conflict artifacts preserve the exact competing disk representation.
@@ -8661,10 +12833,18 @@ export class ReconciliationController {
 				const existingContent = typeof this.deps.app.vault.adapter.read === "function"
 					? await this.deps.app.vault.adapter.read(file.path)
 					: await this.deps.app.vault.read(file);
-				if (contentFingerprint(existingContent) === targetFingerprint && existingContent === content) {
+				if (!isCurrent()) throw new Error("stale reconciliation work");
+				const existingHash = await contentBaselineHash(existingContent);
+				if (!isCurrent()) throw new Error("stale reconciliation work");
+				if (
+					existingContent === content
+					&& existingHash === targetHash
+					&& contentFingerprint(existingContent) === targetFingerprint
+				) {
 					return file.path;
 				}
-			} catch {
+			} catch (error) {
+				if (!isCurrent()) throw error;
 				// If an existing candidate cannot be read, keep looking. The
 				// create path below still preserves the competing version.
 			}
@@ -8683,8 +12863,15 @@ export class ReconciliationController {
 			expectedCrdtContent?: string | null;
 			expectedEditorTicket?: OpenEditorMutationTicket;
 			expectedOpenEditorContent?: string;
+			expectedEditorAuthorityLease?: EditorAuthorityLease;
 		} = {},
 	): Promise<boolean> {
+		if (this.isSamePathAdoptionProjectionHeld(path)) {
+			this.deps.trace("reconcile", "disk-index-settlement-held-for-adoption", {
+				path,
+			});
+			return false;
+		}
 		const startingContentHash = this.deps.getDiskIndex()[path]?.contentHash;
 		const startingBaselineRevision = this.diskBaselineRevisions.get(path) ?? 0;
 		try {
@@ -8730,13 +12917,9 @@ export class ReconciliationController {
 							current: false as const,
 							reason: "binding-manager-unavailable" as const,
 						};
-					const currentEditorAuthority = options.expectedOpenEditorContent === undefined
-						? null
-						: this.getOpenEditorAuthority(this.getOpenMarkdownViewsForPath(path));
-					const editorContentCurrent = options.expectedOpenEditorContent === undefined || (
-						currentEditorAuthority?.kind === "single" &&
-						currentEditorAuthority.content === options.expectedOpenEditorContent
-					);
+					const editorContentCurrent =
+						options.expectedEditorAuthorityLease === undefined ||
+						this.isPathEditorAuthorityLeaseCurrent(options.expectedEditorAuthorityLease);
 					if (
 						!fileIdentityCurrent ||
 						!editorTicketValidation.current ||

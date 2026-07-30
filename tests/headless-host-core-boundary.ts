@@ -2,6 +2,12 @@ import assert from "node:assert/strict";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { EditorState } from "../src/headless-host/codeMirrorStateShim";
+import {
+	historyField,
+	isolateHistory,
+	redoDepth,
+	undoDepth,
+} from "../src/headless-host/codeMirrorCommandsShim";
 
 const CORE_DIR = "src/headless-host/core";
 const forbiddenImportPatterns = [
@@ -43,3 +49,10 @@ console.log("\n--- headless host CodeMirror shim: editor safety extensions are a
 assert.equal(typeof EditorState.transactionFilter.of, "function");
 assert.equal(typeof EditorState.transactionExtender.of, "function");
 console.log("  PASS  transaction filters and extenders can be installed during plugin boot");
+
+console.log("\n--- headless host CodeMirror commands shim: replay imports are boot-safe ---");
+assert.equal(typeof historyField, "symbol");
+assert.equal(typeof isolateHistory.of, "function");
+assert.equal(undoDepth({}), 0);
+assert.equal(redoDepth({}), 0);
+console.log("  PASS  replay command imports stay inert without a live editor history");

@@ -58,6 +58,19 @@ function makeMarkdownFixture(options: FixtureOptions = {}) {
 			file,
 			editor: { getValue: () => editorContent },
 		});
+	const editorAuthorityLease = Object.freeze({ leaseId: `dashboard:${path}` });
+	const editorBindings = {
+		capturePathEditorAuthority: (candidate: string) => {
+			if (candidate !== path || openView === null) return { kind: "none" as const };
+			return {
+				kind: "proven-single" as const,
+				content: editorContent,
+				lease: editorAuthorityLease,
+			};
+		},
+		isPathEditorAuthorityLeaseCurrent: (lease: unknown) =>
+			lease === editorAuthorityLease && openView?.file === file && file.path === path,
+	};
 
 	const vaultSync = {
 		isMarkdownTombstoned: (candidate: string) => candidate === path && tombstoned,
@@ -75,9 +88,15 @@ function makeMarkdownFixture(options: FixtureOptions = {}) {
 		) => {
 			ensureCalls++;
 			ensureOptions = optionsArg;
-			if (options.ensureSucceeds === false) return null;
+			if (options.ensureSucceeds === false) {
+				return { kind: "blocked" as const, reason: "policy" as const };
+			}
 			tombstoned = false;
-			return ytext;
+			return {
+				kind: "created" as const,
+				fileId: "dashboard-file-id",
+				ytext,
+			};
 		},
 	};
 	const diskMirror = {
@@ -109,7 +128,7 @@ function makeMarkdownFixture(options: FixtureOptions = {}) {
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => diskMirror as any,
 		getBlobSync: () => null,
-		getEditorBindings: () => null,
+		getEditorBindings: () => editorBindings as any,
 		getDiskIndex: () => diskIndex,
 		setDiskIndex: (next) => { diskIndex = next; },
 		recordBaselineText: () => {},

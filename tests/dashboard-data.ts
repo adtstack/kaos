@@ -219,6 +219,14 @@ const baseInput: KaosDashboardCollectorInput = {
 			contentCheckLimited: false,
 		},
 	},
+	handoffRecovery: {
+		status: "ready",
+		activeCount: 0,
+		terminalCount: 0,
+		totalBytes: 0,
+		issues: [],
+		items: [],
+	},
 	recentChanges: {
 		status: "ready",
 		manifestCount: 1,

@@ -31,6 +31,7 @@ export function buildKaosDashboardData(input: KaosDashboardCollectorInput): Kaos
 		overview: buildOverview(input),
 		snapshotStatus: input.snapshotStatus,
 		recoveryStorageStatus: input.recoveryStorageStatus,
+		handoffRecovery: input.handoffRecovery,
 		recentChanges: input.recentChanges,
 		conflicts: collectDashboardConflictArtifacts(input),
 		blobSafetyCopies: collectDashboardBlobSafetyCopies(input),
