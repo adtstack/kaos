@@ -11,6 +11,7 @@ import { strFromU8, unzipSync } from "fflate";
 import { buildHeadlessHost, buildProductPluginBundle, installVaultPlugin } from "./helpers/headless-host-vault-plugin.mjs";
 
 const root = await mkdtemp(join(tmpdir(), "kaos-headless-user-install-"));
+const PUBLISHED_HEADLESS_0_2_5_KAOSCTL_SHA256 = "df53c7002016cdedbd3afc8b5c94cd5a2aa5382e2373bba2d3f6b88c17ffb5e9";
 
 try {
 	console.log("\n--- headless host user install: build user release assets ---");
@@ -19,6 +20,8 @@ try {
 
 	const headlessVersion = JSON.parse(await readFile("headless-host.version.json", "utf8")).version;
 	const pluginVersion = JSON.parse(await readFile("manifest.json", "utf8")).version;
+	const previousHeadlessVersion = "0.2.5";
+	const previousPluginVersion = "1.10.4";
 	const releaseManifest = JSON.parse(await readFile("dist/kaos-headless-user-manifest.json", "utf8"));
 	assert.equal(releaseManifest.kind, "kaos-headless-user-release-manifest");
 	assert.equal(releaseManifest.schemaVersion, 1);
@@ -62,7 +65,7 @@ try {
 	const installRoot = join(home, ".local", "lib", "kaos");
 	const releasesDir = join(installRoot, "releases");
 	const currentLink = join(installRoot, "current");
-	const oldRelease = join(releasesDir, "0.0.0");
+	const oldRelease = join(releasesDir, previousHeadlessVersion);
 	const configDir = join(home, ".config", "kaos");
 	const stateDir = join(home, ".local", "state", "kaos-headless");
 	const runtimeDir = join(stateDir, "run", "kaos-headless");
@@ -74,16 +77,25 @@ try {
 	await mkdir(serviceDir, { recursive: true });
 	await mkdir(binDir, { recursive: true });
 	await mkdir(join(vaultRoot, ".obsidian"), { recursive: true });
-	await writeFile(join(oldRelease, "VERSION"), "0.0.0\n", "utf8");
+	await writeFile(join(oldRelease, "VERSION"), `${previousHeadlessVersion}\n`, "utf8");
 	await writeFile(join(oldRelease, "kaos-headless-host.mjs"), "console.log('{}')\n", "utf8");
-	await writeFile(join(oldRelease, "kaosctl.mjs"), "console.log('{}')\n", "utf8");
+	const publishedUpdater = await readFile("dist/kaosctl.mjs");
+	assert.equal(
+		sha256Bytes(publishedUpdater),
+		PUBLISHED_HEADLESS_0_2_5_KAOSCTL_SHA256,
+		"the bridge must execute the immutable updater published with headless 0.2.5",
+	);
+	await writeFile(join(oldRelease, "kaosctl.mjs"), publishedUpdater);
 	await chmod(join(oldRelease, "kaosctl.mjs"), 0o755);
 	symlinkSync(oldRelease, currentLink);
 
 	const pluginDir = await installVaultPlugin(vaultRoot);
 	const localPluginManifest = JSON.parse(await readFile(join(pluginDir, "manifest.json"), "utf8"));
-	localPluginManifest.version = "0.0.0-local";
+	localPluginManifest.version = previousPluginVersion;
 	await writeFile(join(pluginDir, "manifest.json"), `${JSON.stringify(localPluginManifest, null, 2)}\n`, "utf8");
+	for (const entry of ["main.js", "telemetry.js", "styles.css"]) {
+		await writeFile(join(pluginDir, entry), `published-1.10.4-${entry}-sentinel\n`, "utf8");
+	}
 	await writeFile(join(pluginDir, "data.json"), `${JSON.stringify({
 		host: "https://worker.example.invalid",
 		token: "secret-token",
@@ -120,22 +132,31 @@ try {
 	}, null, 2)}\n`, "utf8");
 	await writeFile(paths.installConfig, `${JSON.stringify({
 		kind: "kaos-headless-user-install",
-		version: "0.0.0",
+		version: previousHeadlessVersion,
 		releaseBaseUrl: pathToFileURL(`${resolve("dist")}/`).href,
 		vaultRoot,
 		pluginDir,
 		paths,
 	}, null, 2)}\n`, "utf8");
 
-	const update = spawnSync(process.execPath, ["dist/kaosctl.mjs", "update", "--config", paths.installConfig], {
+	const installedUpdater = join(currentLink, "kaosctl.mjs");
+	assert.equal(sha256Bytes(await readFile(installedUpdater)), PUBLISHED_HEADLESS_0_2_5_KAOSCTL_SHA256);
+	const update = spawnSync(process.execPath, [installedUpdater, "update", "--config", paths.installConfig], {
 		encoding: "utf8",
 		env: { ...process.env, HOME: home },
 	});
 	assert.equal(update.status, 0, update.stderr || update.stdout);
 	const updatePayload = JSON.parse(update.stdout);
+	for (const entry of ["manifest.json", "main.js", "telemetry.js", "styles.css"]) {
+		assert.equal(
+			sha256Bytes(await readFile(join(pluginDir, entry))),
+			sha256Bytes(pluginBundle[entry]),
+			`${entry} must be replaced from the 1.10.5 plugin release payload`,
+		);
+	}
 	assert.equal(updatePayload.ok, true);
 	assert.equal(updatePayload.updated, true);
-	assert.equal(updatePayload.previousVersion, "0.0.0");
+	assert.equal(updatePayload.previousVersion, previousHeadlessVersion);
 	assert.equal(updatePayload.version, releaseManifest.version);
 	assert.equal(updatePayload.pluginUpdated, true);
 	assert.equal(updatePayload.pluginVersion, pluginVersion);
