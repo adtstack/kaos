@@ -21,6 +21,17 @@ const forbiddenImportPatterns = [
 	/\.\.\/\.\.\/telemetry/,
 ];
 
+function compareSemver(left: string, right: string): number {
+	const leftParts = left.split(".").map(Number);
+	const rightParts = right.split(".").map(Number);
+	for (let index = 0; index < 3; index++) {
+		if (leftParts[index] !== rightParts[index]) {
+			return leftParts[index] > rightParts[index] ? 1 : -1;
+		}
+	}
+	return 0;
+}
+
 let checked = 0;
 
 async function walk(dir: string): Promise<void> {
@@ -56,3 +67,13 @@ assert.equal(typeof isolateHistory.of, "function");
 assert.equal(undoDepth({}), 0);
 assert.equal(redoDepth({}), 0);
 console.log("  PASS  replay command imports stay inert without a live editor history");
+
+const headlessVersionManifest = JSON.parse(
+	await readFile("headless-host.version.json", "utf8"),
+) as { version?: unknown };
+assert.equal(typeof headlessVersionManifest.version, "string");
+assert.ok(
+	compareSemver(headlessVersionManifest.version, "0.2.6") >= 0,
+	"the @codemirror/commands host capability must not ship under headless 0.2.5",
+);
+console.log("  PASS  commands shim is carried by headless 0.2.6 or newer");

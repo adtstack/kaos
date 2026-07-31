@@ -39,6 +39,7 @@ const UPLOAD_KEYS = new Set([
 	"status",
 	"readyAt",
 	"attentionResolution",
+	"deferredUntilSettlement",
 	"needsRerun",
 	"rerunResets",
 ]);
@@ -180,6 +181,17 @@ function isUpload(value: unknown): boolean {
 		&& (value.status === undefined || value.status === "pending" || value.status === "processing")
 		&& isOptionalNonNegativeSafeInteger(value.readyAt)
 		&& (value.attentionResolution === undefined || isAttentionResolution(value.attentionResolution))
+		&& (value.deferredUntilSettlement === undefined || value.deferredUntilSettlement === true)
+		&& (
+			value.deferredUntilSettlement !== true
+			|| (
+				value.baseRefKnown === false
+				&& value.expectedBaseRef === undefined
+				&& value.expectedBaseSourceVersion === undefined
+				&& value.causalBaseRef === undefined
+				&& value.attentionResolution === undefined
+			)
+		)
 		&& (value.needsRerun === undefined || typeof value.needsRerun === "boolean")
 		&& isOptionalNonNegativeSafeInteger(value.rerunResets);
 }

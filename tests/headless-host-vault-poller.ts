@@ -61,9 +61,57 @@ try {
 	} finally {
 		livePoller.stop();
 	}
+
+	console.log("\n--- headless host vault poller: external write during Vault create remains observable ---");
+	const raceRoot = await mkdtemp(join(tmpdir(), "kaos-headless-host-create-race-"));
+	const raceVault = new HeadlessVault({ vaultRoot: raceRoot });
+	const racePoller = new HeadlessVaultPoller(raceVault, {
+		intervalMs: 60_000,
+		quietMs: 0,
+	});
+	const raceEvents: Array<{ kind: string; path: string }> = [];
+	racyVaultOnCreateAndModify(raceVault, raceEvents);
+	await racePoller.start();
+	try {
+		const path = "attachments/create-race.bin";
+		const adapter = raceVault.adapter as unknown as {
+			linkPreparedFile(source: string, target: string): Promise<void>;
+		};
+		const originalLinkPreparedFile = adapter.linkPreparedFile.bind(raceVault.adapter);
+		adapter.linkPreparedFile = async (source, target) => {
+			await originalLinkPreparedFile(source, target);
+			// Model an out-of-band writer that reacts to the linked destination before
+			// the adapter can return and HeadlessVault can publish its create event.
+			await writeFile(target, Buffer.from([9, 8, 7]));
+		};
+		await raceVault.createBinary(path, new Uint8Array([0, 1, 2, 3, 4]).buffer);
+		raceEvents.length = 0;
+		await racePoller.pollOnce();
+		assert.deepEqual(
+			raceEvents,
+			[{ kind: "modify", path }],
+			"the poll baseline retains the Vault-owned revision instead of swallowing the external overwrite",
+		);
+		console.log("  PASS  pre-event external overwrite is emitted as a later modify");
+	} finally {
+		racePoller.stop();
+		await rm(raceRoot, { recursive: true, force: true });
+	}
 } finally {
 	poller.stop();
 	await rm(root, { recursive: true, force: true });
+}
+
+function racyVaultOnCreateAndModify(
+	vault: HeadlessVault,
+	events: Array<{ kind: string; path: string }>,
+): void {
+	vault.on("create", (file: { path: string }) => {
+		events.push({ kind: "create", path: file.path });
+	});
+	vault.on("modify", (file: { path: string }) => {
+		events.push({ kind: "modify", path: file.path });
+	});
 }
 
 function sleep(ms: number): Promise<void> {
