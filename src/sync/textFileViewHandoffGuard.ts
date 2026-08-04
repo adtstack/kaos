@@ -17,6 +17,21 @@ export type ManagedHostSwitchTicket = Readonly<{
 	sourceUnloadReceiptId: string;
 }>;
 
+/**
+ * A load-entry callback may defer admission while an editor-side reservation
+ * reaches a terminal boundary. A synchronous null retains the legacy
+ * pass-through behavior. A deferred null is different: the host load is
+ * suppressed because delegating it after an explicit deferred admission
+ * failed would create an untracked file transition.
+ */
+export type ManagedHostSwitchTicketAdmission =
+	| ManagedHostSwitchTicket
+	| null
+	| PromiseLike<ManagedHostSwitchTicket | null>;
+
+/** Null means the source input gate is already closed; a promise drains one exact reservation. */
+export type ManagedSourceUnloadDrainAdmission = null | PromiseLike<void>;
+
 export type ExactHostLoadDispatchIdentity = Readonly<{
 	hostLoadTokenId: string;
 	sessionId: string;
@@ -31,10 +46,12 @@ export type ExactHostLoadDispatchIdentity = Readonly<{
 }>;
 
 export interface TextFileViewHandoffGuardCallbacks {
+	/** Runs before native unload or its forced save can observe the source editor. */
+	onUnloadFileEntry(sourceFile: TFile): ManagedSourceUnloadDrainAdmission;
 	onLoadFileEntry(
 		targetFile: TFile,
 		sourceUnloadReceiptId: string,
-	): ManagedHostSwitchTicket | null;
+	): ManagedHostSwitchTicketAdmission;
 	onSetViewDataEntry(input: Readonly<{
 		ticket: ManagedHostSwitchTicket;
 		incomingContent: string;
@@ -66,6 +83,8 @@ export type TextFileViewHostCapability =
 export interface TextFileViewHandoffGuardInstallOptions {
 	hostApiVersion: string;
 	requestSaveDelayMs?: number;
+	/** Terminal bound for the exact editor-drain plus preexisting-save settlement. */
+	sourceUnloadDrainDeadlineMs?: number;
 }
 
 export interface ManagedSaveOwnershipContext {
@@ -94,6 +113,32 @@ export type ManagedSourceUnloadSnapshot = Readonly<{
 	state: "saving" | "settled" | "rejected" | "atomic-window-expired";
 	forcedSaveObserved: boolean;
 	cacheRetiredBeforeUnloadSettled: boolean;
+}>;
+
+export type ManagedDeferredLoadAdmissionSnapshot = Readonly<{
+	ownerId: number;
+	pendingLoadEpoch: number;
+	targetFile: TFile;
+	targetPath: string;
+	sourceUnloadReceiptId: string;
+	sourceUnloadId: number;
+	sourceFile: TFile;
+	sourcePath: string;
+	viewFileAtEntry: TFile | null;
+	viewPathAtEntry: string | null;
+}>;
+
+export type ManagedSourceUnloadDrainSnapshot = Readonly<{
+	ownerId: number;
+	sourceFile: TFile;
+	sourcePath: string;
+	viewFileAtEntry: TFile;
+	viewPathAtEntry: string;
+	nativeLoadEpochAtEntry: number;
+	pendingLoadEpochAtEntry: number;
+	saveEpochAtEntry: number;
+	preexistingSaveCount: number;
+	expectedSaveEpochAfterDrain: number;
 }>;
 
 export type TextFileViewHandoffGuardInstallResult =
@@ -136,7 +181,46 @@ export type ManagedViewSaveGuard = Readonly<{
 	pendingTargetSave: boolean;
 	pendingOwnedSave: ManagedOwnedSaveJobSnapshot | null;
 	sourceUnload: ManagedSourceUnloadSnapshot | null;
+	/** Monotonic revision for every pending host-load owner/state transition. */
+	pendingLoadEpoch?: number;
+	pendingDeferredLoadAdmission?: ManagedDeferredLoadAdmissionSnapshot | null;
+	pendingSourceUnloadDrain?: ManagedSourceUnloadDrainSnapshot | null;
+	/** Monotonic CAS revision for native load and association state. */
+	nativeLoadEpoch?: number;
+	/** Native host-load promises that have entered but not settled. */
+	pendingNativeHostLoadCount?: number;
+	/** Any active native load/association ambiguity makes normal release ineligible. */
+	nativeHostLoadAmbiguous?: boolean;
+	/** Monotonic revision for the retained post-presentation setViewData fence. */
+	managedClearTombstoneEpoch?: number;
+	/** True until the presented target enters its next exact unload or teardown. */
+	managedClearTombstoneActive?: boolean;
+	/** Guard-owned host lifecycle suspended until explicit safe teardown. */
+	terminalHostLifecycle?: Readonly<{
+		ownerId: number;
+		state: "blocked";
+	}> | null;
+	/** True only while both installed save wrappers are the live host entry points. */
+	wrappersCurrent: boolean;
+	/** True only while load/unload/setViewData are the exact installed entry points. */
+	loadWrappersCurrent?: boolean;
+	/** Emergency ownership exists and both save entry points are synchronously blocked. */
+	emergencySaveBlocked: boolean;
 }>;
+
+export interface TextFileViewEmergencySaveFence {
+	readonly view: TextFileView;
+	/**
+	 * Reclaim writable/configurable save entry points and synchronously re-arm the block.
+	 * Once wrapper drift is observed this remains false: an already-scheduled foreign
+	 * save tail cannot be proven cancelled merely by restoring function identity.
+	 */
+	refresh(): boolean;
+	/** Ownership/identity proof. Observed wrapper drift permanently taints this guard. */
+	isCurrent(): boolean;
+	/** Release this exact owner once. The manager calls this only after exact B or safe teardown. */
+	release(): boolean;
+}
 
 export interface TextFileViewHandoffGuard {
 	beginBlockingHandoff(input: Readonly<{
@@ -144,7 +228,24 @@ export interface TextFileViewHandoffGuard {
 		sourceLineagePath: string | null;
 		targetPath: string;
 	}>): void;
+	/** Pure exact-CAS predicate for irreversible target-presentation work. */
+	isTargetPresentationReady(input: Readonly<{
+		handoffGeneration: number;
+		targetFile: TFile;
+		certifiedContent: string;
+	}>): boolean;
 	markTargetProven(input: Readonly<{
+		handoffGeneration: number;
+		targetFile: TFile;
+		certifiedContent: string;
+	}>): boolean;
+	/**
+	 * Publish an exact completed host load as the new local editor authority.
+	 * Unlike controller presentation proof, this also retires the consumed
+	 * source-unload record so ordinary same-path admission can proceed behind
+	 * the already-visible target.
+	 */
+	markTargetLocallyPresented(input: Readonly<{
 		handoffGeneration: number;
 		targetFile: TFile;
 		certifiedContent: string;
@@ -154,6 +255,9 @@ export interface TextFileViewHandoffGuard {
 	isExactHostLoadDispatchActive(identity: ExactHostLoadDispatchIdentity): boolean;
 	flushOwnedSave(): Promise<void>;
 	cancelOwnedSave(): void;
+	/** Reject one exact terminal lifecycle owner at a safe close/reopen boundary. */
+	cancelTerminalHostLifecycle(reason: string): boolean;
+	acquireEmergencySaveFence(): TextFileViewEmergencySaveFence;
 	markInert(): void;
 	restoreIfCurrent(): void;
 	snapshot(): ManagedViewSaveGuard;
@@ -192,6 +296,8 @@ type RuntimeMethodDescriptor = Omit<PropertyDescriptor, "value" | "get" | "set">
 	value: RuntimeMethod;
 }>;
 
+const HOST_LOAD_SUPERSEDED = "superseded" as const;
+
 type LocatedMethod = Readonly<{
 	name: GuardedMethodName;
 	descriptor: RuntimeMethodDescriptor;
@@ -204,6 +310,60 @@ type InFlightLoad = {
 	targetPathAtEntry: string;
 	ambiguous: boolean;
 	clearObserved: boolean;
+	superseded: boolean;
+	locallyCommitted: boolean;
+	localCommit: Promise<void>;
+	resolveLocalCommit: () => void;
+	retirement: Promise<void>;
+	resolveRetirement: () => void;
+	supersession: Promise<typeof HOST_LOAD_SUPERSEDED>;
+	resolveSupersession: (outcome: typeof HOST_LOAD_SUPERSEDED) => void;
+};
+
+type DeferredHostLoadAdmission = {
+	ownerId: number;
+	epoch: number;
+	targetFile: TFile;
+	targetPathAtEntry: string;
+	sourceRetirement: SourceUnloadRecord;
+	callbacks: TextFileViewHandoffGuardCallbacks;
+	viewFileAtEntry: TFile | null;
+	viewPathAtEntry: string | null;
+	cancelled: boolean;
+	supersession: Promise<typeof HOST_LOAD_SUPERSEDED>;
+	resolveSupersession: (outcome: typeof HOST_LOAD_SUPERSEDED) => void;
+};
+
+type PendingSourceUnloadDrain = {
+	ownerId: number;
+	sourceFile: TFile;
+	sourcePathAtEntry: string;
+	callbacks: TextFileViewHandoffGuardCallbacks;
+	viewFileAtEntry: TFile;
+	viewPathAtEntry: string;
+	nativeLoadEpochAtEntry: number;
+	pendingLoadEpochAtEntry: number;
+	saveEpochAtEntry: number;
+	preexistingSaveTails: readonly InFlightSave[];
+	expectedSaveEpochAfterDrain: number;
+	managedClearTombstoneEpochAtEntry: number;
+	sourceUnloadAtEntry: SourceUnloadRecord | null;
+	activeUnprovenTargetUnloadAtEntry: UnprovenTargetUnload | null;
+	modeAtEntry: InternalMode;
+	deadlineExpired: boolean;
+	deadlineTimer: ReturnType<typeof setTimeout> | null;
+	cancellation: Promise<never>;
+	rejectCancellation: (reason: unknown) => void;
+};
+
+type InFlightSave = {
+	id: number;
+	file: TFile | null;
+	path: string | null;
+	startedAt: number;
+	settlement: Promise<void>;
+	resolveSettlement: () => void;
+	settled: boolean;
 };
 
 type SourceUnloadRecord = {
@@ -213,6 +373,7 @@ type SourceUnloadRecord = {
 	path: string;
 	sourceContent: string | null;
 	state: ManagedSourceUnloadSnapshot["state"];
+	cleanRefresh: boolean;
 	forcedSaveObserved: boolean;
 	forcedSaveFile: TFile | null;
 	forcedSavePath: string | null;
@@ -228,6 +389,13 @@ type UnprovenTargetRolloverProof = Readonly<{
 	candidate: PendingHostLoadCandidate;
 }>;
 
+type SourceRetirementRolloverEvidence =
+	| Readonly<{ kind: "source-presentation" }>
+	| Readonly<{
+		kind: "held-target";
+		proof: UnprovenTargetRolloverProof;
+	}>;
+
 type UnprovenTargetUnload = Readonly<{
 	load: InFlightLoad | null;
 	ticket: ManagedHostSwitchTicket;
@@ -237,24 +405,23 @@ type UnprovenTargetUnload = Readonly<{
 	retiredSource: SourceUnloadRecord | null;
 }>;
 
-type LoadAmbiguityGroup = {
-	id: number;
-	activeLoadIds: Set<number>;
-	expectedClearCount: number;
-	observedClearCount: number;
-};
-
 type HostLoadAssociation = {
 	loadId: number;
 	ticket: ManagedHostSwitchTicket;
 	targetPathAtEntry: string;
 	hostLoadTokenId: string;
 	incomingContent: string;
-	loadStatus: "pending" | "fulfilled";
+	loadStatus: "pending" | "fulfilled" | "local-committed";
 	candidate: PendingHostLoadCandidate | null;
 	pendingReceipt: HostLoadCompletionReceipt | null;
+	completionForwarded: boolean;
 	dispatchAmbiguous: boolean;
 };
+
+type ManagedClearTombstone = Readonly<{
+	targetFile: TFile;
+	targetPath: string;
+}>;
 
 type BlockingState = Readonly<{
 	kind: "blocking-handoff";
@@ -295,6 +462,7 @@ type RegisteredReplacement =
 const installedGuards = new WeakMap<object, InstalledGuardRegistryEntry>();
 const OWNED_SCHEDULER_WITH_UNLOAD_FLUSH_HOSTS = new Set(["1.8.4", "1.13.4"]);
 const DEFAULT_REQUEST_SAVE_DELAY_MS = 2_000;
+const DEFAULT_SOURCE_UNLOAD_DRAIN_DEADLINE_MS = 10_000;
 const MAX_SOURCE_UNLOAD_RECERTIFICATION_SAVES = 3;
 let nextHostGuardInstanceId = 1;
 const editorHandoffHostQaBarrierByView = EDITOR_HANDOFF_QA_ENABLED
@@ -416,6 +584,12 @@ export function installTextFileViewHandoffGuard(
 	if (!Number.isSafeInteger(requestSaveDelayMs) || requestSaveDelayMs < 0) {
 		return { kind: "unsupported", reason: "unsupported-host-adapter" };
 	}
+	const sourceUnloadDrainDeadlineMs = options.sourceUnloadDrainDeadlineMs
+		?? DEFAULT_SOURCE_UNLOAD_DRAIN_DEADLINE_MS;
+	if (
+		!Number.isSafeInteger(sourceUnloadDrainDeadlineMs)
+		|| sourceUnloadDrainDeadlineMs < 1
+	) return { kind: "unsupported", reason: "unsupported-host-adapter" };
 	const methods = new Map<GuardedMethodName, LocatedMethod>();
 	for (const name of [
 		"onUnloadFile",
@@ -466,10 +640,15 @@ export function installTextFileViewHandoffGuard(
 	let callbackRef: TextFileViewHandoffGuardCallbacks | null = callbacks;
 	let mode: InternalMode = { kind: "pass-through" };
 	let nextLoadId = 1;
-	let nextAmbiguityGroupId = 1;
 	let nextSaveId = 1;
 	let nextOwnedSaveJobId = 1;
 	let nextSourceUnloadId = 1;
+	let nextPendingLoadOwnerId = 1;
+	let nextSourceUnloadDrainOwnerId = 1;
+	let nextTerminalHostLifecycleOwnerId = 1;
+	let pendingLoadEpoch = 0;
+	let nativeLoadEpoch = 0;
+	let managedClearTombstoneEpoch = 0;
 	const hostGuardInstanceId = nextHostGuardInstanceId++;
 	let saveEpoch = 0;
 	let hostCapabilityState: "ready" | "lost" = "ready";
@@ -481,17 +660,86 @@ export function installTextFileViewHandoffGuard(
 	const inFlightLoads = new Map<number, InFlightLoad>();
 	const hostLoadAssociations = new Map<string, HostLoadAssociation>();
 	let activeHostLoadDispatch: HostLoadAssociation | null = null;
-	const inFlightSaves = new Map<number, Readonly<{
-		file: TFile | null;
-		path: string | null;
-		startedAt: number;
-	}>>();
+	let managedClearTombstone: ManagedClearTombstone | null = null;
+	let pendingSourceUnloadDrain: PendingSourceUnloadDrain | null = null;
+	let pendingDeferredLoadAdmission: DeferredHostLoadAdmission | null = null;
+	let activeNativeLoadInvocation: InFlightLoad | null = null;
+	let terminalHostLifecycle: {
+		ownerId: number;
+		promise: Promise<void>;
+		reject(reason: unknown): void;
+		settled: boolean;
+	} | null = null;
+	const emergencySaveFenceOwners = new Set<object>();
+	let emergencySaveFenceUnprovable = false;
+	const inFlightSaves = new Map<number, InFlightSave>();
 	const qaHeldLoadSettlements = EDITOR_HANDOFF_QA_ENABLED
 		? new Map<number, Promise<"applied" | "rejected">>()
 		: null;
 	let latestLoad: InFlightLoad | null = null;
-	let activeAmbiguityGroup: LoadAmbiguityGroup | null = null;
 	let clearLoadCapability: "observable" | "clear-load-not-observable" = "observable";
+
+	function advancePendingLoadEpoch(): void {
+		if (pendingLoadEpoch < Number.MAX_SAFE_INTEGER) pendingLoadEpoch += 1;
+	}
+
+	function advanceNativeLoadEpoch(): void {
+		if (nativeLoadEpoch < Number.MAX_SAFE_INTEGER) nativeLoadEpoch += 1;
+	}
+
+	function advanceManagedClearTombstoneEpoch(): void {
+		if (managedClearTombstoneEpoch < Number.MAX_SAFE_INTEGER) {
+			managedClearTombstoneEpoch += 1;
+		}
+	}
+
+	function retainManagedClearTombstone(association: HostLoadAssociation): void {
+		advanceNativeLoadEpoch();
+		managedClearTombstone = Object.freeze({
+			targetFile: association.ticket.targetFile,
+			targetPath: association.targetPathAtEntry,
+		});
+		advanceManagedClearTombstoneEpoch();
+	}
+
+	function clearManagedClearTombstone(): void {
+		if (managedClearTombstone === null) return;
+		managedClearTombstone = null;
+		advanceNativeLoadEpoch();
+		advanceManagedClearTombstoneEpoch();
+	}
+
+	function nativeHostLoadIsAmbiguous(): boolean {
+		return clearLoadCapability !== "observable"
+			|| [...inFlightLoads.values()].some((load) => load.ambiguous)
+			|| hostLoadAssociations.size > 1
+			|| [...hostLoadAssociations.values()].some(
+				(association) => association.dispatchAmbiguous,
+			);
+	}
+
+	function exactPendingViewFile(
+		targetFile: TFile,
+		targetPath: string,
+		viewFileAtEntry: TFile | null,
+		viewPathAtEntry: string | null,
+	): boolean {
+		const current = currentFileOf(view);
+		return targetFile.path === targetPath
+			&& targetPath.length > 0
+			&& current === viewFileAtEntry
+			&& (current?.path ?? null) === viewPathAtEntry;
+	}
+
+	function guardedHostLoadCancellation(reason: string): Error {
+		return new Error(`KAOS guarded host load cancelled: ${reason}`);
+	}
+
+	function rejectGuardedHostLoad(reason: string): Promise<never> {
+		const rejected = Promise.reject(guardedHostLoadCancellation(reason));
+		void rejected.catch(() => undefined);
+		return rejected;
+	}
 
 	function isTicketCurrent(ticket: ManagedHostSwitchTicket): boolean {
 		return callbackRef !== null
@@ -502,12 +750,16 @@ export function installTextFileViewHandoffGuard(
 		for (const association of hostLoadAssociations.values()) {
 			if (association.loadId === loadId) {
 				hostLoadAssociations.delete(association.hostLoadTokenId);
+				advanceNativeLoadEpoch();
 			}
 		}
 	}
 
 	function markLoadAmbiguous(load: InFlightLoad): void {
-		load.ambiguous = true;
+		if (!load.ambiguous) {
+			load.ambiguous = true;
+			advanceNativeLoadEpoch();
+		}
 		invalidateAssociationsForLoad(load.id);
 		if (
 			mode.kind === "blocking-handoff"
@@ -515,58 +767,32 @@ export function installTextFileViewHandoffGuard(
 		) mode = { ...mode, ticket: null };
 	}
 
-	function loseClearLoadCapability(): void {
-		if (clearLoadCapability === "clear-load-not-observable") return;
-		clearLoadCapability = "clear-load-not-observable";
-		latestLoad = null;
-		activeAmbiguityGroup = null;
-		hostLoadAssociations.clear();
-		for (const load of inFlightLoads.values()) markLoadAmbiguous(load);
-		if (mode.kind === "blocking-handoff") mode = { ...mode, ticket: null };
-	}
-
-	function addLoadToAmbiguityGroup(
-		group: LoadAmbiguityGroup,
-		load: InFlightLoad,
-	): void {
-		if (group.activeLoadIds.has(load.id)) return;
-		group.activeLoadIds.add(load.id);
-		group.expectedClearCount += 1;
-		if (load.clearObserved) group.observedClearCount += 1;
-		markLoadAmbiguous(load);
-	}
-
-	function ensureAmbiguityGroup(extraLoad?: InFlightLoad): LoadAmbiguityGroup {
-		let group = activeAmbiguityGroup;
-		if (group === null) {
-			group = {
-				id: nextAmbiguityGroupId++,
-				activeLoadIds: new Set(),
-				expectedClearCount: 0,
-				observedClearCount: 0,
-			};
-			activeAmbiguityGroup = group;
+	function supersedeManagedLoad(load: InFlightLoad): void {
+		if (load.superseded) return;
+		load.superseded = true;
+		advanceNativeLoadEpoch();
+		invalidateAssociationsForLoad(load.id);
+		if (latestLoad === load) latestLoad = null;
+		if (mode.kind === "blocking-handoff" && mode.ticket === load.ticket) {
+			mode = { ...mode, ticket: null };
 		}
-		for (const load of inFlightLoads.values()) addLoadToAmbiguityGroup(group, load);
-		if (extraLoad !== undefined) addLoadToAmbiguityGroup(group, extraLoad);
-		return group;
+		load.resolveSupersession(HOST_LOAD_SUPERSEDED);
 	}
 
 	function exactLoadForSetViewData(): InFlightLoad | null {
-		if (clearLoadCapability !== "observable" || inFlightLoads.size === 0) return null;
+		if (clearLoadCapability !== "observable") return null;
+		const activeLoads = activeManagedLoads();
+		if (activeLoads.length !== 1) return null;
+		const load = activeLoads[0];
+		if (load === undefined || load.ambiguous) return null;
 		if (
-			activeAmbiguityGroup !== null
-			|| inFlightLoads.size !== 1
-		) {
-			ensureAmbiguityGroup().observedClearCount += 1;
-			return null;
+			inFlightLoads.size !== activeLoads.length
+			&& activeNativeLoadInvocation !== load
+		) return null;
+		if (!load.clearObserved) {
+			load.clearObserved = true;
+			advanceNativeLoadEpoch();
 		}
-		const load = inFlightLoads.values().next().value as InFlightLoad | undefined;
-		if (load === undefined || load.ambiguous) {
-			ensureAmbiguityGroup().observedClearCount += 1;
-			return null;
-		}
-		load.clearObserved = true;
 		return isTicketCurrent(load.ticket)
 			&& view.file === load.ticket.targetFile
 			&& view.file.path === load.targetPathAtEntry
@@ -575,13 +801,13 @@ export function installTextFileViewHandoffGuard(
 	}
 
 	function exactLoadForQaHold(): InFlightLoad | null {
+		const activeLoads = activeManagedLoads();
 		if (
 			!EDITOR_HANDOFF_QA_ENABLED
 			|| clearLoadCapability !== "observable"
-			|| activeAmbiguityGroup !== null
-			|| inFlightLoads.size !== 1
+			|| activeLoads.length !== 1
 		) return null;
-		const load = inFlightLoads.values().next().value as InFlightLoad | undefined;
+		const load = activeLoads[0];
 		return load !== undefined
 			&& !load.ambiguous
 			&& !load.clearObserved
@@ -617,18 +843,24 @@ export function installTextFileViewHandoffGuard(
 			&& receipt.effectFingerprint === candidate.effectFingerprint;
 	}
 
-	function forwardCompletionIfSettled(association: HostLoadAssociation): void {
-		const receipt = association.pendingReceipt;
+	function forwardLocallyCommittedCompletion(association: HostLoadAssociation): boolean {
 		if (
-			association.loadStatus !== "fulfilled"
-			|| receipt === null
+			association.loadStatus !== "local-committed"
+			|| association.pendingReceipt === null
+			|| association.completionForwarded
 			|| callbackRef === null
 			|| !associationIsCurrent(association)
-			|| !receiptMatchesAssociation(association, receipt)
-		) return;
-		association.pendingReceipt = null;
-		hostLoadAssociations.delete(association.hostLoadTokenId);
-		callbackRef.onHostLoadCompleted(receipt);
+		) return false;
+		association.completionForwarded = true;
+		advanceNativeLoadEpoch();
+		try {
+			callbackRef.onHostLoadCompleted(association.pendingReceipt);
+			return true;
+		} catch {
+			association.dispatchAmbiguous = true;
+			advanceNativeLoadEpoch();
+			return false;
+		}
 	}
 
 	function settleLoad(loadId: number | null, fulfilled: boolean): void {
@@ -646,32 +878,40 @@ export function installTextFileViewHandoffGuard(
 		}
 		const load = inFlightLoads.get(loadId);
 		if (load === undefined) return;
+		const rejectedAfterCandidate = !fulfilled
+			&& [...hostLoadAssociations.values()].some(
+				(association) => association.loadId === loadId
+					&& association.loadStatus !== "local-committed"
+					&& (association.candidate !== null || association.pendingReceipt !== null),
+			);
 		inFlightLoads.delete(loadId);
-		if (!fulfilled) markLoadAmbiguous(load);
-		if (activeAmbiguityGroup?.activeLoadIds.has(loadId) === true) {
-			const group = activeAmbiguityGroup;
-			group.activeLoadIds.delete(loadId);
-			if (group.activeLoadIds.size === 0) {
-				activeAmbiguityGroup = null;
-				if (group.observedClearCount < group.expectedClearCount) {
-					loseClearLoadCapability();
-				}
-			}
-		} else if (
+		advanceNativeLoadEpoch();
+		if (!fulfilled && !load.superseded) markLoadAmbiguous(load);
+		if (
 			fulfilled
 			&& !load.clearObserved
-			&& isTicketCurrent(load.ticket)
 		) {
-			loseClearLoadCapability();
+			if (load.superseded) {
+				void enterHostLoadMutationTerminal(
+					"superseded-host-load-tail-unobservable",
+				);
+			} else if (isTicketCurrent(load.ticket)) {
+				void enterHostLoadMutationTerminal("host-load-clear-not-observed");
+			}
 		}
 		for (const association of hostLoadAssociations.values()) {
 			if (association.loadId !== loadId) continue;
-			if (!fulfilled || !associationIsCurrent(association)) {
+			if (!fulfilled || load.superseded || !associationIsCurrent(association)) {
 				hostLoadAssociations.delete(association.hostLoadTokenId);
+				advanceNativeLoadEpoch();
 				continue;
 			}
+			if (association.loadStatus !== "pending") continue;
 			association.loadStatus = "fulfilled";
-			forwardCompletionIfSettled(association);
+			advanceNativeLoadEpoch();
+		}
+		if (rejectedAfterCandidate && !load.superseded) {
+			void enterHostLoadMutationTerminal("host-native-load-rejected-after-candidate");
 		}
 	}
 
@@ -684,6 +924,11 @@ export function installTextFileViewHandoffGuard(
 			invocationFile,
 			invocationPath: invocationFile?.path ?? null,
 		});
+	}
+
+	function terminalSaveSuppressionActive(): boolean {
+		return callbackRef !== null
+			&& (terminalHostLifecycle !== null || hostCapabilityState === "lost");
 	}
 
 	function clearSourceUnloadExpiry(): void {
@@ -700,6 +945,91 @@ export function installTextFileViewHandoffGuard(
 		}
 	}
 
+	function sourceUnloadDrainIsCurrent(owner: PendingSourceUnloadDrain): boolean {
+		return pendingSourceUnloadDrain === owner
+			&& callbackRef === owner.callbacks
+			&& terminalHostLifecycle === null
+			&& hostCapabilityState === "ready"
+			&& saveWrappersCurrent()
+			&& loadWrappersCurrent()
+			&& currentFileOf(view) === owner.viewFileAtEntry
+			&& owner.viewFileAtEntry === owner.sourceFile
+			&& owner.sourceFile.path === owner.sourcePathAtEntry
+			&& owner.viewPathAtEntry === owner.sourcePathAtEntry
+			&& nativeLoadEpoch === owner.nativeLoadEpochAtEntry
+			&& pendingLoadEpoch === owner.pendingLoadEpochAtEntry
+			&& saveEpoch === owner.expectedSaveEpochAfterDrain
+			&& inFlightSaves.size === 0
+			&& owner.preexistingSaveTails.every((tail) =>
+				tail.settled && inFlightSaves.get(tail.id) !== tail
+			)
+			&& managedClearTombstoneEpoch
+				=== owner.managedClearTombstoneEpochAtEntry
+			&& sourceUnload === owner.sourceUnloadAtEntry
+			&& activeUnprovenTargetUnload
+				=== owner.activeUnprovenTargetUnloadAtEntry
+			&& mode === owner.modeAtEntry;
+	}
+
+	function sourceUnloadDrainObservableStateIsExact(
+		owner: PendingSourceUnloadDrain,
+	): boolean {
+		// We intentionally do not proxy mutable host/TFile properties. A direct
+		// A -> B -> A mutation with no guarded call is outside the observable host
+		// boundary; every guarded save/load/set entry recertifies the exact owner.
+		try {
+			return pendingSourceUnloadDrain === owner
+				&& callbackRef === owner.callbacks
+				&& terminalHostLifecycle === null
+				&& hostCapabilityState === "ready"
+				&& saveWrappersCurrent()
+				&& loadWrappersCurrent()
+				&& currentFileOf(view) === owner.viewFileAtEntry
+				&& owner.viewFileAtEntry === owner.sourceFile
+				&& owner.sourceFile.path === owner.sourcePathAtEntry
+				&& owner.viewPathAtEntry === owner.sourcePathAtEntry
+				&& nativeLoadEpoch === owner.nativeLoadEpochAtEntry
+				&& pendingLoadEpoch === owner.pendingLoadEpochAtEntry
+				&& managedClearTombstoneEpoch
+					=== owner.managedClearTombstoneEpochAtEntry
+				&& sourceUnload === owner.sourceUnloadAtEntry
+				&& activeUnprovenTargetUnload
+					=== owner.activeUnprovenTargetUnloadAtEntry
+				&& mode === owner.modeAtEntry;
+		} catch {
+			return false;
+		}
+	}
+
+	function sourceUnloadDrainObservedDrift(): boolean {
+		const owner = pendingSourceUnloadDrain;
+		if (owner === null || sourceUnloadDrainObservableStateIsExact(owner)) return false;
+		void enterHostLoadMutationTerminal("source-unload-drain-observable-drift");
+		return true;
+	}
+
+	function clearSourceUnloadDrainDeadline(owner: PendingSourceUnloadDrain): void {
+		if (owner.deadlineTimer !== null) clearTimeout(owner.deadlineTimer);
+		owner.deadlineTimer = null;
+	}
+
+	function clearSourceUnloadDrain(owner: PendingSourceUnloadDrain): void {
+		clearSourceUnloadDrainDeadline(owner);
+		if (pendingSourceUnloadDrain === owner) pendingSourceUnloadDrain = null;
+	}
+
+	function armSourceUnloadDrainDeadline(owner: PendingSourceUnloadDrain): void {
+		if (owner.deadlineTimer !== null || owner.deadlineExpired) return;
+		owner.deadlineTimer = setTimeout(() => {
+			owner.deadlineTimer = null;
+			if (pendingSourceUnloadDrain !== owner || owner.deadlineExpired) return;
+			owner.deadlineExpired = true;
+			owner.rejectCancellation(
+				guardedHostLoadCancellation("source-unload-drain-deadline-exceeded"),
+			);
+		}, sourceUnloadDrainDeadlineMs);
+	}
+
 	function isSourceCacheRetired(): boolean {
 		const host = view as TextFileView & { lastSavedData?: unknown };
 		return view.data === "" && host.lastSavedData === null;
@@ -707,6 +1037,39 @@ export function installTextFileViewHandoffGuard(
 
 	function sourcePresentationMatchesRetirement(record: SourceUnloadRecord): boolean {
 		return isSourceCacheRetired() || currentViewContent() === record.sourceContent;
+	}
+
+	function cleanRefreshPresentationIsExact(record: SourceUnloadRecord): boolean {
+		if (!record.cleanRefresh || record.sourceContent === null) return false;
+		try {
+			const host = view as TextFileView & {
+				dirty?: unknown;
+				lastSavedData?: unknown;
+			};
+			return currentFileOf(view) === record.file
+				&& record.file.path === record.path
+				&& currentViewContent() === record.sourceContent
+				&& view.data === record.sourceContent
+				&& host.lastSavedData === record.sourceContent
+				&& host.dirty === false;
+		} catch {
+			return false;
+		}
+	}
+
+	function sourceRetirementProofIsExact(record: SourceUnloadRecord): boolean {
+		if (record.sourceContent === null || record.file.path !== record.path) return false;
+		if (record.cleanRefresh) {
+			return !record.forcedSaveObserved
+				&& record.forcedSaveFile === null
+				&& record.forcedSavePath === null
+				&& record.forcedSaveContent === null
+				&& !record.inputObservedBeforeSettlement;
+		}
+		return record.forcedSaveObserved
+			&& record.forcedSaveFile === record.file
+			&& record.forcedSavePath === record.path
+			&& record.forcedSaveContent === record.sourceContent;
 	}
 
 	function armSourceUnloadExpiry(record: SourceUnloadRecord): void {
@@ -720,7 +1083,12 @@ export function installTextFileViewHandoffGuard(
 	}
 
 	function sourceUnloadBlocksOrdinarySave(invocationFile: TFile | null): boolean {
+		if (pendingSourceUnloadDrain !== null) return true;
 		if (activeUnprovenTargetUnload !== null) return true;
+		// Host selection may already expose B or C while the editor-side admission
+		// for that target is still settling. The pending epoch, rather than
+		// view.file, owns this interval, so no ordinary save may cross it.
+		if (pendingDeferredLoadAdmission !== null) return true;
 		const record = sourceUnload;
 		if (record === null) return false;
 		if (record.state === "saving") return true;
@@ -735,10 +1103,227 @@ export function installTextFileViewHandoffGuard(
 		if (record.state === "atomic-window-expired") return;
 		record.state = "rejected";
 		record.consumed = true;
-		clearSourceUnloadExpiry();
+		if (sourceUnload === record) clearSourceUnloadExpiry();
 	}
 
+	function activeManagedLoads(): InFlightLoad[] {
+		return [...inFlightLoads.values()].filter((load) => !load.superseded);
+	}
+
+	function supersedePendingAdmission(owner: DeferredHostLoadAdmission): void {
+		if (owner.cancelled) return;
+		owner.cancelled = true;
+		if (pendingDeferredLoadAdmission === owner) {
+			pendingDeferredLoadAdmission = null;
+			advancePendingLoadEpoch();
+		}
+		owner.resolveSupersession(HOST_LOAD_SUPERSEDED);
+	}
+
+	function rollPendingSourceRetirement(
+		owner: DeferredHostLoadAdmission,
+		latestTargetFile: TFile,
+	): SourceUnloadRecord | null {
+		const record = owner.sourceRetirement;
+		const activeCallbacks = callbackRef;
+		const targetPath = latestTargetFile.path;
+		const exactOwnerRemains = (): boolean =>
+			pendingDeferredLoadAdmission === owner
+			&& !owner.cancelled
+			&& owner.callbacks === activeCallbacks
+			&& activeCallbacks !== null
+			&& callbackRef === activeCallbacks
+			&& clearLoadCapability === "observable"
+			&& hostCapabilityState === "ready"
+			&& terminalHostLifecycle === null
+			&& sourceUnload === record
+			&& retiredSourceReceiptIsExact(record)
+			&& activeManagedLoads().length === 0
+			&& activeUnprovenTargetUnload === null
+			&& latestTargetFile.path === targetPath
+			&& targetPath.length > 0;
+		const sourceStillPresented = (): boolean =>
+			exactOwnerRemains()
+			&& sourcePresentationMatchesRetirement(record)
+			&& exactOwnerRemains();
+		if (!sourceStillPresented() || !sourceStillPresented()) return null;
+		const unloadId = nextSourceUnloadId++;
+		const rollover: SourceUnloadRecord = {
+			receiptId: `source-unload:${hostGuardInstanceId}:${unloadId}`,
+			unloadId,
+			file: record.file,
+			path: record.path,
+			sourceContent: record.sourceContent,
+			state: "settled",
+			cleanRefresh: record.cleanRefresh,
+			forcedSaveObserved: record.forcedSaveObserved,
+			forcedSaveFile: record.forcedSaveFile,
+			forcedSavePath: record.forcedSavePath,
+			forcedSaveContent: record.forcedSaveContent,
+			cacheRetiredBeforeUnloadSettled: record.cacheRetiredBeforeUnloadSettled,
+			inputObservedBeforeSettlement: record.inputObservedBeforeSettlement,
+			consumed: false,
+			unprovenTargetRolloverProof: null,
+		};
+		if (!exactOwnerRemains()) return null;
+		rejectSourceUnload(record);
+		supersedePendingAdmission(owner);
+		sourceUnload = rollover;
+		armSourceUnloadExpiry(rollover);
+		return rollover;
+	}
+
+	function rollConsumedSourceRetirement(
+		record: SourceUnloadRecord,
+		latestTargetFile: TFile,
+	): SourceUnloadRecord | null {
+		const previousLoad = latestLoad;
+		const activeCallbacks = callbackRef;
+		const targetPath = latestTargetFile.path;
+		const exactOwnerRemains = (): boolean => {
+			const activeLoads = activeManagedLoads();
+			return previousLoad !== null
+				&& activeLoads.length === 1
+				&& activeLoads[0] === previousLoad
+				&& !previousLoad.ambiguous
+				&& previousLoad.ticket.sourceUnloadReceiptId === record.receiptId
+				&& activeCallbacks !== null
+				&& callbackRef === activeCallbacks
+				&& clearLoadCapability === "observable"
+				&& hostCapabilityState === "ready"
+				&& terminalHostLifecycle === null
+				&& sourceUnload === record
+				&& retiredSourceReceiptIsExact(record)
+				&& activeUnprovenTargetUnload === null
+				&& latestTargetFile.path === targetPath
+				&& targetPath.length > 0;
+		};
+		const captureEvidence = (): SourceRetirementRolloverEvidence | null => {
+			if (!exactOwnerRemains()) return null;
+			if (sourcePresentationMatchesRetirement(record)) {
+				return exactOwnerRemains()
+					? Object.freeze({ kind: "source-presentation" })
+					: null;
+			}
+			if (previousLoad === null) return null;
+			const candidate = exactHeldCandidateForTicket(previousLoad.ticket);
+			if (candidate === null) return null;
+			const proof = Object.freeze({ ticket: previousLoad.ticket, candidate });
+			return exactUnprovenTargetRolloverPresentation(
+				proof,
+				record,
+				latestTargetFile,
+			) && exactOwnerRemains()
+				? Object.freeze({ kind: "held-target", proof })
+				: null;
+		};
+		const evidence = captureEvidence();
+		const confirmed = captureEvidence();
+		if (
+			evidence === null
+			|| confirmed === null
+			|| evidence.kind !== confirmed.kind
+			|| (
+				evidence.kind === "held-target"
+				&& (
+					confirmed.kind !== "held-target"
+					|| confirmed.proof.ticket !== evidence.proof.ticket
+					|| confirmed.proof.candidate !== evidence.proof.candidate
+				)
+			)
+			|| !exactOwnerRemains()
+			|| previousLoad === null
+		) return null;
+		const unloadId = nextSourceUnloadId++;
+		const rollover: SourceUnloadRecord = {
+			receiptId: `source-unload:${hostGuardInstanceId}:${unloadId}`,
+			unloadId,
+			file: record.file,
+			path: record.path,
+			sourceContent: record.sourceContent,
+			state: "settled",
+			cleanRefresh: record.cleanRefresh,
+			forcedSaveObserved: record.forcedSaveObserved,
+			forcedSaveFile: record.forcedSaveFile,
+			forcedSavePath: record.forcedSavePath,
+			forcedSaveContent: record.forcedSaveContent,
+			cacheRetiredBeforeUnloadSettled: record.cacheRetiredBeforeUnloadSettled,
+			inputObservedBeforeSettlement: record.inputObservedBeforeSettlement,
+			consumed: false,
+			unprovenTargetRolloverProof: confirmed.kind === "held-target"
+				? confirmed.proof
+				: null,
+		};
+		rejectSourceUnload(record);
+		supersedeManagedLoad(previousLoad);
+		sourceUnload = rollover;
+		armSourceUnloadExpiry(rollover);
+		return rollover;
+	}
+
+	function prepareSameFileRefreshRetirement(targetFile: TFile): SourceUnloadRecord | null {
+		const tombstone = managedClearTombstone;
+		const activeCallbacks = callbackRef;
+		const targetPath = targetFile.path;
+		const exactRefreshOwner = (): boolean =>
+			tombstone !== null
+			&& managedClearTombstone === tombstone
+			&& tombstone.targetFile === targetFile
+			&& tombstone.targetPath === targetPath
+			&& targetPath.length > 0
+			&& currentFileOf(view) === targetFile
+			&& targetFile.path === targetPath
+			&& activeCallbacks !== null
+			&& callbackRef === activeCallbacks
+			&& hostCapabilityState === "ready"
+			&& clearLoadCapability === "observable"
+			&& terminalHostLifecycle === null
+			&& inFlightLoads.size === 0;
+		if (!exactRefreshOwner()) return null;
+		const content = currentViewContent();
+		if (content === null) return null;
+		const cleanRefreshIsExact = (): boolean => {
+			if (!exactRefreshOwner()) return false;
+			try {
+				const host = view as TextFileView & {
+					dirty?: unknown;
+					lastSavedData?: unknown;
+				};
+				return currentViewContent() === content
+					&& view.data === content
+					&& host.lastSavedData === content
+					&& host.dirty === false
+					&& exactRefreshOwner();
+			} catch {
+				return false;
+			}
+		};
+		if (!cleanRefreshIsExact() || !cleanRefreshIsExact()) return null;
+		const unloadId = nextSourceUnloadId++;
+		const refresh: SourceUnloadRecord = {
+			receiptId: `source-unload:${hostGuardInstanceId}:${unloadId}`,
+			unloadId,
+			file: targetFile,
+			path: targetPath,
+			sourceContent: content,
+			state: "settled",
+			cleanRefresh: true,
+			forcedSaveObserved: false,
+			forcedSaveFile: null,
+			forcedSavePath: null,
+			forcedSaveContent: null,
+			cacheRetiredBeforeUnloadSettled: false,
+			inputObservedBeforeSettlement: false,
+			consumed: false,
+			unprovenTargetRolloverProof: null,
+		};
+		if (!cleanRefreshIsExact()) return null;
+		sourceUnload = refresh;
+		armSourceUnloadExpiry(refresh);
+		return refresh;
+	}
 	function sourceUnloadProofFailure(record: SourceUnloadRecord): string | null {
+		if (record.cleanRefresh) return "unexpected-clean-refresh-save";
 		if (record.file.path !== record.path) return "source-path-changed";
 		if (record.sourceContent === null) return "source-content-unavailable";
 		if (
@@ -764,6 +1349,13 @@ export function installTextFileViewHandoffGuard(
 		if (!fulfilled) {
 			rejectSourceUnload(record);
 			return;
+		}
+		if (
+			callbackRef !== null
+			&& (!saveWrappersCurrent() || !loadWrappersCurrent())
+		) {
+			rejectSourceUnload(record);
+			return enterHostWrapperDriftTerminal();
 		}
 		let proofFailure = sourceUnloadProofFailure(record);
 		for (
@@ -791,12 +1383,27 @@ export function installTextFileViewHandoffGuard(
 				throw error;
 			}
 			if (sourceUnload !== record || record.state !== "saving") return;
+			if (
+				callbackRef !== null
+				&& (!saveWrappersCurrent() || !loadWrappersCurrent())
+			) {
+				rejectSourceUnload(record);
+				return enterHostWrapperDriftTerminal();
+			}
 			proofFailure = sourceUnloadProofFailure(record);
 		}
 		if (proofFailure !== null) {
 			rejectSourceUnload(record);
-			loseHostCapability(`source-unload-not-provable:${proofFailure}`);
-			return;
+			return enterSourceUnloadProofLostTerminal(
+				`source-unload-not-provable:${proofFailure}`,
+			);
+		}
+		if (
+			callbackRef !== null
+			&& (!saveWrappersCurrent() || !loadWrappersCurrent())
+		) {
+			rejectSourceUnload(record);
+			return enterHostWrapperDriftTerminal();
 		}
 		record.state = "settled";
 		armSourceUnloadExpiry(record);
@@ -930,10 +1537,11 @@ export function installTextFileViewHandoffGuard(
 		);
 		if (
 			record === null
+			|| sourceUnload !== record
 			|| record.state !== "settled"
 			|| record.consumed
-			|| record.file.path !== record.path
-			|| !record.forcedSaveObserved
+			|| !sourceRetirementProofIsExact(record)
+			|| (record.cleanRefresh && !cleanRefreshPresentationIsExact(record))
 			|| !presentationCurrent
 		) {
 			if (record !== null && record.state !== "atomic-window-expired") {
@@ -956,7 +1564,6 @@ export function installTextFileViewHandoffGuard(
 		if (
 			activeUnprovenTargetUnload !== null
 			|| clearLoadCapability !== "observable"
-			|| activeAmbiguityGroup !== null
 			|| currentFileOf(view) !== sourceFile
 			|| sourceFile.path.length === 0
 			|| mode.kind !== "blocking-handoff"
@@ -993,20 +1600,8 @@ export function installTextFileViewHandoffGuard(
 		return record !== null
 			&& record.state === "settled"
 			&& record.consumed
-			&& record.file.path === record.path
-			&& record.sourceContent !== null
-			&& record.forcedSaveObserved
-			&& record.forcedSaveFile === record.file
-			&& record.forcedSavePath === record.path
-			&& record.forcedSaveContent === record.sourceContent;
+			&& sourceRetirementProofIsExact(record);
 	}
-
-	type SourceRetirementRolloverEvidence =
-		| Readonly<{ kind: "source-presentation" }>
-		| Readonly<{
-			kind: "held-target";
-			proof: UnprovenTargetRolloverProof;
-		}>;
 
 	function captureSourceRetirementRolloverEvidence(
 		unload: UnprovenTargetUnload,
@@ -1026,13 +1621,16 @@ export function installTextFileViewHandoffGuard(
 
 	function retireUnprovenTarget(unload: UnprovenTargetUnload): void {
 		if (unload.load !== null) {
-			markLoadAmbiguous(unload.load);
-			inFlightLoads.delete(unload.load.id);
+			// Keep the superseded native tail registered until its own promise settles.
+			// This is the late-tail fence: C may run synchronously under its own owner,
+			// while a later opaque B setViewData cannot be mistaken for C.
+			supersedeManagedLoad(unload.load);
 		}
 		if (latestLoad?.ticket === unload.ticket) latestLoad = null;
 		for (const association of hostLoadAssociations.values()) {
 			if (association.ticket === unload.ticket) {
 				hostLoadAssociations.delete(association.hostLoadTokenId);
+				advanceNativeLoadEpoch();
 			}
 		}
 		if (mode.kind === "blocking-handoff" && mode.ticket === unload.ticket) {
@@ -1082,7 +1680,8 @@ export function installTextFileViewHandoffGuard(
 			path: retiredSource.path,
 			sourceContent: retiredSource.sourceContent,
 			state: "settled",
-			forcedSaveObserved: true,
+			cleanRefresh: retiredSource.cleanRefresh,
+			forcedSaveObserved: retiredSource.forcedSaveObserved,
 			forcedSaveFile: retiredSource.forcedSaveFile,
 			forcedSavePath: retiredSource.forcedSavePath,
 			forcedSaveContent: retiredSource.forcedSaveContent,
@@ -1130,11 +1729,22 @@ export function installTextFileViewHandoffGuard(
 		}
 		return Promise.resolve(result).then(
 			() => {
+				if (
+					callbackRef !== null
+					&& (!saveWrappersCurrent() || !loadWrappersCurrent())
+				) {
+					if (activeUnprovenTargetUnload === unload) activeUnprovenTargetUnload = null;
+					return enterHostWrapperDriftTerminal();
+				}
 				const rolled = rollSourceRetirementAcrossUnprovenTarget(unload);
 				if (activeUnprovenTargetUnload === unload) activeUnprovenTargetUnload = null;
 				if (!rolled) {
-					loseHostCapability("source-unload-not-provable:unproven-target-source-lineage");
+					return enterSourceUnloadProofLostTerminal(
+						"source-unload-not-provable:unproven-target-source-lineage",
+					);
 				}
+				unload.load?.resolveRetirement();
+				return undefined;
 			},
 			(error) => {
 				if (activeUnprovenTargetUnload === unload) activeUnprovenTargetUnload = null;
@@ -1162,9 +1772,50 @@ export function installTextFileViewHandoffGuard(
 			}
 			if (replacement.kind === "inert") return Promise.resolve();
 		}
+		if (
+			callbackRef !== null
+			&& (!saveWrappersCurrent() || !loadWrappersCurrent())
+		) {
+			// If onLoadFile itself was displaced, returning from unload would let the
+			// host continue directly into that unguarded target mutation. Enter the
+			// same terminal wrapper-drift boundary before original unload or save runs,
+			// and keep the host lifecycle pending until this pane is reopened.
+			return enterHostWrapperDriftTerminal();
+		}
+		if (terminalHostLifecycle !== null) return terminalHostLifecycle.promise;
+		if (pendingSourceUnloadDrain !== null) {
+			return enterHostLoadMutationTerminal("source-unload-drain-reentrant");
+		}
+		// Retire any already-owned debounce before the drain can wait. Letting that
+		// timer fire during the reservation settlement would create save-epoch drift
+		// even though the save itself is suppressed.
 		cancelOwnedSaveJob();
 		if (originalCancellableRequestSave !== null) {
 			originalCancellableRequestSave.cancel.call(originalCancellableRequestSave);
+		}
+		const preexistingSaveTails = Object.freeze([...inFlightSaves.values()]);
+		const unprovenTargetAtEntry = preexistingSaveTails.length === 0
+			? exactUnprovenTargetForUnload(sourceFile)
+			: null;
+		if (unprovenTargetAtEntry !== null) {
+			// B has host selection identity but never acquired editor presentation or
+			// binding authority. Asking the editor manager to drain B would therefore
+			// reject with held-missing and strand the pane before C can enter. The host
+			// guard already owns the exact B ticket and retired A receipt, so retire B
+			// directly while the existing save fence keeps source bytes pinned to A.
+			clearSourceUnloadExpiry();
+			return unloadUnprovenTarget(unprovenTargetAtEntry, sourceFile, args);
+		}
+		const continueOriginalUnload = (): Promise<void> => {
+		const tombstoneAtUnloadEntry = managedClearTombstone;
+		if (
+			tombstoneAtUnloadEntry !== null
+			&& tombstoneAtUnloadEntry.targetFile === sourceFile
+			&& tombstoneAtUnloadEntry.targetPath === sourceFile.path
+			&& currentFileOf(view) === sourceFile
+			&& managedClearTombstone === tombstoneAtUnloadEntry
+		) {
+			clearManagedClearTombstone();
 		}
 		clearSourceUnloadExpiry();
 		const unprovenTarget = exactUnprovenTargetForUnload(sourceFile);
@@ -1182,6 +1833,7 @@ export function installTextFileViewHandoffGuard(
 			path: sourceFile.path,
 			sourceContent: sourceFile === currentFileOf(view) ? currentViewContent() : null,
 			state: "saving",
+			cleanRefresh: false,
 			forcedSaveObserved: false,
 			forcedSaveFile: null,
 			forcedSavePath: null,
@@ -1234,6 +1886,109 @@ export function installTextFileViewHandoffGuard(
 			},
 		);
 	};
+		const activeCallbacks = callbackRef;
+		if (activeCallbacks === null) return continueOriginalUnload();
+		const viewFileAtEntry = currentFileOf(view);
+		if (
+			viewFileAtEntry !== sourceFile
+			|| sourceFile.path.length === 0
+			|| viewFileAtEntry.path !== sourceFile.path
+		) return enterHostLoadMutationTerminal("source-unload-drain-file-first");
+		let rejectDrainCancellation!: (reason: unknown) => void;
+		const drainCancellation = new Promise<never>((_resolve, reject) => {
+			rejectDrainCancellation = reject;
+		});
+		void drainCancellation.catch(() => undefined);
+		const drainOwner: PendingSourceUnloadDrain = {
+			ownerId: nextSourceUnloadDrainOwnerId++,
+			sourceFile,
+			sourcePathAtEntry: sourceFile.path,
+			callbacks: activeCallbacks,
+			viewFileAtEntry,
+			viewPathAtEntry: viewFileAtEntry.path,
+			nativeLoadEpochAtEntry: nativeLoadEpoch,
+			pendingLoadEpochAtEntry: pendingLoadEpoch,
+			saveEpochAtEntry: saveEpoch,
+			preexistingSaveTails,
+			expectedSaveEpochAfterDrain: saveEpoch + preexistingSaveTails.length,
+			managedClearTombstoneEpochAtEntry: managedClearTombstoneEpoch,
+			sourceUnloadAtEntry: sourceUnload,
+			activeUnprovenTargetUnloadAtEntry: activeUnprovenTargetUnload,
+			modeAtEntry: mode,
+			deadlineExpired: false,
+			deadlineTimer: null,
+			cancellation: drainCancellation,
+			rejectCancellation: rejectDrainCancellation,
+		};
+		pendingSourceUnloadDrain = drainOwner;
+		let drainAdmission: ManagedSourceUnloadDrainAdmission;
+		try {
+			drainAdmission = activeCallbacks.onUnloadFileEntry(sourceFile);
+		} catch {
+			clearSourceUnloadDrain(drainOwner);
+			return enterHostLoadMutationTerminal("source-unload-drain-threw");
+		}
+		const continueAfterDrain = (): Promise<void> => {
+			if (!sourceUnloadDrainIsCurrent(drainOwner)) {
+				clearSourceUnloadDrain(drainOwner);
+				return enterHostLoadMutationTerminal("source-unload-drain-cas-drift");
+			}
+			clearSourceUnloadDrain(drainOwner);
+			return continueOriginalUnload();
+		};
+		const preexistingSaveSettlement = preexistingSaveTails.length === 0
+			? null
+			: Promise.all(preexistingSaveTails.map((tail) => tail.settlement)).then(
+				() => undefined,
+			);
+		const continueAfterSettlement = (settlement: Promise<void>): Promise<void> => {
+			armSourceUnloadDrainDeadline(drainOwner);
+			return Promise.race([settlement, drainOwner.cancellation]).then(
+				() => continueAfterDrain(),
+				(error) => {
+					if (pendingSourceUnloadDrain !== drainOwner && callbackRef === null) {
+						throw error;
+					}
+					clearSourceUnloadDrain(drainOwner);
+					return enterHostLoadMutationTerminal(drainOwner.deadlineExpired
+						? "source-unload-drain-deadline-exceeded"
+						: "source-unload-drain-rejected");
+				},
+			);
+		};
+		if (drainAdmission === null) {
+			return preexistingSaveSettlement === null
+				? continueAfterDrain()
+				: continueAfterSettlement(preexistingSaveSettlement);
+		}
+		let drainThen: unknown;
+		try {
+			drainThen = Reflect.get(drainAdmission, "then");
+		} catch {
+			clearSourceUnloadDrain(drainOwner);
+			return enterHostLoadMutationTerminal("source-unload-drain-unreadable");
+		}
+		if (typeof drainThen !== "function") {
+			clearSourceUnloadDrain(drainOwner);
+			return enterHostLoadMutationTerminal("source-unload-drain-not-promise");
+		}
+		const drainSettlement = new Promise<void>((resolve, reject) => {
+			try {
+				Reflect.apply(drainThen as (...args: unknown[]) => unknown, drainAdmission, [
+					resolve,
+					reject,
+				]);
+			} catch (error) {
+				reject(error instanceof Error
+					? error
+					: guardedHostLoadCancellation("source-unload-drain-rejected"));
+			}
+		});
+		const fullSettlement = preexistingSaveSettlement === null
+			? drainSettlement
+			: Promise.all([drainSettlement, preexistingSaveSettlement]).then(() => undefined);
+		return continueAfterSettlement(fullSettlement);
+	};
 
 	const installedOnLoadFile = function (
 		this: TextFileView,
@@ -1250,83 +2005,281 @@ export function installTextFileViewHandoffGuard(
 			}
 			if (replacement.kind === "inert") return Promise.resolve();
 		}
-		const sourceRetirement = claimSourceUnloadForLoad(targetFile);
-		const activeCallbacks = clearLoadCapability === "observable"
-			&& sourceRetirement !== null
-			? callbackRef
-			: null;
+		if (
+			callbackRef !== null
+			&& (!saveWrappersCurrent() || !loadWrappersCurrent())
+		) return enterHostWrapperDriftTerminal();
+		if (terminalHostLifecycle !== null) return terminalHostLifecycle.promise;
+		if (pendingSourceUnloadDrain !== null) {
+			return enterHostLoadMutationTerminal("host-load-before-source-unload-drain");
+		}
 		const targetPathAtEntry = targetFile.path;
-		let loadId: number | null = null;
-		let exactLoad: InFlightLoad | null = null;
-		if (activeCallbacks !== null && sourceRetirement !== null) {
-			const ticket = activeCallbacks.onLoadFileEntry(
-				targetFile,
-				sourceRetirement.receiptId,
-			);
+		const tombstoneAtEntry = managedClearTombstone;
+		const priorAdmission = pendingDeferredLoadAdmission;
+		let sourceRetirement: SourceUnloadRecord | null = null;
+		let sameFileRefresh = false;
+		if (
+			priorAdmission !== null
+			&& tombstoneAtEntry !== null
+			&& (
+				tombstoneAtEntry.targetFile !== targetFile
+				|| tombstoneAtEntry.targetPath !== targetPathAtEntry
+			)
+		) {
+			return enterHostLoadMutationTerminal("host-load-before-exact-unload");
+		}
+		if (priorAdmission !== null) {
+			const rollover = rollPendingSourceRetirement(priorAdmission, targetFile);
+			if (rollover === null) {
+				return enterSourceUnloadProofLostTerminal(
+					"source-unload-not-provable:pending-admission-supersession",
+				);
+			}
+			sourceRetirement = claimSourceUnloadForLoad(targetFile);
+			sameFileRefresh = tombstoneAtEntry !== null
+				&& tombstoneAtEntry.targetFile === targetFile
+				&& tombstoneAtEntry.targetPath === targetPathAtEntry;
+		} else if (
+			tombstoneAtEntry !== null
+			&& tombstoneAtEntry.targetFile === targetFile
+			&& tombstoneAtEntry.targetPath === targetPathAtEntry
+		) {
+			const refresh = prepareSameFileRefreshRetirement(targetFile);
+			if (refresh === null) {
+				return enterHostLoadMutationTerminal("host-refresh-owner-not-provable");
+			}
+			sourceRetirement = claimSourceUnloadForLoad(targetFile);
+			sameFileRefresh = sourceRetirement === refresh;
+		} else if (tombstoneAtEntry !== null) {
+			return enterHostLoadMutationTerminal("host-load-before-exact-unload");
+		} else {
+			const sourceAtEntry = sourceUnload;
 			if (
-				ticket !== null
-				&& ticket.sourceUnloadReceiptId === sourceRetirement.receiptId
-				&& ticket.targetFile === targetFile
-				&& ticket.targetFile.path === targetPathAtEntry
-				&& activeCallbacks.isSessionCurrent(ticket.sessionId, ticket.handoffGeneration)
+				sourceAtEntry !== null
+				&& sourceAtEntry.state === "settled"
+				&& sourceAtEntry.consumed
 			) {
-				for (const association of hostLoadAssociations.values()) {
-					if (
-						association.ticket.sessionId !== ticket.sessionId
-						|| association.ticket.handoffGeneration !== ticket.handoffGeneration
-						|| association.ticket.switchIntentSeq !== ticket.switchIntentSeq
-					) hostLoadAssociations.delete(association.hostLoadTokenId);
-				}
-				loadId = nextLoadId++;
-				const load: InFlightLoad = {
-					id: loadId,
-					ticket,
-					targetPathAtEntry,
-					ambiguous: false,
-					clearObserved: false,
-				};
-				exactLoad = load;
-				if (
-					inFlightLoads.size > 0
-					|| activeAmbiguityGroup !== null
-				) ensureAmbiguityGroup(load);
-				inFlightLoads.set(loadId, load);
-				latestLoad = load;
-				if (
-					!load.ambiguous
-					&& mode.kind === "blocking-handoff"
-					&& mode.handoffGeneration === ticket.handoffGeneration
-					&& mode.targetPath === targetPathAtEntry
-				) {
-					mode = { ...mode, ticket };
-				}
+				const rollover = rollConsumedSourceRetirement(sourceAtEntry, targetFile);
+				if (rollover !== null) sourceRetirement = claimSourceUnloadForLoad(targetFile);
+			} else {
+				sourceRetirement = claimSourceUnloadForLoad(targetFile);
+			}
+			if (sourceAtEntry !== null && sourceRetirement === null) {
+				return enterSourceUnloadProofLostTerminal();
 			}
 		}
-		const continueOriginalLoad = (): Promise<void> => {
-			try {
-				const result = withRegisteredDelegation(
+		if (sourceRetirement === null) {
+			if (managedClearTombstone !== null) {
+				return enterHostLoadMutationTerminal("host-refresh-owner-not-provable");
+			}
+			return withRegisteredDelegation(
 				"onLoadFile",
 				installedOnLoadFile as RuntimeMethod,
 				() => originalOnLoadFile.apply(view, [targetFile, ...args]) as Promise<void>,
-				);
-				if (typeof result === "object" && result !== null && typeof result.then === "function") {
-					void result.then(
-						() => settleLoad(loadId, true),
-						() => settleLoad(loadId, false),
-					);
-				} else {
-					settleLoad(loadId, true);
-				}
-				return result;
-			} catch (error) {
-				settleLoad(loadId, false);
-				throw error;
+			);
+		}
+		if (sameFileRefresh) {
+			cancelOwnedSaveJob();
+			if (originalCancellableRequestSave !== null) {
+				originalCancellableRequestSave.cancel.call(originalCancellableRequestSave);
 			}
+		}
+		const activeCallbacks = callbackRef;
+		if (
+			activeCallbacks === null
+			|| clearLoadCapability !== "observable"
+			|| hostCapabilityState !== "ready"
+		) {
+			rejectSourceUnload(sourceRetirement);
+			return enterHostLoadMutationTerminal("host-load-admission-unavailable");
+		}
+
+		const viewFileAtEntry = currentFileOf(view);
+		let resolveAdmissionSupersession!: (
+			outcome: typeof HOST_LOAD_SUPERSEDED,
+		) => void;
+		const admissionSupersession = new Promise<typeof HOST_LOAD_SUPERSEDED>((resolve) => {
+			resolveAdmissionSupersession = resolve;
+		});
+		advancePendingLoadEpoch();
+		const admissionOwner: DeferredHostLoadAdmission = {
+			ownerId: nextPendingLoadOwnerId++,
+			epoch: pendingLoadEpoch,
+			targetFile,
+			targetPathAtEntry,
+			sourceRetirement,
+			callbacks: activeCallbacks,
+			viewFileAtEntry,
+			viewPathAtEntry: viewFileAtEntry?.path ?? null,
+			cancelled: false,
+			supersession: admissionSupersession,
+			resolveSupersession: resolveAdmissionSupersession,
 		};
-		if (EDITOR_HANDOFF_QA_ENABLED && exactLoad !== null) {
-			const load = exactLoad;
+		pendingDeferredLoadAdmission = admissionOwner;
+		let admission: ManagedHostSwitchTicketAdmission;
+		try {
+			admission = activeCallbacks.onLoadFileEntry(
+				targetFile,
+				sourceRetirement.receiptId,
+			);
+		} catch {
+			if (pendingDeferredLoadAdmission === admissionOwner) {
+				pendingDeferredLoadAdmission = null;
+				advancePendingLoadEpoch();
+			}
+			rejectSourceUnload(sourceRetirement);
+			return enterHostLoadMutationTerminal("host-load-admission-threw");
+		}
+		const continueWithAdmission = (
+			ticket: ManagedHostSwitchTicket | null,
+		): Promise<void> => {
+			const admissionStillOwned = pendingDeferredLoadAdmission === admissionOwner
+				&& pendingLoadEpoch === admissionOwner.epoch
+				&& !admissionOwner.cancelled
+				&& callbackRef === activeCallbacks;
+			if (!admissionStillOwned) {
+				return admissionOwner.cancelled
+					? Promise.resolve()
+					: enterHostLoadMutationTerminal("host-load-admission-owner-changed");
+			}
+			let sessionCurrent = false;
+			if (ticket !== null) {
+				try {
+					sessionCurrent = activeCallbacks.isSessionCurrent(
+						ticket.sessionId,
+						ticket.handoffGeneration,
+					);
+				} catch {
+					sessionCurrent = false;
+				}
+			}
+			const releaseAdmissionOwner = (): void => {
+				if (pendingDeferredLoadAdmission !== admissionOwner) return;
+				pendingDeferredLoadAdmission = null;
+				advancePendingLoadEpoch();
+			};
+			if (
+				ticket === null
+				|| callbackRef !== activeCallbacks
+				|| ticket.sourceUnloadReceiptId !== sourceRetirement.receiptId
+				|| ticket.targetFile !== targetFile
+				|| ticket.targetFile.path !== targetPathAtEntry
+				|| !exactPendingViewFile(
+					targetFile,
+					targetPathAtEntry,
+					admissionOwner.viewFileAtEntry,
+					admissionOwner.viewPathAtEntry,
+				)
+				|| !sessionCurrent
+			) {
+				releaseAdmissionOwner();
+				rejectSourceUnload(sourceRetirement);
+				return enterHostLoadMutationTerminal("host-load-admission-not-exact");
+			}
+			releaseAdmissionOwner();
+			if (activeManagedLoads().length > 0) {
+				rejectSourceUnload(sourceRetirement);
+				return enterHostLoadMutationTerminal("host-load-supersession-not-provable");
+			}
+		for (const association of hostLoadAssociations.values()) {
+			if (
+				association.ticket.sessionId !== ticket.sessionId
+				|| association.ticket.handoffGeneration !== ticket.handoffGeneration
+				|| association.ticket.switchIntentSeq !== ticket.switchIntentSeq
+			) {
+				hostLoadAssociations.delete(association.hostLoadTokenId);
+				advanceNativeLoadEpoch();
+			}
+		}
+			let resolveSupersession!: (outcome: typeof HOST_LOAD_SUPERSEDED) => void;
+			const supersession = new Promise<typeof HOST_LOAD_SUPERSEDED>((resolve) => {
+				resolveSupersession = resolve;
+			});
+			let resolveLocalCommit!: () => void;
+			const localCommit = new Promise<void>((resolve) => {
+				resolveLocalCommit = resolve;
+			});
+			let resolveRetirement!: () => void;
+			const retirement = new Promise<void>((resolve) => {
+				resolveRetirement = resolve;
+			});
+			advanceNativeLoadEpoch();
+			const load: InFlightLoad = {
+			id: nextLoadId++,
+			ticket,
+			targetPathAtEntry,
+				ambiguous: false,
+				clearObserved: false,
+				superseded: false,
+				locallyCommitted: false,
+				localCommit,
+				resolveLocalCommit,
+				retirement,
+				resolveRetirement,
+				supersession,
+				resolveSupersession,
+			};
+		inFlightLoads.set(load.id, load);
+		latestLoad = load;
+		if (
+			mode.kind === "blocking-handoff"
+			&& mode.handoffGeneration === ticket.handoffGeneration
+			&& mode.targetPath === targetPathAtEntry
+		) mode = { ...mode, ticket };
+		if (sameFileRefresh && managedClearTombstone === tombstoneAtEntry) {
+			clearManagedClearTombstone();
+		}
+
+		const continueOriginalLoad = (): Promise<unknown> => {
+			if (
+				callbackRef !== activeCallbacks
+				|| !saveWrappersCurrent()
+				|| !loadWrappersCurrent()
+			) {
+				settleLoad(load.id, false);
+				rejectSourceUnload(sourceRetirement);
+				return enterHostWrapperDriftTerminal();
+			}
+			if (terminalHostLifecycle !== null || load.superseded) {
+				settleLoad(load.id, false);
+				return load.superseded
+					? Promise.resolve()
+					: terminalHostLifecycle?.promise ?? rejectGuardedHostLoad("terminal-load");
+			}
+			let result: unknown;
+			activeNativeLoadInvocation = load;
+			try {
+				result = withRegisteredDelegation(
+					"onLoadFile",
+					installedOnLoadFile as RuntimeMethod,
+					() => originalOnLoadFile.apply(view, [targetFile, ...args]),
+				);
+			} catch (error) {
+				settleLoad(load.id, false);
+				if (load.locallyCommitted) return load.localCommit;
+				throw error;
+			} finally {
+				if (activeNativeLoadInvocation === load) activeNativeLoadInvocation = null;
+			}
+			const nativeResult = Promise.resolve(result);
+			void nativeResult.then(
+				() => settleLoad(load.id, true),
+				() => settleLoad(load.id, false),
+			);
+			const hostVisibleNativeResult = nativeResult.catch((error) => {
+				if (load.superseded) return undefined;
+				throw error;
+			});
+			return Promise.race([
+				load.localCommit,
+				hostVisibleNativeResult,
+				load.retirement,
+			]);
+		};
+
+		if (EDITOR_HANDOFF_QA_ENABLED) {
 			const barrier = editorHandoffHostQaBarrierByView?.get(view);
-			let continuation: Promise<void> | null = null;
+			let continuation: Promise<unknown> | null = null;
 			let continuationFailure: Readonly<{ error: unknown }> | null = null;
 			const held = barrier?.tryHoldHostLoad({
 				stage: "load-entry",
@@ -1337,11 +2290,10 @@ export function installTextFileViewHandoffGuard(
 				invocationFile: currentFileOf(view),
 				continueHostLoad: () => {
 					if (
-						callbackRef === null
+						callbackRef !== activeCallbacks
 						|| inFlightLoads.get(load.id) !== load
+						|| load.superseded
 						|| !isTicketCurrent(load.ticket)
-						|| view.file !== load.ticket.targetFile
-						|| view.file.path !== load.targetPathAtEntry
 					) {
 						settleLoad(load.id, false);
 						return "rejected";
@@ -1356,26 +2308,94 @@ export function installTextFileViewHandoffGuard(
 				},
 			});
 			if (held) {
-				return held.settlement.then(async (outcome) => {
+				const heldResult = held.settlement.then(async (outcome) => {
 					if (outcome === "rejected" && continuation === null) {
 						settleLoad(load.id, false);
+						if (load.superseded) return;
+						throw guardedHostLoadCancellation("qa-held-host-load-rejected");
 					}
 					if (continuationFailure !== null) throw continuationFailure.error;
 					if (continuation !== null) await continuation;
 				});
+				return Promise.race([
+					load.localCommit,
+					heldResult,
+					load.supersession,
+				]).then(() => undefined);
 			}
 		}
-		return continueOriginalLoad();
-	};
+		return continueOriginalLoad() as Promise<void>;
+		};
 
+		let admissionThen: unknown = null;
+		if (
+			admission !== null
+			&& (typeof admission === "object" || typeof admission === "function")
+		) {
+			try {
+				admissionThen = Reflect.get(admission, "then");
+			} catch {
+				if (pendingDeferredLoadAdmission === admissionOwner) {
+					pendingDeferredLoadAdmission = null;
+					advancePendingLoadEpoch();
+				}
+				rejectSourceUnload(sourceRetirement);
+				return enterHostLoadMutationTerminal("host-load-admission-unreadable");
+			}
+		}
+		if (typeof admissionThen !== "function") {
+			return continueWithAdmission(admission as ManagedHostSwitchTicket | null);
+		}
+		const admissionSettlement = new Promise<ManagedHostSwitchTicket | null>(
+			(resolve, reject) => {
+				try {
+					Reflect.apply(admissionThen as (...args: unknown[]) => unknown, admission, [
+						resolve,
+						reject,
+					]);
+					} catch (error) {
+						reject(error instanceof Error
+							? error
+							: guardedHostLoadCancellation("host-load-admission-rejected"));
+				}
+			},
+		);
+		return Promise.race([
+			admissionSettlement,
+			admissionOwner.supersession,
+		]).then(
+			(ticket) => ticket === HOST_LOAD_SUPERSEDED
+				? undefined
+				: continueWithAdmission(ticket),
+			(error) => {
+				if (admissionOwner.cancelled) throw error;
+				if (pendingDeferredLoadAdmission === admissionOwner) {
+					pendingDeferredLoadAdmission = null;
+					advancePendingLoadEpoch();
+				}
+				rejectSourceUnload(sourceRetirement);
+				return enterHostLoadMutationTerminal("host-load-admission-rejected");
+			},
+		);
+	};
 	const installedSetViewData = function (
 		this: TextFileView,
 		incomingContent: string,
 		clear: boolean,
 		...args: unknown[]
 	): void {
-		if (activeHostLoadDispatch !== null) {
+		if (pendingSourceUnloadDrain !== null) {
+			const observedDrift = sourceUnloadDrainObservedDrift();
+			void enterHostLoadMutationTerminal(observedDrift
+				? "source-unload-drain-observable-drift"
+				: "host-set-view-data-before-source-unload-drain");
+			throw guardedHostLoadCancellation(observedDrift
+				? "source-unload-drain-observable-drift"
+				: "host-set-view-data-before-source-unload-drain");
+		}
+		if (activeHostLoadDispatch !== null && !activeHostLoadDispatch.dispatchAmbiguous) {
 			activeHostLoadDispatch.dispatchAmbiguous = true;
+			advanceNativeLoadEpoch();
 		}
 		if (callbackRef === null) {
 			const replacement = registeredReplacement(
@@ -1390,6 +2410,15 @@ export function installTextFileViewHandoffGuard(
 				) as void;
 			}
 			if (replacement.kind === "inert") return undefined;
+		}
+		if (callbackRef !== null && terminalHostLifecycle !== null) {
+			throw guardedHostLoadCancellation("terminal-host-lifecycle");
+		}
+		if (callbackRef !== null && managedClearTombstone !== null) {
+			void enterHostLoadMutationTerminal("host-set-view-data-after-target-presentation");
+			throw guardedHostLoadCancellation(
+				"host-set-view-data-after-target-presentation",
+			);
 		}
 		if (EDITOR_HANDOFF_QA_ENABLED && clear === true) {
 			const load = exactLoadForQaHold();
@@ -1407,7 +2436,14 @@ export function installTextFileViewHandoffGuard(
 							callbackRef === null
 							|| inFlightLoads.get(load.id) !== load
 							|| exactLoadForQaHold() !== load
-						) return "rejected";
+						) {
+							// A rejected held clear is an intercepted no-op, not an opaque
+							// native tail. Retire its exact load synchronously so the queued
+							// C clear cannot be made ambiguous by the barrier's microtask.
+							qaHeldLoadSettlements?.delete(load.id);
+							settleLoad(load.id, false);
+							return "rejected";
+						}
 						installedSetViewData.apply(view, [incomingContent, clear, ...args]);
 						return "applied";
 					},
@@ -1425,12 +2461,29 @@ export function installTextFileViewHandoffGuard(
 			&& clearLoadCapability === "observable"
 		) {
 			const load = exactLoadForSetViewData();
-			if (load !== null) {
-				const hostLoadTokenId = callbackRef.onSetViewDataEntry({
-					ticket: load.ticket,
-					incomingContent,
-					clear: true,
-				});
+			if (load === null) {
+				const managedClearOwnerExists = inFlightLoads.size > 0
+					|| hostLoadAssociations.size > 0;
+				if (managedClearOwnerExists) {
+					for (const pendingLoad of [...inFlightLoads.values()]) {
+						markLoadAmbiguous(pendingLoad);
+					}
+					void enterHostLoadMutationTerminal("host-clear-load-not-authorized");
+					throw guardedHostLoadCancellation("host-clear-load-not-authorized");
+				}
+			} else {
+				let hostLoadTokenId: string | null = null;
+				try {
+					hostLoadTokenId = callbackRef.onSetViewDataEntry({
+						ticket: load.ticket,
+						incomingContent,
+						clear: true,
+					});
+				} catch (error) {
+					markLoadAmbiguous(load);
+					void enterHostLoadMutationTerminal("host-clear-load-not-authorized");
+					throw error;
+				}
 				if (
 					hostLoadTokenId !== null
 					&& callbackRef !== null
@@ -1446,9 +2499,15 @@ export function installTextFileViewHandoffGuard(
 						loadStatus: "pending",
 						candidate: null,
 						pendingReceipt: null,
+						completionForwarded: false,
 						dispatchAmbiguous: false,
 					};
 					hostLoadAssociations.set(hostLoadTokenId, newAssociation);
+					advanceNativeLoadEpoch();
+				} else {
+					markLoadAmbiguous(load);
+					void enterHostLoadMutationTerminal("host-clear-load-not-authorized");
+					throw guardedHostLoadCancellation("host-clear-load-not-authorized");
 				}
 			}
 		}
@@ -1481,13 +2540,18 @@ export function installTextFileViewHandoffGuard(
 					|| callbackRef === null
 					|| !associationIsCurrent(newAssociation)
 				) {
-					newAssociation.dispatchAmbiguous = true;
+					if (!newAssociation.dispatchAmbiguous) {
+						newAssociation.dispatchAmbiguous = true;
+						advanceNativeLoadEpoch();
+					}
 				}
 			}
 			return result;
 		} catch (error) {
 			if (newAssociation !== null) {
-				hostLoadAssociations.delete(newAssociation.hostLoadTokenId);
+				if (hostLoadAssociations.delete(newAssociation.hostLoadTokenId)) {
+					advanceNativeLoadEpoch();
+				}
 			}
 			throw error;
 		} finally {
@@ -1628,6 +2692,22 @@ export function installTextFileViewHandoffGuard(
 		ownedSaveTimer = null;
 		pendingOwnedSave = null;
 		saveEpoch += 1;
+		if (
+			pendingSourceUnloadDrain !== null
+			|| pendingDeferredLoadAdmission !== null
+		) {
+			reportSuppressed(currentFileOf(view));
+			return Promise.resolve();
+		}
+		if (emergencySaveFenceOwners.size > 0) {
+			callbackRef?.onSaveSuppressed({
+				sessionId: job.sessionId,
+				handoffGeneration: job.generation,
+				invocationFile: job.file,
+				invocationPath: job.path,
+			});
+			return Promise.resolve();
+		}
 		if (!isOwnedSaveJobCurrent(job)) {
 			callbackRef?.onSaveSuppressed({
 				sessionId: job.sessionId,
@@ -1641,7 +2721,11 @@ export function installTextFileViewHandoffGuard(
 	}
 
 	function scheduleOwnedSave(): void {
-		if (hostCapabilityState !== "ready" || callbackRef === null) return;
+		if (
+			emergencySaveFenceOwners.size > 0
+			|| hostCapabilityState !== "ready"
+			|| callbackRef === null
+		) return;
 		const context = callbackRef.captureSaveOwnershipContext();
 		if (
 			context === null
@@ -1676,6 +2760,15 @@ export function installTextFileViewHandoffGuard(
 	}
 
 	const installedRequestSave = function (this: TextFileView, ...args: unknown[]): void {
+		if (pendingSourceUnloadDrain !== null) {
+			sourceUnloadDrainObservedDrift();
+			reportSuppressed(currentFileOf(view));
+			return undefined;
+		}
+		if (emergencySaveFenceOwners.size > 0) {
+			reportSuppressed(currentFileOf(view));
+			return undefined;
+		}
 		if (callbackRef === null) {
 			const replacement = registeredReplacement(
 				"requestSave",
@@ -1686,6 +2779,10 @@ export function installTextFileViewHandoffGuard(
 			}
 			if (replacement.kind === "inert") return undefined;
 			return Reflect.apply(originalRequestSave, view, args) as void;
+		}
+		if (terminalSaveSuppressionActive()) {
+			reportSuppressed(currentFileOf(view));
+			return undefined;
 		}
 		const invocationFile = currentFileOf(view);
 		if (sourceUnload?.state === "saving") {
@@ -1705,6 +2802,10 @@ export function installTextFileViewHandoffGuard(
 		configurable: true,
 		enumerable: false,
 		value: (...args: unknown[]) => {
+			if (pendingSourceUnloadDrain !== null) {
+				sourceUnloadDrainObservedDrift();
+				return undefined;
+			}
 			cancelOwnedSaveJob();
 			return originalCancellableRequestSave === null
 				? undefined
@@ -1720,6 +2821,15 @@ export function installTextFileViewHandoffGuard(
 		configurable: true,
 		enumerable: false,
 		value: (...args: unknown[]) => {
+			if (pendingSourceUnloadDrain !== null) {
+				sourceUnloadDrainObservedDrift();
+				reportSuppressed(currentFileOf(view));
+				return undefined;
+			}
+			if (emergencySaveFenceOwners.size > 0) {
+				reportSuppressed(currentFileOf(view));
+				return undefined;
+			}
 			if (callbackRef === null) {
 				const replacement = registeredReplacement(
 					"requestSave",
@@ -1738,6 +2848,10 @@ export function installTextFileViewHandoffGuard(
 					? Reflect.apply(originalFlush, originalCancellableRequestSave, args)
 					: undefined;
 			}
+			if (terminalSaveSuppressionActive()) {
+				reportSuppressed(currentFileOf(view));
+				return undefined;
+			}
 			return runOwnedSave();
 		},
 		writable: false,
@@ -1746,6 +2860,15 @@ export function installTextFileViewHandoffGuard(
 		configurable: true,
 		enumerable: false,
 		value: (...args: unknown[]) => {
+			if (pendingSourceUnloadDrain !== null) {
+				sourceUnloadDrainObservedDrift();
+				reportSuppressed(currentFileOf(view));
+				return undefined;
+			}
+			if (emergencySaveFenceOwners.size > 0) {
+				reportSuppressed(currentFileOf(view));
+				return undefined;
+			}
 			if (callbackRef === null) {
 				const replacement = registeredReplacement(
 					"requestSave",
@@ -1763,6 +2886,10 @@ export function installTextFileViewHandoffGuard(
 				return typeof originalRun === "function"
 					? Reflect.apply(originalRun, originalCancellableRequestSave, args)
 					: undefined;
+			}
+			if (terminalSaveSuppressionActive()) {
+				reportSuppressed(currentFileOf(view));
+				return undefined;
 			}
 			const invocationFile = currentFileOf(view);
 			if (sourceUnload?.state === "saving") {
@@ -1788,6 +2915,14 @@ export function installTextFileViewHandoffGuard(
 		outcome: "delegated" | "suppressed" | "rejected";
 		result: Promise<void>;
 	}> {
+		if (emergencySaveFenceOwners.size > 0) {
+			reportSuppressed(invocationFile);
+			return { outcome: "suppressed", result: Promise.resolve() };
+		}
+		if (terminalSaveSuppressionActive()) {
+			reportSuppressed(invocationFile);
+			return { outcome: "suppressed", result: Promise.resolve() };
+		}
 		if (
 			!allowBlockingSourceRetirement
 			&& (
@@ -1801,37 +2936,27 @@ export function installTextFileViewHandoffGuard(
 		if (currentFileOf(view) !== invocationFile) {
 			return { outcome: "rejected", result: Promise.resolve() };
 		}
-		const invocationId = nextSaveId++;
-		inFlightSaves.set(invocationId, {
-			file: invocationFile,
-			path: invocationFile?.path ?? null,
-			startedAt: Date.now(),
-		});
-		const settle = (): void => {
-			inFlightSaves.delete(invocationId);
-		};
-		try {
-			const result = withRegisteredDelegation(
-				"save",
-				installedSave as RuntimeMethod,
-				() => originalSave.apply(view, args) as Promise<void>,
-			);
-			if (typeof result === "object" && result !== null && typeof result.then === "function") {
-				void result.then(settle, settle);
-			} else {
-				settle();
-			}
-			return { outcome: "delegated", result };
-		} catch (error) {
-			settle();
-			throw error;
-		}
+		const result = withRegisteredDelegation(
+			"save",
+			installedSave as RuntimeMethod,
+			() => originalSave.apply(view, args) as Promise<void>,
+		);
+		return { outcome: "delegated", result };
 	}
 
 	const installedSave = function (
 		this: TextFileView,
 		...args: unknown[]
 	): Promise<void> {
+		if (pendingSourceUnloadDrain !== null) {
+			sourceUnloadDrainObservedDrift();
+			reportSuppressed(currentFileOf(view));
+			return Promise.resolve();
+		}
+		if (emergencySaveFenceOwners.size > 0) {
+			reportSuppressed(currentFileOf(view));
+			return Promise.resolve();
+		}
 		if (callbackRef === null) {
 			const replacement = registeredReplacement("save", installedSave as RuntimeMethod);
 			if (replacement.kind === "route") {
@@ -1839,15 +2964,43 @@ export function installTextFileViewHandoffGuard(
 			}
 			if (replacement.kind === "inert") return Promise.resolve();
 		}
+		if (terminalSaveSuppressionActive()) {
+			reportSuppressed(currentFileOf(view));
+			return Promise.resolve();
+		}
+		if (pendingDeferredLoadAdmission !== null) {
+			reportSuppressed(currentFileOf(view));
+			return Promise.resolve();
+		}
+		const invocationFile = currentFileOf(view);
 		saveEpoch += 1;
+		let resolveSettlement!: () => void;
+		const settlement = new Promise<void>((resolve) => {
+			resolveSettlement = resolve;
+		});
+		const invocationId = nextSaveId++;
+		const inFlightSave: InFlightSave = {
+			id: invocationId,
+			file: invocationFile,
+			path: invocationFile?.path ?? null,
+			startedAt: Date.now(),
+			settlement,
+			resolveSettlement,
+			settled: false,
+		};
+		inFlightSaves.set(invocationId, inFlightSave);
 		let settled = false;
 		const noteSettlement = (): void => {
 			if (settled) return;
 			settled = true;
+			inFlightSave.settled = true;
+			if (inFlightSaves.get(invocationId) === inFlightSave) {
+				inFlightSaves.delete(invocationId);
+			}
 			saveEpoch += 1;
+			resolveSettlement();
 		};
 		try {
-			const invocationFile = currentFileOf(view);
 			let forcedSourceRetirement = false;
 			const activeSourceUnload = sourceUnload;
 			if (
@@ -1942,22 +3095,272 @@ export function installTextFileViewHandoffGuard(
 		return { kind: "unsupported", reason: "method-not-wrappable" };
 	}
 
+	function saveWrappersCurrent(): boolean {
+		const registered = installedGuards.get(view);
+		if (registered?.guard !== guard) return false;
+		try {
+			return Object.getOwnPropertyDescriptor(view, "requestSave")?.value
+					=== installedRequestSave
+				&& Object.getOwnPropertyDescriptor(view, "save")?.value === installedSave;
+		} catch {
+			return false;
+		}
+	}
+
+	function loadWrappersCurrent(): boolean {
+		const registered = installedGuards.get(view);
+		if (registered?.guard !== guard) return false;
+		try {
+			return Object.getOwnPropertyDescriptor(view, "onUnloadFile")?.value
+					=== installedOnUnloadFile
+				&& Object.getOwnPropertyDescriptor(view, "onLoadFile")?.value
+					=== installedOnLoadFile
+				&& Object.getOwnPropertyDescriptor(view, "setViewData")?.value
+					=== installedSetViewData;
+		} catch {
+			return false;
+		}
+	}
+
+	function revokeEmergencySaveDelegations(): void {
+		cancelOwnedSaveJob();
+		const registered = installedGuards.get(view);
+		if (registered?.guard === guard) {
+			for (const lane of [
+				"requestSave",
+				"requestSave.run",
+				"requestSave.flush",
+				"save",
+			] as const satisfies readonly SaveDelegationLane[]) {
+				const frames = registered.delegationFrames.get(lane);
+				if (frames === undefined) continue;
+				for (const frame of frames) frame.state = "revoked";
+			}
+		}
+		if (originalCancellableRequestSave !== null) {
+			try {
+				originalCancellableRequestSave.cancel.call(originalCancellableRequestSave);
+			} catch {
+				// The owned wrappers below remain the fail-closed authority.
+			}
+		}
+	}
+
+	function restoreEmergencySaveWrapperIdentity(): boolean {
+		if (installedGuards.get(view)?.guard !== guard) return false;
+		if (emergencySaveFenceOwners.size > 0 && !saveWrappersCurrent()) {
+			// A displaced wrapper may already have captured `save` or scheduled a
+			// timer/promise tail. Re-installing our entry points blocks future calls,
+			// but it cannot prove that opaque work was cancelled. Keep this guard
+			// permanently unprovable so the manager requires an explicit reopen.
+			emergencySaveFenceUnprovable = true;
+		}
+		const changed: Array<Readonly<{
+			name: "requestSave" | "save";
+			previous: PropertyDescriptor | undefined;
+		}>> = [];
+		try {
+			for (const name of ["requestSave", "save"] as const) {
+				const wrapper = wrappers.get(name);
+				const original = methods.get(name);
+				if (wrapper === undefined || original === undefined) throw new TypeError("save wrapper missing");
+				const current = Object.getOwnPropertyDescriptor(view, name);
+				if (current?.value === wrapper) continue;
+				if (
+					current !== undefined
+					&& current.configurable !== true
+					&& current.writable !== true
+				) throw new TypeError("save wrapper not replaceable");
+				changed.push({ name, previous: current });
+				Object.defineProperty(
+					view,
+					name,
+					current === undefined
+						? installedDescriptor(original, wrapper)
+						: { ...current, value: wrapper },
+				);
+			}
+		} catch {
+			for (const { name, previous } of changed.reverse()) {
+				try {
+					if (previous === undefined) Reflect.deleteProperty(view, name);
+					else Object.defineProperty(view, name, previous);
+				} catch {
+					// A partially hostile host remains observable as wrappersCurrent=false.
+				}
+			}
+			return false;
+		}
+		return saveWrappersCurrent();
+	}
+
+	function ensureTerminalHostLifecycle(): Promise<void> {
+		if (terminalHostLifecycle !== null) return terminalHostLifecycle.promise;
+		let reject!: (reason: unknown) => void;
+		const promise = new Promise<void>((_resolve, rejectPromise) => {
+			reject = rejectPromise;
+		});
+		// The host may ignore the returned promise. Mark its rejection handled while
+		// preserving rejection for callers that await or chain the exact promise.
+		void promise.catch(() => undefined);
+		terminalHostLifecycle = {
+			ownerId: nextTerminalHostLifecycleOwnerId++,
+			promise,
+			reject,
+			settled: false,
+		};
+		return promise;
+	}
+
+	function settleTerminalHostLifecycle(reason: string): boolean {
+		const owner = terminalHostLifecycle;
+		if (owner === null || owner.settled) return false;
+		if (pendingSourceUnloadDrain !== null) {
+			clearSourceUnloadDrainDeadline(pendingSourceUnloadDrain);
+		}
+		terminalHostLifecycle = null;
+		owner.settled = true;
+		for (const load of inFlightLoads.values()) {
+			if (load.superseded) load.resolveRetirement();
+		}
+		owner.reject(new Error(`KAOS terminal host lifecycle cancelled: ${reason}`));
+		return true;
+	}
+
+	function enterHostWrapperDriftTerminal(): Promise<void> {
+		const blocked = ensureTerminalHostLifecycle();
+		// A displaced wrapper may already own an opaque timer/promise tail.
+		// Recapture future save entry points, permanently taint the emergency proof,
+		// and reject further guarded lifecycle mutation. Load wrappers are not
+		// restored because their displaced work cannot be proven cancelled.
+		emergencySaveFenceUnprovable = true;
+		revokeEmergencySaveDelegations();
+		restoreEmergencySaveWrapperIdentity();
+		loseHostCapability("host-wrapper-drift-before-host-load");
+		return blocked;
+	}
+
+	function enterHostLoadMutationTerminal(reason: string): Promise<void> {
+		const blocked = ensureTerminalHostLifecycle();
+		if (pendingSourceUnloadDrain !== null) {
+			clearSourceUnloadDrainDeadline(pendingSourceUnloadDrain);
+		}
+		// Once exact host-load ownership is lost, native lifecycle or save mutation
+		// could relabel source bytes as the target. Fence future saves and hand the
+		// lifecycle to the manager until a safe reopen cancels it.
+		revokeEmergencySaveDelegations();
+		restoreEmergencySaveWrapperIdentity();
+		loseHostCapability(reason);
+		return blocked;
+	}
+
+	function enterSourceUnloadProofLostTerminal(
+		reason = "source-unload-proof-lost-before-host-load",
+	): Promise<void> {
+		return enterHostLoadMutationTerminal(reason);
+	}
+
 	function becomeInert(): void {
+		settleTerminalHostLifecycle("guard-became-inert");
 		if (EDITOR_HANDOFF_QA_ENABLED) {
 			editorHandoffHostQaBarrierByView?.get(view)?.invalidateGuard(leafIdOf(view));
 			editorHandoffHostQaBarrierByView?.delete(view);
 		}
+		if (pendingSourceUnloadDrain !== null) {
+			const pending = pendingSourceUnloadDrain;
+			clearSourceUnloadDrain(pending);
+			pending.rejectCancellation(
+				guardedHostLoadCancellation("guard-became-inert"),
+			);
+		}
+		if (pendingDeferredLoadAdmission !== null) {
+			const pending = pendingDeferredLoadAdmission;
+			rejectSourceUnload(pending.sourceRetirement);
+			supersedePendingAdmission(pending);
+		}
 		callbackRef = null;
+		clearManagedClearTombstone();
 		activeUnprovenTargetUnload = null;
 		cancelOwnedSaveJob();
 		clearSourceUnloadExpiry();
 		latestLoad = null;
-		activeAmbiguityGroup = null;
+		if (inFlightLoads.size > 0 || hostLoadAssociations.size > 0) {
+			advanceNativeLoadEpoch();
+		}
 		inFlightLoads.clear();
 		inFlightSaves.clear();
 		hostLoadAssociations.clear();
 		activeHostLoadDispatch = null;
 		mode = { kind: "inert-pass-through" };
+	}
+
+	function targetPresentationReady(input: Readonly<{
+		handoffGeneration: number;
+		targetFile: TFile;
+		certifiedContent: string;
+	}>): boolean {
+		if (
+			clearLoadCapability !== "observable"
+			|| mode.kind !== "blocking-handoff"
+			|| callbackRef === null
+			|| mode.ticket === null
+			|| !saveWrappersCurrent()
+			|| !loadWrappersCurrent()
+		) return false;
+		const expectedMode = mode;
+		const expectedTicket = mode.ticket;
+		const activeCallbacks = callbackRef;
+		const matchingAssociations = [...hostLoadAssociations.values()].filter(
+			(association) => association.ticket === expectedTicket,
+		);
+		const expectedAssociation = matchingAssociations[0] ?? null;
+		const exactAssociationRemains = (): boolean => {
+			const currentMatchingAssociations = [...hostLoadAssociations.values()].filter(
+				(association) => association.ticket === expectedTicket,
+			);
+			return expectedAssociation !== null
+				&& currentMatchingAssociations.length === 1
+				&& currentMatchingAssociations[0] === expectedAssociation
+				&& hostLoadAssociations.get(expectedAssociation.hostLoadTokenId)
+					=== expectedAssociation
+				&& (
+					expectedAssociation.loadStatus === "fulfilled"
+					|| expectedAssociation.loadStatus === "local-committed"
+				)
+				&& expectedAssociation.incomingContent === input.certifiedContent
+				&& !expectedAssociation.dispatchAmbiguous
+				&& inFlightLoads.size === 0;
+		};
+		if (expectedMode.handoffGeneration !== input.handoffGeneration) return false;
+		if (expectedMode.targetPath !== input.targetFile.path) return false;
+		if (expectedTicket.handoffGeneration !== input.handoffGeneration) return false;
+		if (expectedTicket.targetFile !== input.targetFile) return false;
+		if (!exactAssociationRemains()) return false;
+		if (!activeCallbacks.isSessionCurrent(expectedTicket.sessionId, input.handoffGeneration)) {
+			return false;
+		}
+		if (view.file !== input.targetFile || view.file.path !== expectedMode.targetPath) return false;
+		if (view.data !== input.certifiedContent) return false;
+		const editorContent = view.getViewData();
+		if (
+			editorContent !== input.certifiedContent
+			|| mode !== expectedMode
+			|| callbackRef !== activeCallbacks
+			|| !saveWrappersCurrent()
+			|| !loadWrappersCurrent()
+		) return false;
+		if (!activeCallbacks.isSessionCurrent(
+			expectedTicket.sessionId,
+			input.handoffGeneration,
+		)) return false;
+		return mode === expectedMode
+			&& callbackRef === activeCallbacks
+			&& view.file === input.targetFile
+			&& view.file.path === expectedMode.targetPath
+			&& view.data === input.certifiedContent
+			&& saveWrappersCurrent()
+			&& loadWrappersCurrent()
+			&& exactAssociationRemains();
 	}
 
 	const guard: TextFileViewHandoffGuard = {
@@ -1996,42 +3399,84 @@ export function installTextFileViewHandoffGuard(
 				originalCancellableRequestSave.cancel.call(originalCancellableRequestSave);
 			}
 		},
+		isTargetPresentationReady(input): boolean {
+			return targetPresentationReady(input);
+		},
 		markTargetProven(input): boolean {
+			if (!targetPresentationReady(input)) return false;
+			if (!targetPresentationReady(input)) return false;
+			if (mode.kind !== "blocking-handoff" || mode.ticket === null) return false;
+			const presentationTicket = mode.ticket;
+			const exactAssociations = [...hostLoadAssociations.values()].filter(
+				(association) => association.ticket === presentationTicket,
+			);
+			const exactAssociation = exactAssociations.length === 1
+				? exactAssociations[0] ?? null
+				: null;
 			if (
-				clearLoadCapability !== "observable"
-				|| mode.kind !== "blocking-handoff"
-				|| callbackRef === null
-				|| mode.ticket === null
+				exactAssociation === null
+				|| (
+					exactAssociation.loadStatus !== "fulfilled"
+					&& exactAssociation.loadStatus !== "local-committed"
+				)
+				|| exactAssociation.dispatchAmbiguous
+				|| exactAssociation.incomingContent !== input.certifiedContent
 			) return false;
+			retainManagedClearTombstone(exactAssociation);
+			mode = { kind: "pass-through" };
+			return true;
+		},
+		markTargetLocallyPresented(input): boolean {
+			if (!targetPresentationReady(input)) return false;
+			if (mode.kind !== "blocking-handoff" || mode.ticket === null) return false;
+			if (callbackRef === null || sourceUnload === null) return false;
 			const expectedMode = mode;
 			const expectedTicket = mode.ticket;
+			const expectedSourceUnload = sourceUnload;
 			const activeCallbacks = callbackRef;
-			if (expectedMode.handoffGeneration !== input.handoffGeneration) return false;
-			if (expectedMode.targetPath !== input.targetFile.path) return false;
-			if (expectedTicket.handoffGeneration !== input.handoffGeneration) return false;
-			if (expectedTicket.targetFile !== input.targetFile) return false;
-			if (!activeCallbacks.isSessionCurrent(expectedTicket.sessionId, input.handoffGeneration)) return false;
-			if (view.file !== input.targetFile || view.file.path !== expectedMode.targetPath) return false;
-			if (view.data !== input.certifiedContent) return false;
-			const editorContent = view.getViewData();
+			const exactAssociations = [...hostLoadAssociations.values()].filter(
+				(association) => association.ticket === expectedTicket,
+			);
+			const expectedAssociation = exactAssociations.length === 1
+				? exactAssociations[0] ?? null
+				: null;
+			const exactLocalOwnerRemains = (): boolean =>
+				expectedAssociation !== null
+				&& mode === expectedMode
+				&& sourceUnload === expectedSourceUnload
+				&& callbackRef === activeCallbacks
+				&& expectedMode.ticket === expectedTicket
+				&& expectedSourceUnload.receiptId === expectedTicket.sourceUnloadReceiptId
+				&& retiredSourceReceiptIsExact(expectedSourceUnload)
+				&& hostLoadAssociations.get(expectedAssociation.hostLoadTokenId)
+					=== expectedAssociation
+				&& expectedAssociation.ticket === expectedTicket
+				&& expectedAssociation.targetPathAtEntry === expectedMode.targetPath
+				&& expectedAssociation.loadStatus === "local-committed"
+				&& expectedAssociation.pendingReceipt !== null
+				&& expectedAssociation.completionForwarded
+				&& !expectedAssociation.dispatchAmbiguous
+				&& expectedAssociation.incomingContent === input.certifiedContent
+				&& inFlightLoads.get(expectedAssociation.loadId) === undefined
+				&& inFlightLoads.size === 0;
 			if (
-				editorContent !== input.certifiedContent
-				|| mode !== expectedMode
-				|| callbackRef !== activeCallbacks
+				!exactLocalOwnerRemains()
+				|| !targetPresentationReady(input)
+				|| !exactLocalOwnerRemains()
+				|| expectedAssociation === null
 			) return false;
-			if (!activeCallbacks.isSessionCurrent(
-				expectedTicket.sessionId,
-				input.handoffGeneration,
-			)) return false;
+			clearSourceUnloadExpiry();
 			if (
-				// Both host reads and the session callback are re-entrant boundaries.
-				// Recheck the exact mode owner after each before releasing the gate.
-				mode !== expectedMode
-				|| callbackRef !== activeCallbacks
-				|| view.file !== input.targetFile
-				|| view.file.path !== expectedMode.targetPath
-				|| view.data !== input.certifiedContent
-			) return false;
+				latestLoad?.id === expectedAssociation.loadId
+				&& latestLoad.ticket === expectedTicket
+			) {
+				latestLoad = null;
+			}
+			retainManagedClearTombstone(expectedAssociation);
+			if (hostLoadAssociations.delete(expectedAssociation.hostLoadTokenId)) {
+				advanceNativeLoadEpoch();
+			}
+			sourceUnload = null;
 			mode = { kind: "pass-through" };
 			return true;
 		},
@@ -2041,6 +3486,7 @@ export function installTextFileViewHandoffGuard(
 			if (association === undefined || callbackRef === null) return false;
 			if (!associationIsCurrent(association)) {
 				hostLoadAssociations.delete(association.hostLoadTokenId);
+				advanceNativeLoadEpoch();
 				return false;
 			}
 			if (
@@ -2057,21 +3503,57 @@ export function installTextFileViewHandoffGuard(
 				|| candidate.leafId !== leafIdOf(view)
 			) return false;
 			association.candidate = candidate;
+			advanceNativeLoadEpoch();
 			callbackRef.onHostLoadCandidate(candidate);
 			return true;
 		},
 		reportHostLoadCompleted(receipt): boolean {
 			if (clearLoadCapability !== "observable") return false;
 			const association = hostLoadAssociations.get(receipt.hostLoadTokenId);
+			const exactAssociations = association === undefined
+				? []
+				: [...hostLoadAssociations.values()].filter(
+					(candidateAssociation) => candidateAssociation.ticket === association.ticket,
+				);
+			const load = association === undefined
+				? null
+				: inFlightLoads.get(association.loadId) ?? null;
+			const exactPendingLoad = association !== undefined
+				&& association.loadStatus === "pending"
+				&& load !== null
+				&& inFlightLoads.size === 1
+				&& !load.ambiguous
+				&& !load.superseded
+				&& !load.locallyCommitted
+				&& load.clearObserved
+				&& load.ticket === association.ticket
+				&& load.targetPathAtEntry === association.targetPathAtEntry;
+			const exactFulfilledLoad = association !== undefined
+				&& association.loadStatus === "fulfilled"
+				&& load === null
+				&& inFlightLoads.size === 0;
 			if (
 				association === undefined
 				|| association.pendingReceipt !== null
+				|| association.completionForwarded
+				|| association.dispatchAmbiguous
+				|| hostLoadAssociations.size !== 1
+				|| exactAssociations.length !== 1
+				|| exactAssociations[0] !== association
+				|| (!exactPendingLoad && !exactFulfilledLoad)
 				|| !associationIsCurrent(association)
 				|| !receiptMatchesAssociation(association, receipt)
 			) return false;
 			association.pendingReceipt = receipt;
-			forwardCompletionIfSettled(association);
-			return true;
+			association.loadStatus = "local-committed";
+			if (load !== null) {
+				load.locallyCommitted = true;
+				inFlightLoads.delete(load.id);
+				if (latestLoad === load) latestLoad = null;
+				load.resolveLocalCommit();
+			}
+			advanceNativeLoadEpoch();
+			return forwardLocallyCommittedCompletion(association);
 		},
 		isExactHostLoadDispatchActive(identity): boolean {
 			const association = activeHostLoadDispatch;
@@ -2106,10 +3588,50 @@ export function installTextFileViewHandoffGuard(
 		cancelOwnedSave(): void {
 			cancelOwnedSaveJob();
 		},
+		cancelTerminalHostLifecycle(reason): boolean {
+			return settleTerminalHostLifecycle(reason);
+		},
+		acquireEmergencySaveFence(): TextFileViewEmergencySaveFence {
+			const owner = Object.freeze({});
+			let released = false;
+			emergencySaveFenceOwners.add(owner);
+			const refresh = (): boolean => {
+				if (released || !emergencySaveFenceOwners.has(owner)) return false;
+				revokeEmergencySaveDelegations();
+				const restored = restoreEmergencySaveWrapperIdentity();
+				return restored && !emergencySaveFenceUnprovable;
+			};
+			const fence: TextFileViewEmergencySaveFence = Object.freeze({
+				view,
+				refresh,
+				isCurrent: () => {
+					if (released || !emergencySaveFenceOwners.has(owner)) return false;
+					if (!saveWrappersCurrent()) emergencySaveFenceUnprovable = true;
+					return !emergencySaveFenceUnprovable && saveWrappersCurrent();
+				},
+				release: () => {
+					if (released || !emergencySaveFenceOwners.delete(owner)) return false;
+					released = true;
+					return true;
+				},
+			});
+			refresh();
+			return fence;
+		},
 		markInert(): void {
+			if (emergencySaveFenceOwners.size > 0) {
+				revokeEmergencySaveDelegations();
+				restoreEmergencySaveWrapperIdentity();
+				return;
+			}
 			becomeInert();
 		},
 		restoreIfCurrent(): void {
+			if (emergencySaveFenceOwners.size > 0) {
+				revokeEmergencySaveDelegations();
+				restoreEmergencySaveWrapperIdentity();
+				return;
+			}
 			becomeInert();
 			for (const name of [
 				"onUnloadFile",
@@ -2142,13 +3664,17 @@ export function installTextFileViewHandoffGuard(
 				clearLoadCapability,
 				mode: publicMode(mode),
 				inFlight: new Map(
-					Array.from(inFlightSaves, ([id, entry]) => [id, { ...entry }] as const),
+					Array.from(inFlightSaves, ([id, entry]) => [id, {
+						file: entry.file,
+						path: entry.path,
+						startedAt: entry.startedAt,
+					}] as const),
 				),
 				pendingTargetSave: false,
 				pendingOwnedSave: pendingOwnedSave === null
 					? null
 					: { ...pendingOwnedSave },
-				sourceUnload: sourceUnload === null
+					sourceUnload: sourceUnload === null
 					? null
 					: {
 						receiptId: sourceUnload.receiptId,
@@ -2157,9 +3683,59 @@ export function installTextFileViewHandoffGuard(
 						path: sourceUnload.path,
 						state: sourceUnload.state,
 						forcedSaveObserved: sourceUnload.forcedSaveObserved,
-						cacheRetiredBeforeUnloadSettled:
-							sourceUnload.cacheRetiredBeforeUnloadSettled,
-					},
+							cacheRetiredBeforeUnloadSettled:
+								sourceUnload.cacheRetiredBeforeUnloadSettled,
+						},
+					pendingLoadEpoch,
+					pendingDeferredLoadAdmission: pendingDeferredLoadAdmission === null
+						? null
+						: {
+							ownerId: pendingDeferredLoadAdmission.ownerId,
+							pendingLoadEpoch,
+							targetFile: pendingDeferredLoadAdmission.targetFile,
+							targetPath: pendingDeferredLoadAdmission.targetPathAtEntry,
+							sourceUnloadReceiptId:
+								pendingDeferredLoadAdmission.sourceRetirement.receiptId,
+							sourceUnloadId:
+								pendingDeferredLoadAdmission.sourceRetirement.unloadId,
+							sourceFile: pendingDeferredLoadAdmission.sourceRetirement.file,
+							sourcePath: pendingDeferredLoadAdmission.sourceRetirement.path,
+							viewFileAtEntry: pendingDeferredLoadAdmission.viewFileAtEntry,
+							viewPathAtEntry: pendingDeferredLoadAdmission.viewPathAtEntry,
+						},
+					pendingSourceUnloadDrain: pendingSourceUnloadDrain === null
+						? null
+						: {
+							ownerId: pendingSourceUnloadDrain.ownerId,
+							sourceFile: pendingSourceUnloadDrain.sourceFile,
+							sourcePath: pendingSourceUnloadDrain.sourcePathAtEntry,
+							viewFileAtEntry: pendingSourceUnloadDrain.viewFileAtEntry,
+							viewPathAtEntry: pendingSourceUnloadDrain.viewPathAtEntry,
+							nativeLoadEpochAtEntry:
+								pendingSourceUnloadDrain.nativeLoadEpochAtEntry,
+							pendingLoadEpochAtEntry:
+								pendingSourceUnloadDrain.pendingLoadEpochAtEntry,
+							saveEpochAtEntry: pendingSourceUnloadDrain.saveEpochAtEntry,
+							preexistingSaveCount:
+								pendingSourceUnloadDrain.preexistingSaveTails.length,
+							expectedSaveEpochAfterDrain:
+								pendingSourceUnloadDrain.expectedSaveEpochAfterDrain,
+						},
+					nativeLoadEpoch,
+					pendingNativeHostLoadCount: inFlightLoads.size,
+					nativeHostLoadAmbiguous: nativeHostLoadIsAmbiguous(),
+					managedClearTombstoneEpoch,
+					managedClearTombstoneActive: managedClearTombstone !== null,
+					terminalHostLifecycle: terminalHostLifecycle === null
+						? null
+						: {
+							ownerId: terminalHostLifecycle.ownerId,
+							state: "blocked",
+						},
+					wrappersCurrent: saveWrappersCurrent(),
+					loadWrappersCurrent: loadWrappersCurrent(),
+				emergencySaveBlocked:
+					emergencySaveFenceOwners.size > 0 && saveWrappersCurrent(),
 			};
 		},
 	};

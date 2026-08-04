@@ -13,18 +13,13 @@ import {
 	type Text,
 } from "@codemirror/state";
 import { historyField } from "@codemirror/commands";
-import { EditorView, showPanel, type Panel } from "@codemirror/view";
+import { EditorView } from "@codemirror/view";
 import type { TFile, TextFileView } from "obsidian";
 import type {
-	HandoffInputIntent,
 	HostLoadCompletionReceipt,
 	ManagedLeafSession,
 	PendingHostLoadCandidate,
 } from "./editorHandoffState";
-import type {
-	HandoffCompositionProof,
-	HandoffReplayPermit,
-} from "./editorHandoffReplay";
 
 declare const __KAOS_QA_HARNESS_ENABLED__: boolean;
 
@@ -40,175 +35,13 @@ export const acceptedHostLoad = Annotation.define<Readonly<{
 	handoffGeneration: number;
 }>>();
 
-export const acceptedHandoffReplay = Annotation.define<Readonly<{
-	permit: HandoffReplayPermit;
-	frameIdentity: object;
-}>>();
-
-export type ManualHandoffInputReason =
-	| "switch-spanning"
-	| "composition-update-gap"
-	| "missing-composition-end"
-	| "unproven-final-successor";
-
-export type RoutedHandoffInputIntent =
-	| Readonly<{
-		intent: HandoffInputIntent;
-		disposition: "replay-candidate";
-		reason: null;
-	}>
-	| Readonly<{
-		intent: HandoffInputIntent;
-		disposition: "manual-recovery";
-		reason: ManualHandoffInputReason;
-	}>;
-
-export const capturedInputIntent = Annotation.define<RoutedHandoffInputIntent>();
-
 const guardOwnedGateReconfiguration = Annotation.define<object>();
-
-export type HandoffRecoveryGateAction =
-	| "retry"
-	| "continue-without-automatic-apply"
-	| "retry-settlement"
-	| "copy-and-continue"
-	| "export-and-continue"
-	| "discard-and-continue";
-
-export type HandoffRecoveryGateModel = Readonly<{
-	state:
-		| "persisting"
-		| "escape-pending"
-		| "failed"
-		| "stored"
-		| "replay-pending"
-		| "replayed-awaiting-settlement";
-	message:
-		| "Preserving interrupted input…"
-		| "Completing the selected recovery action…"
-		| "Interrupted input still needs a recovery choice."
-		| "Waiting for a proven target before automatic apply…"
-		| "Preparing one verified automatic apply…"
-		| "Automatic apply is waiting for settlement verification…";
-	actions: readonly HandoffRecoveryGateAction[];
-}>;
-
-export interface HandoffRecoveryGateCallbacks {
-	onRetry(): void;
-	onCopyAndContinue(): void;
-	onExportAndContinue(): void;
-	onDiscardAndContinue(): void;
-	onContinueWithoutAutomaticApply(): void;
-	onRetrySettlement(): void;
-}
-
-export function handoffRecoveryGateActions(
-	state: HandoffRecoveryGateModel["state"],
-): readonly HandoffRecoveryGateAction[] {
-	switch (state) {
-		case "failed":
-			return ["retry", "copy-and-continue", "export-and-continue", "discard-and-continue"];
-		case "persisting":
-		case "escape-pending":
-			return ["copy-and-continue", "export-and-continue", "discard-and-continue"];
-		case "stored":
-		case "replay-pending":
-			return ["continue-without-automatic-apply"];
-		case "replayed-awaiting-settlement":
-			return ["retry-settlement", "continue-without-automatic-apply"];
-	}
-}
-
-const HANDOFF_RECOVERY_ACTION_LABELS: Readonly<
-	Record<HandoffRecoveryGateAction, string>
-> = Object.freeze({
-	"retry": "Retry",
-	"copy-and-continue": "Copy and continue",
-	"export-and-continue": "Export and continue",
-	"discard-and-continue": "Discard and continue",
-	"continue-without-automatic-apply": "Continue without automatic apply",
-	"retry-settlement": "Retry settlement",
-});
-
-function invokeHandoffRecoveryGateAction(
-	action: HandoffRecoveryGateAction,
-	callbacks: HandoffRecoveryGateCallbacks,
-): void {
-	switch (action) {
-		case "retry":
-			callbacks.onRetry();
-			return;
-		case "copy-and-continue":
-			callbacks.onCopyAndContinue();
-			return;
-		case "export-and-continue":
-			callbacks.onExportAndContinue();
-			return;
-		case "discard-and-continue":
-			callbacks.onDiscardAndContinue();
-			return;
-		case "continue-without-automatic-apply":
-			callbacks.onContinueWithoutAutomaticApply();
-			return;
-		case "retry-settlement":
-			callbacks.onRetrySettlement();
-	}
-}
-
-function createHandoffRecoveryPanel(
-	model: HandoffRecoveryGateModel,
-	callbacks: HandoffRecoveryGateCallbacks | undefined,
-): (view: EditorView) => Panel {
-	const actions = handoffRecoveryGateActions(model.state);
-	return (view) => {
-		const document = view.dom.ownerDocument;
-		const dom = document.createElement("div");
-		dom.className = "kaos-handoff-recovery-gate";
-		dom.setAttribute("role", "status");
-		dom.setAttribute("aria-live", "polite");
-		dom.setAttribute("aria-label", "Handoff recovery controls");
-		const message = document.createElement("div");
-		message.className = "kaos-handoff-recovery-gate-message";
-		message.textContent = model.message;
-		dom.appendChild(message);
-		const controls = document.createElement("div");
-		controls.className = "kaos-handoff-recovery-gate-actions";
-		for (const action of actions) {
-			const label = HANDOFF_RECOVERY_ACTION_LABELS[action];
-			const button = document.createElement("button");
-			button.type = "button";
-			button.textContent = label;
-			button.setAttribute("aria-label", label);
-			button.disabled = callbacks === undefined;
-			if (callbacks) {
-				button.addEventListener("click", () => {
-					invokeHandoffRecoveryGateAction(action, callbacks);
-				});
-			}
-			controls.appendChild(button);
-		}
-		dom.appendChild(controls);
-		return { dom, top: true };
-	};
-}
-
-function handoffRecoveryGateFingerprint(
-	model: HandoffRecoveryGateModel | null,
-): string {
-	return model === null
-		? "none"
-		: `${model.state}:${model.message}:${handoffRecoveryGateActions(model.state).join(",")}`;
-}
 
 export type FinalDispatchDecision =
 	| Readonly<{ kind: "forward"; transaction: Transaction }>
+	| Readonly<{ kind: "drop" }>
 	| Readonly<{ kind: "hold-host-load"; candidate: PendingHostLoadCandidate }>
 	| Readonly<{ kind: "capture-composition" }>
-	| Readonly<{
-		kind: "capture-intent";
-		intent: HandoffInputIntent;
-		effectOnly: Transaction;
-	}>
 	| Readonly<{
 		kind: "reject";
 		reason: "stale-generation" | "old-provider" | "ambiguous-editor-api";
@@ -241,6 +74,7 @@ export type CodeMirrorHandoffContext =
 		runtimeView: TextFileView;
 		bindingEpoch: number;
 		editorRevisionBefore: number;
+		inputPolicy?: "capture" | "reject-before-target";
 	}>;
 
 export type CodeMirrorHandoffGuardCallbacks = Readonly<{
@@ -268,13 +102,41 @@ export type CodeMirrorHandoffGuardCallbacks = Readonly<{
 		| "state-replacement-unproven"
 		| "state-document-mismatch"
 	): void;
-	onInputIntent(routed: RoutedHandoffInputIntent): boolean;
+	onUnresolvedInputTerminal?(input: Readonly<{
+		reservation: ManagedLeafInputStartReservation;
+		reason: "composition-unresolved" | "spanning-input";
+	}>): boolean;
 	onSamePathInputCompleted?(input: Readonly<{
 		reservation: ManagedLeafInputStartReservation;
 		cm: EditorView;
 		startDocument: Text;
 		finalDocument: Text;
+		samePathDispatch?: Readonly<{
+			batchStartDocument: Text;
+			nativeHistoryEpochBefore: number;
+			nativeHistoryEpochAfter: number;
+		}>;
 	}>): boolean;
+	onSamePathInputRejected?(input:
+		| Readonly<{
+			reservation: ManagedLeafInputStartReservation;
+			cm: EditorView;
+			startDocument: Text;
+			reason: "cancelled";
+		}>
+		| Readonly<{
+			reservation: ManagedLeafInputStartReservation;
+			cm: EditorView;
+			startDocument: Text;
+			finalDocument: Text;
+			reason: "input-result-ambiguous";
+			samePathDispatch: Readonly<{
+				batchStartDocument: Text;
+				nativeHistoryEpochBefore: number;
+				nativeHistoryEpochAfter: number;
+			}>;
+		}>
+	): boolean;
 	onNativeHistoryAdvanced?(input: Readonly<{
 		cm: EditorView;
 		startState: EditorState;
@@ -285,15 +147,7 @@ export type CodeMirrorHandoffGuardCallbacks = Readonly<{
 	onCompositionBoundary?(phase: "start" | "end"): void;
 	isNativeHistoryReset(transaction: Transaction): boolean;
 	observeNativeHistoryReset(view: EditorView, transaction: Transaction): boolean;
-	hashContent(content: string): string;
-	acceptHandoffReplayTransaction?(
-		transaction: Transaction,
-		boundary: "route" | "update",
-	): boolean;
-	getHandoffRecoveryGateModel?(): HandoffRecoveryGateModel | null;
-	handoffRecoveryGateCallbacks?: HandoffRecoveryGateCallbacks;
 	createId(prefix: string): string;
-	now?(): number;
 }>;
 
 export type ArmHostLoadInput = Readonly<{
@@ -315,6 +169,13 @@ export type CodeMirrorHandoffGuardSnapshot = Readonly<{
 	view: EditorView;
 	inert: boolean;
 	gateClosed: boolean;
+	/** Exact source reservation allowed to finish while fresh native input is blocked. */
+	sourceUnloadDrain: null | Readonly<{
+		ownerId: string;
+		reservation: ManagedLeafInputStartReservation;
+	}>;
+	/** Exact target-less owner held between source settlement and reducer publication. */
+	targetSelectionFence: TargetSelectionFenceToken | null;
 	inputEpoch: number;
 	compositionEpoch: number;
 	nativeHistoryEpoch: number;
@@ -367,7 +228,75 @@ export type CodeMirrorHandoffGuardSnapshot = Readonly<{
 	pendingHostLoadCandidate: PendingHostLoadCandidate | null;
 }>;
 
+const targetSelectionFenceBrand: unique symbol = Symbol("kaos-target-selection-fence");
+
+/**
+ * Opaque exact owner for the source-side, target-less input boundary.  The
+ * manager may retain and return this value, but only this guard can validate or
+ * consume it.
+ */
+export type TargetSelectionFenceToken = Readonly<{
+	readonly [targetSelectionFenceBrand]: true;
+	readonly ownerId: string;
+	readonly view: EditorView;
+	readonly sourceState: EditorState;
+	readonly sourceDocument: Text;
+	readonly nativeHistoryEpoch: number;
+	readonly inputEpoch: number;
+	readonly compositionEpoch: number;
+	readonly selectionEpoch: number;
+	readonly scrollEpoch: number;
+}>;
+
+export type HeldHostLoadPresentationResult =
+	| Readonly<{ kind: "accepted"; receipt: HostLoadCompletionReceipt }>
+	| Readonly<{
+		kind: "pending-notification";
+		notification: "candidate";
+		candidate: PendingHostLoadCandidate;
+	}>
+	| Readonly<{
+		kind: "pending-notification";
+		notification: "completion";
+		receipt: HostLoadCompletionReceipt;
+	}>
+	| Readonly<{
+		kind: "rejected";
+		reason: "stale-generation" | "old-provider" | "ambiguous-editor-api";
+	}>;
+
 export interface CodeMirrorHandoffGuard {
+	/**
+	 * Block fresh native input while allowing only the already-reserved source
+	 * sequence to reach its existing completion/rejection callback.
+	 */
+	beginSourceUnloadDrain(
+		ownerId: string,
+		reservation: ManagedLeafInputStartReservation,
+	): boolean;
+	/** Exact identity proof for the one live source-drain owner. */
+	isSourceUnloadDrainCurrent(
+		ownerId: string,
+		reservation: ManagedLeafInputStartReservation,
+	): boolean;
+	/**
+	 * Settle all provable source input and synchronously install a target-less
+	 * reject-only boundary before a reducer may publish target selection.
+	 */
+	prepareTargetSelectionFence(
+		ownerId: string,
+		drainedReservation?: ManagedLeafInputStartReservation,
+	): TargetSelectionFenceToken | null;
+	/** Last-resort reopen boundary when source input cannot be settled exactly. */
+	forceTargetSelectionFenceForTerminal(ownerId: string): TargetSelectionFenceToken | null;
+	/** Exact identity/epoch proof for the currently owned target-less boundary. */
+	isTargetSelectionFenceCurrent(token: TargetSelectionFenceToken): boolean;
+	/** Transfer the exact target-less owner to the reducer-driven handoff gate. */
+	transferTargetSelectionFence(token: TargetSelectionFenceToken): boolean;
+	/** Release only an unchanged source-side owner after publication aborts. */
+	releaseTargetSelectionFence(token: TargetSelectionFenceToken): boolean;
+	/** Consume the exact owner at an explicit view-close/plugin-teardown boundary. */
+	releaseTargetSelectionFenceForTeardown(token: TargetSelectionFenceToken): boolean;
 	/** Re-read the reducer-owned context and synchronously install/release the gate. */
 	refreshGate(): boolean;
 	/** Arm the exact one-shot Task 3 clear-load association before the host dispatches it. */
@@ -376,26 +305,17 @@ export interface CodeMirrorHandoffGuard {
 	acceptHeldHostLoad(input: Readonly<{
 		candidate: PendingHostLoadCandidate;
 		presentationPlanId: string;
-	}>): Promise<
-		| Readonly<{ kind: "accepted"; receipt: HostLoadCompletionReceipt }>
-		| Readonly<{
-			kind: "pending-notification";
-			notification: "candidate";
-			candidate: PendingHostLoadCandidate;
-		}>
-		| Readonly<{
-			kind: "pending-notification";
-			notification: "completion";
-			receipt: HostLoadCompletionReceipt;
-		}>
-		| Readonly<{
-			kind: "rejected";
-			reason: "stale-generation" | "old-provider" | "ambiguous-editor-api";
-		}>
-	>;
+	}>): Promise<HeldHostLoadPresentationResult>;
+	/** Present the exact held target synchronously, without controller or measure settlement. */
+	presentHeldHostLoadLocally(input: Readonly<{
+		candidate: PendingHostLoadCandidate;
+		localPresentationId: string;
+	}>): HeldHostLoadPresentationResult;
 	/** Certify only the synchronous same-document tail of the exact host clear-load call. */
 	certifyHostLoadPostDelegation(hostLoadTokenId: string): boolean;
 	markInert(): boolean;
+	/** Final tombstone for a view already proven absent from the workspace. */
+	markDetachedInertForTeardown(): boolean;
 	restoreIfCurrent(): boolean;
 	snapshot(): CodeMirrorHandoffGuardSnapshot;
 }
@@ -458,9 +378,19 @@ type InputSequence = {
 	reservation: ManagedLeafInputStartReservation;
 	startGeneration: number;
 	compositionEpoch: number | null;
+	nativeInput: Readonly<{
+		inputType: string;
+		data: string | null;
+	}> | null;
 	originContext: HandoffOriginContext | null;
 	samePathOriginContext: SamePathOriginContext | null;
 	documentAtStart: Text;
+	/** Exact same-path document reached by provider/user batches seen so far. */
+	samePathChainDocument: Text;
+	/** Exact selection paired with samePathChainDocument at the native boundary. */
+	samePathChainSelection: EditorSelection;
+	/** A user-annotated transaction boundary proved the native lane settled. */
+	nativeBoundaryObserved: boolean;
 	beforeHandoffAssociation: BeforeHandoffAssociation;
 };
 type CompositionSequence = {
@@ -473,6 +403,8 @@ type CompositionSequence = {
 	firstCapturedInputSequence: number | null;
 	lastCapturedInputSequence: number | null;
 	lastProofTransaction: Transaction | null;
+	/** Latest native compositionupdate payload not yet certified by an applied transaction. */
+	latestUpdateData: string | null;
 };
 type PendingCompositionSuccessor = Readonly<{
 	sequence: InputSequence;
@@ -483,13 +415,30 @@ type PendingImplicitCompositionCommit = Readonly<{
 	sequence: InputSequence;
 	data: string;
 }>;
-type PendingInputDelivery = {
-	routed: RoutedHandoffInputIntent;
+type PendingOrdinarySpanningSuccessor = Readonly<{
 	sequence: InputSequence;
-	callbackAcknowledged: boolean;
-	effectCaptured: boolean;
-	effectTransaction: Transaction | null;
-};
+	transaction: Transaction;
+}>;
+type RejectBeforeTargetDomFence = Readonly<{
+	contentEditableAttribute: string | null;
+	ariaReadonlyAttribute: string | null;
+	tabIndexAttribute: string | null;
+	focusWasWithinContent: boolean;
+	focusWasDisplaced: boolean;
+}>;
+type StableSamePathInputBatch = Readonly<{
+	sequence: InputSequence;
+	samePathOrigin: SamePathOriginContext;
+	batchStartDocument: Text;
+	finalDocument: Text;
+	nativeHistoryEpochBefore: number;
+	nativeBoundaryObserved: boolean;
+	disposition: "completed" | "pending" | "ambiguous";
+}>;
+type SourceUnloadDrain = Readonly<{
+	ownerId: string;
+	reservation: ManagedLeafInputStartReservation;
+}>;
 type ArmedHostLoad = Readonly<{
 	input: ArmHostLoadInput;
 	startState: EditorState;
@@ -553,7 +502,9 @@ type HostLoadCandidateNotification = {
 };
 type PendingHostLoadCompletion = {
 	held: HeldHostLoad;
-	presentationPlanId: string;
+	presentation:
+		| Readonly<{ kind: "controller"; id: string }>
+		| Readonly<{ kind: "local"; id: string }>;
 	receipt: HostLoadCompletionReceipt;
 	acceptedState: EditorState;
 	phase: HostLoadNotificationPhase;
@@ -565,22 +516,6 @@ type InstalledEntry = Readonly<{
 
 const installedGuards = new WeakMap<EditorView, InstalledEntry>();
 const effectIds = new WeakMap<object, number>();
-const liveCompositionProofOwners = new WeakSet<object>();
-const compositionProofByIntent = new WeakMap<
-	HandoffInputIntent,
-	Readonly<{ owner: object; proof: HandoffCompositionProof }>
->();
-
-export function captureGuardOwnedHandoffCompositionProof(
-	intent: HandoffInputIntent,
-):
-	| Readonly<{ kind: "ready"; proof: HandoffCompositionProof }>
-	| Readonly<{ kind: "unavailable" }> {
-	const entry = compositionProofByIntent.get(intent);
-	return entry !== undefined && liveCompositionProofOwners.has(entry.owner)
-		? frozen({ kind: "ready", proof: entry.proof })
-		: frozen({ kind: "unavailable" });
-}
 let nextEffectId = 1;
 
 function isExactSameSelectionHistorySettlement(transaction: Transaction): boolean {
@@ -852,14 +787,6 @@ function isExactFullReplacement(transaction: Transaction, incomingContent: strin
 	return count === 1 && exact;
 }
 
-function userEventOf(transaction: Transaction): HandoffInputIntent["userEvent"] {
-	if (transaction.isUserEvent("delete")) return "delete";
-	if (transaction.isUserEvent("input.paste")) return "paste";
-	if (transaction.isUserEvent("input.drop") || transaction.isUserEvent("move.drop")) return "drop";
-	if (transaction.isUserEvent("input")) return "input";
-	return "other";
-}
-
 function isUserDocumentTransaction(transaction: Transaction): boolean {
 	return transaction.isUserEvent("input")
 		|| transaction.isUserEvent("delete")
@@ -945,7 +872,10 @@ export function installCodeMirrorHandoffGuard(
 	let activeComposition: CompositionSequence | null = null;
 	let pendingCompositionSuccessor: PendingCompositionSuccessor | null = null;
 	let pendingImplicitCompositionCommit: PendingImplicitCompositionCommit | null = null;
-	let pendingInputDelivery: PendingInputDelivery | null = null;
+	let pendingOrdinarySpanningSuccessor: PendingOrdinarySpanningSuccessor | null = null;
+	let sourceUnloadDrain: SourceUnloadDrain | null = null;
+	let targetSelectionFence: TargetSelectionFenceToken | null = null;
+	let rejectBeforeTargetDomFence: RejectBeforeTargetDomFence | null = null;
 	let gateReconfigurationDepth = 0;
 	const gateReconfigurationLedger: GuardOwnedGateReconfiguration[] = [];
 	let lastComposition: CodeMirrorHandoffGuardSnapshot["lastComposition"] = null;
@@ -997,7 +927,6 @@ export function installCodeMirrorHandoffGuard(
 			&& preCompletionCandidate !== null
 			&& preCompletion.sequence.compositionEpoch !== null
 			&& pendingInput === preCompletion.sequence
-			&& pendingInputDelivery === null
 			&& pendingCompositionSuccessor?.sequence === preCompletion.sequence
 			&& pendingCompositionSuccessor.updateAtCapture === preCompletion.updates
 			&& preCompletion.lastCapturedUpdate === preCompletion.updates
@@ -1092,7 +1021,6 @@ export function installCodeMirrorHandoffGuard(
 			&& noopAuthority.state === pendingNoop.startState
 			&& activeComposition === null
 			&& pendingInput === null
-			&& pendingInputDelivery === null
 			&& (
 				pendingNoop.compositionEpoch === null
 				|| (
@@ -1211,7 +1139,116 @@ export function installCodeMirrorHandoffGuard(
 		return callbackRef?.getCurrentContext() ?? null;
 	}
 
-	function startInputSequence(composition: number | null): void {
+	function restoreOwnedDomAttribute(
+		target: HTMLElement,
+		name: string,
+		ownedValue: string,
+		value: string | null,
+	): void {
+		if (target.getAttribute(name) !== ownedValue) return;
+		if (value === null) target.removeAttribute(name);
+		else target.setAttribute(name, value);
+	}
+
+	function installRejectBeforeTargetDomFence(): void {
+		const content = view.contentDOM;
+		if (rejectBeforeTargetDomFence === null) {
+			const document = content.ownerDocument;
+			const activeBefore = document.activeElement;
+			const focusWasWithinContent = activeBefore === content
+				|| (activeBefore !== null && content.contains(activeBefore));
+			const snapshot = {
+				contentEditableAttribute: content.getAttribute("contenteditable"),
+				ariaReadonlyAttribute: content.getAttribute("aria-readonly"),
+				tabIndexAttribute: content.getAttribute("tabindex"),
+				focusWasWithinContent,
+				focusWasDisplaced: false,
+			};
+			content.setAttribute("contenteditable", "false");
+			content.setAttribute("aria-readonly", "true");
+			if (snapshot.tabIndexAttribute === null) content.setAttribute("tabindex", "0");
+			const activeAfter = document.activeElement;
+			rejectBeforeTargetDomFence = frozen({
+				...snapshot,
+				focusWasDisplaced: focusWasWithinContent
+					&& activeAfter !== activeBefore
+					&& (
+						activeAfter === null
+						|| activeAfter === document.body
+						|| activeAfter === document.documentElement
+					),
+			});
+			return;
+		}
+		// CodeMirror recomputes content attributes during state updates. Reassert
+		// the exact controller-owned fence without replacing the restore snapshot.
+		content.setAttribute("contenteditable", "false");
+		content.setAttribute("aria-readonly", "true");
+		if (rejectBeforeTargetDomFence.tabIndexAttribute === null) {
+			content.setAttribute("tabindex", "0");
+		}
+	}
+
+	function releaseRejectBeforeTargetDomFence(restoreFocus: boolean): void {
+		const snapshot = rejectBeforeTargetDomFence;
+		if (snapshot === null) return;
+		rejectBeforeTargetDomFence = null;
+		const content = view.contentDOM;
+		restoreOwnedDomAttribute(
+			content,
+			"contenteditable",
+			"false",
+			snapshot.contentEditableAttribute,
+		);
+		restoreOwnedDomAttribute(
+			content,
+			"aria-readonly",
+			"true",
+			snapshot.ariaReadonlyAttribute,
+		);
+		if (snapshot.tabIndexAttribute === null) {
+			restoreOwnedDomAttribute(content, "tabindex", "0", null);
+		}
+		if (!restoreFocus || !snapshot.focusWasWithinContent || !snapshot.focusWasDisplaced) return;
+		const document = content.ownerDocument;
+		const active = document.activeElement;
+		if (
+			active !== null
+			&& active !== document.body
+			&& active !== document.documentElement
+		) return;
+		try {
+			view.focus();
+		} catch {
+			// Focus restoration is best-effort and must not keep the input fence closed.
+		}
+	}
+
+	function synchronizeRejectBeforeTargetDomFence(
+		context: CodeMirrorHandoffContext | null = currentContext(),
+	): void {
+		if (
+			!inert
+			&& callbackRef !== null
+			&& (
+				targetSelectionFence !== null
+				|| context === null
+				|| (
+					context?.kind === "handoff"
+					&& context.inputPolicy === "reject-before-target"
+				)
+			)
+		) {
+			installRejectBeforeTargetDomFence();
+			return;
+		}
+		releaseRejectBeforeTargetDomFence(true);
+	}
+
+	function startInputSequence(
+		composition: number | null,
+		nativeInput: InputSequence["nativeInput"] = null,
+	): void {
 		const context = currentContext();
 		if (context === null) {
 			pendingInput = null;
@@ -1244,9 +1281,13 @@ export function installCodeMirrorHandoffGuard(
 			reservation,
 			startGeneration: context.handoffGeneration,
 			compositionEpoch: composition,
+			nativeInput,
 			originContext,
 			samePathOriginContext,
 			documentAtStart: view.state.doc,
+			samePathChainDocument: view.state.doc,
+			samePathChainSelection: view.state.selection,
+			nativeBoundaryObserved: false,
 			beforeHandoffAssociation: samePathOriginContext === null
 				? frozen({ kind: "not-applicable" })
 				: frozen({ kind: "unseen" }),
@@ -1294,9 +1335,45 @@ export function installCodeMirrorHandoffGuard(
 			sequence.beforeHandoffAssociation.kind !== "unseen"
 			|| context?.kind !== "handoff"
 		) return;
+		// Target selection publishes the handoff before detach has produced its
+		// stable binding epoch. Do not permanently reject or freeze a spanning
+		// input against that transient -1 context; the first post-detach boundary
+		// can make the exact association with the certified epoch.
+		if (context.bindingEpoch < 0) return;
 		sequence.beforeHandoffAssociation = isExactBeforeHandoffCandidate(sequence, context)
 			? frozen({ kind: "candidate", context: frozen({ ...context }) })
 			: frozen({ kind: "rejected" });
+	}
+
+	function holdTransientOrdinarySpanningSuccessor(
+		sequence: InputSequence,
+		context: CodeMirrorHandoffContext | null,
+		transaction: Transaction,
+	): boolean {
+		if (
+			sequence.beforeHandoffAssociation.kind !== "unseen"
+			|| sequence.compositionEpoch !== null
+			|| context?.kind !== "handoff"
+			|| context.bindingEpoch >= 0
+			|| context.inputPolicy !== "reject-before-target"
+			|| !isExactBeforeHandoffCandidate(sequence, context)
+			|| sequence.reservation.sourceDocumentAtStart !== transaction.startState.doc
+			|| sequence.documentAtStart !== transaction.startState.doc
+			|| !nativeInputMatchesExactUserBatch(sequence, [transaction])
+			|| (
+				pendingOrdinarySpanningSuccessor !== null
+				&& (
+					pendingOrdinarySpanningSuccessor.sequence !== sequence
+					|| pendingOrdinarySpanningSuccessor.transaction !== transaction
+				)
+			)
+		) return false;
+		// The exact successor is kept out of A while detach is transient, but its
+		// immutable transaction is retained until the certified B epoch can route
+		// it to manual recovery. This is distinct from fresh post-selection input,
+		// which the beforeinput gate rejects before a transaction exists.
+		pendingOrdinarySpanningSuccessor = frozen({ sequence, transaction });
+		return true;
 	}
 
 	function finalizeBeforeHandoffAssociation(
@@ -1307,6 +1384,10 @@ export function installCodeMirrorHandoffGuard(
 		if (association.kind !== "candidate") return;
 		sequence.beforeHandoffAssociation = sequence.reservation.sourceDocumentAtStart === transaction.startState.doc
 			&& sequence.documentAtStart === transaction.startState.doc
+			&& (
+				sequence.compositionEpoch !== null
+				|| nativeInputMatchesExactUserBatch(sequence, [transaction])
+			)
 			? frozen({ kind: "associated", context: association.context })
 			: frozen({ kind: "rejected" });
 	}
@@ -1316,153 +1397,6 @@ export function installCodeMirrorHandoffGuard(
 		return sequence.beforeHandoffAssociation.kind === "associated"
 			? sequence.beforeHandoffAssociation.context
 			: null;
-	}
-
-	function routedInput(
-		intent: HandoffInputIntent,
-		reason: ManualHandoffInputReason | null,
-	): RoutedHandoffInputIntent {
-		return reason === null
-			? frozen({ intent, disposition: "replay-candidate", reason: null })
-			: frozen({ intent, disposition: "manual-recovery", reason });
-	}
-
-	function bindCompletedCompositionProof(
-		completed: CompositionSequence,
-		intent: HandoffInputIntent,
-		input: Readonly<{
-			gapFree: boolean;
-			finalSuccessorObserved: boolean;
-			contextCurrent: boolean;
-		}>,
-	): void {
-		const firstInputSeq = completed.firstCapturedInputSequence;
-		const lastInputSeq = completed.lastCapturedInputSequence;
-		const startedUnderSwitchSeq =
-			completed.sequence.reservation.inputStartedUnderSwitchSeq;
-		if (
-			intent.compositionEpoch === null
-			|| startedUnderSwitchSeq === null
-			|| firstInputSeq === null
-			|| lastInputSeq === null
-			|| !input.gapFree
-			|| !input.finalSuccessorObserved
-			|| !input.contextCurrent
-			|| completed.authorityDrifted
-		) return;
-		const endSeq = completed.nextProofSequence;
-		completed.nextProofSequence += 1;
-		const proof: HandoffCompositionProof = Object.freeze({
-			compositionEpoch: intent.compositionEpoch,
-			startedUnderSwitchSeq,
-			firstInputSeq,
-			lastInputSeq,
-			endSeq,
-			completed: true,
-			gapFree: true,
-			finalSuccessorObserved: true,
-		});
-		compositionProofByIntent.set(intent, Object.freeze({
-			owner: compositionProofOwner,
-			proof,
-		}));
-	}
-
-	function finalizeInputDelivery(delivery: PendingInputDelivery): boolean {
-		if (
-			pendingInputDelivery !== delivery
-			|| !delivery.callbackAcknowledged
-			|| !delivery.effectCaptured
-		) return false;
-		pendingInputDelivery = null;
-		if (pendingInput === delivery.sequence) pendingInput = null;
-		if (activeComposition?.sequence === delivery.sequence) activeComposition = null;
-		if (pendingCompositionSuccessor?.sequence === delivery.sequence) {
-			pendingCompositionSuccessor = null;
-		}
-		if (pendingImplicitCompositionCommit?.sequence === delivery.sequence) {
-			pendingImplicitCompositionCommit = null;
-		}
-		if (gateFailureReason === "input-intent-not-acknowledged") gateFailureReason = null;
-		return true;
-	}
-
-	function stageInputDelivery(
-		routed: RoutedHandoffInputIntent,
-		sequence: InputSequence,
-		startState: EditorState,
-	): PendingInputDelivery | null {
-		if (pendingInputDelivery !== null) {
-			return pendingInputDelivery.sequence === sequence ? pendingInputDelivery : null;
-		}
-		const delivery: PendingInputDelivery = {
-			routed,
-			sequence,
-			callbackAcknowledged: false,
-			effectCaptured: false,
-			effectTransaction: null,
-		};
-		try {
-			delivery.effectTransaction = effectOnly(
-				startState,
-				capturedInputIntent.of(routed) as TransactionAnnotation<unknown>,
-			);
-		} catch {
-			gateFailureReason = "pending-input-not-flushable";
-			return null;
-		}
-		pendingInputDelivery = delivery;
-		return delivery;
-	}
-
-	function acknowledgeInputDelivery(delivery: PendingInputDelivery): boolean {
-		if (delivery.callbackAcknowledged) return true;
-		try {
-			delivery.callbackAcknowledged = callbackRef?.onInputIntent(delivery.routed) === true;
-		} catch {
-			delivery.callbackAcknowledged = false;
-		}
-		if (!delivery.callbackAcknowledged) {
-			gateFailureReason = "input-intent-not-acknowledged";
-		}
-		return delivery.callbackAcknowledged;
-	}
-
-	function markInputEffectCaptured(transaction: Transaction): void {
-		const delivery = pendingInputDelivery;
-		if (delivery === null || delivery.effectTransaction !== transaction) return;
-		const held = heldHostLoad;
-		inputAuthorityAdvanceFailureReason = held === null
-			? "held-missing"
-			: commitState !== "pending"
-				? "commit-state"
-				: held.startStateAuthority.state !== transaction.startState
-					? "start-state-identity"
-					: !exactHeldTarget(held)
-						? "context-lineage"
-						: transaction.annotation(capturedInputIntent) !== delivery.routed
-							? "annotation-identity"
-							: transaction.docChanged
-								? "document-changed"
-								: transaction.effects.length !== 0
-									? "effect-count"
-									: transaction.startState.doc !== held.candidate.startDocument
-										? "start-document-identity"
-										: transaction.newDoc !== held.candidate.startDocument
-											? "new-document-identity"
-											: !transaction.startState.selection.eq(transaction.newSelection)
-												? "selection"
-												: transaction.scrollIntoView
-													? "scroll-into-view"
-													: held.candidate.nativeHistoryEpochBefore !== nativeHistoryEpoch
-														? "native-history-epoch"
-														: null;
-		if (inputAuthorityAdvanceFailureReason === null && held !== null) {
-			held.startStateAuthority.state = transaction.state;
-		}
-		delivery.effectCaptured = true;
-		delivery.effectTransaction = null;
-		finalizeInputDelivery(delivery);
 	}
 
 	function markGuardOwnedGateReconfiguration(transaction: Transaction): void {
@@ -1573,10 +1507,8 @@ export function installCodeMirrorHandoffGuard(
 			|| !isExactSameSelectionHistorySettlement(transaction)
 			|| transaction.startState.doc !== candidate.startDocument
 			|| transaction.newDoc !== candidate.startDocument
-			|| transaction.annotation(capturedInputIntent) !== undefined
 			|| transaction.annotation(guardOwnedGateReconfiguration) !== undefined
 			|| transaction.annotation(acceptedHostLoad) !== undefined
-			|| transaction.annotation(acceptedHandoffReplay) !== undefined
 			|| candidate.nativeHistoryEpochBefore !== nativeHistoryEpoch
 			|| consumedHostLoadTokens.has(candidate.hostLoadTokenId)
 			|| !exactHeldTarget(held)
@@ -1664,124 +1596,6 @@ export function installCodeMirrorHandoffGuard(
 		});
 	}
 
-	function adoptPreCompletionCompositionNoopSettlement(
-		completed: CompositionSequence,
-	): boolean {
-		const observed = preCompletionCompositionNoopSettlement;
-		preCompletionCompositionNoopSettlement = null;
-		const held = heldHostLoad;
-		const candidate = held?.candidate ?? null;
-		const authority = held?.startStateAuthority ?? null;
-		const transaction = observed?.transaction ?? null;
-		const originContext = inputHandoffAuthority(completed.sequence);
-		if (
-			observed === null
-			|| observed.composition !== completed
-			|| observed.compositionEpoch !== completed.sequence.compositionEpoch
-			|| transaction === null
-			|| held === null
-			|| held !== observed.held
-			|| candidate === null
-			|| authority === null
-			|| commitState !== "pending"
-			|| candidate.applicationKind !== "state"
-			|| !authority.postDelegationCertified
-			|| authority.state !== transaction.startState
-			|| transaction.state !== view.state
-			|| !isExactTimeOnlyNoopTransaction(transaction)
-			|| transaction.startState.doc !== candidate.startDocument
-			|| transaction.newDoc !== candidate.startDocument
-			|| candidate.nativeHistoryEpochBefore !== nativeHistoryEpoch
-			|| authority.selectionEpoch !== selectionEpoch
-			|| authority.scrollEpoch !== scrollEpoch
-			|| authority.scrollTop !== view.scrollDOM.scrollTop
-			|| consumedHostLoadTokens.has(candidate.hostLoadTokenId)
-			|| !exactHeldTarget(held)
-			|| runtimeData(candidate.runtimeView) !== candidate.runtimeViewDataBefore
-			|| activeComposition !== completed
-			|| pendingInput !== completed.sequence
-			|| pendingInputDelivery !== null
-			|| originContext === null
-			|| !isSameHandoffContext(currentContext(), originContext)
-			|| lastComposition?.compositionEpoch !== observed.compositionEpoch
-			|| !lastComposition.replayEligible
-		) return false;
-		authority.state = transaction.state;
-		return true;
-	}
-
-	function armCompletedCompositionNoopSettlement(completed: CompositionSequence): void {
-		const composition = lastComposition;
-		const held = heldHostLoad;
-		const completedEpoch = completed.sequence.compositionEpoch;
-		if (
-			completedEpoch === null
-			|| composition === null
-			|| composition.compositionEpoch !== completedEpoch
-			|| !composition.replayEligible
-			|| activeComposition !== null
-			|| pendingInput !== null
-			|| pendingInputDelivery !== null
-			|| held === null
-		) return;
-		const candidate = held.candidate;
-		const authority = held.startStateAuthority;
-		if (
-			commitState !== "pending"
-			|| candidate.applicationKind !== "state"
-			|| !authority.postDelegationCertified
-			|| authority.state !== view.state
-			|| inputAuthorityAdvanceFailureReason !== null
-			|| candidate.startDocument !== view.state.doc
-			|| candidate.nativeHistoryEpochBefore !== nativeHistoryEpoch
-			|| authority.selectionEpoch !== selectionEpoch
-			|| authority.scrollEpoch !== scrollEpoch
-			|| authority.scrollTop !== view.scrollDOM.scrollTop
-			|| consumedHostLoadTokens.has(candidate.hostLoadTokenId)
-			|| !exactHeldTarget(held)
-			|| runtimeData(candidate.runtimeView) !== candidate.runtimeViewDataBefore
-		) return;
-		const pending = frozen({
-			held,
-			startState: view.state,
-			compositionEpoch: completedEpoch,
-			persistenceNeutralEffectConsumed: false,
-		});
-		pendingCompositionNoopSettlement = pending;
-	}
-
-	function deliverPendingInput(delivery: PendingInputDelivery): boolean {
-		acknowledgeInputDelivery(delivery);
-		if (!delivery.effectCaptured) {
-			if (
-				delivery.effectTransaction === null
-				|| delivery.effectTransaction.startState !== view.state
-			) {
-				try {
-					delivery.effectTransaction = effectOnly(
-						view.state,
-						capturedInputIntent.of(delivery.routed) as TransactionAnnotation<unknown>,
-					);
-				} catch {
-					gateFailureReason = "pending-input-not-flushable";
-					return false;
-				}
-			}
-			const effectTransaction = delivery.effectTransaction;
-			try {
-				view.dispatch(effectTransaction);
-			} catch {
-				if (!delivery.effectCaptured) delivery.effectTransaction = null;
-			}
-			if (!delivery.effectCaptured) {
-				gateFailureReason = "pending-input-not-flushable";
-				return false;
-			}
-		}
-		return finalizeInputDelivery(delivery)
-			|| (delivery.callbackAcknowledged && delivery.effectCaptured);
-	}
-
 	function settleStableSamePathComposition(
 		completed: CompositionSequence,
 		flushed: boolean,
@@ -1852,28 +1666,410 @@ export function installCodeMirrorHandoffGuard(
 		return true;
 	}
 
+	function nativeInputMatchesExactUserBatch(
+		sequence: InputSequence,
+		transactions: readonly Transaction[],
+	): boolean {
+		const nativeInput = sequence.nativeInput;
+		if (nativeInput === null || transactions.length === 0) return nativeInput === null;
+		const inputType = nativeInput.inputType;
+		const inserted = transactions.map((transaction) =>
+			insertedContent(transaction.changes)).join("");
+		if (inputType === "historyUndo") {
+			return transactions.length === 1 && transactions[0]?.isUserEvent("undo") === true;
+		}
+		if (inputType === "historyRedo") {
+			return transactions.length === 1 && transactions[0]?.isUserEvent("redo") === true;
+		}
+		if (inputType.startsWith("delete")) {
+			const first = transactions[0];
+			const last = transactions[transactions.length - 1];
+			return first !== undefined
+				&& last !== undefined
+				&& transactions.every((transaction) => transaction.isUserEvent("delete"))
+				&& inserted.length === 0
+				&& last.newDoc.length < first.startState.doc.length;
+		}
+		if (inputType === "insertFromPaste") {
+			return transactions.every((transaction) => transaction.isUserEvent("input.paste"))
+				&& (nativeInput.data === null || inserted === nativeInput.data);
+		}
+		if (inputType === "insertFromDrop") {
+			return transactions.every((transaction) =>
+				transaction.isUserEvent("input.drop") || transaction.isUserEvent("move.drop"))
+				&& (nativeInput.data === null || inserted === nativeInput.data);
+		}
+		if (inputType === "insertText") {
+			return transactions.every((transaction) => transaction.isUserEvent("input.type"))
+				&& nativeInput.data !== null
+				&& inserted === nativeInput.data;
+		}
+		if (inputType === "insertLineBreak" || inputType === "insertParagraph") {
+			return transactions.every((transaction) => transaction.isUserEvent("input.type"))
+				&& inserted === "\n";
+		}
+		return false;
+	}
+
+	function exactSingleSelectionReplacement(
+		transaction: Transaction,
+		expectedInserted: string,
+	): boolean {
+		const ranges = transaction.startState.selection.ranges;
+		if (ranges.length !== 1) return false;
+		const range = ranges[0];
+		if (range === undefined) return false;
+		let count = 0;
+		let exact = false;
+		transaction.changes.iterChanges((fromA, toA, fromB, toB, inserted) => {
+			count += 1;
+			exact = fromA === range.from
+				&& toA === range.to
+				&& fromB === range.from
+				&& toB === range.from + expectedInserted.length
+				&& inserted.toString() === expectedInserted;
+		});
+		const finalRanges = transaction.newSelection.ranges;
+		const finalRange = finalRanges[0];
+		const expectedCursor = range.from + expectedInserted.length;
+		return count === 1
+			&& exact
+			&& finalRanges.length === 1
+			&& finalRange !== undefined
+			&& finalRange.empty
+			&& finalRange.head === expectedCursor;
+	}
+
+	function exactOrdinaryNativeReplacement(
+		sequence: InputSequence,
+		transaction: Transaction,
+	): boolean {
+		const nativeInput = sequence.nativeInput;
+		if (
+			nativeInput === null
+			|| !nativeInputMatchesExactUserBatch(sequence, [transaction])
+		) return false;
+		let expectedInserted: string | null = null;
+		if (nativeInput.inputType === "insertText") {
+			expectedInserted = nativeInput.data;
+		} else if (
+			nativeInput.inputType === "insertLineBreak"
+			|| nativeInput.inputType === "insertParagraph"
+		) {
+			expectedInserted = "\n";
+		} else if (
+			nativeInput.inputType === "insertFromPaste"
+			|| nativeInput.inputType === "insertFromDrop"
+		) {
+			// Browsers commonly redact paste/drop data. Without exact bytes this lane
+			// has no pre-apply content proof and must remain fail-closed.
+			expectedInserted = nativeInput.data;
+		} else if (nativeInput.inputType.startsWith("delete")) {
+			const range = transaction.startState.selection.main;
+			// A selected range is exact. A collapsed cursor would require browser- and
+			// locale-specific grapheme/word movement evidence that this guard does not own.
+			if (range.empty) return false;
+			expectedInserted = "";
+		}
+		return expectedInserted !== null
+			&& exactSingleSelectionReplacement(transaction, expectedInserted);
+	}
+
+	function exactReservedSourceDrainTransaction(transaction: Transaction): boolean {
+		const draining = sourceUnloadDrain;
+		const sequence = pendingInput;
+		if (
+			draining === null
+			|| sequence === null
+			|| sequence.reservation !== draining.reservation
+			|| transaction.startState.doc !== sequence.samePathChainDocument
+			|| !transaction.startState.selection.eq(sequence.samePathChainSelection)
+			|| transaction.annotation(Transaction.remote) !== undefined
+			|| !isUserDocumentTransaction(transaction)
+		) return false;
+		if (sequence.compositionEpoch === null) {
+			return exactOrdinaryNativeReplacement(sequence, transaction);
+		}
+		const composition = activeComposition;
+		return composition !== null
+			&& composition.sequence === sequence
+			&& composition.updates > composition.lastCapturedUpdate
+			&& composition.latestUpdateData !== null
+			&& transaction.isUserEvent("input.type.compose")
+			&& exactSingleSelectionReplacement(transaction, composition.latestUpdateData);
+	}
+
+	function certifyAppliedSamePathCompositionTransaction(transaction: Transaction): void {
+		const composition = activeComposition;
+		const sequence = pendingInput;
+		if (
+			composition === null
+			|| sequence === null
+			|| composition.sequence !== sequence
+			|| sequence.compositionEpoch === null
+			|| inputHandoffAuthority(sequence) !== null
+			|| transaction.startState.doc !== sequence.samePathChainDocument
+			|| !transaction.startState.selection.eq(sequence.samePathChainSelection)
+			|| transaction.annotation(Transaction.remote) !== undefined
+			|| composition.updates <= composition.lastCapturedUpdate
+			|| composition.latestUpdateData === null
+			|| !transaction.isUserEvent("input.type.compose")
+			|| !exactSingleSelectionReplacement(transaction, composition.latestUpdateData)
+		) return;
+		sequence.samePathChainDocument = transaction.newDoc;
+		sequence.samePathChainSelection = transaction.newSelection;
+		composition.lastCapturedUpdate = composition.updates;
+		composition.lastProofTransaction = transaction;
+	}
+
+	function prepareStableSamePathInputBatch(
+		transactions: readonly Transaction[],
+	): StableSamePathInputBatch | null {
+		const sequence = pendingInput;
+		const samePathOrigin = sequence?.samePathOriginContext ?? null;
+		const context = currentContext();
+		const firstTransaction = transactions[0] ?? null;
+		const finalTransaction = transactions[transactions.length - 1] ?? null;
+		if (
+			sequence === null
+			|| sequence.compositionEpoch !== null
+			|| samePathOrigin === null
+			|| sequence.beforeHandoffAssociation.kind !== "unseen"
+			|| inputHandoffAuthority(sequence) !== null
+			|| !isSamePathContext(context, samePathOrigin)
+			|| firstTransaction === null
+			|| finalTransaction === null
+			|| sequence.samePathChainDocument !== firstTransaction.startState.doc
+		) return null;
+		const userDocumentTransactions = transactions.filter((transaction) =>
+			transaction.docChanged && isUserDocumentTransaction(transaction));
+		const firstUserIndex = transactions.findIndex((transaction) =>
+			transaction.docChanged && isUserDocumentTransaction(transaction));
+		const providerAfterUser = firstUserIndex >= 0
+			&& transactions.slice(firstUserIndex + 1).some((transaction) =>
+				transaction.docChanged && !isUserDocumentTransaction(transaction));
+		const disposition: StableSamePathInputBatch["disposition"] =
+			userDocumentTransactions.length === 0
+				? "pending"
+				: providerAfterUser
+					|| !nativeInputMatchesExactUserBatch(sequence, userDocumentTransactions)
+					? "ambiguous"
+					: "completed";
+		return frozen({
+			sequence,
+			samePathOrigin,
+			batchStartDocument: firstTransaction.startState.doc,
+			finalDocument: finalTransaction.newDoc,
+			nativeHistoryEpochBefore: nativeHistoryEpoch,
+			nativeBoundaryObserved: transactions.some(isUserDocumentTransaction),
+			disposition,
+		});
+	}
+
+	function exactSamePathTerminalContext(
+		sequence: InputSequence,
+	): Readonly<{ remainsOnSamePath: boolean; targetSelectedAfterStart: boolean }> {
+		const context = currentContext();
+		const remainsOnSamePath = sequence.samePathOriginContext !== null
+			&& isSamePathContext(context, sequence.samePathOriginContext);
+		const targetSelectedAfterStart = context?.kind === "handoff"
+			&& (
+				sequence.beforeHandoffAssociation.kind === "unseen"
+					? isExactBeforeHandoffCandidate(sequence, context)
+					: (
+						sequence.beforeHandoffAssociation.kind === "candidate"
+							|| sequence.beforeHandoffAssociation.kind === "associated"
+					)
+					&& isSameHandoffContext(
+						context,
+						sequence.beforeHandoffAssociation.context,
+					)
+					|| sequence.beforeHandoffAssociation.kind === "rejected"
+						&& isExactBeforeHandoffCandidate(sequence, context)
+			);
+		return frozen({ remainsOnSamePath, targetSelectedAfterStart });
+	}
+
+	function rejectCancelledSamePathInput(sequence: InputSequence): boolean {
+		if (
+			pendingInput !== sequence
+			|| sequence.compositionEpoch !== null
+			|| sequence.samePathOriginContext === null
+			|| inputHandoffAuthority(sequence) !== null
+			|| callbackRef?.onSamePathInputRejected === undefined
+		) return false;
+		const { remainsOnSamePath, targetSelectedAfterStart } =
+			exactSamePathTerminalContext(sequence);
+		if (!remainsOnSamePath && !targetSelectedAfterStart) return false;
+		let acknowledged = false;
+		try {
+			acknowledged = callbackRef.onSamePathInputRejected({
+				reservation: sequence.reservation,
+				cm: view,
+				startDocument: sequence.documentAtStart,
+				reason: "cancelled",
+			});
+		} catch {
+			acknowledged = false;
+		}
+		if (!acknowledged) {
+			gateFailureReason = "pending-input-not-flushable";
+			return false;
+		}
+		if (pendingInput === sequence) pendingInput = null;
+		gateFailureReason = null;
+		return true;
+	}
+
+	function settleAmbiguousSamePathInput(
+		sequence: InputSequence,
+		proof: Readonly<{
+			batchStartDocument: Text;
+			finalDocument: Text;
+			nativeHistoryEpochBefore: number;
+			nativeHistoryEpochAfter: number;
+		}>,
+	): boolean {
+		if (
+			pendingInput !== sequence
+			|| sequence.compositionEpoch !== null
+			|| sequence.samePathOriginContext === null
+			|| inputHandoffAuthority(sequence) !== null
+			|| callbackRef?.onSamePathInputRejected === undefined
+			|| view.state.doc !== proof.finalDocument
+			|| !Number.isSafeInteger(proof.nativeHistoryEpochBefore)
+			|| !Number.isSafeInteger(proof.nativeHistoryEpochAfter)
+			|| proof.nativeHistoryEpochBefore < 0
+			|| proof.nativeHistoryEpochAfter < proof.nativeHistoryEpochBefore
+			|| (
+				proof.batchStartDocument === proof.finalDocument
+					? proof.nativeHistoryEpochAfter !== proof.nativeHistoryEpochBefore
+					: proof.nativeHistoryEpochAfter <= proof.nativeHistoryEpochBefore
+			)
+		) return false;
+		const { remainsOnSamePath, targetSelectedAfterStart } =
+			exactSamePathTerminalContext(sequence);
+		if (!remainsOnSamePath && !targetSelectedAfterStart) return false;
+		let acknowledged = false;
+		try {
+			acknowledged = callbackRef.onSamePathInputRejected({
+				reservation: sequence.reservation,
+				cm: view,
+				startDocument: sequence.documentAtStart,
+				finalDocument: proof.finalDocument,
+				reason: "input-result-ambiguous",
+				samePathDispatch: frozen({
+					batchStartDocument: proof.batchStartDocument,
+					nativeHistoryEpochBefore: proof.nativeHistoryEpochBefore,
+					nativeHistoryEpochAfter: proof.nativeHistoryEpochAfter,
+				}),
+			});
+		} catch {
+			acknowledged = false;
+		}
+		if (!acknowledged) {
+			gateFailureReason = "pending-input-not-flushable";
+			return false;
+		}
+		if (pendingInput === sequence) pendingInput = null;
+		gateFailureReason = null;
+		return true;
+	}
+
+	function settleStableSamePathInput(
+		batch: StableSamePathInputBatch | null,
+	): boolean {
+		if (batch === null) return false;
+		const {
+			sequence,
+			samePathOrigin,
+			batchStartDocument,
+			finalDocument,
+		} = batch;
+		if (
+			pendingInput !== sequence
+			|| view.state.doc !== finalDocument
+		) return false;
+		sequence.samePathChainDocument = finalDocument;
+		sequence.nativeBoundaryObserved ||= batch.nativeBoundaryObserved;
+		const context = currentContext();
+		const remainsOnSamePath = isSamePathContext(context, samePathOrigin);
+		const selectedTargetDuringApply = context?.kind === "handoff"
+			&& sequence.beforeHandoffAssociation.kind === "unseen"
+			&& isExactBeforeHandoffCandidate(sequence, context);
+		if (!remainsOnSamePath && !selectedTargetDuringApply) return false;
+		if (batch.disposition === "pending") {
+			return selectedTargetDuringApply
+				? settleAmbiguousSamePathInput(sequence, {
+					batchStartDocument,
+					finalDocument,
+					nativeHistoryEpochBefore: batch.nativeHistoryEpochBefore,
+					nativeHistoryEpochAfter: nativeHistoryEpoch,
+				})
+				: false;
+		}
+		if (batch.disposition === "ambiguous") {
+			return settleAmbiguousSamePathInput(sequence, {
+				batchStartDocument,
+				finalDocument,
+				nativeHistoryEpochBefore: batch.nativeHistoryEpochBefore,
+				nativeHistoryEpochAfter: nativeHistoryEpoch,
+			});
+		}
+		if (callbackRef?.onSamePathInputCompleted === undefined) return false;
+		let acknowledged = false;
+		try {
+			acknowledged = callbackRef.onSamePathInputCompleted({
+				reservation: sequence.reservation,
+				cm: view,
+				startDocument: sequence.documentAtStart,
+				finalDocument,
+				samePathDispatch: frozen({
+					batchStartDocument,
+					nativeHistoryEpochBefore: batch.nativeHistoryEpochBefore,
+					nativeHistoryEpochAfter: nativeHistoryEpoch,
+				}),
+			});
+		} catch {
+			acknowledged = false;
+		}
+		if (!acknowledged) {
+			gateFailureReason = "pending-input-not-flushable";
+			return false;
+		}
+		// The synchronous callback acknowledgement is the reducer commit point.
+		// Clear the guard copy even if callback-owned tracing re-enters selection;
+		// retaining it after reducer consumption would split the two authorities.
+		if (pendingInput === sequence) pendingInput = null;
+		gateFailureReason = null;
+		return true;
+	}
+
+	function terminalizeUnresolvedInput(
+		sequence: InputSequence,
+		reason: "composition-unresolved" | "spanning-input",
+	): false {
+		let acknowledged = false;
+		try {
+			acknowledged = callbackRef?.onUnresolvedInputTerminal?.({
+				reservation: sequence.reservation,
+				reason,
+			}) === true;
+		} catch {
+			acknowledged = false;
+		}
+		gateFailureReason = acknowledged
+			? "pending-input-not-flushable"
+			: "input-intent-not-acknowledged";
+		return false;
+	}
+
 	function routeMissingCompositionEnd(): boolean {
-		if (pendingInputDelivery !== null) return deliverPendingInput(pendingInputDelivery);
 		const completed = activeComposition;
 		if (completed === null) return true;
 		const flushed = flushPendingDom();
 		const successor = pendingCompositionSuccessor;
 		if (settleStableSamePathComposition(completed, flushed, successor, false)) return true;
-		const authority = inputHandoffAuthority(completed.sequence);
-		if (
-			!flushed
-			|| successor === null
-			|| successor.sequence !== completed.sequence
-			|| authority === null
-		) {
-			gateFailureReason = "pending-input-not-flushable";
-			return false;
-		}
-		const intent = buildInputIntent(successor.transaction, completed.sequence);
-		if (intent === null) {
-			gateFailureReason = "pending-input-not-flushable";
-			return false;
-		}
 		lastComposition = frozen({
 			compositionEpoch: completed.sequence.compositionEpoch ?? compositionEpoch,
 			startGeneration: completed.sequence.startGeneration,
@@ -1881,12 +2077,10 @@ export function installCodeMirrorHandoffGuard(
 			updates: completed.updates,
 			replayEligible: false,
 		});
-		const delivery = stageInputDelivery(
-			routedInput(intent, "missing-composition-end"),
+		return terminalizeUnresolvedInput(
 			completed.sequence,
-			view.state,
+			"composition-unresolved",
 		);
-		return delivery !== null && deliverPendingInput(delivery);
 	}
 
 	function preventUnroutableNativeInput(event: Event): void {
@@ -1894,8 +2088,134 @@ export function installCodeMirrorHandoffGuard(
 		event.stopImmediatePropagation();
 	}
 
+	function settleContextLostOrdinaryInput(sequence: InputSequence): boolean {
+		if (
+			pendingInput !== sequence
+			|| sequence.compositionEpoch !== null
+			|| currentContext() !== null
+			|| sequence.nativeBoundaryObserved
+			|| view.state.doc !== sequence.samePathChainDocument
+			|| callbackRef?.onSamePathInputRejected === undefined
+		) return false;
+		let acknowledged = false;
+		try {
+			acknowledged = callbackRef.onSamePathInputRejected({
+				reservation: sequence.reservation,
+				cm: view,
+				startDocument: sequence.documentAtStart,
+				finalDocument: view.state.doc,
+				reason: "input-result-ambiguous",
+				samePathDispatch: frozen({
+					batchStartDocument: view.state.doc,
+					nativeHistoryEpochBefore: nativeHistoryEpoch,
+					nativeHistoryEpochAfter: nativeHistoryEpoch,
+				}),
+			});
+		} catch {
+			acknowledged = false;
+		}
+		if (!acknowledged) {
+			gateFailureReason = "pending-input-not-flushable";
+			return false;
+		}
+		if (pendingInput === sequence) pendingInput = null;
+		gateFailureReason = null;
+		return true;
+	}
+
+	function settleUnresolvedOrdinarySamePathInput(sequence: InputSequence): boolean {
+		if (pendingInput !== sequence || sequence.compositionEpoch !== null) return true;
+		if (!flushPendingDom()) return false;
+		if (pendingInput !== sequence) return true;
+		if (
+			view.state.doc === sequence.samePathChainDocument
+			&& currentContext() === null
+			&& !sequence.nativeBoundaryObserved
+		) {
+			// There is no longer an orphan/replay owner. Consume the reducer
+			// reservation as ambiguous so an active source drain becomes terminal and
+			// keeps the pane closed for explicit export/reopen.
+			return settleContextLostOrdinaryInput(sequence);
+		}
+		if (
+			view.state.doc !== sequence.samePathChainDocument
+			|| sequence.samePathOriginContext === null
+		) return false;
+		return settleAmbiguousSamePathInput(sequence, {
+			batchStartDocument: view.state.doc,
+			finalDocument: view.state.doc,
+			nativeHistoryEpochBefore: nativeHistoryEpoch,
+			nativeHistoryEpochAfter: nativeHistoryEpoch,
+		});
+	}
+
+	function scheduleUnresolvedOrdinarySamePathBoundary(
+		sequence: InputSequence,
+		event: InputEvent,
+	): void {
+		queueMicrotask(() => {
+			if (pendingInput !== sequence) return;
+			const semanticEmptyDelete = sequence.documentAtStart.length === 0
+				&& sequence.nativeInput?.inputType.startsWith("delete") === true;
+			if (event.defaultPrevented || semanticEmptyDelete) {
+				rejectCancelledSamePathInput(sequence);
+				return;
+			}
+			const settle = (): void => {
+				queueMicrotask(() => {
+					if (pendingInput !== sequence) return;
+					settleUnresolvedOrdinarySamePathInput(sequence);
+				});
+			};
+			if (typeof globalThis.requestAnimationFrame === "function") {
+				globalThis.requestAnimationFrame(() => {
+					globalThis.requestAnimationFrame(settle);
+				});
+			} else {
+				setTimeout(settle, 0);
+			}
+		});
+	}
+
 	const beforeInputListener = (event: InputEvent): void => {
 		if (inert) return;
+		if (sourceUnloadDrain !== null) {
+			// The already-reserved source lane completes through CodeMirror's
+			// transaction/composition-end path. Every later native start is fresh and
+			// is rejected before the DOM can expose bytes that have no source owner.
+			preventUnroutableNativeInput(event);
+			return;
+		}
+		if (targetSelectionFence !== null) {
+			installRejectBeforeTargetDomFence();
+			preventUnroutableNativeInput(event);
+			return;
+		}
+		const inputContext = currentContext();
+		if (inputContext === null) {
+			if (pendingInput !== null && activeComposition === null) {
+				// Consume the guard and reducer copies together. There is no delayed
+				// transaction owner after this boundary.
+				settleUnresolvedOrdinarySamePathInput(pendingInput);
+			}
+			// A closed gate without a current authority is still a native-input
+			// boundary. In particular, the host may publish target file identity one
+			// turn after selecting it. Reject before DOM application so that interval
+			// cannot flash input and later roll it back.
+			gateFailureReason = "pending-input-not-flushable";
+			installRejectBeforeTargetDomFence();
+			preventUnroutableNativeInput(event);
+			return;
+		}
+		if (
+			inputContext?.kind === "handoff"
+			&& inputContext.inputPolicy === "reject-before-target"
+			&& activeComposition === null
+		) {
+			installRejectBeforeTargetDomFence();
+			preventUnroutableNativeInput(event);
+			return;
+		}
 		if (activeComposition !== null) {
 			if (
 				event.isComposing === false
@@ -1909,14 +2229,62 @@ export function installCodeMirrorHandoffGuard(
 			}
 			return;
 		}
-		if (pendingInputDelivery !== null && !deliverPendingInput(pendingInputDelivery)) {
+		if (pendingInput !== null && inputContext === null) {
+			// The owning managed context has disappeared. Do not let a later native
+			// event inherit the abandoned target identity.
+			pendingInput = null;
+			pendingOrdinarySpanningSuccessor = null;
+		}
+		if (
+			pendingInput !== null
+			&& !settleUnresolvedOrdinarySamePathInput(pendingInput)
+		) {
 			preventUnroutableNativeInput(event);
 			return;
 		}
-		startInputSequence(null);
+		startInputSequence(null, frozen({
+			inputType: event.inputType,
+			data: event.data,
+		}));
+		const startedSequence = pendingInput;
+		if (startedSequence !== null) {
+			scheduleUnresolvedOrdinarySamePathBoundary(startedSequence, event);
+		}
 	};
 	const compositionStartListener = (event: CompositionEvent): void => {
 		if (inert) return;
+		if (sourceUnloadDrain !== null) {
+			preventUnroutableNativeInput(event);
+			return;
+		}
+		if (targetSelectionFence !== null) {
+			installRejectBeforeTargetDomFence();
+			preventUnroutableNativeInput(event);
+			return;
+		}
+		const startContext = currentContext();
+		if (startContext === null) {
+			gateFailureReason = "pending-input-not-flushable";
+			installRejectBeforeTargetDomFence();
+			preventUnroutableNativeInput(event);
+			return;
+		}
+		if (
+			startContext?.kind === "handoff"
+			&& startContext.inputPolicy === "reject-before-target"
+		) {
+			installRejectBeforeTargetDomFence();
+			preventUnroutableNativeInput(event);
+			return;
+		}
+		if (
+			pendingInput !== null
+			&& activeComposition === null
+			&& !settleUnresolvedOrdinarySamePathInput(pendingInput)
+		) {
+			preventUnroutableNativeInput(event);
+			return;
+		}
 		if (!routeMissingCompositionEnd()) {
 			preventUnroutableNativeInput(event);
 			return;
@@ -1935,112 +2303,42 @@ export function installCodeMirrorHandoffGuard(
 					firstCapturedInputSequence: null,
 					lastCapturedInputSequence: null,
 					lastProofTransaction: null,
+					latestUpdateData: null,
 			};
 		}
 		callbackRef?.onCompositionBoundary?.("start");
 	};
-	const compositionUpdateListener = (): void => {
+	const compositionUpdateListener = (event: CompositionEvent): void => {
 		if (activeComposition === null) return;
 		if (
 			activeComposition.updates > 0
 			&& activeComposition.lastCapturedUpdate !== activeComposition.updates
 		) activeComposition.hasUpdateGap = true;
 		activeComposition.updates += 1;
+		activeComposition.latestUpdateData = event.data;
 	};
 	function completeActiveComposition(
 		completed: CompositionSequence,
 		finalData: string,
 	): void {
+		void finalData;
 		if (activeComposition !== completed) return;
 		if (pendingImplicitCompositionCommit?.sequence === completed.sequence) {
 			pendingImplicitCompositionCommit = null;
 		}
-		if (pendingInputDelivery !== null) {
-			if (
-				pendingInputDelivery.sequence !== completed.sequence
-				|| !deliverPendingInput(pendingInputDelivery)
-			) {
-				gateFailureReason = pendingInputDelivery.callbackAcknowledged === false
-					? "input-intent-not-acknowledged"
-					: "pending-input-not-flushable";
-			}
-			return;
-		}
 		const flushed = flushPendingDom();
 		const successor = pendingCompositionSuccessor;
-		const context = currentContext();
-		const sequence = completed.sequence;
-		const originContext = inputHandoffAuthority(sequence);
-		const endGeneration = context?.handoffGeneration ?? -1;
 		if (settleStableSamePathComposition(completed, flushed, successor, true)) return;
-		if (
-			successor === null
-			|| successor.sequence !== sequence
-			|| originContext === null
-		) {
-			lastComposition = frozen({
-				compositionEpoch: sequence.compositionEpoch ?? compositionEpoch,
-				startGeneration: sequence.startGeneration,
-				endGeneration,
-				updates: completed.updates,
-				replayEligible: false,
-			});
-			gateFailureReason = "pending-input-not-flushable";
-			return;
-		}
-		const updateGap = completed.hasUpdateGap
-			|| completed.lastCapturedUpdate !== completed.updates
-			|| successor.updateAtCapture !== completed.updates;
-		const switchSpanning = completed.authorityDrifted
-			|| !isSameHandoffContext(context, originContext)
-			|| sequence.startGeneration !== originContext.handoffGeneration
-			|| sequence.reservation.inputStartSeq <= originContext.switchIntentSeq
-			|| sequence.reservation.inputStartedUnderSwitchSeq !== originContext.switchIntentSeq;
-		const finalSuccessorProven = flushed
-			&& completed.updates > 0
-			&& insertedContent(successor.transaction.changes) === finalData;
-		const reason: ManualHandoffInputReason | null = updateGap
-			? "composition-update-gap"
-			: switchSpanning
-				? "switch-spanning"
-				: !finalSuccessorProven
-					? "unproven-final-successor"
-					: null;
-		const replayEligible = reason === null;
 		lastComposition = frozen({
-			compositionEpoch: sequence.compositionEpoch ?? compositionEpoch,
-			startGeneration: sequence.startGeneration,
-			endGeneration,
+			compositionEpoch: completed.sequence.compositionEpoch ?? compositionEpoch,
+			startGeneration: completed.sequence.startGeneration,
+			endGeneration: currentContext()?.handoffGeneration ?? -1,
 			updates: completed.updates,
-			replayEligible,
+			replayEligible: false,
 		});
-		const intent = buildInputIntent(successor.transaction, sequence);
-		if (intent === null) {
-			gateFailureReason = "pending-input-not-flushable";
-			return;
-		}
-		bindCompletedCompositionProof(completed, intent, {
-			gapFree: !updateGap,
-			finalSuccessorObserved: finalSuccessorProven,
-			contextCurrent: !switchSpanning,
-		});
-		const preCompletionNoopAdopted = replayEligible
-			&& adoptPreCompletionCompositionNoopSettlement(completed);
-		if (!replayEligible) preCompletionCompositionNoopSettlement = null;
-		const delivery = stageInputDelivery(
-			routedInput(intent, reason),
-			sequence,
-			view.state,
-		);
-		const delivered = delivery !== null && deliverPendingInput(delivery);
-		if (!delivered) {
-			gateFailureReason = delivery?.callbackAcknowledged === false
-				? "input-intent-not-acknowledged"
-				: "pending-input-not-flushable";
-		} else if (replayEligible && !preCompletionNoopAdopted) {
-			armCompletedCompositionNoopSettlement(completed);
-		}
+		terminalizeUnresolvedInput(completed.sequence, "composition-unresolved");
 	}
+
 	const compositionEndListener = (event: CompositionEvent): void => {
 		const completed = activeComposition;
 		if (completed === null) return;
@@ -2068,57 +2366,10 @@ export function installCodeMirrorHandoffGuard(
 		view.scrollDOM.removeEventListener("scroll", scrollListener, true);
 	}
 
-	function buildInputIntent(
-		transaction: Transaction,
-		sequence: InputSequence | null = pendingInput,
-	): HandoffInputIntent | null {
-		const activeCallbacks = callbackRef;
-		const context = sequence === null ? null : inputHandoffAuthority(sequence);
-		if (sequence === null || context === null || activeCallbacks === null) return null;
-		const reservation = sequence.reservation;
-		const beforeHandoff = sequence.originContext === null
-			&& sequence.beforeHandoffAssociation.kind === "associated";
-		let startDocument = transaction.startState.doc;
-		if (beforeHandoff) {
-			const reservedDocument = reservation.sourceDocumentAtStart;
-			if (reservedDocument === null || reservedDocument !== transaction.startState.doc) return null;
-			startDocument = reservedDocument;
-		}
-		const afterContent = transaction.newDoc.toString();
-		const sequenceBegan = beforeHandoff
-			? "before-handoff"
-			: reservation.inputStartSeq > context.switchIntentSeq
-				&& reservation.inputStartedUnderSwitchSeq === context.switchIntentSeq
-				? "after-target-selected"
-				: "before-handoff";
-		return frozen({
-			intentId: nextId("handoff-intent"),
-			sessionId: context.sessionId,
-			leafId: context.leafId,
-			handoffGeneration: context.handoffGeneration,
-			fromPath: beforeHandoff ? reservation.sourceAuthorityPathAtStart : context.fromPath,
-			fromFileId: beforeHandoff ? reservation.sourceFileIdAtStart : context.fromFileId,
-			targetPath: context.targetPath,
-			targetFile: context.targetFile,
-			bindingEpoch: context.bindingEpoch,
-			inputEpoch: reservation.inputEpoch,
-			switchIntentSeq: context.switchIntentSeq,
-			inputStartSeq: reservation.inputStartSeq,
-			inputStartedUnderSwitchSeq: reservation.inputStartedUnderSwitchSeq,
-			compositionEpoch: sequence.compositionEpoch,
-			selectionEpoch,
-			sequenceBegan,
-			startDocument,
-			startContentHash: activeCallbacks.hashContent(startDocument.toString()),
-			changes: transaction.changes,
-			afterContent,
-			afterContentHash: activeCallbacks.hashContent(afterContent),
-			selectionBefore: transaction.startState.selection,
-			selectionAfter: transaction.newSelection,
-			originKind: sequence.compositionEpoch === null ? "user" : "ime",
-			userEvent: userEventOf(transaction),
-			capturedAt: activeCallbacks.now?.() ?? Date.now(),
-		});
+	function routeDeferredOrdinarySpanningSuccessor(): boolean {
+		const deferred = pendingOrdinarySpanningSuccessor;
+		if (deferred === null) return true;
+		return terminalizeUnresolvedInput(deferred.sequence, "spanning-input");
 	}
 
 	function exactHeldTarget(held: HeldHostLoad): boolean {
@@ -2548,22 +2799,41 @@ export function installCodeMirrorHandoffGuard(
 	): FinalDispatchDecision {
 		const commitDecision = commitBoundaryDecision(transaction, boundary);
 		if (commitDecision !== null) return commitDecision;
+		// This owner exists before target identity is published.  Applying even a
+		// selection/effect-only transaction would replace EditorState identity and
+		// invalidate the exact token.  Only this guard's own compartment update may
+		// cross the interval; every foreign transaction is dropped without applying
+		// a synthetic no-op transaction.
 		if (
-			transaction.docChanged
-			&& callbackRef?.acceptHandoffReplayTransaction?.(
-				transaction,
-				boundary,
-			) === true
+			targetSelectionFence !== null
+			&& !gateReconfigurationLedger.some((entry) => entry.transaction === transaction)
 		) {
-			return frozen({ kind: "forward", transaction });
+			return frozen({ kind: "drop" });
+		}
+		if (
+			sourceUnloadDrain !== null
+			&& transaction.docChanged
+			&& !exactReservedSourceDrainTransaction(transaction)
+		) {
+			return frozen({
+				kind: "reject",
+				reason: "stale-generation",
+				effectOnly: effectOnly(transaction.startState),
+			});
 		}
 		const context = currentContext();
 		if (!transaction.docChanged) return frozen({ kind: "forward", transaction });
 		const userDocumentTransaction = isUserDocumentTransaction(transaction);
-		if (userDocumentTransaction && pendingInputDelivery !== null) {
+		if (
+			userDocumentTransaction
+			&& context?.kind === "handoff"
+			&& context.inputPolicy === "reject-before-target"
+			&& pendingInput === null
+			&& activeComposition === null
+		) {
 			return frozen({
 				kind: "reject",
-				reason: "ambiguous-editor-api",
+				reason: "stale-generation",
 				effectOnly: effectOnly(transaction.startState),
 			});
 		}
@@ -2575,9 +2845,36 @@ export function installCodeMirrorHandoffGuard(
 			lastNativeInputTransaction = transaction;
 		}
 		if (pendingInput !== null) {
-			observeBeforeHandoffContext(pendingInput, context);
+			const pendingSequence = pendingInput;
+			observeBeforeHandoffContext(pendingSequence, context);
 			if (userDocumentTransaction) {
-				finalizeBeforeHandoffAssociation(pendingInput, transaction);
+				if (holdTransientOrdinarySpanningSuccessor(
+					pendingSequence,
+					context,
+					transaction,
+				)) {
+					return frozen({
+						kind: "reject",
+						reason: "stale-generation",
+						effectOnly: effectOnly(transaction.startState),
+					});
+				}
+				finalizeBeforeHandoffAssociation(pendingSequence, transaction);
+				if (
+					pendingSequence.beforeHandoffAssociation.kind === "rejected"
+					&& context?.kind === "handoff"
+					&& isExactBeforeHandoffCandidate(pendingSequence, context)
+				) {
+					// A transaction that does not exactly match the earlier native event is
+					// fresh/unproven target input. Retire the old reservation explicitly,
+					// but keep the mismatched transaction out of both A and recovery.
+					settleAmbiguousSamePathInput(pendingSequence, {
+						batchStartDocument: view.state.doc,
+						finalDocument: view.state.doc,
+						nativeHistoryEpochBefore: nativeHistoryEpoch,
+						nativeHistoryEpochAfter: nativeHistoryEpoch,
+					});
+				}
 			}
 		}
 		if (context?.kind === "same-path") return frozen({ kind: "forward", transaction });
@@ -2593,34 +2890,8 @@ export function installCodeMirrorHandoffGuard(
 			publishHeldHostLoad(held);
 			return frozen({ kind: "hold-host-load", candidate: held.candidate });
 		}
-		if (userDocumentTransaction) {
-			const intent = buildInputIntent(transaction);
-			if (intent !== null) {
-				const routeReason: ManualHandoffInputReason | null = intent.sequenceBegan === "after-target-selected"
-					&& pendingInput !== null
-					&& pendingInput.originContext !== null
-					&& isSameHandoffContext(context, pendingInput.originContext)
-					? null
-					: "switch-spanning";
-				const delivery = stageInputDelivery(
-					routedInput(intent, routeReason),
-					pendingInput as InputSequence,
-					transaction.startState,
-				);
-				if (delivery === null || delivery.effectTransaction === null) {
-					return frozen({
-						kind: "reject",
-						reason: "ambiguous-editor-api",
-						effectOnly: effectOnly(transaction.startState),
-					});
-				}
-				acknowledgeInputDelivery(delivery);
-				return frozen({
-					kind: "capture-intent",
-					intent,
-					effectOnly: delivery.effectTransaction,
-				});
-			}
+		if (userDocumentTransaction && pendingInput !== null) {
+			terminalizeUnresolvedInput(pendingInput, "spanning-input");
 		}
 		return frozen({
 			kind: "reject",
@@ -2640,6 +2911,7 @@ export function installCodeMirrorHandoffGuard(
 		let expectedState = view.state;
 		for (const transaction of transactions) {
 			if (transaction.startState !== expectedState) {
+				if (targetSelectionFence !== null) break;
 				safe.push(effectOnly(expectedState));
 				break;
 			}
@@ -2649,12 +2921,12 @@ export function installCodeMirrorHandoffGuard(
 					safe.push(decision.transaction);
 					expectedState = decision.transaction.state;
 					continue;
-				case "capture-intent":
 				case "reject":
 					safe.push(decision.effectOnly);
 					break;
 				case "capture-composition":
 				case "hold-host-load":
+				case "drop":
 					break;
 			}
 			break;
@@ -2664,15 +2936,20 @@ export function installCodeMirrorHandoffGuard(
 		const selectionBefore = stateBefore.selection;
 		const scrollBefore = view.scrollDOM.scrollTop;
 		const nativeHistoryEpochBefore = nativeHistoryEpoch;
+		const samePathInputBatch = boundary === "update"
+			? prepareStableSamePathInputBatch(safe)
+			: null;
 		const result = apply(safe);
 		if (boundary === "update") {
 			for (const transaction of safe) {
-					markInputEffectCaptured(transaction);
-					markGuardOwnedGateReconfiguration(transaction);
-					markObservedHostPresentationSettlement(transaction);
-					markObservedCompositionNoopSettlement(transaction);
-					markObservedPersistenceNeutralSettlement(transaction);
+				markGuardOwnedGateReconfiguration(transaction);
+				markObservedHostPresentationSettlement(transaction);
+				markObservedCompositionNoopSettlement(transaction);
+				markObservedPersistenceNeutralSettlement(transaction);
+				if (transaction.docChanged) {
+					certifyAppliedSamePathCompositionTransaction(transaction);
 				}
+			}
 		}
 		if (accountEpochs) {
 			for (const transaction of safe) {
@@ -2694,6 +2971,10 @@ export function installCodeMirrorHandoffGuard(
 				}
 			}
 		}
+		if (boundary === "update") {
+			settleStableSamePathInput(samePathInputBatch);
+		}
+		synchronizeRejectBeforeTargetDomFence();
 		return result;
 	}
 
@@ -2743,6 +3024,11 @@ export function installCodeMirrorHandoffGuard(
 				? args[0] as EditorState
 				: null;
 		if (targetState === null) return undefined;
+		// setState can replace extensions and reopen the compartment even when the
+		// document bytes are identical.  Reject the whole API boundary while the
+		// target-less owner is live; ordinary dispatch still permits effect-only
+		// transactions through the guarded route.
+		if (targetSelectionFence !== null || sourceUnloadDrain !== null) return undefined;
 		const context = currentContext();
 		if (context?.kind === "handoff") {
 			const held = makeHeldHostState(targetState, context);
@@ -2754,6 +3040,7 @@ export function installCodeMirrorHandoffGuard(
 		const selectionBefore = stateBefore.selection;
 		const scrollBefore = view.scrollDOM.scrollTop;
 		const result = Reflect.apply(originalSetState, view, [targetState]);
+		synchronizeRejectBeforeTargetDomFence(context);
 		const nativeHistoryEpochBefore = nativeHistoryEpoch;
 		nativeHistoryEpoch += 1;
 		if (!selectionBefore.eq(view.state.selection)) selectionEpoch += 1;
@@ -2762,6 +3049,7 @@ export function installCodeMirrorHandoffGuard(
 		gateClosed = view.state.facet(handoffGateClosedFacet);
 		gateModelFingerprint = "uninitialized";
 		configureGate(false);
+		synchronizeRejectBeforeTargetDomFence(context);
 		try {
 			callbackRef?.onNativeHistoryAdvanced?.({
 				cm: view,
@@ -2814,10 +3102,6 @@ export function installCodeMirrorHandoffGuard(
 				gateFailureReason = "pending-input-not-flushable";
 				return false;
 			}
-			if (
-				pendingInputDelivery !== null
-				&& !deliverPendingInput(pendingInputDelivery)
-			) return false;
 			gateFailureReason = null;
 			return true;
 		} catch {
@@ -2828,10 +3112,7 @@ export function installCodeMirrorHandoffGuard(
 
 	function configureGate(closed: boolean): boolean {
 		if (!flushPendingDom()) return false;
-		const recoveryModel = closed
-			? callbackRef?.getHandoffRecoveryGateModel?.() ?? null
-			: null;
-		const modelFingerprint = handoffRecoveryGateFingerprint(recoveryModel);
+		const modelFingerprint = "manual-only";
 		if (
 			gateConfigured
 			&& gateClosed === closed
@@ -2842,22 +3123,28 @@ export function installCodeMirrorHandoffGuard(
 			handoffGateClosedFacet.of(closed),
 			hostPresentationSettlementObserver,
 		];
-		if (closed) {
-			extensions.push(Prec.lowest(EditorView.inputHandler.of((target, _from, _to, _text, insert) => {
+			if (closed) {
+				extensions.push(Prec.lowest(EditorView.inputHandler.of((target, _from, _to, _text, insert) => {
 				if (
 					target !== view
 					|| inert
 					|| callbackRef === null
 					|| !gateClosed
 				) return false;
+				const inputContext = currentContext();
+				if (
+					inputContext?.kind === "handoff"
+					&& inputContext.inputPolicy === "reject-before-target"
+					&& pendingInput === null
+					&& activeComposition === null
+				) return true;
 				if (pendingInput === null && activeComposition === null) {
 					startInputSequence(null);
 				}
 				try {
 					const transaction = insert();
 					if (
-						pendingInputDelivery === null
-						&& captureActiveCompositionTransaction(
+						captureActiveCompositionTransaction(
 							transaction,
 							currentContext(),
 						)
@@ -2870,12 +3157,6 @@ export function installCodeMirrorHandoffGuard(
 				}
 				return true;
 			})));
-		}
-		if (recoveryModel !== null) {
-			extensions.push(showPanel.of(createHandoffRecoveryPanel(
-				recoveryModel,
-				callbackRef?.handoffRecoveryGateCallbacks,
-			)));
 		}
 		const extension: Extension = extensions;
 		const effect = gateConfigured
@@ -2962,6 +3243,15 @@ export function installCodeMirrorHandoffGuard(
 		scrollEpoch: number;
 		historyResetObserved: boolean;
 	}>;
+	type PreparedHostLoadCommit = Readonly<{
+		kind: "ready";
+		held: HeldHostLoad;
+		candidate: PendingHostLoadCandidate;
+		commit: HostLoadCommit;
+	}>;
+	type HostLoadCommitPreparation =
+		| PreparedHostLoadCommit
+		| HeldHostLoadPresentationResult;
 	type PendingCommitSettlement = {
 		commit: HostLoadCommit;
 		settled: boolean;
@@ -2991,6 +3281,291 @@ export function installCodeMirrorHandoffGuard(
 				&& view.state.facet(handoffGateClosedFacet)
 				&& gateClosed
 				&& handoffGateCompartment.get(view.state) !== undefined;
+	}
+
+	function samePresentationIdentity(
+		left: PendingHostLoadCompletion["presentation"],
+		right: PendingHostLoadCompletion["presentation"],
+	): boolean {
+		return left.kind === right.kind && left.id === right.id;
+	}
+
+	function retryPendingHostLoadCompletion(
+		candidate: PendingHostLoadCandidate,
+		presentation: PendingHostLoadCompletion["presentation"],
+	): HeldHostLoadPresentationResult | null {
+		if (commitState !== "committed") return null;
+		const held = heldHostLoad;
+		const pending = pendingHostLoadCompletion;
+		if (
+			inert
+			|| callbackRef === null
+			|| held === null
+			|| pending === null
+			|| pending.held !== held
+			|| candidate !== held.candidate
+			|| !samePresentationIdentity(presentation, pending.presentation)
+			|| !exactPendingHostLoadCompletion(pending)
+		) return frozen({ kind: "rejected", reason: "stale-generation" });
+		const notification = notifyHostLoadCompletion(pending);
+		if (notification === "invalid") {
+			failCommit(held, "completion-notification-invalid");
+			return frozen({ kind: "rejected", reason: "stale-generation" });
+		}
+		if (notification === "pending") {
+			return frozen({
+				kind: "pending-notification",
+				notification: "completion",
+				receipt: pending.receipt,
+			});
+		}
+		pendingHostLoadCompletion = null;
+		clearCompositionNoopSettlements(held);
+		heldHostLoad = null;
+		hostLoadCandidateNotification = null;
+		return frozen({ kind: "accepted", receipt: pending.receipt });
+	}
+
+	function prepareHeldHostLoadCommit(
+		requestedCandidate: PendingHostLoadCandidate,
+	): HostLoadCommitPreparation {
+		const held = heldHostLoad;
+		const activeCallbacks = callbackRef;
+		if (
+			inert
+			|| activeCallbacks === null
+			|| held === null
+			|| requestedCandidate !== held.candidate
+			|| commitState !== "pending"
+		) return frozen({ kind: "rejected", reason: "stale-generation" });
+		const candidate = held.candidate;
+		if (!exactPendingHeld(held)) {
+			const authorityCurrent = exactPendingHeldAuthority(held);
+			if (!authorityCurrent) failCommit(held, explainPendingAuthorityStale(held));
+			return frozen({
+				kind: "rejected",
+				reason: authorityCurrent ? "ambiguous-editor-api" : "stale-generation",
+			});
+		}
+		const candidateNotification = notifyHostLoadCandidate(held);
+		if (candidateNotification === "invalid") {
+			failCommit(held, "candidate-notification-invalid");
+			return frozen({ kind: "rejected", reason: "stale-generation" });
+		}
+		if (candidateNotification === "pending") {
+			return frozen({
+				kind: "pending-notification",
+				notification: "candidate",
+				candidate: held.candidate,
+			});
+		}
+		if (!exactPendingHeld(held)) {
+			failCommit(held, "post-candidate-authority-stale");
+			return frozen({ kind: "rejected", reason: "stale-generation" });
+		}
+		let acceptedTransaction: Transaction | null = null;
+		if (candidate.applicationKind === "transaction") {
+			const annotations = annotationsOf(candidate.heldTransaction);
+			if (
+				annotations === null
+				|| candidate.heldTransaction.newDoc !== candidate.targetDocument
+				|| activeCallbacks.isNativeHistoryReset(candidate.heldTransaction) !== true
+			) return frozen({ kind: "rejected", reason: "ambiguous-editor-api" });
+			const acceptedAnnotation = acceptedHostLoad.of(frozen({
+				hostLoadTokenId: candidate.hostLoadTokenId,
+				sessionId: candidate.sessionId,
+				handoffGeneration: candidate.handoffGeneration,
+			}));
+			acceptedTransaction = createRawTransaction({
+				startState: held.startStateAuthority.state,
+				changes: candidate.heldTransaction.changes,
+				selection: candidate.heldTransaction.selection,
+				effects: candidate.heldTransaction.effects,
+				annotations: [...annotations, acceptedAnnotation as TransactionAnnotation<unknown>],
+				scrollIntoView: candidate.heldTransaction.scrollIntoView,
+			});
+			if (
+				acceptedTransaction === null
+				|| acceptedTransaction.changes !== candidate.heldTransaction.changes
+				|| acceptedTransaction.selection !== candidate.heldTransaction.selection
+				|| acceptedTransaction.effects !== candidate.heldTransaction.effects
+				|| acceptedTransaction.scrollIntoView !== candidate.heldTransaction.scrollIntoView
+			) return frozen({ kind: "rejected", reason: "ambiguous-editor-api" });
+		} else if (
+			candidate.heldState.doc !== candidate.targetDocument
+			|| candidate.heldState.selection !== candidate.proposedSelection
+		) {
+			return frozen({ kind: "rejected", reason: "ambiguous-editor-api" });
+		}
+		if (!targetScopedRuntimeDataCas(
+			held,
+			candidate.runtimeViewDataBefore,
+			candidate.incomingContent,
+		)) {
+			if (!exactPendingHeld(held) && !exactPendingHeldAuthority(held)) {
+				failCommit(held, "cache-authority-stale");
+			}
+			return frozen({ kind: "rejected", reason: "stale-generation" });
+		}
+		if (
+			!exactHeldTarget(held)
+			|| held.startStateAuthority.state !== view.state
+			|| candidate.startDocument !== view.state.doc
+			|| candidate.nativeHistoryEpochBefore !== nativeHistoryEpoch
+			|| runtimeData(candidate.runtimeView) !== candidate.incomingContent
+		) {
+			const editorUnchanged = held.startStateAuthority.state === view.state
+				&& candidate.startDocument === view.state.doc
+				&& candidate.nativeHistoryEpochBefore === nativeHistoryEpoch;
+			const rolledBack = targetScopedRuntimeDataCas(
+				held,
+				candidate.incomingContent,
+				candidate.runtimeViewDataBefore,
+			);
+			if (!editorUnchanged || !rolledBack) {
+				failCommit(held, "post-cache-authority-stale");
+			}
+			return frozen({ kind: "rejected", reason: "stale-generation" });
+		}
+		const commit: HostLoadCommit = candidate.applicationKind === "transaction"
+			? {
+				kind: "transaction",
+				held,
+				acceptedTransaction: acceptedTransaction as Transaction,
+				startState: view.state,
+				routeSeen: false,
+				updateSeen: false,
+			}
+			: {
+				kind: "state",
+				held,
+				hostState: candidate.heldState,
+				startState: view.state,
+				acceptedState: null,
+			};
+		activeCommit = commit;
+		commitState = "committing";
+		try {
+			if (commit.kind === "transaction") {
+				view.dispatch(commit.acceptedTransaction);
+			} else {
+				Reflect.apply(originalSetState, view, [commit.hostState]);
+				synchronizeRejectBeforeTargetDomFence();
+				nativeHistoryEpoch += 1;
+				gateConfigured = handoffGateCompartment.get(view.state) !== undefined;
+				gateClosed = view.state.facet(handoffGateClosedFacet);
+				gateModelFingerprint = "uninitialized";
+				const gateReinstalled = configureGate(true);
+				synchronizeRejectBeforeTargetDomFence();
+				commit.acceptedState = view.state;
+				if (!gateReinstalled) {
+					failCommit(held, "state-gate-reinstall-failed");
+					return frozen({ kind: "rejected", reason: "ambiguous-editor-api" });
+				}
+			}
+		} catch {
+			if (!retryCommitIfUnchanged(commit)) failCommit(held, "host-apply-threw");
+			return frozen({ kind: "rejected", reason: "ambiguous-editor-api" });
+		}
+		if (!acceptedPostconditions(commit)) {
+			if (commit.kind === "state" || !retryCommitIfUnchanged(commit)) {
+				failCommit(held, "host-apply-postconditions-failed");
+			}
+			return frozen({ kind: "rejected", reason: "ambiguous-editor-api" });
+		}
+		return frozen({ kind: "ready", held, candidate, commit });
+	}
+
+	function observeImmediateCommitSettlement(
+		commit: HostLoadCommit,
+	): HostLoadSettlementObservation {
+		let historyResetObserved = commit.kind === "state";
+		if (commit.kind === "transaction") {
+			try {
+				historyResetObserved = callbackRef?.observeNativeHistoryReset(
+					view,
+					commit.acceptedTransaction,
+				) === true;
+			} catch {
+				historyResetObserved = false;
+			}
+		}
+		try {
+			return frozen({
+				valid: acceptedPostconditions(commit) && historyResetObserved,
+				state: view.state,
+				selection: view.state.selection,
+				viewportFrom: view.viewport.from,
+				scrollTop: view.scrollDOM.scrollTop,
+				scrollEpoch,
+				historyResetObserved,
+			});
+		} catch {
+			return invalidCommitObservation();
+		}
+	}
+
+	function completeHostLoadCommit(
+		prepared: PreparedHostLoadCommit,
+		presentation: PendingHostLoadCompletion["presentation"],
+		targetSelection: EditorSelection,
+	): HeldHostLoadPresentationResult {
+		const { held, candidate, commit } = prepared;
+		if (
+			activeCommit !== commit
+			|| commitState !== "committing"
+			|| !acceptedPostconditions(commit)
+			|| view.state.selection !== targetSelection
+		) {
+			failCommit(held, "settlement-observation-failed");
+			return frozen({ kind: "rejected", reason: "ambiguous-editor-api" });
+		}
+		selectionEpoch += 1;
+		scrollEpoch += 1;
+		consumedHostLoadTokens.add(candidate.hostLoadTokenId);
+		activeCommit = null;
+		commitState = "committed";
+		const receipt = frozen({
+			receiptId: nextId("host-load-receipt"),
+			hostLoadTokenId: candidate.hostLoadTokenId,
+			switchIntentSeq: candidate.switchIntentSeq,
+			sessionId: candidate.sessionId,
+			leafId: candidate.leafId,
+			handoffGeneration: candidate.handoffGeneration,
+			targetPath: held.targetPath,
+			nativeHistoryEpoch,
+			historyResetObserved: true as const,
+			targetSelection,
+			targetSelectionEpoch: selectionEpoch,
+			targetScrollAnchor: candidate.proposedScrollAnchor,
+			targetScrollEpoch: scrollEpoch,
+			effectFingerprint: candidate.effectFingerprint,
+		});
+		const pending: PendingHostLoadCompletion = {
+			held,
+			presentation: frozen({ ...presentation }),
+			receipt,
+			acceptedState: view.state,
+			phase: "idle",
+		};
+		pendingHostLoadCompletion = pending;
+		const completionNotification = notifyHostLoadCompletion(pending);
+		if (completionNotification === "invalid") {
+			failCommit(held, "completion-notification-invalid");
+			return frozen({ kind: "rejected", reason: "stale-generation" });
+		}
+		if (completionNotification === "pending") {
+			return frozen({
+				kind: "pending-notification",
+				notification: "completion",
+				receipt,
+			});
+		}
+		pendingHostLoadCompletion = null;
+		clearCompositionNoopSettlements(held);
+		heldHostLoad = null;
+		hostLoadCandidateNotification = null;
+		return frozen({ kind: "accepted", receipt });
 	}
 
 	function failCommit(
@@ -3069,6 +3644,7 @@ export function installCodeMirrorHandoffGuard(
 
 	function teardownDestroyedGuard(): void {
 		cancelActiveCommitSettlement();
+		releaseRejectBeforeTargetDomFence(false);
 		inert = true;
 		callbackRef = null;
 		armedHostLoad = null;
@@ -3080,8 +3656,9 @@ export function installCodeMirrorHandoffGuard(
 		activeComposition = null;
 		pendingCompositionSuccessor = null;
 		pendingImplicitCompositionCommit = null;
-		pendingInputDelivery = null;
-		liveCompositionProofOwners.delete(compositionProofOwner);
+		pendingOrdinarySpanningSuccessor = null;
+		sourceUnloadDrain = null;
+		targetSelectionFence = null;
 		removeListeners();
 		restoreOwnedWrappers();
 		installedGuards.delete(view);
@@ -3145,13 +3722,263 @@ export function installCodeMirrorHandoffGuard(
 	}
 
 	const guard: CodeMirrorHandoffGuard = {
+		beginSourceUnloadDrain(ownerId, reservation): boolean {
+			if (
+				inert
+				|| callbackRef === null
+				|| ownerId.length === 0
+				|| sourceUnloadDrain !== null
+				|| targetSelectionFence !== null
+				|| pendingInput?.reservation !== reservation
+				|| reservation.sourceDocumentAtStart === null
+				|| commitState !== "none"
+				|| armedHostLoad !== null
+				|| heldHostLoad !== null
+				|| hostLoadCandidateNotification !== null
+				|| pendingHostLoadCompletion !== null
+			) return false;
+			const context = currentContext();
+			if (
+				context?.kind !== "same-path"
+				|| reservation.handoffGenerationAtStart !== context.handoffGeneration
+				|| reservation.sourceAuthorityPathAtStart !== context.path
+				|| reservation.sourceFileAtStart?.path !== context.path
+				|| reservation.targetPathAtStart !== null
+				|| reservation.targetFileAtStart !== null
+				|| pendingInput.documentAtStart !== reservation.sourceDocumentAtStart
+			) return false;
+			const owner = frozen({ ownerId, reservation });
+			sourceUnloadDrain = owner;
+			if (
+				sourceUnloadDrain !== owner
+				|| pendingInput?.reservation !== reservation
+				|| currentContext()?.kind !== "same-path"
+			) {
+				if (sourceUnloadDrain === owner) sourceUnloadDrain = null;
+				return false;
+			}
+			return true;
+		},
+		isSourceUnloadDrainCurrent(ownerId, reservation): boolean {
+			return !inert
+				&& callbackRef !== null
+				&& sourceUnloadDrain?.ownerId === ownerId
+				&& sourceUnloadDrain.reservation === reservation
+				&& pendingInput?.reservation === reservation
+				&& currentContext()?.kind === "same-path";
+		},
+		prepareTargetSelectionFence(
+			ownerId,
+			drainedReservation,
+		): TargetSelectionFenceToken | null {
+			const draining = sourceUnloadDrain;
+			if (
+				draining === null
+				? drainedReservation !== undefined
+				: (
+					draining.ownerId !== ownerId
+					|| draining.reservation !== drainedReservation
+				)
+			) return null;
+			if (
+				inert
+				|| callbackRef === null
+				|| ownerId.length === 0
+				|| targetSelectionFence !== null
+				|| commitState !== "none"
+				|| armedHostLoad !== null
+				|| heldHostLoad !== null
+				|| hostLoadCandidateNotification !== null
+				|| pendingHostLoadCompletion !== null
+			) return null;
+			const contextBefore = currentContext();
+			if (contextBefore?.kind !== "same-path") return null;
+			// Drain CodeMirror's DOM observer before closing the source.  A live IME
+			// or ambiguous delayed ordinary lane is not silently discarded: its
+			// existing manual/reopen path must settle first.
+			if (!flushPendingDom()) return null;
+			if (activeComposition !== null && !routeMissingCompositionEnd()) return null;
+			if (
+				pendingInput !== null
+				&& activeComposition === null
+				&& !settleUnresolvedOrdinarySamePathInput(pendingInput)
+			) return null;
+			if (!routeDeferredOrdinarySpanningSuccessor()) return null;
+			if (
+				pendingInput !== null
+				|| activeComposition !== null
+				|| pendingCompositionSuccessor !== null
+				|| pendingImplicitCompositionCommit !== null
+				|| pendingOrdinarySpanningSuccessor !== null
+				|| currentContext()?.kind !== "same-path"
+			) return null;
+			const sourceState = view.state;
+			const provisionalToken: TargetSelectionFenceToken = frozen({
+				[targetSelectionFenceBrand]: true as const,
+				ownerId,
+				view,
+				sourceState,
+				sourceDocument: sourceState.doc,
+				nativeHistoryEpoch,
+				inputEpoch,
+				compositionEpoch,
+				selectionEpoch,
+				scrollEpoch,
+			});
+			targetSelectionFence = provisionalToken;
+			if (!configureGate(true)) {
+				targetSelectionFence = null;
+				synchronizeRejectBeforeTargetDomFence(currentContext());
+				return null;
+			}
+			const fencedState = view.state;
+			const token: TargetSelectionFenceToken = frozen({
+				[targetSelectionFenceBrand]: true as const,
+				ownerId,
+				view,
+				sourceState: fencedState,
+				sourceDocument: fencedState.doc,
+				nativeHistoryEpoch,
+				inputEpoch,
+				compositionEpoch,
+				selectionEpoch,
+				scrollEpoch,
+			});
+			targetSelectionFence = token;
+			if (sourceUnloadDrain === draining) sourceUnloadDrain = null;
+			synchronizeRejectBeforeTargetDomFence(currentContext());
+			// Even if a callback drifted an epoch while the DOM fence was being
+			// synchronized, return the installed opaque owner.  The manager will
+			// either prove it exact or retain it as a reopen-required terminal owner;
+			// an installed owner is never hidden behind a null result.
+			return token;
+		},
+		forceTargetSelectionFenceForTerminal(ownerId): TargetSelectionFenceToken | null {
+			if (
+				inert
+				|| callbackRef === null
+				|| ownerId.length === 0
+				|| pendingInput !== null
+				|| activeComposition !== null
+				|| pendingCompositionSuccessor !== null
+				|| pendingImplicitCompositionCommit !== null
+				|| pendingOrdinarySpanningSuccessor !== null
+			) return null;
+			if (targetSelectionFence !== null) return targetSelectionFence;
+			const sourceState = view.state;
+			const token: TargetSelectionFenceToken = frozen({
+				[targetSelectionFenceBrand]: true as const,
+				ownerId,
+				view,
+				sourceState,
+				sourceDocument: sourceState.doc,
+				nativeHistoryEpoch,
+				inputEpoch,
+				compositionEpoch,
+				selectionEpoch,
+				scrollEpoch,
+			});
+			targetSelectionFence = token;
+			sourceUnloadDrain = null;
+			// A failed CM compartment update must not hide the owner.  The dispatch,
+			// setState, beforeinput, composition, and contentDOM boundaries all consult
+			// targetSelectionFence directly, so the pane remains reject-only until an
+			// explicit safe teardown consumes this token.
+			configureGate(true);
+			installRejectBeforeTargetDomFence();
+			return token;
+		},
+		isTargetSelectionFenceCurrent(token): boolean {
+			return !inert
+				&& callbackRef !== null
+				&& targetSelectionFence === token
+				&& token.view === view
+				&& token.sourceState === view.state
+				&& token.sourceDocument === view.state.doc
+				&& token.nativeHistoryEpoch === nativeHistoryEpoch
+				&& token.inputEpoch === inputEpoch
+				&& token.compositionEpoch === compositionEpoch
+				&& token.selectionEpoch === selectionEpoch
+				&& token.scrollEpoch === scrollEpoch
+				&& gateClosed
+				&& view.state.facet(handoffGateClosedFacet)
+				&& rejectBeforeTargetDomFence !== null;
+		},
+		transferTargetSelectionFence(token): boolean {
+			if (!this.isTargetSelectionFenceCurrent(token)) return false;
+			const context = currentContext();
+			if (context?.kind === "same-path") return false;
+			if (!configureGate(true) || !this.isTargetSelectionFenceCurrent(token)) return false;
+			// A handoff context or the target-less host identity gap independently
+			// retains both the CM gate and DOM fence after this exact token is consumed.
+			targetSelectionFence = null;
+			const transferredContext = currentContext();
+			if (transferredContext?.kind === "same-path") {
+				targetSelectionFence = token;
+				return false;
+			}
+			synchronizeRejectBeforeTargetDomFence(transferredContext);
+			return gateClosed
+				&& view.state.facet(handoffGateClosedFacet)
+				&& rejectBeforeTargetDomFence !== null;
+		},
+		releaseTargetSelectionFence(token): boolean {
+			if (
+				!this.isTargetSelectionFenceCurrent(token)
+				|| currentContext()?.kind !== "same-path"
+			) return false;
+			targetSelectionFence = null;
+			if (!configureGate(false)) {
+				targetSelectionFence = token;
+				return false;
+			}
+			synchronizeRejectBeforeTargetDomFence(currentContext());
+			return !gateClosed && targetSelectionFence === null;
+		},
+		releaseTargetSelectionFenceForTeardown(token): boolean {
+			if (
+				inert
+				|| callbackRef === null
+				|| targetSelectionFence !== token
+				|| token.view !== view
+			) return false;
+			targetSelectionFence = null;
+			if (!configureGate(false)) {
+				targetSelectionFence = token;
+				return false;
+			}
+			releaseRejectBeforeTargetDomFence(false);
+			return !gateClosed && targetSelectionFence === null;
+		},
 		refreshGate(): boolean {
 			if (inert || callbackRef === null) return false;
-			if (pendingInputDelivery !== null && !deliverPendingInput(pendingInputDelivery)) return false;
-			const context = currentContext();
+			let context = currentContext();
+			synchronizeRejectBeforeTargetDomFence(context);
+			if (
+				context === null
+				&& pendingInput !== null
+				&& activeComposition === null
+			) {
+				settleUnresolvedOrdinarySamePathInput(pendingInput);
+			}
+			context = currentContext();
 			if (pendingInput !== null) observeBeforeHandoffContext(pendingInput, context);
-			const closed = context === null || context.kind === "handoff";
+			if (!routeDeferredOrdinarySpanningSuccessor()) return false;
+			context = currentContext();
+			const closed = targetSelectionFence !== null
+				|| context === null
+				|| context.kind === "handoff";
 			if (!configureGate(closed)) return false;
+			// Reconfiguration lets CodeMirror recompute content attributes. Keep the
+			// DOM fence aligned with the reducer context after that exact update.
+			const configuredContext = currentContext();
+			synchronizeRejectBeforeTargetDomFence(configuredContext);
+			// Selection may arrive after beforeinput but before CodeMirror emits the
+			// matching transaction (notably through its delayed Android-key lane).
+			// Keep that A-started reservation alive here. Its already-scheduled bounded
+			// rAF settlement will retire a true no-op; an arriving successor is routed
+			// exactly once through the switch-spanning manual-recovery boundary.
+			context = currentContext();
 			if (context?.kind !== "handoff") {
 				armedHostLoad = null;
 				if (commitState !== "committing") {
@@ -3315,245 +4142,65 @@ export function installCodeMirrorHandoffGuard(
 			return true;
 		},
 		async acceptHeldHostLoad(input) {
-			const held = heldHostLoad;
-			if (
-				!inert
-				&& callbackRef !== null
-				&& input.presentationPlanId.length > 0
-				&& commitState === "committed"
-			) {
-				const pending = pendingHostLoadCompletion;
-				if (
-					pending === null
-					|| held === null
-					|| pending.held !== held
-					|| input.candidate !== held.candidate
-					|| input.presentationPlanId !== pending.presentationPlanId
-					|| !exactPendingHostLoadCompletion(pending)
-				) return frozen({ kind: "rejected", reason: "stale-generation" });
-				const notification = notifyHostLoadCompletion(pending);
-				if (notification === "invalid") {
-					failCommit(held, "completion-notification-invalid");
-					return frozen({ kind: "rejected", reason: "stale-generation" });
-				}
-				if (notification === "pending") {
-					return frozen({
-						kind: "pending-notification",
-						notification: "completion",
-						receipt: pending.receipt,
-					});
-				}
-				pendingHostLoadCompletion = null;
-				clearCompositionNoopSettlements(held);
-				heldHostLoad = null;
-				hostLoadCandidateNotification = null;
-				return frozen({ kind: "accepted", receipt: pending.receipt });
-			}
-			if (
-				inert
-				|| callbackRef === null
-				|| input.presentationPlanId.length === 0
-				|| held === null
-				|| input.candidate !== held.candidate
-				|| commitState !== "pending"
-			) return frozen({ kind: "rejected", reason: "stale-generation" });
-			const candidate = held.candidate;
-			if (!exactPendingHeld(held)) {
-				const authorityCurrent = exactPendingHeldAuthority(held);
-				if (!authorityCurrent) failCommit(held, explainPendingAuthorityStale(held));
-				return frozen({
-					kind: "rejected",
-					reason: authorityCurrent ? "ambiguous-editor-api" : "stale-generation",
-				});
-			}
-			const candidateNotification = notifyHostLoadCandidate(held);
-			if (candidateNotification === "invalid") {
-				failCommit(held, "candidate-notification-invalid");
+			if (input.presentationPlanId.length === 0) {
 				return frozen({ kind: "rejected", reason: "stale-generation" });
 			}
-			if (candidateNotification === "pending") {
-				return frozen({
-					kind: "pending-notification",
-					notification: "candidate",
-					candidate: held.candidate,
-				});
-			}
-			if (!exactPendingHeld(held)) {
-				failCommit(held, "post-candidate-authority-stale");
-				return frozen({ kind: "rejected", reason: "stale-generation" });
-			}
-			let acceptedTransaction: Transaction | null = null;
-			if (candidate.applicationKind === "transaction") {
-				const activeCallbacks = callbackRef;
-				const annotations = annotationsOf(candidate.heldTransaction);
-				if (
-					annotations === null
-					|| candidate.heldTransaction.newDoc !== candidate.targetDocument
-					|| activeCallbacks.isNativeHistoryReset(candidate.heldTransaction) !== true
-				) return frozen({ kind: "rejected", reason: "ambiguous-editor-api" });
-				const acceptedAnnotation = acceptedHostLoad.of(frozen({
-					hostLoadTokenId: candidate.hostLoadTokenId,
-					sessionId: candidate.sessionId,
-					handoffGeneration: candidate.handoffGeneration,
-				}));
-				acceptedTransaction = createRawTransaction({
-					startState: held.startStateAuthority.state,
-					changes: candidate.heldTransaction.changes,
-					selection: candidate.heldTransaction.selection,
-					effects: candidate.heldTransaction.effects,
-					annotations: [...annotations, acceptedAnnotation as TransactionAnnotation<unknown>],
-					scrollIntoView: candidate.heldTransaction.scrollIntoView,
-				});
-				if (
-					acceptedTransaction === null
-					|| acceptedTransaction.changes !== candidate.heldTransaction.changes
-					|| acceptedTransaction.selection !== candidate.heldTransaction.selection
-					|| acceptedTransaction.effects !== candidate.heldTransaction.effects
-					|| acceptedTransaction.scrollIntoView !== candidate.heldTransaction.scrollIntoView
-				) return frozen({ kind: "rejected", reason: "ambiguous-editor-api" });
-			} else if (
-				candidate.heldState.doc !== candidate.targetDocument
-				|| candidate.heldState.selection !== candidate.proposedSelection
-			) {
-				return frozen({ kind: "rejected", reason: "ambiguous-editor-api" });
-			}
-			if (!targetScopedRuntimeDataCas(
-				held,
-				candidate.runtimeViewDataBefore,
-				candidate.incomingContent,
-			)) {
-				if (!exactPendingHeld(held) && !exactPendingHeldAuthority(held)) {
-					failCommit(held, "cache-authority-stale");
-				}
-				return frozen({ kind: "rejected", reason: "stale-generation" });
-			}
-			if (
-				!exactHeldTarget(held)
-				|| held.startStateAuthority.state !== view.state
-				|| candidate.startDocument !== view.state.doc
-				|| candidate.nativeHistoryEpochBefore !== nativeHistoryEpoch
-				|| runtimeData(candidate.runtimeView) !== candidate.incomingContent
-			) {
-				const editorUnchanged = held.startStateAuthority.state === view.state
-					&& candidate.startDocument === view.state.doc
-					&& candidate.nativeHistoryEpochBefore === nativeHistoryEpoch;
-				const rolledBack = targetScopedRuntimeDataCas(
-					held,
-					candidate.incomingContent,
-					candidate.runtimeViewDataBefore,
-				);
-				if (!editorUnchanged || !rolledBack) {
-					failCommit(held, "post-cache-authority-stale");
-				}
-				return frozen({ kind: "rejected", reason: "stale-generation" });
-			}
-			const commit: HostLoadCommit = candidate.applicationKind === "transaction"
-				? {
-					kind: "transaction",
-					held,
-					acceptedTransaction: acceptedTransaction as Transaction,
-					startState: view.state,
-					routeSeen: false,
-					updateSeen: false,
-				}
-				: {
-					kind: "state",
-					held,
-					hostState: candidate.heldState,
-					startState: view.state,
-					acceptedState: null,
-				};
-			activeCommit = commit;
-			commitState = "committing";
-			try {
-				if (commit.kind === "transaction") {
-					view.dispatch(commit.acceptedTransaction);
-				} else {
-					Reflect.apply(originalSetState, view, [commit.hostState]);
-					nativeHistoryEpoch += 1;
-					gateConfigured = handoffGateCompartment.get(view.state) !== undefined;
-					gateClosed = view.state.facet(handoffGateClosedFacet);
-					gateModelFingerprint = "uninitialized";
-					const gateReinstalled = configureGate(true);
-					commit.acceptedState = view.state;
-					if (!gateReinstalled) {
-						failCommit(held, "state-gate-reinstall-failed");
-						return frozen({ kind: "rejected", reason: "ambiguous-editor-api" });
-					}
-				}
-			} catch {
-				if (!retryCommitIfUnchanged(commit)) failCommit(held, "host-apply-threw");
-				return frozen({ kind: "rejected", reason: "ambiguous-editor-api" });
-			}
-			if (!acceptedPostconditions(commit)) {
-				if (commit.kind === "state" || !retryCommitIfUnchanged(commit)) {
-					failCommit(held, "host-apply-postconditions-failed");
-				}
-				return frozen({ kind: "rejected", reason: "ambiguous-editor-api" });
-			}
-			const observation = await observeCommitSettlement(commit);
+			const presentation = frozen({
+				kind: "controller" as const,
+				id: input.presentationPlanId,
+			});
+			const retried = retryPendingHostLoadCompletion(input.candidate, presentation);
+			if (retried !== null) return retried;
+			const prepared = prepareHeldHostLoadCommit(input.candidate);
+			if (prepared.kind !== "ready") return prepared;
+			const observation = await observeCommitSettlement(prepared.commit);
 			if (
 				!observation.valid
 				|| !observation.historyResetObserved
 				|| observation.state !== view.state
-				|| !observation.selection.eq(candidate.proposedSelection)
+				|| !observation.selection.eq(prepared.candidate.proposedSelection)
 				|| observation.viewportFrom !== view.viewport.from
 				|| observation.scrollTop !== view.scrollDOM.scrollTop
 				|| observation.scrollEpoch !== scrollEpoch
-				|| !acceptedPostconditions(commit)
+				|| !acceptedPostconditions(prepared.commit)
 			) {
-				failCommit(held, "settlement-observation-failed");
+				failCommit(prepared.held, "settlement-observation-failed");
 				return frozen({ kind: "rejected", reason: "ambiguous-editor-api" });
 			}
-			selectionEpoch += 1;
-			scrollEpoch += 1;
-			consumedHostLoadTokens.add(candidate.hostLoadTokenId);
-			activeCommit = null;
-			commitState = "committed";
-			const receipt = frozen({
-				receiptId: nextId("host-load-receipt"),
-				hostLoadTokenId: candidate.hostLoadTokenId,
-				switchIntentSeq: candidate.switchIntentSeq,
-				sessionId: candidate.sessionId,
-				leafId: candidate.leafId,
-				handoffGeneration: candidate.handoffGeneration,
-				targetPath: held.targetPath,
-				nativeHistoryEpoch,
-				historyResetObserved: true as const,
-				targetSelection: observation.selection,
-				targetSelectionEpoch: selectionEpoch,
-				targetScrollAnchor: candidate.proposedScrollAnchor,
-				targetScrollEpoch: scrollEpoch,
-				effectFingerprint: candidate.effectFingerprint,
-			});
-			const pending: PendingHostLoadCompletion = {
-				held,
-				presentationPlanId: input.presentationPlanId,
-				receipt,
-				acceptedState: view.state,
-				phase: "idle",
-			};
-			pendingHostLoadCompletion = pending;
-			const completionNotification = notifyHostLoadCompletion(pending);
-			if (completionNotification === "invalid") {
-				failCommit(held, "completion-notification-invalid");
+			return completeHostLoadCommit(prepared, presentation, observation.selection);
+		},
+		presentHeldHostLoadLocally(input) {
+			if (input.localPresentationId.length === 0) {
 				return frozen({ kind: "rejected", reason: "stale-generation" });
 			}
-			if (completionNotification === "pending") {
-				return frozen({
-					kind: "pending-notification",
-					notification: "completion",
-					receipt,
-				});
+			const presentation = frozen({
+				kind: "local" as const,
+				id: input.localPresentationId,
+			});
+			const retried = retryPendingHostLoadCompletion(input.candidate, presentation);
+			if (retried !== null) return retried;
+			const prepared = prepareHeldHostLoadCommit(input.candidate);
+			if (prepared.kind !== "ready") return prepared;
+			const observation = observeImmediateCommitSettlement(prepared.commit);
+			if (
+				!observation.valid
+				|| !observation.historyResetObserved
+				|| observation.state !== view.state
+				|| !observation.selection.eq(prepared.candidate.proposedSelection)
+				|| observation.scrollEpoch !== scrollEpoch
+				|| !acceptedPostconditions(prepared.commit)
+			) {
+				failCommit(prepared.held, "settlement-observation-failed");
+				return frozen({ kind: "rejected", reason: "ambiguous-editor-api" });
 			}
-			pendingHostLoadCompletion = null;
-			clearCompositionNoopSettlements(held);
-			heldHostLoad = null;
-			hostLoadCandidateNotification = null;
-			return frozen({ kind: "accepted", receipt });
+			return completeHostLoadCommit(prepared, presentation, observation.selection);
 		},
 		markInert(): boolean {
 			if (inert) return true;
+			if (sourceUnloadDrain !== null) {
+				gateFailureReason = "pending-input-not-flushable";
+				return false;
+			}
 			if (commitState === "committing") {
 				cancelActiveCommitSettlement();
 				if (commitState === "committing") {
@@ -3562,7 +4209,12 @@ export function installCodeMirrorHandoffGuard(
 				}
 			}
 			if (!routeMissingCompositionEnd()) return false;
+			if (targetSelectionFence !== null) {
+				gateFailureReason = "gate-release-failed";
+				return false;
+			}
 			if (!configureGate(false)) return false;
+			releaseRejectBeforeTargetDomFence(false);
 			inert = true;
 			callbackRef = null;
 			armedHostLoad = null;
@@ -3574,8 +4226,28 @@ export function installCodeMirrorHandoffGuard(
 			activeComposition = null;
 			pendingCompositionSuccessor = null;
 			pendingImplicitCompositionCommit = null;
-			pendingInputDelivery = null;
-			liveCompositionProofOwners.delete(compositionProofOwner);
+			pendingOrdinarySpanningSuccessor = null;
+			removeListeners();
+			return true;
+		},
+		markDetachedInertForTeardown(): boolean {
+			if (inert) return true;
+			cancelActiveCommitSettlement();
+			sourceUnloadDrain = null;
+			targetSelectionFence = null;
+			releaseRejectBeforeTargetDomFence(false);
+			inert = true;
+			callbackRef = null;
+			armedHostLoad = null;
+			clearCompositionNoopSettlements();
+			heldHostLoad = null;
+			hostLoadCandidateNotification = null;
+			pendingHostLoadCompletion = null;
+			pendingInput = null;
+			activeComposition = null;
+			pendingCompositionSuccessor = null;
+			pendingImplicitCompositionCommit = null;
+			pendingOrdinarySpanningSuccessor = null;
 			removeListeners();
 			return true;
 		},
@@ -3605,6 +4277,8 @@ export function installCodeMirrorHandoffGuard(
 				view,
 				inert,
 				gateClosed,
+				sourceUnloadDrain,
+				targetSelectionFence,
 				inputEpoch,
 				compositionEpoch,
 				nativeHistoryEpoch,
@@ -3626,9 +4300,7 @@ export function installCodeMirrorHandoffGuard(
 		},
 	};
 
-	liveCompositionProofOwners.add(compositionProofOwner);
 	if (!guard.refreshGate()) {
-		liveCompositionProofOwners.delete(compositionProofOwner);
 		rollbackInstalled(installedNames);
 		return frozen({ kind: "unsupported", reason: "pending-dom-input-not-capturable" });
 	}

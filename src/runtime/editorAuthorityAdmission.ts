@@ -1,10 +1,7 @@
 import type { EditorView } from "@codemirror/view";
 import type { TFile } from "obsidian";
 import * as Y from "yjs";
-import type {
-	OpenEditorMutationTicket,
-	OpenEditorMutationViewTicket,
-} from "../sync/editorBinding";
+import type { OpenEditorMutationTicket } from "../sync/editorBinding";
 import type {
 	MissingTargetSeedPlan,
 	MissingTargetSeedReceipt,
@@ -23,52 +20,6 @@ import type {
 	SamePathAdoptionSeedPermit,
 } from "../sync/samePathAdoption";
 
-export type HandoffReplayRecoveryClaim = Readonly<{
-	recoveryOperationEpoch: number;
-	intentId: string;
-	recordId: string;
-}>;
-
-/**
- * Binding-owner proof carried only by a recovery-purpose open-path ticket.
- *
- * The ordinary OpenEditorMutationTicket validator must recapture and compare
- * every field in this shape. The controller never infers a recovery claim from
- * the generic handoff phase or equal editor bytes.
- */
-export type HandoffReplayRecoveryAdmissionEvidence = Readonly<{
-	purpose: "handoff-replay-target-bind";
-	recoveryClaim: HandoffReplayRecoveryClaim;
-	recoveryTargetBindingRequest: HandoffReplayRecoveryClaim | null;
-	inputGateInstalled: boolean;
-	saveGuardInstalled: boolean;
-	pendingHostLoadCandidate: null;
-	intentState: Readonly<{
-		kind: "stored" | "replay-pending";
-		intentId: string;
-		recordId: string;
-	}>;
-	binding:
-		| Readonly<{ kind: "unbound"; bindingEpoch: number }>
-		| Readonly<{
-			kind: "bound";
-			path: string;
-			fileId: string;
-			ytext: Y.Text;
-			bindingEpoch: number;
-		}>;
-}>;
-
-export type HandoffReplayRecoveryOpenEditorMutationViewTicket =
-	OpenEditorMutationViewTicket & Readonly<{
-		handoffReplayRecovery: HandoffReplayRecoveryAdmissionEvidence;
-	}>;
-
-export type HandoffReplayRecoveryOpenEditorMutationTicket =
-	Omit<OpenEditorMutationTicket, "views"> & Readonly<{
-		views: readonly HandoffReplayRecoveryOpenEditorMutationViewTicket[];
-	}>;
-
 type OpenPathAdmissionRequestBase = Readonly<{
 	requestId: string;
 	sessionId: string;
@@ -81,19 +32,10 @@ type OpenPathAdmissionRequestBase = Readonly<{
 	hostLoadTokenId: string | null;
 }>;
 
-export type OpenPathAdmissionRequest =
-	| (OpenPathAdmissionRequestBase & Readonly<{
-		reason: "open-editor-missing-target";
-		recoveryClaim?: never;
-		openEditorTicket: OpenEditorMutationTicket;
-	}>)
-	| (OpenPathAdmissionRequestBase & Readonly<{
-		reason: "handoff-replay-target-bind";
-		recoveryClaim: HandoffReplayRecoveryClaim;
-		presentation: "target-proven";
-		hostLoadTokenId: null;
-		openEditorTicket: HandoffReplayRecoveryOpenEditorMutationTicket;
-	}>);
+export type OpenPathAdmissionRequest = OpenPathAdmissionRequestBase & Readonly<{
+	reason: "open-editor-missing-target";
+	openEditorTicket: OpenEditorMutationTicket;
+}>;
 
 export type TargetPresentationRequest = Readonly<{
 	requestId: string;

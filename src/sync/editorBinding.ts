@@ -10,10 +10,7 @@ import {
 	type TransactionSpec,
 } from "@codemirror/state";
 import {
-	historyField,
 	isolateHistory,
-	redoDepth,
-	undoDepth,
 } from "@codemirror/commands";
 import { EditorView, ViewPlugin, type ViewUpdate } from "@codemirror/view";
 import { yCollab, ySyncFacet } from "y-codemirror.next";
@@ -48,24 +45,21 @@ import {
 	reduceManagedLeafSession,
 	reserveManagedLeafInputStart,
 	type EditorHandoffEffect,
-	type HandoffIntentState,
-	type HandoffInputIntent,
-	type HandoffReplayPlan,
 	type HostLoadCompletionReceipt,
 	type ManagedLeafInputStartReservation,
 	type ManagedLeafSession,
 	type MissingTargetSeedPlan,
 	type PendingHostLoadCandidate,
-	type TargetPresentationPlan,
-	type TargetPresentationReceipt,
-	type TargetReadyToken,
 } from "./editorHandoffState";
 import {
 	associateEditorHandoffHostQaBarrier,
 	installTextFileViewHandoffGuard,
 	type EditorHandoffHostQaBarrier,
 	type ManagedSourceUnloadSnapshot,
+	type ManagedDeferredLoadAdmissionSnapshot,
+	type ManagedHostSwitchTicket,
 	type ManagedViewSaveGuard,
+	type TextFileViewEmergencySaveFence,
 	type TextFileViewHandoffGuard,
 } from "./textFileViewHandoffGuard";
 import type {
@@ -74,34 +68,12 @@ import type {
 	EditorHandoffManagedLeafDebugSnapshot,
 } from "../runtime/engineControlPort";
 import {
-	captureGuardOwnedHandoffCompositionProof,
-	acceptedHandoffReplay,
-	handoffRecoveryGateActions,
 	installCodeMirrorHandoffGuard,
 	type CodeMirrorHandoffContext,
 	type CodeMirrorHandoffGuard,
 	type CodeMirrorHandoffGuardSnapshot,
-	type HandoffRecoveryGateModel,
+	type TargetSelectionFenceToken,
 } from "./codeMirrorHandoffGuard";
-import {
-	isExactHandoffReplayScrollDispatchPostcondition,
-	type HandoffCompositionProof,
-	type HandoffReplayDispatchResult,
-	type HandoffReplayNotAppliedReason,
-	type HandoffReplayPermit,
-	type HandoffReplaySettlementSnapshot,
-	type HandoffReplayTargetSnapshot,
-	type RedeemExactHandoffReplayDispatchPermitResult,
-} from "./editorHandoffReplay";
-import {
-	canonicalHandoffRecoveryJson,
-	sha256HandoffRecoveryHexSync,
-	type ActiveHandoffRecoveryRecord,
-} from "./handoffRecoveryStore";
-import type {
-	HandoffRecoveryPort,
-	HandoffRecoveryRuntimeRequest,
-} from "../runtime/handoffRecoveryCoordinator";
 import { isMarkdownEditorView } from "../runtime/markdownEditorView";
 import {
 	createPathEditorAuthorityPort,
@@ -113,16 +85,9 @@ import {
 import type {
 	AuthorityFreshnessContext,
 	BindPermitContext,
-	HandoffReplayRecoveryAdmissionEvidence,
-	HandoffReplayRecoveryClaim,
-	HandoffReplayRecoveryOpenEditorMutationTicket,
 	MissingTargetSeedResult,
 	OpenPathAdmissionRequest,
 	OpenPathAdmissionResult,
-	TargetPresentationPermitContext,
-	TargetPresentationRequest,
-	TargetPresentationRequestResult,
-	TargetPresentationResult,
 } from "../runtime/editorAuthorityAdmission";
 import {
 	NO_SAME_PATH_ADOPTION,
@@ -181,9 +146,6 @@ const RECENT_EDITOR_PATCH_SHIELD_MS = 5000;
 const EXTERNAL_DISK_RELOAD_CORRELATION_MS = 5000;
 const TYPING_AWARENESS_MIN_INTERVAL_MS = 750;
 const CONCURRENT_TYPING_NOTICE_COOLDOWN_MS = 8_000;
-// One accepted replay advances the Y.Text mutation fence, the CodeMirror
-// document fence, and the displayed-lineage fence exactly once each.
-const HANDOFF_REPLAY_AUTHORITY_EPOCH_ADVANCE = 3;
 const EDITOR_AUTHORITY_SHIELD_ORIGINS = new Set<string>([
 	ORIGIN_DISK_SYNC,
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
@@ -192,62 +154,8 @@ const EDITOR_AUTHORITY_SHIELD_ORIGINS = new Set<string>([
 const CM_RESOLVE_RETRY_DELAYS_MS = [80, 160, 320, 640, 1000, 1500, 2000] as const;
 const CM_RESOLVE_DELAYED_ATTEMPT = 5;
 const CM_RESOLVE_IDLE_RETRY_DELAY_MS = 5000;
-const TARGET_PRESENTATION_RETRY_DELAYS_MS = [120, 250, 500, 1000, 2000, 5000] as const;
-const TARGET_BIND_RETRY_DELAYS_MS = [120, 250, 500, 1000, 2000, 5000] as const;
+const UNMANAGE_RETRY_DELAYS_MS = [120, 250, 500, 1000, 2000, 5000] as const;
 const SAME_PATH_ADOPTION_RETRY_DELAYS_MS = [120, 250, 500, 1000, 2000, 5000] as const;
-
-function sameScrollSnapshot(
-	left: ReturnType<EditorView["scrollSnapshot"]>,
-	right: ReturnType<EditorView["scrollSnapshot"]>,
-): boolean {
-	return left.value.range.eq(right.value.range, true)
-		&& left.value.y === right.value.y
-		&& left.value.x === right.value.x
-		&& left.value.yMargin === right.value.yMargin
-		&& left.value.xMargin === right.value.xMargin
-		&& left.value.isSnapshot === right.value.isSnapshot;
-}
-
-function sameBytes(left: Uint8Array | null, right: Uint8Array | null): boolean {
-	if (left === null || right === null) return left === right;
-	if (left.byteLength !== right.byteLength) return false;
-	for (let index = 0; index < left.byteLength; index += 1) {
-		if (left[index] !== right[index]) return false;
-	}
-	return true;
-}
-
-function sameOwnPropertyDescriptor(
-	left: PropertyDescriptor | undefined,
-	right: PropertyDescriptor | undefined,
-): boolean {
-	if (left === undefined || right === undefined) return left === right;
-	if (
-		left.configurable !== right.configurable
-		|| left.enumerable !== right.enumerable
-		|| ("value" in left) !== ("value" in right)
-	) return false;
-	if ("value" in left && "value" in right) {
-		return left.value === right.value && left.writable === right.writable;
-	}
-	return left.get === right.get && left.set === right.set;
-}
-
-function sameOwnPropertyDescriptorShape(
-	left: PropertyDescriptor | undefined,
-	right: PropertyDescriptor | undefined,
-): boolean {
-	if (left === undefined || right === undefined) return left === right;
-	if (
-		left.configurable !== right.configurable
-		|| left.enumerable !== right.enumerable
-		|| ("value" in left) !== ("value" in right)
-	) return false;
-	if ("value" in left && "value" in right) {
-		return left.writable === right.writable;
-	}
-	return left.get === right.get && left.set === right.set;
-}
 
 function sameCompositionSnapshot(
 	left: CodeMirrorHandoffGuardSnapshot["activeComposition"]
@@ -285,6 +193,9 @@ function sameCodeMirrorGuardSnapshot(
 	return left.view === right.view
 		&& left.inert === right.inert
 		&& left.gateClosed === right.gateClosed
+		&& left.sourceUnloadDrain?.ownerId === right.sourceUnloadDrain?.ownerId
+		&& left.sourceUnloadDrain?.reservation === right.sourceUnloadDrain?.reservation
+		&& left.targetSelectionFence === right.targetSelectionFence
 		&& left.inputEpoch === right.inputEpoch
 		&& left.compositionEpoch === right.compositionEpoch
 		&& left.nativeHistoryEpoch === right.nativeHistoryEpoch
@@ -314,6 +225,50 @@ function sameHostGuardMode(
 		);
 }
 
+function sameDeferredLoadAdmissionSnapshot(
+	left: ManagedViewSaveGuard["pendingDeferredLoadAdmission"],
+	right: ManagedViewSaveGuard["pendingDeferredLoadAdmission"],
+): boolean {
+	const a = left ?? null;
+	const b = right ?? null;
+	if (a === null || b === null) return a === b;
+	return a.ownerId === b.ownerId
+		&& a.pendingLoadEpoch === b.pendingLoadEpoch
+		&& a.targetFile === b.targetFile
+		&& a.targetPath === b.targetPath
+		&& a.sourceUnloadReceiptId === b.sourceUnloadReceiptId
+		&& a.sourceUnloadId === b.sourceUnloadId
+		&& a.sourceFile === b.sourceFile
+		&& a.sourcePath === b.sourcePath
+		&& a.viewFileAtEntry === b.viewFileAtEntry
+		&& a.viewPathAtEntry === b.viewPathAtEntry;
+}
+
+function sameSourceUnloadDrainSnapshot(
+	left: ManagedViewSaveGuard["pendingSourceUnloadDrain"],
+	right: ManagedViewSaveGuard["pendingSourceUnloadDrain"],
+): boolean {
+	const a = left ?? null;
+	const b = right ?? null;
+	if (a === null || b === null) return a === b;
+	return a.ownerId === b.ownerId
+		&& a.sourceFile === b.sourceFile
+		&& a.sourcePath === b.sourcePath
+		&& a.viewFileAtEntry === b.viewFileAtEntry
+		&& a.viewPathAtEntry === b.viewPathAtEntry
+		&& a.nativeLoadEpochAtEntry === b.nativeLoadEpochAtEntry
+		&& a.pendingLoadEpochAtEntry === b.pendingLoadEpochAtEntry
+		&& a.saveEpochAtEntry === b.saveEpochAtEntry;
+}
+
+function hasNoPendingHostLoadOwner(snapshot: ManagedViewSaveGuard): boolean {
+	return snapshot.pendingDeferredLoadAdmission == null;
+}
+
+function hasExactHostGuardWrappers(snapshot: ManagedViewSaveGuard): boolean {
+	return snapshot.wrappersCurrent && snapshot.loadWrappersCurrent !== false;
+}
+
 function sameHostGuardSnapshot(
 	left: ManagedViewSaveGuard | null,
 	right: ManagedViewSaveGuard | null,
@@ -330,6 +285,19 @@ function sameHostGuardSnapshot(
 		|| left.hostCapabilityState !== right.hostCapabilityState
 		|| left.saveEpoch !== right.saveEpoch
 		|| left.clearLoadCapability !== right.clearLoadCapability
+		|| (left.pendingLoadEpoch ?? 0) !== (right.pendingLoadEpoch ?? 0)
+		|| (left.nativeLoadEpoch ?? 0) !== (right.nativeLoadEpoch ?? 0)
+		|| (left.pendingNativeHostLoadCount ?? 0)
+			!== (right.pendingNativeHostLoadCount ?? 0)
+		|| (left.nativeHostLoadAmbiguous ?? false)
+			!== (right.nativeHostLoadAmbiguous ?? false)
+		|| (left.managedClearTombstoneEpoch ?? 0)
+			!== (right.managedClearTombstoneEpoch ?? 0)
+		|| (left.managedClearTombstoneActive ?? false)
+			!== (right.managedClearTombstoneActive ?? false)
+		|| left.wrappersCurrent !== right.wrappersCurrent
+		|| (left.loadWrappersCurrent ?? true) !== (right.loadWrappersCurrent ?? true)
+		|| left.emergencySaveBlocked !== right.emergencySaveBlocked
 		|| !sameHostGuardMode(left.mode, right.mode)
 		|| left.pendingTargetSave !== right.pendingTargetSave
 		|| left.pendingOwnedSave?.jobId !== right.pendingOwnedSave?.jobId
@@ -347,6 +315,16 @@ function sameHostGuardSnapshot(
 		|| left.sourceUnload?.forcedSaveObserved !== right.sourceUnload?.forcedSaveObserved
 		|| left.sourceUnload?.cacheRetiredBeforeUnloadSettled
 			!== right.sourceUnload?.cacheRetiredBeforeUnloadSettled
+		|| !sameDeferredLoadAdmissionSnapshot(
+			left.pendingDeferredLoadAdmission,
+			right.pendingDeferredLoadAdmission,
+		)
+		|| !sameSourceUnloadDrainSnapshot(
+			left.pendingSourceUnloadDrain,
+			right.pendingSourceUnloadDrain,
+		)
+		|| left.terminalHostLifecycle?.ownerId !== right.terminalHostLifecycle?.ownerId
+		|| left.terminalHostLifecycle?.state !== right.terminalHostLifecycle?.state
 		|| left.inFlight.size !== right.inFlight.size
 	) return false;
 	for (const [id, entry] of left.inFlight) {
@@ -357,120 +335,6 @@ function sameHostGuardSnapshot(
 			|| entry.path !== other.path
 			|| entry.startedAt !== other.startedAt
 		) return false;
-	}
-	return true;
-}
-
-export function isExactHandoffReplayOwnedSaveStart(
-	before: ManagedViewSaveGuard | null,
-	after: ManagedViewSaveGuard | null,
-	expected: Pick<
-		HandoffReplayTargetSnapshot,
-		"sessionId" | "handoffGeneration" | "targetFile" | "targetPath"
-	>,
-): boolean {
-	if (
-		before === null
-		|| after === null
-		|| before.pendingOwnedSave !== null
-		|| after.pendingOwnedSave === null
-		|| !Number.isSafeInteger(before.saveEpoch)
-		|| before.saveEpoch < 0
-		|| before.saveEpoch >= Number.MAX_SAFE_INTEGER
-		|| after.saveEpoch !== before.saveEpoch + 1
-		|| expected.sessionId.length === 0
-		|| !Number.isSafeInteger(expected.handoffGeneration)
-		|| expected.handoffGeneration < 0
-		|| expected.targetPath.length === 0
-		|| expected.targetFile.path !== expected.targetPath
-	) return false;
-
-	const job = after.pendingOwnedSave;
-	if (
-		!Number.isSafeInteger(job.jobId)
-		|| job.jobId <= 0
-		|| job.sessionId !== expected.sessionId
-		|| job.generation !== expected.handoffGeneration
-		|| job.file !== expected.targetFile
-		|| job.path !== expected.targetPath
-		|| job.displayedPath !== expected.targetPath
-		|| job.saveEpoch !== after.saveEpoch
-	) return false;
-
-	return sameHostGuardSnapshot(before, {
-		...after,
-		saveEpoch: before.saveEpoch,
-		pendingOwnedSave: null,
-	});
-}
-
-export function isExactHandoffReplayRuntimeCacheProjection(input: Readonly<{
-	beforeDescriptor: PropertyDescriptor | undefined;
-	afterDispatchDescriptor: PropertyDescriptor | undefined;
-	expectedStartContent: string;
-	expectedResultContent: string;
-	hostBefore: ManagedViewSaveGuard | null;
-	hostAfter: ManagedViewSaveGuard | null;
-	expected: Pick<
-		HandoffReplayTargetSnapshot,
-		"sessionId" | "handoffGeneration" | "targetFile" | "targetPath"
-	>;
-}>): boolean {
-	const { beforeDescriptor, afterDispatchDescriptor } = input;
-	return input.expectedStartContent !== input.expectedResultContent
-		&& beforeDescriptor !== undefined
-		&& afterDispatchDescriptor !== undefined
-		&& "value" in beforeDescriptor
-		&& "value" in afterDispatchDescriptor
-		&& beforeDescriptor.writable === true
-		&& typeof beforeDescriptor.value === "string"
-		&& beforeDescriptor.value === input.expectedStartContent
-		&& afterDispatchDescriptor.value === input.expectedStartContent
-		&& sameOwnPropertyDescriptor(
-			beforeDescriptor,
-			afterDispatchDescriptor,
-		)
-		&& isExactHandoffReplayOwnedSaveStart(
-			input.hostBefore,
-			input.hostAfter,
-			input.expected,
-		);
-}
-
-export function isExactHandoffReplayYTextTransaction(input: Readonly<{
-	transactions: readonly Y.Transaction[];
-	expectedOrigin: unknown;
-	expectedYtext: Y.Text;
-}>): boolean {
-	const transaction = input.transactions[0] ?? null;
-	if (
-		transaction === null
-		|| input.transactions.length !== 1
-		|| input.expectedYtext.doc === null
-		|| transaction.doc !== input.expectedYtext.doc
-		|| transaction.origin !== input.expectedOrigin
-		|| transaction.changed.size !== 1
-		|| !transaction.changed.has(input.expectedYtext)
-		|| !transaction.changedParentTypes.has(input.expectedYtext)
-	) return false;
-
-	const allowedParentTypes = new Set<unknown>();
-	let current: unknown = input.expectedYtext;
-	while (current !== null) {
-		if (
-			typeof current !== "object"
-			|| allowedParentTypes.has(current)
-			|| allowedParentTypes.size >= 64
-		) return false;
-		allowedParentTypes.add(current);
-		try {
-			current = Reflect.get(current, "parent");
-		} catch {
-			return false;
-		}
-	}
-	for (const parentType of transaction.changedParentTypes.keys()) {
-		if (!allowedParentTypes.has(parentType)) return false;
 	}
 	return true;
 }
@@ -494,30 +358,6 @@ interface EditorBinding {
 	localYtextMutationRevisionAtBind?: number;
 }
 
-type ActiveHandoffReplayDispatchFrame = {
-	readonly frameIdentity: object;
-	readonly permit: HandoffReplayPermit;
-	readonly plan: HandoffReplayPlan;
-	readonly record: ActiveHandoffRecoveryRecord & Readonly<{
-		status: "replay-pending";
-	}>;
-	readonly recoveryOperationEpoch: number;
-	readonly expectedSnapshot: HandoffReplayTargetSnapshot;
-	readonly runtime: ManagedLeafRuntime;
-	readonly session: ManagedLeafSession;
-	readonly handoff: NonNullable<ManagedLeafSession["handoff"]>;
-	readonly workflow: ManagedTargetWorkflow;
-	readonly binding: EditorBinding;
-	readonly targetReadyToken: TargetReadyToken;
-	readonly hostLoadReceipt: HostLoadCompletionReceipt;
-	readonly cm: EditorView;
-	readonly startState: EditorState;
-	readonly mappedScrollEffect: StateEffect<unknown>;
-	transaction: Transaction | null;
-	routeSeen: boolean;
-	updateSeen: boolean;
-};
-
 type ActiveSamePathAdoptionDispatchFrame = {
 	readonly frameIdentity: object;
 	readonly proposal: SamePathAdoptionProposal;
@@ -527,16 +367,6 @@ type ActiveSamePathAdoptionDispatchFrame = {
 	transaction: Transaction | null;
 	updateSeen: boolean;
 };
-
-type HandoffReplaySnapshotPrivateAuthority = Readonly<{
-	binding: EditorBinding;
-	targetReadyToken: TargetReadyToken;
-	hostLoadReceipt: HostLoadCompletionReceipt;
-	nativeHistoryState: unknown;
-	undoDepth: number;
-	redoDepth: number;
-	scrollSnapshot: ReturnType<EditorView["scrollSnapshot"]>;
-}>;
 
 export interface BindingDebugInfo {
 	leafId: string;
@@ -603,16 +433,6 @@ export type OpenPathAdmissionWakeRequest = Readonly<{
 
 export interface EditorAuthorityControllerPort {
 	requestOpenPathAdmission(request: OpenPathAdmissionRequest): Promise<OpenPathAdmissionResult>;
-	requestTargetPresentation(
-		request: TargetPresentationRequest,
-	): Promise<TargetPresentationRequestResult>;
-	consumeTargetPresentationPermit(
-		permitId: string,
-		context: TargetPresentationPermitContext,
-	): boolean;
-	completeTargetPresentation(
-		receipt: HostLoadCompletionReceipt,
-	): Promise<TargetPresentationResult>;
 	seedMissingTarget(plan: MissingTargetSeedPlan): Promise<MissingTargetSeedResult>;
 	isAuthorityFreshnessCurrent(
 		handleId: string,
@@ -631,110 +451,93 @@ export interface EditorAuthorityControllerPort {
 		context: SamePathAdoptionBindContext,
 	): boolean;
 	noteSamePathAdoptionBound?(receipt: SamePathAdoptionBindReceipt): void;
-	redeemExactHandoffReplayDispatchPermit(
-		permit: HandoffReplayPermit,
-	): RedeemExactHandoffReplayDispatchPermitResult;
 }
-
-export type EditorHandoffAcceptedIntentStateObservation = Readonly<{
-	leafId: string;
-	sessionId: string;
-	generation: number;
-	recoveryOperationEpoch: number;
-	intentId: string;
-	fromPath: string | null;
-	targetPath: string;
-	startContentHash: string;
-	afterContentHash: string;
-	state: Exclude<HandoffIntentState["kind"], "none">;
-	action: "copy" | "export" | "discard" | null;
-}>;
 
 export interface EditorHandoffRecoveryActionHost {
-	writeClipboard(text: string): Promise<void>;
 	chooseVerifiedExporter(): Promise<((text: string) => Promise<void>) | null>;
-	confirmDiscard(): Promise<boolean>;
-	/** Content-free diagnostic receipt; failures must never affect Recovery. */
-	observeAcceptedIntentState?(
-		observation: EditorHandoffAcceptedIntentStateObservation,
-	): void;
 }
 
-export type HandoffReplaySnapshotRequest = Readonly<{
-	sessionId: string;
-	expectedGeneration: number;
-	recoveryOperationEpoch: number;
-	recoveryClaim: Readonly<{
-		intentId: string;
-		recordId: string;
-	}>;
-	targetReadyToken: TargetReadyToken;
-}>;
+type ManagedTransitionContainer = Readonly<{
+	contains?(node: unknown): boolean;
+	getAttribute?(name: string): string | null;
+	setAttribute?(name: string, value: string): void;
+	removeAttribute?(name: string): void;
+}> & Record<PropertyKey, unknown>;
 
-export type HandoffReplaySnapshotResult =
-	| Readonly<{ kind: "ready"; snapshot: HandoffReplayTargetSnapshot }>
-	| Readonly<{
-		kind: "not-ready";
-		reason:
-			| "session-stale"
-			| "generation-stale"
-			| "target-token-stale"
-			| "target-not-proven"
-			| "binding-missing"
-			| "target-identity-stale"
-			| "editor-identity-stale";
-	}>;
-
-export type HandoffReplaySettlementSnapshotRequest = Readonly<{
+type ManagedTransitionInputFence = {
+	readonly ownerId: string;
+	readonly view: MarkdownView;
+	readonly container: ManagedTransitionContainer;
+	previousInert: unknown;
+	hadOwnInert: boolean;
+	previousInertAttribute: string | null;
+	readonly cmGuard: CodeMirrorHandoffGuard;
+	targetSelectionToken: TargetSelectionFenceToken | null;
+	targetFile: TFile;
 	targetPath: string;
-	planId: string;
-	mode: "live" | "hydrated";
-}>;
+	sessionId: string;
+	handoffGeneration: number;
+	switchIntentSeq: number | null;
+	state: "preselection" | "handoff" | "reopen-required";
+};
 
-export type HandoffReplaySettlementSnapshotResult =
-	| Readonly<{
-		kind: "ready";
-		snapshot: HandoffReplaySettlementSnapshot;
-	}>
-	| Readonly<{
-		kind: "unavailable";
-		reason:
-			| "target-not-open"
-			| "target-not-proven"
-			| "binding-missing"
-			| "editor-identity-stale";
-	}>;
-
-export type HandoffCompositionProofCaptureResult =
-	| Readonly<{ kind: "not-ime" }>
-	| Readonly<{ kind: "ready"; proof: HandoffCompositionProof }>
-	| Readonly<{ kind: "unavailable" }>;
-
-type ManagedTargetWorkflow = {
-	readonly sessionId: string;
-	readonly handoffGeneration: number;
-	readonly switchIntentSeq: number;
+type ManagedHostLoadAdmissionAttempt = Readonly<{
+	readonly runtime: ManagedLeafRuntime;
+	readonly admission: ManagedDeferredLoadAdmissionSnapshot;
 	readonly targetFile: TFile;
 	readonly targetPath: string;
-	readonly candidate: PendingHostLoadCandidate;
-	readonly openEditorTicket: OpenEditorMutationTicket;
-	presentationPlan: TargetPresentationPlan | null;
-	presentationRequestInFlight: boolean;
-	presentationPermitConsumed: boolean;
-	presentationCommitInFlight: boolean;
-	presentationCompletionInFlight: boolean;
-	hostCompletionReceipt: HostLoadCompletionReceipt | null;
-	targetPresentationReceipt: TargetPresentationReceipt | null;
-	targetReadyToken: TargetReadyToken | null;
-	openAdmissionInFlight: boolean;
+	readonly sourceUnloadReceiptId: string;
+	readonly sourceSession: ManagedLeafSession;
+	readonly sourceBinding: EditorBinding | undefined;
+	readonly sourceBindingEpoch: number;
+	readonly authorityEpoch: number;
+}>;
+
+type ManagedTargetMarkReleaseProof = Readonly<{
+	runtime: ManagedLeafRuntime;
+	sourceSession: ManagedLeafSession;
+	candidate: PendingHostLoadCandidate;
+	hostGuard: TextFileViewHandoffGuard;
+	targetFile: TFile;
+	targetPath: string;
+}>;
+
+type ObservedFileMismatchTerminalOwner = Readonly<{
+	sessionId: string;
+	generation: number;
+	sourceFile: TFile;
+	sourcePath: string;
+	targetFile: TFile;
+	targetPath: string;
+}>;
+
+type ManagedSourceUnloadDrainOwner = {
+	readonly ownerId: string;
+	readonly runtime: ManagedLeafRuntime;
+	readonly sourceSession: ManagedLeafSession;
+	readonly sourceFile: TFile;
+	readonly sourcePath: string;
+	readonly sourceBinding: EditorBinding | undefined;
+	readonly sourceBindingEpoch: number;
+	readonly cmGuard: CodeMirrorHandoffGuard;
+	readonly reservation: ManagedLeafInputStartReservation | null;
+	readonly promise: Promise<void>;
+	state: "draining" | "fenced" | "terminal" | "transferred";
+	targetSelectionToken: TargetSelectionFenceToken | null;
+	settlementQueued: boolean;
+	settled: boolean;
+	readonly resolve: () => void;
+	readonly reject: (reason: Error) => void;
 };
 
 type ManagedLeafRuntime = {
 	session: ManagedLeafSession;
 	hostGuard: TextFileViewHandoffGuard | null;
+	emergencySaveFence: TextFileViewEmergencySaveFence | null;
 	cmGuard: CodeMirrorHandoffGuard | null;
 	capturedSourceAuthority: PathEditorAuthority | null;
-	targetWorkflow: ManagedTargetWorkflow | null;
+	transitionInputFence: ManagedTransitionInputFence | null;
+	sourceUnloadDrain: ManagedSourceUnloadDrainOwner | null;
 	adoption: SamePathAdoptionState;
 };
 
@@ -918,9 +721,12 @@ export interface OpenEditorMutationViewTicket {
 	readonly nativeHistoryEpoch: number;
 	readonly selectionEpoch: number;
 	readonly scrollEpoch: number;
+	/** Legacy controller evidence; the manager no longer publishes target-proven. */
 	readonly handoffPresentation: "stable" | "source" | "target-candidate" | "target-proven";
-	readonly handoffPhase: NonNullable<ManagedLeafSession["handoff"]>["phase"] | null;
-	readonly intentStateKind: NonNullable<ManagedLeafSession["handoff"]>["intentState"]["kind"] | null;
+	/** Compatibility-only evidence. Automatic recovery phases are never emitted. */
+	readonly handoffPhase: string | null;
+	/** Compatibility-only evidence. Switch input is never persisted by the manager. */
+	readonly intentStateKind: string | null;
 	readonly pendingHostLoadTokenId: string | null;
 	readonly view: MarkdownView;
 	readonly viewId: string;
@@ -938,7 +744,6 @@ export interface OpenEditorMutationViewTicket {
 	readonly editorAuthorityContent: string | null;
 	readonly editorDocument: unknown;
 	readonly editorContent: string | null;
-	readonly handoffReplayRecovery?: HandoffReplayRecoveryAdmissionEvidence;
 }
 
 export interface OpenEditorMutationTicket {
@@ -1057,9 +862,6 @@ function createEditorHandoffHostQaBarrierState(
 		return Array.from(internals.managedSessions.values(), (runtime) => {
 			const session = runtime.session;
 			const handoff = session.handoff;
-			const latestRecovery = [...session.activeRecoveries]
-				.reverse()
-				.find((recovery) => recovery.handoffGeneration === session.generation) ?? null;
 			const binding = internals.bindings.get(session.leafId) ?? null;
 			const guardSnapshot = runtime.cmGuard?.snapshot() ?? null;
 			const hostSnapshot = runtime.hostGuard?.snapshot() ?? null;
@@ -1142,8 +944,8 @@ function createEditorHandoffHostQaBarrierState(
 				bindingPath: binding?.path ?? null,
 				cmId,
 				presentation: handoff?.presentation ?? "none",
-				phase: handoff?.phase ?? "stable",
-				recoveryOperationEpoch: handoff?.recoveryOperationEpoch ?? null,
+				phase: "stable",
+				recoveryOperationEpoch: null,
 				inputGateInstalled: handoff?.inputGateInstalled ?? false,
 				saveGuardInstalled: handoff?.saveGuardInstalled ?? false,
 				hostCapability: hostSnapshot?.hostCapability ?? null,
@@ -1175,23 +977,7 @@ function createEditorHandoffHostQaBarrierState(
 				lastComposition: guardSnapshot?.lastComposition
 					? Object.freeze({ ...guardSnapshot.lastComposition })
 					: null,
-				intent: latestRecovery ? Object.freeze({
-					intentId: latestRecovery.intent.intentId,
-					state: latestRecovery.intentState.kind,
-					fromPath: latestRecovery.intent.fromPath,
-					targetPath: latestRecovery.intent.targetPath,
-					handoffGeneration: latestRecovery.intent.handoffGeneration,
-					switchIntentSeq: latestRecovery.intent.switchIntentSeq,
-					inputStartSeq: latestRecovery.intent.inputStartSeq,
-					inputStartedUnderSwitchSeq: latestRecovery.intent.inputStartedUnderSwitchSeq,
-					inputEpoch: latestRecovery.intent.inputEpoch,
-					compositionEpoch: latestRecovery.intent.compositionEpoch,
-					sequenceBegan: latestRecovery.intent.sequenceBegan,
-					originKind: latestRecovery.intent.originKind,
-					userEvent: latestRecovery.intent.userEvent,
-					startContentHash: latestRecovery.intent.startContentHash,
-					afterContentHash: latestRecovery.intent.afterContentHash,
-				}) : null,
+				intent: null,
 				nativeHistoryEpoch: guardSnapshot?.nativeHistoryEpoch ?? null,
 				selectionEpoch: guardSnapshot?.selectionEpoch ?? null,
 				scrollEpoch: guardSnapshot?.scrollEpoch ?? null,
@@ -1279,9 +1065,10 @@ function createEditorHandoffHostQaBarrierState(
 		},
 
 		tryHoldHostLoad(input) {
+			const armed = armedHostLoad;
 			if (
-				armedHostLoad?.path !== input.targetPath
-				|| armedHostLoad.stage !== input.stage
+				armed?.path !== input.targetPath
+				|| armed.stage !== input.stage
 				|| heldHostLoad
 			) return null;
 			armedHostLoad = null;
@@ -1356,21 +1143,6 @@ function createEditorHandoffHostQaBarrierState(
 				hostLoad: hostLoadSnapshot,
 				nativeSave: nativeSaveSnapshot,
 				leaves: Object.freeze(snapshotLeaves()),
-				qaReplayObservation: Object.freeze({
-					phase: "none",
-					planCount: 0,
-					witnessStoredCount: 0,
-					permitConsumedCount: 0,
-					dispatchAttemptCount: 0,
-					dispatchAppliedCount: 0,
-					dispatchUncertainCount: 0,
-					settlementObservationCount: 0,
-					lastOutcome: null,
-					lastClassification: null,
-					selectionNonEmpty: false,
-					mappedScrollAnchor: null,
-					liveScrollAnchor: null,
-				}),
 			});
 		},
 	};
@@ -1472,9 +1244,6 @@ export class EditorBindingManager {
 	private managedAuthorityRequestCounter = 0;
 	private managedSessions = new Map<string, ManagedLeafRuntime>();
 	private pendingAdmissionByLeafId = new Map<string, OpenPathAdmissionWakeRequest>();
-	private handoffRecoveryPort: HandoffRecoveryPort | null;
-	private handoffRecoveryPortActivationEpoch = 0;
-	private handoffRecoveryEffectsInFlight = new Set<string>();
 	private authorityEpoch = 0;
 	private authorityEpochExhausted = false;
 	private asyncAuthorityOpen = true;
@@ -1494,10 +1263,13 @@ export class EditorBindingManager {
 	private cmResolveDelayedLogged = new Set<string>();
 	private pendingCmResolveRetries = new Map<string, ReturnType<typeof setTimeout>>();
 	private pendingUnmanageRetries = new Map<string, ReturnType<typeof setTimeout>>();
-	private pendingTargetPresentationRetries = new Map<string, ReturnType<typeof setTimeout>>();
-	private targetPresentationRetryAttempts = new Map<string, number>();
-	private pendingTargetBindingRetries = new Map<string, ReturnType<typeof setTimeout>>();
-	private targetBindingRetryAttempts = new Map<string, number>();
+	private unmanageRetryAttempts = new Map<string, number>();
+	private localTargetPresentationIdByCandidate =
+		new WeakMap<PendingHostLoadCandidate, string>();
+	private terminalVisibleContentExportByRuntime =
+		new WeakMap<ManagedLeafRuntime, string>();
+	private observedFileMismatchTerminalByRuntime =
+		new WeakMap<ManagedLeafRuntime, ObservedFileMismatchTerminalOwner>();
 	private pendingYTextPatches = new WeakMap<Y.Text, PendingYTextPatch>();
 	private yTextMutationRevisionByText = new WeakMap<Y.Text, number>();
 	private lastYTextMutationTransactionByText = new WeakMap<Y.Text, Y.Transaction>();
@@ -1516,30 +1288,9 @@ export class EditorBindingManager {
 	private editorAuthorityContentByCm = new WeakMap<EditorView, string>();
 	private bindingPublicationOwnerByCm = new WeakMap<EditorView, object>();
 	private bindingEpochByLeafId = new Map<string, number>();
-	private activeHandoffReplayDispatchFrame: ActiveHandoffReplayDispatchFrame | null = null;
 	private activeSamePathAdoptionDispatchFrame: ActiveSamePathAdoptionDispatchFrame | null = null;
 	private samePathAdoptionPostMutationProofs =
 		new WeakSet<SamePathAdoptionPostMutationProof>();
-	private consumedHandoffReplayPlans = new WeakSet<HandoffReplayPlan>();
-	private lastSuccessfullyAppliedHandoffReplayByLeafId = new Map<string, Readonly<{
-		planId: string;
-		binding: EditorBinding;
-		targetFile: TFile;
-		cm: EditorView;
-		ytext: Y.Text;
-		targetFileId: string;
-		ytextIdentity: string;
-		ytextMutationEpoch: number;
-		bindingEpoch: number;
-		editorRevision: number;
-		nativeHistoryEpoch: number;
-		selectionEpoch: number;
-		scrollEpoch: number;
-		selection: EditorSelection;
-		scrollAnchor: number | null;
-	}>>();
-	private handoffReplayPrivateAuthorityBySnapshot =
-		new WeakMap<HandoffReplayTargetSnapshot, HandoffReplaySnapshotPrivateAuthority>();
 	private pendingReplacementCmToLeafId = new WeakMap<EditorView, string>();
 	private lastTypingAwarenessAtByLeaf = new Map<string, number>();
 	private concurrentTypingNoticeAtByPath = new Map<string, number>();
@@ -1569,16 +1320,9 @@ export class EditorBindingManager {
 			request: OpenPathAdmissionWakeRequest,
 		) => void,
 		private readonly editorAuthorityControllerPort?: EditorAuthorityControllerPort,
-		handoffRecoveryPort: HandoffRecoveryPort | null = null,
 		private readonly handoffRecoveryActionHost?: EditorHandoffRecoveryActionHost,
-		private readonly onHandoffTargetReady?: (token: TargetReadyToken) => void,
-		private readonly onHandoffSettlementMayHaveAdvanced?: (targetPath: string) => void,
-		private readonly onHandoffTargetPresentationReady?: (
-			token: TargetReadyToken,
-		) => void,
 	) {
 		this.debug = debug;
-		this.handoffRecoveryPort = handoffRecoveryPort;
 		const authoritySource: PathEditorAuthoritySource = {
 			readAuthorityEpoch: () => this.readAuthorityEpoch(),
 			captureManagedPanes: () => this.captureAuthorityManagedPanes(),
@@ -1603,23 +1347,6 @@ export class EditorBindingManager {
 				void leafId;
 			}
 		});
-	}
-
-	replaceHandoffRecoveryPort(
-		port: HandoffRecoveryPort | null,
-		activationEpoch: number,
-	): boolean {
-		if (
-			!Number.isSafeInteger(activationEpoch)
-			|| activationEpoch < 0
-			|| activationEpoch < this.handoffRecoveryPortActivationEpoch
-		) return false;
-		if (activationEpoch > this.handoffRecoveryPortActivationEpoch) {
-			this.handoffRecoveryPort = null;
-			this.handoffRecoveryPortActivationEpoch = activationEpoch;
-		}
-		this.handoffRecoveryPort = port;
-		return true;
 	}
 
 	private createManagedAuthorityRequestId(kind: string): string {
@@ -1697,6 +1424,13 @@ export class EditorBindingManager {
 			for (const runtime of this.managedSessions.values()) add(runtime.session.view);
 		}
 		return views;
+	}
+
+	private captureOpenViewsForAdmission(path: string): MarkdownView[] {
+		return this.captureAuthorityOpenFileViews(path).filter(
+			(view): view is MarkdownView =>
+				(view as MarkdownView | null)?.file?.path === path,
+		);
 	}
 
 	capturePathEditorAuthority(path: string): PathEditorAuthority {
@@ -1792,6 +1526,8 @@ export class EditorBindingManager {
 			|| host.saveEpoch !== request.hostSaveEpoch
 			|| host.mode.kind !== "pass-through"
 			|| host.sourceUnload !== null
+			|| !hasExactHostGuardWrappers(host)
+			|| !hasNoPendingHostLoadOwner(host)
 			|| guard === null
 			|| guard.view !== request.cm
 			|| guard.inert
@@ -1879,6 +1615,8 @@ export class EditorBindingManager {
 			|| host.saveEpoch !== post.hostSaveEpoch
 			|| host.mode.kind !== "pass-through"
 			|| host.sourceUnload !== null
+			|| !hasExactHostGuardWrappers(host)
+			|| !hasNoPendingHostLoadOwner(host)
 			|| guard === null
 			|| guard.view !== request.cm
 			|| guard.inert
@@ -1945,6 +1683,8 @@ export class EditorBindingManager {
 				|| candidateHost.hostCapabilityState !== "ready"
 				|| candidateHost.mode.kind !== "pass-through"
 				|| candidateHost.sourceUnload !== null
+				|| !hasExactHostGuardWrappers(candidateHost)
+				|| !hasNoPendingHostLoadOwner(candidateHost)
 				|| candidateGuard === null
 				|| candidateGuard.view !== ticket.cm
 				|| candidateGuard.inert
@@ -2147,1997 +1887,6 @@ export class EditorBindingManager {
 		return this.bindings.get(this.getLeafId(view)) ?? null;
 	}
 
-	captureHandoffCompositionProof(
-		intent: HandoffInputIntent,
-	): HandoffCompositionProofCaptureResult {
-		const runtime = this.managedSessions.get(intent.leafId);
-		const session = runtime?.session;
-		const recovery = session?.activeRecoveries.find((candidate) =>
-			candidate.intent === intent
-			&& candidate.sessionId === intent.sessionId
-			&& candidate.handoffGeneration === intent.handoffGeneration
-			&& candidate.intent.switchIntentSeq === intent.switchIntentSeq
-			&& candidate.intent.inputStartSeq === intent.inputStartSeq
-		) ?? null;
-		if (
-			!runtime
-			|| !session
-			|| session.sessionId !== intent.sessionId
-			|| session.generation !== intent.handoffGeneration
-			|| recovery === null
-		) return Object.freeze({ kind: "unavailable" });
-		if (intent.compositionEpoch === null) {
-			return Object.freeze({ kind: "not-ime" });
-		}
-		return captureGuardOwnedHandoffCompositionProof(intent);
-	}
-
-	captureCurrentTargetReadyToken(request: Readonly<{
-		sessionId: string;
-		expectedGeneration: number;
-		targetPath: string;
-		targetFile: TFile;
-	}>): TargetReadyToken | null {
-		for (const runtime of this.managedSessions.values()) {
-			const session = runtime.session;
-			const handoff = session.handoff;
-			const workflow = runtime.targetWorkflow;
-			const token = workflow?.targetReadyToken ?? null;
-			const receipt = workflow?.targetPresentationReceipt ?? null;
-			if (
-				session.sessionId !== request.sessionId
-				|| session.generation !== request.expectedGeneration
-				|| !handoff
-				|| handoff.presentation !== "target-proven"
-				|| handoff.targetPath !== request.targetPath
-				|| handoff.targetFile !== request.targetFile
-				|| !workflow
-				|| workflow.sessionId !== request.sessionId
-				|| workflow.handoffGeneration !== request.expectedGeneration
-				|| workflow.targetPath !== request.targetPath
-				|| workflow.targetFile !== request.targetFile
-				|| !token
-				|| !receipt
-				|| token.sessionId !== request.sessionId
-				|| token.handoffGeneration !== request.expectedGeneration
-				|| token.targetPath !== request.targetPath
-				|| token.targetFile !== request.targetFile
-				|| token.hostLoadReceiptId
-					!== receipt.hostLoadCompletionReceipt.receiptId
-				|| token.hostLoadTokenId
-					!== receipt.hostLoadCompletionReceipt.hostLoadTokenId
-				|| handoff.targetReadyTokenId !== token.tokenId
-			) continue;
-			return token;
-		}
-		return null;
-	}
-
-	captureHandoffReplayTargetSnapshot(
-		request: HandoffReplaySnapshotRequest,
-	): HandoffReplaySnapshotResult {
-		let runtime: ManagedLeafRuntime | null = null;
-		for (const candidate of this.managedSessions.values()) {
-			if (candidate.session.sessionId === request.sessionId) {
-				runtime = candidate;
-				break;
-			}
-		}
-		if (!runtime) {
-			return Object.freeze({ kind: "not-ready", reason: "session-stale" });
-		}
-		const session = runtime.session;
-		if (session.generation !== request.expectedGeneration) {
-			return Object.freeze({ kind: "not-ready", reason: "generation-stale" });
-		}
-		const handoff = session.handoff;
-		const recoveryRequest = handoff?.recoveryTargetBindingRequest ?? null;
-		const recoveryIntent = handoff?.intentState.kind === "stored"
-			|| handoff?.intentState.kind === "replay-pending"
-			? handoff.intentState
-			: null;
-		if (
-			!handoff
-			|| handoff.presentation !== "target-proven"
-			|| recoveryRequest === null
-			|| recoveryIntent === null
-			|| recoveryRequest.recoveryOperationEpoch
-				!== request.recoveryOperationEpoch
-			|| recoveryRequest.intentId !== request.recoveryClaim.intentId
-			|| recoveryRequest.recordId !== request.recoveryClaim.recordId
-			|| recoveryRequest.intentId !== recoveryIntent.intentId
-			|| recoveryRequest.recordId !== recoveryIntent.recordId
-			|| !handoff.inputGateInstalled
-			|| handoff.saveGuardInstalled
-			|| (
-				recoveryIntent.kind === "stored"
-					? handoff.phase !== "awaiting-recovery-commit"
-					: handoff.phase !== "awaiting-replay-settlement"
-			)
-			|| handoff.recoveryOperationEpoch !== request.recoveryOperationEpoch
-		) {
-			return Object.freeze({ kind: "not-ready", reason: "target-not-proven" });
-		}
-		const token = this.captureCurrentTargetReadyToken({
-			sessionId: request.sessionId,
-			expectedGeneration: request.expectedGeneration,
-			targetPath: request.targetReadyToken.targetPath,
-			targetFile: request.targetReadyToken.targetFile,
-		});
-		if (token !== request.targetReadyToken) {
-			return Object.freeze({ kind: "not-ready", reason: "target-token-stale" });
-		}
-		const authority = token.targetAuthority;
-		const workflow = runtime.targetWorkflow;
-		const presentationReceipt = workflow?.targetPresentationReceipt ?? null;
-		const hostReceipt = presentationReceipt?.hostLoadCompletionReceipt ?? null;
-		if (
-			authority.kind !== "existing"
-			|| !workflow
-			|| !presentationReceipt
-			|| !hostReceipt
-			|| workflow.targetReadyToken !== token
-			|| handoff.targetFile !== token.targetFile
-			|| handoff.targetPath !== token.targetPath
-			|| session.view.file !== token.targetFile
-		) {
-			return Object.freeze({ kind: "not-ready", reason: "target-identity-stale" });
-		}
-		const binding = this.bindings.get(session.leafId);
-		if (!binding) {
-			return Object.freeze({ kind: "not-ready", reason: "binding-missing" });
-		}
-		const displayed = session.displayedLineage;
-		const guard = runtime.cmGuard?.snapshot() ?? null;
-		const cm = binding.cm;
-		if (
-			displayed.kind !== "known"
-			|| displayed.file !== token.targetFile
-			|| displayed.path !== token.targetPath
-			|| displayed.cm !== cm
-			|| displayed.document !== cm.state.doc
-			|| binding.view !== session.view
-			|| binding.file !== token.targetFile
-			|| binding.path !== token.targetPath
-			|| binding.fileId !== authority.fileId
-			|| session.binding.kind !== "bound"
-			|| session.binding.path !== token.targetPath
-			|| session.binding.fileId !== authority.fileId
-			|| session.binding.ytext !== binding.ytext
-			|| this.vaultSync.getTextForPath(token.targetPath) !== binding.ytext
-			|| this.vaultSync.getFileId(token.targetPath) !== authority.fileId
-			|| this.vaultSync.getFileIdForText(binding.ytext) !== authority.fileId
-			|| this.getCmView(session.view) !== cm
-			|| guard?.view !== cm
-			|| guard.inert
-			|| !guard.gateClosed
-		) {
-			return Object.freeze({ kind: "not-ready", reason: "target-identity-stale" });
-		}
-		const cmState = cm.state;
-		const cmDocument = cmState.doc;
-		const cmSelection = cmState.selection;
-		const bindingEpoch = this.bindingEpochByLeafId.get(session.leafId) ?? 0;
-		const captureAuthorityEpoch = this.readAuthorityEpoch();
-		let editorFacadeContent: string;
-		let runtimeCacheContent: string;
-		try {
-			editorFacadeContent = session.view.editor.getValue();
-			const runtimeView = session.view as unknown as TextFileView;
-			const descriptor = Object.getOwnPropertyDescriptor(runtimeView, "data");
-			if (
-				descriptor === undefined
-				|| !("value" in descriptor)
-				|| typeof descriptor.value !== "string"
-			) {
-				return Object.freeze({
-					kind: "not-ready",
-					reason: "editor-identity-stale",
-				});
-			}
-			runtimeCacheContent = descriptor.value;
-		} catch {
-			return Object.freeze({ kind: "not-ready", reason: "editor-identity-stale" });
-		}
-		const editorRevision = this.editorRevisionByCm.get(cm) ?? 0;
-		const localYtextMutationRevision =
-			this.yTextMutationRevisionByText.get(binding.ytext) ?? 0;
-		const authorityYtextMutationEpochAtBind =
-			binding.authorityYtextMutationEpochAtBind;
-		const localYtextMutationRevisionAtBind =
-			binding.localYtextMutationRevisionAtBind;
-		if (
-			authorityYtextMutationEpochAtBind === undefined
-			|| localYtextMutationRevisionAtBind === undefined
-			|| localYtextMutationRevision < localYtextMutationRevisionAtBind
-		) {
-			return Object.freeze({ kind: "not-ready", reason: "target-identity-stale" });
-		}
-		const ytextMutationEpoch =
-			authorityYtextMutationEpochAtBind
-			+ (localYtextMutationRevision - localYtextMutationRevisionAtBind);
-		if (!Number.isSafeInteger(ytextMutationEpoch) || ytextMutationEpoch < 0) {
-			return Object.freeze({ kind: "not-ready", reason: "target-identity-stale" });
-		}
-		let scrollSnapshot: ReturnType<EditorView["scrollSnapshot"]>;
-		try {
-			scrollSnapshot = cm.scrollSnapshot();
-		} catch {
-			return Object.freeze({ kind: "not-ready", reason: "editor-identity-stale" });
-		}
-		if (
-			displayed.editorRevision !== editorRevision
-			|| !cmSelection.eq(hostReceipt.targetSelection)
-		) {
-			return Object.freeze({ kind: "not-ready", reason: "editor-identity-stale" });
-		}
-		const ytextContent = binding.ytext.toJSON();
-		const finalGuard = runtime.cmGuard?.snapshot() ?? null;
-		const finalDataDescriptor = Object.getOwnPropertyDescriptor(
-			session.view as unknown as TextFileView,
-			"data",
-		);
-		if (
-			this.managedSessions.get(session.leafId) !== runtime
-			|| runtime.session !== session
-			|| runtime.targetWorkflow !== workflow
-			|| workflow.targetReadyToken !== token
-			|| workflow.targetPresentationReceipt !== presentationReceipt
-			|| presentationReceipt.hostLoadCompletionReceipt !== hostReceipt
-			|| session.handoff !== handoff
-			|| session.displayedLineage !== displayed
-			|| this.bindings.get(session.leafId) !== binding
-			|| binding.view !== session.view
-			|| binding.file !== token.targetFile
-			|| binding.path !== token.targetPath
-			|| binding.fileId !== authority.fileId
-			|| binding.cm !== cm
-			|| binding.ytext !== session.binding.ytext
-			|| session.view.file !== token.targetFile
-			|| token.targetFile.path !== token.targetPath
-			|| !this.knownCmViews.has(cm)
-			|| !cm.dom.isConnected
-			|| !session.view.containerEl.contains(cm.dom)
-			|| this.cmToLeafId.get(cm) !== session.leafId
-			|| cm.state !== cmState
-			|| cm.state.doc !== cmDocument
-			|| !cm.state.selection.eq(cmSelection)
-			|| displayed.document !== cmDocument
-			|| displayed.cm !== cm
-			|| displayed.editorRevision !== editorRevision
-			|| (this.bindingEpochByLeafId.get(session.leafId) ?? 0)
-				!== bindingEpoch
-			|| (this.editorRevisionByCm.get(cm) ?? 0) !== editorRevision
-			|| (this.yTextMutationRevisionByText.get(binding.ytext) ?? 0)
-				!== localYtextMutationRevision
-			|| binding.ytext.toJSON() !== ytextContent
-			|| this.vaultSync.getTextForPath(token.targetPath) !== binding.ytext
-			|| this.vaultSync.getFileId(token.targetPath) !== authority.fileId
-			|| this.vaultSync.getFileIdForText(binding.ytext) !== authority.fileId
-			|| finalGuard === null
-			|| finalGuard.view !== guard.view
-			|| finalGuard.inert !== guard.inert
-			|| finalGuard.gateClosed !== guard.gateClosed
-			|| finalGuard.inputEpoch !== guard.inputEpoch
-			|| finalGuard.compositionEpoch !== guard.compositionEpoch
-			|| finalGuard.nativeHistoryEpoch !== guard.nativeHistoryEpoch
-			|| finalGuard.selectionEpoch !== guard.selectionEpoch
-			|| finalGuard.scrollEpoch !== guard.scrollEpoch
-			|| finalGuard.commitState !== guard.commitState
-			|| finalGuard.pendingHostLoadCandidate !== guard.pendingHostLoadCandidate
-			|| finalDataDescriptor === undefined
-			|| !("value" in finalDataDescriptor)
-			|| finalDataDescriptor.value !== runtimeCacheContent
-			|| this.readAuthorityEpoch() !== captureAuthorityEpoch
-		) {
-			return Object.freeze({ kind: "not-ready", reason: "editor-identity-stale" });
-		}
-		let finalScrollSnapshot: ReturnType<EditorView["scrollSnapshot"]>;
-		try {
-			finalScrollSnapshot = cm.scrollSnapshot();
-		} catch {
-			return Object.freeze({ kind: "not-ready", reason: "editor-identity-stale" });
-		}
-		const postScrollGuard = runtime.cmGuard?.snapshot() ?? null;
-		const postScrollDataDescriptor = Object.getOwnPropertyDescriptor(
-			session.view as unknown as TextFileView,
-			"data",
-		);
-		if (
-			!sameScrollSnapshot(scrollSnapshot, finalScrollSnapshot)
-			|| this.readAuthorityEpoch() !== captureAuthorityEpoch
-			|| this.managedSessions.get(session.leafId) !== runtime
-			|| runtime.session !== session
-			|| runtime.targetWorkflow !== workflow
-			|| workflow.targetReadyToken !== token
-			|| workflow.targetPresentationReceipt !== presentationReceipt
-			|| session.handoff !== handoff
-			|| session.displayedLineage !== displayed
-			|| this.bindings.get(session.leafId) !== binding
-			|| cm.state !== cmState
-			|| cm.state.doc !== cmDocument
-			|| !cm.state.selection.eq(cmSelection)
-			|| (this.bindingEpochByLeafId.get(session.leafId) ?? 0)
-				!== bindingEpoch
-			|| (this.editorRevisionByCm.get(cm) ?? 0) !== editorRevision
-			|| (this.yTextMutationRevisionByText.get(binding.ytext) ?? 0)
-				!== localYtextMutationRevision
-			|| binding.ytext.toJSON() !== ytextContent
-			|| postScrollGuard === null
-			|| postScrollGuard.view !== finalGuard.view
-			|| postScrollGuard.inert !== finalGuard.inert
-			|| postScrollGuard.gateClosed !== finalGuard.gateClosed
-			|| postScrollGuard.inputEpoch !== finalGuard.inputEpoch
-			|| postScrollGuard.compositionEpoch !== finalGuard.compositionEpoch
-			|| postScrollGuard.nativeHistoryEpoch !== finalGuard.nativeHistoryEpoch
-			|| postScrollGuard.selectionEpoch !== finalGuard.selectionEpoch
-			|| postScrollGuard.scrollEpoch !== finalGuard.scrollEpoch
-			|| postScrollGuard.commitState !== finalGuard.commitState
-			|| postScrollGuard.pendingHostLoadCandidate
-				!== finalGuard.pendingHostLoadCandidate
-			|| postScrollDataDescriptor === undefined
-			|| !("value" in postScrollDataDescriptor)
-			|| postScrollDataDescriptor.value !== runtimeCacheContent
-		) {
-			return Object.freeze({ kind: "not-ready", reason: "editor-identity-stale" });
-		}
-		const snapshot: HandoffReplayTargetSnapshot = Object.freeze({
-				sessionId: session.sessionId,
-				leafId: session.leafId,
-				handoffGeneration: session.generation,
-				recoveryOperationEpoch: request.recoveryOperationEpoch,
-				targetReadyTokenId: token.tokenId,
-				hostLoadTokenId: token.hostLoadTokenId,
-				hostLoadReceiptId: token.hostLoadReceiptId,
-				targetPath: token.targetPath,
-				targetFile: token.targetFile,
-				targetFileId: authority.fileId,
-				cm,
-				ytext: binding.ytext,
-				ytextIdentity: authority.ytextIdentity,
-				ytextMutationEpoch,
-				bindingEpoch,
-				editorRevision,
-				nativeHistoryEpoch: guard.nativeHistoryEpoch,
-				selectionEpoch: guard.selectionEpoch,
-				scrollEpoch: guard.scrollEpoch,
-				selection: cmSelection,
-				scrollAnchor: scrollSnapshot.value.range.head,
-				cmDocument,
-				editorFacadeContent,
-				runtimeCacheContent,
-				ytextContent,
-			});
-		this.handoffReplayPrivateAuthorityBySnapshot.set(snapshot, Object.freeze({
-			binding,
-			targetReadyToken: token,
-			hostLoadReceipt: hostReceipt,
-			nativeHistoryState: cm.state.field(historyField, false),
-			undoDepth: undoDepth(cm.state),
-			redoDepth: redoDepth(cm.state),
-			scrollSnapshot,
-		}));
-		return Object.freeze({
-			kind: "ready",
-			snapshot,
-		});
-	}
-
-	captureHandoffReplaySettlementSnapshot(
-		request: HandoffReplaySettlementSnapshotRequest,
-	): HandoffReplaySettlementSnapshotResult {
-		const candidates = Array.from(this.bindings.entries()).filter(
-			([, binding]) => binding.path === request.targetPath,
-		);
-		if (candidates.length === 0) {
-			const targetOpen = Array.from(this.managedSessions.values()).some(
-				(runtime) => runtime.session.view.file?.path === request.targetPath,
-			);
-			return Object.freeze({
-				kind: "unavailable",
-				reason: targetOpen ? "binding-missing" : "target-not-open",
-			});
-		}
-		if (candidates.length !== 1) {
-			return Object.freeze({
-				kind: "unavailable",
-				reason: "editor-identity-stale",
-			});
-		}
-		const [leafId, binding] = candidates[0]!;
-		const runtime = this.managedSessions.get(leafId) ?? null;
-		const session = runtime?.session ?? null;
-		const handoff = session?.handoff ?? null;
-		const workflow = runtime?.targetWorkflow ?? null;
-		const presentationReceipt = workflow?.targetPresentationReceipt ?? null;
-		const hostReceipt = presentationReceipt?.hostLoadCompletionReceipt ?? null;
-		const token = workflow?.targetReadyToken ?? null;
-		if (
-			runtime === null
-			|| session === null
-			|| handoff === null
-			|| handoff.presentation !== "target-proven"
-			|| handoff.phase !== "awaiting-replay-settlement"
-			|| handoff.intentState.kind !== "replayed-awaiting-settlement"
-			|| handoff.targetPath !== request.targetPath
-			|| workflow === null
-			|| presentationReceipt === null
-			|| hostReceipt === null
-			|| token === null
-			|| token.targetAuthority.kind !== "existing"
-		) {
-			return Object.freeze({
-				kind: "unavailable",
-				reason: "target-not-proven",
-			});
-		}
-		const authority = token.targetAuthority;
-		const displayed = session.displayedLineage;
-		const guard = runtime.cmGuard?.snapshot() ?? null;
-		const cm = binding.cm;
-		if (
-			displayed.kind !== "known"
-			|| displayed.file !== binding.file
-			|| displayed.path !== request.targetPath
-			|| displayed.cm !== cm
-			|| displayed.document !== cm.state.doc
-			|| binding.view !== session.view
-			|| binding.file !== handoff.targetFile
-			|| binding.file !== token.targetFile
-			|| binding.file.path !== request.targetPath
-			|| binding.fileId !== authority.fileId
-			|| session.view.file !== binding.file
-			|| session.binding.kind !== "bound"
-			|| session.binding.path !== request.targetPath
-			|| session.binding.fileId !== authority.fileId
-			|| session.binding.ytext !== binding.ytext
-			|| workflow.targetReadyToken !== token
-			|| workflow.targetPath !== request.targetPath
-			|| workflow.targetFile !== binding.file
-			|| token.targetPath !== request.targetPath
-			|| token.hostLoadTokenId !== hostReceipt.hostLoadTokenId
-			|| token.hostLoadReceiptId !== hostReceipt.receiptId
-			|| this.vaultSync.getTextForPath(request.targetPath) !== binding.ytext
-			|| this.vaultSync.getFileId(request.targetPath) !== authority.fileId
-			|| this.vaultSync.getFileIdForText(binding.ytext) !== authority.fileId
-			|| this.getCmView(session.view) !== cm
-			|| !this.knownCmViews.has(cm)
-			|| this.cmToLeafId.get(cm) !== leafId
-			|| !cm.dom.isConnected
-			|| !session.view.containerEl.contains(cm.dom)
-			|| guard?.view !== cm
-			|| guard.inert
-			|| !guard.gateClosed
-		) {
-			return Object.freeze({
-				kind: "unavailable",
-				reason: "editor-identity-stale",
-			});
-		}
-
-		const captureAuthorityEpoch = this.readAuthorityEpoch();
-		const cmState = cm.state;
-		const cmDocument = cmState.doc;
-		const selection = cmState.selection;
-		const bindingEpoch = this.bindingEpochByLeafId.get(leafId) ?? 0;
-		const editorRevision = this.editorRevisionByCm.get(cm) ?? 0;
-		const localYtextRevision =
-			this.yTextMutationRevisionByText.get(binding.ytext) ?? 0;
-		const authorityAtBind = binding.authorityYtextMutationEpochAtBind;
-		const localAtBind = binding.localYtextMutationRevisionAtBind;
-		if (
-			authorityAtBind === undefined
-			|| localAtBind === undefined
-			|| localYtextRevision < localAtBind
-		) {
-			return Object.freeze({
-				kind: "unavailable",
-				reason: "editor-identity-stale",
-			});
-		}
-		const ytextMutationEpoch =
-			authorityAtBind + (localYtextRevision - localAtBind);
-		if (!Number.isSafeInteger(ytextMutationEpoch) || ytextMutationEpoch < 0) {
-			return Object.freeze({
-				kind: "unavailable",
-				reason: "editor-identity-stale",
-			});
-		}
-
-		let editorFacadeContent: string;
-		let runtimeCacheContent: string;
-		let scrollSnapshot: ReturnType<EditorView["scrollSnapshot"]>;
-		try {
-			editorFacadeContent = session.view.editor.getValue();
-			const descriptor = Object.getOwnPropertyDescriptor(
-				session.view as unknown as TextFileView,
-				"data",
-			);
-			if (
-				descriptor === undefined
-				|| !("value" in descriptor)
-				|| typeof descriptor.value !== "string"
-			) {
-				return Object.freeze({
-					kind: "unavailable",
-					reason: "editor-identity-stale",
-				});
-			}
-			runtimeCacheContent = descriptor.value;
-			scrollSnapshot = cm.scrollSnapshot();
-		} catch {
-			return Object.freeze({
-				kind: "unavailable",
-				reason: "editor-identity-stale",
-			});
-		}
-		const ytextContent = binding.ytext.toJSON();
-		const finalGuard = runtime.cmGuard?.snapshot() ?? null;
-		let finalScrollSnapshot: ReturnType<EditorView["scrollSnapshot"]>;
-		try {
-			finalScrollSnapshot = cm.scrollSnapshot();
-		} catch {
-			return Object.freeze({
-				kind: "unavailable",
-				reason: "editor-identity-stale",
-			});
-		}
-		const finalDescriptor = Object.getOwnPropertyDescriptor(
-			session.view as unknown as TextFileView,
-			"data",
-		);
-		if (
-			this.readAuthorityEpoch() !== captureAuthorityEpoch
-			|| this.bindings.get(leafId) !== binding
-			|| this.managedSessions.get(leafId) !== runtime
-			|| runtime.session !== session
-			|| runtime.targetWorkflow !== workflow
-			|| session.handoff !== handoff
-			|| workflow.targetReadyToken !== token
-			|| workflow.targetPresentationReceipt !== presentationReceipt
-			|| presentationReceipt.hostLoadCompletionReceipt !== hostReceipt
-			|| binding.view !== session.view
-			|| binding.file !== token.targetFile
-			|| binding.path !== request.targetPath
-			|| binding.fileId !== authority.fileId
-			|| binding.cm !== cm
-			|| binding.ytext !== session.binding.ytext
-			|| session.view.file !== token.targetFile
-			|| token.targetFile.path !== request.targetPath
-			|| cm.state !== cmState
-			|| cm.state.doc !== cmDocument
-			|| !cm.state.selection.eq(selection)
-			|| displayed.document !== cmDocument
-			|| displayed.editorRevision !== editorRevision
-			|| (this.bindingEpochByLeafId.get(leafId) ?? 0) !== bindingEpoch
-			|| (this.editorRevisionByCm.get(cm) ?? 0) !== editorRevision
-			|| (this.yTextMutationRevisionByText.get(binding.ytext) ?? 0)
-				!== localYtextRevision
-			|| binding.ytext.toJSON() !== ytextContent
-			|| this.vaultSync.getTextForPath(request.targetPath) !== binding.ytext
-			|| this.vaultSync.getFileId(request.targetPath) !== authority.fileId
-			|| this.vaultSync.getFileIdForText(binding.ytext) !== authority.fileId
-			|| finalGuard === null
-			|| finalGuard.view !== guard.view
-			|| finalGuard.inert !== guard.inert
-			|| finalGuard.gateClosed !== guard.gateClosed
-			|| finalGuard.nativeHistoryEpoch !== guard.nativeHistoryEpoch
-			|| finalGuard.selectionEpoch !== guard.selectionEpoch
-			|| finalGuard.scrollEpoch !== guard.scrollEpoch
-			|| !sameScrollSnapshot(scrollSnapshot, finalScrollSnapshot)
-			|| finalDescriptor === undefined
-			|| !("value" in finalDescriptor)
-			|| finalDescriptor.value !== runtimeCacheContent
-		) {
-			return Object.freeze({
-				kind: "unavailable",
-				reason: "editor-identity-stale",
-			});
-		}
-
-		const applied = this.lastSuccessfullyAppliedHandoffReplayByLeafId.get(leafId);
-		const appliedPlanId = applied
-			&& applied.planId === request.planId
-			&& applied.binding === binding
-			&& applied.targetFile === binding.file
-			&& applied.cm === cm
-			&& applied.ytext === binding.ytext
-			&& applied.targetFileId === authority.fileId
-			&& applied.ytextIdentity === authority.ytextIdentity
-			&& applied.ytextMutationEpoch === ytextMutationEpoch
-			&& applied.bindingEpoch === bindingEpoch
-			&& applied.editorRevision === editorRevision
-			&& applied.nativeHistoryEpoch === guard.nativeHistoryEpoch
-			&& applied.selectionEpoch === guard.selectionEpoch
-			&& applied.scrollEpoch === guard.scrollEpoch
-			&& applied.selection.eq(selection)
-			&& applied.scrollAnchor === scrollSnapshot.value.range.head
-				? applied.planId
-				: null;
-		return Object.freeze({
-			kind: "ready",
-			snapshot: Object.freeze({
-				planId: appliedPlanId,
-				sessionId: session.sessionId,
-				leafId: session.leafId,
-				handoffGeneration: session.generation,
-				recoveryOperationEpoch: handoff.recoveryOperationEpoch,
-				targetReadyTokenId: token.tokenId,
-				hostLoadTokenId: token.hostLoadTokenId,
-				hostLoadReceiptId: token.hostLoadReceiptId,
-				targetPath: request.targetPath,
-				targetFile: binding.file,
-				targetFileId: authority.fileId,
-				cm,
-				ytext: binding.ytext,
-				ytextIdentity: authority.ytextIdentity,
-				ytextMutationEpoch,
-				bindingEpoch,
-				editorRevision,
-				nativeHistoryEpoch: guard.nativeHistoryEpoch,
-				selectionEpoch: guard.selectionEpoch,
-				scrollEpoch: guard.scrollEpoch,
-				selection,
-				scrollAnchor: scrollSnapshot.value.range.head,
-				cmDocument,
-				editorFacadeContent,
-				runtimeCacheContent,
-				ytextContent,
-			}),
-		});
-	}
-
-	clearHandoffReplaySettlementProofs(): void {
-		this.lastSuccessfullyAppliedHandoffReplayByLeafId.clear();
-	}
-
-	private classifyHandoffReplaySnapshotDrift(
-		expected: HandoffReplayTargetSnapshot,
-		expectedPrivate: HandoffReplaySnapshotPrivateAuthority,
-		actual: HandoffReplayTargetSnapshot,
-	): HandoffReplayNotAppliedReason | null {
-		const actualPrivate =
-			this.handoffReplayPrivateAuthorityBySnapshot.get(actual);
-		if (!actualPrivate || actualPrivate.binding !== expectedPrivate.binding) {
-			return "binding-stale";
-		}
-		if (
-			actual.sessionId !== expected.sessionId
-			|| actual.leafId !== expected.leafId
-		) return "session-stale";
-		if (actual.handoffGeneration !== expected.handoffGeneration) {
-			return "generation-stale";
-		}
-		if (actual.recoveryOperationEpoch !== expected.recoveryOperationEpoch) {
-			return "recovery-operation-stale";
-		}
-		if (
-			actual.targetReadyTokenId !== expected.targetReadyTokenId
-			|| actualPrivate.targetReadyToken !== expectedPrivate.targetReadyToken
-		) return "target-token-stale";
-		if (
-			actual.targetPath !== expected.targetPath
-			|| actual.targetFile !== expected.targetFile
-			|| actual.targetFileId !== expected.targetFileId
-			|| actual.hostLoadTokenId !== expected.hostLoadTokenId
-			|| actual.hostLoadReceiptId !== expected.hostLoadReceiptId
-		) return "target-file-stale";
-		if (
-			actual.bindingEpoch !== expected.bindingEpoch
-			|| actual.ytext !== expected.ytext
-			|| actual.ytextIdentity !== expected.ytextIdentity
-		) return "binding-stale";
-		if (
-			actual.cm !== expected.cm
-			|| actual.editorRevision !== expected.editorRevision
-		) return "editor-stale";
-		if (
-			actual.cmDocument !== expected.cmDocument
-			|| actual.cmDocument.toString() !== expected.cmDocument.toString()
-		) return "document-stale";
-		if (actual.editorFacadeContent !== expected.editorFacadeContent) {
-			return "editor-facade-stale";
-		}
-		if (actual.runtimeCacheContent !== expected.runtimeCacheContent) {
-			return "runtime-cache-stale";
-		}
-		if (
-			actual.ytextMutationEpoch !== expected.ytextMutationEpoch
-			|| actual.ytextContent !== expected.ytextContent
-		) return "ytext-stale";
-		if (
-			actual.nativeHistoryEpoch !== expected.nativeHistoryEpoch
-			|| actualPrivate.nativeHistoryState !== expectedPrivate.nativeHistoryState
-			|| actualPrivate.undoDepth !== expectedPrivate.undoDepth
-			|| actualPrivate.redoDepth !== expectedPrivate.redoDepth
-		) return "native-history-stale";
-		if (
-			actual.selectionEpoch !== expected.selectionEpoch
-			|| !actual.selection.eq(expected.selection)
-		) return "selection-stale";
-		if (
-			actual.scrollEpoch !== expected.scrollEpoch
-			|| actual.scrollAnchor !== expected.scrollAnchor
-			|| !sameScrollSnapshot(
-				actualPrivate.scrollSnapshot,
-				expectedPrivate.scrollSnapshot,
-			)
-		) return "scroll-stale";
-		return null;
-	}
-
-	private handoffReplayNotReadyReason(
-		reason: Exclude<
-			HandoffReplaySnapshotResult,
-			Readonly<{ kind: "ready" }>
-		>["reason"],
-	): HandoffReplayNotAppliedReason {
-		return reason === "session-stale"
-			? "session-stale"
-			: reason === "generation-stale"
-				? "generation-stale"
-				: reason === "target-token-stale"
-					? "target-token-stale"
-					: reason === "target-not-proven"
-						? "recovery-state-stale"
-						: reason === "binding-missing"
-							? "binding-stale"
-							: reason === "target-identity-stale"
-								? "target-file-stale"
-								: "editor-stale";
-	}
-
-	applyExactHandoffReplay(request: Readonly<{
-		plan: HandoffReplayPlan;
-		permit: HandoffReplayPermit;
-		record: ActiveHandoffRecoveryRecord & Readonly<{ status: "replay-pending" }>;
-		recoveryOperationEpoch: number;
-	}>): HandoffReplayDispatchResult {
-		if (
-			typeof request !== "object"
-			|| request === null
-			|| typeof request.plan !== "object"
-			|| request.plan === null
-			|| typeof request.permit !== "object"
-			|| request.permit === null
-		) {
-			return { kind: "not-applied", reason: "permit-mismatch" };
-		}
-		const { plan, permit, record, recoveryOperationEpoch } = request;
-		if (this.consumedHandoffReplayPlans.has(plan)) {
-			return { kind: "not-applied", reason: "plan-already-consumed" };
-		}
-		const controller = this.editorAuthorityControllerPort;
-		if (!controller) {
-			return { kind: "not-applied", reason: "permit-mismatch" };
-		}
-		const redeemed = controller.redeemExactHandoffReplayDispatchPermit(permit);
-		if (redeemed.kind === "rejected") {
-			return { kind: "not-applied", reason: redeemed.reason };
-		}
-		this.consumedHandoffReplayPlans.add(plan);
-		const expected = redeemed.snapshot;
-		const privateAuthority =
-			this.handoffReplayPrivateAuthorityBySnapshot.get(expected);
-		if (!privateAuthority) {
-			return { kind: "not-applied", reason: "permit-mismatch" };
-		}
-		if (redeemed.plan !== plan) {
-			return { kind: "not-applied", reason: "plan-mismatch" };
-		}
-		if (redeemed.record !== record) {
-			return { kind: "not-applied", reason: "record-mismatch" };
-		}
-		if (
-			permit.planId !== plan.planId
-			|| permit.permitId !== plan.replayPermitId
-			|| plan.targetReadyTokenId !== expected.targetReadyTokenId
-			|| plan.expectedTargetDocument !== expected.cmDocument
-			|| plan.expectedSelectionEpoch !== expected.selectionEpoch
-			|| plan.expectedNativeHistoryEpoch !== expected.nativeHistoryEpoch
-			|| plan.expectedTargetScrollEpoch !== expected.scrollEpoch
-			|| plan.switchIntentSeq !== privateAuthority.targetReadyToken.switchIntentSeq
-		) {
-			return { kind: "not-applied", reason: "plan-mismatch" };
-		}
-		let recomputedStartHash: string;
-		try {
-			recomputedStartHash = sha256HandoffRecoveryHexSync(
-				expected.cmDocument.toString(),
-			);
-		} catch {
-			return { kind: "not-applied", reason: "record-mismatch" };
-		}
-		if (
-			record.status !== "replay-pending"
-			|| permit.recordId !== record.recordId
-			|| permit.replayPendingChecksum !== record.checksum
-			|| permit.recordId.length === 0
-			|| record.intentId !== plan.intentId
-			|| record.targetPath !== expected.targetPath
-			|| record.applyWitness === null
-			|| record.applyWitness.planId !== plan.planId
-			|| record.applyWitness.kind !== plan.kind
-			|| record.applyWitness.switchIntentSeq !== plan.switchIntentSeq
-			|| record.applyWitness.hostLoadTokenId !== expected.hostLoadTokenId
-			|| record.applyWitness.targetFileId !== expected.targetFileId
-			|| record.applyWitness.targetYtextIdentity !== expected.ytextIdentity
-			|| record.applyWitness.targetMutationEpochAtPlan
-				!== expected.ytextMutationEpoch
-			|| record.applyWitness.nativeHistoryEpoch !== expected.nativeHistoryEpoch
-			|| record.applyWitness.targetSelectionEpoch !== expected.selectionEpoch
-			|| record.applyWitness.targetScrollEpoch !== expected.scrollEpoch
-			|| record.body.startContent !== expected.cmDocument.toString()
-			|| record.startContentHash !== recomputedStartHash
-			|| record.applyWitness.plannedStartHash !== recomputedStartHash
-			|| record.applyWitness.plannedResultContent !== record.body.afterContent
-			|| record.applyWitness.plannedResultHash !== record.afterContentHash
-			|| record.applyWitness.serializedMappedSelection
-				!== canonicalHandoffRecoveryJson(plan.mappedSelection.toJSON())
-			|| record.applyWitness.dispatchReceiptHash !== null
-		) {
-			return { kind: "not-applied", reason: "record-mismatch" };
-		}
-		let validatedRecordCanonical: string;
-		try {
-			validatedRecordCanonical = canonicalHandoffRecoveryJson(record);
-		} catch {
-			return { kind: "not-applied", reason: "record-mismatch" };
-		}
-		if (
-			!Number.isSafeInteger(recoveryOperationEpoch)
-			|| recoveryOperationEpoch < 0
-			|| permit.recoveryOperationEpoch !== recoveryOperationEpoch
-			|| expected.recoveryOperationEpoch !== recoveryOperationEpoch
-		) {
-			return { kind: "not-applied", reason: "recovery-operation-stale" };
-		}
-		let expectedResultContent: string;
-		let expectedMappedScrollAnchor: number | null;
-		try {
-			expectedResultContent =
-				plan.replayChanges.apply(expected.cmDocument).toString();
-			expectedMappedScrollAnchor = expected.scrollAnchor === null
-				? null
-				: plan.replayChanges.mapPos(expected.scrollAnchor, -1);
-		} catch {
-			return { kind: "not-applied", reason: "plan-mismatch" };
-		}
-		if (
-			expectedResultContent !== record.body.afterContent
-			|| expectedMappedScrollAnchor !== plan.mappedScrollAnchor
-		) {
-			return { kind: "not-applied", reason: "plan-mismatch" };
-		}
-		const current = this.captureHandoffReplayTargetSnapshot({
-			sessionId: expected.sessionId,
-			expectedGeneration: expected.handoffGeneration,
-			recoveryOperationEpoch,
-			recoveryClaim: Object.freeze({
-				intentId: record.intentId,
-				recordId: record.recordId,
-			}),
-			targetReadyToken: privateAuthority.targetReadyToken,
-		});
-		if (current.kind !== "ready") {
-			return {
-				kind: "not-applied",
-				reason: this.handoffReplayNotReadyReason(current.reason),
-			};
-		}
-		const actual = current.snapshot;
-		const driftReason = this.classifyHandoffReplaySnapshotDrift(
-			expected,
-			privateAuthority,
-			actual,
-		);
-		if (driftReason !== null) {
-			return { kind: "not-applied", reason: driftReason };
-		}
-
-		const mappedScrollEffect =
-			privateAuthority.scrollSnapshot.map(plan.replayChanges);
-		if (
-			mappedScrollEffect === undefined
-			|| (
-				plan.mappedScrollAnchor !== null
-				&& mappedScrollEffect.value.range.head
-					!== plan.mappedScrollAnchor
-			)
-		) {
-			return { kind: "not-applied", reason: "scroll-effect-unmappable" };
-		}
-		if (this.activeHandoffReplayDispatchFrame !== null) {
-			this.trace?.("editor", "handoff-replay-dispatch-rejected", {
-				stage: "active-frame",
-			});
-			return { kind: "not-applied", reason: "dispatch-rejected" };
-		}
-		const frameIdentity = Object.freeze({});
-		let transaction: Transaction;
-		try {
-			transaction = actual.cm.state.update({
-				changes: plan.replayChanges,
-				selection: plan.mappedSelection,
-				effects: mappedScrollEffect,
-				annotations: [
-					Transaction.addToHistory.of(true),
-					Transaction.userEvent.of("input.handoff-replay"),
-					isolateHistory.of("full"),
-					acceptedHandoffReplay.of({
-						permit,
-						frameIdentity,
-					}),
-				],
-			});
-		} catch (error) {
-			this.trace?.("editor", "handoff-replay-dispatch-rejected", {
-				stage: "transaction-construction",
-				errorKind: error instanceof Error
-					? "error"
-					: error === null
-						? "null"
-						: typeof error,
-			});
-			return { kind: "not-applied", reason: "dispatch-rejected" };
-		}
-		const postConstruction = this.captureHandoffReplayTargetSnapshot({
-			sessionId: expected.sessionId,
-			expectedGeneration: expected.handoffGeneration,
-			recoveryOperationEpoch,
-			recoveryClaim: Object.freeze({
-				intentId: record.intentId,
-				recordId: record.recordId,
-			}),
-			targetReadyToken: privateAuthority.targetReadyToken,
-		});
-		if (postConstruction.kind !== "ready") {
-			return {
-				kind: "not-applied",
-				reason: this.handoffReplayNotReadyReason(postConstruction.reason),
-			};
-		}
-		const constructionDrift = this.classifyHandoffReplaySnapshotDrift(
-			expected,
-			privateAuthority,
-			postConstruction.snapshot,
-		);
-		if (constructionDrift !== null) {
-			return { kind: "not-applied", reason: constructionDrift };
-		}
-		const dispatchRuntime = this.managedSessions.get(expected.leafId);
-		const dispatchSession = dispatchRuntime?.session;
-		const dispatchHandoff = dispatchSession?.handoff ?? null;
-		const dispatchWorkflow = dispatchRuntime?.targetWorkflow ?? null;
-		if (
-			!dispatchRuntime
-			|| !dispatchSession
-			|| !dispatchHandoff
-			|| !dispatchWorkflow
-			|| dispatchSession.sessionId !== expected.sessionId
-			|| dispatchSession.generation !== expected.handoffGeneration
-			|| dispatchWorkflow.targetReadyToken
-				!== privateAuthority.targetReadyToken
-			|| dispatchWorkflow.targetPresentationReceipt
-				?.hostLoadCompletionReceipt !== privateAuthority.hostLoadReceipt
-			|| this.bindings.get(expected.leafId) !== privateAuthority.binding
-			|| actual.cm.state !== transaction.startState
-		) {
-			return { kind: "not-applied", reason: "dispatch-rejected" };
-		}
-		const frame: ActiveHandoffReplayDispatchFrame = {
-			frameIdentity,
-			permit,
-			plan,
-			record,
-			recoveryOperationEpoch,
-			expectedSnapshot: expected,
-			runtime: dispatchRuntime,
-			session: dispatchSession,
-			handoff: dispatchHandoff,
-			workflow: dispatchWorkflow,
-			binding: privateAuthority.binding,
-			targetReadyToken: privateAuthority.targetReadyToken,
-			hostLoadReceipt: privateAuthority.hostLoadReceipt,
-			cm: actual.cm,
-			startState: actual.cm.state,
-			mappedScrollEffect,
-			transaction,
-			routeSeen: false,
-			updateSeen: false,
-		};
-		const captureDispatchMutationCensus = () => {
-			try {
-				const binding = this.bindings.get(expected.leafId) ?? null;
-				const runtime = this.managedSessions.get(expected.leafId) ?? null;
-				const session = runtime?.session ?? null;
-				const handoff = session?.handoff ?? null;
-				const workflow = runtime?.targetWorkflow ?? null;
-				const presentationReceipt =
-					workflow?.targetPresentationReceipt ?? null;
-				const targetReadyToken = workflow?.targetReadyToken ?? null;
-				const targetAuthority = targetReadyToken?.targetAuthority ?? null;
-				const displayed = session?.displayedLineage ?? null;
-				const view = privateAuthority.binding.view;
-				const editorFacade = view.editor;
-				const undoManager = privateAuthority.binding.undoManager;
-				const dataDescriptor = Object.getOwnPropertyDescriptor(
-					view as unknown as TextFileView,
-					"data",
-				);
-				const cmState = actual.cm.state;
-				const ydoc = expected.ytext.doc;
-				return Object.freeze({
-					authorityEpoch: this.readAuthorityEpoch(),
-					authorityEpochExhausted: this.authorityEpochExhausted,
-					asyncAuthorityOpen: this.asyncAuthorityOpen,
-					binding,
-					bindingEpoch:
-						this.bindingEpochByLeafId.get(expected.leafId) ?? 0,
-					bindingView: binding?.view ?? null,
-					bindingFile: binding?.file ?? null,
-					bindingPath: binding?.path ?? null,
-					bindingFileId: binding?.fileId ?? null,
-					bindingCm: binding?.cm ?? null,
-					bindingYtext: binding?.ytext ?? null,
-					bindingUndoManager: binding?.undoManager ?? null,
-					bindingCmId: binding?.cmId ?? null,
-					bindingLastBoundAt: binding?.lastBoundAt ?? null,
-					bindingLastBoundAtMs: binding?.lastBoundAtMs ?? null,
-					bindingLastEditorChangeAtMs:
-						binding?.lastEditorChangeAtMs ?? null,
-					bindingLastEditorDocChangeAtMs:
-						binding?.lastEditorDocChangeAtMs ?? null,
-					bindingSettleWindowMs: binding?.settleWindowMs ?? null,
-					bindingAuthorityYtextMutationEpochAtBind:
-						binding?.authorityYtextMutationEpochAtBind ?? null,
-					bindingLocalYtextMutationRevisionAtBind:
-						binding?.localYtextMutationRevisionAtBind ?? null,
-					lastEditorDocChangeAtForPath:
-						this.lastEditorDocChangeAtByPath.get(expected.targetPath)
-							?? null,
-					lastUserDocChangeAtForCm:
-						this.lastUserDocChangeAtByCm.get(actual.cm) ?? null,
-					lastTypingAwarenessAtForLeaf:
-						this.lastTypingAwarenessAtByLeaf.get(expected.leafId)
-							?? null,
-					runtime,
-					hostGuard: runtime?.hostGuard ?? null,
-					hostGuardSnapshot:
-						runtime?.hostGuard?.snapshot() ?? null,
-					cmGuard: runtime?.cmGuard ?? null,
-					capturedSourceAuthority:
-						runtime?.capturedSourceAuthority ?? null,
-					capturedSourceAuthorityKind:
-						runtime?.capturedSourceAuthority?.kind ?? null,
-					capturedSourceAuthorityContent:
-						runtime?.capturedSourceAuthority?.kind === "proven-single"
-							? runtime.capturedSourceAuthority.content
-							: null,
-					capturedSourceAuthorityLease:
-						runtime?.capturedSourceAuthority?.kind === "proven-single"
-							? runtime.capturedSourceAuthority.lease
-							: null,
-					capturedSourceAuthorityLeaseId:
-						runtime?.capturedSourceAuthority?.kind === "proven-single"
-							? runtime.capturedSourceAuthority.lease.leaseId
-							: null,
-					capturedSourceAuthorityReason:
-						runtime?.capturedSourceAuthority?.kind === "blocked"
-							? runtime.capturedSourceAuthority.reason
-							: null,
-					session,
-					sessionId: session?.sessionId ?? null,
-					sessionLeafId: session?.leafId ?? null,
-					sessionGeneration: session?.generation ?? null,
-					sessionEventOrderSeq: session?.eventOrderSeq ?? null,
-					sessionSwitchIntentSeq:
-						session?.currentSwitchIntentSeq ?? null,
-					sessionNativeHistoryEpoch:
-						session?.nativeHistoryEpoch ?? null,
-					sessionCompletedDetachEpoch:
-						session?.completedDetachEpoch ?? null,
-					sessionActiveRecoveries:
-						session?.activeRecoveries ?? null,
-					sessionPendingInputStartReservation:
-						session?.pendingInputStartReservation ?? null,
-					handoff,
-					handoffSourceAuthorityPath:
-						handoff?.sourceAuthorityPath ?? null,
-					handoffTargetPath: handoff?.targetPath ?? null,
-					handoffTargetFile: handoff?.targetFile ?? null,
-					handoffBindingEpochAfterDetach:
-						handoff?.bindingEpochAfterDetach ?? null,
-					handoffPresentation: handoff?.presentation ?? null,
-					handoffTargetReadyTokenId:
-						handoff?.targetReadyTokenId ?? null,
-					handoffInputGateInstalled:
-						handoff?.inputGateInstalled ?? null,
-					handoffSaveGuardInstalled:
-						handoff?.saveGuardInstalled ?? null,
-					handoffRecoveryOperationEpoch:
-						handoff?.recoveryOperationEpoch ?? null,
-					handoffIntentState:
-						handoff?.intentState ?? null,
-					handoffPhase: handoff?.phase ?? null,
-					handoffPendingHostLoadCandidate:
-						handoff?.pendingHostLoadCandidate ?? null,
-					handoffRecoveryTargetBindingRequest:
-						handoff?.recoveryTargetBindingRequest ?? null,
-					workflow,
-					workflowSessionId: workflow?.sessionId ?? null,
-					workflowGeneration:
-						workflow?.handoffGeneration ?? null,
-					workflowSwitchIntentSeq:
-						workflow?.switchIntentSeq ?? null,
-					workflowTargetFile: workflow?.targetFile ?? null,
-					workflowTargetPath: workflow?.targetPath ?? null,
-					workflowCandidate: workflow?.candidate ?? null,
-					workflowOpenEditorTicket:
-						workflow?.openEditorTicket ?? null,
-					workflowPresentationPlan:
-						workflow?.presentationPlan ?? null,
-					workflowPresentationRequestInFlight:
-						workflow?.presentationRequestInFlight ?? null,
-					workflowPresentationPermitConsumed:
-						workflow?.presentationPermitConsumed ?? null,
-					workflowPresentationCommitInFlight:
-						workflow?.presentationCommitInFlight ?? null,
-					workflowPresentationCompletionInFlight:
-						workflow?.presentationCompletionInFlight ?? null,
-					workflowHostCompletionReceipt:
-						workflow?.hostCompletionReceipt ?? null,
-					workflowOpenAdmissionInFlight:
-						workflow?.openAdmissionInFlight ?? null,
-					presentationReceipt,
-					hostLoadReceipt:
-						presentationReceipt?.hostLoadCompletionReceipt ?? null,
-					targetReadyToken,
-					targetAuthority,
-					targetTokenId: targetReadyToken?.tokenId ?? null,
-					targetTokenPath: targetReadyToken?.targetPath ?? null,
-					targetTokenFile: targetReadyToken?.targetFile ?? null,
-					targetTokenMutationEpoch: targetAuthority?.kind === "existing"
-						? targetAuthority.ytextMutationEpoch
-						: null,
-					sessionView: session?.view ?? null,
-					sessionViewFile: session?.view.file ?? null,
-					sessionBinding: session?.binding ?? null,
-					sessionBindingKind: session?.binding.kind ?? null,
-					sessionBindingPath: session?.binding.kind === "bound"
-						? session.binding.path
-						: null,
-					sessionBindingFileId: session?.binding.kind === "bound"
-						? session.binding.fileId
-						: null,
-					sessionBindingYtext: session?.binding.kind === "bound"
-						? session.binding.ytext
-						: null,
-					displayed,
-					displayedKind: displayed?.kind ?? null,
-					displayedFile: displayed?.kind === "known"
-						? displayed.file
-						: null,
-					displayedPath: displayed?.kind === "known"
-						? displayed.path
-						: null,
-					displayedFileId: displayed?.kind === "known"
-						? displayed.fileId
-						: null,
-					displayedCm: displayed?.kind === "known"
-						? displayed.cm
-						: null,
-					displayedDocument: displayed?.kind === "known"
-						? displayed.document
-						: null,
-					displayedEditorRevision: displayed?.kind === "known"
-						? displayed.editorRevision
-						: null,
-					view,
-					viewFile: view.file,
-					editorFacade,
-					editorFacadeGetValue: Reflect.get(editorFacade, "getValue"),
-					editorFacadeContent: editorFacade.getValue(),
-					dataDescriptor,
-					cm: actual.cm,
-					cmState,
-					cmDocument: cmState.doc,
-					cmDocumentContent: cmState.doc.toString(),
-					cmSelection: cmState.selection,
-					historyState: cmState.field(historyField, false),
-					undoDepth: undoDepth(cmState),
-					redoDepth: redoDepth(cmState),
-					undoManager,
-					undoManagerLastChange: undoManager.lastChange,
-					undoManagerUndoing: undoManager.undoing,
-					undoManagerRedoing: undoManager.redoing,
-					undoManagerCurrentStackItem:
-						undoManager.currStackItem,
-					undoManagerUndoStack: undoManager.undoStack,
-					undoManagerRedoStack: undoManager.redoStack,
-					undoManagerUndoStackLength:
-						undoManager.undoStack.length,
-					undoManagerRedoStackLength:
-						undoManager.redoStack.length,
-					undoManagerUndoStackTop:
-						undoManager.undoStack.at(-1) ?? null,
-					undoManagerRedoStackTop:
-						undoManager.redoStack.at(-1) ?? null,
-					scrollSnapshot: actual.cm.scrollSnapshot(),
-					scrollTop: actual.cm.scrollDOM.scrollTop,
-					scrollLeft: actual.cm.scrollDOM.scrollLeft,
-					editorRevision:
-						this.editorRevisionByCm.get(actual.cm) ?? 0,
-					editorAuthorityRevision:
-						this.editorAuthorityRevisionByCm.get(actual.cm) ?? 0,
-					editorAuthorityContent:
-						this.editorAuthorityContentByCm.get(actual.cm) ?? null,
-					ytextContent: expected.ytext.toJSON(),
-					ytextMutationRevision:
-						this.yTextMutationRevisionByText.get(expected.ytext) ?? 0,
-					ydoc,
-					ydocStateVector: ydoc === null
-						? null
-						: Y.encodeStateVector(ydoc),
-					vaultText: this.vaultSync.getTextForPath(expected.targetPath),
-					vaultFileId: this.vaultSync.getFileId(expected.targetPath),
-					vaultTextFileId:
-						this.vaultSync.getFileIdForText(expected.ytext),
-					knownCm: this.knownCmViews.has(actual.cm),
-					cmLeafId: this.cmToLeafId.get(actual.cm) ?? null,
-					cmContained: view.containerEl.contains(actual.cm.dom),
-					guard: runtime?.cmGuard?.snapshot() ?? null,
-					recordCanonical: canonicalHandoffRecoveryJson(record),
-				});
-			} catch {
-				return null;
-			}
-		};
-		type DispatchMutationCensus = NonNullable<
-			ReturnType<typeof captureDispatchMutationCensus>
-		>;
-		const dispatchCensusChanged = (
-			before: DispatchMutationCensus,
-			after: DispatchMutationCensus | null,
-		): boolean => after === null
-			|| before.authorityEpoch !== after.authorityEpoch
-			|| before.authorityEpochExhausted
-				!== after.authorityEpochExhausted
-			|| before.asyncAuthorityOpen !== after.asyncAuthorityOpen
-			|| before.binding !== after.binding
-			|| before.bindingEpoch !== after.bindingEpoch
-			|| before.bindingView !== after.bindingView
-			|| before.bindingFile !== after.bindingFile
-			|| before.bindingPath !== after.bindingPath
-			|| before.bindingFileId !== after.bindingFileId
-			|| before.bindingCm !== after.bindingCm
-			|| before.bindingYtext !== after.bindingYtext
-			|| before.bindingUndoManager !== after.bindingUndoManager
-			|| before.bindingCmId !== after.bindingCmId
-			|| before.bindingLastBoundAt !== after.bindingLastBoundAt
-			|| before.bindingLastBoundAtMs !== after.bindingLastBoundAtMs
-			|| before.bindingLastEditorChangeAtMs
-				!== after.bindingLastEditorChangeAtMs
-			|| before.bindingLastEditorDocChangeAtMs
-				!== after.bindingLastEditorDocChangeAtMs
-			|| before.bindingSettleWindowMs !== after.bindingSettleWindowMs
-			|| before.bindingAuthorityYtextMutationEpochAtBind
-				!== after.bindingAuthorityYtextMutationEpochAtBind
-			|| before.bindingLocalYtextMutationRevisionAtBind
-				!== after.bindingLocalYtextMutationRevisionAtBind
-			|| before.lastEditorDocChangeAtForPath
-				!== after.lastEditorDocChangeAtForPath
-			|| before.lastUserDocChangeAtForCm
-				!== after.lastUserDocChangeAtForCm
-			|| before.lastTypingAwarenessAtForLeaf
-				!== after.lastTypingAwarenessAtForLeaf
-			|| before.runtime !== after.runtime
-			|| before.hostGuard !== after.hostGuard
-			|| !sameHostGuardSnapshot(
-				before.hostGuardSnapshot,
-				after.hostGuardSnapshot,
-			)
-			|| before.cmGuard !== after.cmGuard
-			|| before.capturedSourceAuthority
-				!== after.capturedSourceAuthority
-			|| before.capturedSourceAuthorityKind
-				!== after.capturedSourceAuthorityKind
-			|| before.capturedSourceAuthorityContent
-				!== after.capturedSourceAuthorityContent
-			|| before.capturedSourceAuthorityLease
-				!== after.capturedSourceAuthorityLease
-			|| before.capturedSourceAuthorityLeaseId
-				!== after.capturedSourceAuthorityLeaseId
-			|| before.capturedSourceAuthorityReason
-				!== after.capturedSourceAuthorityReason
-			|| before.session !== after.session
-			|| before.sessionId !== after.sessionId
-			|| before.sessionLeafId !== after.sessionLeafId
-			|| before.sessionGeneration !== after.sessionGeneration
-			|| before.sessionEventOrderSeq !== after.sessionEventOrderSeq
-			|| before.sessionSwitchIntentSeq !== after.sessionSwitchIntentSeq
-			|| before.sessionNativeHistoryEpoch
-				!== after.sessionNativeHistoryEpoch
-			|| before.sessionCompletedDetachEpoch
-				!== after.sessionCompletedDetachEpoch
-			|| before.sessionActiveRecoveries
-				!== after.sessionActiveRecoveries
-			|| before.sessionPendingInputStartReservation
-				!== after.sessionPendingInputStartReservation
-			|| before.handoff !== after.handoff
-			|| before.handoffSourceAuthorityPath
-				!== after.handoffSourceAuthorityPath
-			|| before.handoffTargetPath !== after.handoffTargetPath
-			|| before.handoffTargetFile !== after.handoffTargetFile
-			|| before.handoffBindingEpochAfterDetach
-				!== after.handoffBindingEpochAfterDetach
-			|| before.handoffPresentation !== after.handoffPresentation
-			|| before.handoffTargetReadyTokenId
-				!== after.handoffTargetReadyTokenId
-			|| before.handoffInputGateInstalled
-				!== after.handoffInputGateInstalled
-			|| before.handoffSaveGuardInstalled
-				!== after.handoffSaveGuardInstalled
-			|| before.handoffRecoveryOperationEpoch
-				!== after.handoffRecoveryOperationEpoch
-			|| before.handoffIntentState !== after.handoffIntentState
-			|| before.handoffPhase !== after.handoffPhase
-			|| before.handoffPendingHostLoadCandidate
-				!== after.handoffPendingHostLoadCandidate
-			|| before.handoffRecoveryTargetBindingRequest
-				!== after.handoffRecoveryTargetBindingRequest
-			|| before.workflow !== after.workflow
-			|| before.workflowSessionId !== after.workflowSessionId
-			|| before.workflowGeneration !== after.workflowGeneration
-			|| before.workflowSwitchIntentSeq
-				!== after.workflowSwitchIntentSeq
-			|| before.workflowTargetFile !== after.workflowTargetFile
-			|| before.workflowTargetPath !== after.workflowTargetPath
-			|| before.workflowCandidate !== after.workflowCandidate
-			|| before.workflowOpenEditorTicket
-				!== after.workflowOpenEditorTicket
-			|| before.workflowPresentationPlan
-				!== after.workflowPresentationPlan
-			|| before.workflowPresentationRequestInFlight
-				!== after.workflowPresentationRequestInFlight
-			|| before.workflowPresentationPermitConsumed
-				!== after.workflowPresentationPermitConsumed
-			|| before.workflowPresentationCommitInFlight
-				!== after.workflowPresentationCommitInFlight
-			|| before.workflowPresentationCompletionInFlight
-				!== after.workflowPresentationCompletionInFlight
-			|| before.workflowHostCompletionReceipt
-				!== after.workflowHostCompletionReceipt
-			|| before.workflowOpenAdmissionInFlight
-				!== after.workflowOpenAdmissionInFlight
-			|| before.presentationReceipt !== after.presentationReceipt
-			|| before.hostLoadReceipt !== after.hostLoadReceipt
-			|| before.targetReadyToken !== after.targetReadyToken
-			|| before.targetAuthority !== after.targetAuthority
-			|| before.targetTokenId !== after.targetTokenId
-			|| before.targetTokenPath !== after.targetTokenPath
-			|| before.targetTokenFile !== after.targetTokenFile
-			|| before.targetTokenMutationEpoch !== after.targetTokenMutationEpoch
-			|| before.sessionView !== after.sessionView
-			|| before.sessionViewFile !== after.sessionViewFile
-			|| before.sessionBinding !== after.sessionBinding
-			|| before.sessionBindingKind !== after.sessionBindingKind
-			|| before.sessionBindingPath !== after.sessionBindingPath
-			|| before.sessionBindingFileId !== after.sessionBindingFileId
-			|| before.sessionBindingYtext !== after.sessionBindingYtext
-			|| before.displayed !== after.displayed
-			|| before.displayedKind !== after.displayedKind
-			|| before.displayedFile !== after.displayedFile
-			|| before.displayedPath !== after.displayedPath
-			|| before.displayedFileId !== after.displayedFileId
-			|| before.displayedCm !== after.displayedCm
-			|| before.displayedDocument !== after.displayedDocument
-			|| before.displayedEditorRevision
-				!== after.displayedEditorRevision
-			|| before.view !== after.view
-			|| before.viewFile !== after.viewFile
-			|| before.editorFacade !== after.editorFacade
-			|| before.editorFacadeGetValue !== after.editorFacadeGetValue
-			|| before.editorFacadeContent !== after.editorFacadeContent
-			|| !sameOwnPropertyDescriptor(
-				before.dataDescriptor,
-				after.dataDescriptor,
-			)
-			|| before.cm !== after.cm
-			|| before.cmState !== after.cmState
-			|| before.cmDocument !== after.cmDocument
-			|| before.cmDocumentContent !== after.cmDocumentContent
-			|| before.cmSelection !== after.cmSelection
-			|| !before.cmSelection.eq(after.cmSelection)
-			|| before.historyState !== after.historyState
-			|| before.undoDepth !== after.undoDepth
-			|| before.redoDepth !== after.redoDepth
-			|| before.undoManager !== after.undoManager
-			|| before.undoManagerLastChange
-				!== after.undoManagerLastChange
-			|| before.undoManagerUndoing !== after.undoManagerUndoing
-			|| before.undoManagerRedoing !== after.undoManagerRedoing
-			|| before.undoManagerCurrentStackItem
-				!== after.undoManagerCurrentStackItem
-			|| before.undoManagerUndoStack
-				!== after.undoManagerUndoStack
-			|| before.undoManagerRedoStack
-				!== after.undoManagerRedoStack
-			|| before.undoManagerUndoStackLength
-				!== after.undoManagerUndoStackLength
-			|| before.undoManagerRedoStackLength
-				!== after.undoManagerRedoStackLength
-			|| before.undoManagerUndoStackTop
-				!== after.undoManagerUndoStackTop
-			|| before.undoManagerRedoStackTop
-				!== after.undoManagerRedoStackTop
-			|| !sameScrollSnapshot(
-				before.scrollSnapshot,
-				after.scrollSnapshot,
-			)
-			|| before.scrollTop !== after.scrollTop
-			|| before.scrollLeft !== after.scrollLeft
-			|| before.editorRevision !== after.editorRevision
-			|| before.editorAuthorityRevision !== after.editorAuthorityRevision
-			|| before.editorAuthorityContent !== after.editorAuthorityContent
-			|| before.ytextContent !== after.ytextContent
-			|| before.ytextMutationRevision !== after.ytextMutationRevision
-			|| before.ydoc !== after.ydoc
-			|| !sameBytes(before.ydocStateVector, after.ydocStateVector)
-			|| before.vaultText !== after.vaultText
-			|| before.vaultFileId !== after.vaultFileId
-			|| before.vaultTextFileId !== after.vaultTextFileId
-			|| before.knownCm !== after.knownCm
-			|| before.cmLeafId !== after.cmLeafId
-			|| before.cmContained !== after.cmContained
-			|| !sameCodeMirrorGuardSnapshot(before.guard, after.guard)
-			|| before.recordCanonical !== after.recordCanonical;
-		const hasUnexpectedReplayMutation = (
-			before: DispatchMutationCensus,
-			after: DispatchMutationCensus | null,
-		): boolean => after === null
-			|| before.authorityEpochExhausted
-			|| after.authorityEpochExhausted
-			|| after.authorityEpoch
-				!== before.authorityEpoch
-					+ HANDOFF_REPLAY_AUTHORITY_EPOCH_ADVANCE
-			|| before.asyncAuthorityOpen !== after.asyncAuthorityOpen
-			|| before.binding !== after.binding
-			|| before.bindingEpoch !== after.bindingEpoch
-			|| before.bindingView !== after.bindingView
-			|| before.bindingFile !== after.bindingFile
-			|| before.bindingPath !== after.bindingPath
-			|| before.bindingFileId !== after.bindingFileId
-			|| before.bindingCm !== after.bindingCm
-			|| before.bindingYtext !== after.bindingYtext
-			|| before.bindingUndoManager !== after.bindingUndoManager
-			|| before.bindingCmId !== after.bindingCmId
-			|| before.bindingLastBoundAt !== after.bindingLastBoundAt
-			|| before.bindingLastBoundAtMs !== after.bindingLastBoundAtMs
-			|| before.bindingLastEditorChangeAtMs
-				!== after.bindingLastEditorChangeAtMs
-			|| before.bindingLastEditorDocChangeAtMs
-				!== after.bindingLastEditorDocChangeAtMs
-			|| before.bindingSettleWindowMs !== after.bindingSettleWindowMs
-			|| before.bindingAuthorityYtextMutationEpochAtBind
-				!== after.bindingAuthorityYtextMutationEpochAtBind
-			|| before.bindingLocalYtextMutationRevisionAtBind
-				!== after.bindingLocalYtextMutationRevisionAtBind
-			|| before.lastEditorDocChangeAtForPath
-				!== after.lastEditorDocChangeAtForPath
-			|| before.lastUserDocChangeAtForCm
-				!== after.lastUserDocChangeAtForCm
-			|| before.lastTypingAwarenessAtForLeaf
-				!== after.lastTypingAwarenessAtForLeaf
-			|| before.runtime !== after.runtime
-			|| before.hostGuard !== after.hostGuard
-			|| (
-				!sameHostGuardSnapshot(
-					before.hostGuardSnapshot,
-					after.hostGuardSnapshot,
-				)
-				&& !isExactHandoffReplayOwnedSaveStart(
-					before.hostGuardSnapshot,
-					after.hostGuardSnapshot,
-					expected,
-				)
-			)
-			|| before.cmGuard !== after.cmGuard
-			|| before.capturedSourceAuthority
-				!== after.capturedSourceAuthority
-			|| before.capturedSourceAuthorityKind
-				!== after.capturedSourceAuthorityKind
-			|| before.capturedSourceAuthorityContent
-				!== after.capturedSourceAuthorityContent
-			|| before.capturedSourceAuthorityLease
-				!== after.capturedSourceAuthorityLease
-			|| before.capturedSourceAuthorityLeaseId
-				!== after.capturedSourceAuthorityLeaseId
-			|| before.capturedSourceAuthorityReason
-				!== after.capturedSourceAuthorityReason
-			|| before.sessionId !== after.sessionId
-			|| before.sessionLeafId !== after.sessionLeafId
-			|| before.sessionGeneration !== after.sessionGeneration
-			|| before.sessionEventOrderSeq !== after.sessionEventOrderSeq
-			|| before.sessionSwitchIntentSeq !== after.sessionSwitchIntentSeq
-			|| before.sessionNativeHistoryEpoch
-				!== after.sessionNativeHistoryEpoch
-			|| before.sessionCompletedDetachEpoch
-				!== after.sessionCompletedDetachEpoch
-			|| before.sessionActiveRecoveries
-				!== after.sessionActiveRecoveries
-			|| before.sessionPendingInputStartReservation
-				!== after.sessionPendingInputStartReservation
-			|| before.handoff !== after.handoff
-			|| before.handoffSourceAuthorityPath
-				!== after.handoffSourceAuthorityPath
-			|| before.handoffTargetPath !== after.handoffTargetPath
-			|| before.handoffTargetFile !== after.handoffTargetFile
-			|| before.handoffBindingEpochAfterDetach
-				!== after.handoffBindingEpochAfterDetach
-			|| before.handoffPresentation !== after.handoffPresentation
-			|| before.handoffTargetReadyTokenId
-				!== after.handoffTargetReadyTokenId
-			|| before.handoffInputGateInstalled
-				!== after.handoffInputGateInstalled
-			|| before.handoffSaveGuardInstalled
-				!== after.handoffSaveGuardInstalled
-			|| before.handoffRecoveryOperationEpoch
-				!== after.handoffRecoveryOperationEpoch
-			|| before.handoffIntentState !== after.handoffIntentState
-			|| before.handoffPhase !== after.handoffPhase
-			|| before.handoffPendingHostLoadCandidate
-				!== after.handoffPendingHostLoadCandidate
-			|| before.handoffRecoveryTargetBindingRequest
-				!== after.handoffRecoveryTargetBindingRequest
-			|| before.workflow !== after.workflow
-			|| before.workflowSessionId !== after.workflowSessionId
-			|| before.workflowGeneration !== after.workflowGeneration
-			|| before.workflowSwitchIntentSeq
-				!== after.workflowSwitchIntentSeq
-			|| before.workflowTargetFile !== after.workflowTargetFile
-			|| before.workflowTargetPath !== after.workflowTargetPath
-			|| before.workflowCandidate !== after.workflowCandidate
-			|| before.workflowOpenEditorTicket
-				!== after.workflowOpenEditorTicket
-			|| before.workflowPresentationPlan
-				!== after.workflowPresentationPlan
-			|| before.workflowPresentationRequestInFlight
-				!== after.workflowPresentationRequestInFlight
-			|| before.workflowPresentationPermitConsumed
-				!== after.workflowPresentationPermitConsumed
-			|| before.workflowPresentationCommitInFlight
-				!== after.workflowPresentationCommitInFlight
-			|| before.workflowPresentationCompletionInFlight
-				!== after.workflowPresentationCompletionInFlight
-			|| before.workflowHostCompletionReceipt
-				!== after.workflowHostCompletionReceipt
-			|| before.workflowOpenAdmissionInFlight
-				!== after.workflowOpenAdmissionInFlight
-			|| before.presentationReceipt !== after.presentationReceipt
-			|| before.hostLoadReceipt !== after.hostLoadReceipt
-			|| before.targetReadyToken !== after.targetReadyToken
-			|| before.targetAuthority !== after.targetAuthority
-			|| before.targetTokenId !== after.targetTokenId
-			|| before.targetTokenPath !== after.targetTokenPath
-			|| before.targetTokenFile !== after.targetTokenFile
-			|| before.targetTokenMutationEpoch !== after.targetTokenMutationEpoch
-			|| before.sessionView !== after.sessionView
-			|| before.sessionViewFile !== after.sessionViewFile
-			|| before.sessionBinding !== after.sessionBinding
-			|| before.sessionBindingKind !== after.sessionBindingKind
-			|| before.sessionBindingPath !== after.sessionBindingPath
-			|| before.sessionBindingFileId !== after.sessionBindingFileId
-			|| before.sessionBindingYtext !== after.sessionBindingYtext
-			|| before.displayedKind !== after.displayedKind
-			|| before.displayedFile !== after.displayedFile
-			|| before.displayedPath !== after.displayedPath
-			|| before.displayedFileId !== after.displayedFileId
-			|| before.displayedCm !== after.displayedCm
-			|| before.view !== after.view
-			|| before.viewFile !== after.viewFile
-			|| before.editorFacade !== after.editorFacade
-			|| before.editorFacadeGetValue !== after.editorFacadeGetValue
-			|| !sameOwnPropertyDescriptorShape(
-				before.dataDescriptor,
-				after.dataDescriptor,
-			)
-			|| before.cm !== after.cm
-			|| before.undoManager !== after.undoManager
-			|| before.undoManagerUndoStack !== after.undoManagerUndoStack
-			|| before.undoManagerRedoStack !== after.undoManagerRedoStack
-			|| before.ydoc !== after.ydoc
-			|| before.vaultText !== after.vaultText
-			|| before.vaultFileId !== after.vaultFileId
-			|| before.vaultTextFileId !== after.vaultTextFileId
-			|| before.knownCm !== after.knownCm
-			|| before.cmLeafId !== after.cmLeafId
-			|| before.cmContained !== after.cmContained
-			|| before.recordCanonical !== after.recordCanonical
-			|| before.guard === null
-			|| after.guard === null
-			|| before.guard.view !== after.guard.view
-			|| before.guard.inert !== after.guard.inert
-			|| before.guard.gateClosed !== after.guard.gateClosed
-			|| before.guard.inputEpoch !== after.guard.inputEpoch
-			|| before.guard.compositionEpoch !== after.guard.compositionEpoch
-			|| !sameCompositionSnapshot(
-				before.guard.activeComposition,
-				after.guard.activeComposition,
-			)
-			|| !sameCompositionSnapshot(
-				before.guard.lastComposition,
-				after.guard.lastComposition,
-			)
-			|| before.guard.gateFailureReason
-				!== after.guard.gateFailureReason
-			|| before.guard.commitState !== after.guard.commitState
-			|| before.guard.pendingHostLoadCandidate
-				!== after.guard.pendingHostLoadCandidate;
-		const beforeDispatch = captureDispatchMutationCensus();
-		if (
-			beforeDispatch === null
-			|| beforeDispatch.recordCanonical !== validatedRecordCanonical
-			|| beforeDispatch.authorityEpochExhausted
-			|| beforeDispatch.authorityEpoch
-				> Number.MAX_SAFE_INTEGER
-					- HANDOFF_REPLAY_AUTHORITY_EPOCH_ADVANCE
-			|| !this.isHandoffReplayDispatchFrameAuthorityCurrent(frame)
-		) {
-			return { kind: "not-applied", reason: "dispatch-rejected" };
-		}
-		const beforeYTextMutationRevision =
-			beforeDispatch.ytextMutationRevision;
-		const replayYdoc = expected.ytext.doc;
-		const replayYTransactions: Y.Transaction[] = [];
-		const expectedYSyncOrigin = frame.startState.facet(ySyncFacet);
-		const observeReplayYTransaction = (transaction: Y.Transaction): void => {
-			replayYTransactions.push(transaction);
-		};
-		if (replayYdoc === null || expectedYSyncOrigin === undefined) {
-			return { kind: "not-applied", reason: "dispatch-rejected" };
-		}
-		try {
-			replayYdoc.on("afterTransaction", observeReplayYTransaction);
-		} catch {
-			return { kind: "not-applied", reason: "dispatch-rejected" };
-		}
-		let dispatchError: unknown = null;
-		this.activeHandoffReplayDispatchFrame = frame;
-		try {
-			privateAuthority.binding.undoManager.stopCapturing();
-			actual.cm.dispatch(transaction);
-		} catch (error) {
-			dispatchError = error;
-		} finally {
-			try {
-				privateAuthority.binding.undoManager.stopCapturing();
-			} catch (error) {
-				dispatchError ??= error;
-			}
-			try {
-				replayYdoc.off("afterTransaction", observeReplayYTransaction);
-			} catch (error) {
-				dispatchError ??= error;
-			}
-			if (this.activeHandoffReplayDispatchFrame === frame) {
-				this.activeHandoffReplayDispatchFrame = null;
-			}
-		}
-
-		const afterDispatch = captureDispatchMutationCensus();
-		const postBinding = afterDispatch?.binding ?? null;
-		const postRuntime = afterDispatch?.runtime ?? null;
-		const postGuard = afterDispatch?.guard ?? null;
-		const postYTextMutationRevision =
-			afterDispatch?.ytextMutationRevision ?? Number.NaN;
-		const anyMutation = dispatchCensusChanged(
-			beforeDispatch,
-			afterDispatch,
-		);
-		if (dispatchError !== null) {
-			this.trace?.("editor", "handoff-replay-dispatch-rejected", {
-				stage: "dispatch-threw",
-				mutated: anyMutation,
-				errorKind: dispatchError instanceof Error
-					? "error"
-					: dispatchError === null
-						? "null"
-						: typeof dispatchError,
-			});
-			return anyMutation
-				? {
-					kind: "dispatched-uncertain",
-					reason: "dispatch-threw-after-mutation",
-				}
-				: { kind: "not-applied", reason: "dispatch-rejected" };
-		}
-		if (!frame.routeSeen || !frame.updateSeen) {
-			this.trace?.("editor", "handoff-replay-dispatch-rejected", {
-				stage: "guard-boundary",
-				routeSeen: frame.routeSeen,
-				updateSeen: frame.updateSeen,
-				mutated: anyMutation,
-			});
-			if (!anyMutation) {
-				return { kind: "not-applied", reason: "dispatch-rejected" };
-			}
-			return {
-				kind: "dispatched-uncertain",
-				reason: "post-document-mismatch",
-			};
-		}
-		if (hasUnexpectedReplayMutation(beforeDispatch, afterDispatch)) {
-			return {
-				kind: "dispatched-uncertain",
-				reason: "post-target-identity-mismatch",
-			};
-		}
-		const postHandoff = postRuntime?.session.handoff ?? null;
-		if (
-			postBinding !== privateAuthority.binding
-			|| postRuntime === null
-			|| postRuntime.session.sessionId !== expected.sessionId
-			|| postRuntime.session.generation !== expected.handoffGeneration
-			|| postRuntime.session.view !== privateAuthority.binding.view
-			|| postRuntime.session.binding.kind !== "bound"
-			|| postRuntime.session.binding.path !== expected.targetPath
-			|| postRuntime.session.binding.fileId !== expected.targetFileId
-			|| postRuntime.session.binding.ytext !== expected.ytext
-			|| postHandoff === null
-			|| postHandoff.presentation !== "target-proven"
-			|| postHandoff.recoveryOperationEpoch
-				!== expected.recoveryOperationEpoch
-			|| postHandoff.targetReadyTokenId !== expected.targetReadyTokenId
-			|| postHandoff.intentState.kind !== "replay-pending"
-			|| postHandoff.intentState.intentId !== record.intentId
-			|| postHandoff.intentState.recordId !== record.recordId
-			|| postHandoff.recoveryTargetBindingRequest
-				?.recoveryOperationEpoch !== recoveryOperationEpoch
-			|| postHandoff.recoveryTargetBindingRequest?.intentId
-				!== record.intentId
-			|| postHandoff.recoveryTargetBindingRequest?.recordId
-				!== record.recordId
-			|| privateAuthority.binding.file !== expected.targetFile
-			|| privateAuthority.binding.path !== expected.targetPath
-			|| privateAuthority.binding.cm !== expected.cm
-			|| privateAuthority.binding.ytext !== expected.ytext
-			|| this.vaultSync.getTextForPath(expected.targetPath)
-				!== expected.ytext
-			|| this.vaultSync.getFileId(expected.targetPath)
-				!== expected.targetFileId
-			|| this.vaultSync.getFileIdForText(expected.ytext)
-				!== expected.targetFileId
-		) {
-			return {
-				kind: "dispatched-uncertain",
-				reason: "post-target-identity-mismatch",
-			};
-		}
-		if (
-			actual.cm.state !== transaction.state
-			|| actual.cm.state.doc !== transaction.newDoc
-			|| actual.cm.state.doc.toString() !== expectedResultContent
-			|| (this.editorRevisionByCm.get(actual.cm) ?? 0)
-				!== expected.editorRevision + 1
-			|| afterDispatch === null
-			|| afterDispatch.editorAuthorityRevision
-				!== beforeDispatch.editorAuthorityRevision + 1
-			|| afterDispatch.editorAuthorityContent !== expectedResultContent
-			|| afterDispatch.displayedDocument !== transaction.newDoc
-			|| afterDispatch.displayedEditorRevision
-				!== expected.editorRevision + 1
-		) {
-			return {
-				kind: "dispatched-uncertain",
-				reason: "post-document-mismatch",
-			};
-		}
-		if (afterDispatch.editorFacadeContent !== expectedResultContent) {
-			return {
-				kind: "dispatched-uncertain",
-				reason: "post-editor-facade-mismatch",
-			};
-		}
-		const runtimeCacheAlreadyExact =
-			afterDispatch.dataDescriptor !== undefined
-			&& "value" in afterDispatch.dataDescriptor
-			&& afterDispatch.dataDescriptor.value === expectedResultContent;
-		const expectedLocalYTextMutationRevision =
-			beforeYTextMutationRevision + 1;
-		const postYTextMutationEpoch =
-			expected.ytextMutationEpoch + 1;
-		const replayYTextWasOnlyChangedType =
-			isExactHandoffReplayYTextTransaction({
-				transactions: replayYTransactions,
-				expectedOrigin: expectedYSyncOrigin,
-				expectedYtext: expected.ytext,
-			});
-		if (
-			expected.ytext.toJSON() !== expectedResultContent
-			|| postYTextMutationRevision
-				!== expectedLocalYTextMutationRevision
-			|| !replayYTextWasOnlyChangedType
-		) {
-			return {
-				kind: "dispatched-uncertain",
-				reason: "post-ytext-mismatch",
-			};
-		}
-		if (
-			postGuard === null
-			|| afterDispatch === null
-			|| postGuard.nativeHistoryEpoch !== expected.nativeHistoryEpoch + 1
-			|| actual.cm.state.field(historyField, false)
-				=== privateAuthority.nativeHistoryState
-			|| undoDepth(actual.cm.state) !== privateAuthority.undoDepth + 1
-			|| redoDepth(actual.cm.state) !== 0
-			|| afterDispatch.undoManager !== beforeDispatch.undoManager
-			|| afterDispatch.undoManagerUndoStack
-				!== beforeDispatch.undoManagerUndoStack
-			|| afterDispatch.undoManagerRedoStack
-				!== beforeDispatch.undoManagerRedoStack
-			|| afterDispatch.undoManagerUndoStackLength
-				!== beforeDispatch.undoManagerUndoStackLength + 1
-			|| afterDispatch.undoManagerUndoStackTop === null
-			|| afterDispatch.undoManagerUndoStackTop
-				=== beforeDispatch.undoManagerUndoStackTop
-			|| afterDispatch.undoManagerRedoStackLength !== 0
-			|| afterDispatch.undoManagerRedoStackTop !== null
-			|| afterDispatch.undoManagerLastChange !== 0
-			|| afterDispatch.undoManagerUndoing
-			|| afterDispatch.undoManagerRedoing
-			|| afterDispatch.undoManagerCurrentStackItem !== null
-		) {
-			return {
-				kind: "dispatched-uncertain",
-				reason: "post-native-history-mismatch",
-			};
-		}
-		const expectedSelectionEpoch = expected.selectionEpoch
-			+ (expected.selection.eq(plan.mappedSelection) ? 0 : 1);
-		if (
-			!actual.cm.state.selection.eq(plan.mappedSelection)
-			|| postGuard.selectionEpoch !== expectedSelectionEpoch
-		) {
-			return {
-				kind: "dispatched-uncertain",
-				reason: "post-selection-mismatch",
-			};
-		}
-		let postScrollAnchor: number | null = null;
-		try {
-			postScrollAnchor = actual.cm.scrollSnapshot().value.range.head;
-		} catch {
-			// Leave null so the exact postcondition fails closed.
-		}
-		if (!isExactHandoffReplayScrollDispatchPostcondition({
-			beforeEpoch: expected.scrollEpoch,
-			afterEpoch: postGuard.scrollEpoch,
-			mappedAnchor: plan.mappedScrollAnchor,
-			observedAnchor: postScrollAnchor,
-		})) {
-			return {
-				kind: "dispatched-uncertain",
-				reason: "post-scroll-mismatch",
-			};
-		}
-		if (!runtimeCacheAlreadyExact) {
-			const beforeProjection = captureDispatchMutationCensus();
-			if (
-				beforeProjection === null
-				|| dispatchCensusChanged(afterDispatch, beforeProjection)
-				|| beforeProjection.authorityEpochExhausted
-				|| beforeProjection.authorityEpoch >= Number.MAX_SAFE_INTEGER
-				|| !isExactHandoffReplayRuntimeCacheProjection({
-					beforeDescriptor: beforeDispatch.dataDescriptor,
-					afterDispatchDescriptor: beforeProjection.dataDescriptor,
-					expectedStartContent: expected.runtimeCacheContent,
-					expectedResultContent,
-					hostBefore: beforeDispatch.hostGuardSnapshot,
-					hostAfter: beforeProjection.hostGuardSnapshot,
-					expected,
-				})
-			) {
-				return {
-					kind: "dispatched-uncertain",
-					reason: "post-runtime-cache-mismatch",
-				};
-			}
-
-			const runtimeView = privateAuthority.binding.view as unknown as TextFileView;
-			let projected = false;
-			try {
-				projected = Reflect.set(
-					runtimeView,
-					"data",
-					expectedResultContent,
-					runtimeView,
-				);
-			} catch {
-				// The replay already mutated the document. Any host-cache trap is
-				// therefore uncertain and must not be retried automatically.
-			}
-			if (!projected) {
-				return {
-					kind: "dispatched-uncertain",
-					reason: "post-runtime-cache-mismatch",
-				};
-			}
-			this.advanceAuthorityEpoch();
-			const afterProjection = captureDispatchMutationCensus();
-			const projectedDescriptor = afterProjection?.dataDescriptor;
-			const normalizedAfterProjection = afterProjection === null
-				? null
-				: {
-					...afterProjection,
-					authorityEpoch: beforeProjection.authorityEpoch,
-					dataDescriptor: beforeProjection.dataDescriptor,
-				};
-			if (
-				afterProjection === null
-				|| normalizedAfterProjection === null
-				|| afterProjection.authorityEpoch
-					!== beforeProjection.authorityEpoch + 1
-				|| afterProjection.authorityEpochExhausted
-				|| projectedDescriptor === undefined
-				|| !("value" in projectedDescriptor)
-				|| projectedDescriptor.value !== expectedResultContent
-				|| !sameOwnPropertyDescriptorShape(
-					beforeProjection.dataDescriptor,
-					projectedDescriptor,
-				)
-				|| dispatchCensusChanged(
-					beforeProjection,
-					normalizedAfterProjection,
-				)
-			) {
-				return {
-					kind: "dispatched-uncertain",
-					reason: "post-runtime-cache-mismatch",
-				};
-			}
-		}
-		this.lastSuccessfullyAppliedHandoffReplayByLeafId.set(
-			expected.leafId,
-			Object.freeze({
-				planId: plan.planId,
-				binding: privateAuthority.binding,
-				targetFile: expected.targetFile,
-				cm: expected.cm,
-				ytext: expected.ytext,
-				targetFileId: expected.targetFileId,
-				ytextIdentity: expected.ytextIdentity,
-				ytextMutationEpoch: postYTextMutationEpoch,
-				bindingEpoch: expected.bindingEpoch,
-				editorRevision: expected.editorRevision + 1,
-				nativeHistoryEpoch: expected.nativeHistoryEpoch + 1,
-				selectionEpoch: expectedSelectionEpoch,
-				scrollEpoch: postGuard.scrollEpoch,
-				selection: actual.cm.state.selection,
-				scrollAnchor: postScrollAnchor,
-			}),
-		);
-		return {
-			kind: "applied",
-			postcondition: Object.freeze({
-				planId: plan.planId,
-				recordId: record.recordId,
-				recoveryOperationEpoch,
-				targetFileId: expected.targetFileId,
-				ytextIdentity: expected.ytextIdentity,
-				ytextMutationEpoch: postYTextMutationEpoch,
-				bindingEpoch: expected.bindingEpoch,
-				editorRevision: expected.editorRevision + 1,
-				nativeHistoryEpoch: expected.nativeHistoryEpoch + 1,
-				selectionEpoch: expectedSelectionEpoch,
-				scrollEpoch: postGuard.scrollEpoch,
-				selection: actual.cm.state.selection,
-				scrollAnchor: postScrollAnchor,
-			}),
-		};
-	}
-
 	private getLeafId(view: MarkdownView): string {
 		return (view.leaf as unknown as { id?: string }).id ?? view.file?.path ?? "unknown";
 	}
@@ -4152,6 +1901,7 @@ export class EditorBindingManager {
 			return host?.view === (runtime.session.view as unknown as TextFileView)
 				&& host.clearLoadCapability === "observable"
 				&& host.hostCapabilityState === "ready"
+				&& hasExactHostGuardWrappers(host)
 				&& host.mode.kind !== "inert-pass-through"
 				&& cm?.view === expectedCm
 				&& cm.inert === false;
@@ -4176,10 +1926,11 @@ export class EditorBindingManager {
 			const host = runtime.hostGuard?.snapshot() ?? null;
 			const cm = runtime.cmGuard?.snapshot() ?? null;
 			if (
-				host?.view !== (session.view as unknown as TextFileView)
-				|| host.clearLoadCapability !== "observable"
-				|| host.hostCapabilityState !== "ready"
-				|| host.mode.kind === "inert-pass-through"
+					host?.view !== (session.view as unknown as TextFileView)
+					|| host.clearLoadCapability !== "observable"
+					|| host.hostCapabilityState !== "ready"
+					|| !hasExactHostGuardWrappers(host)
+					|| host.mode.kind === "inert-pass-through"
 				|| cm?.view !== displayed.cm
 				|| cm.inert
 			) return false;
@@ -4283,13 +2034,15 @@ export class EditorBindingManager {
 					? { kind: "bound", path: binding.path, fileId: binding.fileId, ytext: binding.ytext }
 					: { kind: "unbound" },
 			});
-			runtime = {
+				runtime = {
 				session,
 				hostGuard: null,
+				emergencySaveFence: null,
 				cmGuard: null,
 				capturedSourceAuthority: null,
-				targetWorkflow: null,
-				adoption: NO_SAME_PATH_ADOPTION,
+					transitionInputFence: null,
+					sourceUnloadDrain: null,
+					adoption: NO_SAME_PATH_ADOPTION,
 			};
 			this.advanceAuthorityEpoch();
 			this.managedSessions.set(leafId, runtime);
@@ -4330,9 +2083,11 @@ export class EditorBindingManager {
 			|| hostBefore.hostCapabilityState !== "ready"
 			|| hostBefore.mode.kind === "blocking-handoff"
 			|| hostBefore.mode.kind === "inert-pass-through"
-			|| hostBefore.pendingTargetSave
-			|| hostBefore.sourceUnload !== null
-			|| guardBefore.view !== cm
+				|| hostBefore.pendingTargetSave
+				|| hostBefore.sourceUnload !== null
+				|| !hasExactHostGuardWrappers(hostBefore)
+				|| !hasNoPendingHostLoadOwner(hostBefore)
+				|| guardBefore.view !== cm
 			|| guardBefore.inert
 			|| guardBefore.pendingHostLoadCandidate !== null
 		) return;
@@ -4447,8 +2202,40 @@ export class EditorBindingManager {
 		const leafId = this.getLeafId(view);
 		const runtime = this.managedSessions.get(leafId);
 		if (!runtime || runtime.session.view !== view) return true;
-		this.clearTargetPresentationRetry(leafId);
-		this.clearTargetBindingRetry(leafId);
+		if (runtime.emergencySaveFence !== null) {
+			const protectedNow = this.ensureEmergencyHostSaveFence(
+				runtime,
+				`unmanage-blocked:${reason}`,
+			);
+			this.trace?.("editor", "managed-view-emergency-save-fence-retained", {
+				leafId,
+				reason,
+				protected: protectedNow,
+			});
+			try {
+				new Notice(
+					protectedNow
+						? "This pane still contains an unresolved note switch. Native saving remains blocked; complete the recovery export action before reopening it."
+						: "This pane has an unresolved note switch and its native save wrappers drifted. Do not continue editing; restore the recovery controls, export the blocked text, then reopen the pane.",
+					10_000,
+				);
+			} catch {
+				// Runtime ownership remains retained even if the warning surface fails.
+			}
+			return false;
+		}
+		if (runtime.transitionInputFence !== null) {
+			runtime.transitionInputFence.state = "reopen-required";
+			try {
+				new Notice(
+					"This pane still owns an unresolved note transition. Close and reopen the pane before continuing.",
+					10_000,
+				);
+			} catch {
+				// The exact container and CM owners remain fail-closed.
+			}
+			return false;
+		}
 		if (runtime.cmGuard && !runtime.cmGuard.markInert()) {
 			const snapshot = runtime.cmGuard.snapshot();
 			this.trace?.("editor", "managed-view-invalidation-deferred", {
@@ -4459,13 +2246,35 @@ export class EditorBindingManager {
 				commitState: snapshot.commitState,
 			});
 			if (scheduleRetry && !this.pendingUnmanageRetries.has(leafId)) {
+				const attempt = (this.unmanageRetryAttempts.get(leafId) ?? 0) + 1;
+				this.unmanageRetryAttempts.set(leafId, attempt);
+				if (attempt > UNMANAGE_RETRY_DELAYS_MS.length) {
+					this.trace?.("editor", "managed-view-invalidation-exhausted", {
+						leafId,
+						reason,
+						gateFailureReason: snapshot.gateFailureReason,
+						commitState: snapshot.commitState,
+					});
+					try {
+						new Notice(
+							"The editor input boundary could not be released safely. Keep the pane open, complete the recovery export action, then reopen it.",
+							10_000,
+						);
+					} catch {
+						// The still-live managed guard remains the authoritative safety boundary.
+					}
+					return false;
+				}
+				const delayMs = UNMANAGE_RETRY_DELAYS_MS[
+					Math.min(attempt - 1, UNMANAGE_RETRY_DELAYS_MS.length - 1)
+				]!;
 				const timer = setTimeout(() => {
 					if (this.pendingUnmanageRetries.get(leafId) !== timer) return;
 					this.pendingUnmanageRetries.delete(leafId);
 					const current = this.managedSessions.get(leafId);
 					if (current !== runtime || current.session.view !== view) return;
 					this.unmanageView(view, `${reason}:retry`, true);
-				}, LIVE_UPDATE_HEALTH_RETRY_DELAY_MS);
+				}, delayMs);
 				this.pendingUnmanageRetries.set(leafId, timer);
 			}
 			return false;
@@ -4473,6 +2282,7 @@ export class EditorBindingManager {
 		const retry = this.pendingUnmanageRetries.get(leafId);
 		if (retry) clearTimeout(retry);
 		this.pendingUnmanageRetries.delete(leafId);
+		this.unmanageRetryAttempts.delete(leafId);
 		const adoptionRetry = this.pendingSamePathAdoptionRetries.get(leafId);
 		if (adoptionRetry) clearTimeout(adoptionRetry);
 		this.pendingSamePathAdoptionRetries.delete(leafId);
@@ -4484,7 +2294,6 @@ export class EditorBindingManager {
 		runtime.hostGuard?.restoreIfCurrent();
 		runtime.cmGuard = null;
 		runtime.hostGuard = null;
-		runtime.targetWorkflow = null;
 		runtime.adoption = NO_SAME_PATH_ADOPTION;
 		const currentCm = this.getCmView(view);
 		if (currentCm && this.cmToLeafId.get(currentCm) === leafId) {
@@ -4507,6 +2316,28 @@ export class EditorBindingManager {
 			if (exactWorkspaceViews.has(view)) continue;
 			const leafId = runtime.session.leafId;
 			if (this.managedSessions.get(leafId) !== runtime) continue;
+			this.teardownSourceUnloadDrain(
+				runtime,
+				`workspace-view-removed:${reason}`,
+			);
+			// Workspace absence is the explicit safe teardown boundary: the host can
+			// no longer autosave this detached view after its emergency owner releases.
+			const emergencyReleased = this.releaseEmergencyHostSaveFence(
+				runtime,
+				`workspace-view-removed:${reason}`,
+				true,
+			);
+			if (emergencyReleased) {
+				runtime.hostGuard?.cancelTerminalHostLifecycle?.(
+					`workspace-view-removed:${reason}`,
+				);
+			}
+			if (emergencyReleased) {
+				this.tombstoneDetachedTransitionBoundary(
+					runtime,
+					`workspace-view-removed:${reason}`,
+				);
+			}
 			this.cancelManagedHandoffAndUnmanage(
 				view,
 				`workspace-view-removed:${reason}`,
@@ -4523,35 +2354,494 @@ export class EditorBindingManager {
 		return revoked;
 	}
 
+	private exactPendingHostLoadAdmission(
+		runtime: ManagedLeafRuntime,
+		targetFile: TFile,
+		targetPath: string,
+		sourceUnloadReceiptId: string,
+	): ManagedDeferredLoadAdmissionSnapshot | null {
+		const guard = runtime.hostGuard;
+		if (guard === null) return null;
+		let first: ManagedViewSaveGuard;
+		let second: ManagedViewSaveGuard;
+		try {
+			first = guard.snapshot();
+			second = guard.snapshot();
+		} catch {
+			return null;
+		}
+		const owner = second.pendingDeferredLoadAdmission ?? null;
+		if (
+			this.managedSessions.get(runtime.session.leafId) !== runtime
+			|| runtime.hostGuard !== guard
+			|| !sameHostGuardSnapshot(first, second)
+			|| !hasExactHostGuardWrappers(second)
+			|| owner === null
+			|| owner.targetFile !== targetFile
+			|| owner.targetPath !== targetPath
+			|| owner.sourceUnloadReceiptId !== sourceUnloadReceiptId
+			|| owner.viewFileAtEntry !== runtime.session.view.file
+			|| owner.viewPathAtEntry !== runtime.session.view.file?.path
+			|| owner.pendingLoadEpoch !== (second.pendingLoadEpoch ?? 0)
+		) return null;
+		return owner;
+	}
+
+	private tryAdmitPendingHostLoad(
+		request: ManagedHostLoadAdmissionAttempt,
+	): ManagedHostSwitchTicket | null {
+		const runtime = request.runtime;
+		if (
+			this.managedSessions.get(runtime.session.leafId) !== runtime
+			|| runtime.session !== request.sourceSession
+			|| this.bindings.get(runtime.session.leafId) !== request.sourceBinding
+			|| (this.bindingEpochByLeafId.get(runtime.session.leafId) ?? 0)
+				!== request.sourceBindingEpoch
+			|| this.readAuthorityEpoch() !== request.authorityEpoch
+		) return null;
+		const owner = this.exactPendingHostLoadAdmission(
+			runtime,
+			request.targetFile,
+			request.targetPath,
+			request.sourceUnloadReceiptId,
+		);
+		if (
+			owner === null
+			|| !sameDeferredLoadAdmissionSnapshot(owner, request.admission)
+			|| this.managedSessions.get(runtime.session.leafId) !== runtime
+			|| runtime.session !== request.sourceSession
+			|| this.bindings.get(runtime.session.leafId) !== request.sourceBinding
+			|| (this.bindingEpochByLeafId.get(runtime.session.leafId) ?? 0)
+				!== request.sourceBindingEpoch
+			|| this.readAuthorityEpoch() !== request.authorityEpoch
+			|| runtime.session.view.file !== request.admission.viewFileAtEntry
+			|| runtime.session.view.file?.path !== request.admission.viewPathAtEntry
+		) return null;
+		if (!this.beginPathHandoff(
+			runtime.session.view,
+			request.targetFile,
+			"host-load-entry",
+			"selected",
+			request.sourceUnloadReceiptId,
+			owner,
+		)) return null;
+		const currentRuntime = this.managedSessions.get(runtime.session.leafId);
+		const current = currentRuntime?.session;
+		const finalOwner = currentRuntime === runtime
+			? this.exactPendingHostLoadAdmission(
+				runtime,
+				request.targetFile,
+				request.targetPath,
+				request.sourceUnloadReceiptId,
+			)
+			: null;
+		if (
+			currentRuntime !== runtime
+			|| finalOwner === null
+			|| !sameDeferredLoadAdmissionSnapshot(finalOwner, request.admission)
+			|| !current?.handoff
+			|| current.handoff.targetFile !== request.targetFile
+			|| current.handoff.targetPath !== request.targetPath
+			|| current.handoff.sourceUnloadReceiptId !== request.sourceUnloadReceiptId
+			|| current.currentSwitchIntentSeq === null
+			|| runtime.transitionInputFence?.targetFile !== request.targetFile
+			|| runtime.transitionInputFence.targetPath !== request.targetPath
+			|| runtime.transitionInputFence.state !== "handoff"
+		) {
+			return null;
+		}
+		let finalHost: ManagedViewSaveGuard | null = null;
+		try {
+			finalHost = runtime.hostGuard?.snapshot() ?? null;
+		} catch {
+			finalHost = null;
+		}
+		if (
+			finalHost === null
+			|| !hasExactHostGuardWrappers(finalHost)
+			|| !sameDeferredLoadAdmissionSnapshot(
+				finalHost.pendingDeferredLoadAdmission,
+				request.admission,
+			)
+			|| (finalHost.pendingLoadEpoch ?? 0) !== request.admission.pendingLoadEpoch
+		) {
+			return null;
+		}
+		return Object.freeze({
+			sessionId: current.sessionId,
+			handoffGeneration: current.generation,
+			switchIntentSeq: current.currentSwitchIntentSeq,
+			targetFile: request.targetFile,
+			sourceUnloadReceiptId: request.sourceUnloadReceiptId,
+		});
+	}
+
+	private createSourceUnloadDrainOwner(
+		runtime: ManagedLeafRuntime,
+		sourceFile: TFile,
+		reservation: ManagedLeafInputStartReservation | null,
+	): ManagedSourceUnloadDrainOwner | null {
+		const session = runtime.session;
+		const displayed = session.displayedLineage;
+		const cmGuard = runtime.cmGuard;
+		const sourceBinding = this.bindings.get(session.leafId);
+		let cmSnapshot: CodeMirrorHandoffGuardSnapshot;
+		if (
+			!this.asyncAuthorityOpen
+			|| this.managedSessions.get(session.leafId) !== runtime
+			|| session.view.file !== sourceFile
+			|| sourceFile.path.length === 0
+			|| displayed.kind !== "known"
+			|| displayed.file !== sourceFile
+			|| displayed.path !== sourceFile.path
+			|| cmGuard === null
+			|| runtime.sourceUnloadDrain !== null
+			|| runtime.transitionInputFence !== null
+			|| session.handoff !== null
+		) return null;
+		try {
+			cmSnapshot = cmGuard.snapshot();
+		} catch {
+			return null;
+		}
+		if (
+			cmSnapshot.view !== displayed.cm
+			|| cmSnapshot.inert
+			|| cmSnapshot.targetSelectionFence !== null
+			|| cmSnapshot.sourceUnloadDrain !== null
+			|| this.getCmView(session.view) !== displayed.cm
+			|| displayed.document !== displayed.cm.state.doc
+			|| (
+				reservation === null
+				? session.pendingInputStartReservation !== null
+				: (
+					session.pendingInputStartReservation !== reservation
+					|| reservation.sourceFileAtStart !== sourceFile
+					|| reservation.sourceAuthorityPathAtStart !== displayed.path
+					|| reservation.sourceDocumentAtStart !== displayed.document
+					|| reservation.targetFileAtStart !== null
+					|| reservation.targetPathAtStart !== null
+				)
+			)
+		) return null;
+		let resolve!: () => void;
+		let reject!: (reason: Error) => void;
+		const promise = new Promise<void>((accept, decline) => {
+			resolve = accept;
+			reject = decline;
+		});
+		// The TextFileView wrapper consumes this promise immediately. Marking it
+		// handled here also keeps a synchronous terminal classification from
+		// surfacing as an unrelated unhandled-rejection warning.
+		void promise.catch(() => undefined);
+		return {
+			ownerId: this.createManagedAuthorityRequestId("source-unload-drain"),
+			runtime,
+			sourceSession: session,
+			sourceFile,
+			sourcePath: sourceFile.path,
+			sourceBinding,
+			sourceBindingEpoch: this.bindingEpochByLeafId.get(session.leafId) ?? 0,
+			cmGuard,
+			reservation,
+			promise,
+			state: "draining",
+			targetSelectionToken: null,
+			settlementQueued: false,
+			settled: false,
+			resolve,
+			reject,
+		};
+	}
+
+	private sourceUnloadDrainSourceCurrent(
+		runtime: ManagedLeafRuntime,
+		owner: ManagedSourceUnloadDrainOwner,
+	): boolean {
+		const session = runtime.session;
+		const displayed = session.displayedLineage;
+		try {
+			return this.sourceUnloadDrainOwnerCurrent(runtime, owner)
+				&& displayed.kind === "known"
+				&& displayed.cm === owner.cmGuard.snapshot().view
+				&& displayed.document === displayed.cm.state.doc
+				&& this.getCmView(session.view) === displayed.cm;
+		} catch {
+			return false;
+		}
+	}
+
+	private sourceUnloadDrainOwnerCurrent(
+		runtime: ManagedLeafRuntime,
+		owner: ManagedSourceUnloadDrainOwner,
+	): boolean {
+		const session = runtime.session;
+		const displayed = session.displayedLineage;
+		return this.asyncAuthorityOpen
+			&& this.managedSessions.get(session.leafId) === runtime
+			&& runtime.sourceUnloadDrain === owner
+			&& owner.runtime === runtime
+			&& runtime.cmGuard === owner.cmGuard
+			&& owner.sourceSession.sessionId === session.sessionId
+			&& owner.sourceSession.generation === session.generation
+			&& owner.sourceFile.path === owner.sourcePath
+			&& session.view.file === owner.sourceFile
+			&& displayed.kind === "known"
+			&& displayed.file === owner.sourceFile
+			&& displayed.path === owner.sourcePath
+			&& this.bindings.get(session.leafId) === owner.sourceBinding
+			&& (this.bindingEpochByLeafId.get(session.leafId) ?? 0)
+				=== owner.sourceBindingEpoch;
+	}
+
+	private terminalizeSourceUnloadDrain(
+		runtime: ManagedLeafRuntime,
+		owner: ManagedSourceUnloadDrainOwner,
+		reason: string,
+	): void {
+		if (runtime.sourceUnloadDrain !== owner || owner.state === "transferred") return;
+		owner.state = "terminal";
+		if (owner.targetSelectionToken === null) {
+			try {
+				owner.targetSelectionToken = owner.cmGuard
+					.forceTargetSelectionFenceForTerminal(owner.ownerId);
+			} catch {
+				owner.targetSelectionToken = null;
+			}
+		}
+		this.ensureEmergencyHostSaveFence(runtime, `source-unload-drain:${reason}`);
+		const visible = this.captureStableVisibleManagedContent(runtime);
+		if (visible !== null) {
+			this.offerTerminalVisibleContentExport(
+				runtime,
+				visible,
+				`source-unload-drain:${reason}`,
+			);
+		}
+		if (!owner.settled) {
+			owner.settled = true;
+			owner.reject(new Error(`source-unload-drain:${reason}`));
+		}
+		this.trace?.("editor", "source-unload-drain-terminal", {
+			leafId: runtime.session.leafId,
+			path: owner.sourcePath,
+			reason,
+		});
+	}
+
+	private beginSourceUnloadDrain(
+		runtime: ManagedLeafRuntime,
+		sourceFile: TFile,
+	): null | PromiseLike<void> {
+		const reservation = runtime.session.pendingInputStartReservation;
+		const owner = this.createSourceUnloadDrainOwner(runtime, sourceFile, reservation);
+		if (owner === null) {
+			const rejected = Promise.reject(new Error("source-unload-drain-boundary-unprovable"));
+			void rejected.catch(() => undefined);
+			return rejected;
+		}
+		runtime.sourceUnloadDrain = owner;
+		if (reservation === null) {
+			let token: TargetSelectionFenceToken | null = null;
+			try {
+				token = owner.cmGuard.prepareTargetSelectionFence(owner.ownerId);
+			} catch {
+				token = null;
+			}
+			if (
+				token === null
+				|| !this.sourceUnloadDrainOwnerCurrent(runtime, owner)
+				|| !owner.cmGuard.isTargetSelectionFenceCurrent(token)
+			) {
+				this.terminalizeSourceUnloadDrain(runtime, owner, "immediate-fence-unprovable");
+				return owner.promise;
+			}
+			owner.targetSelectionToken = token;
+			owner.state = "fenced";
+			owner.settled = true;
+			owner.resolve();
+			return null;
+		}
+		let draining = false;
+		try {
+			draining = owner.cmGuard.beginSourceUnloadDrain(owner.ownerId, reservation);
+		} catch {
+			draining = false;
+		}
+		if (!draining || !this.sourceUnloadDrainSourceCurrent(runtime, owner)) {
+			this.terminalizeSourceUnloadDrain(runtime, owner, "reservation-drain-unprovable");
+		}
+		return owner.promise;
+	}
+
+	private queueSourceUnloadDrainSettlement(
+		runtime: ManagedLeafRuntime,
+		reservation: ManagedLeafInputStartReservation,
+		outcome: "completed" | "cancelled" | "ambiguous",
+	): void {
+		const owner = runtime.sourceUnloadDrain;
+		if (
+			owner === null
+			|| owner.reservation !== reservation
+			|| owner.state !== "draining"
+			|| owner.settlementQueued
+		) return;
+		if (outcome === "ambiguous") {
+			this.terminalizeSourceUnloadDrain(runtime, owner, "input-result-ambiguous");
+			return;
+		}
+		owner.settlementQueued = true;
+		queueMicrotask(() => {
+			if (
+				owner.state !== "draining"
+				|| owner.settled
+				|| runtime.session.pendingInputStartReservation !== null
+			) {
+				this.terminalizeSourceUnloadDrain(runtime, owner, "settlement-cas-drift");
+				return;
+			}
+			let token: TargetSelectionFenceToken | null = null;
+			try {
+				token = owner.cmGuard.prepareTargetSelectionFence(
+					owner.ownerId,
+					reservation,
+				);
+			} catch {
+				token = null;
+			}
+			const sourceCurrent = token !== null
+				&& this.sourceUnloadDrainOwnerCurrent(runtime, owner);
+			const tokenCurrent = token !== null
+				&& owner.cmGuard.isTargetSelectionFenceCurrent(token);
+			if (token === null || !sourceCurrent || !tokenCurrent) {
+				const session = runtime.session;
+				const displayed = session.displayedLineage;
+				let guardViewCurrent = false;
+				try {
+					guardViewCurrent = displayed.kind === "known"
+						&& displayed.cm === owner.cmGuard.snapshot().view;
+				} catch {
+					guardViewCurrent = false;
+				}
+				this.trace?.("editor", "source-unload-drain-fence-cas-rejected", {
+					leafId: runtime.session.leafId,
+					path: owner.sourcePath,
+					tokenCreated: token !== null,
+					sourceCurrent,
+					tokenCurrent,
+					managerCurrent: this.managedSessions.get(session.leafId) === runtime,
+					ownerCurrent: runtime.sourceUnloadDrain === owner,
+					sessionCurrent: owner.sourceSession.sessionId === session.sessionId
+						&& owner.sourceSession.generation === session.generation,
+					filePathCurrent: owner.sourceFile.path === owner.sourcePath,
+					viewFileCurrent: session.view.file === owner.sourceFile,
+					displayedFileCurrent: displayed.kind === "known"
+						&& displayed.file === owner.sourceFile
+						&& displayed.path === owner.sourcePath,
+					guardViewCurrent,
+					documentCurrent: displayed.kind === "known"
+						&& displayed.document === displayed.cm.state.doc,
+					runtimeCmCurrent: displayed.kind === "known"
+						&& this.getCmView(session.view) === displayed.cm,
+					bindingCurrent: this.bindings.get(session.leafId) === owner.sourceBinding,
+					bindingEpochCurrent: (this.bindingEpochByLeafId.get(session.leafId) ?? 0)
+						=== owner.sourceBindingEpoch,
+				});
+				this.terminalizeSourceUnloadDrain(runtime, owner, "settled-fence-unprovable");
+				return;
+			}
+			owner.targetSelectionToken = token;
+			owner.state = "fenced";
+			owner.settled = true;
+			owner.resolve();
+			this.trace?.("editor", "source-unload-drain-settled", {
+				leafId: runtime.session.leafId,
+				path: owner.sourcePath,
+				outcome,
+			});
+		});
+	}
+
 	private installManagedHostGuard(runtime: ManagedLeafRuntime): boolean {
 		if (runtime.hostGuard) {
 			const snapshot = runtime.hostGuard.snapshot();
-			if (snapshot.mode.kind !== "inert-pass-through") return true;
+			if (snapshot.mode.kind !== "inert-pass-through") {
+				let emergencyCurrent = true;
+				if (runtime.emergencySaveFence !== null) {
+					try {
+						emergencyCurrent = runtime.emergencySaveFence.isCurrent();
+					} catch {
+						emergencyCurrent = false;
+					}
+				}
+				if (hasExactHostGuardWrappers(snapshot) && emergencyCurrent) return true;
+				this.ensureEmergencyHostSaveFence(runtime, "managed-save-wrapper-drift");
+				runtime.cmGuard?.refreshGate();
+				this.trace?.("editor", "managed-save-wrapper-drift-terminal", {
+					leafId: runtime.session.leafId,
+					wrappersCurrent: snapshot.wrappersCurrent,
+				});
+				try {
+					new Notice(
+						"Kaos detected a replaced native save boundary. Future saves are blocked, but an earlier opaque save tail cannot be cancelled; complete the recovery export action and reopen this pane.",
+						10_000,
+					);
+				} catch {
+					// The retained runtime and recaptured wrappers remain authoritative.
+				}
+				return false;
+			}
 			runtime.hostGuard.restoreIfCurrent();
 			runtime.hostGuard = null;
 		}
-		const view = runtime.session.view as unknown as TextFileView;
-		const result = installTextFileViewHandoffGuard(view, {
-			onLoadFileEntry: (targetFile, sourceUnloadReceiptId) => {
-				if (!this.beginPathHandoff(
-					runtime.session.view,
-					targetFile,
-					"host-load-entry",
-					"selected",
-					sourceUnloadReceiptId,
-				)) {
-					return null;
-				}
-				const current = this.managedSessions.get(runtime.session.leafId)?.session;
-				if (!current?.handoff || current.handoff.targetFile !== targetFile) return null;
-				return {
-					sessionId: current.sessionId,
-					handoffGeneration: current.generation,
-					switchIntentSeq: current.currentSwitchIntentSeq ?? -1,
-					targetFile,
-					sourceUnloadReceiptId,
-				};
-			},
+			const view = runtime.session.view as unknown as TextFileView;
+			const result = installTextFileViewHandoffGuard(view, {
+				onUnloadFileEntry: (sourceFile) =>
+					this.beginSourceUnloadDrain(runtime, sourceFile),
+				onLoadFileEntry: (targetFile, sourceUnloadReceiptId) => {
+					const rejectAdmission = (reason: string) => {
+						const drain = runtime.sourceUnloadDrain;
+						if (drain !== null) {
+							this.terminalizeSourceUnloadDrain(runtime, drain, reason);
+						} else {
+							this.ensureEmergencyHostSaveFence(
+								runtime,
+								`host-load-entry:${reason}`,
+							);
+						}
+						const rejected = Promise.reject<ManagedHostSwitchTicket | null>(
+							new Error(`host-load-entry:${reason}`),
+						);
+						void rejected.catch(() => undefined);
+						return rejected;
+					};
+					const admission = this.exactPendingHostLoadAdmission(
+						runtime,
+						targetFile,
+						targetFile.path,
+						sourceUnloadReceiptId,
+					);
+					if (admission === null) return rejectAdmission("owner-unprovable");
+					const leafId = runtime.session.leafId;
+					const sourceSession = runtime.session;
+					const base = {
+						runtime,
+						admission,
+						targetFile,
+						targetPath: targetFile.path,
+						sourceUnloadReceiptId,
+						sourceSession,
+						sourceBinding: this.bindings.get(leafId),
+						sourceBindingEpoch: this.bindingEpochByLeafId.get(leafId) ?? 0,
+						authorityEpoch: this.readAuthorityEpoch(),
+					} as const;
+					const synchronousProbe: ManagedHostLoadAdmissionAttempt = {
+						...base,
+					};
+					const ticket = this.tryAdmitPendingHostLoad(synchronousProbe);
+					if (ticket !== null) return ticket;
+					return rejectAdmission("selected-fence-cas-rejected");
+				},
 			onSetViewDataEntry: ({ ticket, incomingContent, clear }) => {
 				if (!this.isManagedSessionCurrent(ticket.sessionId, ticket.handoffGeneration)) {
 					this.trace?.("editor", "host-clear-load-arm-rejected", {
@@ -4667,15 +2957,23 @@ export class EditorBindingManager {
 					leafId: current.session.leafId,
 					reason: failureReason,
 				});
+				if (certified) this.presentLocalTargetOnce(current);
 				return certified;
 			},
-			onHostLoadCandidate: (candidate) => {
-				this.isHostLoadCandidateCurrent(candidate);
-			},
+			onHostLoadCandidate: (candidate) =>
+				this.isHostLoadCandidateCurrent(candidate),
 			isHostLoadCandidateCurrent: (candidate) =>
 				this.isHostLoadCandidateCurrent(candidate),
 			onHostLoadCompleted: (receipt) => {
-				this.handleSettledHostLoadCompletion(runtime, receipt);
+				const finalize = (): void => {
+					if (this.managedSessions.get(runtime.session.leafId) !== runtime) return;
+					this.handleLocalTargetPresentationCompletion(runtime, receipt);
+				};
+				// Receipt publication is re-entrant from the CM guard. Let its exact
+				// post-notification checks finish before publishing B authority. The
+				// local commit starts in setViewData's certified synchronous tail, so
+				// this microtask is queued before the host load promise is exposed.
+				queueMicrotask(finalize);
 			},
 			onSaveSuppressed: (input) => {
 				this.trace?.("editor", "managed-save-suppressed", input);
@@ -4718,6 +3016,18 @@ export class EditorBindingManager {
 			},
 			onHostCapabilityLost: (reason) => {
 				this.advanceAuthorityEpoch();
+				const handoffAtLoss = runtime.session.handoff;
+				if (
+					handoffAtLoss !== null
+					|| reason === "host-wrapper-drift-before-host-load"
+					|| reason === "source-unload-proof-lost-before-host-load"
+					|| reason.startsWith("source-unload-")
+				) {
+					this.ensureEmergencyHostSaveFence(
+						runtime,
+						`host-capability-lost:${reason}`,
+					);
+				}
 				this.trace?.("editor", "managed-host-capability-lost", {
 					leafId: runtime.session.leafId,
 					reason,
@@ -4725,6 +3035,103 @@ export class EditorBindingManager {
 				queueMicrotask(() => {
 					const current = this.managedSessions.get(runtime.session.leafId);
 					if (current !== runtime) return;
+					const handoff = runtime.session.handoff;
+					const candidate = handoff?.pendingHostLoadCandidate ?? null;
+					if (handoff !== null) {
+						// A certified candidate can exist only behind this exact host
+						// wrapper. Capability loss must not restore that wrapper and open
+						// an A-to-B autosave lane while any handoff remains unresolved.
+						runtime.hostGuard?.beginBlockingHandoff({
+							handoffGeneration: runtime.session.generation,
+							sourceLineagePath: handoff.sourceAuthorityPath,
+							targetPath: handoff.targetPath,
+						});
+						const protectedNow = this.ensureEmergencyHostSaveFence(
+							runtime,
+							`host-capability-lost:${reason}:terminal`,
+						);
+						if (
+							candidate !== null
+							&& handoff.presentation === "target-candidate"
+						) {
+							this.handleFailedTargetPresentation(
+								runtime,
+								candidate,
+								`host-capability-lost:${reason}`,
+							);
+						} else {
+							const visibleContent = this.captureStableVisibleManagedContent(runtime);
+							if (visibleContent !== null) {
+								this.offerTerminalVisibleContentExport(
+									runtime,
+									visibleContent,
+									`host-capability-lost:${reason}`,
+								);
+								return;
+							}
+							try {
+								new Notice(
+									protectedNow
+										? "KAOS lost the native save capability during a note switch. Saving and input are blocked; close and reopen this pane."
+										: "KAOS lost the native save capability during a note switch and could not prove both save entry points. Keep this pane open and do not continue editing until recovery controls are available.",
+									10_000,
+								);
+							} catch {
+								// The retained runtime and emergency wrapper are authoritative.
+							}
+						}
+						return;
+					}
+					let terminalLifecycle = false;
+					try {
+						terminalLifecycle = runtime.hostGuard?.snapshot().terminalHostLifecycle != null;
+					} catch {
+						terminalLifecycle = true;
+					}
+					if (
+						reason === "host-wrapper-drift-before-host-load"
+						|| reason === "source-unload-proof-lost-before-host-load"
+						|| reason.startsWith("source-unload-")
+						|| terminalLifecycle
+					) {
+						const protectedNow = this.ensureEmergencyHostSaveFence(
+							runtime,
+							`host-capability-lost:${reason}:terminal-lifecycle`,
+						);
+						const displayed = runtime.session.displayedLineage;
+						const terminalTarget = runtime.session.view.file
+							?? (displayed.kind === "known" ? displayed.file : null);
+						if (terminalTarget !== null && runtime.transitionInputFence === null) {
+							const transition = this.acquireTransitionInputFence(
+								runtime,
+								terminalTarget,
+								terminalTarget.path,
+								runtime.session,
+								true,
+							);
+							if (transition !== null) transition.fence.state = "reopen-required";
+						}
+						const visibleContent = this.captureStableVisibleManagedContent(runtime);
+						if (visibleContent !== null) {
+							this.offerTerminalVisibleContentExport(
+								runtime,
+								visibleContent,
+								`host-capability-lost:${reason}:terminal-lifecycle`,
+							);
+							return;
+						}
+						try {
+							new Notice(
+								protectedNow
+									? "KAOS blocked this note switch before the target load. Input and saving are blocked; close and reopen this pane."
+									: "KAOS could not prove a save boundary before the target load. Keep this pane open and do not continue editing until recovery controls are available.",
+								10_000,
+							);
+						} catch {
+							// The terminal managed boundary remains retained.
+						}
+						return;
+					}
 					this.cancelManagedHandoffAndUnmanage(
 						runtime.session.view,
 						`host-capability-lost:${reason}`,
@@ -4755,6 +3162,748 @@ export class EditorBindingManager {
 				reason: result.reason,
 			});
 			return false;
+		}
+	}
+
+	private ensureEmergencyHostSaveFence(
+		runtime: ManagedLeafRuntime,
+		reason: string,
+	): boolean {
+		const guard = runtime.hostGuard;
+		if (
+			guard === null
+			|| this.managedSessions.get(runtime.session.leafId) !== runtime
+		) return false;
+		let fence = runtime.emergencySaveFence;
+		if (fence === null || fence.view !== runtime.session.view) {
+			try {
+				fence = guard.acquireEmergencySaveFence();
+				runtime.emergencySaveFence = fence;
+			} catch {
+				fence = null;
+			}
+		}
+		let ready = false;
+		try {
+			ready = fence !== null && fence.refresh() && fence.isCurrent();
+		} catch {
+			ready = false;
+		}
+		this.trace?.("editor", ready
+			? "managed-emergency-save-fence-retained"
+			: "managed-emergency-save-fence-unavailable", {
+			leafId: runtime.session.leafId,
+			reason,
+		});
+		return ready;
+	}
+
+	private releaseEmergencyHostSaveFence(
+		runtime: ManagedLeafRuntime,
+		reason: string,
+		safeBoundary = false,
+		markProof: ManagedTargetMarkReleaseProof | null = null,
+	): boolean {
+		const fence = runtime.emergencySaveFence;
+		if (fence === null) return true;
+		if (safeBoundary) {
+			let released = false;
+			try {
+				released = fence.release();
+			} catch {
+				released = false;
+			}
+			if (released && runtime.emergencySaveFence === fence) {
+				runtime.emergencySaveFence = null;
+			}
+			this.trace?.("editor", released
+				? "managed-emergency-save-fence-released"
+				: "managed-emergency-save-fence-release-rejected", {
+				leafId: runtime.session.leafId,
+				reason,
+				current: false,
+			});
+			return released;
+		}
+
+		const session = runtime.session;
+		const handoff = session.handoff;
+		const guard = runtime.hostGuard;
+		const cmGuard = runtime.cmGuard;
+		const candidate = handoff?.pendingHostLoadCandidate ?? null;
+		const authorityEpoch = this.readAuthorityEpoch();
+		if (
+			handoff === null
+			|| candidate === null
+			|| guard === null
+			|| this.managedSessions.get(session.leafId) !== runtime
+			|| session.view.file !== handoff.targetFile
+			|| handoff.targetFile.path !== handoff.targetPath
+			|| fence.view !== (session.view as unknown as TextFileView)
+		) return false;
+		const exactMarkProof = markProof !== null
+			&& markProof.runtime === runtime
+			&& markProof.sourceSession === session
+			&& markProof.candidate === candidate
+			&& markProof.hostGuard === guard
+			&& markProof.targetFile === handoff.targetFile
+			&& markProof.targetPath === handoff.targetPath
+			&& this.getCmView(session.view) === candidate.cm;
+		if (markProof !== null && !exactMarkProof) return false;
+		let nativeTargetReady = exactMarkProof;
+		if (!nativeTargetReady) {
+			try {
+				nativeTargetReady = guard.isTargetPresentationReady({
+					handoffGeneration: session.generation,
+					targetFile: handoff.targetFile,
+					certifiedContent: candidate.incomingContent,
+				});
+			} catch {
+				nativeTargetReady = false;
+			}
+		}
+		if (!nativeTargetReady) return false;
+		let before: ManagedViewSaveGuard;
+		let cmBefore: CodeMirrorHandoffGuardSnapshot | null;
+		let current = false;
+		try {
+			before = guard.snapshot();
+			cmBefore = cmGuard?.snapshot() ?? null;
+			current = fence.isCurrent();
+		} catch {
+			return false;
+		}
+		if (
+			!current
+			|| cmBefore === null
+			|| this.getCmView(session.view) !== cmBefore.view
+			|| before.view !== (session.view as unknown as TextFileView)
+			|| !hasExactHostGuardWrappers(before)
+			|| !before.emergencySaveBlocked
+			|| before.hostCapabilityState !== "ready"
+			|| before.inFlight.size !== 0
+			|| before.pendingOwnedSave !== null
+			|| before.pendingTargetSave
+			|| !hasNoPendingHostLoadOwner(before)
+		) return false;
+		let stableBefore: ManagedViewSaveGuard;
+		let stableCmBefore: CodeMirrorHandoffGuardSnapshot | null;
+		try {
+			stableBefore = guard.snapshot();
+			stableCmBefore = cmGuard?.snapshot() ?? null;
+		} catch {
+			return false;
+		}
+		if (
+			this.managedSessions.get(session.leafId) !== runtime
+			|| runtime.session !== session
+			|| runtime.hostGuard !== guard
+			|| runtime.cmGuard !== cmGuard
+			|| runtime.emergencySaveFence !== fence
+			|| session.view.file !== handoff.targetFile
+			|| handoff.targetFile.path !== handoff.targetPath
+			|| stableCmBefore === null
+			|| this.getCmView(session.view) !== stableCmBefore.view
+			|| this.readAuthorityEpoch() !== authorityEpoch
+			|| !sameHostGuardSnapshot(before, stableBefore)
+			|| !sameCodeMirrorGuardSnapshot(cmBefore, stableCmBefore)
+		) return false;
+		let released = false;
+		try {
+			released = fence.release();
+		} catch {
+			released = false;
+		}
+		let post: ManagedViewSaveGuard | null = null;
+		let postCm: CodeMirrorHandoffGuardSnapshot | null = null;
+		try {
+			post = guard.snapshot();
+			postCm = cmGuard?.snapshot() ?? null;
+		} catch {
+			post = null;
+		}
+		const postStable = released
+			&& post !== null
+			&& this.managedSessions.get(session.leafId) === runtime
+			&& runtime.session === session
+			&& runtime.hostGuard === guard
+			&& runtime.cmGuard === cmGuard
+			&& runtime.emergencySaveFence === fence
+			&& session.view.file === handoff.targetFile
+			&& handoff.targetFile.path === handoff.targetPath
+			&& postCm !== null
+			&& this.getCmView(session.view) === postCm.view
+			&& this.readAuthorityEpoch() === authorityEpoch
+			&& !post.emergencySaveBlocked
+			&& sameHostGuardSnapshot(stableBefore, {
+				...post,
+				emergencySaveBlocked: stableBefore.emergencySaveBlocked,
+			})
+			&& sameCodeMirrorGuardSnapshot(stableCmBefore, postCm);
+		if (postStable) runtime.emergencySaveFence = null;
+		else if (released) {
+			// The owner was consumed while a re-entrant callback changed authority.
+			// Re-arm a fresh exact owner before returning failure to the caller.
+			try {
+				const replacement = guard.acquireEmergencySaveFence();
+				runtime.emergencySaveFence = replacement;
+				replacement.refresh();
+			} catch {
+				// The caller retains the terminal input boundary and explicit reopen path.
+			}
+			runtime.cmGuard?.refreshGate();
+		}
+		this.trace?.("editor", released
+			&& postStable
+			? "managed-emergency-save-fence-released"
+			: "managed-emergency-save-fence-release-rejected", {
+			leafId: runtime.session.leafId,
+			reason,
+			current,
+		});
+		return postStable;
+	}
+
+	private transitionContainer(view: MarkdownView): ManagedTransitionContainer | null {
+		const container = (view as MarkdownView & Readonly<{
+			containerEl?: ManagedTransitionContainer;
+		}>).containerEl;
+		return typeof container === "object" && container !== null ? container : null;
+	}
+
+	private isTransitionContainerOwned(fence: ManagedTransitionInputFence): boolean {
+		try {
+			if (
+				this.transitionContainer(fence.view) !== fence.container
+				|| Reflect.get(fence.container, "inert") !== true
+			) return false;
+			const getAttribute = fence.container.getAttribute;
+			const setAttribute = fence.container.setAttribute;
+			return typeof getAttribute !== "function"
+				|| typeof setAttribute !== "function"
+				|| Reflect.apply(getAttribute, fence.container, ["inert"]) === "";
+		} catch {
+			return false;
+		}
+	}
+
+	private restoreTransitionContainer(
+		fence: ManagedTransitionInputFence,
+		force = false,
+	): boolean {
+		try {
+			const currentContainer = this.transitionContainer(fence.view);
+			if (!force && currentContainer !== fence.container) return false;
+			if (!force && !this.isTransitionContainerOwned(fence)) return false;
+			if (fence.hadOwnInert) {
+				if (!Reflect.set(fence.container, "inert", fence.previousInert)) return false;
+			} else if (!Reflect.deleteProperty(fence.container, "inert")) {
+				return false;
+			}
+			const getAttribute = fence.container.getAttribute;
+			const setAttribute = fence.container.setAttribute;
+			const removeAttribute = fence.container.removeAttribute;
+			if (typeof getAttribute === "function") {
+				const current = Reflect.apply(getAttribute, fence.container, ["inert"]);
+				if (force || current === "") {
+					if (
+						fence.previousInertAttribute === null
+						&& typeof removeAttribute === "function"
+					) Reflect.apply(removeAttribute, fence.container, ["inert"]);
+					else if (
+						fence.previousInertAttribute !== null
+						&& typeof setAttribute === "function"
+					) {
+						Reflect.apply(setAttribute, fence.container, [
+							"inert",
+							fence.previousInertAttribute,
+						]);
+					}
+				}
+			}
+			const inertRestored = Object.prototype.hasOwnProperty.call(
+				fence.container,
+				"inert",
+			) === fence.hadOwnInert
+				&& Object.is(Reflect.get(fence.container, "inert"), fence.previousInert);
+			let attributeRestored = true;
+			if (typeof getAttribute === "function") {
+				attributeRestored = Reflect.apply(
+					getAttribute,
+					fence.container,
+					["inert"],
+				) === fence.previousInertAttribute;
+			}
+			return inertRestored && attributeRestored;
+		} catch {
+			return false;
+		}
+	}
+
+	private acquireTransitionInputFence(
+		runtime: ManagedLeafRuntime,
+		targetFile: TFile,
+		targetPath: string,
+		nextSession: ManagedLeafSession,
+		terminal = false,
+		preownedTargetSelectionToken: TargetSelectionFenceToken | null = null,
+	): Readonly<{
+		fence: ManagedTransitionInputFence;
+		newlyAcquired: boolean;
+		tokenPreowned: boolean;
+		previousTargetFile: TFile;
+		previousTargetPath: string;
+		previousSessionId: string;
+		previousGeneration: number;
+		previousSwitchIntentSeq: number | null;
+		previousState: ManagedTransitionInputFence["state"];
+	}> | null {
+		const existing = runtime.transitionInputFence;
+		if (existing !== null) {
+			let guardSnapshot: CodeMirrorHandoffGuardSnapshot;
+			try {
+				guardSnapshot = existing.cmGuard.snapshot();
+			} catch {
+				existing.state = "reopen-required";
+				return null;
+			}
+			if (
+				existing.view !== runtime.session.view
+				|| !this.isTransitionContainerOwned(existing)
+				|| runtime.cmGuard !== existing.cmGuard
+				|| guardSnapshot.inert
+				|| !guardSnapshot.gateClosed
+				|| existing.state !== "handoff"
+				|| existing.targetSelectionToken !== null
+				|| guardSnapshot.targetSelectionFence !== null
+			) {
+				existing.state = "reopen-required";
+				return null;
+			}
+			const previous = {
+				fence: existing,
+				newlyAcquired: false,
+				tokenPreowned: false,
+				previousTargetFile: existing.targetFile,
+				previousTargetPath: existing.targetPath,
+				previousSessionId: existing.sessionId,
+				previousGeneration: existing.handoffGeneration,
+				previousSwitchIntentSeq: existing.switchIntentSeq,
+				previousState: existing.state,
+			} as const;
+			existing.targetFile = targetFile;
+			existing.targetPath = targetPath;
+			existing.sessionId = nextSession.sessionId;
+			existing.handoffGeneration = nextSession.generation;
+			existing.switchIntentSeq = nextSession.currentSwitchIntentSeq;
+			existing.state = "handoff";
+			return previous;
+		}
+
+		const cmGuard = runtime.cmGuard;
+		const sourceSession = runtime.session;
+		const sourceAuthorityEpoch = this.readAuthorityEpoch();
+		const container = this.transitionContainer(sourceSession.view);
+		if (cmGuard === null || container === null) return null;
+		let hadOwnInert: boolean;
+		let previousInert: unknown;
+		let previousInertAttribute: string | null = null;
+		let getAttribute: ManagedTransitionContainer["getAttribute"];
+		let setAttribute: ManagedTransitionContainer["setAttribute"];
+		try {
+			hadOwnInert = Object.prototype.hasOwnProperty.call(container, "inert");
+			previousInert = Reflect.get(container, "inert");
+			getAttribute = container.getAttribute;
+			setAttribute = container.setAttribute;
+			if (typeof getAttribute === "function") {
+				previousInertAttribute = Reflect.apply(getAttribute, container, ["inert"]);
+			}
+		} catch {
+			return null;
+		}
+		if (
+			this.managedSessions.get(sourceSession.leafId) !== runtime
+			|| runtime.session !== sourceSession
+			|| runtime.cmGuard !== cmGuard
+			|| runtime.transitionInputFence !== null
+			|| this.transitionContainer(sourceSession.view) !== container
+			|| this.readAuthorityEpoch() !== sourceAuthorityEpoch
+		) return null;
+		const ownerId = this.createManagedAuthorityRequestId("target-selection-fence");
+		const token = preownedTargetSelectionToken
+			?? (cmGuard.prepareTargetSelectionFence(ownerId)
+				?? (terminal
+					? cmGuard.forceTargetSelectionFenceForTerminal(ownerId)
+					: null));
+		if (token === null) return null;
+		if (
+			preownedTargetSelectionToken !== null
+			&& !cmGuard.isTargetSelectionFenceCurrent(preownedTargetSelectionToken)
+		) return null;
+		const fence: ManagedTransitionInputFence = {
+			ownerId,
+			view: sourceSession.view,
+			container,
+			previousInert,
+			hadOwnInert,
+			previousInertAttribute,
+			cmGuard,
+			targetSelectionToken: token,
+			targetFile,
+			targetPath,
+			sessionId: nextSession.sessionId,
+			handoffGeneration: nextSession.generation,
+			switchIntentSeq: nextSession.currentSwitchIntentSeq,
+			state: "preselection",
+		};
+		// Publish ownership before the container mutation.  Any exception or
+		// re-entrant epoch drift still leaves an explicit reopen owner behind.
+		runtime.transitionInputFence = fence;
+		try {
+			if (
+				this.managedSessions.get(sourceSession.leafId) !== runtime
+				|| runtime.session !== sourceSession
+				|| runtime.cmGuard !== cmGuard
+				|| runtime.transitionInputFence !== fence
+				|| this.transitionContainer(sourceSession.view) !== container
+				|| this.readAuthorityEpoch() !== sourceAuthorityEpoch
+				|| !cmGuard.isTargetSelectionFenceCurrent(token)
+				|| Object.prototype.hasOwnProperty.call(container, "inert") !== hadOwnInert
+				|| !Object.is(Reflect.get(container, "inert"), previousInert)
+				|| container.getAttribute !== getAttribute
+				|| container.setAttribute !== setAttribute
+				|| (
+					typeof getAttribute === "function"
+					&& Reflect.apply(getAttribute, container, ["inert"])
+						!== previousInertAttribute
+				)
+			) throw new Error("transition-owner-stale-before-inert");
+			if (!Reflect.set(container, "inert", true)) throw new Error("inert-set-rejected");
+			if (runtime.transitionInputFence !== fence) {
+				throw new Error("transition-owner-revoked-during-inert-set");
+			}
+			if (typeof setAttribute === "function") {
+				Reflect.apply(setAttribute, container, ["inert", ""]);
+			}
+			if (runtime.transitionInputFence !== fence) {
+				throw new Error("transition-owner-revoked-during-inert-attribute");
+			}
+			if (!this.isTransitionContainerOwned(fence)) {
+				throw new Error("inert-not-owned");
+			}
+			return {
+				fence,
+				newlyAcquired: true,
+				tokenPreowned: preownedTargetSelectionToken !== null,
+				previousTargetFile: targetFile,
+				previousTargetPath: targetPath,
+				previousSessionId: nextSession.sessionId,
+				previousGeneration: nextSession.generation,
+				previousSwitchIntentSeq: nextSession.currentSwitchIntentSeq,
+				previousState: "preselection" as const,
+			};
+		} catch {
+			if (preownedTargetSelectionToken !== null) {
+				const restored = this.restoreTransitionContainer(fence, true);
+				if (runtime.transitionInputFence === fence) {
+					if (restored) runtime.transitionInputFence = null;
+					else fence.state = "reopen-required";
+				}
+				return null;
+			}
+			// Exact source release is attempted only while the token still proves the
+			// unchanged source.  A failed release deliberately leaves CM fail-closed.
+			let released = false;
+			try {
+				released = cmGuard.releaseTargetSelectionFence(token);
+			} catch {
+				released = false;
+			}
+			const restored = this.restoreTransitionContainer(fence, true);
+			if (runtime.transitionInputFence === fence) {
+				if (released && restored) runtime.transitionInputFence = null;
+				else fence.state = "reopen-required";
+			}
+			return null;
+		}
+	}
+
+	private abortTransitionInputFence(
+		runtime: ManagedLeafRuntime,
+		acquisition: NonNullable<ReturnType<EditorBindingManager["acquireTransitionInputFence"]>>,
+	): void {
+		const fence = acquisition.fence;
+		if (runtime.transitionInputFence !== fence) return;
+		if (!acquisition.newlyAcquired) {
+			fence.targetFile = acquisition.previousTargetFile;
+			fence.targetPath = acquisition.previousTargetPath;
+			fence.sessionId = acquisition.previousSessionId;
+			fence.handoffGeneration = acquisition.previousGeneration;
+			fence.switchIntentSeq = acquisition.previousSwitchIntentSeq;
+			fence.state = acquisition.previousState;
+			return;
+		}
+		if (acquisition.tokenPreowned) {
+			fence.state = "reopen-required";
+			return;
+		}
+		const token = fence.targetSelectionToken;
+		let released = false;
+		try {
+			released = token !== null
+				&& fence.cmGuard.releaseTargetSelectionFence(token);
+		} catch {
+			released = false;
+		}
+		if (released && this.restoreTransitionContainer(fence)) {
+			runtime.transitionInputFence = null;
+			return;
+		}
+		fence.state = "reopen-required";
+	}
+
+	private transferTransitionInputFence(
+		runtime: ManagedLeafRuntime,
+		fence: ManagedTransitionInputFence,
+	): boolean {
+		if (runtime.transitionInputFence !== fence) return false;
+		const token = fence.targetSelectionToken;
+		if (token !== null) {
+			let transferred = false;
+			try {
+				transferred = fence.cmGuard.transferTargetSelectionFence(token);
+			} catch {
+				transferred = false;
+			}
+			if (!transferred) {
+				fence.state = "reopen-required";
+				return false;
+			}
+			fence.targetSelectionToken = null;
+		}
+		fence.state = "handoff";
+		return true;
+	}
+
+	private releaseTransitionInputFence(
+		runtime: ManagedLeafRuntime,
+		targetFile: TFile,
+		targetPath: string,
+		reason: string,
+		force = false,
+	): boolean {
+		const fence = runtime.transitionInputFence;
+		if (fence === null) return true;
+		let cmSnapshot: CodeMirrorHandoffGuardSnapshot | null = null;
+		let hostSnapshot: ManagedViewSaveGuard | null = null;
+		try {
+			cmSnapshot = runtime.cmGuard?.snapshot() ?? null;
+			hostSnapshot = runtime.hostGuard?.snapshot() ?? null;
+		} catch {
+			// The force teardown path below does not need live wrapper snapshots.
+		}
+		const exactTarget = fence.view.file === targetFile
+			&& targetFile.path === targetPath
+			&& fence.targetFile === targetFile
+			&& fence.targetPath === targetPath;
+		const safe = force || (
+			exactTarget
+			&& runtime.emergencySaveFence === null
+			&& runtime.cmGuard === fence.cmGuard
+			&& cmSnapshot?.inert === false
+			&& cmSnapshot.gateClosed === false
+			&& cmSnapshot.targetSelectionFence === null
+			&& hostSnapshot !== null
+			&& hasExactHostGuardWrappers(hostSnapshot)
+			&& hasNoPendingHostLoadOwner(hostSnapshot)
+			&& hostSnapshot.mode.kind === "pass-through"
+			&& !hostSnapshot.emergencySaveBlocked
+		);
+		if (force && fence.targetSelectionToken !== null) {
+			let tokenReleased = false;
+			try {
+				tokenReleased = fence.cmGuard.releaseTargetSelectionFenceForTeardown(
+					fence.targetSelectionToken,
+				);
+			} catch {
+				tokenReleased = false;
+			}
+			if (!tokenReleased) return false;
+			fence.targetSelectionToken = null;
+		}
+		if (!safe || !this.restoreTransitionContainer(fence, force)) {
+			fence.state = "reopen-required";
+			this.trace?.("editor", "managed-transition-input-fence-release-rejected", {
+				leafId: runtime.session.leafId,
+				path: targetPath,
+				reason,
+			});
+			return false;
+		}
+		runtime.transitionInputFence = null;
+		this.trace?.("editor", "managed-transition-input-fence-released", {
+			leafId: runtime.session.leafId,
+			path: targetPath,
+			reason,
+		});
+		return true;
+	}
+
+	private tombstoneDetachedTransitionBoundary(
+		runtime: ManagedLeafRuntime,
+		reason: string,
+	): void {
+		const fence = runtime.transitionInputFence;
+		try {
+			runtime.cmGuard?.markDetachedInertForTeardown();
+		} catch {
+			// Workspace absence, not a live-view mutation, is the authority to tombstone.
+		}
+		if (fence !== null) {
+			fence.targetSelectionToken = null;
+			this.restoreTransitionContainer(fence, true);
+			runtime.transitionInputFence = null;
+		}
+		this.trace?.("editor", "managed-detached-transition-boundary-tombstoned", {
+			leafId: runtime.session.leafId,
+			reason,
+			hadTransitionFence: fence !== null,
+		});
+	}
+
+	private teardownSourceUnloadDrain(
+		runtime: ManagedLeafRuntime,
+		reason: string,
+	): boolean {
+		const owner = runtime.sourceUnloadDrain;
+		if (owner === null) return true;
+		let released = owner.targetSelectionToken === null;
+		if (owner.targetSelectionToken !== null) {
+			try {
+				released = owner.cmGuard.releaseTargetSelectionFenceForTeardown(
+					owner.targetSelectionToken,
+				);
+			} catch {
+				released = false;
+			}
+		}
+		if (!released) {
+			this.trace?.("editor", "source-unload-drain-teardown-rejected", {
+				leafId: runtime.session.leafId,
+				path: owner.sourcePath,
+				reason,
+			});
+			return false;
+		}
+		owner.targetSelectionToken = null;
+		owner.state = "terminal";
+		if (!owner.settled) {
+			owner.settled = true;
+			owner.reject(new Error(`source-unload-drain-teardown:${reason}`));
+		}
+		runtime.sourceUnloadDrain = null;
+		this.trace?.("editor", "source-unload-drain-torn-down", {
+			leafId: runtime.session.leafId,
+			path: owner.sourcePath,
+			reason,
+		});
+		return true;
+	}
+
+	private retainManagedTargetCompletionFence(
+		runtime: ManagedLeafRuntime,
+		reason: string,
+		candidate: PendingHostLoadCandidate | null = null,
+	): void {
+		const session = runtime.session;
+		const handoff = session.handoff;
+		const displayed = session.displayedLineage;
+		const candidateTargetFile = candidate !== null
+			&& candidate.runtimeView === session.view
+			&& session.view.file?.path === candidate.targetPathAtDispatch
+				? session.view.file
+				: null;
+		const targetFile = candidateTargetFile
+			?? handoff?.targetFile
+			?? runtime.transitionInputFence?.targetFile
+			?? (displayed.kind === "known" ? displayed.file : null)
+			?? null;
+		const targetPath = candidate?.targetPathAtDispatch
+			?? handoff?.targetPath
+			?? runtime.transitionInputFence?.targetPath
+			?? (displayed.kind === "known" ? displayed.path : null)
+			?? null;
+		if (
+			this.managedSessions.get(session.leafId) !== runtime
+			|| targetFile === null
+			|| targetPath === null
+			|| session.view.file !== targetFile
+			|| targetFile.path !== targetPath
+		) return;
+		if (runtime.transitionInputFence !== null) {
+			runtime.transitionInputFence.state = "reopen-required";
+		}
+		try {
+			runtime.hostGuard?.beginBlockingHandoff({
+				handoffGeneration: session.generation,
+				sourceLineagePath: handoff?.sourceAuthorityPath ?? null,
+				targetPath,
+			});
+		} catch {
+			// The emergency owner below remains the independent native-save boundary.
+		}
+		const saveFenceReady = this.ensureEmergencyHostSaveFence(
+			runtime,
+			`${reason}:terminal`,
+		);
+		let inputFenceReady = false;
+		try {
+			const cmGuard = runtime.cmGuard;
+			const targetSelectionToken = runtime.transitionInputFence
+				?.targetSelectionToken ?? null;
+			const terminalSelectionFenceCurrent = cmGuard !== null
+				&& targetSelectionToken !== null
+				&& cmGuard.isTargetSelectionFenceCurrent(targetSelectionToken);
+			inputFenceReady = cmGuard !== null
+				&& (terminalSelectionFenceCurrent || cmGuard.refreshGate())
+				&& cmGuard.snapshot().gateClosed;
+		} catch {
+			inputFenceReady = false;
+		}
+		this.trace?.("editor", "managed-target-completion-retained", {
+			leafId: session.leafId,
+			path: targetPath,
+			reason,
+			saveFenceReady,
+			inputFenceReady,
+		});
+		try {
+			new Notice(
+				"The selected note is preserved behind a blocked transition boundary. Use the recovery export action if offered, then close and reopen this pane. No automatic replay or rollback was attempted.",
+				10_000,
+			);
+		} catch {
+			// The retained managed guards remain authoritative without the warning UI.
+		}
+	}
+
+	private terminalizeManagedTargetCompletion(
+		runtime: ManagedLeafRuntime,
+		candidate: PendingHostLoadCandidate,
+		reason: string,
+		visibleContent: string | null = null,
+	): void {
+		if (runtime.transitionInputFence !== null) {
+			runtime.transitionInputFence.state = "reopen-required";
+		}
+		this.retainManagedTargetCompletionFence(runtime, reason, candidate);
+		const stableContent = visibleContent
+			?? this.captureStableVisibleManagedContent(runtime);
+		if (
+			stableContent !== null
+			&& stableContent !== candidate.incomingContent
+		) {
+			this.offerTerminalVisibleContentExport(runtime, stableContent, reason);
 		}
 	}
 
@@ -4826,23 +3975,21 @@ export class EditorBindingManager {
 					reason,
 				});
 			},
-			onInputIntent: ({ intent }) => {
-				const current = this.managedSessions.get(intent.leafId);
-				if (!current) return false;
-				const reduction = reduceManagedLeafSession(current.session, {
-					type: "intent-captured",
-					sessionId: intent.sessionId,
-					expectedGeneration: intent.handoffGeneration,
-					intent,
-				});
-				if (!reduction.accepted) return false;
-				this.advanceAuthorityEpoch();
-				current.session = reduction.state;
-				this.applyHandoffEffects(current, reduction.effects, "input-intent-captured");
+			onUnresolvedInputTerminal: ({ reservation, reason }) => {
+				const current = this.managedSessions.get(runtime.session.leafId);
+				const owner = current?.sourceUnloadDrain ?? null;
+				if (
+					current !== runtime
+					|| owner === null
+					|| owner.reservation !== reservation
+				) return false;
+				this.terminalizeSourceUnloadDrain(runtime, owner, reason);
 				return true;
 			},
 			onSamePathInputCompleted: (completion) =>
 				this.acceptSamePathInputCompletion(runtime, completion),
+			onSamePathInputRejected: (rejection) =>
+				this.acceptSamePathInputRejection(runtime, rejection),
 			onNativeHistoryAdvanced: (advance) =>
 				this.acceptStableNativeHistoryAdvance(advance),
 			onCompositionBoundary: (phase) => {
@@ -4911,20 +4058,6 @@ export class EditorBindingManager {
 					&& current.session.sessionId === runtime.session.sessionId
 					&& current.session.generation === runtime.session.generation;
 			},
-			hashContent: (content) => this.hashManagedContent(content),
-			acceptHandoffReplayTransaction: (transaction, boundary) =>
-				this.acceptHandoffReplayTransaction(transaction, boundary),
-			getHandoffRecoveryGateModel: () =>
-				this.getHandoffRecoveryGateModel(runtime.session.leafId),
-			handoffRecoveryGateCallbacks: {
-				onRetry: () => this.startHandoffRecoveryRetry(runtime.session.leafId),
-				onCopyAndContinue: () => this.startHandoffRecoveryCopy(runtime.session.leafId),
-				onExportAndContinue: () => this.startHandoffRecoveryExport(runtime.session.leafId),
-				onDiscardAndContinue: () => this.startHandoffRecoveryDiscard(runtime.session.leafId),
-				onContinueWithoutAutomaticApply: () =>
-					this.continueHandoffRecoveryManually(runtime.session.leafId),
-				onRetrySettlement: () => this.retryHandoffRecoverySettlement(runtime.session.leafId),
-			},
 		});
 		if (result.kind === "installed") {
 			this.advanceAuthorityEpoch();
@@ -4939,341 +4072,17 @@ export class EditorBindingManager {
 		}
 	}
 
-	private getHandoffRecoveryGateModel(
-		leafId: string,
-	): HandoffRecoveryGateModel | null {
-		const intentState = this.managedSessions.get(leafId)?.session.handoff?.intentState;
-		if (!intentState) return null;
-		let state: HandoffRecoveryGateModel["state"];
-		let message: HandoffRecoveryGateModel["message"];
-		switch (intentState.kind) {
-			case "persisting":
-				state = "persisting";
-				message = "Preserving interrupted input…";
-				break;
-			case "failed":
-				state = "failed";
-				message = "Interrupted input still needs a recovery choice.";
-				break;
-			case "stored":
-				state = "stored";
-				message = "Waiting for a proven target before automatic apply…";
-				break;
-			case "replay-pending":
-				state = "replay-pending";
-				message = "Preparing one verified automatic apply…";
-				break;
-			case "replayed-awaiting-settlement":
-				state = "replayed-awaiting-settlement";
-				message = "Automatic apply is waiting for settlement verification…";
-				break;
-			case "escape-pending":
-				state = "escape-pending";
-				message = "Completing the selected recovery action…";
-				break;
-			case "none":
-			case "needs-review":
-			case "escaped":
-			case "resolved":
-			case "discarded":
-				return null;
-		}
-		return {
-			state,
-			message,
-			actions: handoffRecoveryGateActions(state),
-		};
-	}
-
-	private buildHandoffRecoveryRequest(
-		leafId: string,
-		effect: Extract<EditorHandoffEffect, { type: "persist-intent" }>,
-		expectedPort: HandoffRecoveryPort | null = this.handoffRecoveryPort,
-	): HandoffRecoveryRuntimeRequest | null {
+	private getCodeMirrorHandoffContext(leafId: string): CodeMirrorHandoffContext | null {
 		const runtime = this.managedSessions.get(leafId);
-		const handoff = runtime?.session.handoff;
-		if (
-			!runtime
-			|| runtime.session.sessionId !== effect.sessionId
-			|| runtime.session.generation !== effect.expectedGeneration
-			|| handoff?.recoveryOperationEpoch !== effect.recoveryOperationEpoch
-		) return null;
-		const recovery = runtime.session.activeRecoveries.find((candidate) =>
-			candidate.sessionId === effect.sessionId
-			&& candidate.handoffGeneration === effect.expectedGeneration
-			&& candidate.recoveryOperationEpoch === effect.recoveryOperationEpoch
-			&& candidate.intent === effect.intent
-		);
-		if (!recovery) return null;
-		const activationEpoch = this.handoffRecoveryPortActivationEpoch;
-		return {
-			sessionId: effect.sessionId,
-			expectedGeneration: effect.expectedGeneration,
-			recoveryOperationEpoch: effect.recoveryOperationEpoch,
-			intent: effect.intent,
-			deliver: (event) => {
-				if (
-					this.handoffRecoveryPortActivationEpoch !== activationEpoch
-					|| this.handoffRecoveryPort !== expectedPort
-				) return false;
-				if (event.type === "intent-state-changed") {
-					return this.deliverHandoffRecoveryIntentState(leafId, event);
-				}
-				const current = this.managedSessions.get(leafId);
-				if (!current) return false;
-				const reduction = reduceManagedLeafSession(current.session, event);
-				if (!reduction.accepted) return false;
-				this.advanceAuthorityEpoch();
-				current.session = reduction.state;
-				this.applyHandoffEffects(
-					current,
-					reduction.effects,
-					"recovery-target-binding-requested",
-				);
-				return true;
-			},
-		};
-	}
-
-	private buildCurrentHandoffRecoveryRequest(
-		leafId: string,
-		expectedPort: HandoffRecoveryPort | null = this.handoffRecoveryPort,
-	): HandoffRecoveryRuntimeRequest | null {
-		const runtime = this.managedSessions.get(leafId);
-		const handoff = runtime?.session.handoff;
-		if (!runtime || !handoff || handoff.intentState.kind === "none") return null;
-		const intentId = handoff.intentState.intentId;
-		const recovery = runtime.session.activeRecoveries.find((candidate) =>
-			candidate.sessionId === runtime.session.sessionId
-			&& candidate.handoffGeneration === runtime.session.generation
-			&& candidate.recoveryOperationEpoch === handoff.recoveryOperationEpoch
-			&& candidate.intent.intentId === intentId
-		);
-		if (!recovery) return null;
-		return this.buildHandoffRecoveryRequest(leafId, {
-			type: "persist-intent",
-			sessionId: runtime.session.sessionId,
-			expectedGeneration: runtime.session.generation,
-			recoveryOperationEpoch: handoff.recoveryOperationEpoch,
-			intent: recovery.intent,
-		}, expectedPort);
-	}
-
-	private deliverHandoffRecoveryIntentState(
-		leafId: string,
-		event: Extract<
-			Parameters<HandoffRecoveryRuntimeRequest["deliver"]>[0],
-			{ type: "intent-state-changed" }
-		>,
-	): boolean {
-		const runtime = this.managedSessions.get(leafId);
-		if (!runtime) return false;
-		const observedIntentState = event.intentState;
-		const observedRecovery = observedIntentState.kind === "none"
-			? null
-			: runtime.session.activeRecoveries.find((candidate) =>
-				candidate.sessionId === event.sessionId
-				&& candidate.handoffGeneration === event.expectedGeneration
-				&& candidate.recoveryOperationEpoch === event.recoveryOperationEpoch
-				&& candidate.intent.intentId === observedIntentState.intentId
-			) ?? null;
-		const recoveryWorkflow =
-			runtime.session.handoff?.recoveryTargetBindingRequest
-				? runtime.targetWorkflow
-				: null;
-		const reduction = reduceManagedLeafSession(runtime.session, event);
-		if (!reduction.accepted) return false;
-		this.advanceAuthorityEpoch();
-		runtime.session = reduction.state;
-		if (observedRecovery && observedIntentState.kind !== "none") {
-			const action = observedIntentState.kind === "escape-pending"
-				|| observedIntentState.kind === "escaped"
-				? observedIntentState.action
-				: observedIntentState.kind === "discarded"
-					? "discard" as const
-					: null;
+		const session = runtime?.session;
+		if (!runtime || !session) return null;
+		if (runtime.emergencySaveFence !== null) {
 			try {
-				this.handoffRecoveryActionHost?.observeAcceptedIntentState?.(Object.freeze({
-					leafId,
-					sessionId: event.sessionId,
-					generation: event.expectedGeneration,
-					recoveryOperationEpoch: event.recoveryOperationEpoch,
-					intentId: observedRecovery.intent.intentId,
-					fromPath: observedRecovery.intent.fromPath,
-					targetPath: observedRecovery.intent.targetPath,
-					startContentHash: observedRecovery.intent.startContentHash,
-					afterContentHash: observedRecovery.intent.afterContentHash,
-					state: observedIntentState.kind,
-					action,
-				}));
+				if (!runtime.emergencySaveFence.isCurrent()) return null;
 			} catch {
-				// Diagnostic observation is deliberately non-authoritative.
+				return null;
 			}
 		}
-		this.applyHandoffEffects(runtime, reduction.effects, "handoff-recovery-state");
-		if (recoveryWorkflow && runtime.session.handoff === null) {
-			this.clearTargetPresentationRetry(leafId);
-			this.clearTargetBindingRetry(leafId);
-			runtime.targetWorkflow = null;
-		}
-		runtime.cmGuard?.refreshGate();
-		const workflow = runtime.targetWorkflow;
-		if (
-			workflow
-			&& runtime.session.handoff?.presentation === "target-proven"
-			&& runtime.session.handoff.phase === "target-ready"
-		) this.requestTargetBindingAdmission(runtime, workflow);
-		return true;
-	}
-
-	private beginHandoffRecoveryOperation(
-		leafId: string,
-		operation: "retry" | "copy" | "export" | "discard",
-	): Readonly<{
-		port: HandoffRecoveryPort;
-		request: HandoffRecoveryRuntimeRequest;
-	}> | null {
-		const runtime = this.managedSessions.get(leafId);
-		const port = this.handoffRecoveryPort;
-		if (!runtime) return null;
-		const reduction = reduceManagedLeafSession(runtime.session, {
-			type: "recovery-operation-started",
-			sessionId: runtime.session.sessionId,
-			expectedGeneration: runtime.session.generation,
-			operation,
-		});
-		if (!reduction.accepted) return null;
-		this.advanceAuthorityEpoch();
-		runtime.session = reduction.state;
-		this.applyHandoffEffects(runtime, reduction.effects, `handoff-recovery-${operation}`);
-		runtime.cmGuard?.refreshGate();
-		const request = this.buildCurrentHandoffRecoveryRequest(leafId, port);
-		if (!request) return null;
-		if (!port) {
-			this.deliverHandoffRecoveryIntentState(leafId, {
-				type: "intent-state-changed",
-				sessionId: request.sessionId,
-				expectedGeneration: request.expectedGeneration,
-				recoveryOperationEpoch: request.recoveryOperationEpoch,
-				intentState: {
-					kind: "failed",
-					intentId: request.intent.intentId,
-					reason: "recovery-store-unavailable",
-				},
-			});
-			return null;
-		}
-		return { port, request };
-	}
-
-	private startHandoffRecoveryRetry(leafId: string): void {
-		const operation = this.beginHandoffRecoveryOperation(leafId, "retry");
-		if (!operation) return;
-		void operation.port.persistAndClassify(operation.request).catch(() => {
-			operation.request.deliver({
-				type: "intent-state-changed",
-				sessionId: operation.request.sessionId,
-				expectedGeneration: operation.request.expectedGeneration,
-				recoveryOperationEpoch: operation.request.recoveryOperationEpoch,
-				intentState: {
-					kind: "failed",
-					intentId: operation.request.intent.intentId,
-					reason: "recovery-runtime-failed",
-				},
-			});
-		});
-	}
-
-	private startHandoffRecoveryCopy(leafId: string): void {
-		const operation = this.beginHandoffRecoveryOperation(leafId, "copy");
-		if (!operation) return;
-		void operation.port.copyAndContinue(
-			operation.request,
-			this.handoffRecoveryActionHost?.writeClipboard
-				? (text) => this.handoffRecoveryActionHost!.writeClipboard(text)
-				: async () => { throw new Error("Recovery clipboard is unavailable"); },
-		).catch(() => {
-			operation.request.deliver({
-				type: "intent-state-changed",
-				sessionId: operation.request.sessionId,
-				expectedGeneration: operation.request.expectedGeneration,
-				recoveryOperationEpoch: operation.request.recoveryOperationEpoch,
-				intentState: {
-					kind: "failed",
-					intentId: operation.request.intent.intentId,
-					reason: "recovery-runtime-failed",
-				},
-			});
-		});
-	}
-
-	private startHandoffRecoveryExport(leafId: string): void {
-		const actionHost = this.handoffRecoveryActionHost;
-		if (!actionHost) return;
-		void actionHost.chooseVerifiedExporter().then((exportVerified) => {
-			if (!exportVerified) return;
-			const operation = this.beginHandoffRecoveryOperation(leafId, "export");
-			if (!operation) return;
-			void operation.port.exportAndContinue(operation.request, exportVerified).catch(() => {
-				operation.request.deliver({
-					type: "intent-state-changed",
-					sessionId: operation.request.sessionId,
-					expectedGeneration: operation.request.expectedGeneration,
-					recoveryOperationEpoch: operation.request.recoveryOperationEpoch,
-					intentState: {
-						kind: "failed",
-						intentId: operation.request.intent.intentId,
-						reason: "recovery-runtime-failed",
-					},
-				});
-			});
-		}).catch(() => undefined);
-	}
-
-	private startHandoffRecoveryDiscard(leafId: string): void {
-		const actionHost = this.handoffRecoveryActionHost;
-		if (!actionHost) return;
-		void actionHost.confirmDiscard().then((confirmed) => {
-			if (!confirmed) return;
-			const operation = this.beginHandoffRecoveryOperation(leafId, "discard");
-			if (!operation) return;
-			void operation.port.discardAndContinue(operation.request).catch(() => {
-				operation.request.deliver({
-					type: "intent-state-changed",
-					sessionId: operation.request.sessionId,
-					expectedGeneration: operation.request.expectedGeneration,
-					recoveryOperationEpoch: operation.request.recoveryOperationEpoch,
-					intentState: {
-						kind: "failed",
-						intentId: operation.request.intent.intentId,
-						reason: "recovery-runtime-failed",
-					},
-				});
-			});
-		}).catch(() => undefined);
-	}
-
-	private continueHandoffRecoveryManually(leafId: string): void {
-		const port = this.handoffRecoveryPort;
-		const request = this.buildCurrentHandoffRecoveryRequest(leafId, port);
-		if (!port || !request) return;
-		void port.continueWithoutAutomaticApply(request).catch(() => undefined);
-	}
-
-	private retryHandoffRecoverySettlement(leafId: string): void {
-		const port = this.handoffRecoveryPort;
-		const request = this.buildCurrentHandoffRecoveryRequest(leafId, port);
-		if (!port || !request) return;
-		void port.retrySettlement(request).catch(() => undefined);
-	}
-
-	private hashManagedContent(content: string): string {
-		return sha256HandoffRecoveryHexSync(content);
-	}
-
-	private getCodeMirrorHandoffContext(leafId: string): CodeMirrorHandoffContext | null {
-		const session = this.managedSessions.get(leafId)?.session;
-		if (!session) return null;
 		if (session.handoff) {
 			const currentCm = this.getCmView(session.view);
 			if (
@@ -5281,21 +4090,6 @@ export class EditorBindingManager {
 				|| session.view.file !== session.handoff.targetFile
 				|| session.handoff.targetFile.path !== session.handoff.targetPath
 			) return null;
-			if (
-				session.handoff.presentation === "target-proven"
-				&& session.handoff.inputGateInstalled === false
-				&& session.displayedLineage.kind === "known"
-				&& session.displayedLineage.file === session.handoff.targetFile
-				&& session.displayedLineage.path === session.handoff.targetPath
-			) {
-				return {
-					kind: "same-path",
-					sessionId: session.sessionId,
-					leafId: session.leafId,
-					handoffGeneration: session.generation,
-					path: session.handoff.targetPath,
-				};
-			}
 			return {
 				kind: "handoff",
 				sessionId: session.sessionId,
@@ -5312,6 +4106,7 @@ export class EditorBindingManager {
 				runtimeView: session.view as unknown as TextFileView,
 				bindingEpoch: session.handoff.bindingEpochAfterDetach,
 				editorRevisionBefore: this.editorRevisionByCm.get(currentCm) ?? 0,
+				inputPolicy: "reject-before-target",
 			};
 		}
 		if (session.displayedLineage.kind !== "known") return null;
@@ -5326,191 +4121,6 @@ export class EditorBindingManager {
 			handoffGeneration: session.generation,
 			path: session.displayedLineage.path,
 		};
-	}
-
-	private acceptHandoffReplayTransaction(
-		transaction: Transaction,
-		boundary: "route" | "update",
-	): boolean {
-		const frame = this.activeHandoffReplayDispatchFrame;
-		const annotation = transaction.annotation(acceptedHandoffReplay);
-		if (frame === null) {
-			this.trace?.("editor", "handoff-replay-transaction-rejected", {
-				boundary,
-				activeFrame: false,
-			});
-			return false;
-		}
-		const checks = {
-			authorityCurrent:
-				this.isHandoffReplayDispatchFrameAuthorityCurrent(frame),
-			transactionIdentity: frame.transaction === transaction,
-			startStateCurrent: frame.cm.state === frame.startState,
-			startStateIdentity: transaction.startState === frame.startState,
-			changesIdentity: transaction.changes === frame.plan.replayChanges,
-			selectionExact:
-				transaction.newSelection.eq(frame.plan.mappedSelection),
-			addToHistory:
-				transaction.annotation(Transaction.addToHistory) === true,
-			userEvent:
-				transaction.annotation(Transaction.userEvent)
-					=== "input.handoff-replay",
-			historyIsolation: transaction.annotation(isolateHistory) === "full",
-			permitIdentity: annotation?.permit === frame.permit,
-			frameIdentity:
-				annotation?.frameIdentity === frame.frameIdentity,
-			scrollEffectIdentity:
-				transaction.effects.length === 1
-				&& transaction.effects[0] === frame.mappedScrollEffect,
-		};
-		if (
-			Object.values(checks).some((accepted) => !accepted)
-		) {
-			this.trace?.("editor", "handoff-replay-transaction-rejected", {
-				boundary,
-				...checks,
-			});
-			return false;
-		}
-		if (boundary === "route") {
-			if (frame.routeSeen || frame.updateSeen) return false;
-			frame.routeSeen = true;
-			return true;
-		}
-		if (!frame.routeSeen || frame.updateSeen) return false;
-		frame.updateSeen = true;
-		return true;
-	}
-
-	private isHandoffReplayDispatchFrameAuthorityCurrent(
-		frame: ActiveHandoffReplayDispatchFrame,
-	): boolean {
-		const expected = frame.expectedSnapshot;
-		const runtime = this.managedSessions.get(expected.leafId);
-		const session = runtime?.session ?? null;
-		const handoff = session?.handoff ?? null;
-		const workflow = runtime?.targetWorkflow ?? null;
-		const displayed = session?.displayedLineage ?? null;
-		const binding = this.bindings.get(expected.leafId) ?? null;
-		const guard = runtime?.cmGuard?.snapshot() ?? null;
-		const localYtextRevision =
-			this.yTextMutationRevisionByText.get(expected.ytext) ?? 0;
-		const authorityAtBind = frame.binding.authorityYtextMutationEpochAtBind;
-		const localAtBind = frame.binding.localYtextMutationRevisionAtBind;
-		const runtimeDataDescriptor = Object.getOwnPropertyDescriptor(
-			frame.binding.view as unknown as TextFileView,
-			"data",
-		);
-		const currentYtextEpoch =
-			authorityAtBind === undefined
-				|| localAtBind === undefined
-				|| localYtextRevision < localAtBind
-				? null
-				: authorityAtBind + (localYtextRevision - localAtBind);
-		return this.asyncAuthorityOpen
-			&& runtime === frame.runtime
-			&& session === frame.session
-			&& handoff === frame.handoff
-			&& workflow === frame.workflow
-			&& binding === frame.binding
-			&& session !== null
-			&& handoff !== null
-			&& workflow !== null
-			&& displayed?.kind === "known"
-			&& session.sessionId === expected.sessionId
-			&& session.leafId === expected.leafId
-			&& session.generation === expected.handoffGeneration
-			&& session.view === frame.binding.view
-			&& session.view.file === expected.targetFile
-			&& expected.targetFile.path === expected.targetPath
-			&& session.binding.kind === "bound"
-			&& session.binding.path === expected.targetPath
-			&& session.binding.fileId === expected.targetFileId
-			&& session.binding.ytext === expected.ytext
-			&& session.nativeHistoryEpoch === expected.nativeHistoryEpoch
-			&& displayed.file === expected.targetFile
-			&& displayed.path === expected.targetPath
-			&& displayed.fileId === expected.targetFileId
-			&& displayed.cm === expected.cm
-			&& displayed.document === expected.cmDocument
-			&& displayed.editorRevision === expected.editorRevision
-			&& handoff.presentation === "target-proven"
-			&& handoff.targetFile === expected.targetFile
-			&& handoff.targetPath === expected.targetPath
-			&& handoff.targetReadyTokenId === expected.targetReadyTokenId
-			&& handoff.inputGateInstalled
-			&& !handoff.saveGuardInstalled
-			&& handoff.pendingHostLoadCandidate === null
-			&& handoff.phase === "awaiting-replay-settlement"
-			&& handoff.recoveryOperationEpoch === frame.recoveryOperationEpoch
-			&& handoff.intentState.kind === "replay-pending"
-			&& handoff.intentState.intentId === frame.record.intentId
-			&& handoff.intentState.recordId === frame.record.recordId
-			&& handoff.recoveryTargetBindingRequest?.recoveryOperationEpoch
-				=== frame.recoveryOperationEpoch
-			&& handoff.recoveryTargetBindingRequest.intentId
-				=== frame.record.intentId
-			&& handoff.recoveryTargetBindingRequest.recordId
-				=== frame.record.recordId
-			&& workflow.sessionId === expected.sessionId
-			&& workflow.handoffGeneration === expected.handoffGeneration
-			&& workflow.targetFile === expected.targetFile
-			&& workflow.targetPath === expected.targetPath
-			&& workflow.targetReadyToken === frame.targetReadyToken
-			&& workflow.targetPresentationReceipt
-				?.hostLoadCompletionReceipt === frame.hostLoadReceipt
-			&& frame.targetReadyToken.tokenId === expected.targetReadyTokenId
-			&& frame.targetReadyToken.targetFile === expected.targetFile
-			&& frame.targetReadyToken.targetPath === expected.targetPath
-			&& frame.targetReadyToken.targetAuthority.kind === "existing"
-			&& frame.targetReadyToken.targetAuthority.fileId
-				=== expected.targetFileId
-			&& frame.targetReadyToken.targetAuthority.ytextIdentity
-				=== expected.ytextIdentity
-			&& frame.binding.file === expected.targetFile
-			&& frame.binding.path === expected.targetPath
-			&& frame.binding.fileId === expected.targetFileId
-			&& frame.binding.cm === expected.cm
-			&& frame.binding.ytext === expected.ytext
-			&& frame.record.status === "replay-pending"
-			&& frame.record.recordId === frame.permit.recordId
-			&& frame.record.checksum === frame.permit.replayPendingChecksum
-			&& frame.record.intentId === frame.plan.intentId
-			&& frame.record.targetPath === expected.targetPath
-			&& frame.record.applyWitness?.planId === frame.plan.planId
-			&& frame.record.applyWitness.kind === frame.plan.kind
-			&& frame.record.applyWitness.dispatchReceiptHash === null
-			&& frame.permit.planId === frame.plan.planId
-			&& frame.permit.permitId === frame.plan.replayPermitId
-			&& frame.permit.recoveryOperationEpoch
-				=== frame.recoveryOperationEpoch
-			&& this.knownCmViews.has(expected.cm)
-			&& this.cmToLeafId.get(expected.cm) === expected.leafId
-			&& expected.cm.dom.isConnected
-			&& session.view.containerEl.contains(expected.cm.dom)
-			&& expected.cm.state === frame.startState
-			&& expected.cm.state.doc === expected.cmDocument
-			&& expected.cm.state.selection.eq(expected.selection)
-			&& (this.bindingEpochByLeafId.get(expected.leafId) ?? 0)
-				=== expected.bindingEpoch
-			&& (this.editorRevisionByCm.get(expected.cm) ?? 0)
-				=== expected.editorRevision
-			&& currentYtextEpoch === expected.ytextMutationEpoch
-			&& expected.ytext.toJSON() === expected.ytextContent
-			&& runtimeDataDescriptor !== undefined
-			&& "value" in runtimeDataDescriptor
-			&& runtimeDataDescriptor.value === expected.runtimeCacheContent
-			&& this.vaultSync.getTextForPath(expected.targetPath) === expected.ytext
-			&& this.vaultSync.getFileId(expected.targetPath)
-				=== expected.targetFileId
-			&& this.vaultSync.getFileIdForText(expected.ytext)
-				=== expected.targetFileId
-			&& guard?.view === expected.cm
-			&& !guard.inert
-			&& guard.gateClosed
-			&& guard.nativeHistoryEpoch === expected.nativeHistoryEpoch
-			&& guard.selectionEpoch === expected.selectionEpoch
-			&& guard.scrollEpoch === expected.scrollEpoch;
 	}
 
 	private isManagedSessionCurrent(sessionId: string, generation: number): boolean {
@@ -5648,6 +4258,11 @@ export class EditorBindingManager {
 			cm: EditorView;
 			startDocument: Text;
 			finalDocument: Text;
+			samePathDispatch?: Readonly<{
+				batchStartDocument: Text;
+				nativeHistoryEpochBefore: number;
+				nativeHistoryEpochAfter: number;
+			}>;
 		}>,
 	): boolean {
 		const current = this.managedSessions.get(runtime.session.leafId);
@@ -5663,9 +4278,111 @@ export class EditorBindingManager {
 		if (!reduction.accepted) return false;
 		this.advanceAuthorityEpoch();
 		current.session = reduction.state;
+		this.queueSourceUnloadDrainSettlement(
+			current,
+			completion.reservation,
+			"completed",
+		);
+		this.queueObservedFileMismatchTerminalAfterInputSettlement(
+			current,
+			"same-path-input-completed",
+		);
 		return true;
 	}
 
+	private acceptSamePathInputRejection(
+		runtime: ManagedLeafRuntime,
+		rejection:
+			| Readonly<{
+				reservation: ManagedLeafInputStartReservation;
+				cm: EditorView;
+				startDocument: Text;
+				reason: "cancelled";
+			}>
+			| Readonly<{
+				reservation: ManagedLeafInputStartReservation;
+				cm: EditorView;
+				startDocument: Text;
+				finalDocument: Text;
+				reason: "input-result-ambiguous";
+				samePathDispatch: Readonly<{
+					batchStartDocument: Text;
+					nativeHistoryEpochBefore: number;
+					nativeHistoryEpochAfter: number;
+				}>;
+			}>,
+	): boolean {
+		const current = this.managedSessions.get(runtime.session.leafId);
+		if (current !== runtime || !this.asyncAuthorityOpen) return false;
+		const reduction = rejection.reason === "input-result-ambiguous"
+			? reduceManagedLeafSession(current.session, {
+				type: "same-path-input-rejected",
+				sessionId: current.session.sessionId,
+				expectedGeneration: current.session.generation,
+				...rejection,
+				editorRevision: this.editorRevisionByCm.get(rejection.cm) ?? 0,
+			})
+			: reduceManagedLeafSession(current.session, {
+				type: "same-path-input-rejected",
+				sessionId: current.session.sessionId,
+				expectedGeneration: current.session.generation,
+				...rejection,
+			});
+		if (!reduction.accepted) return false;
+		this.advanceAuthorityEpoch();
+		current.session = reduction.state;
+		this.queueSourceUnloadDrainSettlement(
+			current,
+			rejection.reservation,
+			rejection.reason === "cancelled" ? "cancelled" : "ambiguous",
+		);
+		const committedSession = current.session;
+		queueMicrotask(() => {
+			try {
+				this.trace?.("editor", "same-path-input-rejected", {
+					leafId: committedSession.leafId,
+					path: committedSession.displayedLineage.kind === "known"
+						? committedSession.displayedLineage.path
+						: null,
+					reason: rejection.reason,
+				});
+			} catch {
+				// Diagnostics cannot split the reducer and guard acknowledgement.
+			}
+			if (rejection.reason === "input-result-ambiguous") {
+				try {
+					new Notice(
+						"The previous note changed while input was being resolved. Nothing was replayed; export if needed, then reopen this pane.",
+						8000,
+					);
+				} catch {
+					// UI feedback is best-effort after the terminal reducer commit.
+				}
+			}
+		});
+		this.queueObservedFileMismatchTerminalAfterInputSettlement(
+			current,
+			`same-path-input-rejected:${rejection.reason}`,
+		);
+		return true;
+	}
+
+	private queueObservedFileMismatchTerminalAfterInputSettlement(
+		runtime: ManagedLeafRuntime,
+		reason: string,
+	): void {
+		if (!this.observedFileMismatchTerminalByRuntime.has(runtime)) return;
+		queueMicrotask(() => {
+			const current = this.managedSessions.get(runtime.session.leafId);
+			const targetFile = current?.session.view.file ?? null;
+			if (
+				!this.asyncAuthorityOpen
+				|| current !== runtime
+				|| targetFile === null
+			) return;
+			this.enterObservedFileMismatchTerminal(runtime, targetFile, reason);
+		});
+	}
 	private acceptStableNativeHistoryAdvance(input: Readonly<{
 		cm: EditorView;
 		startState: EditorState;
@@ -5802,6 +4519,688 @@ export class EditorBindingManager {
 		return true;
 	}
 
+	private presentLocalTargetOnce(runtime: ManagedLeafRuntime): void {
+		const session = runtime.session;
+		const handoff = session.handoff;
+		const candidate = handoff?.pendingHostLoadCandidate ?? null;
+		const guard = runtime.cmGuard;
+		if (
+			!this.asyncAuthorityOpen
+			|| this.managedSessions.get(session.leafId) !== runtime
+			|| handoff === null
+			|| candidate === null
+			|| guard === null
+			|| handoff.presentation !== "target-candidate"
+			|| session.currentSwitchIntentSeq === null
+			|| session.view.file !== handoff.targetFile
+			|| handoff.targetFile.path !== handoff.targetPath
+		) return;
+
+		if (!guard.refreshGate()) {
+			this.handleFailedTargetPresentation(
+				runtime,
+				candidate,
+				"local-input-boundary-refresh-rejected",
+			);
+			return;
+		}
+
+		const refreshedSession = runtime.session;
+		const refreshedHandoff = refreshedSession.handoff;
+		if (
+			this.managedSessions.get(session.leafId) !== runtime
+			|| refreshedSession.sessionId !== session.sessionId
+			|| refreshedSession.generation !== session.generation
+			|| refreshedHandoff === null
+			|| refreshedHandoff.pendingHostLoadCandidate !== candidate
+			|| refreshedHandoff.presentation !== "target-candidate"
+			|| refreshedSession.view.file !== refreshedHandoff.targetFile
+			|| refreshedHandoff.targetFile.path !== refreshedHandoff.targetPath
+		) return;
+
+		let snapshot: CodeMirrorHandoffGuardSnapshot;
+		try {
+			snapshot = guard.snapshot();
+		} catch {
+			this.handleFailedTargetPresentation(
+				runtime,
+				candidate,
+				"local-input-boundary-snapshot-rejected",
+			);
+			return;
+		}
+		if (
+			runtime.cmGuard !== guard
+			|| snapshot.inert
+			|| snapshot.view !== candidate.cm
+			|| this.getCmView(refreshedSession.view) !== candidate.cm
+		) {
+			this.handleFailedTargetPresentation(
+				runtime,
+				candidate,
+				"local-provider-boundary-stale",
+			);
+			return;
+		}
+		if (
+			snapshot.activeComposition !== null
+			|| refreshedSession.pendingInputStartReservation !== null
+		) {
+			this.handleFailedTargetPresentation(
+				runtime,
+				candidate,
+				"local-input-boundary-active",
+			);
+			return;
+		}
+		let localPresentationId = this.localTargetPresentationIdByCandidate.get(candidate);
+		if (localPresentationId === undefined) {
+			localPresentationId = this.createManagedAuthorityRequestId(
+				"local-target-presentation",
+			);
+			this.localTargetPresentationIdByCandidate.set(candidate, localPresentationId);
+		}
+		const result = guard.presentHeldHostLoadLocally({
+			candidate,
+			localPresentationId,
+		});
+		this.trace?.("editor", "local-target-presentation-attempted", {
+			leafId: refreshedSession.leafId,
+			path: refreshedHandoff.targetPath,
+			kind: result.kind,
+			reason: result.kind === "rejected"
+				? result.reason
+				: result.kind === "pending-notification"
+					? result.notification
+					: null,
+		});
+		if (result.kind === "accepted" || result.kind === "pending-notification") return;
+		this.handleFailedTargetPresentation(
+			runtime,
+			candidate,
+			`local-host-load-${result.reason}`,
+		);
+	}
+
+	private captureStableVisibleManagedContent(
+		runtime: ManagedLeafRuntime,
+	): string | null {
+		const read = () => {
+			const session = runtime.session;
+			const cm = this.getCmView(session.view);
+			if (cm === null) return null;
+			const state = cm.state;
+			const document = state.doc;
+			const editor = session.view.editor;
+			// eslint-disable-next-line @typescript-eslint/unbound-method
+			const editorGetValue = editor.getValue;
+			const hostView = session.view as unknown as TextFileView;
+			// eslint-disable-next-line @typescript-eslint/unbound-method
+			const getViewData = hostView.getViewData;
+			let editorContent: string;
+			let hostContent: string;
+			let rawData: unknown;
+			try {
+				editorContent = Reflect.apply(editorGetValue, editor, []);
+				hostContent = Reflect.apply(getViewData, hostView, []);
+				rawData = (hostView as TextFileView & Readonly<{ data?: unknown }>).data;
+			} catch {
+				return null;
+			}
+			if (
+				this.managedSessions.get(session.leafId) !== runtime
+				|| runtime.session !== session
+				|| this.getCmView(session.view) !== cm
+				|| cm.state !== state
+				|| state.doc !== document
+				|| session.view.editor !== editor
+				|| editor.getValue !== editorGetValue
+				|| hostView.getViewData !== getViewData
+			) return null;
+			const content = document.toString();
+			return content === editorContent
+				&& content === hostContent
+				&& content === rawData
+					? { session, cm, state, document, editor, editorGetValue, getViewData, content }
+					: null;
+		};
+		const first = read();
+		const second = read();
+		return first !== null
+			&& second !== null
+			&& first.session === second.session
+			&& first.cm === second.cm
+			&& first.state === second.state
+			&& first.document === second.document
+			&& first.editor === second.editor
+			&& first.editorGetValue === second.editorGetValue
+			&& first.getViewData === second.getViewData
+			&& first.content === second.content
+				? second.content
+				: null;
+	}
+
+	private offerTerminalVisibleContentExport(
+		runtime: ManagedLeafRuntime,
+		content: string,
+		reason: string,
+	): void {
+		const leafId = runtime.session.leafId;
+		if (
+			!this.asyncAuthorityOpen
+			|| this.managedSessions.get(leafId) !== runtime
+		) return;
+		if (this.terminalVisibleContentExportByRuntime.get(runtime) === content) return;
+		this.terminalVisibleContentExportByRuntime.set(runtime, content);
+		const actionHost = this.handoffRecoveryActionHost;
+		if (!actionHost) {
+			try {
+				new Notice(
+					"The pane is blocked with unsaved switch-time text, but the recovery export action is unavailable. Keep the pane open and restore KAOS recovery controls before closing it.",
+					10_000,
+				);
+			} catch {
+				// The retained input/save owners remain authoritative.
+			}
+			return;
+		}
+		try {
+			new Notice(
+				"The pane is blocked with unsaved switch-time text. Complete the recovery export prompt before reopening it.",
+				10_000,
+			);
+		} catch {
+			// The global exporter remains usable without a Notice.
+		}
+		void actionHost.chooseVerifiedExporter().then(async (exportVerified) => {
+			if (
+				!this.asyncAuthorityOpen
+				|| this.managedSessions.get(leafId) !== runtime
+				|| this.handoffRecoveryActionHost !== actionHost
+				|| this.terminalVisibleContentExportByRuntime.get(runtime) !== content
+			) return;
+			if (exportVerified === null) {
+				if (this.terminalVisibleContentExportByRuntime.get(runtime) === content) {
+					this.terminalVisibleContentExportByRuntime.delete(runtime);
+				}
+				try {
+					new Notice(
+						"Export was cancelled. The pane remains blocked; use the recovery export action again before closing it.",
+						10_000,
+					);
+				} catch {
+					// The retained owner keeps the bytes stable for a later export action.
+				}
+				return;
+			}
+			await exportVerified(content);
+			if (
+				!this.asyncAuthorityOpen
+				|| this.managedSessions.get(leafId) !== runtime
+				|| this.handoffRecoveryActionHost !== actionHost
+			) return;
+			try {
+				new Notice(
+					"A verified export of the blocked pane text was saved. You can now close and reopen the pane.",
+					10_000,
+				);
+			} catch {
+				// The verified external artifact is authoritative.
+			}
+		}).catch(() => {
+			if (this.terminalVisibleContentExportByRuntime.get(runtime) === content) {
+				this.terminalVisibleContentExportByRuntime.delete(runtime);
+			}
+			this.trace?.("editor", "terminal-visible-content-export-failed", {
+				leafId,
+				reason,
+			});
+			try {
+				new Notice(
+					"The verified export failed. The pane remains blocked; restore the recovery controls and try the export again before closing it.",
+					10_000,
+				);
+			} catch {
+				// The retained owner preserves the content independently of the warning.
+			}
+		});
+	}
+
+	private classifyFailedTargetSurface(
+		runtime: ManagedLeafRuntime,
+		candidate: PendingHostLoadCandidate,
+	): Readonly<{
+		kind:
+			| "exact-target"
+			| "exact-target-pending"
+			| "exact-source"
+			| "mixed-or-unknown";
+		visibleContent: string | null;
+	}> {
+		const session = runtime.session;
+		const handoff = session.handoff;
+		const guard = runtime.cmGuard;
+		const hostGuard = runtime.hostGuard;
+		const fence = runtime.transitionInputFence;
+		if (
+			this.managedSessions.get(session.leafId) !== runtime
+			|| handoff?.pendingHostLoadCandidate !== candidate
+			|| session.view !== candidate.runtimeView
+			|| session.view.file !== handoff.targetFile
+			|| handoff.targetFile.path !== candidate.targetPathAtDispatch
+			|| this.getCmView(session.view) !== candidate.cm
+			|| guard === null
+			|| hostGuard === null
+			|| fence === null
+			|| fence.targetFile !== handoff.targetFile
+			|| fence.targetPath !== handoff.targetPath
+			|| !this.isTransitionContainerOwned(fence)
+		) return { kind: "mixed-or-unknown", visibleContent: null };
+		const read = () => {
+			const state = candidate.cm.state;
+			const document = state.doc;
+			const editor = session.view.editor;
+			// eslint-disable-next-line @typescript-eslint/unbound-method
+			const editorGetValue = editor.getValue;
+			// eslint-disable-next-line @typescript-eslint/unbound-method
+			const getViewData = candidate.runtimeView.getViewData;
+			let editorContent: string;
+			let hostContent: string;
+			let dataContent: unknown;
+			let cmSnapshot: CodeMirrorHandoffGuardSnapshot;
+			let hostSnapshot: ManagedViewSaveGuard;
+			let emergencyCurrent = false;
+			let targetPresentationReady = false;
+			try {
+				editorContent = Reflect.apply(editorGetValue, editor, []);
+				hostContent = Reflect.apply(getViewData, candidate.runtimeView, []);
+				dataContent = (candidate.runtimeView as TextFileView & Readonly<{
+					data?: unknown;
+				}>).data;
+				cmSnapshot = guard.snapshot();
+				hostSnapshot = hostGuard.snapshot();
+				emergencyCurrent = runtime.emergencySaveFence?.isCurrent() === true;
+				targetPresentationReady = hostGuard.isTargetPresentationReady({
+					handoffGeneration: candidate.handoffGeneration,
+					targetFile: handoff.targetFile,
+					certifiedContent: candidate.incomingContent,
+				});
+			} catch {
+				return null;
+			}
+			if (
+				this.managedSessions.get(session.leafId) !== runtime
+				|| runtime.session !== session
+				|| runtime.cmGuard !== guard
+				|| runtime.hostGuard !== hostGuard
+				|| runtime.transitionInputFence !== fence
+				|| this.getCmView(session.view) !== candidate.cm
+				|| candidate.cm.state !== state
+				|| state.doc !== document
+				|| session.view.editor !== editor
+				|| editor.getValue !== editorGetValue
+				|| candidate.runtimeView.getViewData !== getViewData
+				|| cmSnapshot.view !== candidate.cm
+				|| cmSnapshot.inert
+				|| !cmSnapshot.gateClosed
+				|| cmSnapshot.commitState !== "failed"
+				|| !hasExactHostGuardWrappers(hostSnapshot)
+				|| !hasNoPendingHostLoadOwner(hostSnapshot)
+				|| !hostSnapshot.emergencySaveBlocked
+				|| !emergencyCurrent
+			) return null;
+			return {
+				state,
+				document,
+				editor,
+				editorGetValue,
+				getViewData,
+				documentContent: document.toString(),
+				editorContent,
+				hostContent,
+				dataContent,
+				targetPresentationReady,
+				cmSnapshot,
+				hostSnapshot,
+			};
+		};
+		const first = read();
+		const second = read();
+		if (
+			first === null
+			|| second === null
+			|| first.state !== second.state
+			|| first.document !== second.document
+			|| first.editor !== second.editor
+			|| first.editorGetValue !== second.editorGetValue
+			|| first.getViewData !== second.getViewData
+			|| first.documentContent !== second.documentContent
+			|| first.editorContent !== second.editorContent
+			|| first.hostContent !== second.hostContent
+			|| first.dataContent !== second.dataContent
+			|| first.targetPresentationReady !== second.targetPresentationReady
+			|| !sameCodeMirrorGuardSnapshot(first.cmSnapshot, second.cmSnapshot)
+			|| !sameHostGuardSnapshot(first.hostSnapshot, second.hostSnapshot)
+		) return { kind: "mixed-or-unknown", visibleContent: null };
+		const exactTarget = second.documentContent === candidate.incomingContent
+			&& second.editorContent === candidate.incomingContent
+			&& second.hostContent === candidate.incomingContent
+			&& second.dataContent === candidate.incomingContent;
+		if (exactTarget) {
+			return {
+				kind: second.targetPresentationReady
+					? "exact-target"
+					: "exact-target-pending",
+				visibleContent: candidate.incomingContent,
+			};
+		}
+		const sourceContent = candidate.startDocument.toString();
+		const exactSource = second.documentContent === sourceContent
+			&& second.editorContent === sourceContent
+			&& second.hostContent === candidate.runtimeViewDataBefore
+			&& second.dataContent === candidate.runtimeViewDataBefore;
+		return exactSource
+			? { kind: "exact-source", visibleContent: sourceContent }
+			: {
+				kind: "mixed-or-unknown",
+				visibleContent: second.documentContent === second.editorContent
+					? second.documentContent
+					: null,
+			};
+	}
+
+	private handleFailedTargetPresentation(
+		runtime: ManagedLeafRuntime,
+		candidate: PendingHostLoadCandidate,
+		reason: string,
+	): void {
+		if (
+			!this.asyncAuthorityOpen
+			|| this.managedSessions.get(runtime.session.leafId) !== runtime
+			|| runtime.session.handoff?.pendingHostLoadCandidate !== candidate
+		) return;
+		this.ensureEmergencyHostSaveFence(runtime, `failed-target:${reason}`);
+		const surface = this.classifyFailedTargetSurface(runtime, candidate);
+		this.terminalizeManagedTargetCompletion(
+			runtime,
+			candidate,
+			`failed-target-${surface.kind}:${reason}`,
+			surface.visibleContent,
+		);
+	}
+
+	private handleLocalTargetPresentationCompletion(
+		runtime: ManagedLeafRuntime,
+		receipt: HostLoadCompletionReceipt,
+	): void {
+		const sourceSession = runtime.session;
+		const handoff = sourceSession.handoff;
+		const candidate = handoff?.pendingHostLoadCandidate ?? null;
+		if (
+			!this.asyncAuthorityOpen
+			|| this.managedSessions.get(sourceSession.leafId) !== runtime
+			|| handoff === null
+			|| candidate === null
+			|| handoff.presentation !== "target-candidate"
+			|| sourceSession.view.file !== handoff.targetFile
+			|| handoff.targetFile.path !== handoff.targetPath
+			|| !this.isHostLoadCompletionCurrent(receipt)
+			|| receipt.targetPath !== handoff.targetPath
+		) return;
+		if (!this.advanceSettledHostStateRevision(candidate)) {
+			this.trace?.("editor", "local-target-presentation-revision-rejected", {
+				leafId: sourceSession.leafId,
+				path: handoff.targetPath,
+			});
+			this.terminalizeManagedTargetCompletion(
+				runtime,
+				candidate,
+				"local-target-state-revision-rejected",
+			);
+			return;
+		}
+		const targetText = this.vaultSync.getTextForPath(handoff.targetPath);
+		const pathFileId = this.vaultSync.getFileId(handoff.targetPath) ?? null;
+		const textFileId = targetText === null
+			? null
+			: this.vaultSync.getFileIdForText(targetText) ?? null;
+		const targetFileId = targetText === null
+			? pathFileId
+			: pathFileId !== null && pathFileId === textFileId
+				? pathFileId
+				: null;
+		const reduction = reduceManagedLeafSession(sourceSession, {
+			type: "target-locally-presented",
+			sessionId: sourceSession.sessionId,
+			expectedGeneration: sourceSession.generation,
+			receipt,
+			targetFileId,
+		});
+		if (!reduction.accepted) {
+			this.trace?.("editor", "local-target-presentation-reducer-rejected", {
+				leafId: sourceSession.leafId,
+				path: handoff.targetPath,
+			});
+			this.terminalizeManagedTargetCompletion(
+				runtime,
+				candidate,
+				"local-target-reducer-rejected",
+			);
+			return;
+		}
+		if (
+			this.managedSessions.get(sourceSession.leafId) !== runtime
+			|| runtime.session !== sourceSession
+			|| sourceSession.handoff?.pendingHostLoadCandidate !== candidate
+			|| sourceSession.view.file !== handoff.targetFile
+			|| handoff.targetFile.path !== handoff.targetPath
+			|| this.getCmView(sourceSession.view) !== candidate.cm
+			|| candidate.cm.state.doc.toString() !== candidate.incomingContent
+		) {
+			if (this.managedSessions.get(sourceSession.leafId) === runtime) {
+				this.terminalizeManagedTargetCompletion(
+					runtime,
+					candidate,
+					"local-target-pre-mark-cas-drift",
+				);
+			}
+			return;
+		}
+		const mappedLeafId = this.cmToLeafId.get(candidate.cm);
+		if (mappedLeafId !== undefined && mappedLeafId !== sourceSession.leafId) {
+			this.trace?.("editor", "local-target-presentation-cm-owned-elsewhere", {
+				leafId: sourceSession.leafId,
+				path: handoff.targetPath,
+				mappedLeafId,
+			});
+			this.terminalizeManagedTargetCompletion(
+				runtime,
+				candidate,
+				"local-target-cm-owned-elsewhere",
+			);
+			return;
+		}
+		const hostGuard = runtime.hostGuard;
+		const cmGuard = runtime.cmGuard;
+		const emergencyFence = runtime.emergencySaveFence;
+		const authorityEpoch = this.readAuthorityEpoch();
+		let hostBefore: ManagedViewSaveGuard | null = null;
+		let cmBefore: CodeMirrorHandoffGuardSnapshot | null = null;
+		try {
+			hostBefore = hostGuard?.snapshot() ?? null;
+			cmBefore = cmGuard?.snapshot() ?? null;
+		} catch {
+			hostBefore = null;
+		}
+		let marked = false;
+		if (
+			hostGuard === null
+			|| hostBefore === null
+			|| cmGuard === null
+			|| cmBefore === null
+			|| cmBefore.view !== candidate.cm
+			|| this.getCmView(sourceSession.view) !== candidate.cm
+			|| !hasExactHostGuardWrappers(hostBefore)
+			|| !hasNoPendingHostLoadOwner(hostBefore)
+		) {
+			this.terminalizeManagedTargetCompletion(
+				runtime,
+				candidate,
+				"local-target-pre-mark-boundary-rejected",
+			);
+			return;
+		}
+		try {
+			marked = hostGuard.markTargetLocallyPresented({
+				handoffGeneration: sourceSession.generation,
+				targetFile: handoff.targetFile,
+				certifiedContent: candidate.incomingContent,
+			});
+		} catch {
+			marked = false;
+		}
+		if (!marked) {
+			this.trace?.("editor", "local-target-presentation-host-rejected", {
+				leafId: sourceSession.leafId,
+				path: handoff.targetPath,
+			});
+			this.terminalizeManagedTargetCompletion(
+				runtime,
+				candidate,
+				"local-target-host-mark-rejected",
+			);
+			return;
+		}
+		let hostContent: string | null = null;
+		let hostAfter: ManagedViewSaveGuard | null = null;
+		let cmAfter: CodeMirrorHandoffGuardSnapshot | null = null;
+		try {
+			hostContent = candidate.runtimeView.getViewData();
+			hostAfter = hostGuard.snapshot();
+			cmAfter = cmGuard?.snapshot() ?? null;
+		} catch {
+			hostAfter = null;
+		}
+		const postMarkCurrent = this.managedSessions.get(sourceSession.leafId) === runtime
+			&& runtime.session === sourceSession
+			&& runtime.hostGuard === hostGuard
+			&& runtime.cmGuard === cmGuard
+			&& runtime.emergencySaveFence === emergencyFence
+			&& sourceSession.handoff === handoff
+			&& handoff.pendingHostLoadCandidate === candidate
+			&& sourceSession.view.file === handoff.targetFile
+			&& handoff.targetFile.path === handoff.targetPath
+			&& this.getCmView(sourceSession.view) === candidate.cm
+			&& candidate.cm.state.doc.toString() === candidate.incomingContent
+			&& hostContent === candidate.incomingContent
+			&& hostAfter !== null
+			&& hasExactHostGuardWrappers(hostAfter)
+			&& hasNoPendingHostLoadOwner(hostAfter)
+			&& (hostAfter.pendingLoadEpoch ?? 0) === (hostBefore.pendingLoadEpoch ?? 0)
+			&& hostAfter.mode.kind === "pass-through"
+			&& hostAfter.hostCapabilityState === "ready"
+			&& sameCodeMirrorGuardSnapshot(cmBefore, cmAfter)
+			&& this.readAuthorityEpoch() === authorityEpoch;
+		if (!postMarkCurrent) {
+			this.terminalizeManagedTargetCompletion(
+				runtime,
+				candidate,
+				"local-target-post-mark-drift",
+			);
+			return;
+		}
+		const markProof = Object.freeze({
+			runtime,
+			sourceSession,
+			candidate,
+			hostGuard,
+			targetFile: handoff.targetFile,
+			targetPath: handoff.targetPath,
+		}) satisfies ManagedTargetMarkReleaseProof;
+		if (!this.releaseEmergencyHostSaveFence(
+			runtime,
+			"target-locally-presented",
+			false,
+			markProof,
+		)) {
+			this.terminalizeManagedTargetCompletion(
+				runtime,
+				candidate,
+				"local-target-emergency-release-rejected",
+			);
+			return;
+		}
+		this.pendingAdmissionByLeafId.delete(sourceSession.leafId);
+		this.advanceAuthorityEpoch();
+		const targetEditorRevision =
+			this.editorRevisionByCm.get(candidate.cm) ?? 0;
+		this.editorAuthorityRevisionByCm.set(
+			candidate.cm,
+			targetEditorRevision,
+		);
+		this.editorAuthorityContentByCm.set(
+			candidate.cm,
+			candidate.incomingContent,
+		);
+		this.cmToLeafId.set(candidate.cm, sourceSession.leafId);
+		runtime.session = reduction.state;
+		runtime.capturedSourceAuthority = null;
+		runtime.adoption = NO_SAME_PATH_ADOPTION;
+		try {
+			this.applyHandoffEffects(
+				runtime,
+				reduction.effects,
+				"target-locally-presented",
+			);
+		} catch {
+			this.terminalizeManagedTargetCompletion(
+				runtime,
+				candidate,
+				"local-target-publication-effect-failed",
+			);
+			return;
+		}
+		if (
+			runtime.cmGuard?.snapshot().gateClosed !== false
+			|| this.getCodeMirrorHandoffContext(reduction.state.leafId)?.kind !== "same-path"
+		) {
+			this.terminalizeManagedTargetCompletion(
+				runtime,
+				candidate,
+				"local-target-final-boundary-rejected",
+			);
+			return;
+		}
+		if (!this.releaseTransitionInputFence(
+			runtime,
+			handoff.targetFile,
+			handoff.targetPath,
+			"target-locally-presented",
+		)) {
+			this.terminalizeManagedTargetCompletion(
+				runtime,
+				candidate,
+				"local-target-transition-release-rejected",
+			);
+			return;
+		}
+		if (this.editorAuthorityControllerPort?.requestSamePathAdoption) {
+			this.samePathAdoptionRequiredPathByLeafId.set(
+				reduction.state.leafId,
+				handoff.targetPath,
+			);
+		}
+		this.trace?.("editor", "local-target-presentation-published", {
+			leafId: reduction.state.leafId,
+			path: handoff.targetPath,
+		});
+
+		// B is already the stable local editor authority. Sync admission now runs
+		// through the ordinary same-path contract and may retry indefinitely
+		// without rolling the editor back to A or capturing transition input.
+		this.scheduleSamePathAdoptionRefresh(runtime, "target-locally-presented");
+	}
+
 	private isHostLoadCandidateCurrent(candidate: PendingHostLoadCandidate): boolean {
 		const session = this.managedSessions.get(candidate.leafId)?.session;
 		return this.asyncAuthorityOpen
@@ -5820,306 +5219,6 @@ export class EditorBindingManager {
 			&& session.generation === receipt.handoffGeneration
 			&& session.handoff?.sourceUnloadReceiptId === candidate?.sourceUnloadReceiptId
 			&& candidate?.hostLoadTokenId === receipt.hostLoadTokenId;
-	}
-
-	private isManagedTargetWorkflowCurrent(
-		runtime: ManagedLeafRuntime,
-		workflow: ManagedTargetWorkflow,
-	): boolean {
-		const handoff = runtime.session.handoff;
-		return this.asyncAuthorityOpen
-			&& this.managedSessions.get(runtime.session.leafId) === runtime
-			&& runtime.targetWorkflow === workflow
-			&& runtime.session.sessionId === workflow.sessionId
-			&& runtime.session.generation === workflow.handoffGeneration
-			&& runtime.session.currentSwitchIntentSeq === workflow.switchIntentSeq
-			&& runtime.session.view.file === workflow.targetFile
-			&& workflow.targetFile.path === workflow.targetPath
-			&& handoff !== null
-			&& handoff.targetFile === workflow.targetFile
-			&& handoff.targetPath === workflow.targetPath
-			&& handoff.sourceUnloadReceiptId !== null
-			&& handoff.sourceUnloadReceiptId === workflow.candidate.sourceUnloadReceiptId;
-	}
-
-	private captureOpenViewsForAdmission(path: string): MarkdownView[] {
-		return this.captureAuthorityOpenFileViews(path).filter((view): view is MarkdownView => {
-			return (view as MarkdownView | null)?.file?.path === path;
-		});
-	}
-
-	private beginTargetPresentation(runtime: ManagedLeafRuntime): void {
-		const port = this.editorAuthorityControllerPort;
-		const handoff = runtime.session.handoff;
-		const candidate = handoff?.pendingHostLoadCandidate ?? null;
-		if (
-			!this.asyncAuthorityOpen
-			|| !port
-			|| !handoff
-			|| !candidate
-			|| handoff.presentation !== "target-candidate"
-			|| runtime.session.currentSwitchIntentSeq === null
-		) return;
-		const retained = runtime.targetWorkflow;
-		if (
-			retained
-			&& retained.candidate === candidate
-			&& this.isManagedTargetWorkflowCurrent(runtime, retained)
-		) return;
-		const openViews = this.captureOpenViewsForAdmission(handoff.targetPath);
-		if (openViews.length === 0) {
-			this.trace?.("editor", "target-presentation-start-deferred", {
-				leafId: runtime.session.leafId,
-				path: handoff.targetPath,
-				reason: "target-view-not-enumerated",
-				viewPath: runtime.session.view.file?.path ?? null,
-			});
-			return;
-		}
-		let openEditorTicket: OpenEditorMutationTicket;
-		try {
-			openEditorTicket = this.captureOpenEditorMutationTicket(
-				handoff.targetPath,
-				openViews,
-			);
-		} catch (error) {
-			this.trace?.("editor", "target-presentation-start-deferred", {
-				leafId: runtime.session.leafId,
-				path: handoff.targetPath,
-				reason: "ticket-capture-failed",
-				error: error instanceof Error ? error.message : String(error),
-			});
-			return;
-		}
-		const workflow: ManagedTargetWorkflow = {
-			sessionId: runtime.session.sessionId,
-			handoffGeneration: runtime.session.generation,
-			switchIntentSeq: runtime.session.currentSwitchIntentSeq,
-			targetFile: handoff.targetFile,
-			targetPath: handoff.targetPath,
-			candidate,
-			openEditorTicket,
-			presentationPlan: null,
-			presentationRequestInFlight: false,
-			presentationPermitConsumed: false,
-			presentationCommitInFlight: false,
-			presentationCompletionInFlight: false,
-			hostCompletionReceipt: null,
-			targetPresentationReceipt: null,
-			targetReadyToken: null,
-			openAdmissionInFlight: false,
-		};
-		this.clearTargetPresentationRetry(runtime.session.leafId, false);
-		this.clearTargetBindingRetry(runtime.session.leafId);
-		runtime.targetWorkflow = workflow;
-		const request: TargetPresentationRequest = Object.freeze({
-			requestId: this.createManagedAuthorityRequestId("target-presentation"),
-			sessionId: workflow.sessionId,
-			leafId: runtime.session.leafId,
-			handoffGeneration: workflow.handoffGeneration,
-			switchIntentSeq: workflow.switchIntentSeq,
-			targetPath: workflow.targetPath,
-			targetFile: workflow.targetFile,
-			candidate,
-			openEditorTicket,
-		});
-		void this.runTargetPresentationRequest(runtime, workflow, request);
-	}
-
-	private async runTargetPresentationRequest(
-		runtime: ManagedLeafRuntime,
-		workflow: ManagedTargetWorkflow,
-		request: TargetPresentationRequest,
-	): Promise<void> {
-		const port = this.editorAuthorityControllerPort;
-		if (!port || workflow.presentationRequestInFlight) return;
-		workflow.presentationRequestInFlight = true;
-		const requestedAt = Date.now();
-		let result: TargetPresentationRequestResult;
-		try {
-			result = await port.requestTargetPresentation(request);
-		} catch (error) {
-			workflow.presentationRequestInFlight = false;
-			this.trace?.("editor", "target-presentation-request-failed", {
-				leafId: request.leafId,
-				path: request.targetPath,
-				error: error instanceof Error ? error.message : String(error),
-			});
-			this.scheduleTargetPresentationReplan(runtime, workflow, "request-failed");
-			return;
-		}
-		workflow.presentationRequestInFlight = false;
-		const workflowCurrent = this.isManagedTargetWorkflowCurrent(runtime, workflow);
-		this.trace?.("editor", "target-presentation-request-settled", {
-			leafId: request.leafId,
-			path: request.targetPath,
-			kind: result.kind,
-			reason: result.kind === "planned" ? null : result.reason,
-			workflowCurrent,
-			durationMs: Date.now() - requestedAt,
-		});
-		if (!workflowCurrent) return;
-		if (result.kind !== "planned") {
-			this.trace?.("editor", "target-presentation-deferred", {
-				leafId: request.leafId,
-				path: request.targetPath,
-				kind: result.kind,
-				reason: result.reason,
-			});
-			this.scheduleTargetPresentationReplan(
-				runtime,
-				workflow,
-				`request-${result.kind}-${result.reason}`,
-			);
-			return;
-		}
-		const plan = result.plan;
-		if (
-			plan.hostLoadTokenId !== workflow.candidate.hostLoadTokenId
-			|| plan.switchIntentSeq !== workflow.switchIntentSeq
-			|| plan.expectedNativeHistoryEpoch
-				!== workflow.candidate.nativeHistoryEpochBefore
-		) {
-			this.scheduleTargetPresentationReplan(runtime, workflow, "plan-lineage-mismatch");
-			return;
-		}
-		workflow.presentationPlan = plan;
-		const guard = runtime.cmGuard;
-		if (!guard) {
-			this.scheduleTargetPresentationReplan(runtime, workflow, "guard-missing");
-			return;
-		}
-		const permitContext: TargetPresentationPermitContext = Object.freeze({
-			presentationPlanId: plan.planId,
-			authorityFreshnessHandleId: plan.authorityFreshnessHandleId,
-			sessionId: workflow.sessionId,
-			leafId: runtime.session.leafId,
-			handoffGeneration: workflow.handoffGeneration,
-			switchIntentSeq: workflow.switchIntentSeq,
-			targetPath: workflow.targetPath,
-			targetFile: workflow.targetFile,
-			hostLoadTokenId: workflow.candidate.hostLoadTokenId,
-			candidate: workflow.candidate,
-			openEditorTicket: workflow.openEditorTicket,
-		});
-		if (!port.consumeTargetPresentationPermit(plan.presentationPermitId, permitContext)) {
-			this.scheduleTargetPresentationReplan(runtime, workflow, "permit-stale");
-			return;
-		}
-		workflow.presentationPermitConsumed = true;
-		if (!this.isManagedTargetWorkflowCurrent(runtime, workflow)) return;
-		this.clearTargetPresentationRetry(runtime.session.leafId);
-		void this.applyTargetPresentationPlan(runtime, workflow);
-	}
-
-	private async applyTargetPresentationPlan(
-		runtime: ManagedLeafRuntime,
-		workflow: ManagedTargetWorkflow,
-	): Promise<void> {
-		const plan = workflow.presentationPlan;
-		const guard = runtime.cmGuard;
-		if (
-			!plan
-			|| !guard
-			|| !workflow.presentationPermitConsumed
-			|| workflow.presentationCommitInFlight
-			|| !this.isManagedTargetWorkflowCurrent(runtime, workflow)
-		) return;
-		workflow.presentationCommitInFlight = true;
-		let accepted: Awaited<ReturnType<CodeMirrorHandoffGuard["acceptHeldHostLoad"]>>;
-		try {
-			accepted = await guard.acceptHeldHostLoad({
-				candidate: workflow.candidate,
-				presentationPlanId: plan.planId,
-			});
-		} catch (error) {
-			workflow.presentationCommitInFlight = false;
-			this.trace?.("editor", "target-presentation-host-load-failed", {
-				leafId: runtime.session.leafId,
-				path: workflow.targetPath,
-				error: error instanceof Error ? error.message : String(error),
-			});
-			this.scheduleTargetPresentationCommitRetry(runtime, workflow, "host-load-failed");
-			return;
-		}
-		workflow.presentationCommitInFlight = false;
-		if (!this.isManagedTargetWorkflowCurrent(runtime, workflow)) return;
-		if (accepted.kind === "accepted") {
-			this.handleSettledHostLoadCompletion(runtime, accepted.receipt);
-			return;
-		}
-		if (accepted.kind === "pending-notification") {
-			this.scheduleTargetPresentationCommitRetry(
-				runtime,
-				workflow,
-				`pending-${accepted.notification}`,
-			);
-			return;
-		}
-		if (accepted.kind === "rejected") {
-			const commitSnapshot = guard.snapshot();
-			const qaFailureDetails = (
-				typeof __KAOS_QA_HARNESS_ENABLED__ !== "undefined"
-				&& __KAOS_QA_HARNESS_ENABLED__
-			)
-				? {
-					commitFailureReason: commitSnapshot.commitFailureReason ?? null,
-					gateAuthorityAdvanceFailureReason:
-						commitSnapshot.gateAuthorityAdvanceFailureReason ?? null,
-					inputAuthorityAdvanceFailureReason:
-						commitSnapshot.inputAuthorityAdvanceFailureReason ?? null,
-					hostPostDelegationFailureReason:
-						commitSnapshot.hostPostDelegationFailureReason ?? null,
-				}
-				: {};
-			this.trace?.("editor", "target-presentation-host-load-rejected", {
-				leafId: runtime.session.leafId,
-				path: workflow.targetPath,
-				reason: accepted.reason,
-				...qaFailureDetails,
-			});
-			const commitState = commitSnapshot.commitState;
-			if (commitState === "pending" || commitState === "committed") {
-				this.scheduleTargetPresentationCommitRetry(
-					runtime,
-					workflow,
-					`host-load-${accepted.reason}`,
-				);
-			}
-		}
-	}
-
-	private handleSettledHostLoadCompletion(
-		runtime: ManagedLeafRuntime,
-		receipt: HostLoadCompletionReceipt,
-	): void {
-		const workflow = runtime.targetWorkflow;
-		if (
-			!workflow
-			|| !workflow.presentationPlan
-			|| !this.isManagedTargetWorkflowCurrent(runtime, workflow)
-			|| !this.isHostLoadCompletionCurrent(receipt)
-			|| receipt.hostLoadTokenId !== workflow.candidate.hostLoadTokenId
-			|| receipt.switchIntentSeq !== workflow.switchIntentSeq
-			|| receipt.targetPath !== workflow.targetPath
-		) return;
-		if (workflow.hostCompletionReceipt === receipt) return;
-		if (workflow.hostCompletionReceipt !== null) return;
-		if (!this.advanceSettledHostStateRevision(workflow.candidate)) {
-			this.trace?.("editor", "target-presentation-state-revision-rejected", {
-				leafId: runtime.session.leafId,
-				path: workflow.targetPath,
-				applicationKind: workflow.candidate.applicationKind,
-				observedEditorRevision:
-					this.editorRevisionByCm.get(workflow.candidate.cm) ?? 0,
-				expectedEditorRevision:
-					workflow.candidate.editorRevisionBefore + 1,
-			});
-			return;
-		}
-		this.clearTargetPresentationRetry(runtime.session.leafId);
-		workflow.hostCompletionReceipt = receipt;
-		void this.finishTargetPresentation(runtime, workflow, receipt);
 	}
 
 	private advanceSettledHostStateRevision(
@@ -6143,497 +5242,37 @@ export class EditorBindingManager {
 		return true;
 	}
 
-	private async finishTargetPresentation(
-		runtime: ManagedLeafRuntime,
-		workflow: ManagedTargetWorkflow,
-		hostReceipt: HostLoadCompletionReceipt,
-	): Promise<void> {
-		const port = this.editorAuthorityControllerPort;
-		const plan = workflow.presentationPlan;
-		if (!port || !plan || workflow.presentationCompletionInFlight) return;
-		workflow.presentationCompletionInFlight = true;
-		let result: TargetPresentationResult;
-		try {
-			result = await port.completeTargetPresentation(hostReceipt);
-		} catch (error) {
-			workflow.presentationCompletionInFlight = false;
-			this.trace?.("editor", "target-presentation-completion-failed", {
-				leafId: runtime.session.leafId,
-				path: workflow.targetPath,
-				error: error instanceof Error ? error.message : String(error),
-			});
-			this.scheduleTargetPresentationCompletionRetry(
-				runtime,
-				workflow,
-				hostReceipt,
-				"completion-failed",
-			);
-			return;
-		}
-		workflow.presentationCompletionInFlight = false;
-		if (!this.isManagedTargetWorkflowCurrent(runtime, workflow)) return;
-		if (result.kind !== "accepted") {
-			this.scheduleTargetPresentationCompletionRetry(
-				runtime,
-				workflow,
-				hostReceipt,
-				`completion-${result.reason}`,
-			);
-			return;
-		}
-		const receipt = result.receipt;
-		if (
-			receipt.presentationPlanId !== plan.planId
-			|| receipt.hostLoadCompletionReceipt !== hostReceipt
-			|| receipt.replacementTargetReadyToken.targetFile !== workflow.targetFile
-			|| receipt.replacementTargetReadyToken.targetPath !== workflow.targetPath
-		) {
-			this.scheduleTargetPresentationCompletionRetry(
-				runtime,
-				workflow,
-				hostReceipt,
-				"completion-lineage-mismatch",
-			);
-			return;
-		}
-		const reduction = reduceManagedLeafSession(runtime.session, {
-			type: "target-presented",
-			sessionId: workflow.sessionId,
-			expectedGeneration: workflow.handoffGeneration,
-			receipt,
-		});
-		if (!reduction.accepted) {
-			this.scheduleTargetPresentationCompletionRetry(
-				runtime,
-				workflow,
-				hostReceipt,
-				"completion-reducer-rejected",
-			);
-			return;
-		}
-		if (runtime.hostGuard?.markTargetProven({
-			handoffGeneration: workflow.handoffGeneration,
-			targetFile: workflow.targetFile,
-			certifiedContent: receipt.replacementTargetReadyToken.certifiedBaseContent,
-		}) !== true) {
-			this.scheduleTargetPresentationCompletionRetry(
-				runtime,
-				workflow,
-				hostReceipt,
-				"completion-host-guard-rejected",
-			);
-			return;
-		}
-		this.clearTargetPresentationRetry(runtime.session.leafId);
-		workflow.targetPresentationReceipt = receipt;
-		workflow.targetReadyToken = receipt.replacementTargetReadyToken;
-		this.advanceAuthorityEpoch();
-		runtime.session = reduction.state;
-		this.applyHandoffEffects(runtime, reduction.effects, "target-presented");
-		this.onHandoffTargetPresentationReady?.(
-			receipt.replacementTargetReadyToken,
-		);
-		this.requestTargetBindingAdmission(runtime, workflow);
-	}
-
-	private clearTargetPresentationRetry(leafId: string, resetAttempts = true): void {
-		const timer = this.pendingTargetPresentationRetries.get(leafId);
-		if (timer) clearTimeout(timer);
-		this.pendingTargetPresentationRetries.delete(leafId);
-		if (resetAttempts) this.targetPresentationRetryAttempts.delete(leafId);
-	}
-
-	private scheduleTargetPresentationRetry(
-		runtime: ManagedLeafRuntime,
-		workflow: ManagedTargetWorkflow,
-		reason: string,
-		retry: () => void,
-	): void {
-		const leafId = runtime.session.leafId;
-		if (
-			!this.isManagedTargetWorkflowCurrent(runtime, workflow)
-			|| runtime.session.handoff?.presentation !== "target-candidate"
-			|| this.pendingTargetPresentationRetries.has(leafId)
-		) return;
-		const attempt = (this.targetPresentationRetryAttempts.get(leafId) ?? 0) + 1;
-		this.targetPresentationRetryAttempts.set(leafId, attempt);
-		const delayMs = TARGET_PRESENTATION_RETRY_DELAYS_MS[
-			Math.min(attempt - 1, TARGET_PRESENTATION_RETRY_DELAYS_MS.length - 1)
-		]!;
-		const timer = setTimeout(() => {
-			if (this.pendingTargetPresentationRetries.get(leafId) !== timer) return;
-			this.pendingTargetPresentationRetries.delete(leafId);
-			if (!this.isManagedTargetWorkflowCurrent(runtime, workflow)) {
-				this.targetPresentationRetryAttempts.delete(leafId);
-				return;
-			}
-			retry();
-		}, delayMs);
-		this.pendingTargetPresentationRetries.set(leafId, timer);
-		this.trace?.("editor", "target-presentation-fresh-evaluation-scheduled", {
-			leafId,
-			path: workflow.targetPath,
-			reason,
-			attempt,
-			delayMs,
-		});
-	}
-
-	private scheduleTargetPresentationReplan(
-		runtime: ManagedLeafRuntime,
-		workflow: ManagedTargetWorkflow,
-		reason: string,
-	): void {
-		if (workflow.presentationPermitConsumed) return;
-		this.scheduleTargetPresentationRetry(runtime, workflow, reason, () => {
-			if (
-				workflow.presentationPermitConsumed
-				|| runtime.targetWorkflow !== workflow
-			) return;
-			runtime.targetWorkflow = null;
-			this.beginTargetPresentation(runtime);
-		});
-	}
-
-	private scheduleTargetPresentationCommitRetry(
-		runtime: ManagedLeafRuntime,
-		workflow: ManagedTargetWorkflow,
-		reason: string,
-	): void {
-		this.scheduleTargetPresentationRetry(runtime, workflow, reason, () => {
-			void this.applyTargetPresentationPlan(runtime, workflow);
-		});
-	}
-
-	private scheduleTargetPresentationCompletionRetry(
-		runtime: ManagedLeafRuntime,
-		workflow: ManagedTargetWorkflow,
-		hostReceipt: HostLoadCompletionReceipt,
-		reason: string,
-	): void {
-		this.scheduleTargetPresentationRetry(runtime, workflow, reason, () => {
-			void this.finishTargetPresentation(runtime, workflow, hostReceipt);
-		});
-	}
-
-	private clearTargetBindingRetry(leafId: string, resetAttempts = true): void {
-		const timer = this.pendingTargetBindingRetries.get(leafId);
-		if (timer) clearTimeout(timer);
-		this.pendingTargetBindingRetries.delete(leafId);
-		if (resetAttempts) this.targetBindingRetryAttempts.delete(leafId);
-	}
-
-	private captureRecoveryTargetBindingRequest(
-		runtime: ManagedLeafRuntime,
-		workflow: ManagedTargetWorkflow,
-	): NonNullable<ManagedLeafSession["handoff"]>["recoveryTargetBindingRequest"] {
-		const session = runtime.session;
-		const handoff = session.handoff;
-		const request = handoff?.recoveryTargetBindingRequest ?? null;
-		const intentState = handoff?.intentState;
-		if (
-			!request
-			|| !intentState
-			|| (
-				intentState.kind !== "stored"
-				&& intentState.kind !== "replay-pending"
-			)
-			|| !this.isManagedTargetWorkflowCurrent(runtime, workflow)
-			|| handoff.presentation !== "target-proven"
-			|| handoff.pendingHostLoadCandidate !== null
-			|| !handoff.inputGateInstalled
-			|| handoff.saveGuardInstalled
-			|| (
-				intentState.kind === "stored"
-					? handoff.phase !== "awaiting-recovery-commit"
-					: handoff.phase !== "awaiting-replay-settlement"
-			)
-			|| request.recoveryOperationEpoch !== handoff.recoveryOperationEpoch
-			|| request.intentId !== intentState.intentId
-			|| request.recordId !== intentState.recordId
-			|| session.binding.kind !== "unbound"
-			|| session.pendingInputStartReservation !== null
-			|| session.displayedLineage.kind !== "known"
-			|| session.displayedLineage.file !== handoff.targetFile
-			|| session.displayedLineage.path !== handoff.targetPath
-			|| session.displayedLineage.cm.state.doc
-				!== session.displayedLineage.document
-			|| !session.activeRecoveries.some((recovery) =>
-				recovery.sessionId === session.sessionId
-				&& recovery.handoffGeneration === session.generation
-				&& recovery.recoveryOperationEpoch === request.recoveryOperationEpoch
-				&& recovery.intentState.kind === intentState.kind
-				&& recovery.intentState.intentId === request.intentId
-				&& recovery.intentState.recordId === request.recordId
-				&& recovery.intent.intentId === request.intentId
-				&& recovery.intent.targetPath === workflow.targetPath
-				&& recovery.intent.targetFile === workflow.targetFile
-			)
-		) return null;
-		return request;
-	}
-
-	private isNormalTargetBindingReady(
-		runtime: ManagedLeafRuntime,
-		workflow: ManagedTargetWorkflow,
-	): boolean {
-		const handoff = runtime.session.handoff;
-		return this.isManagedTargetWorkflowCurrent(runtime, workflow)
-			&& handoff?.presentation === "target-proven"
-			&& handoff.phase === "target-ready"
-			&& !handoff.inputGateInstalled
-			&& !handoff.saveGuardInstalled
-			&& runtime.session.pendingInputStartReservation === null;
-	}
-
-	private scheduleTargetBindingRetry(
-		runtime: ManagedLeafRuntime,
-		workflow: ManagedTargetWorkflow,
-		reason: string,
-	): void {
-		const leafId = runtime.session.leafId;
-		const recoveryRequest =
-			this.captureRecoveryTargetBindingRequest(runtime, workflow);
-		if (
-			(!this.isNormalTargetBindingReady(runtime, workflow) && !recoveryRequest)
-			|| this.pendingTargetBindingRetries.has(leafId)
-		) return;
-		workflow.targetReadyToken = null;
-		const attempt = (this.targetBindingRetryAttempts.get(leafId) ?? 0) + 1;
-		this.targetBindingRetryAttempts.set(leafId, attempt);
-		const delayMs = TARGET_BIND_RETRY_DELAYS_MS[
-			Math.min(attempt - 1, TARGET_BIND_RETRY_DELAYS_MS.length - 1)
-		]!;
-		const timer = setTimeout(() => {
-			if (this.pendingTargetBindingRetries.get(leafId) !== timer) return;
-			this.pendingTargetBindingRetries.delete(leafId);
-			if (!this.isManagedTargetWorkflowCurrent(runtime, workflow)) {
-				this.targetBindingRetryAttempts.delete(leafId);
-				return;
-			}
-			this.requestTargetBindingAdmission(runtime, workflow);
-		}, delayMs);
-		this.pendingTargetBindingRetries.set(leafId, timer);
-		this.trace?.("editor", "target-binding-fresh-evaluation-scheduled", {
-			leafId,
-			path: workflow.targetPath,
-			reason,
-			attempt,
-			delayMs,
-		});
-	}
-
-	private requestTargetBindingAdmission(
-		runtime: ManagedLeafRuntime,
-		workflow: ManagedTargetWorkflow,
-	): void {
-		const port = this.editorAuthorityControllerPort;
-		const recoveryRequest =
-			this.captureRecoveryTargetBindingRequest(runtime, workflow);
-		if (
-			!port
-			|| workflow.openAdmissionInFlight
-			|| !workflow.targetPresentationReceipt
-			|| (
-				!this.isNormalTargetBindingReady(runtime, workflow)
-				&& !recoveryRequest
-			)
-		) return;
-		this.clearTargetBindingRetry(runtime.session.leafId, false);
-		const openViews = this.captureOpenViewsForAdmission(workflow.targetPath);
-		if (openViews.length === 0) {
-			this.scheduleTargetBindingRetry(runtime, workflow, "open-view-missing");
-			return;
-		}
-		let openEditorTicket: OpenEditorMutationTicket;
-		try {
-			openEditorTicket = this.captureOpenEditorMutationTicket(
-				workflow.targetPath,
-				openViews,
-			);
-		} catch {
-			this.scheduleTargetBindingRetry(runtime, workflow, "ticket-capture-failed");
-			return;
-		}
-		const requestId =
-			this.createManagedAuthorityRequestId("open-path-admission");
-		let request: OpenPathAdmissionRequest;
-		if (recoveryRequest) {
-			const recoveryClaim: HandoffReplayRecoveryClaim = Object.freeze({
-				recoveryOperationEpoch:
-					recoveryRequest.recoveryOperationEpoch,
-				intentId: recoveryRequest.intentId,
-				recordId: recoveryRequest.recordId,
-			});
-			if (!this.isHandoffReplayRecoveryOpenEditorMutationTicket(
-				openEditorTicket,
-				recoveryClaim,
-			)) {
-				this.scheduleTargetBindingRetry(
-					runtime,
-					workflow,
-					"recovery-ticket-capture-failed",
-				);
-				return;
-			}
-			request = Object.freeze({
-				requestId,
-				reason: "handoff-replay-target-bind",
-				recoveryClaim,
-				sessionId: workflow.sessionId,
-				leafId: runtime.session.leafId,
-				handoffGeneration: workflow.handoffGeneration,
-				switchIntentSeq: workflow.switchIntentSeq,
-				targetPath: workflow.targetPath,
-				targetFile: workflow.targetFile,
-				presentation: "target-proven",
-				hostLoadTokenId: null,
-				openEditorTicket,
-			});
-		} else {
-			request = Object.freeze({
-				requestId,
-				reason: "open-editor-missing-target",
-				sessionId: workflow.sessionId,
-				leafId: runtime.session.leafId,
-				handoffGeneration: workflow.handoffGeneration,
-				switchIntentSeq: workflow.switchIntentSeq,
-				targetPath: workflow.targetPath,
-				targetFile: workflow.targetFile,
-				presentation: "target-proven",
-				hostLoadTokenId: null,
-				openEditorTicket,
-			});
-		}
-		workflow.openAdmissionInFlight = true;
-		void this.runTargetBindingAdmission(runtime, workflow, request);
-	}
-
-	private async runTargetBindingAdmission(
-		runtime: ManagedLeafRuntime,
-		workflow: ManagedTargetWorkflow,
-		request: OpenPathAdmissionRequest,
-	): Promise<void> {
-		const port = this.editorAuthorityControllerPort;
-		if (!port) return;
-		let result: OpenPathAdmissionResult;
-		try {
-			result = await port.requestOpenPathAdmission(request);
-		} catch (error) {
-			if (this.isManagedTargetWorkflowCurrent(runtime, workflow)) {
-				workflow.openAdmissionInFlight = false;
-				this.scheduleTargetBindingRetry(runtime, workflow, "admission-request-failed");
-			}
-			this.trace?.("editor", "open-path-admission-failed", {
-				leafId: request.leafId,
-				path: request.targetPath,
-				error: error instanceof Error ? error.message : String(error),
-			});
-			return;
-		}
-		if (!this.isManagedTargetWorkflowCurrent(runtime, workflow)) return;
-		let token: TargetReadyToken | null = null;
-		if (result.kind === "existing") {
-			token = result.targetReadyToken;
-		} else if (result.kind === "seed-required") {
-			let seeded: MissingTargetSeedResult;
-			try {
-				seeded = await port.seedMissingTarget(result.plan);
-			} catch {
-				if (this.isManagedTargetWorkflowCurrent(runtime, workflow)) {
-					workflow.openAdmissionInFlight = false;
-					this.scheduleTargetBindingRetry(runtime, workflow, "target-seed-failed");
-				}
-				return;
-			}
-			if (!this.isManagedTargetWorkflowCurrent(runtime, workflow)) return;
-			if (seeded.kind === "seeded") {
-				token = seeded.receipt.replacementTargetReadyToken;
-			}
-		}
-		if (!token) {
-			workflow.openAdmissionInFlight = false;
-			this.scheduleTargetBindingRetry(runtime, workflow, `admission-${result.kind}`);
-			return;
-		}
-		workflow.openAdmissionInFlight = false;
-		workflow.targetReadyToken = token;
-		this.bindManagedTargetReady(runtime, workflow, token);
-	}
-
-	private bindManagedTargetReady(
-		runtime: ManagedLeafRuntime,
-		workflow: ManagedTargetWorkflow,
-		token: TargetReadyToken,
-	): void {
-		if (!this.isManagedTargetWorkflowCurrent(runtime, workflow)) return;
-		if (
-			token.targetAuthority.kind !== "existing"
-			|| token.sessionId !== workflow.sessionId
-			|| token.leafId !== runtime.session.leafId
-			|| token.handoffGeneration !== workflow.handoffGeneration
-			|| token.switchIntentSeq !== workflow.switchIntentSeq
-			|| token.targetFile !== workflow.targetFile
-			|| token.targetPath !== workflow.targetPath
-		) {
-			this.scheduleTargetBindingRetry(runtime, workflow, "target-token-lineage-mismatch");
-			return;
-		}
-		const cm = this.getCmView(runtime.session.view);
-		const ytext = this.vaultSync.getTextForPath(workflow.targetPath);
-		if (!cm || !ytext) {
-			this.scheduleTargetBindingRetry(runtime, workflow, "target-runtime-authority-missing");
-			return;
-		}
-		const bound = this.applyBinding({
-			action: "bind",
-			deviceName: this.lastDeviceName,
-			view: runtime.session.view,
-			cm,
-			cmId: this.getCmId(cm),
-			leafId: runtime.session.leafId,
-			file: workflow.targetFile,
-			filePath: workflow.targetPath,
-			ytext,
-			fileId: token.targetAuthority.fileId,
-			targetReadyToken: token,
-			targetPresentationReceipt: workflow.targetPresentationReceipt ?? undefined,
-			reason: "target-ready-token",
-			rapidSwitch: true,
-		});
-		if (bound && runtime.targetWorkflow === workflow) {
-			this.clearTargetPresentationRetry(runtime.session.leafId);
-			this.clearTargetBindingRetry(runtime.session.leafId);
-			if (runtime.session.handoff?.recoveryTargetBindingRequest == null) {
-				runtime.targetWorkflow = null;
-			}
-			this.pendingAdmissionByLeafId.delete(runtime.session.leafId);
-			const current = this.captureCurrentTargetReadyToken({
-				sessionId: token.sessionId,
-				expectedGeneration: token.handoffGeneration,
-				targetPath: token.targetPath,
-				targetFile: token.targetFile,
-			});
-			if (current === token) this.onHandoffTargetReady?.(token);
-		} else if (runtime.targetWorkflow === workflow) {
-			this.scheduleTargetBindingRetry(runtime, workflow, "final-bind-cas-stale");
-		}
-	}
-
 	beginPathHandoff(
 		view: MarkdownView,
 		targetFile: TFile,
 		reason: string,
 		provenance: "observed" | "selected" = "observed",
 		sourceUnloadReceiptId: string | null = null,
+		expectedAdmissionOwner: ManagedDeferredLoadAdmissionSnapshot | null = null,
 	): boolean {
 		this.manageView(view);
 		const leafId = this.getLeafId(view);
 		const runtime = this.managedSessions.get(leafId);
 		if (!runtime || runtime.session.view !== view) return false;
 		if (!this.requireManagedBoundary(view, `handoff:${reason}`)) return false;
+		if (this.observedFileMismatchTerminalByRuntime.has(runtime)) {
+			this.enterObservedFileMismatchTerminal(runtime, targetFile, reason);
+			return false;
+		}
 		const existing = this.bindings.get(leafId);
 		const displayed = runtime.session.displayedLineage;
+		if (
+			provenance === "observed"
+			&& view.file === targetFile
+			&& displayed.kind === "known"
+			&& (
+				displayed.file !== targetFile
+				|| displayed.path !== targetFile.path
+			)
+		) {
+			this.enterObservedFileMismatchTerminal(runtime, targetFile, reason);
+			return false;
+		}
 		if (
 			runtime.session.handoff === null
 			&& displayed.kind === "known"
@@ -6697,10 +5336,163 @@ export class EditorBindingManager {
 		);
 		if (!reduction.accepted) return false;
 		const sourceSession = runtime.session;
+		const sourceBinding = existing;
 		const sourceBindingEpoch = this.bindingEpochByLeafId.get(leafId) ?? 0;
 		const sourceViewFile = view.file;
 		const sourceViewPath = sourceViewFile?.path ?? null;
 		const targetPath = targetFile.path;
+		const sourceAuthorityEpoch = this.readAuthorityEpoch();
+		const sourceHostGuard = runtime.hostGuard;
+		const sourceCmGuard = runtime.cmGuard;
+		if (sourceHostGuard === null || sourceCmGuard === null) return false;
+		const admissionCurrent = (snapshot: ManagedViewSaveGuard): boolean => {
+			if (expectedAdmissionOwner === null) return hasNoPendingHostLoadOwner(snapshot);
+			return sameDeferredLoadAdmissionSnapshot(
+				snapshot.pendingDeferredLoadAdmission,
+				expectedAdmissionOwner,
+			)
+				&& expectedAdmissionOwner.targetFile === targetFile
+				&& expectedAdmissionOwner.targetPath === targetPath
+				&& expectedAdmissionOwner.sourceUnloadReceiptId === sourceUnloadReceiptId
+				&& sourceViewFile === expectedAdmissionOwner.viewFileAtEntry
+				&& sourceViewPath === expectedAdmissionOwner.viewPathAtEntry;
+		};
+		let hostAtEntry: ManagedViewSaveGuard;
+		let cmAtEntry: CodeMirrorHandoffGuardSnapshot;
+		try {
+			hostAtEntry = sourceHostGuard.snapshot();
+			cmAtEntry = sourceCmGuard.snapshot();
+		} catch {
+			return false;
+		}
+		if (
+			!hasExactHostGuardWrappers(hostAtEntry)
+			|| !admissionCurrent(hostAtEntry)
+			|| hostAtEntry.mode.kind === "inert-pass-through"
+			|| cmAtEntry.inert
+			|| cmAtEntry.view !== this.getCmView(view)
+			|| this.managedSessions.get(leafId) !== runtime
+			|| runtime.session !== sourceSession
+			|| runtime.hostGuard !== sourceHostGuard
+			|| runtime.cmGuard !== sourceCmGuard
+			|| this.bindings.get(leafId) !== sourceBinding
+			|| (this.bindingEpochByLeafId.get(leafId) ?? 0) !== sourceBindingEpoch
+			|| this.readAuthorityEpoch() !== sourceAuthorityEpoch
+		) return false;
+		const sourceDrainOwner = runtime.sourceUnloadDrain;
+		const preownedTargetSelectionToken = provenance === "selected"
+			&& sourceDrainOwner !== null
+			&& sourceDrainOwner.state === "fenced"
+			&& sourceDrainOwner.settled
+			&& displayed.kind === "known"
+			&& sourceDrainOwner.sourceFile === displayed.file
+			&& sourceDrainOwner.sourcePath === displayed.path
+			&& sourceDrainOwner.sourceSession.sessionId === sourceSession.sessionId
+			&& sourceDrainOwner.sourceSession.generation === sourceSession.generation
+			&& sourceDrainOwner.cmGuard === sourceCmGuard
+			&& sourceDrainOwner.targetSelectionToken !== null
+			&& sourceCmGuard.isTargetSelectionFenceCurrent(
+				sourceDrainOwner.targetSelectionToken,
+			)
+				? sourceDrainOwner.targetSelectionToken
+				: null;
+		const existingTransitionFence = runtime.transitionInputFence;
+		const reusableSupersessionFence = provenance === "selected"
+			&& expectedAdmissionOwner !== null
+			&& sourceDrainOwner === null
+			&& sourceSession.handoff !== null
+			&& sourceSession.binding.kind === "unbound"
+			&& existingTransitionFence !== null
+			&& existingTransitionFence.view === view
+			&& existingTransitionFence.cmGuard === sourceCmGuard
+			&& existingTransitionFence.targetFile === sourceSession.handoff.targetFile
+			&& existingTransitionFence.targetPath === sourceSession.handoff.targetPath
+			&& existingTransitionFence.sessionId === sourceSession.sessionId
+			&& existingTransitionFence.handoffGeneration === sourceSession.generation
+			&& existingTransitionFence.switchIntentSeq === sourceSession.currentSwitchIntentSeq
+			&& existingTransitionFence.state === "handoff"
+			&& existingTransitionFence.targetSelectionToken === null
+			&& cmAtEntry.gateClosed
+			&& cmAtEntry.targetSelectionFence === null
+			&& this.isTransitionContainerOwned(existingTransitionFence)
+				? existingTransitionFence
+				: null;
+		if (
+			(provenance === "selected" && sourceDrainOwner !== null)
+			&& preownedTargetSelectionToken === null
+		) {
+			return false;
+		}
+		if (
+			expectedAdmissionOwner !== null
+			&& preownedTargetSelectionToken === null
+			&& reusableSupersessionFence === null
+		) {
+			return false;
+		}
+		const transition = this.acquireTransitionInputFence(
+			runtime,
+			targetFile,
+			targetPath,
+			reduction.state,
+			false,
+			preownedTargetSelectionToken,
+		);
+		if (transition === null) {
+			this.trace?.("editor", "target-selection-fence-acquire-rejected", {
+				leafId,
+				path: targetPath,
+				reason,
+			});
+			return false;
+		}
+		let hostBeforeCapture: ManagedViewSaveGuard;
+		let cmBeforeCapture: CodeMirrorHandoffGuardSnapshot;
+		try {
+			hostBeforeCapture = sourceHostGuard.snapshot();
+			cmBeforeCapture = sourceCmGuard.snapshot();
+		} catch {
+			this.abortTransitionInputFence(runtime, transition);
+			return false;
+		}
+		const transitionCurrent = (): boolean => {
+			const fence = transition.fence;
+			const token = fence.targetSelectionToken;
+			return runtime.transitionInputFence === fence
+				&& fence.view === view
+				&& fence.container === this.transitionContainer(view)
+				&& Reflect.get(fence.container, "inert") === true
+				&& fence.cmGuard === sourceCmGuard
+				&& fence.targetFile === targetFile
+				&& fence.targetPath === targetPath
+				&& fence.sessionId === reduction.state.sessionId
+				&& fence.handoffGeneration === reduction.state.generation
+				&& fence.switchIntentSeq === reduction.state.currentSwitchIntentSeq
+				&& (token === null || sourceCmGuard.isTargetSelectionFenceCurrent(token));
+		};
+		if (
+			this.managedSessions.get(leafId) !== runtime
+			|| runtime.session !== sourceSession
+			|| runtime.hostGuard !== sourceHostGuard
+			|| runtime.cmGuard !== sourceCmGuard
+			|| this.bindings.get(leafId) !== sourceBinding
+			|| (this.bindingEpochByLeafId.get(leafId) ?? 0) !== sourceBindingEpoch
+			|| view.file !== sourceViewFile
+			|| sourceViewFile?.path !== sourceViewPath
+			|| targetFile.path !== targetPath
+			|| this.readAuthorityEpoch() !== sourceAuthorityEpoch
+			|| !hasExactHostGuardWrappers(hostBeforeCapture)
+			|| !admissionCurrent(hostBeforeCapture)
+			|| !transitionCurrent()
+		) {
+			this.trace?.("editor", "target-selection-fence-pre-capture-cas-rejected", {
+				leafId,
+				path: targetPath,
+				reason,
+			});
+			this.abortTransitionInputFence(runtime, transition);
+			return false;
+		}
 		const captureEffect = reduction.effects.some(
 			(effect) => effect.type === "capture-authority-before-detach",
 		);
@@ -6708,24 +5500,61 @@ export class EditorBindingManager {
 		const sourceAuthorityBeforeTransition = captureEffect && sourceAuthorityPath !== null
 			? this.capturePathEditorAuthority(sourceAuthorityPath)
 			: null;
+		let hostAfterCapture: ManagedViewSaveGuard;
+		let cmAfterCapture: CodeMirrorHandoffGuardSnapshot;
+		try {
+			hostAfterCapture = sourceHostGuard.snapshot();
+			cmAfterCapture = sourceCmGuard.snapshot();
+		} catch {
+			this.abortTransitionInputFence(runtime, transition);
+			return false;
+		}
 		// Authority capture reads host/editor state and may synchronously re-enter
-		// plugin callbacks. Never publish a reducer result computed from a session
-		// that changed during that read.
+		// plugin callbacks. Publish only after every runtime, wrapper, pending owner,
+		// editor epoch, and target-less fence identity survives an exact second CAS.
 		if (
 			this.managedSessions.get(leafId) !== runtime
 			|| runtime.session !== sourceSession
-			|| this.bindings.get(leafId) !== existing
+			|| runtime.hostGuard !== sourceHostGuard
+			|| runtime.cmGuard !== sourceCmGuard
+			|| this.bindings.get(leafId) !== sourceBinding
 			|| (this.bindingEpochByLeafId.get(leafId) ?? 0) !== sourceBindingEpoch
 			|| view.file !== sourceViewFile
 			|| sourceViewFile?.path !== sourceViewPath
 			|| targetFile.path !== targetPath
-		) return false;
+			|| this.readAuthorityEpoch() !== sourceAuthorityEpoch
+			|| !sameHostGuardSnapshot(hostBeforeCapture, hostAfterCapture)
+			|| !sameCodeMirrorGuardSnapshot(cmBeforeCapture, cmAfterCapture)
+			|| !hasExactHostGuardWrappers(hostAfterCapture)
+			|| !admissionCurrent(hostAfterCapture)
+			|| !transitionCurrent()
+		) {
+			this.trace?.("editor", "target-selection-fence-post-capture-cas-rejected", {
+				leafId,
+				path: targetPath,
+				reason,
+			});
+			this.abortTransitionInputFence(runtime, transition);
+			return false;
+		}
 		this.advanceAuthorityEpoch();
 		runtime.session = reduction.state;
-		this.lastSuccessfullyAppliedHandoffReplayByLeafId.delete(leafId);
-		this.clearTargetPresentationRetry(leafId);
-		this.clearTargetBindingRetry(leafId);
-		runtime.targetWorkflow = null;
+		if (!this.transferTransitionInputFence(runtime, transition.fence)) {
+			this.retainManagedTargetCompletionFence(
+				runtime,
+				"target-selection-fence-transfer-rejected",
+			);
+			return false;
+		}
+		if (
+			sourceDrainOwner !== null
+			&& preownedTargetSelectionToken !== null
+			&& runtime.sourceUnloadDrain === sourceDrainOwner
+		) {
+			sourceDrainOwner.targetSelectionToken = null;
+			sourceDrainOwner.state = "transferred";
+			runtime.sourceUnloadDrain = null;
+		}
 		runtime.adoption = NO_SAME_PATH_ADOPTION;
 		const expectedGeneration = reduction.state.generation;
 		this.applyHandoffEffects(
@@ -6745,6 +5574,10 @@ export class EditorBindingManager {
 			|| current.session.generation !== expectedGeneration
 			|| current.session.handoff?.targetFile !== targetFile
 			|| current.session.handoff.targetPath !== targetFile.path
+			|| current.transitionInputFence !== transition.fence
+			|| transition.fence.state !== "handoff"
+			|| transition.fence.container !== this.transitionContainer(view)
+			|| Reflect.get(transition.fence.container, "inert") !== true
 			|| !hostViewFileIsCurrent
 			|| targetFile.path !== current.session.handoff.targetPath
 		) return false;
@@ -6758,20 +5591,349 @@ export class EditorBindingManager {
 		reason: string,
 	): boolean {
 		const session = this.getManagedSession(view) ?? this.manageView(view);
-		if (this.isManagedTargetSelected(session, targetFile)) return true;
 		const runtime = this.managedSessions.get(session.leafId);
+		if (
+			runtime !== undefined
+			&& this.observedFileMismatchTerminalByRuntime.has(runtime)
+		) {
+			this.enterObservedFileMismatchTerminal(runtime, targetFile, reason);
+			return false;
+		}
+		if (this.isManagedTargetSelected(session, targetFile)) return true;
 		const exactSourceUnloadReceiptId = runtime
 			? this.captureExactSourceUnloadReceipt(runtime, session, targetFile)
 			: null;
-		return exactSourceUnloadReceiptId === null
-			? this.beginPathHandoff(view, targetFile, reason)
-			: this.beginPathHandoff(
+		if (
+			runtime !== undefined
+			&& exactSourceUnloadReceiptId === null
+			&& session.displayedLineage.kind === "known"
+			&& (
+				session.displayedLineage.file !== targetFile
+				|| session.displayedLineage.path !== targetFile.path
+			)
+		) {
+			this.enterObservedFileMismatchTerminal(runtime, targetFile, reason);
+			return false;
+		}
+		if (exactSourceUnloadReceiptId === null) {
+			return this.beginPathHandoff(view, targetFile, reason);
+		}
+		if (
+			this.beginPathHandoff(
 				view,
 				targetFile,
 				reason,
 				"selected",
 				exactSourceUnloadReceiptId,
+			)
+		) return true;
+		const currentRuntime = this.managedSessions.get(session.leafId);
+		if (currentRuntime !== undefined) {
+			this.enterObservedFileMismatchTerminal(
+				currentRuntime,
+				targetFile,
+				`${reason}:selected-boundary-rejected`,
 			);
+		}
+		return false;
+	}
+
+	private enterObservedFileMismatchTerminal(
+		runtime: ManagedLeafRuntime,
+		targetFile: TFile,
+		reason: string,
+	): void {
+		const session = runtime.session;
+		const displayed = session.displayedLineage;
+		const view = session.view;
+		const hostGuard = runtime.hostGuard;
+		const cmGuard = runtime.cmGuard;
+		const targetPath = targetFile.path;
+		if (
+			!this.asyncAuthorityOpen
+			|| this.managedSessions.get(session.leafId) !== runtime
+			|| runtime.session !== session
+			|| view.file !== targetFile
+			|| targetPath.length === 0
+			|| displayed.kind !== "known"
+			|| (
+				displayed.file === targetFile
+				&& displayed.path === targetPath
+			)
+		) return;
+		const previousOwner = this.observedFileMismatchTerminalByRuntime.get(runtime);
+		const owner: ObservedFileMismatchTerminalOwner = Object.freeze({
+			sessionId: previousOwner?.sessionId ?? session.sessionId,
+			generation: previousOwner?.generation ?? session.generation,
+			sourceFile: previousOwner?.sourceFile ?? displayed.file,
+			sourcePath: previousOwner?.sourcePath ?? displayed.path,
+			targetFile,
+			targetPath,
+		});
+		this.observedFileMismatchTerminalByRuntime.set(runtime, owner);
+		if (hostGuard === null || cmGuard === null) {
+			this.trace?.("editor", "observed-file-mismatch-boundary-unavailable", {
+				leafId: session.leafId,
+				sourcePath: displayed.path,
+				targetPath,
+				reason,
+			});
+			try {
+				new Notice(
+					`The pane points to "${targetPath}", but its visible editor still belongs to "${displayed.path}" and a terminal editor boundary is unavailable. Do not edit or save this pane; close and reopen it. No target load or replay was attempted.`,
+					10_000,
+				);
+			} catch {
+				// The persistent owner still rejects every later automatic handoff attempt.
+			}
+			return;
+		}
+		try {
+			hostGuard.beginBlockingHandoff({
+				handoffGeneration: session.generation,
+				sourceLineagePath: displayed.path,
+				targetPath,
+			});
+		} catch {
+			// The independent emergency owner below is still attempted synchronously.
+		}
+		const saveFenceReady = this.ensureEmergencyHostSaveFence(
+			runtime,
+			`observed-file-mismatch:${reason}`,
+		);
+		if (!saveFenceReady) {
+			this.trace?.("editor", "observed-file-mismatch-save-boundary-lost", {
+				leafId: session.leafId,
+				sourcePath: displayed.path,
+				targetPath,
+				reason,
+			});
+			try {
+				new Notice(
+					`The pane points to "${targetPath}", but its visible editor still belongs to "${displayed.path}" and the native save boundary could not be proven. Do not edit this pane; close and reopen it. No target load or replay was attempted.`,
+					10_000,
+				);
+			} catch {
+				// Wrapper drift remains a hard terminal even without the warning surface.
+			}
+			return;
+		}
+		if (runtime.transitionInputFence?.state === "reopen-required") {
+			runtime.transitionInputFence.targetFile = targetFile;
+			runtime.transitionInputFence.targetPath = targetPath;
+			runtime.transitionInputFence.sessionId = session.sessionId;
+			runtime.transitionInputFence.handoffGeneration = session.generation;
+			runtime.transitionInputFence.switchIntentSeq = session.currentSwitchIntentSeq;
+			const visible = this.captureStableVisibleManagedContent(runtime);
+			if (visible !== null) {
+				this.offerTerminalVisibleContentExport(
+					runtime,
+					visible,
+					`observed-file-mismatch-reopen-required:${reason}`,
+				);
+			}
+			return;
+		}
+		if (session.handoff !== null) {
+			if (runtime.transitionInputFence !== null) {
+				runtime.transitionInputFence.state = "reopen-required";
+			}
+			this.retainManagedTargetCompletionFence(
+				runtime,
+				`observed-file-mismatch-existing-handoff:${reason}`,
+			);
+			return;
+		}
+		const transition = this.acquireTransitionInputFence(
+			runtime,
+			targetFile,
+			targetPath,
+			session,
+			true,
+		);
+		if (transition === null) {
+			let pendingInput = false;
+			try {
+				const snapshot = cmGuard.snapshot();
+				pendingInput = snapshot.activeComposition !== null
+					|| snapshot.commitState === "pending"
+					|| session.pendingInputStartReservation !== null;
+			} catch {
+				pendingInput = false;
+			}
+			this.trace?.("editor", "observed-file-mismatch-input-boundary-pending", {
+				leafId: session.leafId,
+				sourcePath: displayed.path,
+				targetPath,
+				reason,
+				pendingInput,
+			});
+			try {
+				new Notice(
+					pendingInput
+						? `The pane changed to "${targetPath}" while an input sequence for "${displayed.path}" was still settling. Native saving is blocked; finish that sequence, then use recovery export and reopen the pane.`
+						: `The pane points to "${targetPath}", but its visible editor still belongs to "${displayed.path}". Native saving is blocked, but the input boundary could not be proven; close and reopen the pane.`,
+					10_000,
+				);
+			} catch {
+				// The host save owner remains the synchronous safety boundary.
+			}
+			return;
+		}
+		// This is a terminal, ownerless observation rather than an authorized
+		// source-to-target handoff. Keep the target-less selection token owned by
+		// the source guard; transferring it would reopen the gate because no
+		// handoff context exists to take over input ownership.
+		transition.fence.state = "reopen-required";
+		const binding = this.bindings.get(session.leafId);
+		const authorityEpoch = this.readAuthorityEpoch();
+		let sourceContent: string | null = null;
+		let editorContent: string | null = null;
+		let hostContent: string | null = null;
+		let rawData: unknown = null;
+		let cmBefore: CodeMirrorHandoffGuardSnapshot | null = null;
+		let hostBefore: ManagedViewSaveGuard | null = null;
+		let emergencyCurrent = false;
+		try {
+			sourceContent = displayed.cm.state.doc.toString();
+			editorContent = view.editor.getValue();
+			hostContent = (view as unknown as TextFileView).getViewData();
+			rawData = (view as unknown as TextFileView & Readonly<{ data?: unknown }>).data;
+			cmBefore = cmGuard.snapshot();
+			hostBefore = hostGuard.snapshot();
+			emergencyCurrent = runtime.emergencySaveFence?.isCurrent() === true;
+		} catch {
+			sourceContent = null;
+		}
+		const exactSource = binding !== undefined
+			&& owner.sessionId === session.sessionId
+			&& owner.generation === session.generation
+			&& owner.sourceFile === displayed.file
+			&& owner.sourcePath === displayed.path
+			&& owner.targetFile === targetFile
+			&& owner.targetPath === targetPath
+			&& binding.view === view
+			&& binding.file === displayed.file
+			&& binding.path === displayed.path
+			&& binding.cm === displayed.cm
+			&& session.binding.kind === "bound"
+			&& session.binding.path === displayed.path
+			&& session.binding.ytext === binding.ytext
+			&& this.getCmView(view) === displayed.cm
+			&& displayed.document === displayed.cm.state.doc
+			&& sourceContent !== null
+			&& editorContent === sourceContent
+			&& binding.ytext.toJSON() === sourceContent
+			&& hostContent === sourceContent
+			&& rawData === sourceContent
+			&& cmBefore?.view === displayed.cm
+			&& cmBefore.inert === false
+			&& cmBefore.gateClosed
+			&& cmBefore.activeComposition === null
+			&& cmBefore.commitState === "none"
+			&& cmBefore.pendingHostLoadCandidate === null
+			&& hostBefore !== null
+			&& hasExactHostGuardWrappers(hostBefore)
+			&& hostBefore.emergencySaveBlocked
+			&& emergencyCurrent
+			&& runtime.transitionInputFence === transition.fence
+			&& this.isTransitionContainerOwned(transition.fence);
+		let secondSourceContent: string | null = null;
+		let secondEditorContent: string | null = null;
+		let secondHostContent: string | null = null;
+		let secondRawData: unknown = null;
+		let cmAfter: CodeMirrorHandoffGuardSnapshot | null = null;
+		let hostAfter: ManagedViewSaveGuard | null = null;
+		let secondEmergencyCurrent = false;
+		try {
+			secondSourceContent = displayed.cm.state.doc.toString();
+			secondEditorContent = view.editor.getValue();
+			secondHostContent = (view as unknown as TextFileView).getViewData();
+			secondRawData = (view as unknown as TextFileView & Readonly<{
+				data?: unknown;
+			}>).data;
+			cmAfter = cmGuard.snapshot();
+			hostAfter = hostGuard.snapshot();
+			secondEmergencyCurrent = runtime.emergencySaveFence?.isCurrent() === true;
+		} catch {
+			secondSourceContent = null;
+		}
+		const exactStableSource = exactSource
+			&& this.managedSessions.get(session.leafId) === runtime
+			&& this.observedFileMismatchTerminalByRuntime.get(runtime) === owner
+			&& runtime.session === session
+			&& this.bindings.get(session.leafId) === binding
+			&& runtime.hostGuard === hostGuard
+			&& runtime.cmGuard === cmGuard
+			&& runtime.transitionInputFence === transition.fence
+			&& this.getCmView(view) === displayed.cm
+			&& displayed.cm.state.doc === displayed.document
+			&& sourceContent === secondSourceContent
+			&& editorContent === secondEditorContent
+			&& hostContent === secondHostContent
+			&& rawData === secondRawData
+			&& cmBefore !== null
+			&& cmAfter !== null
+			&& sameCodeMirrorGuardSnapshot(cmBefore, cmAfter)
+			&& hostBefore !== null
+			&& hostAfter !== null
+			&& sameHostGuardSnapshot(hostBefore, hostAfter)
+			&& secondEmergencyCurrent
+			&& this.readAuthorityEpoch() === authorityEpoch
+			&& this.isTransitionContainerOwned(transition.fence);
+		const stableSourceContent = exactStableSource ? sourceContent : null;
+		if (stableSourceContent === null) {
+			this.retainManagedTargetCompletionFence(
+				runtime,
+				`observed-file-mismatch-source-unprovable:${reason}`,
+			);
+			const visible = this.captureStableVisibleManagedContent(runtime);
+			if (visible !== null) {
+				this.offerTerminalVisibleContentExport(
+					runtime,
+					visible,
+					`observed-file-mismatch-source-unprovable:${reason}`,
+				);
+			}
+			return;
+		}
+		runtime.capturedSourceAuthority = { kind: "blocked", reason: "transitioning" };
+		const detachedEpoch = this.detachBinding(
+			view,
+			"observed-file-mismatch-terminal",
+			true,
+		);
+		if (
+			this.managedSessions.get(session.leafId) !== runtime
+			|| runtime.session !== session
+			|| runtime.transitionInputFence !== transition.fence
+			|| !this.isTransitionContainerOwned(transition.fence)
+		) return;
+		this.advanceAuthorityEpoch();
+		runtime.session = {
+			...session,
+			binding: { kind: "unbound" },
+			completedDetachEpoch: detachedEpoch,
+		};
+		this.offerTerminalVisibleContentExport(
+			runtime,
+			stableSourceContent,
+			`observed-file-mismatch:${reason}`,
+		);
+		this.trace?.("editor", "observed-file-mismatch-terminal", {
+			leafId: session.leafId,
+			sourcePath: displayed.path,
+			targetPath,
+			reason,
+		});
+		try {
+			new Notice(
+				`The pane points to "${targetPath}", but the blocked visible bytes belong to "${displayed.path}". KAOS detached the source sync binding without loading the target. Complete the recovery export, then close and reopen this pane.`,
+				10_000,
+			);
+		} catch {
+			// The verified exporter and retained fences remain authoritative.
+		}
 	}
 
 	private captureExactSourceUnloadReceipt(
@@ -6831,9 +5993,6 @@ export class EditorBindingManager {
 				||
 				runtime.session.sessionId !== effect.sessionId
 				|| runtime.session.generation !== effect.expectedGeneration
-				|| (effect.type === "persist-intent"
-					&& runtime.session.handoff?.recoveryOperationEpoch
-						!== effect.recoveryOperationEpoch)
 			) return;
 			this.trace?.("editor", "handoff-effect-applied", {
 				leafId: runtime.session.leafId,
@@ -6889,117 +6048,11 @@ export class EditorBindingManager {
 					}
 					break;
 				}
-				case "request-target-presentation": {
-					const leafId = runtime.session.leafId;
-					const sessionId = effect.sessionId;
-					const handoffGeneration = effect.expectedGeneration;
-					// The exact host candidate is published from inside TextFileView's
-					// synchronous setViewData(clear=true) dispatch. Admission must observe
-					// the settled host facade, never the re-entrant mid-dispatch projection.
-					queueMicrotask(() => {
-						const current = this.managedSessions.get(leafId);
-						if (
-							current !== runtime
-							|| runtime.session.sessionId !== sessionId
-							|| runtime.session.generation !== handoffGeneration
-						) {
-							this.trace?.("editor", "target-presentation-start-deferred", {
-								leafId,
-								path: runtime.session.handoff?.targetPath ?? null,
-								reason: "scheduled-context-stale",
-								sameRuntime: current === runtime,
-								sameSession: runtime.session.sessionId === sessionId,
-								sameGeneration: runtime.session.generation === handoffGeneration,
-							});
-							return;
-						}
-						this.beginTargetPresentation(runtime);
-					});
-					break;
-				}
-				case "request-recovery-target-binding": {
-					const workflow = runtime.targetWorkflow;
-					const recoveryRequest = workflow
-						? this.captureRecoveryTargetBindingRequest(runtime, workflow)
-						: null;
-					if (
-						workflow
-						&& recoveryRequest
-						&& recoveryRequest.recoveryOperationEpoch
-							=== effect.recoveryOperationEpoch
-						&& recoveryRequest.intentId === effect.intentId
-						&& recoveryRequest.recordId === effect.recordId
-					) {
-						this.requestTargetBindingAdmission(runtime, workflow);
-					}
-					break;
-				}
 				case "release-input-gate":
 					runtime.cmGuard?.refreshGate();
 					break;
 				case "restore-save-pass-through":
 					break;
-				case "persist-intent": {
-					const port = this.handoffRecoveryPort;
-					const request = this.buildHandoffRecoveryRequest(
-						runtime.session.leafId,
-						effect,
-						port,
-					);
-					if (!request) {
-						this.deliverHandoffRecoveryIntentState(runtime.session.leafId, {
-							type: "intent-state-changed",
-							sessionId: effect.sessionId,
-							expectedGeneration: effect.expectedGeneration,
-							recoveryOperationEpoch: effect.recoveryOperationEpoch,
-							intentState: {
-								kind: "failed",
-								intentId: effect.intent.intentId,
-								reason: "recovery-session-unavailable",
-							},
-						});
-						break;
-					}
-					if (!port) {
-						request.deliver({
-							type: "intent-state-changed",
-							sessionId: request.sessionId,
-							expectedGeneration: request.expectedGeneration,
-							recoveryOperationEpoch: request.recoveryOperationEpoch,
-							intentState: {
-								kind: "failed",
-								intentId: request.intent.intentId,
-								reason: "recovery-store-unavailable",
-							},
-						});
-						break;
-					}
-					const effectKey = JSON.stringify([
-						effect.sessionId,
-						effect.expectedGeneration,
-						effect.recoveryOperationEpoch,
-						effect.intent.intentId,
-						this.handoffRecoveryPortActivationEpoch,
-					]);
-					if (this.handoffRecoveryEffectsInFlight.has(effectKey)) break;
-					this.handoffRecoveryEffectsInFlight.add(effectKey);
-					void port.persistAndClassify(request).catch(() => {
-						request.deliver({
-							type: "intent-state-changed",
-							sessionId: request.sessionId,
-							expectedGeneration: request.expectedGeneration,
-							recoveryOperationEpoch: request.recoveryOperationEpoch,
-							intentState: {
-								kind: "failed",
-								intentId: request.intent.intentId,
-								reason: "recovery-runtime-failed",
-							},
-						});
-					}).finally(() => {
-						this.handoffRecoveryEffectsInFlight.delete(effectKey);
-					});
-					break;
-				}
 			}
 		}
 	}
@@ -7064,7 +6117,6 @@ export class EditorBindingManager {
 	 * editor/API transaction even when both share the same millisecond timestamp.
 	 */
 	beginExternalDiskMutation(path: string, sequence: number): void {
-		this.onHandoffSettlementMayHaveAdvanced?.(path);
 		const previous = this.observedExternalDiskMutationSequenceByPath.get(path) ?? 0;
 		if (sequence <= previous) return;
 		this.observedExternalDiskMutationSequenceByPath.set(path, sequence);
@@ -7675,7 +6727,6 @@ export class EditorBindingManager {
 		this.asyncAuthorityOpen = false;
 		this.advanceAuthorityEpoch();
 		for (const runtime of this.managedSessions.values()) {
-			runtime.targetWorkflow = null;
 			runtime.adoption = NO_SAME_PATH_ADOPTION;
 			runtime.session = {
 				...runtime.session,
@@ -7692,12 +6743,9 @@ export class EditorBindingManager {
 		this.pendingHealthChecks.clear();
 		for (const timer of this.pendingCmResolveRetries.values()) clearTimeout(timer);
 		this.pendingCmResolveRetries.clear();
-		for (const timer of this.pendingTargetPresentationRetries.values()) clearTimeout(timer);
-		this.pendingTargetPresentationRetries.clear();
-		this.targetPresentationRetryAttempts.clear();
-		for (const timer of this.pendingTargetBindingRetries.values()) clearTimeout(timer);
-		this.pendingTargetBindingRetries.clear();
-		this.targetBindingRetryAttempts.clear();
+		for (const timer of this.pendingUnmanageRetries.values()) clearTimeout(timer);
+		this.pendingUnmanageRetries.clear();
+		this.unmanageRetryAttempts.clear();
 		this.cmResolveAttempts.clear();
 		this.cmResolveDelayedLogged.clear();
 		this.pendingAdmissionByLeafId.clear();
@@ -7714,9 +6762,56 @@ export class EditorBindingManager {
 	 * Unbind all editors. Called on plugin unload.
 	 */
 	unbindAll(): void {
+		const teardownReleaseAttempts = new Set<ManagedLeafRuntime>();
+		const restoreExactTeardownHostBoundary = (
+			runtime: ManagedLeafRuntime,
+			view: MarkdownView,
+		): void => {
+			if (
+				teardownReleaseAttempts.has(runtime)
+				|| runtime.session.view !== view
+				|| this.managedSessions.get(runtime.session.leafId) !== runtime
+			) return;
+			teardownReleaseAttempts.add(runtime);
+			// Plugin teardown is an explicit final boundary. Release immediately
+			// before restoring the host wrapper in this same synchronous turn;
+			// revokeAsyncAuthority deliberately keeps this owner across all awaited
+			// teardown drains. CM teardown may still remain blocked by an unresolved
+			// orphan input, but it must never strand the native save wrapper.
+			const released = this.releaseEmergencyHostSaveFence(
+				runtime,
+				"unbind-all:teardown",
+				true,
+			);
+			if (!released) return;
+			runtime.hostGuard?.cancelTerminalHostLifecycle?.(
+				"unbind-all:teardown",
+			);
+			const transitionFence = runtime.transitionInputFence;
+			if (transitionFence !== null) {
+				this.releaseTransitionInputFence(
+					runtime,
+					transitionFence.targetFile,
+					transitionFence.targetPath,
+					"unbind-all:teardown",
+					true,
+				);
+			}
+			const hostGuard = runtime.hostGuard;
+			if (hostGuard !== null) {
+				hostGuard.markInert();
+				hostGuard.restoreIfCurrent();
+				if (
+					this.managedSessions.get(runtime.session.leafId) === runtime
+					&& runtime.session.view === view
+					&& runtime.hostGuard === hostGuard
+				) runtime.hostGuard = null;
+			}
+		};
 		for (const binding of Array.from(this.bindings.values())) {
 			const runtime = this.managedSessions.get(this.getLeafId(binding.view));
 			if (runtime?.session.view === binding.view) {
+				restoreExactTeardownHostBoundary(runtime, binding.view);
 				this.cancelManagedHandoffAndUnmanage(
 					binding.view,
 					"unbind-all",
@@ -7727,6 +6822,8 @@ export class EditorBindingManager {
 			}
 		}
 		for (const runtime of Array.from(this.managedSessions.values())) {
+			this.teardownSourceUnloadDrain(runtime, "unbind-all");
+			restoreExactTeardownHostBoundary(runtime, runtime.session.view);
 			this.unmanageView(runtime.session.view, "unbind-all", true);
 		}
 		this.pendingExternalDiskMutations.clear();
@@ -7965,125 +7062,6 @@ export class EditorBindingManager {
 	 * Yjs binding yet, so input during the file-open transition is still part of
 	 * the mutation boundary.
 	 */
-	private captureHandoffReplayRecoveryAdmissionEvidence(
-		session: ManagedLeafSession,
-		leafId: string,
-	): HandoffReplayRecoveryAdmissionEvidence | null {
-		const handoff = session.handoff;
-		const request = handoff?.recoveryTargetBindingRequest ?? null;
-		const intentState = handoff?.intentState;
-		const runtime = this.managedSessions.get(leafId);
-		const guard = runtime?.cmGuard?.snapshot() ?? null;
-		if (
-			!handoff
-			|| !request
-			|| !intentState
-			|| runtime?.session !== session
-			|| guard === null
-			|| guard.inert
-			|| !guard.gateClosed
-			|| (
-				intentState.kind !== "stored"
-				&& intentState.kind !== "replay-pending"
-			)
-			|| request.recoveryOperationEpoch !== handoff.recoveryOperationEpoch
-			|| request.intentId !== intentState.intentId
-			|| request.recordId !== intentState.recordId
-			|| handoff.presentation !== "target-proven"
-			|| handoff.pendingHostLoadCandidate !== null
-			|| !handoff.inputGateInstalled
-			|| handoff.saveGuardInstalled
-			|| (
-				intentState.kind === "stored"
-					? handoff.phase !== "awaiting-recovery-commit"
-					: handoff.phase !== "awaiting-replay-settlement"
-			)
-		) return null;
-		const recoveryClaim = Object.freeze({ ...request });
-		const bindingEpoch = this.bindingEpochByLeafId.get(leafId) ?? 0;
-		const binding = session.binding.kind === "bound"
-			? Object.freeze({
-				kind: "bound" as const,
-				path: session.binding.path,
-				fileId: session.binding.fileId,
-				ytext: session.binding.ytext,
-				bindingEpoch,
-			})
-			: Object.freeze({
-				kind: "unbound" as const,
-				bindingEpoch,
-			});
-		return Object.freeze({
-			purpose: "handoff-replay-target-bind",
-			recoveryClaim,
-			recoveryTargetBindingRequest: recoveryClaim,
-			inputGateInstalled: handoff.inputGateInstalled,
-			saveGuardInstalled: handoff.saveGuardInstalled,
-			pendingHostLoadCandidate: null,
-			intentState: Object.freeze({
-				kind: intentState.kind,
-				intentId: intentState.intentId,
-				recordId: intentState.recordId,
-			}),
-			binding,
-		});
-	}
-
-	private sameHandoffReplayRecoveryAdmissionEvidence(
-		left: HandoffReplayRecoveryAdmissionEvidence | undefined,
-		right: HandoffReplayRecoveryAdmissionEvidence | null,
-	): boolean {
-		if (!left || !right) return left === undefined && right === null;
-		const leftBinding = left.binding;
-		const rightBinding = right.binding;
-		return left.purpose === right.purpose
-			&& left.recoveryClaim.recoveryOperationEpoch
-				=== right.recoveryClaim.recoveryOperationEpoch
-			&& left.recoveryClaim.intentId === right.recoveryClaim.intentId
-			&& left.recoveryClaim.recordId === right.recoveryClaim.recordId
-			&& left.recoveryTargetBindingRequest?.recoveryOperationEpoch
-				=== right.recoveryTargetBindingRequest?.recoveryOperationEpoch
-			&& left.recoveryTargetBindingRequest?.intentId
-				=== right.recoveryTargetBindingRequest?.intentId
-			&& left.recoveryTargetBindingRequest?.recordId
-				=== right.recoveryTargetBindingRequest?.recordId
-			&& left.inputGateInstalled === right.inputGateInstalled
-			&& left.saveGuardInstalled === right.saveGuardInstalled
-			&& left.pendingHostLoadCandidate === right.pendingHostLoadCandidate
-			&& left.intentState.kind === right.intentState.kind
-			&& left.intentState.intentId === right.intentState.intentId
-			&& left.intentState.recordId === right.intentState.recordId
-			&& leftBinding.kind === rightBinding.kind
-			&& leftBinding.bindingEpoch === rightBinding.bindingEpoch
-			&& (
-				leftBinding.kind === "unbound"
-				|| (
-					rightBinding.kind === "bound"
-					&& leftBinding.path === rightBinding.path
-					&& leftBinding.fileId === rightBinding.fileId
-					&& leftBinding.ytext === rightBinding.ytext
-				)
-			);
-	}
-
-	private isHandoffReplayRecoveryOpenEditorMutationTicket(
-		ticket: OpenEditorMutationTicket,
-		claim: HandoffReplayRecoveryClaim,
-	): ticket is HandoffReplayRecoveryOpenEditorMutationTicket {
-		if (ticket.views.length !== 1) return false;
-		const evidence = ticket.views[0]?.handoffReplayRecovery;
-		return evidence?.purpose === "handoff-replay-target-bind"
-			&& evidence.recoveryClaim.recoveryOperationEpoch
-				=== claim.recoveryOperationEpoch
-			&& evidence.recoveryClaim.intentId === claim.intentId
-			&& evidence.recoveryClaim.recordId === claim.recordId
-			&& evidence.recoveryTargetBindingRequest?.recoveryOperationEpoch
-				=== claim.recoveryOperationEpoch
-			&& evidence.recoveryTargetBindingRequest?.intentId === claim.intentId
-			&& evidence.recoveryTargetBindingRequest?.recordId === claim.recordId
-			&& evidence.binding.kind === "unbound";
-	}
-
 	captureOpenEditorMutationTicket(
 		path: string,
 		views: readonly MarkdownView[],
@@ -8106,11 +7084,6 @@ export class EditorBindingManager {
 					? session.displayedLineage
 					: null;
 				const handoff = session.handoff;
-				const handoffReplayRecovery =
-					this.captureHandoffReplayRecoveryAdmissionEvidence(
-						session,
-						leafId,
-					);
 				const managedBoundaryProven = runtime !== undefined
 					&& cm !== null
 					&& this.isManagedBoundaryLive(runtime, cm);
@@ -8136,8 +7109,8 @@ export class EditorBindingManager {
 					selectionEpoch: guardSnapshot?.selectionEpoch ?? 0,
 					scrollEpoch: guardSnapshot?.scrollEpoch ?? 0,
 					handoffPresentation: handoff?.presentation ?? "stable",
-					handoffPhase: handoff?.phase ?? null,
-					intentStateKind: handoff?.intentState.kind ?? null,
+					handoffPhase: null,
+					intentStateKind: null,
 					pendingHostLoadTokenId:
 						handoff?.pendingHostLoadCandidate?.hostLoadTokenId ?? null,
 					view,
@@ -8153,9 +7126,6 @@ export class EditorBindingManager {
 						cm ? (this.editorAuthorityContentByCm.get(cm) ?? null) : null,
 					editorDocument: cm?.state.doc ?? null,
 					editorContent,
-					...(handoffReplayRecovery
-						? { handoffReplayRecovery }
-						: {}),
 				};
 			}),
 		};
@@ -8219,6 +7189,16 @@ export class EditorBindingManager {
 				? session.displayedLineage
 				: null;
 			const validationRuntime = this.managedSessions.get(snapshot.leafId);
+			if (
+				validationRuntime !== undefined
+				&& this.observedFileMismatchTerminalByRuntime.has(validationRuntime)
+			) {
+				return {
+					current: false,
+					reason: "handoff-generation-changed",
+					leafId: snapshot.leafId,
+				};
+			}
 			const stableTargetIdentityProven = snapshot.cm !== null
 				&& validationRuntime !== undefined
 				&& this.isManagedBoundaryLive(validationRuntime, snapshot.cm)
@@ -8245,8 +7225,6 @@ export class EditorBindingManager {
 			const handoff = session.handoff;
 			if (
 				(handoff?.presentation ?? "stable") !== snapshot.handoffPresentation
-				|| (handoff?.phase ?? null) !== snapshot.handoffPhase
-				|| (handoff?.intentState.kind ?? null) !== snapshot.intentStateKind
 				|| (handoff?.pendingHostLoadCandidate?.hostLoadTokenId ?? null)
 					!== snapshot.pendingHostLoadTokenId
 			) {
@@ -8261,20 +7239,6 @@ export class EditorBindingManager {
 			) {
 				return { current: false, reason: "target-file-changed", leafId: snapshot.leafId };
 			}
-			if (!this.sameHandoffReplayRecoveryAdmissionEvidence(
-				snapshot.handoffReplayRecovery,
-				this.captureHandoffReplayRecoveryAdmissionEvidence(
-					session,
-					snapshot.leafId,
-				),
-			)) {
-				return {
-					current: false,
-					reason: "handoff-generation-changed",
-					leafId: snapshot.leafId,
-				};
-			}
-
 			const cm = this.getCmView(view);
 			if (cm !== snapshot.cm) {
 				return { current: false, reason: "cm-changed", leafId: snapshot.leafId };
@@ -8399,8 +7363,6 @@ export class EditorBindingManager {
 				finalSession.currentSwitchIntentSeq !== snapshot.switchIntentSeq
 				|| finalSession.nativeHistoryEpoch !== snapshot.nativeHistoryEpoch
 				|| (finalHandoff?.presentation ?? "stable") !== snapshot.handoffPresentation
-				|| (finalHandoff?.phase ?? null) !== snapshot.handoffPhase
-				|| (finalHandoff?.intentState.kind ?? null) !== snapshot.intentStateKind
 				|| (finalHandoff?.pendingHostLoadCandidate?.hostLoadTokenId ?? null)
 					!== snapshot.pendingHostLoadTokenId
 				|| (
@@ -10108,9 +9070,7 @@ export class EditorBindingManager {
 	private handleLiveEditorUpdate(update: ViewUpdate): void {
 		if (update.docChanged) {
 			const leafId = this.cmToLeafId.get(update.view);
-			if (leafId) {
-				this.lastSuccessfullyAppliedHandoffReplayByLeafId.delete(leafId);
-			}
+			void leafId;
 		}
 		const userDocumentEdit = this.isUserDocumentEdit(update);
 		let editorAuthorityAdvanceCount = 0;
@@ -10243,10 +9203,7 @@ export class EditorBindingManager {
 				runtime
 				&& displayed?.kind === "known"
 				&& displayed.cm === update.view
-				&& (
-					runtime.session.handoff === null
-					|| runtime.session.handoff.presentation === "target-proven"
-				)
+				&& runtime.session.handoff === null
 			) {
 				this.advanceAuthorityEpoch();
 				runtime.session = {
@@ -10414,17 +9371,11 @@ export class EditorBindingManager {
 			|| session.displayedLineage.cm !== cm
 			|| session.displayedLineage.document !== cm.state.doc
 		) return false;
-		return session.handoff === null
-			|| (
-				session.handoff.presentation === "target-proven"
-				&& session.handoff.targetFile === file
-				&& session.handoff.targetPath === file.path
-			);
+		return session.handoff === null;
 	}
 
 	private bumpBindingEpoch(leafId: string): number {
 		this.advanceAuthorityEpoch();
-		this.lastSuccessfullyAppliedHandoffReplayByLeafId.delete(leafId);
 		const next = (this.bindingEpochByLeafId.get(leafId) ?? 0) + 1;
 		this.bindingEpochByLeafId.set(leafId, next);
 		return next;
@@ -10706,184 +9657,6 @@ export class EditorBindingManager {
 		}
 	}
 
-	private captureTargetReadyBindContext(input: Readonly<{
-		view: MarkdownView;
-		file: TFile;
-		filePath: string;
-		leafId: string;
-		cm: EditorView;
-		ytext: Y.Text;
-		fileId: string | undefined;
-		token: TargetReadyToken;
-		presentationReceipt: TargetPresentationReceipt;
-	}>): Readonly<{
-		freshness: AuthorityFreshnessContext;
-		bind: BindPermitContext;
-	}> | null {
-		const {
-			view,
-			file,
-			filePath,
-			leafId,
-			cm,
-			ytext,
-			fileId,
-			token,
-			presentationReceipt,
-		} = input;
-		const authority = token.targetAuthority;
-		if (authority.kind !== "existing" || !fileId) return null;
-		const runtime = this.managedSessions.get(leafId);
-		const session = runtime?.session;
-		const handoff = session?.handoff;
-		const workflow = runtime?.targetWorkflow;
-		const displayed = session?.displayedLineage;
-		const hostReceipt = presentationReceipt.hostLoadCompletionReceipt;
-		const guard = runtime?.cmGuard?.snapshot() ?? null;
-		const recoveryRequest = runtime && workflow
-			? this.captureRecoveryTargetBindingRequest(runtime, workflow)
-			: null;
-		const normalBindingReady = !!runtime
-			&& !!workflow
-			&& this.isNormalTargetBindingReady(runtime, workflow);
-		const sessionIdentityCurrent = this.asyncAuthorityOpen
-			&& !!runtime
-			&& !!session
-			&& session.view === view
-			&& session.sessionId === token.sessionId
-			&& session.leafId === token.leafId
-			&& session.generation === token.handoffGeneration
-			&& session.currentSwitchIntentSeq === token.switchIntentSeq
-			&& view.file === file
-			&& file === token.targetFile
-			&& file.path === filePath
-			&& token.targetPath === filePath;
-		const handoffStateCurrent = !!handoff
-			&& handoff.presentation === "target-proven"
-			&& handoff.targetFile === file
-			&& handoff.targetPath === filePath
-			&& handoff.targetReadyTokenId
-				=== presentationReceipt.replacementTargetReadyToken.tokenId
-			&& handoff.pendingHostLoadCandidate === null
-			&& (normalBindingReady || recoveryRequest !== null)
-			&& session?.pendingInputStartReservation === null;
-		const workflowCurrent = !!workflow
-			&& workflow.targetPresentationReceipt === presentationReceipt
-			&& workflow.targetReadyToken === token;
-		const displayedEditorCurrent = displayed?.kind === "known"
-			&& displayed.file === file
-			&& displayed.path === filePath
-			&& displayed.cm === cm
-			&& displayed.document === cm.state.doc
-			&& displayed.editorRevision === (this.editorRevisionByCm.get(cm) ?? 0)
-			&& this.getCmView(view) === cm
-			&& cm.dom.isConnected
-			&& view.containerEl.contains(cm.dom);
-		const activeAuthorityCurrent =
-			this.vaultSync.getTextForPath(filePath) === ytext
-			&& this.vaultSync.getFileId(filePath) === fileId
-			&& this.vaultSync.getFileIdForText(ytext) === fileId
-			&& authority.fileId === fileId
-			&& authority.ytextIdentity.length > 0
-			&& Number.isSafeInteger(authority.ytextMutationEpoch)
-			&& authority.ytextMutationEpoch >= 0
-			&& authority.bindPermitId.length > 0
-			&& token.authorityFreshnessHandleId.length > 0;
-		const tokenReceiptCurrent =
-			token.hostLoadTokenId === hostReceipt.hostLoadTokenId
-			&& token.hostLoadReceiptId === hostReceipt.receiptId
-			&& token.hostLoadCompletedEpoch === hostReceipt.nativeHistoryEpoch
-			&& token.nativeHistoryEpoch === hostReceipt.nativeHistoryEpoch
-			&& token.targetSelectionEpoch === hostReceipt.targetSelectionEpoch
-			&& token.targetScrollEpoch === hostReceipt.targetScrollEpoch
-			&& token.certifiedBaseContent === cm.state.doc.toString()
-			&& token.certifiedBaseContent === ytext.toJSON();
-		const editorEpochsCurrent = session?.nativeHistoryEpoch === token.nativeHistoryEpoch
-			&& guard?.view === cm
-			&& !guard.inert
-			&& guard.nativeHistoryEpoch === token.nativeHistoryEpoch
-			&& guard.selectionEpoch === token.targetSelectionEpoch
-			&& guard.scrollEpoch === token.targetScrollEpoch
-			&& cm.state.selection.eq(hostReceipt.targetSelection)
-			&& (this.bindingEpochByLeafId.get(leafId) ?? 0)
-				=== handoff?.bindingEpochAfterDetach;
-		if (
-			!sessionIdentityCurrent
-			|| !handoffStateCurrent
-			|| !workflowCurrent
-			|| !displayedEditorCurrent
-			|| !activeAuthorityCurrent
-			|| !tokenReceiptCurrent
-			|| !editorEpochsCurrent
-		) {
-			this.trace?.("editor", "target-ready-bind-context-stale", {
-				leafId,
-				path: filePath,
-				sessionIdentityCurrent,
-				handoffStateCurrent,
-				workflowCurrent,
-				displayedEditorCurrent,
-				displayedKnown: displayed?.kind === "known",
-				displayedFileCurrent:
-					displayed?.kind === "known" && displayed.file === file,
-				displayedPathCurrent:
-					displayed?.kind === "known" && displayed.path === filePath,
-				displayedCmCurrent:
-					displayed?.kind === "known" && displayed.cm === cm,
-				displayedDocumentCurrent:
-					displayed?.kind === "known" && displayed.document === cm.state.doc,
-				displayedRevisionCurrent:
-					displayed?.kind === "known"
-					&& displayed.editorRevision
-						=== (this.editorRevisionByCm.get(cm) ?? 0),
-				resolvedCmCurrent: this.getCmView(view) === cm,
-				cmConnected: cm.dom.isConnected,
-				cmContained: view.containerEl.contains(cm.dom),
-				activeAuthorityCurrent,
-				tokenReceiptCurrent,
-				editorEpochsCurrent,
-			});
-			return null;
-		}
-		let editorContent: string;
-		let hostData: string;
-		try {
-			editorContent = view.editor.getValue();
-			hostData = (view as unknown as TextFileView).getViewData();
-		} catch {
-			return null;
-		}
-		if (
-			editorContent !== token.certifiedBaseContent
-			|| hostData !== token.certifiedBaseContent
-			|| (view as unknown as TextFileView).data !== token.certifiedBaseContent
-		) return null;
-		const freshness: AuthorityFreshnessContext = Object.freeze({
-			sessionId: session.sessionId,
-			leafId,
-			handoffGeneration: session.generation,
-			targetReadyTokenId: token.tokenId,
-			targetFile: file,
-			hostLoadReceiptId: hostReceipt.receiptId,
-			cm,
-			editorRevision: displayed.editorRevision,
-			nativeHistoryEpoch: session.nativeHistoryEpoch,
-			selectionEpoch: guard.selectionEpoch,
-			scrollEpoch: guard.scrollEpoch,
-		});
-		return Object.freeze({
-			freshness,
-			bind: Object.freeze({
-				...freshness,
-				fileId,
-				ytext,
-				ytextIdentity: authority.ytextIdentity,
-				ytextMutationEpoch: authority.ytextMutationEpoch,
-				bindingEpoch: handoff.bindingEpochAfterDetach,
-			}),
-		});
-	}
-
 	private applyBinding(options: {
 		action: "bind" | "repair";
 		deviceName: string;
@@ -10897,8 +9670,6 @@ export class EditorBindingManager {
 		fileId?: string;
 		authorityLease?: EditorAuthorityLease;
 		samePathAdoptionYtextMutationEpochAtBind?: number;
-		targetReadyToken?: TargetReadyToken;
-		targetPresentationReceipt?: TargetPresentationReceipt;
 		existing?: EditorBinding;
 		reason?: string;
 		rapidSwitch?: boolean;
@@ -10916,21 +9687,12 @@ export class EditorBindingManager {
 			fileId,
 			authorityLease,
 			samePathAdoptionYtextMutationEpochAtBind,
-			targetReadyToken,
-			targetPresentationReceipt,
 			existing,
 			reason,
 			rapidSwitch: rapidSwitchHint,
 		} = options;
 		const bindingFile = file ?? view.file;
 		if (!bindingFile || bindingFile.path !== filePath) return false;
-		if ((targetReadyToken === undefined) !== (targetPresentationReceipt === undefined)) {
-			return false;
-		}
-		if (
-			targetReadyToken !== undefined
-			&& samePathAdoptionYtextMutationEpochAtBind !== undefined
-		) return false;
 		if (
 			samePathAdoptionYtextMutationEpochAtBind !== undefined
 			&& (
@@ -10938,11 +9700,10 @@ export class EditorBindingManager {
 				|| samePathAdoptionYtextMutationEpochAtBind < 0
 			)
 		) return false;
-		if (targetReadyToken && !this.editorAuthorityControllerPort) return false;
 		this.manageView(view);
 		if (!this.requireManagedBoundary(view, `${action}:${reason ?? "apply"}`)) return false;
 		let exactLease = authorityLease;
-		if (!targetReadyToken && !exactLease) {
+		if (!exactLease) {
 			const authority = this.capturePathEditorAuthority(filePath);
 			if (authority.kind !== "proven-single" || authority.content !== ytext.toJSON()) {
 				return false;
@@ -11027,66 +9788,7 @@ export class EditorBindingManager {
 		this.bindingPublicationOwnerByCm.set(cm, publicationOwner);
 		let authorityYtextMutationEpochAtBind: number | undefined;
 		let localYtextMutationRevisionAtBind: number | undefined;
-		if (targetReadyToken && targetPresentationReceipt) {
-			const port = this.editorAuthorityControllerPort;
-			const initialContext = this.captureTargetReadyBindContext({
-				view,
-				file: bindingFile,
-				filePath,
-				leafId,
-				cm,
-				ytext,
-				fileId,
-				token: targetReadyToken,
-				presentationReceipt: targetPresentationReceipt,
-			});
-			if (
-				!port
-				|| !initialContext
-				|| !port.isAuthorityFreshnessCurrent(
-					targetReadyToken.authorityFreshnessHandleId,
-					initialContext.freshness,
-				)
-			) {
-				this.bindingPublicationOwnerByCm.delete(cm);
-				undoManager.destroy();
-				return false;
-			}
-			const authority = targetReadyToken.targetAuthority;
-			if (
-				authority.kind !== "existing"
-			) {
-				this.bindingPublicationOwnerByCm.delete(cm);
-				undoManager.destroy();
-				return false;
-			}
-			authorityYtextMutationEpochAtBind = authority.ytextMutationEpoch;
-			localYtextMutationRevisionAtBind =
-				this.yTextMutationRevisionByText.get(ytext) ?? 0;
-			const finalContext = this.captureTargetReadyBindContext({
-				view,
-				file: bindingFile,
-				filePath,
-				leafId,
-				cm,
-				ytext,
-				fileId,
-				token: targetReadyToken,
-				presentationReceipt: targetPresentationReceipt,
-			});
-			if (
-				!finalContext
-				|| targetReadyToken.targetAuthority.kind !== "existing"
-				|| !port.consumeBindPermit(
-					targetReadyToken.targetAuthority.bindPermitId,
-					finalContext.bind,
-				)
-			) {
-				this.bindingPublicationOwnerByCm.delete(cm);
-				undoManager.destroy();
-				return false;
-			}
-		} else if (samePathAdoptionYtextMutationEpochAtBind !== undefined) {
+		if (samePathAdoptionYtextMutationEpochAtBind !== undefined) {
 			authorityYtextMutationEpochAtBind =
 				samePathAdoptionYtextMutationEpochAtBind;
 			localYtextMutationRevisionAtBind =
@@ -11202,7 +9904,7 @@ export class EditorBindingManager {
 		}
 
 		this.advanceAuthorityEpoch();
-		const bindingEpochAfterBind = this.bumpBindingEpoch(leafId);
+		this.bumpBindingEpoch(leafId);
 		this.bindings.set(leafId, {
 			view,
 			file: bindingFile,
@@ -11223,26 +9925,7 @@ export class EditorBindingManager {
 		const runtime = this.managedSessions.get(leafId);
 		if (runtime?.session.view === view) {
 			const currentHandoff = runtime.session.handoff;
-			if (targetReadyToken && targetPresentationReceipt && fileId) {
-				const completed = reduceManagedLeafSession(runtime.session, {
-					type: "binding-completed",
-					sessionId: targetReadyToken.sessionId,
-					expectedGeneration: targetReadyToken.handoffGeneration,
-					presentationTargetReadyTokenId:
-						targetPresentationReceipt.replacementTargetReadyToken.tokenId,
-					finalTargetReadyTokenId: targetReadyToken.tokenId,
-					fileId,
-					ytext,
-					cm,
-					bindingEpochAfterBind,
-				});
-				if (!completed.accepted) {
-					this.detachBinding(view, "target-binding-reducer-rejected", false);
-					return false;
-				}
-				this.advanceAuthorityEpoch();
-				runtime.session = completed.state;
-			} else if (currentHandoff === null || currentHandoff.presentation === "target-proven") {
+			if (currentHandoff === null) {
 				this.advanceAuthorityEpoch();
 				runtime.session = {
 					...runtime.session,
@@ -11572,43 +10255,53 @@ export class EditorBindingManager {
 			});
 			const requiredPath =
 				this.samePathAdoptionRequiredPathByLeafId.get(leafId) ?? null;
-			const retryRequired = requiredPath !== null
+			const retryScopeActive = requiredPath !== null
 				&& runtime.session.view.file?.path === requiredPath
 				&& runtime.session.binding.kind === "unbound"
-				&& runtime.adoption.kind === "none"
 				&& !this.bindings.has(leafId);
-			if (!retryRequired) {
+			if (!retryScopeActive) {
 				this.samePathAdoptionRetryAttempts.delete(leafId);
 				return;
 			}
-			const attempt = (this.samePathAdoptionRetryAttempts.get(leafId) ?? 0) + 1;
-			this.samePathAdoptionRetryAttempts.set(leafId, attempt);
-			const delayMs = SAME_PATH_ADOPTION_RETRY_DELAYS_MS[
-				Math.min(attempt - 1, SAME_PATH_ADOPTION_RETRY_DELAYS_MS.length - 1)
-			];
-			const timer = setTimeout(() => {
-				if (this.pendingSamePathAdoptionRetries.get(leafId) !== timer) return;
-				this.pendingSamePathAdoptionRetries.delete(leafId);
-				const current = this.managedSessions.get(leafId);
-				if (
-					current !== runtime
-					|| !this.asyncAuthorityOpen
-					|| this.samePathAdoptionRequiredPathByLeafId.get(leafId)
-						!== requiredPath
-				) return;
-				this.scheduleSamePathAdoptionRefresh(
-					runtime,
-					`${reason}:required-retry`,
-				);
-			}, delayMs);
-			this.pendingSamePathAdoptionRetries.set(leafId, timer);
-			this.trace?.("editor", "same-path-adoption-retry-scheduled", {
-				leafId,
-				path: requiredPath,
-				reason,
-				attempt,
-				delayMs,
-			});
+			if (runtime.adoption.kind === "none") {
+				this.scheduleSamePathAdoptionRetry(runtime, requiredPath, reason);
+			}
+		});
+	}
+
+	private scheduleSamePathAdoptionRetry(
+		runtime: ManagedLeafRuntime,
+		requiredPath: string,
+		reason: string,
+	): void {
+		const leafId = runtime.session.leafId;
+		if (this.pendingSamePathAdoptionRetries.has(leafId)) return;
+		const attempt = (this.samePathAdoptionRetryAttempts.get(leafId) ?? 0) + 1;
+		this.samePathAdoptionRetryAttempts.set(leafId, attempt);
+		const delayMs = SAME_PATH_ADOPTION_RETRY_DELAYS_MS[
+			Math.min(attempt - 1, SAME_PATH_ADOPTION_RETRY_DELAYS_MS.length - 1)
+		];
+		const timer = setTimeout(() => {
+			if (this.pendingSamePathAdoptionRetries.get(leafId) !== timer) return;
+			this.pendingSamePathAdoptionRetries.delete(leafId);
+			const current = this.managedSessions.get(leafId);
+			if (
+				current !== runtime
+				|| !this.asyncAuthorityOpen
+				|| this.samePathAdoptionRequiredPathByLeafId.get(leafId) !== requiredPath
+			) return;
+			this.scheduleSamePathAdoptionRefresh(
+				runtime,
+				`${reason}:required-retry`,
+			);
+		}, delayMs);
+		this.pendingSamePathAdoptionRetries.set(leafId, timer);
+		this.trace?.("editor", "same-path-adoption-retry-scheduled", {
+			leafId,
+			path: requiredPath,
+			reason,
+			attempt,
+			delayMs,
 		});
 	}
 
@@ -11781,6 +10474,8 @@ export class EditorBindingManager {
 			|| host.saveEpoch !== proposal.hostSaveEpoch
 			|| host.mode.kind !== "pass-through"
 			|| host.sourceUnload !== null
+			|| !hasExactHostGuardWrappers(host)
+			|| !hasNoPendingHostLoadOwner(host)
 			|| guard === null
 			|| guard.view !== request.cm
 			|| guard.inert
@@ -11865,8 +10560,10 @@ export class EditorBindingManager {
 				|| ticket.editorContent !== targetText
 				|| candidateHost === null
 				|| candidateHost.hostCapabilityState !== "ready"
-				|| candidateHost.mode.kind !== "pass-through"
-				|| candidateHost.sourceUnload !== null
+					|| candidateHost.mode.kind !== "pass-through"
+					|| candidateHost.sourceUnload !== null
+					|| !hasExactHostGuardWrappers(candidateHost)
+					|| !hasNoPendingHostLoadOwner(candidateHost)
 				|| candidateGuard === null
 				|| candidateGuard.view !== ticket.cm
 				|| candidateGuard.inert
@@ -12012,8 +10709,10 @@ export class EditorBindingManager {
 					)
 					|| host === null
 					|| host.hostCapabilityState !== "ready"
-					|| host.mode.kind !== "pass-through"
-					|| host.sourceUnload !== null
+						|| host.mode.kind !== "pass-through"
+						|| host.sourceUnload !== null
+						|| !hasExactHostGuardWrappers(host)
+						|| !hasNoPendingHostLoadOwner(host)
 					|| guard === null
 					|| guard.view !== projectionCm
 					|| guard.inert
@@ -12441,10 +11140,12 @@ export class EditorBindingManager {
 		if (
 			host === null
 			|| guard === null
-			|| host.hostCapabilityState !== "ready"
-			|| host.mode.kind !== "pass-through"
-			|| host.sourceUnload !== null
-			|| guard.view !== cm
+				|| host.hostCapabilityState !== "ready"
+				|| host.mode.kind !== "pass-through"
+				|| host.sourceUnload !== null
+				|| !hasExactHostGuardWrappers(host)
+				|| !hasNoPendingHostLoadOwner(host)
+				|| guard.view !== cm
 			|| guard.inert
 			|| guard.gateClosed
 			|| guard.pendingHostLoadCandidate !== null
@@ -12652,8 +11353,10 @@ export class EditorBindingManager {
 				if (!this.isSamePathAdoptionRequestCurrent(request)) {
 					this.advanceAuthorityEpoch();
 					current.adoption = NO_SAME_PATH_ADOPTION;
-					this.scheduleSamePathAdoptionRefresh(
+					this.samePathAdoptionRequiredPathByLeafId.set(leafId, file.path);
+					this.scheduleSamePathAdoptionRetry(
 						current,
+						file.path,
 						"stale-planning-response",
 					);
 					return;
@@ -12697,8 +11400,10 @@ export class EditorBindingManager {
 					return;
 				}
 				current.adoption = NO_SAME_PATH_ADOPTION;
-				this.scheduleSamePathAdoptionRefresh(
+				this.samePathAdoptionRequiredPathByLeafId.set(leafId, file.path);
+				this.scheduleSamePathAdoptionRetry(
 					current,
+					file.path,
 					result.kind === "seeded-replan"
 						? "seeded-remote-replan"
 						: "controller-replan",
@@ -12714,8 +11419,10 @@ export class EditorBindingManager {
 				) {
 					this.advanceAuthorityEpoch();
 					current.adoption = NO_SAME_PATH_ADOPTION;
-					this.scheduleSamePathAdoptionRefresh(
+					this.samePathAdoptionRequiredPathByLeafId.set(leafId, file.path);
+					this.scheduleSamePathAdoptionRetry(
 						current,
+						file.path,
 						"planning-request-rejected",
 					);
 				}
@@ -12790,19 +11497,6 @@ export class EditorBindingManager {
 		if (!file) return null;
 		const session = this.getManagedSession(view);
 		if (!session || !this.isManagedTargetSelected(session, file)) return null;
-		if (
-			this.editorAuthorityControllerPort
-			&& session.handoff?.presentation === "target-proven"
-		) {
-			const runtime = this.managedSessions.get(session.leafId);
-			const workflow = runtime?.targetWorkflow;
-			if (runtime && workflow) this.requestTargetBindingAdmission(runtime, workflow);
-			return Object.freeze({
-				kind: "missing-target",
-				targetFile: file,
-				targetPath: file.path,
-			});
-		}
 		if (!this.isMarkdownPathSyncable(file.path)) {
 			this.skipExcludedBinding(view, file.path, `resolve:${reason}`);
 			return null;
@@ -12812,8 +11506,7 @@ export class EditorBindingManager {
 			session.handoff !== null
 			&& displayed.kind === "known"
 			&& displayed.path === file.path
-			&& displayed.file !== file
-			&& session.handoff.presentation !== "target-proven";
+			&& displayed.file !== file;
 		if (samePathReplacementAwaitingAdmission) {
 			this.trace?.("editor", "same-path-file-replacement-awaiting-controller", {
 				path: file.path,
@@ -13031,6 +11724,20 @@ export class EditorBindingManager {
 				runtime.session = cancelled.state;
 				this.applyHandoffEffects(runtime, cancelled.effects, reason);
 			}
+		}
+		if (
+			runtime?.session.view === view
+			&& runtime.session.handoff === null
+			&& retainedHandoff !== null
+			&& runtime.transitionInputFence !== null
+		) {
+			this.releaseTransitionInputFence(
+				runtime,
+				retainedHandoff.targetFile,
+				retainedHandoff.targetPath,
+				`${reason}:cancelled`,
+				true,
+			);
 		}
 		this.detachBinding(view, reason, false);
 		if (!this.unmanageView(view, reason, scheduleRetry) && runtime && retainedHandoff) {

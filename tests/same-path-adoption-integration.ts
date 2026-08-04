@@ -411,6 +411,8 @@ function makeFixture(options: FixtureOptions) {
 			view,
 			hostCapability: "owned-scheduler-with-unload-flush",
 			hostCapabilityState: "ready",
+			wrappersCurrent: true,
+			loadWrappersCurrent: true,
 			saveEpoch: hostSaveEpoch,
 			clearLoadCapability: "observable",
 			mode: hostMode,
@@ -418,6 +420,8 @@ function makeFixture(options: FixtureOptions) {
 			pendingTargetSave: false,
 			pendingOwnedSave: null,
 			sourceUnload: null,
+			pendingDeferredLoadAdmission: null,
+			pendingSourceUnloadDrain: null,
 		}),
 		markInert: () => true,
 		restoreIfCurrent: () => true,
@@ -514,6 +518,8 @@ function makeFixture(options: FixtureOptions) {
 				view: peerView,
 				hostCapability: "owned-scheduler-with-unload-flush",
 				hostCapabilityState: "ready",
+				wrappersCurrent: true,
+				loadWrappersCurrent: true,
 				saveEpoch: hostSaveEpoch,
 				clearLoadCapability: "observable",
 				mode: hostMode,
@@ -521,6 +527,8 @@ function makeFixture(options: FixtureOptions) {
 				pendingTargetSave: false,
 				pendingOwnedSave: null,
 				sourceUnload: null,
+				pendingDeferredLoadAdmission: null,
+				pendingSourceUnloadDrain: null,
 			}),
 			markInert: () => true,
 			restoreIfCurrent: () => true,
@@ -1246,6 +1254,8 @@ async function compositePaneConflictPublishesToEveryPane(): Promise<void> {
 				view: pane.view,
 				hostCapability: "owned-scheduler-with-unload-flush",
 				hostCapabilityState: "ready",
+				wrappersCurrent: true,
+				loadWrappersCurrent: true,
 				saveEpoch: 0,
 				clearLoadCapability: "observable",
 				mode: { kind: "pass-through" },
@@ -1253,6 +1263,8 @@ async function compositePaneConflictPublishesToEveryPane(): Promise<void> {
 				pendingTargetSave: false,
 				pendingOwnedSave: null,
 				sourceUnload: null,
+				pendingDeferredLoadAdmission: null,
+				pendingSourceUnloadDrain: null,
 			}),
 			markInert: () => true,
 			restoreIfCurrent: () => true,
@@ -1334,8 +1346,20 @@ async function stalePlanningResponseSchedulesFreshAdoption(): Promise<void> {
 	await flushPlanningTurn();
 	assert.equal(
 		fixture.requestCount(),
+		1,
+		"a stale async response does not recurse through immediate microtask replans",
+	);
+	const retryTrace = fixture.traces.find(
+		(trace) => trace.msg === "same-path-adoption-retry-scheduled",
+	);
+	assert.equal(retryTrace?.details?.attempt, 1);
+	assert.equal(retryTrace?.details?.delayMs, 120);
+	await new Promise((resolve) => setTimeout(resolve, 160));
+	await flushPlanningTurn();
+	assert.equal(
+		fixture.requestCount(),
 		2,
-		"a stale async response releases the old planning state and requests a fresh plan",
+		"a stale async response releases the old planning state and requests a delayed fresh plan",
 	);
 	assert.ok(
 		fixture.traces.some((trace) => trace.msg === "same-path-adoption-refreshed"),

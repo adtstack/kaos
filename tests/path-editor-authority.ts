@@ -66,7 +66,7 @@ function fakeYText(identity: string): Y.Text {
 
 function createPane(input?: Readonly<{
 	path?: string;
-	fileId?: string;
+	fileId?: string | null;
 	content?: string;
 	leafId?: string;
 	sessionId?: string;
@@ -76,7 +76,7 @@ function createPane(input?: Readonly<{
 	file?: TFile;
 }>): PaneFixture {
 	const path = input?.path ?? "B.md";
-	const fileId = input?.fileId ?? "file-b";
+	const fileId = input?.fileId === undefined ? "file-b" : input.fileId;
 	const content = input?.content ?? "content:B";
 	const file = input?.file ?? fakeFile(path);
 	const view = { file } as unknown as MutableView;
@@ -97,7 +97,7 @@ function createPane(input?: Readonly<{
 			document,
 			editorRevision,
 		},
-		binding: input?.bound === false
+		binding: input?.bound === false || fileId === null
 			? { kind: "unbound" }
 			: { kind: "bound", path, fileId, ytext },
 	});
@@ -115,6 +115,113 @@ function createPane(input?: Readonly<{
 			read: { kind: "ok", content },
 		},
 	};
+}
+
+// A truly missing target has no fileId/Y.Text yet. Once the exact local pane is
+// stable and unbound, its editor bytes may seed background same-path admission.
+{
+	const fixture = createPane({
+		fileId: null,
+		bound: false,
+		leafId: "leaf-nullable-local",
+	});
+	const source = sourceFor(fixture);
+	const port = createPathEditorAuthorityPort(source);
+	const proven = requireProven(port.capturePathEditorAuthority("B.md"));
+	assert.equal(proven.content, "content:B");
+	assert.equal(port.isLeaseCurrent(proven.lease), true);
+	assert.equal(
+		requireProven(port.capturePathEditorAuthority("B.md")).lease,
+		proven.lease,
+		"stable nullable local authority reuses its exact lease",
+	);
+}
+
+// Materializing the missing target ID is a lineage change, even while the same
+// local editor, TFile and bytes remain visible.
+{
+	const fixture = createPane({ fileId: null, bound: false });
+	const source = sourceFor(fixture);
+	const port = createPathEditorAuthorityPort(source);
+	const nullableLease = requireProven(
+		port.capturePathEditorAuthority("B.md"),
+	).lease;
+	replacePane(source, 0, (pane) => withSession(pane, (session) => ({
+		...session,
+		displayedLineage: session.displayedLineage.kind === "known"
+			? { ...session.displayedLineage, fileId: "file-b" }
+			: session.displayedLineage,
+	})));
+	assert.equal(
+		port.isLeaseCurrent(nullableLease),
+		false,
+		"null-to-concrete file identity invalidates the nullable lease",
+	);
+	const concrete = requireProven(port.capturePathEditorAuthority("B.md"));
+	assert.notEqual(concrete.lease, nullableLease);
+	assert.equal(port.isLeaseCurrent(concrete.lease), true);
+}
+
+// Nullable lineage is local-only authority. An input reservation or retained
+// same-path receipt means the pane is not yet stable enough to seed anything.
+{
+	const transitions: readonly Readonly<{
+		name: string;
+		update(session: ManagedLeafSession): ManagedLeafSession;
+	}>[] = [
+		{
+			name: "pending input reservation",
+			update: (session) => ({
+				...session,
+				pendingInputStartReservation: {} as NonNullable<
+					ManagedLeafSession["pendingInputStartReservation"]
+				>,
+			}),
+		},
+		{
+			name: "completed same-path input receipt",
+			update: (session) => ({
+				...session,
+				completedSamePathInput: {} as NonNullable<
+					ManagedLeafSession["completedSamePathInput"]
+				>,
+			}),
+		},
+	];
+	for (const transition of transitions) {
+		const fixture = createPane({ fileId: null, bound: false });
+		const source = sourceFor(fixture);
+		replacePane(source, 0, (pane) => withSession(pane, (session) =>
+			transition.update(session)));
+		assert.deepEqual(
+			createPathEditorAuthorityPort(source).capturePathEditorAuthority("B.md"),
+			{ kind: "blocked", reason: "transitioning" },
+			transition.name,
+		);
+	}
+}
+
+// A nullable and a concrete lineage are never the same authority proof, even
+// when they display the same TFile and bytes.
+{
+	const sharedFile = fakeFile("B.md", "shared-nullable-file");
+	const nullable = createPane({
+		fileId: null,
+		bound: false,
+		leafId: "leaf-nullable-a",
+		file: sharedFile,
+	});
+	const concrete = createPane({
+		fileId: "file-b",
+		bound: false,
+		leafId: "leaf-concrete",
+		file: sharedFile,
+	});
+	assert.deepEqual(
+		createPathEditorAuthorityPort(sourceFor(nullable, concrete))
+			.capturePathEditorAuthority("B.md"),
+		{ kind: "blocked", reason: "multiple" },
+	);
 }
 
 function createSource(input?: Readonly<{
@@ -310,12 +417,8 @@ function withSession(
 				targetFile: fakeFile(targetPath),
 				bindingEpochAfterDetach: pane.bindingEpoch,
 				presentation: "source",
-				targetReadyTokenId: null,
 				inputGateInstalled: true,
 				saveGuardInstalled: true,
-				recoveryOperationEpoch: 0,
-				intentState: { kind: "none" },
-				phase: "awaiting-host-load",
 				pendingHostLoadCandidate: null,
 			},
 		})));
@@ -411,43 +514,13 @@ function withSession(
 	assert.deepEqual(port.capturePathEditorAuthority("C.md"), { kind: "none" });
 }
 
-// A fully target-proven displayed lineage may be unbound before final binding.
+// A locally committed target is stable and unbound only after its transition
+// handoff has been cleared.
 {
 	const fixture = createPane({ bound: false });
 	const source = sourceFor(fixture);
 	const port = createPathEditorAuthorityPort(source);
 	assert.equal(port.capturePathEditorAuthority("B.md").kind, "proven-single");
-
-	const targetProven = createPane({ bound: false });
-	const targetSource = sourceFor(targetProven);
-	replacePane(targetSource, 0, (pane) => withSession(pane, (session) => ({
-		...session,
-		generation: 2,
-		eventOrderSeq: 3,
-		currentSwitchIntentSeq: 3,
-		completedDetachEpoch: pane.bindingEpoch,
-		handoff: {
-			sourceAuthorityPath: "A.md",
-			sourceUnloadReceiptId: "source-unload:path-authority:2",
-			targetPath: "B.md",
-			targetFile: targetProven.file,
-			bindingEpochAfterDetach: pane.bindingEpoch,
-			presentation: "target-proven",
-			targetReadyTokenId: "target-ready:b",
-			inputGateInstalled: false,
-			saveGuardInstalled: false,
-			recoveryOperationEpoch: 0,
-			intentState: { kind: "none" },
-			phase: "target-ready",
-			pendingHostLoadCandidate: null,
-		},
-	})));
-	assert.equal(
-		createPathEditorAuthorityPort(targetSource)
-			.capturePathEditorAuthority("B.md").kind,
-		"proven-single",
-		"real target-proven handoff remains usable before bind",
-	);
 
 	const mismatchedBinding = createPane();
 	const mismatchSource = sourceFor(mismatchedBinding);
@@ -602,12 +675,8 @@ function withSession(
 					targetFile: fakeFile("C.md"),
 					bindingEpochAfterDetach: pane.bindingEpoch,
 					presentation: "source",
-					targetReadyTokenId: null,
 					inputGateInstalled: true,
 					saveGuardInstalled: true,
-					recoveryOperationEpoch: 0,
-					intentState: { kind: "none" },
-					phase: "awaiting-host-load",
 					pendingHostLoadCandidate: null,
 				},
 				view: fixture.view,

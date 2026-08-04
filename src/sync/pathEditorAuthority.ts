@@ -94,13 +94,9 @@ type CapturedHandoff = null | Readonly<{
 	targetFile: TFile;
 	targetFilePath: string;
 	bindingEpochAfterDetach: number;
-	presentation: "source" | "target-candidate" | "target-proven";
-	targetReadyTokenId: string | null;
+	presentation: "source" | "target-candidate";
 	inputGateInstalled: boolean;
 	saveGuardInstalled: boolean;
-	recoveryOperationEpoch: number;
-	intentState: NonNullable<ManagedLeafSession["handoff"]>["intentState"];
-	phase: NonNullable<ManagedLeafSession["handoff"]>["phase"];
 	pendingHostLoadCandidate: NonNullable<ManagedLeafSession["handoff"]>["pendingHostLoadCandidate"];
 }>;
 
@@ -114,7 +110,7 @@ type CapturedPane = Readonly<{
 	currentSwitchIntentSeq: number | null;
 	nativeHistoryEpoch: number;
 	completedDetachEpoch: number | null;
-	activeRecoveries: ManagedLeafSession["activeRecoveries"];
+	completedSamePathInput: ManagedLeafSession["completedSamePathInput"];
 	pendingInputStartReservation: ManagedLeafSession["pendingInputStartReservation"];
 	view: ManagedLeafSession["view"];
 	currentFile: TFile | null;
@@ -137,7 +133,7 @@ type CapturedPane = Readonly<{
 type AuthorityProof = Readonly<{
 	requestedPath: string;
 	authorityEpoch: number;
-	fileId: string;
+	fileId: string | null;
 	content: string;
 	contentHash: string;
 	fingerprint: string;
@@ -305,12 +301,8 @@ function capturePane(pane: PathEditorAuthorityManagedPane): CapturedPane {
 			targetFilePath: liveHandoff.targetFile.path,
 			bindingEpochAfterDetach: liveHandoff.bindingEpochAfterDetach,
 			presentation: liveHandoff.presentation,
-			targetReadyTokenId: liveHandoff.targetReadyTokenId,
 			inputGateInstalled: liveHandoff.inputGateInstalled,
 			saveGuardInstalled: liveHandoff.saveGuardInstalled,
-			recoveryOperationEpoch: liveHandoff.recoveryOperationEpoch,
-			intentState: liveHandoff.intentState,
-			phase: liveHandoff.phase,
 			pendingHostLoadCandidate: liveHandoff.pendingHostLoadCandidate,
 		};
 	const currentCm = pane.currentCm;
@@ -335,7 +327,7 @@ function capturePane(pane: PathEditorAuthorityManagedPane): CapturedPane {
 		currentSwitchIntentSeq: session.currentSwitchIntentSeq,
 		nativeHistoryEpoch: session.nativeHistoryEpoch,
 		completedDetachEpoch: session.completedDetachEpoch,
-		activeRecoveries: session.activeRecoveries,
+		completedSamePathInput: session.completedSamePathInput,
 		pendingInputStartReservation: session.pendingInputStartReservation,
 		view,
 		currentFile,
@@ -362,7 +354,6 @@ function isHealthyCandidate(pane: CapturedPane, path: string): boolean {
 		displayed.kind !== "known"
 		|| displayed.path !== path
 		|| displayed.filePath !== path
-		|| displayed.fileId === null
 		|| pane.currentFile !== displayed.file
 		|| pane.currentFilePath !== path
 		|| pane.currentCm === null
@@ -379,6 +370,19 @@ function isHealthyCandidate(pane: CapturedPane, path: string): boolean {
 	}
 
 	if (pane.read.content !== pane.displayedDocumentContent) return false;
+	if (
+		displayed.fileId === null
+		&& (
+			pane.binding.kind !== "unbound"
+			|| pane.handoff !== null
+				|| pane.currentSwitchIntentSeq !== null
+				|| pane.completedDetachEpoch !== null
+				|| pane.completedSamePathInput !== null
+				|| pane.pendingInputStartReservation !== null
+		)
+	) {
+		return false;
+	}
 
 	if (
 		pane.binding.kind === "bound"
@@ -390,22 +394,19 @@ function isHealthyCandidate(pane: CapturedPane, path: string): boolean {
 		return false;
 	}
 
-	const handoff = pane.handoff;
-	if (handoff === null) return true;
-	return handoff.presentation === "target-proven"
-		&& handoff.targetPath === path
-		&& handoff.targetFile === displayed.file
-		&& handoff.targetFilePath === path
-		&& handoff.targetReadyTokenId !== null
-		&& handoff.targetReadyTokenId.length > 0
-		&& handoff.bindingEpochAfterDetach === pane.bindingEpoch
-		&& pane.currentSwitchIntentSeq !== null;
+	return pane.handoff === null;
+}
+
+function fingerprintFileId(fileId: string | null): string {
+	// Tag and length-prefix concrete IDs so a missing ID is never confused with
+	// an empty string, the literal "null", or a delimiter-bearing concrete ID.
+	return fileId === null ? "missing" : `concrete:${fileId.length}:${fileId}`;
 }
 
 function buildFingerprint(
 	path: string,
 	authorityEpoch: number,
-	fileId: string,
+	fileId: string | null,
 	contentHash: string,
 	panes: readonly CapturedPane[],
 ): string {
@@ -415,11 +416,15 @@ function buildFingerprint(
 		pane.bindingEpoch,
 		pane.editorRevision,
 		pane.currentFilePath ?? "",
-		pane.displayedLineage.kind === "known" ? pane.displayedLineage.fileId ?? "" : "unknown",
+		pane.displayedLineage.kind === "known"
+			? fingerprintFileId(pane.displayedLineage.fileId)
+			: "unknown-lineage",
 		pane.contentHash ?? "read-failed",
 		pane.handoff?.presentation ?? "stable",
 	].join("\u001f")).join("\u001e");
-	return hashString(`${path}\u001d${authorityEpoch}\u001d${fileId}\u001d${contentHash}\u001d${vector}`);
+	return hashString(
+		`${path}\u001d${authorityEpoch}\u001d${fingerprintFileId(fileId)}\u001d${contentHash}\u001d${vector}`,
+	);
 }
 
 function captureAuthority(
@@ -499,7 +504,6 @@ function captureAuthority(
 		first === undefined
 		|| first.displayedLineage.kind !== "known"
 		|| first.read.kind !== "ok"
-		|| first.displayedLineage.fileId === null
 		|| first.contentHash === null
 	) {
 		return notProven(blocked("transitioning"));
@@ -576,12 +580,8 @@ function sameHandoff(left: CapturedHandoff, right: CapturedHandoff): boolean {
 		&& left.targetFilePath === right.targetFilePath
 		&& left.bindingEpochAfterDetach === right.bindingEpochAfterDetach
 		&& left.presentation === right.presentation
-		&& left.targetReadyTokenId === right.targetReadyTokenId
 		&& left.inputGateInstalled === right.inputGateInstalled
 		&& left.saveGuardInstalled === right.saveGuardInstalled
-		&& left.recoveryOperationEpoch === right.recoveryOperationEpoch
-		&& left.intentState === right.intentState
-		&& left.phase === right.phase
 		&& left.pendingHostLoadCandidate === right.pendingHostLoadCandidate;
 }
 
@@ -600,7 +600,7 @@ function samePane(left: CapturedPane, right: CapturedPane): boolean {
 		&& left.currentSwitchIntentSeq === right.currentSwitchIntentSeq
 		&& left.nativeHistoryEpoch === right.nativeHistoryEpoch
 		&& left.completedDetachEpoch === right.completedDetachEpoch
-		&& left.activeRecoveries === right.activeRecoveries
+		&& left.completedSamePathInput === right.completedSamePathInput
 		&& left.pendingInputStartReservation === right.pendingInputStartReservation
 		&& left.view === right.view
 		&& left.currentFile === right.currentFile

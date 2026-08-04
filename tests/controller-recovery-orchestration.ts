@@ -1563,6 +1563,17 @@ console.log("\n--- Test 0a2: editor admission lifecycle is wired before awaited 
 		fileURLToPath(new URL("../src/sync/editorBinding.ts", import.meta.url)),
 		"utf8",
 	);
+	const managerConstructionStart = mainSource.indexOf(
+		"this.editorBindings = new EditorBindingManager(",
+	);
+	const managerConstructionEnd = mainSource.indexOf(
+		"\n\t\t\t);",
+		managerConstructionStart,
+	);
+	const managerConstruction = mainSource.slice(
+		managerConstructionStart,
+		managerConstructionEnd + "\n\t\t\t);".length,
+	);
 	const teardownStart = mainSource.indexOf("private async teardownSync(): Promise<void>");
 	const teardownEnd = mainSource.indexOf("\n\tprivate ", teardownStart + 1);
 	const teardown = mainSource.slice(teardownStart, teardownEnd);
@@ -1579,10 +1590,8 @@ console.log("\n--- Test 0a2: editor admission lifecycle is wired before awaited 
 		"binding manager exposes a typed controller-owned admission dependency",
 	);
 	for (const method of [
-		"requestTargetPresentation",
-		"consumeTargetPresentationPermit",
-		"completeTargetPresentation",
 		"requestOpenPathAdmission",
+		"seedMissingTarget",
 		"isAuthorityFreshnessCurrent",
 		"consumeBindPermit",
 	]) {
@@ -1591,11 +1600,30 @@ console.log("\n--- Test 0a2: editor admission lifecycle is wired before awaited 
 			`binding manager consumes controller capability ${method}`,
 		);
 	}
+	for (const retiredMethod of [
+		"requestTargetPresentation",
+		"consumeTargetPresentationPermit",
+		"completeTargetPresentation",
+	]) {
+		assert(
+			!bindingSource.includes(retiredMethod),
+			`binding manager no longer delegates local target publication through ${retiredMethod}`,
+		);
+	}
 	assert(
-		mainSource.includes(
-			"this.reconciliationController,\n\t\t\t\tthis.handoffRecoveryCoordinator,",
-		),
-		"production manager construction receives admission and the explicit Recovery escape port",
+		managerConstructionStart >= 0
+			&& managerConstructionEnd > managerConstructionStart
+			&& managerConstruction.includes("this.reconciliationController")
+			&& managerConstruction.includes("chooseVerifiedExporter")
+			&& !managerConstruction.includes("this.handoffRecoveryCoordinator"),
+		"production manager receives controller admission plus a manual export-only terminal action, not a Recovery replay port",
+	);
+	assert(
+		bindingSource.includes("private presentLocalTargetOnce(runtime: ManagedLeafRuntime): void")
+			&& bindingSource.includes(
+				'this.scheduleSamePathAdoptionRefresh(runtime, "target-locally-presented")',
+			),
+		"a certified host load publishes B locally once, then enters ordinary same-path adoption",
 	);
 	assert(
 		editorDrainStart >= 0

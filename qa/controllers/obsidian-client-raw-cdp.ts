@@ -141,8 +141,10 @@ export class RawCdpObsidianClient {
 		return new Promise<T>((resolve, reject) => {
 			const timeout = setTimeout(() => {
 				this.pending.delete(id);
-				reject(new Error(`CDP command timeout (60s): ${method} on port ${this.port}`));
-			}, 60_000);
+				reject(new Error(
+					`CDP command timeout (${this.connectTimeoutMs}ms): ${method} on port ${this.port}`,
+				));
+			}, Math.max(60_000, this.connectTimeoutMs));
 			this.pending.set(id, (message: unknown) => {
 				clearTimeout(timeout);
 				const response = message as {

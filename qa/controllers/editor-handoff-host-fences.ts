@@ -77,10 +77,6 @@ async function releaseNativeSave(client: ObsidianClient): Promise<void> {
 	await client.evalRaw(`window.__KAOS_DEBUG__?.releaseHeldNativeSave()`);
 }
 
-async function releaseHostLoad(client: ObsidianClient): Promise<void> {
-	await client.evalRaw(`window.__KAOS_DEBUG__?.releaseHeldHostLoad()`);
-}
-
 async function phase<Name extends EditorHandoffExternalPhaseName>(
 	client: ObsidianClient,
 	name: Name,
@@ -98,11 +94,10 @@ async function phase<Name extends EditorHandoffExternalPhaseName>(
 	]);
 }
 
-async function physicalKey(
+async function physicalKeyAtCurrentFocus(
 	client: ObsidianClient,
 	input: { key: string; code: string; text: string; windowsVirtualKeyCode: number },
 ): Promise<void> {
-	await client.focusActiveCodeMirror();
 	await client.dispatchPhysicalKey(input);
 }
 
@@ -112,6 +107,33 @@ async function readActiveEditorContent(client: ObsidianClient): Promise<string> 
 		if (typeof value !== "string") throw new Error("active editor content unavailable");
 		return value;
 	})()`);
+}
+
+async function waitForRejectedHeldInput(
+	client: ObsidianClient,
+	label: string,
+	leafId: string,
+	before: EditorHandoffManagedLeafDebugSnapshot,
+	beforeContent: string,
+): Promise<void> {
+	await waitForSnapshot(client, label, (snapshot) => {
+		const leaf = snapshot.leaves.find((candidate) => candidate.leafId === leafId);
+		return snapshot.hostLoad?.state === "held"
+			&& leaf?.gateClosed === true
+			&& leaf.intent === null
+			&& leaf.compositionActive === false
+			&& leaf.inputEpoch === before.inputEpoch
+			&& leaf.compositionEpoch === before.compositionEpoch
+			&& leaf.editorLength === before.editorLength
+			&& leaf.hostDataLength === before.hostDataLength;
+	});
+	const afterContent = await readActiveEditorContent(client);
+	if (afterContent !== beforeContent) {
+		throw new Error(
+			`unsupported-host:${label}: rejected input changed visible editor bytes; `
+			+ `beforeLength=${beforeContent.length};afterLength=${afterContent.length}`,
+		);
+	}
 }
 
 async function waitForExactSourceAuthority(
@@ -150,7 +172,10 @@ async function serviceSaveBeforeSwitch(client: ObsidianClient): Promise<void> {
 	const leafId = before.nativeSave?.leafId;
 	if (!leafId) throw new Error("unsupported-host:native save hold has no leaf identity");
 
-	await client.clickVaultFile(PATH_B);
+	// The source save is deliberately held, so the host may not present B until
+	// that exact A save settles. Prove the physical B click itself here and wait
+	// for B only after releasing the source owner below.
+	await client.clickVaultFileIntent(PATH_B);
 	const afterSwitchIntent = await waitForSnapshot(
 		client,
 		"native A save remains pinned after B switch intent",
@@ -190,7 +215,7 @@ async function serviceAsciiAfterSwitchIntent(client: ObsidianClient): Promise<vo
 		(leaf) => leaf.active && leaf.viewPath === PATH_A && leaf.bindingPath === PATH_A,
 		"ASCII source A",
 	);
-	await client.clickVaultFile(PATH_B);
+	await client.clickVaultFileIntent(PATH_B);
 	const before = await waitForSnapshot(client, `ASCII switch gate for ${source.leafId}`, (snapshot) =>
 		snapshot.hostLoad?.state === "held"
 		&& snapshot.hostLoad.path === PATH_B
@@ -199,19 +224,25 @@ async function serviceAsciiAfterSwitchIntent(client: ObsidianClient): Promise<vo
 	);
 	const leafId = before.hostLoad?.leafId;
 	if (!leafId) throw new Error("unsupported-host:ASCII phase has no leaf identity");
-	await physicalKey(client, {
+	const beforeLeaf = requireLeaf(
+		before,
+		(leaf) => leaf.leafId === leafId,
+		"ASCII held target",
+	);
+	const beforeContent = await readActiveEditorContent(client);
+	await physicalKeyAtCurrentFocus(client, {
 		key: "x",
 		code: "KeyX",
 		text: "x",
 		windowsVirtualKeyCode: 88,
 	});
-	await waitForSnapshot(client, "ASCII intent capture", (snapshot) => {
-		const leaf = snapshot.leaves.find((candidate) => candidate.leafId === leafId);
-		return snapshot.hostLoad?.state === "held"
-			&& leaf?.intent?.originKind === "user"
-			&& leaf.intent.sequenceBegan === "after-target-selected"
-			&& leaf.intent.targetPath === PATH_B;
-	});
+	await waitForRejectedHeldInput(
+		client,
+		"ASCII rejected before target admission",
+		leafId,
+		beforeLeaf,
+		beforeContent,
+	);
 	await client.resumeExternalPhase(ticket);
 }
 
@@ -230,39 +261,30 @@ async function serviceCompletedImeAfterSwitchIntent(client: ObsidianClient): Pro
 	);
 	const leafId = held.hostLoad?.leafId;
 	if (!leafId) throw new Error("unsupported-host:completed IME phase has no leaf identity");
+	const beforeLeaf = requireLeaf(
+		held,
+		(leaf) => leaf.leafId === leafId,
+		"completed IME held target",
+	);
+	const beforeContent = await readActiveEditorContent(client);
 
-	await client.focusActiveCodeMirror();
 	const focused = await client.getCompositionFocusState();
-	if (!focused.activeElementIsCodeMirror || !focused.focusedManagedCmId) {
-		throw new Error("unsupported-host:managed CodeMirror did not accept focus");
+	if (focused.activeElementIsCodeMirror || focused.compositionActive) {
+		throw new Error("unsupported-host:closed pre-target CodeMirror retained input focus");
 	}
-	const ownerCmId = focused.focusedManagedCmId;
-	await client.setImeCompositionSequence([
-		{ text: "ㅎ", selectionStart: 1, selectionEnd: 1 },
-		{ text: "한", selectionStart: 1, selectionEnd: 1 },
-	]);
-	await waitForSnapshot(client, "completed IME update sequence", (snapshot) => {
-		const leaf = snapshot.leaves.find((candidate) => candidate.leafId === leafId);
-		return leaf?.compositionActive === true
-			&& leaf.compositionOwnerCmId === ownerCmId
-			&& leaf.activeCompositionUpdates === 2
-			&& leaf.activeCompositionCapturedUpdates === 2;
-	});
-	const secondFocus = await client.getCompositionFocusState();
-	if (
-		!secondFocus.compositionActive
-		|| secondFocus.compositionOwnerCmId !== ownerCmId
-		|| secondFocus.focusedManagedCmId !== ownerCmId
-	) throw new Error("unsupported-host:IME composition ownership changed before commit");
-	await client.commitImeText("한");
-	await waitForSnapshot(client, "completed IME intent capture", (snapshot) => {
-		const leaf = snapshot.leaves.find((candidate) => candidate.leafId === leafId);
-		return leaf?.compositionActive === false
-			&& leaf.intent?.originKind === "ime"
-			&& leaf.intent.sequenceBegan === "after-target-selected"
-			&& leaf.intent.targetPath === PATH_B
-			&& (leaf.lastComposition?.updates ?? 0) >= 2;
-	});
+	// A target-less pane is deliberately non-editable. Chromium may reject the
+	// native IME command itself or deliver cancellable composition/input events;
+	// both outcomes must leave every editor authority epoch and byte unchanged.
+	await client.setImeComposition("ㅎ", 1, 1).catch(() => undefined);
+	await client.setImeComposition("한", 1, 1).catch(() => undefined);
+	await client.commitImeText("한").catch(() => undefined);
+	await waitForRejectedHeldInput(
+		client,
+		"completed IME rejected before target admission",
+		leafId,
+		beforeLeaf,
+		beforeContent,
+	);
 	await client.resumeExternalPhase(ticket);
 }
 
@@ -290,6 +312,8 @@ async function serviceImeClickWhileComposing(client: ObsidianClient): Promise<vo
 			leaf.leafId === initialLeaf.leafId
 			&& leaf.compositionActive
 			&& leaf.compositionOwnerCmId === ownerCmId
+			&& leaf.activeCompositionUpdates === 2
+			&& (leaf.activeCompositionCapturedUpdates ?? 0) >= 1
 			),
 	);
 	const sourceSuccessorBeforeTarget = await readActiveEditorContent(client);
@@ -325,20 +349,23 @@ async function serviceImeClickWhileComposing(client: ObsidianClient): Promise<vo
 			);
 		}
 		await client.commitImeText("한");
-		afterLeaf = requireLeaf(
-			await waitForSnapshot(client, "composition-click committed successor", (snapshot) => {
-				const leaf = snapshot.leaves.find((candidate) => candidate.leafId === initialLeaf.leafId);
-				return leaf?.compositionActive === false && leaf.intent?.originKind === "ime";
-			}),
-			(leaf) => leaf.leafId === initialLeaf.leafId,
-			"composition-click committed successor",
-		);
 	}
-	const pathScopedIntent = afterLeaf.intent?.originKind === "ime"
-		&& afterLeaf.intent.sequenceBegan === "before-handoff"
-		&& afterLeaf.intent.targetPath === PATH_B
-		&& (afterLeaf.lastComposition?.updates ?? 0) >= 2
-		&& afterLeaf.intent.compositionEpoch === afterLeaf.lastComposition?.compositionEpoch;
+	afterLeaf = requireLeaf(
+		await waitForSnapshot(client, "composition-click source settlement", (snapshot) => {
+			const leaf = snapshot.leaves.find((candidate) => candidate.leafId === initialLeaf.leafId);
+			return leaf?.compositionActive === false
+				&& leaf.intent === null
+				&& (leaf.lastComposition?.updates ?? 0) >= 2
+				&& leaf.lastComposition?.startGeneration === initialLeaf.generation
+				&& leaf.lastComposition.endGeneration === initialLeaf.generation
+				&& leaf.lastComposition.replayEligible === false
+				&& leaf.sourceUnload?.path === PATH_A
+				&& leaf.sourceUnload.state === "settled"
+				&& leaf.sourceUnload.forcedSaveObserved;
+		}),
+		(leaf) => leaf.leafId === initialLeaf.leafId,
+		"composition-click source settlement",
+	);
 	const sourceSettledBeforeTarget = afterLeaf.intent === null
 		&& (afterLeaf.lastComposition?.updates ?? 0) >= 2
 		&& afterLeaf.lastComposition?.startGeneration === initialLeaf.generation
@@ -347,9 +374,9 @@ async function serviceImeClickWhileComposing(client: ObsidianClient): Promise<vo
 		&& afterLeaf.sourceUnload?.path === PATH_A
 		&& afterLeaf.sourceUnload.state === "settled"
 		&& afterLeaf.sourceUnload.forcedSaveObserved;
-	if (!pathScopedIntent && !sourceSettledBeforeTarget) {
+	if (!sourceSettledBeforeTarget) {
 		throw new Error(
-			"unsupported-host:composition was neither path-scoped to B nor settled exactly to source A",
+			"unsupported-host:composition did not settle exactly to source A before B",
 		);
 	}
 	await waitForExactSourceAuthority(client, PATH_A, sourceSuccessorBeforeTarget);
@@ -371,18 +398,25 @@ async function serviceInputWhileHostLoadHeld(client: ObsidianClient): Promise<vo
 	);
 	const leafId = held.hostLoad?.leafId;
 	if (!leafId) throw new Error("unsupported-host:input-held phase has no leaf identity");
-	await physicalKey(client, {
+	const beforeLeaf = requireLeaf(
+		held,
+		(leaf) => leaf.leafId === leafId,
+		"held-input target",
+	);
+	const beforeContent = await readActiveEditorContent(client);
+	await physicalKeyAtCurrentFocus(client, {
 		key: "y",
 		code: "KeyY",
 		text: "y",
 		windowsVirtualKeyCode: 89,
 	});
-	await waitForSnapshot(client, "input captured while host load stayed held", (snapshot) => {
-		const leaf = snapshot.leaves.find((candidate) => candidate.leafId === leafId);
-		return snapshot.hostLoad?.state === "held"
-			&& leaf?.intent?.originKind === "user"
-			&& leaf.intent.targetPath === PATH_B;
-	});
+	await waitForRejectedHeldInput(
+		client,
+		"input rejected while host load stayed held",
+		leafId,
+		beforeLeaf,
+		beforeContent,
+	);
 	await client.resumeExternalPhase(ticket);
 }
 
@@ -394,30 +428,22 @@ async function serviceSupersession(client: ObsidianClient): Promise<void> {
 		(leaf) => leaf.viewPath === PATH_A && leaf.bindingPath === PATH_A,
 		"supersession source A",
 	);
-	await client.clickVaultFile(PATH_B);
-	await waitForSnapshot(client, "supersession held B", (snapshot) =>
-		snapshot.hostLoad?.state === "held"
-		&& snapshot.hostLoad.path === PATH_B
-		&& snapshot.hostLoad.leafId === sourceLeaf.leafId,
-	);
-	await client.clickVaultFile(PATH_C);
-	await waitForSnapshot(client, "C selected before B release", (snapshot) =>
-		snapshot.hostLoad?.state === "held"
-		&& snapshot.leaves.some((leaf) =>
+	await client.clickVaultFileIntent(PATH_B);
+	console.log("S13a rapid switch: physical B intent delivered");
+	await client.clickVaultFileIntent(PATH_C);
+	console.log("S13a rapid switch: physical C intent delivered");
+	await waitForSnapshot(client, "rapid successor C selected", (snapshot) =>
+		snapshot.leaves.some((leaf) =>
 			leaf.leafId === sourceLeaf.leafId
 			&& leaf.viewPath === PATH_C
+			&& leaf.displayedPath === PATH_C
+			&& leaf.bindingPath === PATH_C
+			&& leaf.gateClosed === false
+			&& leaf.saveGuardInstalled === false
+			&& leaf.hostCapabilityState === "ready"
 		),
 	);
-	await releaseHostLoad(client);
-	await waitForSnapshot(client, "superseded B rejected", (snapshot) =>
-		snapshot.hostLoad?.state === "rejected"
-		&& snapshot.hostLoad.path === PATH_B
-		&& snapshot.leaves.some((leaf) =>
-			leaf.leafId === sourceLeaf.leafId
-			&& leaf.viewPath === PATH_C
-			&& leaf.bindingPath !== PATH_B
-		),
-	);
+	console.log("S13a rapid switch: C selected and writable");
 	await client.resumeExternalPhase(ticket);
 }
 
@@ -438,6 +464,7 @@ async function main(): Promise<void> {
 	const client = new ObsidianClient({
 		port,
 		host: "127.0.0.1",
+		connectTimeoutMs: 300_000,
 		transport: "raw-page",
 	});
 	let runPromise: ReturnType<ObsidianClient["runScenario"]> | null = null;
