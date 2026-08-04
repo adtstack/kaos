@@ -1,4 +1,3 @@
-import type { HandoffReplayClassificationQaObservation } from "./handoffReplayQaObserver";
 import type { CodeMirrorHandoffGuardSnapshot } from "../sync/codeMirrorHandoffGuard";
 import type { SamePathAdoptionConflictFailureReason } from "../sync/samePathAdoption";
 
@@ -155,115 +154,10 @@ export type EditorHandoffManagedLeafDebugSnapshot = Readonly<{
 	hostDataLength: number | null;
 }>;
 
-export type EditorHandoffReplayQaObservation = Readonly<{
-	phase:
-		| "none"
-		| "stored"
-		| "replay-pending"
-		| "awaiting-settlement"
-		| "needs-review"
-		| "resolved";
-	planCount: number;
-	witnessStoredCount: number;
-	permitConsumedCount: number;
-	dispatchAttemptCount: number;
-	dispatchAppliedCount: number;
-	dispatchUncertainCount: number;
-	dispatchReason?: string | null;
-	dispatchScrollEpochBefore?: number | null;
-	dispatchScrollEpochAfter?: number | null;
-	settlementObservationCount: number;
-	lastOutcome: string | null;
-	lastClassification: HandoffReplayClassificationQaObservation | null;
-	selectionNonEmpty: boolean;
-	mappedScrollAnchor: number | null;
-	liveScrollAnchor: number | null;
-}>;
-
 export type EditorHandoffDebugSnapshot = Readonly<{
 	hostLoad: EditorHandoffHostOperationDebugSnapshot | null;
 	nativeSave: EditorHandoffHostOperationDebugSnapshot | null;
 	leaves: readonly EditorHandoffManagedLeafDebugSnapshot[];
-	readonly qaReplayObservation: EditorHandoffReplayQaObservation;
-}>;
-
-export type HandoffRecoveryQaFault =
-	| { kind: "fail-next-put"; reason: "quota-exceeded" | "indexeddb-blocked" }
-	| { kind: "hold-next-post-verify-put"; operationId: string }
-	| { kind: "fail-next-copy"; reason: "clipboard-rejected" };
-
-/** Content-free receipt for the last Recovery state accepted by the editor manager. */
-export type HandoffRecoveryQaAcceptedState = Readonly<{
-	sequence: number;
-	leafId: string;
-	sessionId: string;
-	generation: number;
-	recoveryOperationEpoch: number;
-	intentId: string;
-	fromPath: string | null;
-	targetPath: string;
-	startContentHash: string;
-	afterContentHash: string;
-	state:
-		| "persisting"
-		| "stored"
-		| "replay-pending"
-		| "replayed-awaiting-settlement"
-		| "needs-review"
-		| "escape-pending"
-		| "escaped"
-		| "resolved"
-		| "discarded"
-		| "failed";
-	action: "copy" | "export" | "discard" | null;
-}>;
-
-export interface HandoffRecoveryQaSnapshot {
-	armedFault: HandoffRecoveryQaFault["kind"] | null;
-	heldOperationId: string | null;
-	putStartedCount: number;
-	putSettledCount: number;
-	lastCategoricalOutcome: string | null;
-	lastAcceptedState: HandoffRecoveryQaAcceptedState | null;
-}
-
-/**
- * QA-only, content-free projection of a durable manual Recovery row.
- * Bodies, serialized changes, selections, and checksums are intentionally absent.
- */
-export type HandoffRecoveryQaManualRow = Readonly<{
-	recordId: string;
-	intentId: string;
-	fromPath: string | null;
-	targetPath: string;
-	status: "needs-review" | "replayed-awaiting-settlement";
-	startContentHash: string;
-	afterContentHash: string;
-	startLength: number;
-	afterLength: number;
-}>;
-
-export type HandoffRecoveryQaInventoryRow = Readonly<{
-	recordId: string;
-	intentId: string;
-	intentEnvelopeHash: string;
-	fromPath: string | null;
-	targetPath: string;
-	status:
-		| "stored"
-		| "replay-pending"
-		| "replayed-awaiting-settlement"
-		| "needs-review"
-		| "resolved"
-		| "discarded";
-	disposition: "settled-replay" | "manual-resolution" | "discard" | null;
-	startContentHash: string;
-	afterContentHash: string;
-}>;
-
-export type HandoffRecoveryQaInventory = Readonly<{
-	active: readonly HandoffRecoveryQaInventoryRow[];
-	terminal: readonly HandoffRecoveryQaInventoryRow[];
 }>;
 
 export interface EditorHandoffQaPort {
@@ -285,11 +179,6 @@ export interface EngineControlPort extends EditorHandoffQaPort {
 	resumeEditorPropagation(path: string): boolean;
 	/** Suspend automatic disk ingest for deterministic QA setup. Returns the previous state. */
 	setDiskIngestSuspended(suspended: boolean): boolean;
-	__qaOnlyArmHandoffRecoveryFaultUnsafe(fault: HandoffRecoveryQaFault): void;
-	__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe(operationId: string): void;
-	getHandoffRecoveryQaSnapshot(): HandoffRecoveryQaSnapshot;
-	getHandoffRecoveryQaManualRows(): Promise<readonly HandoffRecoveryQaManualRow[]>;
-	getHandoffRecoveryQaInventory(): Promise<HandoffRecoveryQaInventory>;
 }
 
 /**

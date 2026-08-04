@@ -59,14 +59,21 @@ assert.doesNotMatch(
 	/ensureFile|Y\.Text|vault\.create|vault\.modify|recordPreservedUnresolved|storeDispatchReceipt/,
 );
 
-const recoveryEffect = sliceBetween(
+assert.doesNotMatch(
 	binding,
-	'case "persist-intent": {',
-	"separateUndoCaptureForPath(",
+	/case "persist-intent"|case "request-recovery-target-binding"/,
+	"ordinary editor handoff has no persistence or recovery-binding effect lane",
+);
+
+console.log("\n--- Handoff Recovery boundaries: production activation is manual-only ---");
+const recoveryActivation = sliceBetween(
+	main,
+	"private async initializeHandoffRecovery(",
+	"private applyRuntimeSettings(",
 );
 assert.doesNotMatch(
-	recoveryEffect,
-	/ensureFile|Y\.Text|vault\.create|vault\.modify|recordPreservedUnresolved/,
+	recoveryActivation,
+	/HandoffReplayCoordinator|classifyStoredIntent|replayActions|observeAwaitingSettlement/,
 );
 
 class FakeTFile extends TFile {

@@ -26,7 +26,6 @@ const SAME_CONTENT = [
 	"",
 ].join("\n");
 
-type IntentEvidence = NonNullable<EditorHandoffManagedLeafDebugSnapshot["intent"]>;
 type PhaseEvidence = Readonly<{
 	leafId: string;
 	sessionId: string;
@@ -41,7 +40,9 @@ type PhaseEvidence = Readonly<{
 	scrollEpoch: number | null;
 	editorLength: number | null;
 	hostDataLength: number | null;
-	intent: IntentEvidence | null;
+	gateClosed: boolean;
+	compositionActive: boolean;
+	intent: EditorHandoffManagedLeafDebugSnapshot["intent"];
 	lastComposition: EditorHandoffManagedLeafDebugSnapshot["lastComposition"];
 	sourceUnload: EditorHandoffManagedLeafDebugSnapshot["sourceUnload"];
 	operation: EditorHandoffHostOperationDebugSnapshot | null;
@@ -102,6 +103,8 @@ function captureEvidence(
 		scrollEpoch: leaf.scrollEpoch,
 		editorLength: leaf.editorLength,
 		hostDataLength: leaf.hostDataLength,
+		gateClosed: leaf.gateClosed,
+		compositionActive: leaf.compositionActive,
 		intent: leaf.intent,
 		lastComposition: leaf.lastComposition,
 		sourceUnload: leaf.sourceUnload,
@@ -175,14 +178,19 @@ function armHeldHostSwitch(
 	return Object.freeze({ leafId });
 }
 
-async function finishCapturedInputPhase(
+async function finishRejectedInputPhase(
 	ctx: QaContext,
 	name: EditorHandoffExternalPhaseName,
 	leafId: string,
 ): Promise<void> {
-	const beforeRelease = await waitForSnapshot(ctx, `${name} intent capture`, (snapshot) => {
+	const beforeRelease = await waitForSnapshot(ctx, `${name} input rejection`, (snapshot) => {
 		const leaf = leafFor(snapshot, (candidate) => candidate.leafId === leafId);
-		return snapshot.hostLoad?.state === "held" && leaf?.intent !== null;
+		return snapshot.hostLoad?.state === "held"
+			&& leaf?.gateClosed === true
+			&& leaf.intent === null
+			&& leaf.compositionActive === false
+			&& leaf.editorLength !== null
+			&& leaf.editorLength === leaf.hostDataLength;
 	});
 	const beforeLeaf = leafFor(beforeRelease, (leaf) => leaf.leafId === leafId);
 	if (!beforeLeaf) throw new Error(`s13a: ${name} leaf vanished before release`);
@@ -201,20 +209,16 @@ function requireEvidence(name: EditorHandoffExternalPhaseName): PhaseEvidence {
 	return item;
 }
 
-function assertIntent(
-	name: EditorHandoffExternalPhaseName,
-	originKind: "user" | "ime",
-	sequenceBegan: "before-handoff" | "after-target-selected",
-): void {
-	const intent = requireEvidence(name).intent;
-	if (!intent) throw new Error(`s13a: ${name} did not capture an input intent`);
+function assertRejectedInput(name: EditorHandoffExternalPhaseName): void {
+	const item = requireEvidence(name);
 	if (
-		intent.originKind !== originKind
-		|| intent.sequenceBegan !== sequenceBegan
-		|| intent.targetPath !== EDITOR_HANDOFF_HOST_FENCE_PATHS.b
-		|| intent.startContentHash === intent.afterContentHash
+		item.intent !== null
+		|| !item.gateClosed
+		|| item.compositionActive
+		|| item.editorLength === null
+		|| item.editorLength !== item.hostDataLength
 	) {
-		throw new Error(`s13a: ${name} captured the wrong content-free intent lineage`);
+		throw new Error(`s13a: ${name} escaped the closed pre-target input fence`);
 	}
 }
 
@@ -273,21 +277,23 @@ export const s13aEditorHandoffHostFences: QaScenario = {
 		captureEvidence("save-entered-before-switch", savedLeaf, saved.nativeSave);
 		await teardownManagedLeaf(ctx);
 
-		// 2. Physical ASCII begins after the target was selected and is quarantined.
+		// 2. Physical ASCII begins after target selection and is rejected before
+		//    CodeMirror or host data can change.
 		await prepareFreshA(ctx);
 		const asciiSwitch = armHeldHostSwitch(ctx, EDITOR_HANDOFF_HOST_FENCE_PATHS.b);
 		await ctx.awaitExternalPhase<EditorHandoffExternalPhaseName>("ascii-input-after-switch-intent");
-		await finishCapturedInputPhase(
+		await finishRejectedInputPhase(
 			ctx,
 			"ascii-input-after-switch-intent",
 			asciiSwitch.leafId,
 		);
 
-		// 3. A fully completed Korean IME sequence begins after target selection.
+		// 3. A Korean IME attempt begins after target selection and is rejected
+		//    before a composition epoch or editor mutation can begin.
 		await prepareFreshA(ctx);
 		const completedImeSwitch = armHeldHostSwitch(ctx, EDITOR_HANDOFF_HOST_FENCE_PATHS.b);
 		await ctx.awaitExternalPhase<EditorHandoffExternalPhaseName>("completed-ime-after-switch-intent");
-		await finishCapturedInputPhase(
+		await finishRejectedInputPhase(
 			ctx,
 			"completed-ime-after-switch-intent",
 			completedImeSwitch.leafId,
@@ -297,22 +303,18 @@ export const s13aEditorHandoffHostFences: QaScenario = {
 		const composingLeaf = await prepareFreshA(ctx);
 		ctx.kaos.holdNextHostLoad(EDITOR_HANDOFF_HOST_FENCE_PATHS.b);
 		await ctx.awaitExternalPhase<EditorHandoffExternalPhaseName>("ime-and-click-while-composing");
-		const composingSnapshot = await waitForSnapshot(ctx, "composition click capture", (snapshot) => {
+		const composingSnapshot = await waitForSnapshot(ctx, "composition click source settlement", (snapshot) => {
 			const leaf = leafFor(snapshot, (candidate) => candidate.leafId === composingLeaf.leafId);
 			return snapshot.hostLoad?.state === "held"
-				&& leaf !== null
-				&& (
-					leaf.intent !== null
-					|| (
-						leaf.lastComposition !== null
-						&& leaf.lastComposition.updates >= 2
-						&& leaf.lastComposition.startGeneration === composingLeaf.generation
-						&& leaf.lastComposition.endGeneration === composingLeaf.generation
-						&& leaf.sourceUnload?.path === EDITOR_HANDOFF_HOST_FENCE_PATHS.a
-						&& leaf.sourceUnload.state === "settled"
-						&& leaf.sourceUnload.forcedSaveObserved
-					)
-				);
+				&& leaf?.intent === null
+				&& leaf.lastComposition !== null
+				&& leaf.lastComposition.updates >= 2
+				&& leaf.lastComposition.startGeneration === composingLeaf.generation
+				&& leaf.lastComposition.endGeneration === composingLeaf.generation
+				&& leaf.lastComposition.replayEligible === false
+				&& leaf.sourceUnload?.path === EDITOR_HANDOFF_HOST_FENCE_PATHS.a
+				&& leaf.sourceUnload.state === "settled"
+				&& leaf.sourceUnload.forcedSaveObserved;
 		});
 		const composingEvidence = leafFor(
 			composingSnapshot,
@@ -341,29 +343,30 @@ export const s13aEditorHandoffHostFences: QaScenario = {
 		);
 		await teardownManagedLeaf(ctx);
 
-		// 5. Physical input remains quarantined for the full held host-load interval.
+		// 5. Physical input remains rejected for the full held host-load interval.
 		await prepareFreshA(ctx);
 		const heldInputSwitch = armHeldHostSwitch(ctx, EDITOR_HANDOFF_HOST_FENCE_PATHS.b);
 		await ctx.awaitExternalPhase<EditorHandoffExternalPhaseName>("input-while-host-load-held");
-		await finishCapturedInputPhase(
+		await finishRejectedInputPhase(
 			ctx,
 			"input-while-host-load-held",
 			heldInputSwitch.leafId,
 		);
 
-		// 6. The controller clicks C before releasing B's exact one-shot continuation.
+		// 6. The controller performs real rapid B then C explorer clicks. Synthetic
+		//    host-load suspension is intentionally excluded here because Obsidian does
+		//    not support a second file switch while its first native load is paused.
 		const supersessionLeaf = await prepareFreshA(ctx);
-		ctx.kaos.holdNextHostLoad(
-			EDITOR_HANDOFF_HOST_FENCE_PATHS.b,
-			"clear-load",
-		);
 		await ctx.awaitExternalPhase<EditorHandoffExternalPhaseName>("supersede-b-with-c");
-		const superseded = await waitForSnapshot(ctx, "B host continuation rejection", (snapshot) =>
-			snapshot.hostLoad?.state === "rejected"
-			&& snapshot.hostLoad.path === EDITOR_HANDOFF_HOST_FENCE_PATHS.b
-			&& snapshot.leaves.some((leaf) =>
+		const superseded = await waitForSnapshot(ctx, "rapid successor C selection", (snapshot) =>
+			snapshot.leaves.some((leaf) =>
 				leaf.leafId === supersessionLeaf.leafId
 				&& leaf.viewPath === EDITOR_HANDOFF_HOST_FENCE_PATHS.c
+				&& leaf.displayedPath === EDITOR_HANDOFF_HOST_FENCE_PATHS.c
+				&& leaf.bindingPath === EDITOR_HANDOFF_HOST_FENCE_PATHS.c
+				&& leaf.gateClosed === false
+				&& leaf.saveGuardInstalled === false
+				&& leaf.hostCapabilityState === "ready"
 			),
 		);
 		const supersededLeaf = leafFor(
@@ -371,7 +374,7 @@ export const s13aEditorHandoffHostFences: QaScenario = {
 			(leaf) => leaf.leafId === supersessionLeaf.leafId,
 		);
 		if (!supersededLeaf) throw new Error("s13a: superseded leaf vanished");
-		captureEvidence("supersede-b-with-c", supersededLeaf, superseded.hostLoad);
+		captureEvidence("supersede-b-with-c", supersededLeaf, null);
 		await teardownManagedLeaf(ctx);
 	},
 
@@ -383,16 +386,11 @@ export const s13aEditorHandoffHostFences: QaScenario = {
 			|| save.operation.path !== EDITOR_HANDOFF_HOST_FENCE_PATHS.a
 		) throw new Error("s13a: native save lost its invocation-entry A identity");
 
-		assertIntent("ascii-input-after-switch-intent", "user", "after-target-selected");
-		assertIntent("completed-ime-after-switch-intent", "ime", "after-target-selected");
-		assertIntent("input-while-host-load-held", "user", "after-target-selected");
+		assertRejectedInput("ascii-input-after-switch-intent");
+		assertRejectedInput("completed-ime-after-switch-intent");
+		assertRejectedInput("input-while-host-load-held");
 
 		const composing = requireEvidence("ime-and-click-while-composing");
-		const pathScopedIntent = composing.intent?.originKind === "ime"
-			&& composing.intent.sequenceBegan === "before-handoff"
-			&& composing.intent.targetPath === EDITOR_HANDOFF_HOST_FENCE_PATHS.b
-			&& (composing.lastComposition?.updates ?? 0) >= 2
-			&& composing.intent.compositionEpoch === composing.lastComposition?.compositionEpoch;
 		const sourceSettledBeforeTarget = composing.intent === null
 			&& (composing.lastComposition?.updates ?? 0) >= 2
 			&& composing.lastComposition?.startGeneration === composing.lastComposition?.endGeneration
@@ -401,16 +399,16 @@ export const s13aEditorHandoffHostFences: QaScenario = {
 			&& composing.sourceUnload?.path === EDITOR_HANDOFF_HOST_FENCE_PATHS.a
 			&& composing.sourceUnload.state === "settled"
 			&& composing.sourceUnload.forcedSaveObserved;
-		if (!pathScopedIntent && !sourceSettledBeforeTarget) {
-			throw new Error("s13a: composition was neither B-scoped nor settled exactly to source A");
+		if (!sourceSettledBeforeTarget) {
+			throw new Error("s13a: composition did not settle exactly to source A before B");
 		}
 
 		const superseded = requireEvidence("supersede-b-with-c");
 		if (
-			superseded.operation?.state !== "rejected"
-			|| superseded.operation.path !== EDITOR_HANDOFF_HOST_FENCE_PATHS.b
-			|| superseded.viewPath !== EDITOR_HANDOFF_HOST_FENCE_PATHS.c
-			|| superseded.bindingPath === EDITOR_HANDOFF_HOST_FENCE_PATHS.b
+			superseded.viewPath !== EDITOR_HANDOFF_HOST_FENCE_PATHS.c
+			|| superseded.displayedPath !== EDITOR_HANDOFF_HOST_FENCE_PATHS.c
+			|| superseded.bindingPath !== EDITOR_HANDOFF_HOST_FENCE_PATHS.c
+			|| superseded.gateClosed
 		) throw new Error("s13a: superseded B completion crossed into C");
 
 		if (!baselineHash) throw new Error("s13a: baseline hash was not captured");

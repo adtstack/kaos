@@ -1,6 +1,6 @@
 {
 	"name": "kaos",
-	"version": "1.10.5",
+	"version": "1.10.6",
 	"releaseVersions": {
 		"server": "0.7.2",
 		"headlessHost": "0.2.6"
@@ -50,8 +50,6 @@
 		"qa:obsidian": "bun run qa/controllers/single-device.ts",
 		"qa:open-external-merge": "bun run qa/controllers/open-external-merge.ts",
 		"qa:handoff-host-fences": "bun run qa/controllers/editor-handoff-host-fences.ts",
-		"qa:handoff-recovery": "bun run qa/controllers/editor-handoff-recovery.ts",
-		"qa:handoff-exact-replay": "bun run qa/controllers/exact-handoff-replay.ts",
 		"qa:same-path-adoption": "bun run qa/controllers/same-path-adoption.ts",
 		"qa:two-device": "bun run qa/controllers/two-device.ts",
 		"version:bump": "node version-bump.mjs",

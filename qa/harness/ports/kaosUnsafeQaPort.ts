@@ -45,13 +45,6 @@ export interface KaosUnsafeQaPort {
 	releaseHeldNativeSave(): void;
 	getEditorHandoffDebugSnapshot(): import("../../../src/runtime/engineControlPort").EditorHandoffDebugSnapshot;
 	getContentFreeSnapshot(): import("../../../src/runtime/engineControlPort").EditorHandoffDebugSnapshot;
-	__qaOnlyArmHandoffRecoveryFaultUnsafe(
-		fault: import("../../../src/runtime/engineControlPort").HandoffRecoveryQaFault,
-	): void;
-	__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe(operationId: string): void;
-	getHandoffRecoveryQaSnapshot(): import("../../../src/runtime/engineControlPort").HandoffRecoveryQaSnapshot;
-	getHandoffRecoveryQaManualRows(): Promise<readonly import("../../../src/runtime/engineControlPort").HandoffRecoveryQaManualRow[]>;
-	getHandoffRecoveryQaInventory(): Promise<import("../../../src/runtime/engineControlPort").HandoffRecoveryQaInventory>;
 
 	// --- Network control ---
 	setQaNetworkHold(mode: "offline" | "online"): void;

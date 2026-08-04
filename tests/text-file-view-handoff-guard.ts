@@ -65,6 +65,7 @@ type Host = TextFileView & {
 };
 
 type CallbackFacts = {
+	unloadEntries: TFile[];
 	loadEntries: TFile[];
 	tickets: ManagedHostSwitchTicket[];
 	setEntries: Array<Readonly<{
@@ -90,6 +91,7 @@ type CallbackFacts = {
 function callbacksFor(input?: Readonly<{
 	sessionId?: string;
 	generation?: () => number;
+	onUnload?: (file: TFile) => null | PromiseLike<void>;
 	onLoad?: (file: TFile) => void;
 	onSet?: (ticket: ManagedHostSwitchTicket, content: string, clear: boolean) => void;
 	onSetExit?: (ticket: ManagedHostSwitchTicket, hostLoadTokenId: string) => boolean;
@@ -98,6 +100,7 @@ function callbacksFor(input?: Readonly<{
 	isSaveOwnershipContextCurrent?: (context: ManagedSaveOwnershipContext) => boolean;
 }>): Readonly<{ callbacks: TextFileViewHandoffGuardCallbacks; facts: CallbackFacts }> {
 	const facts: CallbackFacts = {
+		unloadEntries: [],
 		loadEntries: [],
 		tickets: [],
 		setEntries: [],
@@ -109,6 +112,10 @@ function callbacksFor(input?: Readonly<{
 	};
 	let switchIntentSeq = 0;
 	const callbacks: TextFileViewHandoffGuardCallbacks = {
+		onUnloadFileEntry(sourceFile) {
+			facts.unloadEntries.push(sourceFile);
+			return input?.onUnload?.(sourceFile) ?? null;
+		},
 		onLoadFileEntry(targetFile, sourceUnloadReceiptId?: string) {
 			facts.loadEntries.push(targetFile);
 			input?.onLoad?.(targetFile);
@@ -535,7 +542,7 @@ async function copiedWrappersStayBoundToManagedView(): Promise<void> {
 	await retireSourceForNextLoad(host);
 	receivers.length = 0;
 	await Reflect.apply(copiedLoad, other, [fileB]);
-	Reflect.apply(copiedSet, other, ["content:B", true]);
+	Reflect.apply(copiedSet, other, ["content:B", false]);
 	assert.equal(Reflect.apply(copiedRequestSave, other, []), undefined);
 	assert.notEqual(result.guard.snapshot().pendingOwnedSave, null);
 	(host.requestSave as unknown as { cancel(): void }).cancel();
@@ -662,12 +669,14 @@ async function associatedHostLoadLifecycleRoutesExactFacts(): Promise<void> {
 	const fileB = fakeFile("B.md");
 	const setReached = deferred<void>();
 	const loadReleased = deferred<void>();
+	let nativeTailSettled = false;
 	const host = makeOwnHost({
 		onLoadFile: async function (file) {
 			this.file = file;
 			this.setViewData("unassociated", false);
 			this.setViewData("content:B", true);
 			await loadReleased.promise;
+			nativeTailSettled = true;
 		},
 		setViewData: function (data, clear) {
 			this.data = data;
@@ -727,35 +736,72 @@ async function associatedHostLoadLifecycleRoutesExactFacts(): Promise<void> {
 	assert.equal(result.guard.reportHostLoadCompleted(wrongFingerprint), false);
 	const receipt = makeHostLoadReceipt(candidate);
 	assert.equal(result.guard.reportHostLoadCompleted(receipt), true);
-	assert.equal(result.guard.reportHostLoadCompleted(receipt), false, "queued completion is one-shot");
-	assert.deepEqual(facts.completions, [], "completion waits for original onLoadFile fulfillment");
-	loadReleased.resolve();
+	assert.equal(result.guard.reportHostLoadCompleted(receipt), false, "local completion is one-shot");
+	assert.deepEqual(
+		facts.completions,
+		[receipt],
+		"exact local B completion is forwarded before the opaque native tail settles",
+	);
+	assert.equal(result.guard.snapshot().pendingNativeHostLoadCount, 0);
 	await pendingLoad;
-	assert.deepEqual(facts.completions, [receipt]);
+	assert.equal(nativeTailSettled, false, "the guarded host promise fulfills at local B commit");
+	loadReleased.resolve();
+	await loadReleased.promise;
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(nativeTailSettled, true);
+	assert.deepEqual(facts.completions, [receipt], "late native fulfillment is bookkeeping only");
 	assert.equal(result.guard.reportHostLoadCompleted(receipt), false, "completed receipt cannot replay");
 }
 
-async function rejectedHostLoadDiscardsQueuedCompletion(): Promise<void> {
+async function rejectedHostLoadCannotRetractLocalCompletion(): Promise<void> {
+	const fileA = fakeFile("A.md");
 	const fileB = fakeFile("B.md");
 	const setReached = deferred<void>();
 	const rejectLoad = deferred<void>();
 	const hostError = new Error("host load rejected");
+	let guard: TextFileViewHandoffGuard | null = null;
+	let nativeLoadCount = 0;
+	let nativeSetCount = 0;
+	let nativeSaveCount = 0;
+	let nativeTailRejected = false;
 	const host = makeOwnHost({
+		file: fileA,
+		data: "content:A",
 		onLoadFile: async function (file) {
+			nativeLoadCount += 1;
 			this.file = file;
 			this.setViewData("content:B", true);
 			await rejectLoad.promise;
+			nativeTailRejected = true;
 			throw hostError;
 		},
 		setViewData: function (data, clear) {
+			nativeSetCount += 1;
 			this.data = data;
 			if (clear) setReached.resolve();
 		},
+		save: async function (clear?: boolean) {
+			nativeSaveCount += 1;
+			if (clear === true) {
+				this.data = "";
+				this.lastSavedData = null;
+			}
+		},
 	});
-	const { callbacks, facts } = callbacksFor();
+	const { callbacks, facts } = callbacksFor({
+		onLoad() {
+			guard?.beginBlockingHandoff({
+				handoffGeneration: 1,
+				sourceLineagePath: fileA.path,
+				targetPath: fileB.path,
+			});
+		},
+	});
 	const result = installTextFileViewHandoffGuard(host, callbacks);
 	assert.equal(result.kind, "installed");
 	if (result.kind !== "installed") return;
+	guard = result.guard;
 	await retireSourceForNextLoad(host);
 	const pendingLoad = host.onLoadFile(fileB);
 	await setReached.promise;
@@ -769,11 +815,563 @@ async function rejectedHostLoadDiscardsQueuedCompletion(): Promise<void> {
 	const receipt = makeHostLoadReceipt(candidate);
 	assert.equal(result.guard.reportHostLoadCandidate(candidate), true);
 	assert.equal(result.guard.reportHostLoadCompleted(receipt), true);
+	assert.deepEqual(facts.completions, [receipt]);
+	assert.equal(result.guard.snapshot().pendingNativeHostLoadCount, 0);
+	assert.equal(result.guard.isTargetPresentationReady({
+		handoffGeneration: 1,
+		targetFile: fileB,
+		certifiedContent: "content:B",
+	}), true, "exact local B is ready while the native tail remains pending");
+	assert.equal(result.guard.markTargetLocallyPresented({
+		handoffGeneration: 1,
+		targetFile: fileB,
+		certifiedContent: "content:B",
+	}), true, "local B consumes the committed association before native settlement");
+	assert.equal(await pendingLoad, undefined, "the guarded host promise fulfills at local commit");
+	assert.equal(nativeTailRejected, false);
+	assert.equal(nativeSetCount, 1, "native B setViewData delegates exactly once");
+	const committedCounts = { nativeLoadCount, nativeSetCount, nativeSaveCount };
 	rejectLoad.resolve();
-	await assert.rejects(pendingLoad, (error: unknown) => error === hostError);
+	await rejectLoad.promise;
+	await Promise.resolve();
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(nativeTailRejected, true);
 	assert.deepEqual(facts.candidates, [candidate]);
-	assert.deepEqual(facts.completions, [], "rejected host invocation discards queued completion");
+	assert.deepEqual(facts.completions, [receipt], "late rejection cannot emit another completion");
 	assert.equal(result.guard.reportHostLoadCompleted(receipt), false);
+	assert.equal(result.guard.markTargetLocallyPresented({
+		handoffGeneration: 1,
+		targetFile: fileB,
+		certifiedContent: "content:B",
+	}), false, "the locally committed association is consumed exactly once");
+	const settled = result.guard.snapshot();
+	assert.equal(settled.pendingNativeHostLoadCount, 0);
+	assert.equal(settled.nativeHostLoadAmbiguous, false);
+	assert.equal(settled.terminalHostLifecycle, null);
+	assert.deepEqual(facts.capabilityLosses, []);
+	assert.equal(host.file, fileB, "late native rejection cannot relabel B back to A");
+	assert.equal(host.data, "content:B", "late native rejection cannot roll back visible B");
+	assert.deepEqual(
+		{ nativeLoadCount, nativeSetCount, nativeSaveCount },
+		committedCounts,
+		"late native rejection performs no extra load or save",
+	);
+	result.guard.markInert();
+	result.guard.restoreIfCurrent();
+}
+
+async function locallyPresentedPendingLoadDoesNotPoisonSupersedingLoad(): Promise<void> {
+	const fileA = fakeFile("A.md");
+	const fileB = fakeFile("B.md");
+	const fileC = fakeFile("C.md");
+	const pendingB = deferred<string>();
+	const pendingC = deferred<string>();
+	let generation = 1;
+	let guard: TextFileViewHandoffGuard | null = null;
+	const host = makeOwnHost({
+		file: fileA,
+		data: "content:A",
+		onLoadFile: function (file) {
+			this.file = file;
+			this.setViewData(`content:${file.path}`, true);
+			return file === fileB ? pendingB.promise : pendingC.promise;
+		},
+	});
+	const { callbacks, facts } = callbacksFor({
+		generation: () => generation,
+		onLoad: (targetFile) => {
+			guard?.beginBlockingHandoff({
+				handoffGeneration: generation,
+				sourceLineagePath: targetFile === fileB ? fileA.path : fileB.path,
+				targetPath: targetFile.path,
+			});
+		},
+	});
+	const result = installTextFileViewHandoffGuard(host, callbacks);
+	assert.equal(result.kind, "installed");
+	if (result.kind !== "installed") return;
+	guard = result.guard;
+
+	await retireSourceForNextLoad(host);
+	const returnedB = host.onLoadFile(fileB) as unknown as Promise<string>;
+	assert.notEqual(
+		returnedB,
+		pendingB.promise,
+		"managed B is wrapped by the stale-load cancellation epoch",
+	);
+	const bEntry = required(facts.setEntries[0], "pending B setViewData entry");
+	const bCandidate = makeHostLoadCandidate({
+		hostLoadTokenId: `host-load:${bEntry.ticket.switchIntentSeq}`,
+		ticket: bEntry.ticket,
+		view: host,
+		incomingContent: bEntry.incomingContent,
+	});
+	const bReceipt = makeHostLoadReceipt(bCandidate);
+	assert.equal(result.guard.reportHostLoadCandidate(bCandidate), true);
+	assert.equal(result.guard.reportHostLoadCompleted(bReceipt), true);
+	assert.deepEqual(facts.completions, [bReceipt], "pending B publishes its exact local completion");
+	assert.equal(result.guard.snapshot().pendingNativeHostLoadCount, 0);
+	assert.equal(result.guard.isTargetPresentationReady({
+		handoffGeneration: 1,
+		targetFile: fileB,
+		certifiedContent: "content:B.md",
+	}), true, "local B is ready independently of the opaque native tail");
+	assert.equal(result.guard.markTargetLocallyPresented({
+		handoffGeneration: 1,
+		targetFile: fileB,
+		certifiedContent: "content:B.md",
+	}), true, "pending native B cannot delay exact local publication");
+	assert.equal(result.guard.markTargetProven({
+		handoffGeneration: 1,
+		targetFile: fileB,
+		certifiedContent: "content:B.md",
+	}), false, "the consumed local association cannot be proven a second time");
+	assert.equal(await returnedB, undefined, "B wrapper fulfills at local commit");
+
+	generation = 2;
+	await retireSourceForNextLoad(host);
+	const returnedC = host.onLoadFile(fileC) as unknown as Promise<string>;
+	assert.notEqual(
+		returnedC,
+		pendingC.promise,
+		"managed C also retains a cancellable wrapper owner",
+	);
+	const cEntry = required(
+		facts.setEntries[1],
+		"C remains an exact clear-load after fulfilled B retires",
+	);
+	assert.equal(cEntry.ticket.targetFile, fileC);
+	assert.equal(clearLoadCapabilityOf(result.guard), "observable");
+
+	const cCandidate = makeHostLoadCandidate({
+		hostLoadTokenId: `host-load:${cEntry.ticket.switchIntentSeq}`,
+		ticket: cEntry.ticket,
+		view: host,
+		incomingContent: cEntry.incomingContent,
+	});
+	const cReceipt = makeHostLoadReceipt(cCandidate);
+	assert.equal(result.guard.reportHostLoadCandidate(cCandidate), true);
+	assert.equal(result.guard.reportHostLoadCompleted(cReceipt), true);
+	assert.deepEqual(facts.completions, [bReceipt, cReceipt]);
+	assert.equal(result.guard.snapshot().pendingNativeHostLoadCount, 0);
+	assert.equal(result.guard.isTargetPresentationReady({
+		handoffGeneration: 2,
+		targetFile: fileC,
+		certifiedContent: "content:C.md",
+	}), true);
+	assert.equal(result.guard.markTargetLocallyPresented({
+		handoffGeneration: 2,
+		targetFile: fileC,
+		certifiedContent: "content:C.md",
+	}), true, "C also publishes before either opaque native tail settles");
+	assert.equal(await returnedC, undefined, "C wrapper also fulfills at local commit");
+	pendingB.resolve("third-party:B");
+	await pendingB.promise;
+	pendingC.resolve("third-party:C");
+	await pendingC.promise;
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.deepEqual(facts.candidates, [bCandidate, cCandidate]);
+	assert.deepEqual(facts.completions, [bReceipt, cReceipt]);
+	assert.equal(host.file, fileC);
+	assert.equal(host.data, "content:C.md");
+	assert.equal(clearLoadCapabilityOf(result.guard), "observable");
+}
+
+async function unauthorizedManagedClearNeverMutatesOrReopensSave(): Promise<void> {
+	const fileA = fakeFile("A.md");
+	const fileB = fakeFile("B.md");
+	let nativeLoadCount = 0;
+	let nativeSetCount = 0;
+	let nativeRequestCount = 0;
+	let nativeRunCount = 0;
+	let nativeFlushCount = 0;
+	let nativeSaveCount = 0;
+	const host = makeOwnHost({
+		file: fileA,
+		data: "content:A",
+		onLoadFile: async function (targetFile) {
+			nativeLoadCount += 1;
+			this.file = targetFile;
+			this.setViewData("content:B", true);
+		},
+		setViewData: function (content, _clear) {
+			nativeSetCount += 1;
+			this.data = content;
+		},
+		requestSave: Object.assign(function () {
+			nativeRequestCount += 1;
+		}, {
+			cancel() {},
+			run() { nativeRunCount += 1; },
+			flush() { nativeFlushCount += 1; },
+		}),
+		save: async function (clear?: boolean) {
+			nativeSaveCount += 1;
+			if (clear === true) {
+				this.data = "";
+				this.lastSavedData = null;
+			}
+		},
+	});
+	const base = callbacksFor({ hostLoadToken: () => null });
+	const result = installTextFileViewHandoffGuard(host, base.callbacks);
+	assert.equal(result.kind, "installed");
+	if (result.kind !== "installed") return;
+
+	await retireSourceForNextLoad(host);
+	const nativeEpochBefore = result.guard.snapshot().nativeLoadEpoch ?? -1;
+	await assert.rejects(
+		host.onLoadFile(fileB),
+		/KAOS guarded host load cancelled: host-clear-load-not-authorized/,
+	);
+	assert.equal(nativeLoadCount, 1, "the admitted native load enters once");
+	assert.equal(nativeSetCount, 0, "a null clear token never reaches native setViewData");
+	assert.equal(host.getViewData(), "", "unauthorized B bytes never replace the retired source cache");
+	const terminal = result.guard.snapshot();
+	assert.ok((terminal.nativeLoadEpoch ?? -1) > nativeEpochBefore);
+	assert.equal(terminal.pendingNativeHostLoadCount, 0);
+	assert.ok((terminal.terminalHostLifecycle?.ownerId ?? 0) > 0);
+	assert.deepEqual(base.facts.capabilityLosses, ["host-clear-load-not-authorized"]);
+
+	host.data = "content:A+x";
+	host.requestSave();
+	(host.requestSave as unknown as { run(): unknown }).run();
+	(host.requestSave as unknown as { flush(): unknown }).flush();
+	await host.save(false);
+	await host.save(true);
+	assert.deepEqual(
+		[nativeRequestCount, nativeRunCount, nativeFlushCount],
+		[0, 0, 0],
+		"terminal ownership synchronously suppresses every requestSave entry",
+	);
+	assert.equal(nativeSaveCount, 1, "only the pre-terminal source retirement reaches native save");
+	assert.equal(host.getViewData(), "content:A+x", "terminal save suppression preserves later input bytes");
+	assert.equal(result.guard.cancelTerminalHostLifecycle("test-safe-close:null-clear"), true);
+	result.guard.restoreIfCurrent();
+}
+
+async function repeatedOrLateManagedClearIsTerminal(): Promise<void> {
+	const fileA = fakeFile("A.md");
+	const fileB = fakeFile("B.md");
+
+	{
+		const releaseSecondClear = deferred<void>();
+		const firstClearApplied = deferred<void>();
+		const nativeSets: string[] = [];
+		let guard: TextFileViewHandoffGuard | null = null;
+		const host = makeOwnHost({
+			file: fileA,
+			data: "content:A",
+			onLoadFile: async function (targetFile) {
+				this.file = targetFile;
+				this.setViewData("content:B", true);
+				firstClearApplied.resolve();
+				await releaseSecondClear.promise;
+				this.setViewData("content:B-late", true);
+			},
+			setViewData: function (content, _clear) {
+				nativeSets.push(content);
+				this.data = content;
+			},
+		});
+		const base = callbacksFor({
+			onLoad: (targetFile) => guard?.beginBlockingHandoff({
+				handoffGeneration: 1,
+				sourceLineagePath: fileA.path,
+				targetPath: targetFile.path,
+			}),
+		});
+		const result = installTextFileViewHandoffGuard(host, base.callbacks);
+		assert.equal(result.kind, "installed");
+		if (result.kind !== "installed") return;
+		guard = result.guard;
+		await retireSourceForNextLoad(host);
+		const pendingLoad = host.onLoadFile(fileB);
+		await firstClearApplied.promise;
+		assert.equal(result.guard.snapshot().pendingNativeHostLoadCount, 1);
+		assert.equal(result.guard.isTargetPresentationReady({
+			handoffGeneration: 1,
+			targetFile: fileB,
+			certifiedContent: "content:B",
+		}), false, "a pending native promise cannot open target presentation");
+		releaseSecondClear.resolve();
+		await assert.rejects(
+			pendingLoad,
+			/KAOS guarded host load cancelled: host-clear-load-not-authorized/,
+		);
+		assert.deepEqual(nativeSets, ["content:B"], "the duplicate clear never reaches native mutation");
+		assert.equal(host.getViewData(), "content:B");
+		assert.equal(result.guard.snapshot().pendingNativeHostLoadCount, 0);
+		assert.ok((result.guard.snapshot().terminalHostLifecycle?.ownerId ?? 0) > 0);
+		assert.deepEqual(base.facts.capabilityLosses, ["host-clear-load-not-authorized"]);
+		assert.equal(result.guard.cancelTerminalHostLifecycle("test-safe-close:duplicate-clear"), true);
+		result.guard.restoreIfCurrent();
+	}
+
+	for (const markKind of ["local", "controller"] as const) {
+		for (const lateClear of [true, false] as const) {
+			const nativeSets: string[] = [];
+			let guard: TextFileViewHandoffGuard | null = null;
+			const host = makeOwnHost({
+				file: fileA,
+				data: "content:A",
+				onLoadFile: async function (targetFile) {
+					this.file = targetFile;
+					this.setViewData("content:B", true);
+				},
+				setViewData: function (content, _clear) {
+					nativeSets.push(content);
+					this.data = content;
+				},
+			});
+			const base = callbacksFor({
+				onLoad: (targetFile) => guard?.beginBlockingHandoff({
+					handoffGeneration: 1,
+					sourceLineagePath: fileA.path,
+					targetPath: targetFile.path,
+				}),
+			});
+			const result = installTextFileViewHandoffGuard(host, base.callbacks);
+			assert.equal(result.kind, "installed");
+			if (result.kind !== "installed") return;
+			guard = result.guard;
+			await switchHostFile(host, fileB);
+			assert.equal(result.guard.snapshot().pendingNativeHostLoadCount, 0);
+			if (markKind === "local") {
+				const setEntry = required(base.facts.setEntries[0], "local mark setViewData entry");
+				const candidate = makeHostLoadCandidate({
+					hostLoadTokenId: `host-load:${setEntry.ticket.switchIntentSeq}`,
+					ticket: setEntry.ticket,
+					view: host,
+					incomingContent: setEntry.incomingContent,
+				});
+				assert.equal(result.guard.reportHostLoadCandidate(candidate), true);
+				assert.equal(
+					result.guard.reportHostLoadCompleted(makeHostLoadReceipt(candidate)),
+					true,
+				);
+			}
+			assert.equal(result.guard.isTargetPresentationReady({
+				handoffGeneration: 1,
+				targetFile: fileB,
+				certifiedContent: "content:B",
+			}), true);
+			const marked = markKind === "local"
+				? result.guard.markTargetLocallyPresented({
+					handoffGeneration: 1,
+					targetFile: fileB,
+					certifiedContent: "content:B",
+				})
+				: result.guard.markTargetProven({
+					handoffGeneration: 1,
+					targetFile: fileB,
+					certifiedContent: "content:B",
+				});
+			assert.equal(marked, true, `${markKind} mark installs the post-presentation fence`);
+			const markedSnapshot = result.guard.snapshot();
+			assert.equal(markedSnapshot.managedClearTombstoneActive, true);
+			assert.ok((markedSnapshot.managedClearTombstoneEpoch ?? 0) > 0);
+			host.data = "content:B+x";
+			assert.throws(
+				() => host.setViewData("content:B-after-mark", lateClear),
+				/KAOS guarded host load cancelled: host-set-view-data-after-target-presentation/,
+			);
+			assert.deepEqual(
+				nativeSets,
+				["content:B"],
+				`${markKind}/${String(lateClear)} late set never reaches native mutation`,
+			);
+			assert.equal(host.getViewData(), "content:B+x", "post-mark input remains byte exact");
+			assert.ok((result.guard.snapshot().terminalHostLifecycle?.ownerId ?? 0) > 0);
+			assert.deepEqual(base.facts.capabilityLosses, [
+				"host-set-view-data-after-target-presentation",
+			]);
+			assert.equal(
+				result.guard.cancelTerminalHostLifecycle(
+					`test-safe-close:late-set:${markKind}:${String(lateClear)}`,
+				),
+				true,
+			);
+			result.guard.markInert();
+			assert.equal(result.guard.snapshot().managedClearTombstoneActive, false);
+			result.guard.restoreIfCurrent();
+		}
+	}
+}
+
+async function sameFileRefreshRequiresANewLoadEpoch(): Promise<void> {
+	const fileA = fakeFile("A.md");
+	const fileB = fakeFile("B.md");
+	{
+		let nativeLoadCount = 0;
+		let guard: TextFileViewHandoffGuard | null = null;
+		const host = makeOwnHost({
+			file: fileA,
+			data: "content:A",
+			onLoadFile: async function (targetFile) {
+				nativeLoadCount += 1;
+				this.file = targetFile;
+				this.setViewData(`content:B:${nativeLoadCount}`, true);
+			},
+			setViewData: function (data, clear) {
+				this.data = data;
+				if (clear) {
+					this.lastSavedData = data;
+					this.dirty = false;
+				}
+			},
+		});
+		const fixture = callbacksFor({
+			onLoad(targetFile) {
+				guard?.beginBlockingHandoff({
+					handoffGeneration: 1,
+					sourceLineagePath: nativeLoadCount === 0 ? fileA.path : fileB.path,
+					targetPath: targetFile.path,
+				});
+			},
+		});
+		const result = installTextFileViewHandoffGuard(host, fixture.callbacks);
+		assert.equal(result.kind, "installed");
+		if (result.kind !== "installed") return;
+		guard = result.guard;
+
+		await switchHostFile(host, fileB);
+		const firstSetEntry = required(
+			fixture.facts.setEntries[0],
+			"first B local completion entry",
+		);
+		const firstCandidate = makeHostLoadCandidate({
+			hostLoadTokenId: `host-load:${firstSetEntry.ticket.switchIntentSeq}`,
+			ticket: firstSetEntry.ticket,
+			view: host,
+			incomingContent: firstSetEntry.incomingContent,
+		});
+		assert.equal(result.guard.reportHostLoadCandidate(firstCandidate), true);
+		assert.equal(
+			result.guard.reportHostLoadCompleted(makeHostLoadReceipt(firstCandidate)),
+			true,
+		);
+		assert.equal(result.guard.markTargetLocallyPresented({
+			handoffGeneration: 1,
+			targetFile: fileB,
+			certifiedContent: "content:B:1",
+		}), true);
+		const firstMark = result.guard.snapshot();
+		assert.equal(firstMark.managedClearTombstoneActive, true);
+		const firstReceipt = required(
+			fixture.facts.tickets[0]?.sourceUnloadReceiptId,
+			"first B load receipt",
+		);
+
+		// A clean same-file refresh is legal only through a new onLoadFile owner.
+		// The retained tombstone remains closed until that exact ticket is admitted.
+		await host.onLoadFile(fileB);
+		assert.equal(nativeLoadCount, 2);
+		assert.equal(host.data, "content:B:2");
+		assert.equal(result.guard.snapshot().terminalHostLifecycle, null);
+		assert.equal(fixture.facts.tickets.length, 2);
+		assert.notEqual(
+			fixture.facts.tickets[1]?.sourceUnloadReceiptId,
+			firstReceipt,
+			"the explicit refresh receives a fresh source-retirement receipt",
+		);
+		assert.equal(
+			result.guard.snapshot().sourceUnload?.forcedSaveObserved,
+			false,
+			"a clean refresh is never represented as a forced source save",
+		);
+		assert.equal(result.guard.markTargetProven({
+			handoffGeneration: 1,
+			targetFile: fileB,
+			certifiedContent: "content:B:2",
+		}), true);
+		assert.equal(result.guard.snapshot().managedClearTombstoneActive, true);
+		assert.throws(
+			() => host.setViewData("ownerless-refresh", false),
+			/host-set-view-data-after-target-presentation/,
+		);
+		assert.equal(host.data, "content:B:2");
+		assert.equal(result.guard.cancelTerminalHostLifecycle("test:same-file-refresh"), true);
+		result.guard.markInert();
+		result.guard.restoreIfCurrent();
+	}
+
+	{
+		let nativeLoadCount = 0;
+		let nativeSetCount = 0;
+		let guard: TextFileViewHandoffGuard | null = null;
+		const host = makeOwnHost({
+			file: fileA,
+			data: "content:A",
+			onLoadFile: async function (targetFile) {
+				nativeLoadCount += 1;
+				this.file = targetFile;
+				this.setViewData("content:B", true);
+			},
+			setViewData: function (data, clear) {
+				nativeSetCount += 1;
+				this.data = data;
+				if (clear) {
+					this.lastSavedData = data;
+					this.dirty = false;
+				}
+			},
+		});
+		const fixture = callbacksFor({
+			onLoad(targetFile) {
+				guard?.beginBlockingHandoff({
+					handoffGeneration: 1,
+					sourceLineagePath: nativeLoadCount === 0 ? fileA.path : fileB.path,
+					targetPath: targetFile.path,
+				});
+			},
+		});
+		const result = installTextFileViewHandoffGuard(host, fixture.callbacks);
+		assert.equal(result.kind, "installed");
+		if (result.kind !== "installed") return;
+		guard = result.guard;
+		await switchHostFile(host, fileB);
+		const setEntry = required(
+			fixture.facts.setEntries[0],
+			"dirty refresh B local completion entry",
+		);
+		const candidate = makeHostLoadCandidate({
+			hostLoadTokenId: `host-load:${setEntry.ticket.switchIntentSeq}`,
+			ticket: setEntry.ticket,
+			view: host,
+			incomingContent: setEntry.incomingContent,
+		});
+		assert.equal(result.guard.reportHostLoadCandidate(candidate), true);
+		assert.equal(
+			result.guard.reportHostLoadCompleted(makeHostLoadReceipt(candidate)),
+			true,
+		);
+		assert.equal(result.guard.markTargetLocallyPresented({
+			handoffGeneration: 1,
+			targetFile: fileB,
+			certifiedContent: "content:B",
+		}), true);
+
+		host.data = "content:B+x";
+		host.dirty = true;
+		assert.equal(host.lastSavedData, "content:B");
+		const dirtyRefresh = host.onLoadFile(fileB);
+		void dirtyRefresh.catch(() => undefined);
+		assert.equal(nativeLoadCount, 1, "dirty same-file refresh never reaches native load");
+		assert.equal(nativeSetCount, 1, "dirty same-file refresh never reaches native setViewData");
+		assert.equal(host.data, "content:B+x", "dirty same-file bytes remain exact");
+		assert.notEqual(result.guard.snapshot().terminalHostLifecycle, null);
+		assert.equal(
+			result.guard.cancelTerminalHostLifecycle("test:dirty-same-file-refresh"),
+			true,
+		);
+		await assert.rejects(dirtyRefresh, /terminal host lifecycle cancelled/);
+		assert.equal(host.data, "content:B+x", "terminal cancellation does not replay or roll back input");
+		result.guard.markInert();
+		result.guard.restoreIfCurrent();
+	}
 }
 
 async function rejectedNoClearLoadAllowsMultipleCleanRetries(): Promise<void> {
@@ -822,51 +1420,42 @@ async function fulfilledNoClearLoadLosesCapabilityUntilTeardown(): Promise<void>
 	const fileB = fakeFile("B.md");
 	const fileC = fakeFile("C.md");
 	const fileD = fakeFile("D.md");
-	let generation = 1;
 	const host = makeOwnHost({
 		onLoadFile: async function (file) {
 			this.file = file;
 			if (file !== fileB) this.setViewData(`content:${file.path}`, true);
 		},
 	});
-	const firstFacts = callbacksFor({ generation: () => generation });
+	const firstFacts = callbacksFor();
 	const first = installTextFileViewHandoffGuard(host, firstFacts.callbacks);
 	assert.equal(first.kind, "installed");
 	if (first.kind !== "installed") return;
 
 	await switchHostFile(host, fileB);
-	const capabilityAfterB = clearLoadCapabilityOf(first.guard);
-	generation = 2;
-	await switchHostFile(host, fileC);
-	first.guard.beginBlockingHandoff({
-		handoffGeneration: 2,
-		sourceLineagePath: "B.md",
-		targetPath: "C.md",
-	});
-	const proofAfterLoss = first.guard.markTargetProven({
-		handoffGeneration: 2,
-		targetFile: fileC,
-		certifiedContent: "content:C.md",
-	});
-
-	assert.equal(capabilityAfterB, "clear-load-not-observable");
-	assert.equal(clearLoadCapabilityOf(first.guard), "clear-load-not-observable");
-	assert.deepEqual(firstFacts.facts.loadEntries, [fileB], "capability loss stops future managed entries");
+	assert.notEqual(
+		first.guard.snapshot().terminalHostLifecycle,
+		null,
+		"a fulfilled managed load without its clear boundary requires reopen",
+	);
+	assert.deepEqual(firstFacts.facts.loadEntries, [fileB]);
 	assert.deepEqual(firstFacts.facts.setEntries, []);
-	assert.equal(proofAfterLoss, false);
-	assert.equal(host.data, "content:C.md", "host pass-through remains functional after capability loss");
-
+	const blockedC = host.onLoadFile(fileC);
+	void blockedC.catch(() => undefined);
+	assert.equal(host.file, fileB, "terminal ownership prevents a later native C load");
+	assert.equal(first.guard.cancelTerminalHostLifecycle("test-safe-close:no-clear"), true);
+	await assert.rejects(blockedC, /terminal host lifecycle cancelled/);
+	first.guard.markInert();
 	first.guard.restoreIfCurrent();
+
 	const resetFacts = callbacksFor({ sessionId: "boot-reset" });
 	const reset = installTextFileViewHandoffGuard(host, resetFacts.callbacks);
 	assert.equal(reset.kind, "installed");
 	if (reset.kind !== "installed") return;
 	await switchHostFile(host, fileD);
-	assert.equal(clearLoadCapabilityOf(reset.guard), "observable", "teardown creates a fresh capability epoch");
+	assert.equal(clearLoadCapabilityOf(reset.guard), "observable");
 	assert.deepEqual(resetFacts.facts.loadEntries, [fileD]);
 	assert.equal(resetFacts.facts.setEntries.length, 1);
 }
-
 async function unretiredOverlappingLoadsRemainAuthorityInert(): Promise<void> {
 	const fileB = fakeFile("B.md");
 	const fileC = fakeFile("C.md");
@@ -876,7 +1465,7 @@ async function unretiredOverlappingLoadsRemainAuthorityInert(): Promise<void> {
 	const releaseB = deferred<void>();
 	const releaseC = deferred<void>();
 	const host = makeOwnHost({
-		onLoadFile: async function (file) {
+			onLoadFile: async function (file) {
 			this.file = file;
 			if (file === fileB) {
 				bEntered.resolve();
@@ -919,9 +1508,11 @@ async function staleLoadBecomesCallbackInert(): Promise<void> {
 	const fileB = fakeFile("B.md");
 	const fileC = fakeFile("C.md");
 	const releaseB = deferred<void>();
+	const nativeLoadTargets: TFile[] = [];
 	let generation = 1;
 	const host = makeOwnHost({
 		onLoadFile: async function (file) {
+			nativeLoadTargets.push(file);
 			this.file = file;
 			this.setViewData(`content:${file.path}`, true);
 			if (file === fileB) await releaseB.promise;
@@ -934,7 +1525,16 @@ async function staleLoadBecomesCallbackInert(): Promise<void> {
 	await retireSourceForNextLoad(host);
 	const pendingB = host.onLoadFile(fileB);
 	generation = 2;
-	await host.onLoadFile(fileC);
+	const pendingC = host.onLoadFile(fileC);
+	let cOutcome: "pending" | "fulfilled" | "rejected" = "pending";
+	void pendingC.then(
+		() => { cOutcome = "fulfilled"; },
+		() => { cOutcome = "rejected"; },
+	);
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(cOutcome, "pending", "a consumed source receipt terminally blocks overlapping C");
+	assert.deepEqual(nativeLoadTargets, [fileB], "C never reaches the original host load");
 	const bEntry = required(facts.setEntries[0], "stale B setViewData entry");
 	const staleB = makeHostLoadCandidate({
 		hostLoadTokenId: `host-load:${bEntry.ticket.switchIntentSeq}`,
@@ -946,9 +1546,19 @@ async function staleLoadBecomesCallbackInert(): Promise<void> {
 	assert.deepEqual(facts.candidates, [], "B cannot report after C owns the generation");
 	releaseB.resolve();
 	await pendingB;
-	assert.equal(facts.setEntries.length, 1, "overlapping C is fail-closed even after B emitted a clear");
+	assert.equal(facts.setEntries.length, 1, "terminal C is fail-closed after B emitted a clear");
 	assert.equal(facts.setEntries[0]?.ticket.targetFile, fileB);
-	assert.equal(host.data, "content:C.md");
+	assert.equal(host.data, "content:B.md");
+	assert.deepEqual(facts.capabilityLosses, ["source-unload-proof-lost-before-host-load"]);
+	assert.ok((result.guard.snapshot().terminalHostLifecycle?.ownerId ?? 0) > 0);
+	assert.equal(result.guard.cancelTerminalHostLifecycle("test-safe-close:stale-overlap"), true);
+	await assert.rejects(
+		pendingC,
+		/KAOS terminal host lifecycle cancelled: test-safe-close:stale-overlap/,
+	);
+	assert.equal(cOutcome, "rejected");
+	assert.deepEqual(nativeLoadTargets, [fileB]);
+	result.guard.restoreIfCurrent();
 }
 
 async function overlappingLoadsFailClosed(input: Readonly<{
@@ -958,11 +1568,11 @@ async function overlappingLoadsFailClosed(input: Readonly<{
 	const fileA = fakeFile("A.md");
 	const fileB = fakeFile("B.md");
 	const fileC = fakeFile("C.md");
-	const fileD = fakeFile("D.md");
 	const bEntered = deferred<void>();
 	const cEntered = deferred<void>();
 	const releaseB = deferred<void>();
 	const releaseC = deferred<void>();
+	const nativeSetEntries: string[] = [];
 	let generation = 1;
 	const host = makeOwnHost({
 		file: fileA,
@@ -984,11 +1594,26 @@ async function overlappingLoadsFailClosed(input: Readonly<{
 			this.file = file;
 			this.setViewData("content:D", true);
 		},
+		setViewData: function (content, _clear) {
+			nativeSetEntries.push(content);
+			this.data = content;
+		},
 	});
-	const { callbacks, facts } = callbacksFor({ generation: () => generation });
+	let guard: TextFileViewHandoffGuard | null = null;
+	const { callbacks, facts } = callbacksFor({
+		generation: () => generation,
+		onLoad(targetFile) {
+			guard?.beginBlockingHandoff({
+				handoffGeneration: generation,
+				sourceLineagePath: fileA.path,
+				targetPath: targetFile.path,
+			});
+		},
+	});
 	const result = installTextFileViewHandoffGuard(host, callbacks);
 	assert.equal(result.kind, "installed");
 	if (result.kind !== "installed") return;
+	guard = result.guard;
 
 	await retireSourceForNextLoad(host);
 	const pendingB = host.onLoadFile(fileB);
@@ -1012,7 +1637,10 @@ async function overlappingLoadsFailClosed(input: Readonly<{
 		makeHostLoadReceipt(crossCandidate),
 	);
 	releaseC.resolve();
-	await pendingC;
+	await assert.rejects(
+		pendingC,
+		/KAOS guarded host load cancelled: terminal-host-lifecycle/,
+	);
 
 	assert.deepEqual(
 		[crossCandidateResult, crossReceiptResult],
@@ -1020,38 +1648,33 @@ async function overlappingLoadsFailClosed(input: Readonly<{
 		`${input.label}: B clear-load facts cannot route under C's ticket`,
 	);
 	assert.equal(facts.setEntries.length, 0, `${input.label}: all overlapping clear loads are ambiguous`);
+	assert.deepEqual(nativeSetEntries, [], `${input.label}: ambiguous clear loads never reach native setViewData`);
 	assert.deepEqual(facts.candidates, []);
 	assert.deepEqual(facts.completions, []);
 
-	if (input.advanceGeneration) generation = 3;
-	await switchHostFile(host, fileD);
-	const dEntry = required(facts.setEntries[0], `${input.label} clean D entry`);
-	assert.equal(dEntry.ticket.targetFile, fileD, `${input.label}: a later non-overlap retry is certifiable`);
-	const dCandidate = makeHostLoadCandidate({
-		hostLoadTokenId: `host-load:${dEntry.ticket.switchIntentSeq}`,
-		ticket: dEntry.ticket,
-		view: host,
-		incomingContent: dEntry.incomingContent,
-	});
-	const dReceipt = makeHostLoadReceipt(dCandidate);
-	assert.equal(result.guard.reportHostLoadCandidate(dCandidate), true);
-	assert.equal(result.guard.reportHostLoadCompleted(dReceipt), true);
-	assert.deepEqual(facts.candidates, [dCandidate]);
-	assert.deepEqual(facts.completions, [dReceipt]);
+	const terminal = result.guard.snapshot();
+	assert.equal(terminal.pendingNativeHostLoadCount, 0);
+	assert.equal(terminal.nativeHostLoadAmbiguous, false);
+	assert.ok((terminal.nativeLoadEpoch ?? 0) > 0);
+	assert.ok((terminal.terminalHostLifecycle?.ownerId ?? 0) > 0);
+	assert.deepEqual(facts.capabilityLosses, ["host-clear-load-not-authorized"]);
+	assert.equal(result.guard.cancelTerminalHostLifecycle(`test-safe-close:${input.label}`), true);
+	result.guard.restoreIfCurrent();
 }
 
 async function delayedClearAfterSettlementPoisonsTheConcurrentRetryOnly(): Promise<void> {
 	const fileB = fakeFile("B.md");
 	const fileC = fakeFile("C.md");
-	const fileD = fakeFile("D.md");
 	const bEntered = deferred<void>();
 	const cEntered = deferred<void>();
 	const releaseB = deferred<void>();
 	const releaseC = deferred<void>();
+	const nativeSetEntries: string[] = [];
 	let generation = 1;
 	let fireDelayedB = (): void => {
 		throw new Error("delayed B clear was not scheduled");
 	};
+	let guard: TextFileViewHandoffGuard | null = null;
 	const host = makeOwnHost({
 		onLoadFile: async function (file) {
 			if (file === fileB) {
@@ -1068,14 +1691,27 @@ async function delayedClearAfterSettlementPoisonsTheConcurrentRetryOnly(): Promi
 				this.setViewData("content:C", true);
 				return;
 			}
-			this.file = fileD;
-			this.setViewData("content:D", true);
+			throw new Error(`unexpected target: ${file.path}`);
+		},
+		setViewData: function (content, _clear) {
+			nativeSetEntries.push(content);
+			this.data = content;
 		},
 	});
-	const { callbacks, facts } = callbacksFor({ generation: () => generation });
+	const { callbacks, facts } = callbacksFor({
+		generation: () => generation,
+		onLoad(targetFile) {
+			guard?.beginBlockingHandoff({
+				handoffGeneration: generation,
+				sourceLineagePath: "A.md",
+				targetPath: targetFile.path,
+			});
+		},
+	});
 	const result = installTextFileViewHandoffGuard(host, callbacks);
 	assert.equal(result.kind, "installed");
 	if (result.kind !== "installed") return;
+	guard = result.guard;
 
 	await retireSourceForNextLoad(host);
 	const pendingB = host.onLoadFile(fileB);
@@ -1087,7 +1723,11 @@ async function delayedClearAfterSettlementPoisonsTheConcurrentRetryOnly(): Promi
 	await cEntered.promise;
 	releaseB.resolve();
 	await pendingB;
-	fireDelayedB();
+	await Promise.resolve();
+	assert.throws(
+		() => fireDelayedB(),
+		/KAOS guarded host load cancelled: terminal-host-lifecycle/,
+	);
 	const cTicket = required(facts.tickets[1], "delayed-clear C ticket");
 	const crossCandidate = makeHostLoadCandidate({
 		hostLoadTokenId: `host-load:${cTicket.switchIntentSeq}`,
@@ -1100,7 +1740,10 @@ async function delayedClearAfterSettlementPoisonsTheConcurrentRetryOnly(): Promi
 		makeHostLoadReceipt(crossCandidate),
 	);
 	releaseC.resolve();
-	await pendingC;
+	await assert.rejects(
+		pendingC,
+		/KAOS guarded host load cancelled: terminal-host-lifecycle/,
+	);
 
 	assert.deepEqual(
 		[crossCandidateResult, crossReceiptResult],
@@ -1108,23 +1751,15 @@ async function delayedClearAfterSettlementPoisonsTheConcurrentRetryOnly(): Promi
 		"a post-settlement B clear cannot become C's sole current invocation",
 	);
 	assert.equal(facts.setEntries.length, 0, "the concurrent C retry remains ambiguity-inert");
+	assert.deepEqual(nativeSetEntries, [], "delayed/concurrent clears never reach native setViewData");
 	assert.deepEqual(facts.candidates, []);
 	assert.deepEqual(facts.completions, []);
 
-	generation = 3;
-	await switchHostFile(host, fileD);
-	const dEntry = required(facts.setEntries[0], "post-ambiguity D entry");
-	const dCandidate = makeHostLoadCandidate({
-		hostLoadTokenId: `host-load:${dEntry.ticket.switchIntentSeq}`,
-		ticket: dEntry.ticket,
-		view: host,
-		incomingContent: dEntry.incomingContent,
-	});
-	const dReceipt = makeHostLoadReceipt(dCandidate);
-	assert.equal(result.guard.reportHostLoadCandidate(dCandidate), true);
-	assert.equal(result.guard.reportHostLoadCompleted(dReceipt), true);
-	assert.deepEqual(facts.candidates, [dCandidate]);
-	assert.deepEqual(facts.completions, [dReceipt]);
+	assert.deepEqual(facts.capabilityLosses, ["superseded-host-load-tail-unobservable"]);
+	assert.equal(result.guard.snapshot().pendingNativeHostLoadCount, 0);
+	assert.ok((result.guard.snapshot().terminalHostLifecycle?.ownerId ?? 0) > 0);
+	assert.equal(result.guard.cancelTerminalHostLifecycle("test-safe-close:delayed-clear"), true);
+	result.guard.restoreIfCurrent();
 }
 
 async function loadEntryPathIsImmutableAcrossTFileRename(): Promise<void> {
@@ -1236,6 +1871,827 @@ async function callbackCanBlockBeforeTicketReturn(): Promise<void> {
 	);
 }
 
+async function sourceUnloadDrainPrecedesNativeRetirement(): Promise<void> {
+	const fileA = fakeFile("A.md");
+	const fileB = fakeFile("B.md");
+	const drain = deferred<void>();
+	const nativeOrder: string[] = [];
+	let nativeUnloadCount = 0;
+	let nativeSaveCount = 0;
+	const host = makeOwnHost({
+		file: fileA,
+		data: "content:A",
+		onUnloadFile: async function () {
+			nativeUnloadCount += 1;
+			nativeOrder.push(`unload:${this.data}`);
+			await this.save(true);
+		},
+		onLoadFile: async function (targetFile) {
+			nativeOrder.push(`load:${targetFile.path}`);
+			this.file = targetFile;
+			this.setViewData("content:B", true);
+		},
+		save: async function (clear?: boolean) {
+			nativeSaveCount += 1;
+			nativeOrder.push(`save:${this.data}`);
+			if (clear === true) {
+				this.data = "";
+				this.lastSavedData = null;
+			}
+		},
+	});
+	const fixture = callbacksFor({
+		onUnload(sourceFile) {
+			assert.equal(sourceFile, fileA);
+			return drain.promise;
+		},
+	});
+	const result = installTextFileViewHandoffGuard(host, fixture.callbacks);
+	assert.equal(result.kind, "installed");
+	if (result.kind !== "installed") return;
+
+	const pendingUnload = host.onUnloadFile(fileA);
+	const drainSnapshot = result.guard.snapshot().pendingSourceUnloadDrain;
+	assert.equal(drainSnapshot?.sourceFile, fileA);
+	assert.equal(drainSnapshot?.sourcePath, fileA.path);
+	assert.equal(drainSnapshot?.viewFileAtEntry, fileA);
+	assert.equal(drainSnapshot?.viewPathAtEntry, fileA.path);
+	assert.equal(nativeUnloadCount, 0, "native unload waits for the input reservation");
+	assert.equal(nativeSaveCount, 0, "forced save also waits for the reservation");
+
+	// This is the final transaction of the already-reserved A input. New save
+	// entry points are blocked while the drain owner is pending.
+	host.data = "content:A+x";
+	host.requestSave();
+	await host.save(false);
+	assert.equal(nativeSaveCount, 0, "ordinary saves cannot cross the drain epoch");
+	drain.resolve();
+	await pendingUnload;
+	assert.equal(result.guard.snapshot().pendingSourceUnloadDrain, null);
+	assert.deepEqual(nativeOrder, ["unload:content:A+x", "save:content:A+x"]);
+	assert.equal(nativeUnloadCount, 1);
+	assert.equal(nativeSaveCount, 1);
+	assert.equal(result.guard.snapshot().sourceUnload?.state, "settled");
+
+	await host.onLoadFile(fileB);
+	assert.deepEqual(nativeOrder, [
+		"unload:content:A+x",
+		"save:content:A+x",
+		"load:B.md",
+	]);
+	assert.equal(host.data, "content:B");
+	assert.deepEqual(fixture.facts.unloadEntries, [fileA]);
+}
+
+async function sourceUnloadWaitsForPreexistingSaveTails(): Promise<void> {
+	const fileA = fakeFile("A.md");
+	const drain = deferred<void>();
+	const oldSaveGate = deferred<void>();
+	const nativeOrder: string[] = [];
+	let disk = "content:initial";
+	let nativeUnloadCount = 0;
+	let nativeSaveCount = 0;
+	const host = makeOwnHost({
+		file: fileA,
+		data: "content:A",
+		onUnloadFile: async function () {
+			nativeUnloadCount += 1;
+			nativeOrder.push(`unload:${this.data}`);
+			await this.save(true);
+		},
+		save: async function (clear?: boolean) {
+			const saveIndex = nativeSaveCount++;
+			const captured = this.data;
+			nativeOrder.push(`save${saveIndex}:entered:${captured}`);
+			if (saveIndex === 0) await oldSaveGate.promise;
+			disk = captured;
+			nativeOrder.push(`save${saveIndex}:written:${captured}`);
+			if (clear === true) {
+				this.data = "";
+				this.lastSavedData = null;
+			} else {
+				this.lastSavedData = captured;
+			}
+		},
+	});
+	const fixture = callbacksFor({ onUnload: () => drain.promise });
+	const result = installTextFileViewHandoffGuard(host, fixture.callbacks);
+	assert.equal(result.kind, "installed");
+	if (result.kind !== "installed") return;
+
+	const oldSave = host.save(false);
+	assert.equal(result.guard.snapshot().inFlight.size, 1);
+	const pendingUnload = host.onUnloadFile(fileA);
+	const drainSnapshot = required(
+		result.guard.snapshot().pendingSourceUnloadDrain ?? undefined,
+		"source unload drain snapshot",
+	);
+	assert.equal(drainSnapshot.preexistingSaveCount, 1);
+	assert.equal(
+		drainSnapshot.expectedSaveEpochAfterDrain,
+		drainSnapshot.saveEpochAtEntry + 1,
+	);
+
+	// The reservation can now expose the final A transaction, but the forced
+	// A+x save must not run until the already-entered stale A writer is settled.
+	host.data = "content:A+x";
+	host.dirty = true;
+	drain.resolve();
+	await Promise.resolve();
+	await Promise.resolve();
+	await Promise.resolve();
+	const unloadCountBeforeOldSaveSettled = nativeUnloadCount;
+	oldSaveGate.resolve();
+	await oldSave;
+	await pendingUnload;
+
+	assert.equal(
+		unloadCountBeforeOldSaveSettled,
+		0,
+		"native unload waits for every save already in flight at drain entry",
+	);
+	assert.deepEqual(nativeOrder, [
+		"save0:entered:content:A",
+		"save0:written:content:A",
+		"unload:content:A+x",
+		"save1:entered:content:A+x",
+		"save1:written:content:A+x",
+	]);
+	assert.equal(nativeSaveCount, 2, "the stale tail and exact forced save each delegate once");
+	assert.equal(nativeUnloadCount, 1, "native source unload delegates exactly once");
+	assert.equal(disk, "content:A+x", "the forced save is the final disk writer");
+	assert.equal(result.guard.snapshot().pendingSourceUnloadDrain, null);
+	assert.equal(result.guard.snapshot().sourceUnload?.state, "settled");
+	result.guard.markInert();
+	result.guard.restoreIfCurrent();
+}
+
+async function sourceUnloadDrainDeadlineIsTerminal(): Promise<void> {
+	for (const stalledLane of ["input-drain", "preexisting-save"] as const) {
+		const fileA = fakeFile("A.md");
+		const fileB = fakeFile("B.md");
+		const neverSettles = deferred<void>();
+		let nativeUnloadCount = 0;
+		let nativeLoadCount = 0;
+		let nativeSaveCount = 0;
+		let forcedSaveCount = 0;
+		const host = makeOwnHost({
+			file: fileA,
+			data: "content:A",
+			onUnloadFile: async function () {
+				nativeUnloadCount += 1;
+				await this.save(true);
+			},
+			onLoadFile: async function (targetFile) {
+				nativeLoadCount += 1;
+				this.file = targetFile;
+				this.setViewData("content:B", true);
+			},
+			save: async function (clear?: boolean) {
+				nativeSaveCount += 1;
+				if (clear === true) forcedSaveCount += 1;
+				if (stalledLane === "preexisting-save" && clear !== true) {
+					await neverSettles.promise;
+				}
+			},
+		});
+		const fixture = callbacksFor({
+			onUnload: () => stalledLane === "input-drain" ? neverSettles.promise : null,
+		});
+		const result = installTextFileViewHandoffGuard(host, fixture.callbacks, {
+			hostApiVersion: "1.13.4",
+			sourceUnloadDrainDeadlineMs: 10,
+		});
+		assert.equal(result.kind, "installed");
+		if (result.kind !== "installed") continue;
+
+		if (stalledLane === "preexisting-save") {
+			void host.save(false);
+			assert.equal(nativeSaveCount, 1, "the exact preexisting save enters before drain");
+		}
+		const transition = host.onUnloadFile(fileA).then(() => host.onLoadFile(fileB));
+		await new Promise<void>((resolve) => setTimeout(resolve, 40));
+
+		assert.equal(
+			result.guard.snapshot().pendingSourceUnloadDrain,
+			null,
+			`${stalledLane} releases its expired drain owner`,
+		);
+		assert.ok(
+			(result.guard.snapshot().terminalHostLifecycle?.ownerId ?? 0) > 0,
+			`${stalledLane} retains the export/reopen lifecycle`,
+		);
+		assert.equal(result.guard.snapshot().hostCapabilityState, "lost");
+		assert.deepEqual(
+			fixture.facts.capabilityLosses,
+			["source-unload-drain-deadline-exceeded"],
+		);
+		assert.deepEqual(fixture.facts.loadEntries, [], "B admission is never attempted");
+		assert.equal(nativeUnloadCount, 0, "native source unload never enters after expiry");
+		assert.equal(nativeLoadCount, 0, "native B load never enters after expiry");
+		assert.equal(forcedSaveCount, 0, "expiry cannot force a final source save");
+		assert.equal(host.file, fileA, "A remains the host file until explicit reopen");
+		assert.equal(host.data, "content:A", "A remains visibly retained");
+
+		const countsAtExpiry = { nativeUnloadCount, nativeLoadCount, nativeSaveCount };
+		await new Promise<void>((resolve) => setTimeout(resolve, 20));
+		assert.deepEqual(
+			{ nativeUnloadCount, nativeLoadCount, nativeSaveCount },
+			countsAtExpiry,
+			`${stalledLane} deadline is terminal rather than a retry`,
+		);
+		assert.deepEqual(
+			fixture.facts.capabilityLosses,
+			["source-unload-drain-deadline-exceeded"],
+			"terminal expiry reports capability loss exactly once",
+		);
+
+		assert.equal(
+			result.guard.cancelTerminalHostLifecycle(`test-safe-close:${stalledLane}`),
+			true,
+		);
+		await assert.rejects(
+			transition,
+			new RegExp(`terminal host lifecycle cancelled: test-safe-close:${stalledLane}`),
+		);
+		assert.equal(nativeLoadCount, 0, "safe close does not replay the target load");
+		result.guard.markInert();
+		result.guard.restoreIfCurrent();
+	}
+}
+
+async function sourceUnloadDrainDriftIsTerminal(): Promise<void> {
+	const fileA = fakeFile("A.md");
+	const fileB = fakeFile("B.md");
+	for (const drift of [
+		"rejected",
+		"file-first",
+		"reentrant",
+		"observed-file-aba",
+		"observed-path-aba",
+		"observed-wrapper-aba",
+		"set-during-drain",
+	] as const) {
+		const drain = deferred<void>();
+		let nativeUnloadCount = 0;
+		let nativeSetCount = 0;
+		const host = makeOwnHost({
+			file: fileA,
+			data: "content:A",
+			onUnloadFile: async function () {
+				nativeUnloadCount += 1;
+			},
+			setViewData: function (data, _clear) {
+				nativeSetCount += 1;
+				this.data = data;
+			},
+		});
+		const fixture = callbacksFor({ onUnload: () => drain.promise });
+		const result = installTextFileViewHandoffGuard(host, fixture.callbacks);
+		assert.equal(result.kind, "installed");
+		if (result.kind !== "installed") continue;
+		const pendingUnload = host.onUnloadFile(fileA);
+		void pendingUnload.catch(() => undefined);
+		if (drift === "rejected") {
+			drain.reject(new Error("input settlement rejected"));
+		} else if (drift === "file-first") {
+			host.file = fileB;
+			drain.resolve();
+		} else if (drift === "reentrant") {
+			const duplicateUnload = host.onUnloadFile(fileA);
+			void duplicateUnload.catch(() => undefined);
+			drain.resolve();
+		} else if (drift === "observed-file-aba") {
+			host.file = fileB;
+			host.requestSave();
+			host.file = fileA;
+			drain.resolve();
+		} else if (drift === "observed-path-aba") {
+			fileA.path = "A-renamed.md";
+			host.requestSave();
+			fileA.path = "A.md";
+			drain.resolve();
+		} else if (drift === "observed-wrapper-aba") {
+			const installedSave = result.guard.snapshot().installedSave;
+			host.save = async function () {};
+			host.requestSave();
+			host.save = installedSave as Host["save"];
+			drain.resolve();
+		} else {
+			assert.throws(
+				() => host.setViewData("content:mutated-during-drain", false),
+				/source-unload-drain/,
+			);
+			drain.resolve();
+		}
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		assert.notEqual(
+			result.guard.snapshot().terminalHostLifecycle,
+			null,
+			`${drift} retains the reopen boundary`,
+		);
+		assert.equal(nativeUnloadCount, 0, `${drift} never reaches native unload`);
+		assert.equal(nativeSetCount, 0, `${drift} never reaches native setViewData`);
+		assert.equal(host.data, "content:A", `${drift} preserves source bytes`);
+		assert.equal(result.guard.cancelTerminalHostLifecycle(`test:${drift}`), true);
+		await assert.rejects(pendingUnload, /terminal host lifecycle cancelled/);
+		result.guard.markInert();
+		result.guard.restoreIfCurrent();
+	}
+}
+
+async function deferredLoadAdmissionNeverDelegatesAnUntrackedTarget(): Promise<void> {
+	const fileA = fakeFile("A.md");
+	const fileB = fakeFile("B.md");
+	const fileC = fakeFile("C.md");
+
+	{
+		const admission = deferred<ManagedHostSwitchTicket | null>();
+		const nativeLoad = deferred<string>();
+		let sourceUnloadReceiptId: string | null = null;
+		let nativeLoadCount = 0;
+		let nativeSaveCount = 0;
+		let guard: TextFileViewHandoffGuard | null = null;
+		const host = makeOwnHost({
+			file: fileA,
+			data: "content:A",
+			onLoadFile: function (targetFile) {
+				nativeLoadCount += 1;
+				this.file = targetFile;
+				this.setViewData("content:B", true);
+				return nativeLoad.promise;
+			},
+			save: async function (clear?: boolean) {
+				nativeSaveCount += 1;
+				if (clear === true) {
+					this.data = "";
+					this.lastSavedData = null;
+				}
+			},
+		});
+		const base = callbacksFor();
+		const result = installTextFileViewHandoffGuard(host, {
+			...base.callbacks,
+			onLoadFileEntry(targetFile, receiptId) {
+				base.facts.loadEntries.push(targetFile);
+				sourceUnloadReceiptId = receiptId;
+				return admission.promise;
+			},
+		});
+		assert.equal(result.kind, "installed");
+		if (result.kind !== "installed") return;
+		guard = result.guard;
+		await retireSourceForNextLoad(host);
+		const savesAfterRetirement = nativeSaveCount;
+		const epochBefore = guard.snapshot().pendingLoadEpoch ?? -1;
+		const returned = host.onLoadFile(fileB) as unknown as Promise<string>;
+		assert.equal(nativeLoadCount, 0);
+		const pending = required(
+			guard.snapshot().pendingDeferredLoadAdmission ?? undefined,
+			"single pending load admission",
+		);
+		assert.equal(pending.targetFile, fileB);
+		assert.ok(pending.pendingLoadEpoch > epochBefore);
+		host.requestSave();
+		await host.save(false);
+		assert.equal(
+			nativeSaveCount,
+			savesAfterRetirement,
+			"view.file-independent admission ownership blocks ordinary saves",
+		);
+		guard.beginBlockingHandoff({
+			handoffGeneration: 1,
+			sourceLineagePath: fileA.path,
+			targetPath: fileB.path,
+		});
+		admission.resolve({
+			sessionId: "boot-a",
+			handoffGeneration: 1,
+			switchIntentSeq: 1,
+			targetFile: fileB,
+			sourceUnloadReceiptId: required(
+				sourceUnloadReceiptId ?? undefined,
+				"deferred B source retirement",
+			),
+		});
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		assert.equal(nativeLoadCount, 1);
+		assert.equal(guard.snapshot().pendingDeferredLoadAdmission, null);
+		assert.notEqual(returned, nativeLoad.promise);
+		nativeLoad.resolve("native:B");
+		assert.equal(await returned, "native:B");
+	}
+
+	{
+		const bAdmission = deferred<ManagedHostSwitchTicket | null>();
+		let generation = 1;
+		let sourceUnloadReceiptIdB: string | null = null;
+		let guard: TextFileViewHandoffGuard | null = null;
+		const nativeLoadTargets: TFile[] = [];
+		const host = makeOwnHost({
+			file: fileA,
+			data: "content:A",
+			onLoadFile: async function (targetFile) {
+				nativeLoadTargets.push(targetFile);
+				this.file = targetFile;
+				this.setViewData(`content:${targetFile.path}`, true);
+			},
+		});
+		const base = callbacksFor({
+			generation: () => generation,
+			onLoad(targetFile) {
+				guard?.beginBlockingHandoff({
+					handoffGeneration: generation,
+					sourceLineagePath: fileA.path,
+					targetPath: targetFile.path,
+				});
+			},
+		});
+		const result = installTextFileViewHandoffGuard(host, {
+			...base.callbacks,
+			onLoadFileEntry(targetFile, receiptId) {
+				if (targetFile === fileB) {
+					base.facts.loadEntries.push(targetFile);
+					sourceUnloadReceiptIdB = receiptId;
+					return bAdmission.promise;
+				}
+				generation = 2;
+				return base.callbacks.onLoadFileEntry(targetFile, receiptId);
+			},
+		});
+		assert.equal(result.kind, "installed");
+		if (result.kind !== "installed") return;
+		guard = result.guard;
+		await retireSourceForNextLoad(host);
+		const pendingB = host.onLoadFile(fileB);
+		void pendingB.catch(() => undefined);
+		const bEpoch = guard.snapshot().pendingLoadEpoch ?? -1;
+		const pendingC = host.onLoadFile(fileC);
+		await pendingC;
+		await pendingB;
+		bAdmission.resolve({
+			sessionId: "boot-a",
+			handoffGeneration: 1,
+			switchIntentSeq: 1,
+			targetFile: fileB,
+			sourceUnloadReceiptId: required(
+				sourceUnloadReceiptIdB ?? undefined,
+				"superseded B source retirement",
+			),
+		});
+		await Promise.resolve();
+		assert.deepEqual(nativeLoadTargets, [fileC]);
+		assert.equal(host.file, fileC);
+		assert.equal(host.data, "content:C.md");
+		assert.deepEqual(base.facts.loadEntries, [fileB, fileC]);
+		assert.deepEqual(
+			base.facts.tickets.map((ticket) => ticket.targetFile),
+			[fileC],
+		);
+		assert.ok((guard.snapshot().pendingLoadEpoch ?? -1) > bEpoch);
+		assert.equal(guard.snapshot().pendingDeferredLoadAdmission, null);
+		assert.equal(guard.snapshot().terminalHostLifecycle, null);
+	}
+}
+async function deferredAdmissionWrapperDriftIsTerminal(): Promise<void> {
+	const fileA = fakeFile("A.md");
+	const fileB = fakeFile("B.md");
+	const admission = deferred<ManagedHostSwitchTicket | null>();
+	let sourceUnloadReceiptId: string | null = null;
+	let originalLoadCount = 0;
+	let originalSetCount = 0;
+	let foreignSetCount = 0;
+	const host = makeOwnHost({
+		file: fileA,
+		data: "content:A",
+		onLoadFile: async function (targetFile) {
+			originalLoadCount += 1;
+			this.file = targetFile;
+			this.setViewData("content:B", true);
+		},
+		setViewData: function (content, _clear) {
+			originalSetCount += 1;
+			this.data = content;
+		},
+	});
+	const base = callbacksFor();
+	const result = installTextFileViewHandoffGuard(host, {
+		...base.callbacks,
+		onLoadFileEntry(targetFile, receiptId) {
+			base.facts.loadEntries.push(targetFile);
+			sourceUnloadReceiptId = receiptId;
+			return admission.promise;
+		},
+	});
+	assert.equal(result.kind, "installed");
+	if (result.kind !== "installed") return;
+	await retireSourceForNextLoad(host);
+	const pendingLoad = host.onLoadFile(fileB);
+	assert.notEqual(result.guard.snapshot().pendingDeferredLoadAdmission, null);
+	host.setViewData = function () {
+		foreignSetCount += 1;
+	};
+	admission.resolve({
+		sessionId: "boot-a",
+		handoffGeneration: 1,
+		switchIntentSeq: 1,
+		targetFile: fileB,
+		sourceUnloadReceiptId: required(
+			sourceUnloadReceiptId ?? undefined,
+			"wrapper-drift deferred source receipt",
+		),
+	});
+	let loadSettled = false;
+	void pendingLoad.then(
+		() => { loadSettled = true; },
+		() => { loadSettled = true; },
+	);
+	await Promise.resolve();
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(loadSettled, false, "wrapper drift retains one terminal deferred load owner");
+	assert.equal(originalLoadCount, 0, "final wrapper CAS runs before original host load");
+	assert.equal(originalSetCount, 0);
+	assert.equal(foreignSetCount, 0, "the displaced writer cannot receive target bytes");
+	assert.equal(host.file, fileA);
+	assert.equal(host.getViewData(), "", "only the already-proven source retirement is visible");
+	const terminal = result.guard.snapshot();
+	assert.equal(terminal.pendingDeferredLoadAdmission, null);
+	assert.equal(terminal.pendingNativeHostLoadCount, 0);
+	assert.equal(terminal.loadWrappersCurrent, false);
+	assert.ok((terminal.terminalHostLifecycle?.ownerId ?? 0) > 0);
+	assert.deepEqual(base.facts.capabilityLosses, ["host-wrapper-drift-before-host-load"]);
+	assert.equal(result.guard.cancelTerminalHostLifecycle("test-safe-close:deferred-wrapper-drift"), true);
+	await assert.rejects(
+		pendingLoad,
+		/KAOS terminal host lifecycle cancelled: test-safe-close:deferred-wrapper-drift/,
+	);
+	assert.equal(loadSettled, true);
+	assert.equal(originalLoadCount, 0);
+	assert.equal(foreignSetCount, 0);
+	result.guard.restoreIfCurrent();
+}
+
+async function loadWrapperDriftBlocksTargetDelegation(): Promise<void> {
+	const fileA = fakeFile("A.md");
+	const fileB = fakeFile("B.md");
+	{
+		let originalLoadCount = 0;
+		let foreignSetCount = 0;
+		const host = makeOwnHost({
+			file: fileA,
+			data: "content:A",
+			onLoadFile: async function (targetFile) {
+				originalLoadCount += 1;
+				this.file = targetFile;
+				this.setViewData(`content:${targetFile.path}`, true);
+			},
+		});
+		const base = callbacksFor();
+		const result = installTextFileViewHandoffGuard(host, base.callbacks);
+		assert.equal(result.kind, "installed");
+		if (result.kind !== "installed") return;
+		const guardedOnLoadFile = host.onLoadFile;
+		const foreignSetViewData = function (this: Host): void {
+			foreignSetCount += 1;
+		};
+		host.setViewData = foreignSetViewData;
+		host.file = fileB;
+		assert.equal(result.guard.snapshot().wrappersCurrent, true, "save wrappers remain exact");
+		assert.equal(result.guard.snapshot().loadWrappersCurrent, false);
+
+		const pendingLoad = Reflect.apply(guardedOnLoadFile, host, [fileB]);
+		const repeatedPendingLoad = Reflect.apply(guardedOnLoadFile, host, [fileB]);
+		let loadSettled = false;
+		void pendingLoad.then(
+			() => { loadSettled = true; },
+			() => { loadSettled = true; },
+		);
+		await Promise.resolve();
+		assert.equal(pendingLoad, repeatedPendingLoad, "repeated drift calls share one exact terminal owner");
+		assert.equal(loadSettled, false, "guarded load drift never reports target success");
+		assert.equal(originalLoadCount, 0, "load-wrapper drift blocks original target mutation");
+		assert.equal(foreignSetCount, 0, "the displaced target writer is not invoked");
+		assert.equal(host.file, fileB, "a host-published B identity remains terminally visible");
+		assert.equal(host.getViewData(), "content:A", "visible A bytes are never reported as loaded B");
+		assert.equal(result.guard.snapshot().hostCapabilityState, "lost");
+		assert.deepEqual(base.facts.capabilityLosses, ["host-wrapper-drift-before-host-load"]);
+		assert.equal(result.guard.snapshot().wrappersCurrent, true, "future save entries remain capturable");
+		assert.ok((result.guard.snapshot().terminalHostLifecycle?.ownerId ?? 0) > 0);
+		result.guard.markInert();
+		await assert.rejects(
+			pendingLoad,
+			/KAOS terminal host lifecycle cancelled: guard-became-inert/,
+		);
+		await assert.rejects(repeatedPendingLoad);
+		assert.equal(loadSettled, true, "safe inerting rejects the exact load owner once");
+		assert.equal(result.guard.snapshot().terminalHostLifecycle, null);
+		result.guard.restoreIfCurrent();
+	}
+
+	{
+		let originalUnloadCount = 0;
+		let originalLoadCount = 0;
+		let foreignLoadCount = 0;
+		let guard: TextFileViewHandoffGuard | null = null;
+		let terminalFence: Readonly<{
+			isCurrent(): boolean;
+			release(): boolean;
+		}> | null = null;
+		const host = makeOwnHost({
+			file: fileA,
+			data: "content:A",
+			onUnloadFile: async function () {
+				originalUnloadCount += 1;
+				await this.save(true);
+			},
+			onLoadFile: async function (targetFile) {
+				originalLoadCount += 1;
+				this.file = targetFile;
+				this.setViewData(`content:${targetFile.path}`, true);
+			},
+		});
+		const base = callbacksFor();
+		const callbacks: TextFileViewHandoffGuardCallbacks = {
+			...base.callbacks,
+			onHostCapabilityLost(reason) {
+				base.callbacks.onHostCapabilityLost(reason);
+				terminalFence = guard?.acquireEmergencySaveFence() ?? null;
+			},
+		};
+		const result = installTextFileViewHandoffGuard(host, callbacks);
+		assert.equal(result.kind, "installed");
+		if (result.kind !== "installed") return;
+		guard = result.guard;
+		const foreignOnLoadFile = async function (this: Host, targetFile: TFile): Promise<void> {
+			foreignLoadCount += 1;
+			this.file = targetFile;
+			this.setViewData(`foreign:${targetFile.path}`, true);
+		};
+		host.onLoadFile = foreignOnLoadFile;
+		assert.equal(result.guard.snapshot().wrappersCurrent, true);
+		assert.equal(result.guard.snapshot().loadWrappersCurrent, false);
+
+		let transitionSettled = false;
+		const pendingUnload = host.onUnloadFile(fileA);
+		const repeatedPendingUnload = host.onUnloadFile(fileA);
+		assert.equal(pendingUnload, repeatedPendingUnload, "unload drift reuses one terminal owner");
+		const attemptedTransition = pendingUnload.then(
+			() => host.onLoadFile(fileB),
+		);
+		const transitionOutcome = attemptedTransition.then(
+			() => {
+				transitionSettled = true;
+				return "fulfilled" as const;
+			},
+			() => {
+				transitionSettled = true;
+				return "rejected" as const;
+			},
+		);
+		await Promise.resolve();
+		await Promise.resolve();
+		assert.equal(originalUnloadCount, 0, "load-wrapper drift blocks original source unload");
+		assert.equal(originalLoadCount, 0, "the retired original load is never reached");
+		assert.equal(foreignLoadCount, 0, "pending unload cannot continue into foreign B load");
+		assert.equal(transitionSettled, false, "the unsafe host lifecycle remains reopen-pending");
+		assert.equal(host.file, fileA, "A remains selected without retiring or relabelling its bytes");
+		assert.equal(host.getViewData(), "content:A");
+		const terminal = result.guard.snapshot();
+		assert.equal(terminal.hostCapabilityState, "lost");
+		assert.equal(terminal.mode.kind, "pass-through");
+		assert.equal(terminal.sourceUnload, null, "no source receipt is minted without exact wrappers");
+		assert.equal(terminal.wrappersCurrent, true, "future save entries are recaptured");
+		assert.equal(terminal.loadWrappersCurrent, false, "foreign load identity remains terminally visible");
+		assert.equal(terminal.emergencySaveBlocked, true, "the persistent owner blocks native saves");
+		const terminalOwnerId = terminal.terminalHostLifecycle?.ownerId ?? 0;
+		assert.ok(terminalOwnerId > 0, "terminal snapshot exposes one exact lifecycle owner");
+		assert.deepEqual(base.facts.capabilityLosses, ["host-wrapper-drift-before-host-load"]);
+		assert.equal(terminalFence?.isCurrent(), false, "opaque load drift remains unprovable until reopen");
+		assert.equal(host.onLoadFile, foreignOnLoadFile, "the guard never certifies foreign load recapture");
+		result.guard.markInert();
+		await Promise.resolve();
+		assert.equal(transitionSettled, false, "an active emergency owner prevents ordinary inert cancellation");
+		assert.equal(
+			result.guard.snapshot().terminalHostLifecycle?.ownerId,
+			terminalOwnerId,
+			"ordinary inerting cannot replace the terminal owner",
+		);
+		assert.equal(terminalFence?.release(), true);
+		assert.equal(
+			result.guard.cancelTerminalHostLifecycle("test-safe-close"),
+			true,
+			"safe close rejects the exact terminal lifecycle owner",
+		);
+		assert.equal(
+			result.guard.cancelTerminalHostLifecycle("test-safe-close-again"),
+			false,
+			"terminal lifecycle owner settles at most once",
+		);
+		assert.equal(await transitionOutcome, "rejected");
+		assert.equal(transitionSettled, true, "safe close settles the host transition boundedly");
+		assert.equal(foreignLoadCount, 0, "terminal rejection skips the foreign B success continuation");
+		assert.equal(result.guard.snapshot().terminalHostLifecycle, null);
+		result.guard.markInert();
+		result.guard.restoreIfCurrent();
+		const replacement = installTextFileViewHandoffGuard(host, base.callbacks);
+		assert.equal(replacement.kind, "installed", "safe restore removes the old guard registry owner");
+		if (replacement.kind === "installed") {
+			replacement.guard.markInert();
+			replacement.guard.restoreIfCurrent();
+		}
+	}
+
+	{
+		const saveEntered = deferred<void>();
+		const releaseSave = deferred<void>();
+		let originalUnloadCount = 0;
+		let originalLoadCount = 0;
+		let foreignLoadCount = 0;
+		let foreignSetCount = 0;
+		const host = makeOwnHost({
+			file: fileA,
+			data: "content:A",
+			onUnloadFile: async function () {
+				originalUnloadCount += 1;
+				await this.save(true);
+			},
+			onLoadFile: async function (targetFile) {
+				originalLoadCount += 1;
+				this.file = targetFile;
+				this.setViewData(`content:${targetFile.path}`, true);
+			},
+			save: async function () {
+				saveEntered.resolve();
+				await releaseSave.promise;
+			},
+		});
+		const base = callbacksFor();
+		const result = installTextFileViewHandoffGuard(host, base.callbacks);
+		assert.equal(result.kind, "installed");
+		if (result.kind !== "installed") return;
+
+		const pendingUnload = host.onUnloadFile(fileA);
+		await saveEntered.promise;
+		const foreignOnLoadFile = async function (this: Host, targetFile: TFile): Promise<void> {
+			foreignLoadCount += 1;
+			this.file = targetFile;
+			this.setViewData(`foreign:${targetFile.path}`, true);
+		};
+		host.onLoadFile = foreignOnLoadFile;
+		host.setViewData = function () {
+			foreignSetCount += 1;
+		};
+		let transitionSettled = false;
+		const attemptedTransition = pendingUnload.then(() => host.onLoadFile(fileB));
+		const transitionOutcome = attemptedTransition.then(
+			() => {
+				transitionSettled = true;
+				return "fulfilled" as const;
+			},
+			() => {
+				transitionSettled = true;
+				return "rejected" as const;
+			},
+		);
+		releaseSave.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+
+		assert.equal(originalUnloadCount, 1, "the exact source unload entered before wrapper drift");
+		assert.equal(originalLoadCount, 0, "settlement drift cannot continue into original B");
+		assert.equal(foreignLoadCount, 0, "settlement drift cannot continue into foreign B");
+		assert.equal(foreignSetCount, 0, "no foreign target presentation runs");
+		assert.equal(transitionSettled, false, "unload settlement remains terminal until reopen");
+		assert.equal(host.file, fileA);
+		assert.equal(host.getViewData(), "content:A");
+		const terminal = result.guard.snapshot();
+		assert.equal(terminal.sourceUnload?.state, "rejected");
+		assert.equal(terminal.hostCapabilityState, "lost");
+		assert.equal(terminal.loadWrappersCurrent, false);
+		assert.ok((terminal.terminalHostLifecycle?.ownerId ?? 0) > 0);
+		assert.deepEqual(base.facts.capabilityLosses, ["host-wrapper-drift-before-host-load"]);
+		assert.equal(result.guard.cancelTerminalHostLifecycle("test-safe-close:settlement-drift"), true);
+		await assert.rejects(
+			pendingUnload,
+			/KAOS terminal host lifecycle cancelled: test-safe-close:settlement-drift/,
+		);
+		assert.equal(await transitionOutcome, "rejected");
+		assert.equal(transitionSettled, true);
+		assert.equal(originalLoadCount, 0);
+		assert.equal(foreignLoadCount, 0);
+		assert.equal(foreignSetCount, 0);
+		result.guard.restoreIfCurrent();
+	}
+}
+
 async function saveCancellationSuppressionProofAndPinning(): Promise<void> {
 	const fileA = fakeFile("A.md");
 	const fileB = fakeFile("B.md");
@@ -1330,7 +2786,7 @@ async function saveCancellationSuppressionProofAndPinning(): Promise<void> {
 	host.requestSave();
 	await host.save();
 	host.file = fileB;
-	host.data = "content:B";
+	host.data = "content:B.md";
 	host.requestSave();
 	await host.save();
 	assert.equal((host.requestSave as unknown as { run(): unknown }).run(), undefined);
@@ -1348,7 +2804,7 @@ async function saveCancellationSuppressionProofAndPinning(): Promise<void> {
 	assert.equal(result.guard.markTargetProven({
 		handoffGeneration: 2,
 		targetFile: fileB,
-		certifiedContent: "content:B",
+		certifiedContent: "content:B.md",
 	}), false, "wrong generation cannot prove");
 	generation = 1;
 	host.file = fileB;
@@ -1378,28 +2834,28 @@ async function saveCancellationSuppressionProofAndPinning(): Promise<void> {
 	assert.equal(result.guard.markTargetProven({
 		handoffGeneration: 1,
 		targetFile: fileB,
-		certifiedContent: "content:B",
+		certifiedContent: "content:B.md",
 	}), false, "editor mismatch cannot prove even when the runtime cache matches");
-	host.getViewData = () => "content:B";
+	host.getViewData = () => "content:B.md";
 	host.data = "cache-mismatch";
 	assert.equal(result.guard.markTargetProven({
 		handoffGeneration: 1,
 		targetFile: fileB,
-		certifiedContent: "content:B",
+		certifiedContent: "content:B.md",
 	}), false, "runtime cache mismatch cannot prove even when editor data matches");
-	host.data = "content:B";
+	host.data = "content:B.md";
 	host.getViewData = () => {
 		result.guard.beginBlockingHandoff({
 			handoffGeneration: 1,
 			sourceLineagePath: "B.md",
 			targetPath: "C.md",
 		});
-		return "content:B";
+		return "content:B.md";
 	};
 	assert.equal(result.guard.markTargetProven({
 		handoffGeneration: 1,
 		targetFile: fileB,
-		certifiedContent: "content:B",
+		certifiedContent: "content:B.md",
 	}), false, "host read reentry cannot release a superseding handoff gate");
 	assert.equal(
 		result.guard.snapshot().mode.kind === "blocking-handoff"
@@ -1413,11 +2869,11 @@ async function saveCancellationSuppressionProofAndPinning(): Promise<void> {
 		sourceLineagePath: "A.md",
 		targetPath: "B.md",
 	});
-	host.getViewData = () => "content:B";
+	host.getViewData = () => "content:B.md";
 	assert.equal(result.guard.markTargetProven({
 		handoffGeneration: 1,
 		targetFile: fileB,
-		certifiedContent: "content:B",
+		certifiedContent: "content:B.md",
 	}), true);
 	assert.equal(facts.suppressed.length, 7, "suppressed saves are never replayed");
 	assert.equal(
@@ -1430,7 +2886,7 @@ async function saveCancellationSuppressionProofAndPinning(): Promise<void> {
 	await (host.requestSave as unknown as { run(): Promise<void> }).run();
 	assert.equal(requestCount, 0);
 	assert.equal(requestRunCount, 0);
-	assert.equal(await host.save(), "content:B");
+	assert.equal(await host.save(), "content:B.md");
 	assert.equal(saveCount, 4, "owned flush and a fresh direct save delegate only after proof");
 }
 
@@ -1670,6 +3126,21 @@ async function retiredSaveWrappersRouteThroughTheReplacementGuard(): Promise<voi
 	assert.equal(replacement.kind, "installed");
 	if (replacement.kind !== "installed") return;
 	await switchHostFile(host, fileB);
+	const replacementSetEntry = required(
+		replacementFacts.facts.setEntries[0],
+		"replacement local completion entry",
+	);
+	const replacementCandidate = makeHostLoadCandidate({
+		hostLoadTokenId: `host-load:${replacementSetEntry.ticket.switchIntentSeq}`,
+		ticket: replacementSetEntry.ticket,
+		view: host,
+		incomingContent: replacementSetEntry.incomingContent,
+	});
+	assert.equal(replacement.guard.reportHostLoadCandidate(replacementCandidate), true);
+	assert.equal(
+		replacement.guard.reportHostLoadCompleted(makeHostLoadReceipt(replacementCandidate)),
+		true,
+	);
 	originalSaveCount = 0;
 	bridgeSaveCount = 0;
 	replacement.guard.beginBlockingHandoff({
@@ -1703,25 +3174,42 @@ async function retiredSaveWrappersRouteThroughTheReplacementGuard(): Promise<voi
 	);
 
 	host.file = fileB;
-	host.data = "content:B";
-	assert.equal(replacement.guard.markTargetProven({
+	host.data = "content:B.md";
+	const replacementSnapshot = replacement.guard.snapshot();
+	host.requestSave = replacementSnapshot.installedRequestSave as Host["requestSave"];
+	host.save = replacementSnapshot.installedSave as Host["save"];
+	assert.equal(replacement.guard.snapshot().wrappersCurrent, true);
+	assert.equal(replacement.guard.snapshot().sourceUnload?.state, "settled");
+	assert.equal(replacement.guard.snapshot().sourceUnload?.forcedSaveObserved, true);
+	assert.equal(replacement.guard.isTargetPresentationReady({
 		handoffGeneration: 1,
 		targetFile: fileB,
-		certifiedContent: "content:B",
+		certifiedContent: "content:B.md",
 	}), true);
+	assert.equal(replacement.guard.markTargetLocallyPresented({
+		handoffGeneration: 1,
+		targetFile: fileB,
+		certifiedContent: "content:B.md",
+	}), true);
+	assert.deepEqual(replacementFacts.facts.capabilityLosses, []);
 	Reflect.apply(retiredRequestSave, other, []);
 	Reflect.apply(retiredRequestSaveRun, retiredRequestSave, []);
 	await Reflect.apply(retiredSave, other, []);
 	assert.deepEqual(
+		replacementFacts.facts.suppressed.map((entry) => entry.invocationPath),
+		["A.md", "A.md", "A.md"],
+	);
+	assert.deepEqual(
 		[bridgeRequestCount, bridgeRunCount, bridgeSaveCount],
-		[0, 0, 1],
-		"future request scheduling remains owned while direct save may use the bridge",
+		[0, 0, 0],
+		"lost save ownership synchronously suppresses every retired bridge entry",
 	);
 	assert.deepEqual(
 		[originalRequestCount, originalRunCount, originalSaveCount],
-		[0, 0, 1],
-		"request bridges cannot regain scheduler ownership after target proof",
+		[0, 0, 0],
+		"lost save ownership cannot fall through to native save",
 	);
+	assert.deepEqual(replacementFacts.facts.capabilityLosses, ["save-ownership-unavailable"]);
 	assert.equal(replacedPropertyRequestCount, 0);
 	assert.equal(replacedPropertySaveCount, 0);
 }
@@ -1874,7 +3362,11 @@ async function asyncDelegationFramesPreserveBridgeTailsAndIdentity(): Promise<vo
 	bridgeSaveCount = 0;
 	rawSaveCount = 0;
 	const loadResult = Reflect.apply(retiredLoad, makeOwnHost(), [fileB]);
-	assert.equal(loadResult, bridgeLoadPromise, "load returns the third-party bridge promise unchanged");
+	assert.notEqual(
+		loadResult,
+		bridgeLoadPromise,
+		"a managed load wraps the third-party bridge with its cancellation epoch",
+	);
 	await loadResult;
 	assert.throws(
 		() => Reflect.apply(retiredSet, makeOwnHost(), ["throw", false]),
@@ -2821,10 +4313,17 @@ function makeRetiringHost(input?: Readonly<{
 	content?: string;
 	forcedSaveGate?: Deferred<void>;
 	rejectForcedSave?: Error;
-}>): Readonly<{ host: Host; writes: PinnedHostWrite[] }> {
+}>): Readonly<{
+	host: Host;
+	writes: PinnedHostWrite[];
+	nativeLoadTargets: TFile[];
+	nativeSetEntries: Array<Readonly<{ content: string; clear: boolean }>>;
+}> {
 	const file = input?.file ?? fakeFile("A.md");
 	const content = input?.content ?? "content:A";
 	const writes: PinnedHostWrite[] = [];
+	const nativeLoadTargets: TFile[] = [];
+	const nativeSetEntries: Array<Readonly<{ content: string; clear: boolean }>> = [];
 	const host = makeOwnHost({
 		file,
 		data: content,
@@ -2833,9 +4332,14 @@ function makeRetiringHost(input?: Readonly<{
 			assert.equal(sourceFile, this.file);
 			await this.save(true);
 		},
-		onLoadFile: async function (targetFile) {
+			onLoadFile: async function (targetFile) {
+			nativeLoadTargets.push(targetFile);
 			this.file = targetFile;
 			this.setViewData(`content:${targetFile.path}`, true);
+		},
+		setViewData: function (nextContent, clear) {
+			nativeSetEntries.push({ content: nextContent, clear });
+			this.data = nextContent;
 		},
 		save: async function (clear?: boolean) {
 			const pinnedFile = this.file;
@@ -2855,13 +4359,273 @@ function makeRetiringHost(input?: Readonly<{
 		},
 	});
 	host.lastSavedData = content;
-	return { host, writes };
+	return { host, writes, nativeLoadTargets, nativeSetEntries };
+}
+
+async function localTargetPresentationRetiresOnlyExactConsumedSourceUnload(): Promise<void> {
+	const fileA = fakeFile("A.md");
+	const fileB = fakeFile("B.md");
+	const foreignFileB = fakeFile("B.md");
+
+	{
+		let guard: TextFileViewHandoffGuard | null = null;
+		const { host } = makeRetiringHost({ file: fileA });
+		const { callbacks, facts } = callbacksFor({
+			onLoad: (targetFile) => {
+				guard?.beginBlockingHandoff({
+					handoffGeneration: 1,
+					sourceLineagePath: fileA.path,
+					targetPath: targetFile.path,
+				});
+			},
+		});
+		const result = installTextFileViewHandoffGuard(host, callbacks);
+		assert.equal(result.kind, "installed");
+		if (result.kind !== "installed") return;
+		guard = result.guard;
+
+		await host.onUnloadFile(fileA);
+		await host.onLoadFile(fileB);
+		assert.equal(host.file, fileB);
+		assert.equal(host.data, "content:B.md");
+		assert.equal(host.getViewData(), "content:B.md");
+		assert.equal(facts.tickets.length, 1, "the exact B load consumes one source receipt");
+		const sourceReceiptId = required(
+			facts.tickets[0]?.sourceUnloadReceiptId,
+			"consumed source unload receipt",
+		);
+		const setEntry = required(facts.setEntries[0], "exact B local completion entry");
+		const candidate = makeHostLoadCandidate({
+			hostLoadTokenId: `host-load:${setEntry.ticket.switchIntentSeq}`,
+			ticket: setEntry.ticket,
+			view: host,
+			incomingContent: setEntry.incomingContent,
+		});
+		assert.equal(result.guard.reportHostLoadCandidate(candidate), true);
+		assert.equal(
+			result.guard.reportHostLoadCompleted(makeHostLoadReceipt(candidate)),
+			true,
+		);
+
+		const assertStillBlocking = (label: string): void => {
+			const snapshot = result.guard.snapshot();
+			assert.deepEqual(snapshot.mode, {
+				kind: "blocking-handoff",
+				handoffGeneration: 1,
+				sourceLineagePath: fileA.path,
+				targetPath: fileB.path,
+			}, label);
+			assert.equal(snapshot.sourceUnload?.receiptId, sourceReceiptId, label);
+			assert.equal(snapshot.sourceUnload?.state, "settled", label);
+			assert.equal(snapshot.sourceUnload?.forcedSaveObserved, true, label);
+		};
+
+		assert.equal(result.guard.markTargetLocallyPresented({
+			handoffGeneration: 2,
+			targetFile: fileB,
+			certifiedContent: "content:B.md",
+		}), false, "a stale generation cannot publish B locally");
+		assertStillBlocking("stale generation preserves the blocking owner and source receipt");
+
+		assert.equal(result.guard.markTargetLocallyPresented({
+			handoffGeneration: 1,
+			targetFile: foreignFileB,
+			certifiedContent: "content:B.md",
+		}), false, "a same-path foreign TFile cannot publish B locally");
+		assertStillBlocking("foreign target identity preserves the blocking owner and source receipt");
+
+		assert.equal(result.guard.markTargetLocallyPresented({
+			handoffGeneration: 1,
+			targetFile: fileB,
+			certifiedContent: "content:drifted",
+		}), false, "content drift cannot publish B locally");
+		assertStillBlocking("content drift preserves the blocking owner and source receipt");
+
+		assert.equal(result.guard.markTargetLocallyPresented({
+			handoffGeneration: 1,
+			targetFile: fileB,
+			certifiedContent: "content:B.md",
+		}), true, "the exact locally presented B retires the consumed source receipt");
+		assert.equal(result.guard.snapshot().mode.kind, "pass-through");
+		assert.equal(result.guard.snapshot().sourceUnload, null);
+	}
+
+	{
+		const forcedSaveGate = deferred<void>();
+		const { host } = makeRetiringHost({ file: fileA, forcedSaveGate });
+		const result = installTextFileViewHandoffGuard(host, callbacksFor().callbacks);
+		assert.equal(result.kind, "installed");
+		if (result.kind !== "installed") return;
+		const pendingUnload = host.onUnloadFile(fileA);
+		result.guard.beginBlockingHandoff({
+			handoffGeneration: 1,
+			sourceLineagePath: fileA.path,
+			targetPath: fileB.path,
+		});
+		assert.equal(result.guard.snapshot().sourceUnload?.state, "saving");
+		assert.equal(result.guard.markTargetLocallyPresented({
+			handoffGeneration: 1,
+			targetFile: fileB,
+			certifiedContent: "content:B.md",
+		}), false, "an unsettled source unload cannot be retired by local presentation");
+		assert.equal(result.guard.snapshot().mode.kind, "blocking-handoff");
+		assert.equal(result.guard.snapshot().sourceUnload?.state, "saving");
+		forcedSaveGate.resolve();
+		await pendingUnload;
+	}
+
+	{
+		const { host } = makeRetiringHost({ file: fileA });
+		const result = installTextFileViewHandoffGuard(host, callbacksFor().callbacks);
+		assert.equal(result.kind, "installed");
+		if (result.kind !== "installed") return;
+		await host.onUnloadFile(fileA);
+		const unconsumedReceiptId = result.guard.snapshot().sourceUnload?.receiptId;
+		assert.equal(result.guard.snapshot().sourceUnload?.state, "settled");
+		result.guard.beginBlockingHandoff({
+			handoffGeneration: 1,
+			sourceLineagePath: fileA.path,
+			targetPath: fileB.path,
+		});
+		assert.equal(result.guard.markTargetLocallyPresented({
+			handoffGeneration: 1,
+			targetFile: fileB,
+			certifiedContent: "content:B.md",
+		}), false, "an unconsumed source unload cannot be retired by local presentation");
+		assert.equal(result.guard.snapshot().mode.kind, "blocking-handoff");
+		assert.equal(result.guard.snapshot().sourceUnload?.receiptId, unconsumedReceiptId);
+		assert.equal(result.guard.snapshot().sourceUnload?.state, "settled");
+		result.guard.markInert();
+	}
+}
+
+async function managedOnLoadWrapsThirdPartyPromiseWithCancellationEpoch(): Promise<void> {
+	const fileA = fakeFile("A.md");
+	const fileB = fakeFile("B.md");
+	const thirdPartyLoad = deferred<string>();
+	let guard: TextFileViewHandoffGuard | null = null;
+	const host = makeOwnHost({
+		file: fileA,
+		data: "content:A",
+		lastSavedData: "content:A",
+		onUnloadFile: async function () {
+			await this.save(true);
+		},
+		onLoadFile: function (targetFile) {
+			this.file = targetFile;
+			this.setViewData("content:B", true);
+			return thirdPartyLoad.promise;
+		},
+	});
+	const { callbacks } = callbacksFor({
+		onLoad: (targetFile) => {
+			guard?.beginBlockingHandoff({
+				handoffGeneration: 1,
+				sourceLineagePath: fileA.path,
+				targetPath: targetFile.path,
+			});
+		},
+	});
+	const result = installTextFileViewHandoffGuard(host, callbacks);
+	assert.equal(result.kind, "installed");
+	if (result.kind !== "installed") return;
+	guard = result.guard;
+
+	await host.onUnloadFile(fileA);
+	const returnedLoad = host.onLoadFile(fileB) as unknown as Promise<string>;
+	assert.notEqual(
+		returnedLoad,
+		thirdPartyLoad.promise,
+		"the guard owns a cancellable settlement wrapper around the third-party promise",
+	);
+	thirdPartyLoad.resolve("third-party-loaded");
+	assert.equal(await returnedLoad, "third-party-loaded");
 }
 
 async function sourceUnloadReceiptGatesTargetLoadOrdering(): Promise<void> {
 	const fileA = fakeFile("A.md");
 	const fileB = fakeFile("B.md");
 	const fileC = fakeFile("C.md");
+	const sourceProofLossReason = "source-unload-proof-lost-before-host-load";
+
+	async function assertTerminalSourceProofLoad(input: Readonly<{
+		label: string;
+		guard: TextFileViewHandoffGuard;
+		pendingLoad: Promise<void>;
+		host: Host;
+		expectedFile: TFile;
+		expectedContent: string;
+		facts: CallbackFacts;
+		nativeLoadTargets: readonly TFile[];
+		nativeSetEntries: ReadonlyArray<Readonly<{ content: string; clear: boolean }>>;
+	}>): Promise<void> {
+		let outcome: "pending" | "fulfilled" | "rejected" = "pending";
+		void input.pendingLoad.then(
+			() => { outcome = "fulfilled"; },
+			() => { outcome = "rejected"; },
+		);
+		await Promise.resolve();
+		await Promise.resolve();
+		assert.equal(outcome, "pending", `${input.label}: target load remains reopen-pending`);
+		assert.equal(input.facts.tickets.length, 0, `${input.label}: no target authority ticket`);
+		assert.equal(input.nativeLoadTargets.length, 0, `${input.label}: no original target load`);
+		assert.equal(input.nativeSetEntries.length, 0, `${input.label}: no native target presentation`);
+		assert.equal(input.host.file, input.expectedFile, `${input.label}: file identity is preserved`);
+		assert.equal(input.host.data, input.expectedContent, `${input.label}: host bytes are preserved`);
+		assert.equal(
+			input.host.getViewData(),
+			input.expectedContent,
+			`${input.label}: visible bytes are preserved`,
+		);
+		const terminal = input.guard.snapshot();
+		assert.equal(terminal.hostCapabilityState, "lost", `${input.label}: host capability is lost`);
+		assert.ok(
+			(terminal.terminalHostLifecycle?.ownerId ?? 0) > 0,
+			`${input.label}: terminal snapshot exposes the reopen owner`,
+		);
+		assert.equal(
+			input.guard.cancelTerminalHostLifecycle(`test-safe-close:${input.label}`),
+			true,
+			`${input.label}: safe close cancels the exact terminal owner`,
+		);
+		await assert.rejects(
+			input.pendingLoad,
+			/KAOS terminal host lifecycle cancelled: test-safe-close:/,
+		);
+		assert.equal(outcome, "rejected", `${input.label}: safe close rejects target success`);
+		assert.equal(input.nativeLoadTargets.length, 0, `${input.label}: cancellation cannot resume B`);
+		assert.equal(input.nativeSetEntries.length, 0, `${input.label}: cancellation cannot present B`);
+		assert.equal(input.host.file, input.expectedFile, `${input.label}: cancellation preserves identity`);
+		assert.equal(input.host.getViewData(), input.expectedContent);
+		assert.equal(input.guard.snapshot().terminalHostLifecycle, null);
+		assert.equal(
+			input.guard.cancelTerminalHostLifecycle(`test-safe-close-again:${input.label}`),
+			false,
+			`${input.label}: terminal owner settles once`,
+		);
+	}
+
+	{
+		const { host, nativeLoadTargets, nativeSetEntries } = makeRetiringHost({ file: fileA });
+		const { callbacks, facts } = callbacksFor();
+		const result = installTextFileViewHandoffGuard(host, callbacks);
+		assert.equal(result.kind, "installed");
+		if (result.kind !== "installed") return;
+
+		await host.onLoadFile(fileB);
+		assert.deepEqual(
+			nativeLoadTargets,
+			[fileB],
+			"an independent load with no source-unload record preserves native pass-through",
+		);
+		assert.deepEqual(nativeSetEntries, [{ content: "content:B.md", clear: true }]);
+		assert.equal(host.file, fileB);
+		assert.equal(host.getViewData(), "content:B.md");
+		assert.equal(facts.tickets.length, 0);
+		assert.equal(result.guard.snapshot().hostCapabilityState, "ready");
+		assert.equal(result.guard.snapshot().terminalHostLifecycle, null);
+		result.guard.restoreIfCurrent();
+	}
 
 	{
 		const writes: PinnedHostWrite[] = [];
@@ -2954,7 +4718,12 @@ async function sourceUnloadReceiptGatesTargetLoadOrdering(): Promise<void> {
 
 	{
 		const forcedSaveGate = deferred<void>();
-		const { host, writes } = makeRetiringHost({ file: fileA, forcedSaveGate });
+		const {
+			host,
+			writes,
+			nativeLoadTargets,
+			nativeSetEntries,
+		} = makeRetiringHost({ file: fileA, forcedSaveGate });
 		const { callbacks, facts } = callbacksFor({
 			saveOwnershipContext: () => ({
 				sessionId: "boot-a",
@@ -3018,15 +4787,32 @@ async function sourceUnloadReceiptGatesTargetLoadOrdering(): Promise<void> {
 			"only the exact forced retirement save may run while unload is held",
 		);
 
-		await host.onLoadFile(fileB);
-		assert.equal(facts.tickets.length, 0, "load before unload settlement has no authority ticket");
+		const pendingLoad = host.onLoadFile(fileB);
+		assert.deepEqual(facts.capabilityLosses, [sourceProofLossReason]);
+		await assertTerminalSourceProofLoad({
+			label: "saving-source-unload",
+			guard: result.guard,
+			pendingLoad,
+			host,
+			expectedFile: fileA,
+			expectedContent: "",
+			facts,
+			nativeLoadTargets,
+			nativeSetEntries,
+		});
 		forcedSaveGate.resolve();
 		await pendingUnload;
 		assert.equal(facts.tickets.length, 0, "late unload settlement cannot bless an early load");
+		result.guard.restoreIfCurrent();
 	}
 
 	{
-		const { host, writes } = makeRetiringHost({ file: fileA });
+		const {
+			host,
+			writes,
+			nativeLoadTargets,
+			nativeSetEntries,
+		} = makeRetiringHost({ file: fileA });
 		const { callbacks, facts } = callbacksFor();
 		const result = installTextFileViewHandoffGuard(host, callbacks);
 		assert.equal(result.kind, "installed");
@@ -3056,8 +4842,30 @@ async function sourceUnloadReceiptGatesTargetLoadOrdering(): Promise<void> {
 		assert.equal(writes[1]?.file, fileB);
 		assert.equal(writes[1]?.content, "content:B.md");
 
-		await host.onLoadFile(fileA);
+		const pendingThirdLoad = host.onLoadFile(fileA);
+		let thirdOutcome: "pending" | "fulfilled" | "rejected" = "pending";
+		void pendingThirdLoad.then(
+			() => { thirdOutcome = "fulfilled"; },
+			() => { thirdOutcome = "rejected"; },
+		);
+		await Promise.resolve();
+		await Promise.resolve();
+		assert.equal(thirdOutcome, "pending", "a consumed non-null receipt cannot native-delegate");
 		assert.equal(facts.tickets.length, 2, "one retirement receipt authorizes one load entry only");
+		assert.deepEqual(nativeLoadTargets, [fileB, fileC]);
+		assert.equal(nativeSetEntries.length, 2);
+		assert.equal(host.file, fileC);
+		assert.equal(host.getViewData(), "content:C.md");
+		assert.ok((result.guard.snapshot().terminalHostLifecycle?.ownerId ?? 0) > 0);
+		assert.equal(result.guard.cancelTerminalHostLifecycle("test-safe-close:consumed-receipt"), true);
+		await assert.rejects(
+			pendingThirdLoad,
+			/KAOS terminal host lifecycle cancelled: test-safe-close:consumed-receipt/,
+		);
+		assert.equal(thirdOutcome, "rejected");
+		assert.deepEqual(nativeLoadTargets, [fileB, fileC]);
+		assert.equal(nativeSetEntries.length, 2);
+		result.guard.restoreIfCurrent();
 	}
 
 	{
@@ -3091,6 +4899,9 @@ async function sourceUnloadReceiptGatesTargetLoadOrdering(): Promise<void> {
 		});
 		const { callbacks, facts } = callbacksFor({
 			generation: () => generation,
+			onUnload: (sourceFile) => sourceFile === fileB
+				? Promise.reject(new Error("held-missing"))
+				: null,
 			onLoad: (targetFile) => {
 				guard?.beginBlockingHandoff({
 					handoffGeneration: generation,
@@ -3106,12 +4917,19 @@ async function sourceUnloadReceiptGatesTargetLoadOrdering(): Promise<void> {
 
 		await host.onUnloadFile(fileA);
 		const pendingB = host.onLoadFile(fileB);
+		void pendingB.catch(() => undefined);
 		assert.equal(host.file, fileB, "B file identity publishes before its target presentation");
 		await host.onUnloadFile(fileB);
+		await pendingB;
 		assert.deepEqual(
 			writes.map((write) => ({ file: write.file, content: write.content })),
 			[{ file: fileA, content: "content:A" }],
 			"unpresented B never saves the still-source-scoped host cache to B",
+		);
+		assert.deepEqual(
+			facts.unloadEntries,
+			[fileA],
+			"an unpresented B has no editor authority to drain before retirement",
 		);
 
 		generation = 2;
@@ -3133,7 +4951,6 @@ async function sourceUnloadReceiptGatesTargetLoadOrdering(): Promise<void> {
 		);
 		assert.equal(host.data, "content:C.md");
 		assert.deepEqual(facts.capabilityLosses, []);
-		void pendingB;
 	}
 
 	{
@@ -3300,6 +5117,8 @@ async function sourceUnloadReceiptGatesTargetLoadOrdering(): Promise<void> {
 	{
 		const releaseBPresentation = deferred<void>();
 		const writes: PinnedHostWrite[] = [];
+		const nativeLoadTargets: TFile[] = [];
+		let nativeSetCount = 0;
 		let generation = 1;
 		let guard: TextFileViewHandoffGuard | null = null;
 		const host = makeOwnHost({
@@ -3309,9 +5128,14 @@ async function sourceUnloadReceiptGatesTargetLoadOrdering(): Promise<void> {
 				await this.save(true);
 			},
 			onLoadFile: async function (targetFile) {
+				nativeLoadTargets.push(targetFile);
 				this.file = targetFile;
 				if (targetFile === fileB) await releaseBPresentation.promise;
 				this.setViewData(`content:${targetFile.path}`, true);
+			},
+			setViewData: function (content, _clear) {
+				nativeSetCount += 1;
+				this.data = content;
 			},
 			save: async function (clear?: boolean) {
 				writes.push({
@@ -3343,8 +5167,26 @@ async function sourceUnloadReceiptGatesTargetLoadOrdering(): Promise<void> {
 
 		await host.onUnloadFile(fileA);
 		const pendingB = host.onLoadFile(fileB);
+		void pendingB.catch(() => undefined);
 		host.data = "unproven-source-drift";
-		await host.onUnloadFile(fileB);
+		const pendingUnprovenUnload = host.onUnloadFile(fileB);
+		generation = 2;
+		let transitionSettled = false;
+		const transitionOutcome = pendingUnprovenUnload.then(
+			() => host.onLoadFile(fileC),
+		).then(
+			() => {
+				transitionSettled = true;
+				return "fulfilled" as const;
+			},
+			() => {
+				transitionSettled = true;
+				return "rejected" as const;
+			},
+		);
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
 		assert.deepEqual(
 			writes.map((write) => ({ file: write.file, content: write.content })),
 			[{ file: fileA, content: "content:A" }],
@@ -3355,30 +5197,65 @@ async function sourceUnloadReceiptGatesTargetLoadOrdering(): Promise<void> {
 			["source-unload-not-provable:unproven-target-source-lineage"],
 			"unproven rollover loses managed capability without minting source authority",
 		);
-		generation = 2;
-		await host.onLoadFile(fileC);
+		assert.equal(transitionSettled, false, "proof-lost target unload never opens C");
 		assert.deepEqual(
 			facts.tickets.map((ticket) => ticket.targetFile),
 			[fileB],
 			"proof-drifted C receives no target authority ticket",
 		);
-		void pendingB;
+		assert.deepEqual(nativeLoadTargets, [fileB], "C never reaches the original host load");
+		assert.equal(nativeSetCount, 0, "C never reaches native target presentation");
+		assert.equal(host.file, fileB);
+		assert.equal(host.getViewData(), "unproven-source-drift");
+		assert.ok((result.guard.snapshot().terminalHostLifecycle?.ownerId ?? 0) > 0);
+		assert.equal(result.guard.cancelTerminalHostLifecycle("test-safe-close:lost-capability"), true);
+		await assert.rejects(
+			pendingUnprovenUnload,
+			/KAOS terminal host lifecycle cancelled: test-safe-close:lost-capability/,
+		);
+		assert.equal(await transitionOutcome, "rejected");
+		assert.equal(transitionSettled, true);
+		assert.deepEqual(nativeLoadTargets, [fileB], "safe cancellation cannot resume C");
+		assert.equal(nativeSetCount, 0);
+		await pendingB;
 	}
 
 	{
-		const { host } = makeRetiringHost({ file: fileA });
+		const {
+			host,
+			nativeLoadTargets,
+			nativeSetEntries,
+		} = makeRetiringHost({ file: fileA });
 		const { callbacks, facts } = callbacksFor();
 		const result = installTextFileViewHandoffGuard(host, callbacks);
 		assert.equal(result.kind, "installed");
 		if (result.kind !== "installed") return;
 		await host.onUnloadFile(fileA);
-		host.data = "input-after-unload";
-		await host.onLoadFile(fileB);
-		assert.equal(facts.tickets.length, 0, "input after retirement invalidates load authority");
+		host.data = "content:A+x";
+		const pendingLoad = host.onLoadFile(fileB);
+		assert.equal(result.guard.snapshot().sourceUnload?.state, "rejected");
+		assert.deepEqual(facts.capabilityLosses, [sourceProofLossReason]);
+		await assertTerminalSourceProofLoad({
+			label: "input-after-source-unload",
+			guard: result.guard,
+			pendingLoad,
+			host,
+			expectedFile: fileA,
+			expectedContent: "content:A+x",
+			facts,
+			nativeLoadTargets,
+			nativeSetEntries,
+		});
+		result.guard.restoreIfCurrent();
 	}
 
 	{
-		const { host, writes } = makeRetiringHost({ file: fileA });
+		const {
+			host,
+			writes,
+			nativeLoadTargets,
+			nativeSetEntries,
+		} = makeRetiringHost({ file: fileA });
 		const { callbacks, facts } = callbacksFor();
 		const result = installTextFileViewHandoffGuard(host, callbacks);
 		assert.equal(result.kind, "installed");
@@ -3392,29 +5269,59 @@ async function sourceUnloadReceiptGatesTargetLoadOrdering(): Promise<void> {
 			1,
 			"receipt expiry cannot authorize an empty-cache source save",
 		);
-		await host.onLoadFile(fileB);
-		assert.equal(facts.tickets.length, 0, "an intervening task turn closes load authority");
+		const pendingLoad = host.onLoadFile(fileB);
+		assert.deepEqual(facts.capabilityLosses, [sourceProofLossReason]);
+		await assertTerminalSourceProofLoad({
+			label: "atomic-window-expired",
+			guard: result.guard,
+			pendingLoad,
+			host,
+			expectedFile: fileA,
+			expectedContent: "",
+			facts,
+			nativeLoadTargets,
+			nativeSetEntries,
+		});
+		result.guard.restoreIfCurrent();
 	}
 
 	{
 		const rejected = new Error("forced save rejected");
-		const { host } = makeRetiringHost({ file: fileA, rejectForcedSave: rejected });
+		const {
+			host,
+			nativeLoadTargets,
+			nativeSetEntries,
+		} = makeRetiringHost({ file: fileA, rejectForcedSave: rejected });
 		const { callbacks, facts } = callbacksFor();
 		const result = installTextFileViewHandoffGuard(host, callbacks);
 		assert.equal(result.kind, "installed");
 		if (result.kind !== "installed") return;
 		await assert.rejects(host.onUnloadFile(fileA), (error: unknown) => error === rejected);
 		assert.equal(result.guard.snapshot().sourceUnload?.state, "rejected");
-		await host.onLoadFile(fileB);
-		assert.equal(facts.tickets.length, 0, "rejected forced save cannot authorize target load");
+		const pendingLoad = host.onLoadFile(fileB);
+		assert.deepEqual(facts.capabilityLosses, [sourceProofLossReason]);
+		await assertTerminalSourceProofLoad({
+			label: "forced-save-rejected",
+			guard: result.guard,
+			pendingLoad,
+			host,
+			expectedFile: fileA,
+			expectedContent: "",
+			facts,
+			nativeLoadTargets,
+			nativeSetEntries,
+		});
+		result.guard.restoreIfCurrent();
 	}
 
 	{
+		let nativeUnloadCount = 0;
 		const host = makeOwnHost({
 			file: fileB,
 			data: "content:A",
 			lastSavedData: "content:A",
 			onUnloadFile: async function () {
+				nativeUnloadCount += 1;
 				await this.save(true);
 			},
 			save: async function (clear?: boolean) {
@@ -3428,12 +5335,29 @@ async function sourceUnloadReceiptGatesTargetLoadOrdering(): Promise<void> {
 		const result = installTextFileViewHandoffGuard(host, callbacks);
 		assert.equal(result.kind, "installed");
 		if (result.kind !== "installed") return;
-		await host.onUnloadFile(fileA);
+		const pendingUnload = host.onUnloadFile(fileA);
+		let unloadOutcome: "pending" | "fulfilled" | "rejected" = "pending";
+		void pendingUnload.then(
+			() => { unloadOutcome = "fulfilled"; },
+			() => { unloadOutcome = "rejected"; },
+		);
+		await Promise.resolve();
+		await Promise.resolve();
+		assert.equal(unloadOutcome, "pending");
+		assert.equal(nativeUnloadCount, 0, "file-first drift never reaches native unload");
 		assert.deepEqual(
 			facts.capabilityLosses,
-			["source-unload-not-provable:source-content-unavailable"],
-			"a host-selected target before unload entry reports the exact missing source proof",
+			["source-unload-drain-file-first"],
+			"file-first unload entry is terminal before native save or unload",
 		);
+		assert.ok((result.guard.snapshot().terminalHostLifecycle?.ownerId ?? 0) > 0);
+		assert.equal(result.guard.cancelTerminalHostLifecycle("test-safe-close:no-source-content"), true);
+		await assert.rejects(
+			pendingUnload,
+			/KAOS terminal host lifecycle cancelled: test-safe-close:no-source-content/,
+		);
+		assert.equal(unloadOutcome, "rejected");
+		result.guard.restoreIfCurrent();
 	}
 
 	{
@@ -3509,32 +5433,72 @@ async function sourceUnloadReceiptGatesTargetLoadOrdering(): Promise<void> {
 			onUnloadFile: async function () {
 				await this.save(true);
 			},
-			save: async function (clear?: boolean) {
+			save: async function (_clear?: boolean) {
 				await forcedSaveGate.promise;
-				if (clear === true) {
-					this.data = "";
-					this.lastSavedData = null;
-				}
 			},
 		});
+		const nativeLoadTargets: TFile[] = [];
+		const nativeSetEntries: Array<Readonly<{ content: string; clear: boolean }>> = [];
+		host.onLoadFile = async function (targetFile) {
+			nativeLoadTargets.push(targetFile);
+			this.file = targetFile;
+			this.setViewData(`content:${targetFile.path}`, true);
+		};
+		host.setViewData = function (content, clear) {
+			nativeSetEntries.push({ content, clear });
+			this.data = content;
+		};
 		const { callbacks, facts } = callbacksFor();
 		const result = installTextFileViewHandoffGuard(host, callbacks);
 		assert.equal(result.kind, "installed");
 		if (result.kind !== "installed") return;
 
 		const pendingUnload = host.onUnloadFile(fileA);
-		host.data = "content:A한";
+		let transitionSettled = false;
+		const attemptedTransition = pendingUnload.then(() => host.onLoadFile(fileB));
+		const transitionOutcome = attemptedTransition.then(
+			() => {
+				transitionSettled = true;
+				return "fulfilled" as const;
+			},
+			() => {
+				transitionSettled = true;
+				return "rejected" as const;
+			},
+		);
+		host.data = "content:A+x";
 		host.requestSave();
 		forcedSaveGate.resolve();
-		await pendingUnload;
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		assert.equal(transitionSettled, false, "proof-lost unload never opens its B continuation");
 		assert.equal(result.guard.snapshot().sourceUnload?.state, "rejected");
 		assert.deepEqual(
 			facts.capabilityLosses,
 			["source-unload-not-provable:source-input-observed-before-settlement"],
-			"input observed during awaited retirement cannot be hidden by a later cache clear",
+			"input observed during awaited retirement terminally blocks host continuation",
 		);
-		await host.onLoadFile(fileB);
-		assert.equal(facts.tickets.length, 0);
+		assert.ok((result.guard.snapshot().terminalHostLifecycle?.ownerId ?? 0) > 0);
+		assert.equal(host.file, fileA);
+		assert.equal(host.data, "content:A+x");
+		assert.equal(host.getViewData(), "content:A+x");
+		assert.equal(nativeLoadTargets.length, 0, "original B load stays unreachable");
+		assert.equal(nativeSetEntries.length, 0, "B presentation stays unreachable");
+		assert.equal(result.guard.cancelTerminalHostLifecycle("test-safe-close:proof-lost-unload"), true);
+		await assert.rejects(
+			pendingUnload,
+			/KAOS terminal host lifecycle cancelled: test-safe-close:proof-lost-unload/,
+		);
+		assert.equal(await transitionOutcome, "rejected");
+		assert.equal(transitionSettled, true);
+		assert.equal(nativeLoadTargets.length, 0, "safe cancellation cannot replay B");
+		assert.equal(nativeSetEntries.length, 0);
+		assert.equal(host.getViewData(), "content:A+x");
+		assert.deepEqual(facts.capabilityLosses, [
+			"source-unload-not-provable:source-input-observed-before-settlement",
+		]);
+		result.guard.restoreIfCurrent();
 	}
 
 	{
@@ -3586,11 +5550,37 @@ async function sourceUnloadReceiptGatesTargetLoadOrdering(): Promise<void> {
 				}
 			},
 		});
+		const nativeLoadTargets: TFile[] = [];
+		const nativeSetEntries: Array<Readonly<{ content: string; clear: boolean }>> = [];
+		host.onLoadFile = async function (targetFile) {
+			nativeLoadTargets.push(targetFile);
+			this.file = targetFile;
+			this.setViewData(`content:${targetFile.path}`, true);
+		};
+		host.setViewData = function (content, clear) {
+			nativeSetEntries.push({ content, clear });
+			this.data = content;
+		};
 		const { callbacks, facts } = callbacksFor();
 		const result = installTextFileViewHandoffGuard(host, callbacks);
 		assert.equal(result.kind, "installed");
 		if (result.kind !== "installed") return;
-		await host.onUnloadFile(fileA);
+		const pendingUnload = host.onUnloadFile(fileA);
+		let transitionSettled = false;
+		const transitionOutcome = pendingUnload.then(
+			() => host.onLoadFile(fileB),
+		).then(
+			() => {
+				transitionSettled = true;
+				return "fulfilled" as const;
+			},
+			() => {
+				transitionSettled = true;
+				return "rejected" as const;
+			},
+		);
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		assert.equal(transitionSettled, false);
 		assert.equal(
 			saveCount,
 			4,
@@ -3602,8 +5592,24 @@ async function sourceUnloadReceiptGatesTargetLoadOrdering(): Promise<void> {
 			"a host that never presents stable source bytes loses managed capability",
 		);
 		assert.equal(result.guard.snapshot().sourceUnload?.state, "rejected");
-		await host.onLoadFile(fileB);
-		assert.equal(facts.tickets.length, 0, "exhausted recertification authorizes no target load");
+		assert.ok((result.guard.snapshot().terminalHostLifecycle?.ownerId ?? 0) > 0);
+		assert.equal(host.file, fileA);
+		assert.equal(host.getViewData(), "content:A!!!!");
+		assert.equal(nativeLoadTargets.length, 0);
+		assert.equal(nativeSetEntries.length, 0);
+		assert.equal(result.guard.cancelTerminalHostLifecycle("test-safe-close:recertification"), true);
+		await assert.rejects(
+			pendingUnload,
+			/KAOS terminal host lifecycle cancelled: test-safe-close:recertification/,
+		);
+		assert.equal(await transitionOutcome, "rejected");
+		assert.equal(nativeLoadTargets.length, 0);
+		assert.equal(nativeSetEntries.length, 0);
+		assert.equal(host.getViewData(), "content:A!!!!");
+		assert.deepEqual(facts.capabilityLosses, [
+			"source-unload-not-provable:source-content-changed-before-settlement",
+		]);
+		result.guard.restoreIfCurrent();
 	}
 
 	{
@@ -3623,21 +5629,54 @@ async function sourceUnloadReceiptGatesTargetLoadOrdering(): Promise<void> {
 				}
 			},
 		});
+		let nativeLoadCount = 0;
+		host.onLoadFile = async function (targetFile) {
+			nativeLoadCount += 1;
+			this.file = targetFile;
+			this.setViewData(`content:${targetFile.path}`, true);
+		};
 		const { callbacks, facts } = callbacksFor();
 		const result = installTextFileViewHandoffGuard(host, callbacks);
 		assert.equal(result.kind, "installed");
 		if (result.kind !== "installed") return;
 		const pendingUnload = host.onUnloadFile(fileA);
+		let transitionSettled = false;
+		const transitionOutcome = pendingUnload.then(
+			() => host.onLoadFile(fileB),
+		).then(
+			() => {
+				transitionSettled = true;
+				return "fulfilled" as const;
+			},
+			() => {
+				transitionSettled = true;
+				return "rejected" as const;
+			},
+		);
 		host.file = fileB;
 		forcedSaveGate.resolve();
-		await pendingUnload;
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+		assert.equal(transitionSettled, false);
 		assert.deepEqual(
 			facts.capabilityLosses,
 			["source-unload-not-provable:source-selection-changed-before-settlement"],
 			"target selection during a deferred source save fails closed",
 		);
-		await host.onLoadFile(fileB);
 		assert.equal(facts.tickets.length, 0, "selection-drifted retirement authorizes no target load");
+		assert.equal(nativeLoadCount, 0);
+		assert.equal(host.file, fileB);
+		assert.equal(host.getViewData(), "");
+		assert.ok((result.guard.snapshot().terminalHostLifecycle?.ownerId ?? 0) > 0);
+		assert.equal(result.guard.cancelTerminalHostLifecycle("test-safe-close:selection-drift"), true);
+		await assert.rejects(
+			pendingUnload,
+			/KAOS terminal host lifecycle cancelled: test-safe-close:selection-drift/,
+		);
+		assert.equal(await transitionOutcome, "rejected");
+		assert.equal(nativeLoadCount, 0);
+		result.guard.restoreIfCurrent();
 	}
 
 	{
@@ -3725,6 +5764,103 @@ async function snapshotIsDefensive(): Promise<void> {
 	await pending;
 }
 
+async function emergencySaveFenceFailsClosedAcrossWrapperDrift(): Promise<void> {
+	let nativeRequestSaveCalls = 0;
+	let nativeSaveCalls = 0;
+	let driftedRequestSaveCalls = 0;
+	let driftedSaveCalls = 0;
+	const releaseOpaqueTail = deferred<void>();
+	let opaqueTail: Promise<void> | null = null;
+	const originalRequestSave = Object.assign(function (this: Host) {
+		nativeRequestSaveCalls += 1;
+		this.dirty = true;
+	}, {
+		cancel() {},
+		run() { nativeRequestSaveCalls += 1; },
+		flush() { nativeRequestSaveCalls += 1; },
+	});
+	const originalSave = async function (this: Host): Promise<void> {
+		nativeSaveCalls += 1;
+	};
+	const host = makeOwnHost({
+		requestSave: originalRequestSave,
+		save: originalSave,
+	});
+	const { callbacks } = callbacksFor();
+	const result = installTextFileViewHandoffGuard(host, callbacks);
+	assert.equal(result.kind, "installed");
+	if (result.kind !== "installed") return;
+
+	const fence = result.guard.acquireEmergencySaveFence();
+	assert.equal(fence.isCurrent(), true, "the installed guard owns the initial emergency fence");
+	assert.equal(result.guard.snapshot().emergencySaveBlocked, true);
+	assert.equal(result.guard.snapshot().wrappersCurrent, true);
+
+	host.requestSave();
+	(host.requestSave as unknown as { run(): unknown }).run();
+	(host.requestSave as unknown as { flush(): unknown }).flush();
+	await host.save(false);
+	await host.save(true);
+	assert.equal(nativeRequestSaveCalls, 0, "all request-save entry points fail closed");
+	assert.equal(nativeSaveCalls, 0, "both ordinary and forced native saves fail closed");
+
+	result.guard.markInert();
+	result.guard.restoreIfCurrent();
+	assert.equal(fence.isCurrent(), true, "inert/restore cannot release an owned emergency fence");
+	assert.equal(host.requestSave, result.guard.snapshot().installedRequestSave);
+	assert.equal(host.save, result.guard.snapshot().installedSave);
+
+	const driftedRequestSave = Object.assign(function (this: Host) {
+		driftedRequestSaveCalls += 1;
+		// A foreign wrapper can retain a native save reference and schedule work
+		// outside KAOS's delegation registry. Re-installing the visible wrapper
+		// cannot prove this already-created promise tail was cancelled.
+		opaqueTail = releaseOpaqueTail.promise.then(() => originalSave.call(this));
+	}, {
+		cancel() {},
+		run() { driftedRequestSaveCalls += 1; },
+		flush() { driftedRequestSaveCalls += 1; },
+	});
+	const driftedSave = async function (): Promise<void> {
+		driftedSaveCalls += 1;
+	};
+	host.requestSave = driftedRequestSave as Host["requestSave"];
+	host.save = driftedSave as Host["save"];
+	host.requestSave();
+	assert.equal(fence.isCurrent(), false, "wrapper identity drift is never reported protected");
+	assert.equal(result.guard.snapshot().wrappersCurrent, false);
+	assert.equal(result.guard.snapshot().emergencySaveBlocked, false);
+	assert.equal(
+		fence.refresh(),
+		false,
+		"recapturing writable wrappers cannot certify an already-scheduled foreign tail",
+	);
+	assert.equal(fence.isCurrent(), false, "observed wrapper drift permanently taints the fence");
+	assert.equal(result.guard.snapshot().wrappersCurrent, true, "future entry points are recaptured");
+	assert.equal(result.guard.snapshot().emergencySaveBlocked, true);
+	host.requestSave();
+	(host.requestSave as unknown as { run(): unknown }).run();
+	(host.requestSave as unknown as { flush(): unknown }).flush();
+	await host.save(false);
+	await host.save(true);
+	assert.equal(driftedRequestSaveCalls, 1, "the displaced wrapper ran only before recapture");
+	assert.equal(driftedSaveCalls, 0, "the displaced native save is never delegated");
+	releaseOpaqueTail.resolve();
+	await opaqueTail;
+	assert.equal(
+		nativeSaveCalls,
+		1,
+		"the opaque pre-recapture tail demonstrates why the fence must remain unprovable",
+	);
+
+	assert.equal(fence.release(), true, "the exact owner can release its fence once");
+	assert.equal(fence.release(), false, "an emergency fence cannot be released twice");
+	result.guard.markInert();
+	result.guard.restoreIfCurrent();
+	assert.equal(host.requestSave, originalRequestSave);
+	assert.equal(host.save, originalSave);
+}
+
 function saveGuardModeAliasIsModulePrivate(): void {
 	const source = readFileSync(
 		new URL("../src/sync/textFileViewHandoffGuard.ts", import.meta.url),
@@ -3746,7 +5882,11 @@ await exactHostLoadDispatchCertificateIsSynchronousAndExact();
 await ticketOrderingAndClearAssociation();
 await candidateRoutesInsideOriginalClearBoundary();
 await associatedHostLoadLifecycleRoutesExactFacts();
-await rejectedHostLoadDiscardsQueuedCompletion();
+await rejectedHostLoadCannotRetractLocalCompletion();
+await locallyPresentedPendingLoadDoesNotPoisonSupersedingLoad();
+await unauthorizedManagedClearNeverMutatesOrReopensSave();
+await repeatedOrLateManagedClearIsTerminal();
+await sameFileRefreshRequiresANewLoadEpoch();
 await rejectedNoClearLoadAllowsMultipleCleanRetries();
 await fulfilledNoClearLoadLosesCapabilityUntilTeardown();
 await unretiredOverlappingLoadsRemainAuthorityInert();
@@ -3756,6 +5896,13 @@ await overlappingLoadsFailClosed({ label: "newer generation", advanceGeneration:
 await delayedClearAfterSettlementPoisonsTheConcurrentRetryOnly();
 await loadEntryPathIsImmutableAcrossTFileRename();
 await callbackCanBlockBeforeTicketReturn();
+await sourceUnloadDrainPrecedesNativeRetirement();
+await sourceUnloadWaitsForPreexistingSaveTails();
+await sourceUnloadDrainDeadlineIsTerminal();
+await sourceUnloadDrainDriftIsTerminal();
+await deferredLoadAdmissionNeverDelegatesAnUntrackedTarget();
+await deferredAdmissionWrapperDriftIsTerminal();
+await loadWrapperDriftBlocksTargetDelegation();
 await saveCancellationSuppressionProofAndPinning();
 await ownedFutureSchedulersPreserveTheSynchronousDirtyContract();
 await thirdPartyAndInertSafety();
@@ -3765,7 +5912,10 @@ unsupportedHostsAreAtomic();
 await testedPrivateHostUsesOwnedFutureScheduler();
 await testedPublicHostUsesOwnedFutureSchedulerAndTeardownDrain();
 await retiredFlushRoutesThroughTheReplacementOwnedScheduler();
+await localTargetPresentationRetiresOnlyExactConsumedSourceUnload();
+await managedOnLoadWrapsThirdPartyPromiseWithCancellationEpoch();
 await sourceUnloadReceiptGatesTargetLoadOrdering();
+await emergencySaveFenceFailsClosedAcrossWrapperDrift();
 await snapshotIsDefensive();
 saveGuardModeAliasIsModulePrivate();
 

@@ -244,9 +244,6 @@ import type { TelemetryRuntimeHandle } from "./telemetry/installTelemetryRuntime
 import type {
 	EngineControlPort,
 	DiskIngestPort,
-	EditorHandoffReplayQaObservation,
-	HandoffRecoveryQaAcceptedState,
-	HandoffRecoveryQaFault,
 } from "./runtime/engineControlPort";
 import type { BindingPropagationGate } from "./sync/editorBinding";
 import { getOrCreateLocalDeviceIdentity } from "./sync/indexedDbCandidateStore";
@@ -260,8 +257,6 @@ import {
 	type HandoffRecoveryHydrationResult,
 } from "./sync/handoffRecoveryStore";
 import { ManualHandoffRecoveryCoordinator } from "./runtime/handoffRecoveryCoordinator";
-import { HandoffReplayCoordinator } from "./runtime/handoffReplayCoordinator";
-import { associateHandoffReplayClassificationObserverForQa } from "./runtime/handoffReplayQaObserver";
 import { exportHandoffRecoveryBody } from "./sync/handoffRecoveryExport";
 import { requestHandoffRecoveryExportPath } from "./ui/HandoffRecoveryExportModal";
 
@@ -363,18 +358,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		diskIngestSuspended: boolean;
 		pausedEditorPropagationPaths: Set<string>;
 		bindingReconfigureHook: ((path: string, deviceName: string, action: "pause" | "resume") => void) | null;
-		handoffRecoveryFault: HandoffRecoveryQaFault | null;
-		heldHandoffRecoveryPut: Readonly<{
-			operationId: string;
-			release(): void;
-		}> | null;
-		handoffRecoveryPutStartedCount: number;
-		handoffRecoveryPutSettledCount: number;
-		handoffRecoveryLastCategoricalOutcome: string | null;
-	handoffRecoveryAcceptedStateSequence: number;
-	handoffRecoveryLastAcceptedState: HandoffRecoveryQaAcceptedState | null;
-	handoffReplayLastClassification:
-		EditorHandoffReplayQaObservation["lastClassification"];
 	controlPort: EngineControlPort;
 	} | null = null;
 	/** Domain-level trace sink. Routes to lab when active, noop otherwise. */
@@ -456,7 +439,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private blobLocalDeviceIdentityStatus: LocalDeviceIdentityStatus = "unknown";
 	private handoffRecoveryStore: IndexedDbHandoffRecoveryStore | null = null;
 	private handoffRecoveryCoordinator: ManualHandoffRecoveryCoordinator | null = null;
-	private handoffReplayCoordinator: HandoffReplayCoordinator | null = null;
 	private handoffRecoveryScopeKey: string | null = null;
 	private handoffRecoveryActivationEpoch = 0;
 	private handoffRecoveryReady = false;
@@ -2915,214 +2897,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// BindingPropagationGate hooks can store into _qaState.
 		// In production this block is dead code — esbuild eliminates it entirely.
 		if (__KAOS_QA_HARNESS_ENABLED__) {
-			type MutableReplayObservation = {
-				-readonly [Key in keyof EditorHandoffReplayQaObservation]:
-					EditorHandoffReplayQaObservation[Key];
-			};
-			const replayObservation: MutableReplayObservation = {
-				phase: "none",
-				planCount: 0,
-				witnessStoredCount: 0,
-				permitConsumedCount: 0,
-				dispatchAttemptCount: 0,
-				dispatchAppliedCount: 0,
-				dispatchUncertainCount: 0,
-				dispatchReason: null,
-				dispatchScrollEpochBefore: null,
-				dispatchScrollEpochAfter: null,
-				settlementObservationCount: 0,
-				lastOutcome: null,
-				lastClassification: null,
-				selectionNonEmpty: false,
-				mappedScrollAnchor: null,
-				liveScrollAnchor: null,
-			};
-			let observedReplayController: ReconciliationController | null = null;
-			let observedRecoveryStore: IndexedDbHandoffRecoveryStore | null = null;
-			let observedEditorBindings: EditorBindingManager | null = null;
-			const observeRecoveryStatus = (status: string): void => {
-				switch (status) {
-					case "stored": replayObservation.phase = "stored"; break;
-					case "replay-pending": replayObservation.phase = "replay-pending"; break;
-					case "replayed-awaiting-settlement":
-						replayObservation.phase = "awaiting-settlement";
-						break;
-					case "needs-review": replayObservation.phase = "needs-review"; break;
-					case "resolved":
-					case "discarded": replayObservation.phase = "resolved"; break;
-				}
-			};
-			const ensureReplayObservation = (): void => {
-				const controller = this.reconciliationController as
-					| ReconciliationController
-					| undefined;
-				if (controller && observedReplayController !== controller) {
-					observedReplayController = controller;
-					const requestPlan = controller.requestExactHandoffReplayPlan.bind(controller);
-					controller.requestExactHandoffReplayPlan = async (request) => {
-						const result = await requestPlan(request);
-						replayObservation.planCount += 1;
-						replayObservation.lastOutcome = `plan:${result.kind}`;
-						if (result.kind === "planned") {
-							replayObservation.selectionNonEmpty = request.intent.selectionBefore.ranges
-								.some((range) => !range.empty);
-							replayObservation.mappedScrollAnchor = result.plan.mappedScrollAnchor;
-						}
-						return result;
-					};
-					const consumePermit = controller.consumeExactHandoffReplayPermit.bind(controller);
-					controller.consumeExactHandoffReplayPermit = (request) => {
-						const result = consumePermit(request);
-						replayObservation.lastOutcome = `permit:${result.kind}`;
-						if (result.kind === "accepted") replayObservation.permitConsumedCount += 1;
-						return result;
-					};
-					const observeSettlement = controller.observeExactHandoffReplaySettlement
-						.bind(controller);
-					controller.observeExactHandoffReplaySettlement = async (request) => {
-						const result = await observeSettlement(request);
-						if (result.kind !== "pending") replayObservation.settlementObservationCount += 1;
-						replayObservation.lastOutcome = `settlement:${result.kind}`;
-						return result;
-					};
-				}
-
-				const store = this.handoffRecoveryStore;
-				if (store && observedRecoveryStore !== store) {
-					observedRecoveryStore = store;
-					const putIntent = store.putIntent.bind(store);
-					store.putIntent = async (intent) => {
-						const result = await putIntent(intent);
-						replayObservation.selectionNonEmpty = false;
-						replayObservation.mappedScrollAnchor = null;
-						replayObservation.liveScrollAnchor = null;
-						replayObservation.lastOutcome = `put:${result.kind}`;
-						if ((result.kind === "stored" || result.kind === "existing")
-							&& isActiveHandoffRecoveryRecord(result.record)) {
-							observeRecoveryStatus(result.record.status);
-						}
-						return result;
-					};
-					const storeWitness = store.storeApplyWitness.bind(store);
-					store.storeApplyWitness = async (...args) => {
-						const result = await storeWitness(...args);
-						replayObservation.lastOutcome = `witness:${result.kind}`;
-						if (result.kind === "updated"
-							&& isActiveHandoffRecoveryRecord(result.record)
-							&& result.record.status === "replay-pending") {
-							replayObservation.witnessStoredCount += 1;
-							observeRecoveryStatus(result.record.status);
-						}
-						return result;
-					};
-					const storeReceipt = store.storeDispatchReceipt.bind(store);
-					store.storeDispatchReceipt = async (...args) => {
-						const result = await storeReceipt(...args);
-						replayObservation.lastOutcome = `receipt:${result.kind}`;
-						if ((result.kind === "updated" || result.kind === "unchanged")
-							&& isActiveHandoffRecoveryRecord(result.record)) {
-							observeRecoveryStatus(result.record.status);
-						}
-						return result;
-					};
-					const compareStatus = store.compareAndSetStatus.bind(store);
-					store.compareAndSetStatus = async (...args) => {
-						const result = await compareStatus(...args);
-						replayObservation.lastOutcome = `cas:${result.kind}`;
-						if ((result.kind === "updated" || result.kind === "unchanged")
-							&& isActiveHandoffRecoveryRecord(result.record)) {
-							observeRecoveryStatus(result.record.status);
-						}
-						return result;
-					};
-					const resolveRecord = store.resolveRecord.bind(store);
-					store.resolveRecord = async (request) => {
-						const result = await resolveRecord(request);
-						replayObservation.lastOutcome = `resolve:${result.kind}`;
-						if (result.kind === "updated" || result.kind === "unchanged") {
-							observeRecoveryStatus(result.record.status);
-						}
-						return result;
-					};
-				}
-
-				const bindings = this.editorBindings;
-				if (bindings && observedEditorBindings !== bindings) {
-					observedEditorBindings = bindings;
-					const applyReplay = bindings.applyExactHandoffReplay.bind(bindings);
-					bindings.applyExactHandoffReplay = (request) => {
-						replayObservation.dispatchAttemptCount += 1;
-						replayObservation.dispatchScrollEpochBefore =
-							request.plan.expectedTargetScrollEpoch;
-						const result = applyReplay(request);
-						replayObservation.lastOutcome = `dispatch:${result.kind}`;
-						replayObservation.dispatchReason = "reason" in result
-							? result.reason
-							: null;
-						try {
-							const liveBindings = Reflect.get(bindings, "bindings") as Map<
-								string,
-								Readonly<{
-									path: string;
-									cm: { scrollSnapshot(): { value: { range: { head: number } } } };
-								}>
-							>;
-							const targetBindings = Array.from(liveBindings.values()).filter(
-								(binding) => binding.path === request.record.targetPath,
-							);
-							if (targetBindings.length === 1) {
-								const liveRuntimes = Reflect.get(bindings, "managedSessions") as Map<
-									string,
-									Readonly<{ cmGuard?: { snapshot(): { view: unknown; scrollEpoch: number } } }>
-								>;
-								const targetCm = targetBindings[0]?.cm;
-								const targetRuntime = Array.from(liveRuntimes.values()).find(
-									(runtime) => runtime.cmGuard?.snapshot().view === targetCm,
-								);
-								replayObservation.dispatchScrollEpochAfter =
-									targetRuntime?.cmGuard?.snapshot().scrollEpoch ?? null;
-								replayObservation.liveScrollAnchor =
-									targetBindings[0]?.cm.scrollSnapshot().value.range.head ?? null;
-							}
-						} catch {
-							replayObservation.liveScrollAnchor = null;
-						}
-						if (result.kind === "applied") {
-							replayObservation.dispatchAppliedCount += 1;
-							replayObservation.liveScrollAnchor = result.postcondition.scrollAnchor;
-						} else if (result.kind === "dispatched-uncertain") {
-							replayObservation.dispatchUncertainCount += 1;
-						}
-						return result;
-					};
-				}
-			};
 			const contentFreeSnapshot = () => {
 				if (!this.editorBindings) throw new Error("EditorBindingManager not ready");
-				ensureReplayObservation();
-				return Object.freeze({
-					...getEditorHandoffQaDebugSnapshot(this.editorBindings),
-					qaReplayObservation: Object.freeze({
-						...replayObservation,
-						lastClassification:
-							this._qaState?.handoffReplayLastClassification ?? null,
-					}),
-				});
+				return getEditorHandoffQaDebugSnapshot(this.editorBindings);
 			};
 			this._qaState = {
 				diskIngestPort: null,
-				diskIngestSuspended: false,
-				pausedEditorPropagationPaths: new Set(),
-				bindingReconfigureHook: null,
-				handoffRecoveryFault: null,
-				heldHandoffRecoveryPut: null,
-				handoffRecoveryPutStartedCount: 0,
-				handoffRecoveryPutSettledCount: 0,
-				handoffRecoveryLastCategoricalOutcome: null,
-				handoffRecoveryAcceptedStateSequence: 0,
-				handoffRecoveryLastAcceptedState: null,
-				handoffReplayLastClassification: null,
-				controlPort: {
+					diskIngestSuspended: false,
+					pausedEditorPropagationPaths: new Set(),
+					bindingReconfigureHook: null,
+					controlPort: {
 					setEditorHandoffHostApiVersionOverride: (version) => {
 						setEditorHandoffHostApiVersionOverrideForQa(version);
 					},
@@ -3166,137 +2950,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						if (!this.editorBindings) throw new Error("EditorBindingManager not ready");
 						releaseHeldEditorNativeSaveForQa(this.editorBindings);
 					},
-					getEditorHandoffDebugSnapshot: contentFreeSnapshot,
-					getContentFreeSnapshot: contentFreeSnapshot,
-					__qaOnlyArmHandoffRecoveryFaultUnsafe: (fault) => {
-						const state = this._qaState;
-						if (!state) throw new Error("QA state not initialised");
-						if (!fault || typeof fault !== "object") {
-							throw new Error("Choose a valid handoff Recovery QA fault");
-						}
-						const keys = Object.keys(fault).sort().join(",");
-						switch (fault.kind) {
-							case "fail-next-put":
-								if (
-									keys !== "kind,reason"
-									|| (fault.reason !== "quota-exceeded"
-										&& fault.reason !== "indexeddb-blocked")
-								) throw new Error("Choose a valid fail-next-put reason");
-								break;
-							case "hold-next-post-verify-put":
-								if (
-									keys !== "kind,operationId"
-									|| typeof fault.operationId !== "string"
-									|| fault.operationId.length === 0
-									|| fault.operationId.length > 128
-								) throw new Error("Choose a valid held-put operation ID");
-								break;
-							case "fail-next-copy":
-								if (keys !== "kind,reason" || fault.reason !== "clipboard-rejected") {
-									throw new Error("Choose a valid fail-next-copy reason");
-								}
-								break;
-							default:
-								throw new Error("Unknown handoff Recovery QA fault");
-						}
-						if (state.handoffRecoveryFault) {
-							throw new Error("A handoff Recovery fault is already armed");
-						}
-						if (
-							state.heldHandoffRecoveryPut
-							&& fault.kind !== "fail-next-copy"
-						) {
-							throw new Error("A handoff Recovery put is already held");
-						}
-						state.handoffRecoveryFault = Object.freeze({ ...fault });
-						state.handoffRecoveryLastCategoricalOutcome = `armed:${fault.kind}`;
+						getEditorHandoffDebugSnapshot: contentFreeSnapshot,
+						getContentFreeSnapshot: contentFreeSnapshot,
 					},
-					__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe: (operationId) => {
-						const state = this._qaState;
-						const held = state?.heldHandoffRecoveryPut;
-						if (!state || !held || held.operationId !== operationId) {
-							throw new Error("No matching handoff Recovery put is held");
-						}
-						state.heldHandoffRecoveryPut = null;
-						state.handoffRecoveryPutSettledCount += 1;
-						state.handoffRecoveryLastCategoricalOutcome = "put-released-post-verify";
-						held.release();
-					},
-					getHandoffRecoveryQaSnapshot: () => {
-						const state = this._qaState;
-						if (!state) throw new Error("QA state not initialised");
-						return Object.freeze({
-							armedFault: state.handoffRecoveryFault?.kind ?? null,
-							heldOperationId: state.heldHandoffRecoveryPut?.operationId ?? null,
-							putStartedCount: state.handoffRecoveryPutStartedCount,
-							putSettledCount: state.handoffRecoveryPutSettledCount,
-							lastCategoricalOutcome:
-								state.handoffRecoveryLastCategoricalOutcome,
-							lastAcceptedState: state.handoffRecoveryLastAcceptedState
-								? Object.freeze({ ...state.handoffRecoveryLastAcceptedState })
-								: null,
-						});
-					},
-					getHandoffRecoveryQaManualRows: async () => {
-						const state = this._qaState;
-						if (!state) throw new Error("QA state not initialised");
-						const coordinator = this.handoffRecoveryCoordinator;
-						const scopeKey = this.handoffRecoveryScopeKey;
-						if (!this.handoffRecoveryReady || !coordinator || !scopeKey) {
-							return Object.freeze([]);
-						}
-						const dashboard = await coordinator.collectDashboardHandoffRecovery();
-						if (
-							this.handoffRecoveryCoordinator !== coordinator
-							|| this.handoffRecoveryScopeKey !== scopeKey
-						) throw new Error("Handoff Recovery scope changed during QA row read");
-						return Object.freeze(dashboard.items.map((item) => Object.freeze({
-							recordId: item.recordId,
-							intentId: item.intentId,
-							fromPath: item.fromPath,
-							targetPath: item.targetPath,
-							status: item.status,
-							startContentHash: item.startContentHash,
-							afterContentHash: item.afterContentHash,
-							startLength: item.startLength,
-							afterLength: item.afterLength,
-						})));
-					},
-					getHandoffRecoveryQaInventory: async () => {
-						const coordinator = this.handoffRecoveryCoordinator;
-						const scopeKey = this.handoffRecoveryScopeKey;
-						if (!this.handoffRecoveryReady || !coordinator || !scopeKey) {
-							return Object.freeze({ active: Object.freeze([]), terminal: Object.freeze([]) });
-						}
-						const hydration = await coordinator.hydrateScope();
-						if (
-							this.handoffRecoveryCoordinator !== coordinator
-							|| this.handoffRecoveryScopeKey !== scopeKey
-						) throw new Error("Handoff Recovery scope changed during QA inventory read");
-						const project = (
-							record: (typeof hydration.active)[number] | (typeof hydration.terminal)[number],
-						) => Object.freeze({
-							recordId: record.recordId,
-							intentId: record.intentId,
-							intentEnvelopeHash: record.intentEnvelopeHash,
-							fromPath: record.fromPath,
-							targetPath: record.targetPath,
-							status: record.status,
-							disposition: "disposition" in record ? record.disposition : null,
-							startContentHash: record.startContentHash,
-							afterContentHash: record.afterContentHash,
-						});
-						const byIdentity = <T extends Readonly<{ recordId: string; status: string }>>(
-							left: T,
-							right: T,
-						): number => left.recordId.localeCompare(right.recordId)
-							|| left.status.localeCompare(right.status);
-						return Object.freeze({
-							active: Object.freeze(hydration.active.map(project).sort(byIdentity)),
-							terminal: Object.freeze(hydration.terminal.map(project).sort(byIdentity)),
-						});
-					},
-				},
 			};
 			// Attach the accessor as an instance property so the method name
 			// never appears on the class prototype in production bundles.
@@ -3875,27 +3531,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.editorWorkspace?.onOpenPathAdmissionWake(request.targetPath);
 				},
 				this.reconciliationController,
-				this.handoffRecoveryCoordinator,
 				{
-					writeClipboard: async (text) => {
-						if (__KAOS_QA_HARNESS_ENABLED__ && this._qaState) {
-							const fault = this._qaState.handoffRecoveryFault;
-							if (fault?.kind === "fail-next-copy") {
-								this._qaState.handoffRecoveryFault = null;
-								this._qaState.handoffRecoveryLastCategoricalOutcome =
-									"clipboard-rejected";
-								throw new Error("clipboard-rejected");
-							}
-						}
-						if (!navigator.clipboard?.writeText) {
-							throw new Error("Clipboard is unavailable");
-						}
-						await navigator.clipboard.writeText(text);
-						if (__KAOS_QA_HARNESS_ENABLED__ && this._qaState) {
-							this._qaState.handoffRecoveryLastCategoricalOutcome =
-								"clipboard-written";
-						}
-					},
 					chooseVerifiedExporter: async () => {
 						const path = await requestHandoffRecoveryExportPath(
 							this.app,
@@ -3906,37 +3542,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 							await exportHandoffRecoveryBody(this.app, path, content);
 						};
 					},
-					confirmDiscard: () => new Promise<boolean>((resolve) => {
-						new ConfirmModal(
-							this.app,
-							"Discard handoff Recovery",
-							"Discard this interrupted input without applying it? This cannot be undone.",
-							() => resolve(true),
-							"Discard",
-							"Cancel",
-							() => resolve(false),
-						).open();
-					}),
-					...(__KAOS_QA_HARNESS_ENABLED__ ? {
-						observeAcceptedIntentState: (observation) => {
-							const state = this._qaState;
-							if (!state) return;
-							state.handoffRecoveryAcceptedStateSequence += 1;
-							state.handoffRecoveryLastAcceptedState = Object.freeze({
-								...observation,
-								sequence: state.handoffRecoveryAcceptedStateSequence,
-							});
-						},
-					} : {}),
 				},
-				(token) => this.handoffReplayCoordinator?.notifyTargetReady(token),
-				(path) =>
-					this.handoffReplayCoordinator?.notifySettlementMayHaveAdvanced(path),
-				(token) =>
-					this.handoffReplayCoordinator?.notifyTargetPresentationReady(token),
 			);
-			// Settings are applied before the editor manager exists on cold start.
-			// Retry the same scope now that both runtime ports can be constructed.
+			// Settings may have been applied before local identity was ready.
+			// Retry the same manual Recovery scope after editor startup.
 			this.rotateHandoffRecoveryScope("editor-bindings-ready");
 			if (__KAOS_QA_HARNESS_ENABLED__) {
 				installEditorHandoffHostQaBarrier(this.editorBindings);
@@ -5039,12 +4648,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private async teardownSync(): Promise<void> {
 		const editorSaveDrain = this.editorBindings?.beginOwnedSaveDrainForTeardown();
 		this.reconciliationController.revokeAsyncAuthority();
-		const replayDrain = this.handoffReplayCoordinator;
-		replayDrain?.invalidateForRecoveryClear();
 		this.editorBindings?.revokeAsyncAuthority();
 		this.log("teardownSync: tearing down all sync state");
 		await editorSaveDrain;
-		await replayDrain?.drainAndDemoteForRecoveryClear();
 
 		// Safe teardown ordering for disk index baseline persistence:
 		//   1. Flush all pending disk writes (callbacks fire, hashes recorded in memory)
@@ -5075,7 +4681,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.editorBindings = null;
 		this.handoffRecoveryStore = null;
 		this.handoffRecoveryCoordinator = null;
-		this.handoffReplayCoordinator = null;
 		this.handoffRecoveryReady = false;
 		this.diskMirror = null;
 		this.externalDiskMutationSequence = 0;
@@ -6796,16 +6401,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			requestedScopeKey === this.handoffRecoveryScopeKey
 			&& (
 				(requestedScopeKey !== null
-					&& this.handoffRecoveryCoordinator !== null
-					&& this.handoffReplayCoordinator !== null)
+					&& this.handoffRecoveryCoordinator !== null)
 				|| this.handoffRecoveryOperationalError === "identity-unavailable"
 			)
 		) return;
 		const activationEpoch = ++this.handoffRecoveryActivationEpoch;
 		this.handoffRecoveryReady = false;
 		this.handoffRecoveryScopeKey = requestedScopeKey;
-		this.handoffReplayCoordinator?.invalidateForRecoveryClear();
-		this.editorBindings?.replaceHandoffRecoveryPort(null, activationEpoch);
 		void this.initializeHandoffRecovery(activationEpoch, requestedScopeKey, reason);
 	}
 
@@ -6821,11 +6423,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			|| requestedScopeKey !== this.handoffRecoveryScopeKey
 		) return;
 		const previous = this.handoffRecoveryCoordinator;
-		const previousReplay = this.handoffReplayCoordinator;
 		if (!vaultId || !localDeviceId) {
 			this.handoffRecoveryStore = null;
 			this.handoffRecoveryCoordinator = null;
-			this.handoffReplayCoordinator = null;
 			this.handoffRecoveryReady = false;
 			this.handoffRecoveryScopeKey = null;
 			this.handoffRecoveryOperationalError = "identity-unavailable";
@@ -6836,7 +6436,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				issues: [],
 				totalBytes: 0,
 			};
-			void previousReplay?.drainAndDemoteForRecoveryClear().catch(() => undefined);
 			void previous?.drain().catch(() => undefined);
 			return;
 		}
@@ -6847,101 +6446,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		};
 		const scopeKey = buildHandoffRecoveryScopeKey(scope);
 		if (scopeKey !== requestedScopeKey) return;
-		const store = __KAOS_QA_HARNESS_ENABLED__
-			? new IndexedDbHandoffRecoveryStore(
-				scope,
-				undefined,
-				undefined,
-				() => Date.now(),
-				{
-					beforePutBeforeStorage: async () => {
-						const state = this._qaState;
-						if (!state) return;
-						state.handoffRecoveryPutStartedCount += 1;
-						state.handoffRecoveryLastCategoricalOutcome = "put-started";
-						const fault = state.handoffRecoveryFault;
-						if (fault?.kind !== "fail-next-put") return;
-						state.handoffRecoveryFault = null;
-						state.handoffRecoveryPutSettledCount += 1;
-						state.handoffRecoveryLastCategoricalOutcome = fault.reason;
-						if (fault.reason === "quota-exceeded") {
-							throw new DOMException("quota-exceeded", "QuotaExceededError");
-						}
-						throw new Error("indexeddb-blocked");
-					},
-					afterVerifiedPutBeforeFence: async () => {
-						const state = this._qaState;
-						if (!state) return;
-						const fault = state.handoffRecoveryFault;
-						if (fault?.kind !== "hold-next-post-verify-put") {
-							state.handoffRecoveryPutSettledCount += 1;
-							state.handoffRecoveryLastCategoricalOutcome = "put-verified";
-							return;
-						}
-						state.handoffRecoveryFault = null;
-						state.handoffRecoveryLastCategoricalOutcome =
-							"put-held-post-verify";
-						await new Promise<void>((release) => {
-							state.heldHandoffRecoveryPut = Object.freeze({
-								operationId: fault.operationId,
-								release,
-							});
-						});
-					},
-				},
-			)
-			: new IndexedDbHandoffRecoveryStore(scope);
-		if (!this.editorBindings) {
-			void previousReplay?.drainAndDemoteForRecoveryClear().catch(() => undefined);
-			void previous?.drain().catch(() => undefined);
-			return;
-		}
-		const replayCoordinator = new HandoffReplayCoordinator({
-			store,
-			controller: this.reconciliationController,
-			editorBindings: this.editorBindings,
-			isScopeCurrent: () =>
-				activationEpoch === this.handoffRecoveryActivationEpoch
-				&& scopeKey === this.handoffRecoveryScopeKey,
-		});
-		if (__KAOS_QA_HARNESS_ENABLED__) {
-			if (this._qaState) this._qaState.handoffReplayLastClassification = null;
-			associateHandoffReplayClassificationObserverForQa(
-				replayCoordinator,
-				(observation) => {
-					if (!this._qaState) return;
-					this._qaState.handoffReplayLastClassification = observation;
-				},
-			);
-		}
+		const store = new IndexedDbHandoffRecoveryStore(scope);
 		const coordinator = new ManualHandoffRecoveryCoordinator({
 			store,
 			isScopeCurrent: () =>
 				activationEpoch === this.handoffRecoveryActivationEpoch
 				&& scopeKey === this.handoffRecoveryScopeKey,
-			classifyStoredIntent: replayCoordinator.classifyStoredIntent,
-			observeAwaitingSettlement:
-				replayCoordinator.observeHydratedAwaitingSettlement,
-			replayActions: {
-				continueWithoutAutomaticApply: (request, recordId, isActionCurrent) =>
-					replayCoordinator.continueWithoutAutomaticApply(
-						request,
-						recordId,
-						isActionCurrent,
-					),
-				retrySettlement: (recordId) =>
-					replayCoordinator.retrySettlement(recordId),
-			},
-			clearHooks: {
-				invalidateReplayAuthorityBeforeClear: () =>
-					replayCoordinator.invalidateForRecoveryClear(),
-				drainAndDemoteReplayRowsBeforeClear: () =>
-					replayCoordinator.drainAndDemoteForRecoveryClear(),
-			},
 		});
 		this.handoffRecoveryStore = store;
 		this.handoffRecoveryCoordinator = coordinator;
-		this.handoffReplayCoordinator = replayCoordinator;
 		try {
 			const hydration = await coordinator.hydrateScope();
 			if (
@@ -6951,15 +6464,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.handoffRecoveryHydration = hydration;
 			this.handoffRecoveryOperationalError = null;
 			this.handoffRecoveryReady = true;
-			this.editorBindings?.replaceHandoffRecoveryPort(coordinator, activationEpoch);
 		} catch {
 			if (activationEpoch !== this.handoffRecoveryActivationEpoch) return;
 			this.handoffRecoveryOperationalError = "indexeddb-unavailable";
 			this.handoffRecoveryReady = false;
-			// Keep the coordinator attached even when open/hydration fails. Its
-			// precommit Copy/Export/Discard lane is deliberately storage-free, so a
-			// failed IndexedDB cannot turn the visible Recovery gate into a dead end.
-			this.editorBindings?.replaceHandoffRecoveryPort(coordinator, activationEpoch);
+			// Recovery remains unavailable rather than applying unverified editor data.
 			this.handoffRecoveryHydration = {
 				status: "missing",
 				active: [],
@@ -6973,7 +6482,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				activationEpoch,
 				current: activationEpoch === this.handoffRecoveryActivationEpoch,
 			});
-			void previousReplay?.drainAndDemoteForRecoveryClear().catch(() => undefined);
 			void previous?.drain().catch(() => undefined);
 		}
 	}

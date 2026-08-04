@@ -24,6 +24,7 @@ import { normalizeEditorText } from "../src/utils/editorTextNormalization";
 import {
 	reduceManagedLeafSession,
 	reserveManagedLeafInputStart,
+	type ManagedLeafInputStartReservation,
 	type ManagedLeafSession,
 	type PendingHostLoadCandidate,
 } from "../src/sync/editorHandoffState";
@@ -126,6 +127,9 @@ function clearPendingHealthChecks(manager: unknown): void {
 		clearTimeout(timer);
 	}
 	pendingUnmanage?.clear();
+	(manager as { unmanageRetryAttempts?: Map<string, number> })
+		.unmanageRetryAttempts?.clear();
+
 }
 
 function captureSingleMicrotask(action: () => void): () => void {
@@ -191,15 +195,38 @@ function installManagedBoundaryStubs(
 	let hostMode: { kind: string; [key: string]: unknown } = { kind: "pass-through" };
 	let cmInert = false;
 	let gateClosed = false;
+	let targetSelectionFence: object | null = null;
+	let sourceUnloadDrain: Readonly<{
+		ownerId: string;
+		reservation: ManagedLeafInputStartReservation;
+	}> | null = null;
+	let emergencySaveBlocked = false;
+	const emergencySaveFence = {
+		view,
+		refresh: () => emergencySaveBlocked,
+		isCurrent: () => emergencySaveBlocked,
+		release: () => {
+			if (!emergencySaveBlocked) return false;
+			emergencySaveBlocked = false;
+			return true;
+		},
+	};
 	runtime.hostGuard = {
 		beginBlockingHandoff: (input: Record<string, unknown>) => {
 			hostMode = { kind: "blocking-handoff", ...input };
 		},
+		isTargetPresentationReady: () => true,
 		markTargetProven: () => true,
+		markTargetLocallyPresented: () => true,
 		reportHostLoadCandidate: () => true,
 		reportHostLoadCompleted: () => true,
 		flushOwnedSave: () => Promise.resolve(),
 		cancelOwnedSave: () => {},
+		cancelTerminalHostLifecycle: () => true,
+		acquireEmergencySaveFence: () => {
+			emergencySaveBlocked = true;
+			return emergencySaveFence;
+		},
 		markInert: () => { hostMode = { kind: "inert-pass-through" }; },
 		restoreIfCurrent: () => { hostMode = { kind: "inert-pass-through" }; },
 		snapshot: () => ({
@@ -208,15 +235,81 @@ function installManagedBoundaryStubs(
 			hostCapability: "public-cancellable",
 			hostCapabilityState: "ready",
 			saveEpoch: 0,
+			pendingLoadEpoch: 0,
+			nativeLoadEpoch: 0,
+			pendingNativeHostLoadCount: 0,
+			nativeHostLoadAmbiguous: false,
+			managedClearTombstoneEpoch: 0,
+			managedClearTombstoneActive: false,
 			clearLoadCapability: "observable",
+			wrappersCurrent: true,
+			loadWrappersCurrent: true,
+			emergencySaveBlocked,
 			mode: hostMode,
 			inFlight: new Map(),
 			pendingTargetSave: false,
 			pendingOwnedSave: null,
 			sourceUnload: null,
+			pendingDeferredLoadAdmission: null,
+			pendingSourceUnloadDrain: null,
 		}),
 	};
 	runtime.cmGuard = {
+		beginSourceUnloadDrain: (
+			ownerId: string,
+			reservation: ManagedLeafInputStartReservation,
+		) => {
+			if (cmInert || gateClosed || sourceUnloadDrain !== null) return false;
+			sourceUnloadDrain = { ownerId, reservation };
+			return true;
+		},
+		isSourceUnloadDrainCurrent: (
+			ownerId: string,
+			reservation: ManagedLeafInputStartReservation,
+		) => sourceUnloadDrain?.ownerId === ownerId
+			&& sourceUnloadDrain.reservation === reservation,
+		prepareTargetSelectionFence: (
+			ownerId: string,
+			drainedReservation?: ManagedLeafInputStartReservation,
+		) => {
+			if (drainedReservation !== undefined) {
+				if (
+					sourceUnloadDrain?.ownerId !== ownerId
+					|| sourceUnloadDrain.reservation !== drainedReservation
+				) return null;
+				sourceUnloadDrain = null;
+			} else if (sourceUnloadDrain !== null) {
+				return null;
+			}
+			gateClosed = true;
+			targetSelectionFence = { ownerId };
+			return targetSelectionFence;
+		},
+		forceTargetSelectionFenceForTerminal: (ownerId: string) => {
+			sourceUnloadDrain = null;
+			gateClosed = true;
+			targetSelectionFence = { ownerId };
+			return targetSelectionFence;
+		},
+		isTargetSelectionFenceCurrent: (token: object) => targetSelectionFence === token,
+		transferTargetSelectionFence: (token: object) => {
+			if (targetSelectionFence !== token) return false;
+			targetSelectionFence = null;
+			gateClosed = true;
+			return true;
+		},
+		releaseTargetSelectionFence: (token: object) => {
+			if (targetSelectionFence !== token) return false;
+			targetSelectionFence = null;
+			gateClosed = false;
+			return true;
+		},
+		releaseTargetSelectionFenceForTeardown: (token: object) => {
+			if (targetSelectionFence !== token) return false;
+			targetSelectionFence = null;
+			gateClosed = false;
+			return true;
+		},
 		refreshGate: () => {
 			gateClosed = manager.getManagedSession(view as never)?.handoff !== null;
 			return true;
@@ -226,17 +319,30 @@ function installManagedBoundaryStubs(
 			gateClosed = false;
 			return true;
 		},
+		markDetachedInertForTeardown: () => {
+			cmInert = true;
+			sourceUnloadDrain = null;
+			targetSelectionFence = null;
+			return true;
+		},
 		restoreIfCurrent: () => {
 			cmInert = true;
 			gateClosed = false;
 			return true;
 		},
-		snapshot: () => ({
+			snapshot: () => ({
 			view: cm,
 			inert: cmInert,
 			gateClosed,
+			sourceUnloadDrain,
+			targetSelectionFence,
+			inputEpoch: 0,
+			compositionEpoch: 0,
+			nativeHistoryEpoch: 0,
 			selectionEpoch: 0,
 			scrollEpoch: 0,
+			activeComposition: null,
+			lastComposition: null,
 			gateFailureReason: null,
 			commitState: "none",
 			pendingHostLoadCandidate: null,
@@ -254,6 +360,7 @@ function buildManagerFixture(options: {
 	onExternalDiskReloadIntercepted?: (
 		candidate: InterceptedExternalDiskMutation,
 	) => void;
+	handoffRecoveryActionHost?: unknown;
 }) {
 	const flightEvents: Array<{ kind: string; data?: Record<string, unknown> }> = [];
 	const traceRecords: Array<{
@@ -339,6 +446,8 @@ function buildManagerFixture(options: {
 		},
 		options.externalReloadGuardEnabled,
 		options.onOpenPathAdmissionRequested,
+		undefined,
+		options.handoffRecoveryActionHost as never,
 	);
 	const binding = {
 		view,
@@ -437,7 +546,7 @@ console.log("\n--- Test 0: editor binding boot IDs require cryptographic uniquen
 
 console.log("\n--- Test 1: recent editor activity defers unhealthy binding repair ---");
 {
-	const { manager, binding } = buildManagerFixture({
+	const { manager, binding, traceRecords } = buildManagerFixture({
 		lastEditorChangeAgeMs: 100,
 		lastEditorDocChangeAgeMs: 100,
 	});
@@ -4528,8 +4637,8 @@ console.log("\n--- Test 25: stale path bindings detach before user input propaga
 	assertEq(result !== null, true, "stale binding adds a same-transaction detach effect");
 	assertEq(
 		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has("leaf-1"),
-		false,
-		"stale path binding is removed before the editor update phase",
+		true,
+		"unprovable stale source binding remains owned behind the terminal editor boundary",
 	);
 	await Promise.resolve();
 	clearPendingHealthChecks(manager);
@@ -4748,11 +4857,17 @@ console.log("\n--- Test 29: rapid same-leaf switch gates the replacement without
 
 	manager.bind(binding.view as never, "TestDevice");
 
-	const rebound = (manager as unknown as {
+	const internals = manager as unknown as {
 		bindings: Map<string, { path: string; cm: unknown; settleWindowMs: number }>;
-	}).bindings.get("leaf-1");
-	assertEq(rebound, undefined, "rapid switch remains detached until a presentation receipt");
-	assertEq(oldDispatches, 1, "old CM is detached exactly once");
+		managedSessions: Map<string, {
+			transitionInputFence: { state: string; targetFile: unknown } | null;
+			emergencySaveFence: { isCurrent(): boolean } | null;
+		}>;
+	};
+	const rebound = internals.bindings.get("leaf-1");
+	const terminalRuntime = internals.managedSessions.get("leaf-1");
+	assertEq(rebound, binding, "unprovable replaced source binding remains owned until pane reopen");
+	assertEq(oldDispatches, 0, "terminal classification never reconfigures the unproven old CM");
 	assertEq(replacementTransactions.length, 0, "unproven replacement CM is not configured");
 	assertEq(replacementState.selection.main.anchor, 1100, "selection anchor survives binding reconfigure");
 	assertEq(replacementState.selection.main.head, 1125, "selection head survives binding reconfigure");
@@ -4765,7 +4880,23 @@ console.log("\n--- Test 29: rapid same-leaf switch gates the replacement without
 		binding.path,
 		"rapid switch keeps A as displayed lineage",
 	);
-	assertEq(session?.handoff?.targetFile, nextFile, "rapid switch keeps the exact B target identity");
+	assertEq(session?.handoff, null, "file-first replacement mints no automatic handoff");
+	assertEq(
+		terminalRuntime?.transitionInputFence?.state,
+		"reopen-required",
+		"file-first replacement retains a terminal input fence",
+	);
+	assertEq(
+		terminalRuntime?.transitionInputFence?.targetFile,
+		nextFile,
+		"terminal input fence retains the exact observed B identity",
+	);
+	assertEq(
+		terminalRuntime?.emergencySaveFence?.isCurrent(),
+		true,
+		"file-first replacement retains the emergency native-save fence",
+	);
+	manager.reconcileManagedWorkspaceViews([], "test-29-close");
 	nextDoc.destroy();
 	clearPendingHealthChecks(manager);
 }
@@ -4884,6 +5015,7 @@ async function exerciseMissingTargetEntry(entry: MissingTargetEntry): Promise<vo
 		getManagedSession?: (managedView: unknown) => {
 			displayedLineage: { kind: string; path?: string; file?: unknown };
 			generation: number;
+			handoff: unknown;
 		} | null;
 		getBinding?: (managedView: unknown) => unknown;
 		beginPathHandoff?: (managedView: unknown, target: unknown, reason: string) => boolean;
@@ -4898,7 +5030,16 @@ async function exerciseMissingTargetEntry(entry: MissingTargetEntry): Promise<vo
 		fenceStaleUserBinding: (transaction: unknown) => unknown;
 		maybeHealBinding: (leafId: string, candidate: unknown, source: string) => void;
 		unmanageView?: (managedView: unknown, reason: string) => void;
-		managedSessions: Map<string, { cmGuard: unknown }>;
+		managedSessions: Map<string, {
+			cmGuard: { snapshot(): Readonly<{ gateClosed: boolean }> } | null;
+			emergencySaveFence: { isCurrent(): boolean } | null;
+			transitionInputFence: {
+				state: string;
+				targetFile: unknown;
+				targetPath: string;
+			} | null;
+			capturedSourceAuthority: { kind: string; reason?: string } | null;
+		}>;
 	};
 	runtime.bindings.set(leaf.id, binding);
 	runtime.knownCmViews.add(cm);
@@ -4916,9 +5057,95 @@ async function exerciseMissingTargetEntry(entry: MissingTargetEntry): Promise<vo
 	runtime.manageView(view);
 	const managedRuntime = runtime.managedSessions.get(leaf.id);
 	if (!managedRuntime) throw new Error(`Expected managed runtime for ${entry}`);
+	let hostMode: { kind: string; [key: string]: unknown } = { kind: "pass-through" };
+	let emergencySaveBlocked = false;
+	const emergencySaveFence = {
+		view,
+		refresh: () => emergencySaveBlocked,
+		isCurrent: () => emergencySaveBlocked,
+		release: () => {
+			if (!emergencySaveBlocked) return false;
+			emergencySaveBlocked = false;
+			return true;
+		},
+	};
+	(managedRuntime as unknown as { hostGuard: unknown }).hostGuard = {
+		beginBlockingHandoff: (input: Record<string, unknown>) => {
+			hostMode = { kind: "blocking-handoff", ...input };
+		},
+		isTargetPresentationReady: () => true,
+		markTargetProven: () => true,
+		markTargetLocallyPresented: () => true,
+		reportHostLoadCandidate: () => true,
+		reportHostLoadCompleted: () => true,
+		flushOwnedSave: () => Promise.resolve(),
+		cancelOwnedSave: () => {},
+		cancelTerminalHostLifecycle: () => true,
+		acquireEmergencySaveFence: () => {
+			emergencySaveBlocked = true;
+			return emergencySaveFence;
+		},
+		markInert: () => { hostMode = { kind: "inert-pass-through" }; },
+		restoreIfCurrent: () => true,
+		snapshot: () => ({
+			leafId: leaf.id,
+			view,
+			hostCapability: "public-cancellable",
+			hostCapabilityState: "ready",
+			saveEpoch: 0,
+			pendingLoadEpoch: 0,
+			nativeLoadEpoch: 0,
+			pendingNativeHostLoadCount: 0,
+			nativeHostLoadAmbiguous: false,
+			managedClearTombstoneEpoch: 0,
+			managedClearTombstoneActive: false,
+			clearLoadCapability: "observable",
+			wrappersCurrent: true,
+			loadWrappersCurrent: true,
+			emergencySaveBlocked,
+			mode: hostMode,
+			inFlight: new Map(),
+			pendingTargetSave: false,
+			pendingOwnedSave: null,
+			sourceUnload: null,
+			pendingDeferredLoadAdmission: null,
+			pendingSourceUnloadDrain: null,
+			terminalHostLifecycle: null,
+		}),
+	};
 	let cmGuardInert = false;
 	let cmGateClosed = false;
+	let targetSelectionFence: object | null = null;
 	managedRuntime.cmGuard = {
+		prepareTargetSelectionFence: (ownerId: string) => {
+			cmGateClosed = true;
+			targetSelectionFence = { ownerId };
+			return targetSelectionFence;
+		},
+		forceTargetSelectionFenceForTerminal: (ownerId: string) => {
+			cmGateClosed = true;
+			targetSelectionFence = { ownerId };
+			return targetSelectionFence;
+		},
+		isTargetSelectionFenceCurrent: (token: object) => targetSelectionFence === token,
+		transferTargetSelectionFence: (token: object) => {
+			if (targetSelectionFence !== token) return false;
+			targetSelectionFence = null;
+			cmGateClosed = true;
+			return true;
+		},
+		releaseTargetSelectionFence: (token: object) => {
+			if (targetSelectionFence !== token) return false;
+			targetSelectionFence = null;
+			cmGateClosed = false;
+			return true;
+		},
+		releaseTargetSelectionFenceForTeardown: (token: object) => {
+			if (targetSelectionFence !== token) return false;
+			targetSelectionFence = null;
+			cmGateClosed = false;
+			return true;
+		},
 		refreshGate: () => {
 			cmGateClosed = true;
 			return true;
@@ -4928,17 +5155,28 @@ async function exerciseMissingTargetEntry(entry: MissingTargetEntry): Promise<vo
 			cmGateClosed = false;
 			return true;
 		},
+		markDetachedInertForTeardown: () => {
+			cmGuardInert = true;
+			targetSelectionFence = null;
+			return true;
+		},
 		restoreIfCurrent: () => {
 			cmGuardInert = true;
 			cmGateClosed = false;
 			return true;
 		},
-		snapshot: () => ({
+			snapshot: () => ({
 			view: cm,
 			inert: cmGuardInert,
 			gateClosed: cmGateClosed,
+			targetSelectionFence,
+			inputEpoch: 0,
+			compositionEpoch: 0,
+			nativeHistoryEpoch: 0,
 			selectionEpoch: 0,
 			scrollEpoch: 0,
+			activeComposition: null,
+			lastComposition: null,
 			gateFailureReason: null,
 			commitState: "none",
 			pendingHostLoadCandidate: null,
@@ -4988,36 +5226,39 @@ async function exerciseMissingTargetEntry(entry: MissingTargetEntry): Promise<vo
 	await Promise.resolve();
 
 	assertEq(ensureFileCalls, 0, `${entry}: no binding-layer Y.Text creation`);
-	assertEq(admissionRequests.length, 1, `${entry}: one exact admission wake request`);
+	assertEq(admissionRequests.length, 0, `${entry}: observed file-first mismatch creates no admission`);
 	const request = admissionRequests[0];
-	assertEq(request?.targetFile, targetFile, `${entry}: admission keeps exact target TFile`);
-	assertEq(request?.targetPath, targetPath, `${entry}: admission keeps exact target path`);
+	assertEq(request?.targetFile, undefined, `${entry}: no target TFile enters an admission`);
+	assertEq(request?.targetPath, undefined, `${entry}: no target path enters an admission`);
 	assertEq("content" in (request ?? {}), false, `${entry}: admission carries no editor content`);
 	assertEq(runtime.getBinding?.(view) ?? runtime.bindings.get(leaf.id) ?? null, null, `${entry}: binding is detached`);
 	const session = runtime.getManagedSession?.(view) ?? null;
+	const terminalRuntime = runtime.managedSessions.get(leaf.id);
 	assertEq(session?.displayedLineage.kind, "known", `${entry}: displayed lineage remains known`);
 	assertEq(session?.displayedLineage.path, sourcePath, `${entry}: displayed lineage remains A`);
 	assertEq(session?.displayedLineage.file, sourceFile, `${entry}: displayed lineage keeps exact A TFile`);
-	assertEq(effectOrder.slice(0, 5).join("|"), [
-		"cancel-pending-save",
-		"block-save",
-		"install-input-gate",
-		"capture-authority-before-detach",
-		"detach-binding",
-	].join("|"), `${entry}: exact five-effect handoff prefix`);
+	assertEq(session?.handoff, null, `${entry}: observed mismatch mints no automatic handoff`);
+	assertEq(effectOrder.length, 0, `${entry}: observed mismatch runs no handoff reducer effects`);
 	assertEq(sourceText.toString(), sourceContent, `${entry}: source Y.Text is unchanged`);
-	assertEq(cmDocumentMutationCalls, 0, `${entry}: handoff performs no CM document mutation`);
+	assertEq(cmDocumentMutationCalls, 0, `${entry}: terminal fencing performs no CM document mutation`);
 	assertEq(runtime.lastEditorDocChangeAtByPath.has(targetPath), false, `${entry}: A activity is not relabelled B`);
 	assertEq(undoDestroyCalls, 1, `${entry}: source UndoManager is destroyed exactly once`);
-	assertEq(authorityObservedBeforeDetach, true, `${entry}: source authority is captured before map deletion`);
-	assertEq(capturedAuthority?.kind, "blocked", `${entry}: late mismatch source authority is fail-closed`);
-	assertEq(capturedAuthority?.reason, "transitioning", `${entry}: late mismatch reports a transition`);
-	runtime.unmanageView?.(view, "teardown");
+	assertEq(authorityObservedBeforeDetach, false, `${entry}: terminal path performs no normal authority capture`);
+	assertEq(capturedAuthority, null, `${entry}: terminal path never publishes source authority through the normal port`);
+	assertEq(terminalRuntime?.capturedSourceAuthority?.kind, "blocked", `${entry}: detached source authority is fail-closed`);
+	assertEq(terminalRuntime?.capturedSourceAuthority?.reason, "transitioning", `${entry}: detached source reports a transition`);
+	assertEq(terminalRuntime?.transitionInputFence?.state, "reopen-required", `${entry}: terminal input fence is retained`);
+	assertEq(terminalRuntime?.transitionInputFence?.targetFile, targetFile, `${entry}: terminal fence keeps exact B identity`);
+	assertEq(terminalRuntime?.transitionInputFence?.targetPath, targetPath, `${entry}: terminal fence keeps exact B path`);
+	assertEq(terminalRuntime?.cmGuard?.snapshot().gateClosed, true, `${entry}: CM input remains blocked`);
+	assertEq(terminalRuntime?.emergencySaveFence?.isCurrent(), true, `${entry}: native saving remains blocked`);
+	assertEq(Reflect.get(view.containerEl, "inert"), true, `${entry}: pane container remains inert`);
+	manager.reconcileManagedWorkspaceViews([], `test-30-${entry}-close`);
 	clearPendingHealthChecks(manager);
 	sourceDoc.destroy();
 }
 
-console.log("\n--- Test 30: every path-mismatch entry is a managed missing-target handoff ---");
+console.log("\n--- Test 30: every observed file-first mismatch is terminal without target admission ---");
 for (const entry of ["bind", "repair", "heal", "rebind", "stale-user", "health"] as const) {
 	await exerciseMissingTargetEntry(entry);
 }
@@ -5072,6 +5313,12 @@ console.log("\n--- Test 30b: file-open before target CM mount retains the exact 
 	});
 	type TestRuntime = {
 		session: ManagedLeafSession;
+		emergencySaveFence: { isCurrent(): boolean } | null;
+		transitionInputFence: {
+			state: string;
+			targetFile: unknown;
+			targetPath: string;
+		} | null;
 		hostGuard: {
 			snapshot(): Record<string, unknown>;
 			[key: string]: unknown;
@@ -5117,34 +5364,62 @@ console.log("\n--- Test 30b: file-open before target CM mount retains the exact 
 
 	const retained = internals.managedSessions.get("leaf-1") ?? null;
 	assertEq(retained !== null, true, "unresolved target CM does not unmanage the guarded source runtime");
-	assertEq(retained?.session.handoff?.targetFile, targetFile, "the exact observed target is retained");
 	assertEq(
-		retained?.session.handoff?.sourceUnloadReceiptId,
-		sourceUnloadReceiptId,
-		"the file-open wake inherits only the exact source-unload receipt",
+		retained?.session.handoff,
+		null,
+		"an exact unload receipt cannot mint a handoff without live source/CM proof",
 	);
 	assertEq(
-		retained?.session.currentSwitchIntentSeq !== null,
-		true,
-		"the source-unload receipt mints selected-switch provenance before target CM mount",
+		retained?.session.currentSwitchIntentSeq,
+		null,
+		"a rejected selected boundary mints no switch provenance",
 	);
-	assertEq(manager.getBinding(binding.view as never), null, "source Y.Text is detached during the retained transition");
+	assertEq(
+		manager.getBinding(binding.view as never),
+		binding,
+		"the unprovable source binding remains owned until explicit pane reopen",
+	);
+	assertEq(
+		retained?.transitionInputFence?.state,
+		"reopen-required",
+		"the rejected selected boundary becomes an explicit reopen terminal",
+	);
+	assertEq(
+		retained?.transitionInputFence?.targetFile,
+		targetFile,
+		"the terminal fence retains the exact observed target identity",
+	);
+	assertEq(
+		retained?.transitionInputFence?.targetPath,
+		targetFile.path,
+		"the terminal fence retains the exact observed target path",
+	);
 	assertEq(retained?.cmGuard?.snapshot().gateClosed, true, "the guarded source CM closes its input gate");
 	assertEq(
-		traceRecords.some((record) => record.msg === "managed-transition-boundary-retained"),
+		retained?.emergencySaveFence?.isCurrent(),
 		true,
-		"the exact transitional fallback emits a bounded trace",
+		"the rejected selected boundary blocks native saves",
 	);
+	assertEq(
+		traceRecords.some((record) => (
+			record.msg === "observed-file-mismatch-terminal"
+			|| record.msg === "observed-file-mismatch-input-boundary-pending"
+			|| record.msg === "managed-target-completion-retained"
+		)),
+		true,
+		"the exact-receipt fallback emits a bounded terminal trace",
+	);
+	manager.reconcileManagedWorkspaceViews([], "test-30b-close");
 	clearPendingHealthChecks(manager);
 }
 
-console.log("\n--- Test 30c: a later exact host selection promotes the same observed target ---");
+console.log("\n--- Test 30c: a late exact host selection cannot escape an observed terminal owner ---");
 {
 	const { manager, binding } = buildManagerFixture({
 		lastEditorChangeAgeMs: 10_000,
 		lastEditorDocChangeAgeMs: 10_000,
 	});
-	const runtime = manager as unknown as {
+	const internals = manager as unknown as {
 		beginPathHandoff: (
 			view: unknown,
 			targetFile: unknown,
@@ -5152,46 +5427,56 @@ console.log("\n--- Test 30c: a later exact host selection promotes the same obse
 			provenance?: "observed" | "selected",
 			sourceUnloadReceiptId?: string | null,
 		) => boolean;
+		managedSessions: Map<string, {
+			emergencySaveFence: { isCurrent(): boolean } | null;
+			transitionInputFence: { state: string; targetFile: unknown } | null;
+		}>;
+		observedFileMismatchTerminalByRuntime: WeakMap<object, unknown>;
 	};
 	const targetFile = { path: "Notes/observed-then-selected.md" };
 	(binding.view as unknown as { file: unknown }).file = targetFile;
 	assertEq(
-		runtime.beginPathHandoff(binding.view, targetFile, "file-open-observed"),
-		true,
-		"the public file-open wake records the observed target",
+		internals.beginPathHandoff(binding.view, targetFile, "file-open-observed"),
+		false,
+		"the public file-open wake rejects automatic handoff",
 	);
 	const observed = manager.getManagedSession(binding.view as never);
-	assertEq(observed?.handoff?.sourceUnloadReceiptId, null, "observation alone mints no unload authority");
+	const terminalRuntime = internals.managedSessions.get("leaf-1");
+	assertEq(observed?.handoff, null, "observation alone mints no handoff or unload authority");
 	assertEq(observed?.currentSwitchIntentSeq, null, "observation alone mints no switch sequence");
-	assertEq(observed?.binding.kind, "unbound", "observation completes the source detach");
-	assertEq(observed?.handoff?.phase, "awaiting-host-load", "observation waits for exact host selection");
+	assertEq(observed?.binding.kind, "bound", "unprovable source binding remains owned behind the terminal fence");
 	assertEq(
-		observed?.completedDetachEpoch,
-		observed?.handoff?.bindingEpochAfterDetach,
-		"observation retains the exact completed detach epoch",
+		terminalRuntime?.transitionInputFence?.state,
+		"reopen-required",
+		"observation retains a reopen-required input fence",
+	);
+	assertEq(terminalRuntime?.transitionInputFence?.targetFile, targetFile, "terminal fence keeps exact B identity");
+	assertEq(terminalRuntime?.emergencySaveFence?.isCurrent(), true, "terminal owner blocks native saves");
+	assertEq(
+		terminalRuntime === undefined
+			? false
+			: internals.observedFileMismatchTerminalByRuntime.has(terminalRuntime),
+		true,
+		"observation publishes a persistent terminal owner",
 	);
 	const observedGeneration = observed?.generation ?? -1;
 
 	assertEq(
-		runtime.beginPathHandoff(
+		internals.beginPathHandoff(
 			binding.view,
 			targetFile,
 			"host-load-entry",
 			"selected",
 			"source-unload:observed-then-selected",
 		),
-		true,
-		"the exact host callback promotes the already-observed target",
+		false,
+		"the late exact host callback is rejected by the terminal owner",
 	);
 	const selected = manager.getManagedSession(binding.view as never);
-	assertEq(selected?.generation, observedGeneration + 1, "promotion advances the handoff generation");
-	assertEq(
-		selected?.handoff?.sourceUnloadReceiptId,
-		"source-unload:observed-then-selected",
-		"promotion retains the exact source-unload receipt",
-	);
-	assertEq(selected?.currentSwitchIntentSeq, 1, "promotion mints one exact switch sequence");
-	assertEq(selected?.handoff?.targetFile, targetFile, "promotion retains the exact target identity");
+	assertEq(selected?.generation, observedGeneration, "late receipt cannot advance terminal generation");
+	assertEq(selected?.handoff, null, "late receipt cannot create a handoff");
+	assertEq(selected?.currentSwitchIntentSeq, null, "late receipt cannot mint a switch sequence");
+	manager.reconcileManagedWorkspaceViews([], "test-30c-close");
 	clearPendingHealthChecks(manager);
 }
 
@@ -5263,6 +5548,7 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 				import * as Y from "yjs";
 				import { Awareness } from "y-protocols/awareness";
 				import { EditorState, Transaction } from "@codemirror/state";
+				import { history, undo, undoDepth } from "@codemirror/commands";
 				import { EditorView } from "@codemirror/view";
 				import { EditorBindingManager } from "./src/sync/editorBinding";
 
@@ -5307,6 +5593,8 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 					};
 					const requestSave = Object.assign(function requestSave() {}, { cancel() {} });
 					let hostData = "source";
+					let targetLoadCalls = 0;
+					let setViewDataCalls = 0;
 					let cm;
 					const view = {
 						file: fileA,
@@ -5317,8 +5605,12 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 						dirty: false,
 						getViewData: () => hostData,
 						onUnloadFile: function onUnloadFile(_file) {},
-						onLoadFile: function onLoadFile(_file) {},
-						setViewData: function setViewData(data, _clear) { hostData = data; this.data = data; },
+						onLoadFile: function onLoadFile(_file) { targetLoadCalls += 1; },
+						setViewData: function setViewData(data, _clear) {
+							setViewDataCalls += 1;
+							hostData = data;
+							this.data = data;
+						},
 						requestSave,
 						save: function save() {},
 					};
@@ -5344,6 +5636,10 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 					});
 					manager.bind(view, "Browser");
 					const initiallyBound = manager.getBinding(view) !== null;
+					const rejectedUnload = view.onUnloadFile(fileA);
+					void rejectedUnload.catch(() => undefined);
+					const sourceUnloadPrefixSaveBlocked =
+						manager.managedSessions.get("browser-leaf")?.emergencySaveFence?.isCurrent() === true;
 					view.file = fileB;
 					cm.dispatch({
 						changes: { from: cm.state.doc.length, insert: "!" },
@@ -5351,6 +5647,8 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 					});
 					await Promise.resolve();
 					const session = manager.getManagedSession(view);
+					const runtime = manager.managedSessions.get("browser-leaf");
+					const cmSnapshot = runtime?.cmGuard?.snapshot() ?? null;
 					const result = {
 						initiallyBound,
 						cmContent: cm.state.doc.toString(),
@@ -5360,8 +5658,17 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 							? session.displayedLineage.path
 							: null,
 						admissionCount: admissions.length,
+						handoffActive: session?.handoff !== null,
+						gateClosed: cmSnapshot?.gateClosed ?? null,
+						containerInert: parent.inert === true,
+						transitionState: runtime?.transitionInputFence?.state ?? null,
+						transitionTargetPath: runtime?.transitionInputFence?.targetPath ?? null,
+						emergencySaveBlocked: runtime?.emergencySaveFence?.isCurrent() === true,
+						targetLoadCalls,
+						setViewDataCalls,
+						sourceUnloadPrefixSaveBlocked,
 					};
-					manager.unbindAll();
+					manager.reconcileManagedWorkspaceViews([], "browser-observed-terminal-close");
 					cm.destroy();
 					doc.destroy();
 					return result;
@@ -5373,9 +5680,12 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 						contentA,
 						contentB,
 						contentC = null,
-						failFirstBindFreshness = false,
-						deferFirstPresentation = false,
-						replanFirstCompletion = false,
+						probeTargetFirstBeforePresentationProof = false,
+						probePendingHostFailure = false,
+						probeDeferredTargetBytes = false,
+						probeMissingTarget = false,
+						probeSupersededInput = false,
+						probeSourceDrainOrdering = false,
 					}) => {
 					const pathA = "Notes/task9-browser-" + suffix + "-A.md";
 					const pathB = "Notes/task9-browser-" + suffix + "-B.md";
@@ -5390,167 +5700,203 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 					ytextA.insert(0, contentA);
 					ytextB.insert(0, contentB);
 					if (contentC !== null) ytextC.insert(0, contentC);
-					const awareness = new Awareness(doc);
-					const controllerCalls = [];
-					const releasePresentationByPath = new Map();
-					const targetTokenByPath = new Map();
-					let bindFreshnessChecks = 0;
-					let presentationRequests = 0;
-					let presentationCompletions = 0;
-					let hostLoadDispatchActive = false;
-					let presentationRequestedInsideHostLoad = false;
-					const presentationReadyNotifications = [];
-					const targetForPath = (path) => path === pathC && contentC !== null
-						? { file: fileC, ytext: ytextC, content: contentC, fileId: "file-C", suffix: "C" }
-						: { file: fileB, ytext: ytextB, content: contentB, fileId: "file-B", suffix: "B" };
+					let ytextAMutations = 0;
+					let ytextBMutations = 0;
+					ytextA.observe(() => { ytextAMutations += 1; });
+					ytextB.observe(() => { ytextBMutations += 1; });
+						const awareness = new Awareness(doc);
+						const controllerCalls = [];
+						let adoptionRequests = 0;
+						let recoveryPersistRequests = 0;
+						let missingTargetSeeded = false;
+						let releaseMissingPreInputRequest = null;
+						const missingTargetSeedContents = [];
+						const adoptionRequestPaths = [];
+						const adoptionRequestOutcomes = [];
+						const adoptionRequestFileIds = [];
+						const adoptionRequestHasYText = [];
+						const adoptionRequestAuthorityKinds = [];
+						const transitionCmDocuments = [];
+						const hostSaveSnapshots = [];
+						const sourceDrainOrder = [];
+						let nativeUnloadCalls = 0;
+						let nativeLoadCalls = 0;
+						let nativeSaveCalls = 0;
+						let forcedSourceSaveCalls = 0;
+						let releasePreexistingSave = null;
+						const preexistingSaveGate = probeSourceDrainOrdering
+							? new Promise((resolve) => { releasePreexistingSave = resolve; })
+							: null;
+						const samePathProposalByPermit = new Map();
+						const consumedSamePathPermits = new Set();
+						const targetForPath = (path) => path === pathC && contentC !== null
+							? { file: fileC, ytext: ytextC, content: ytextC.toString(), fileId: "file-C", suffix: "C" }
+							: { file: fileB, ytext: ytextB, content: ytextB.toString(), fileId: "file-B", suffix: "B" };
 					const controller = {
-						requestTargetPresentation(request) {
-							if (hostLoadDispatchActive) {
-								presentationRequestedInsideHostLoad = true;
+						requestSamePathAdoption(request) {
+							controllerCalls.push("request-same-path-adoption");
+							adoptionRequestPaths.push(request.path);
+							adoptionRequestFileIds.push(request.fileId);
+								adoptionRequestHasYText.push(request.ytext !== null);
+								adoptionRequestAuthorityKinds.push(request.editorAuthority.kind);
+								adoptionRequests += 1;
+								if (probeMissingTarget && !missingTargetSeeded) {
+									if (adoptionRequests === 1) {
+										adoptionRequestOutcomes.push("held-before-input");
+										return new Promise((resolve) => {
+											releaseMissingPreInputRequest = () => resolve({
+												kind: "replan",
+												reason: "local-input-advanced",
+											});
+										});
+									}
+									if (request.editorAuthority.kind !== "proven-single") {
+										adoptionRequestOutcomes.push("seed-authority-blocked");
+										return Promise.resolve({ kind: "replan", reason: "authority-blocked" });
+									}
+									const seedContent = request.editorAuthority.content;
+									missingTargetSeedContents.push(seedContent);
+									doc.transact(() => {
+										if (ytextB.length > 0) ytextB.delete(0, ytextB.length);
+										if (seedContent.length > 0) ytextB.insert(0, seedContent);
+									}, "task9-missing-target-seed");
+									missingTargetSeeded = true;
+									adoptionRequestOutcomes.push("seeded-replan");
+									return Promise.resolve({ kind: "seeded-replan" });
+								}
+								if (
+									probeTargetFirstBeforePresentationProof
+									|| (contentC !== null && request.path === pathB)
+							) {
+								adoptionRequestOutcomes.push("unresolved");
+								return new Promise(() => {});
 							}
-							controllerCalls.push("request-presentation");
-							presentationRequests += 1;
-							if (deferFirstPresentation && presentationRequests === 1) {
-								return Promise.resolve({
-									kind: "deferred",
-									reason: "authority-blocked",
-								});
-							}
-							return new Promise((resolve) => {
-								const target = targetForPath(request.targetPath);
-								releasePresentationByPath.set(request.targetPath, () => resolve({
-									kind: "planned",
-									plan: {
-										planId: "presentation-plan-" + target.suffix,
-										hostLoadTokenId: request.candidate.hostLoadTokenId,
-										switchIntentSeq: request.switchIntentSeq,
-										authorityFreshnessHandleId: "presentation-freshness-" + target.suffix,
-										expectedNativeHistoryEpoch: request.candidate.nativeHistoryEpochBefore,
-										presentationPermitId: "presentation-permit-" + target.suffix,
-									},
-								}));
+							const target = targetForPath(request.path);
+							const mutationPermit = Object.freeze({
+								permitId: "same-path-mutation-" + target.suffix,
+								kind: "same-path-adoption-mutation",
 							});
-						},
-						consumeTargetPresentationPermit(_permitId, context) {
-							controllerCalls.push("consume-presentation");
-							const target = targetForPath(context.targetPath);
-							return context.targetFile === target.file
-								&& context.candidate.incomingContent === target.content;
-						},
-						completeTargetPresentation(receipt) {
-							controllerCalls.push("complete-presentation");
-							presentationCompletions += 1;
-							if (replanFirstCompletion && presentationCompletions === 1) {
-								return Promise.resolve({
-									kind: "replan",
-									reason: "authority-changed",
-								});
+							const bindPermit = Object.freeze({
+								permitId: "same-path-bind-" + target.suffix,
+								kind: "same-path-adoption-bind",
+							});
+							if (request.editorAuthority.kind !== "proven-single") {
+								return Promise.resolve({ kind: "replan", reason: "authority-blocked" });
 							}
-							const target = targetForPath(receipt.targetPath);
-							const targetToken = Object.freeze({
-								tokenId: "target-ready-" + target.suffix,
-								sessionId: receipt.sessionId,
-								authorityFreshnessHandleId: "bind-freshness-" + target.suffix,
-								authorityFingerprint: "authority-" + target.suffix,
-								controllerLifecycleGeneration: 1,
-								leafId: receipt.leafId,
-								handoffGeneration: receipt.handoffGeneration,
-								switchIntentSeq: receipt.switchIntentSeq,
-								targetPath: receipt.targetPath,
-								targetFile: target.file,
-								targetAuthority: {
-									kind: "existing",
+							const proposal = Object.freeze({
+								proposalId: "same-path-proposal-" + target.suffix,
+								planId: "same-path-plan-" + target.suffix,
+								authorityFreshnessHandleId: "same-path-freshness-" + target.suffix,
+								request,
+								adoptionId: request.adoptionId,
+								path: request.path,
+								file: target.file,
+								baselineHash: "same-path-baseline-" + target.suffix,
+								baselineRevision: 1,
+								baselineText: target.content,
+								diskFile: target.file,
+								diskStat: Object.freeze({ ctime: 1, mtime: 1, size: target.content.length }),
+								diskContent: target.content,
+								diskContentHash: "same-path-disk-" + target.suffix,
+								localText: target.content,
+								remoteText: target.content,
+								activeAuthority: Object.freeze({
+									activeFileIds: Object.freeze([target.fileId]),
+									activeSetEpoch: 1,
 									fileId: target.fileId,
-									ytextIdentity: "ytext-" + target.suffix,
+									ytext: target.ytext,
+									ytextIdentity: "same-path-ytext-" + target.suffix,
 									ytextMutationEpoch: 0,
-									bindPermitId: "bind-permit-" + target.suffix,
-								},
-								hostLoadTokenId: receipt.hostLoadTokenId,
-								hostLoadCompletedEpoch: receipt.nativeHistoryEpoch,
-								hostLoadReceiptId: receipt.receiptId,
-								nativeHistoryEpoch: receipt.nativeHistoryEpoch,
-								targetSelectionEpoch: receipt.targetSelectionEpoch,
-								targetScrollEpoch: receipt.targetScrollEpoch,
-								certifiedBaseContent: target.content,
-								certifiedBaseHash: "hash-" + target.suffix,
-								openEditorTicketId: "ticket-" + target.suffix,
+									ytextContent: target.content,
+								}),
+								fileId: target.fileId,
+								ytext: target.ytext,
+								ytextIdentity: "same-path-ytext-" + target.suffix,
+								ytextMutationEpoch: 0,
+								providerInstance: null,
+								editorAuthorityLease: request.editorAuthority.lease,
+								hostCapability: request.hostCapability,
+								hostSaveEpoch: request.hostSaveEpoch,
+								lifecycleGeneration: 1,
+								attentionGeneration: 0,
+								syncScopeGeneration: 1,
+								plan: Object.freeze({ kind: "already-settled", targetText: target.content }),
+								mutationPermit,
+								bindPermit,
 							});
-							targetTokenByPath.set(receipt.targetPath, targetToken);
-							return Promise.resolve({
-								kind: "accepted",
-								receipt: {
-									receiptId: "presentation-receipt-" + target.suffix,
-									presentationPlanId: "presentation-plan-" + target.suffix,
-									hostLoadCompletionReceipt: receipt,
-									replacementTargetReadyToken: targetToken,
-								},
-							});
+							samePathProposalByPermit.set(mutationPermit, proposal);
+							samePathProposalByPermit.set(bindPermit, proposal);
+							adoptionRequestOutcomes.push("planned");
+							return Promise.resolve({ kind: "planned", proposal });
 						},
-						requestOpenPathAdmission(request) {
-							controllerCalls.push("request-open-admission");
-							const targetToken = targetTokenByPath.get(request.targetPath) ?? null;
-							return Promise.resolve(
-								request.presentation === "target-proven" && targetToken
-									? { kind: "existing", targetReadyToken: targetToken }
-									: { kind: "deferred", reason: "transitioning" },
-							);
+						consumeSamePathAdoptionMutationPermit(permit, context) {
+							const proposal = samePathProposalByPermit.get(permit);
+							if (
+								!proposal
+								|| consumedSamePathPermits.has(permit)
+								|| context.proposal !== proposal
+								|| context.request !== proposal.request
+								|| !manager.isSamePathAdoptionRequestCurrent(context.request)
+							) return false;
+							consumedSamePathPermits.add(permit);
+							controllerCalls.push("consume-same-path-mutation");
+							return true;
 						},
-						seedMissingTarget() {
-							throw new Error("existing B must not enter the missing-target seed lane");
+						consumeSamePathAdoptionBindPermit(permit, context) {
+							const proposal = samePathProposalByPermit.get(permit);
+							if (
+								!proposal
+								|| consumedSamePathPermits.has(permit)
+								|| context.proposal !== proposal
+								|| context.request !== proposal.request
+								|| !manager.isSamePathAdoptionBindContextCurrent(context)
+							) return false;
+							consumedSamePathPermits.add(permit);
+							controllerCalls.push("consume-same-path-bind");
+							return true;
 						},
-						isAuthorityFreshnessCurrent(_handleId, context) {
-							controllerCalls.push("check-bind-freshness");
-							bindFreshnessChecks += 1;
-							if (failFirstBindFreshness && bindFreshnessChecks === 1) return false;
-							const targetToken = targetTokenByPath.get(context.targetFile.path) ?? null;
-							return context.targetFile === targetForPath(context.targetFile.path).file
-								&& context.hostLoadReceiptId === targetToken?.hostLoadReceiptId;
-						},
-						consumeBindPermit(_permitId, context) {
-							controllerCalls.push("consume-bind");
-							const target = targetForPath(context.targetFile.path);
-							return context.targetFile === target.file && context.ytext === target.ytext;
+						noteSamePathAdoptionBound() {
+							controllerCalls.push("note-same-path-bound");
 						},
 					};
 					const vaultSync = {
 						provider: { awareness },
-						getTextForPath: (path) => path === pathA ? ytextA : path === pathB ? ytextB : path === pathC && contentC !== null ? ytextC : null,
-						getFileId: (path) => path === pathA ? "file-A" : path === pathB ? "file-B" : path === pathC && contentC !== null ? "file-C" : undefined,
-						getFileIdForText: (text) => text === ytextA ? "file-A" : text === ytextB ? "file-B" : text === ytextC && contentC !== null ? "file-C" : undefined,
+							getTextForPath: (path) => path === pathA ? ytextA : path === pathB && (!probeMissingTarget || missingTargetSeeded) ? ytextB : path === pathC && contentC !== null ? ytextC : null,
+							getFileId: (path) => path === pathA ? "file-A" : path === pathB && (!probeMissingTarget || missingTargetSeeded) ? "file-B" : path === pathC && contentC !== null ? "file-C" : undefined,
+							getFileIdForText: (text) => text === ytextA ? "file-A" : text === ytextB && (!probeMissingTarget || missingTargetSeeded) ? "file-B" : text === ytextC && contentC !== null ? "file-C" : undefined,
 						isPendingRenameTarget: () => false,
 						isMarkdownTombstoned: () => false,
 					};
+						const managerTrace = [];
 					const manager = new EditorBindingManager(
 						vaultSync,
 						false,
 						(path) => path.endsWith(".md"),
-						undefined,
-						undefined,
-						undefined,
-						undefined,
-						undefined,
-						undefined,
-						undefined,
-						controller,
-						undefined,
-						undefined,
-						undefined,
-						undefined,
-						(token) => {
-							presentationReadyNotifications.push({
-								path: token.targetPath,
-								bindingPath: manager.getBinding(view)?.path ?? null,
-								presentation:
-									manager.getManagedSession(view)?.handoff?.presentation
-										?? null,
-							});
+						(_source, message, details) => {
+							if (message.startsWith("source-unload-drain")) {
+								managerTrace.push({ message, details });
+							}
 						},
+						undefined,
+						undefined,
+						undefined,
+						undefined,
+						undefined,
+						undefined,
+							controller,
 					);
 					const parent = document.createElement("div");
 					document.body.appendChild(parent);
 					let cm;
 					let hostData = contentA;
-					let originalSaveCalls = 0;
+					let rejectPendingHostLoad = null;
+					const pendingHostLoad = probePendingHostFailure
+						? new Promise((_resolve, reject) => { rejectPendingHostLoad = reject; })
+						: null;
+					let releaseTargetBytes = null;
+					const targetBytesGate = probeDeferredTargetBytes
+						? new Promise((resolve) => { releaseTargetBytes = resolve; })
+						: null;
 					const leaf = {
 						id: "task9-browser-leaf",
 						workspace: {
@@ -5558,12 +5904,15 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 							iterateAllLeaves(callback) { callback({ view }); },
 						},
 					};
-					const requestSave = Object.assign(function requestSave() {
-						originalSaveCalls += 1;
-					}, { cancel() {} });
+					const requestSave = Object.assign(function requestSave() {}, { cancel() {} });
 					const view = {
 						file: fileA,
 						leaf,
+						app: {
+							workspace: {
+								iterateAllLeaves(callback) { callback({ view }); },
+							},
+						},
 						containerEl: parent,
 						editor: { getValue: () => cm.state.doc.toString() },
 						data: hostData,
@@ -5571,16 +5920,17 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 						lastSavedData: hostData,
 						getViewData: () => hostData,
 						onUnloadFile: async function onUnloadFile(_file) {
+							nativeUnloadCalls += 1;
+							sourceDrainOrder.push("native-unload-enter");
 							await this.save(true);
 						},
 						onLoadFile: async function onLoadFile(targetFile) {
-							hostLoadDispatchActive = true;
-							try {
-								this.setViewData(targetFile === fileC ? contentC : contentB, true);
-							} finally {
-								hostLoadDispatchActive = false;
-							}
-							await Promise.resolve();
+							nativeLoadCalls += 1;
+							sourceDrainOrder.push("native-load-enter");
+							if (targetBytesGate !== null) await targetBytesGate;
+							this.setViewData(targetFile === fileC ? contentC : contentB, true);
+							if (pendingHostLoad !== null) await pendingHostLoad;
+							else await Promise.resolve();
 						},
 						setViewData: function setViewData(data, _clear) {
 							hostData = data;
@@ -5593,21 +5943,52 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 							});
 						},
 						requestSave,
-						save: async function save(clear) {
-							originalSaveCalls += 1;
-							this.dirty = false;
-							if (clear === true) {
-								hostData = "";
+							save: async function save(clear) {
+								nativeSaveCalls += 1;
+								if (probeSourceDrainOrdering && clear !== true && preexistingSaveGate !== null) {
+									sourceDrainOrder.push("prior-save-enter");
+									await preexistingSaveGate;
+									sourceDrainOrder.push("prior-save-settled");
+									return;
+								}
+								this.dirty = false;
+								if (clear === true) {
+									forcedSourceSaveCalls += 1;
+									sourceDrainOrder.push("forced-save-enter");
+									hostSaveSnapshots.push({
+										path: this.file?.path ?? null,
+										content: hostData,
+									});
+									hostData = "";
 								this.data = "";
 								this.lastSavedData = null;
 							}
 							await Promise.resolve();
 						},
 					};
+					const originalOnUnloadFile = view.onUnloadFile;
+					const originalOnLoadFile = view.onLoadFile;
+					const originalSetViewData = view.setViewData;
+					const originalSave = view.save;
 					leaf.workspace.activeLeaf = leaf;
 					cm = new EditorView({
 						parent,
-						state: EditorState.create({ doc: contentA, extensions: [manager.getBaseExtension()] }),
+						state: EditorState.create({
+							doc: contentA,
+							selection: { anchor: contentA.length },
+							extensions: [
+								history(),
+								manager.getBaseExtension(),
+									EditorView.updateListener.of((update) => {
+										if (update.docChanged) {
+											const content = update.state.doc.toString();
+											transitionCmDocuments.push(content);
+											hostData = content;
+											view.data = content;
+										}
+								}),
+							],
+						}),
 					});
 					let sourceUndoDestroyed = 0;
 					const sourceUndo = new Y.UndoManager(ytextA);
@@ -5629,61 +6010,522 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 						settleWindowMs: 0,
 					});
 					manager.bind(view, "Browser");
+					if (probeSourceDrainOrdering) {
+						const orderingSnapshot = (stage) => {
+							const runtime = manager.managedSessions.get(leaf.id);
+							const host = runtime?.hostGuard?.snapshot() ?? null;
+							const guard = runtime?.cmGuard?.snapshot() ?? null;
+							return {
+								stage,
+								sourceDrainOrder: [...sourceDrainOrder],
+								unloadOutcome: typeof unloadOutcome === "undefined" ? "not-started" : unloadOutcome,
+								nativeUnloadCalls,
+								nativeSaveCalls,
+								forcedSourceSaveCalls,
+								managerDrainState: runtime?.sourceUnloadDrain?.state ?? null,
+								managerDrainSettled: runtime?.sourceUnloadDrain?.settled ?? null,
+								cmDrain: guard?.sourceUnloadDrain !== null,
+								targetFence: guard?.targetSelectionFence !== null,
+								hostDrain: host?.pendingSourceUnloadDrain ?? null,
+								hostInFlight: host?.inFlight?.size ?? null,
+								hostSaveEpoch: host?.saveEpoch ?? null,
+								managerTrace,
+							};
+						};
+						const awaitOrdering = async (promise, stage) => {
+							let timeoutId = null;
+							const timeout = new Promise((_resolve, reject) => {
+								timeoutId = setTimeout(() => reject(new Error(
+									"SOURCE_DRAIN_TIMEOUT:" + JSON.stringify(orderingSnapshot(stage)),
+								)), 1000);
+							});
+							try {
+								return await Promise.race([promise, timeout]);
+							} finally {
+								if (timeoutId !== null) clearTimeout(timeoutId);
+							}
+						};
+						const priorSave = view.save(false);
+						await Promise.resolve();
+						const activeInput = new InputEvent("beforeinput", {
+							bubbles: true,
+							cancelable: true,
+							inputType: "insertText",
+							data: "x",
+						});
+						cm.contentDOM.dispatchEvent(activeInput);
+						let unloadOutcome = "pending";
+						const unload = view.onUnloadFile(fileA).then(
+							() => { unloadOutcome = "fulfilled"; },
+							() => { unloadOutcome = "rejected"; },
+						);
+						await Promise.resolve();
+						const beforeCompletion = {
+							unloadOutcome,
+							nativeUnloadCalls,
+							forcedSourceSaveCalls,
+							cmContent: cm.state.doc.toString(),
+						};
+						const freshInput = new InputEvent("beforeinput", {
+							bubbles: true,
+							cancelable: true,
+							inputType: "insertText",
+							data: "y",
+						});
+						cm.contentDOM.dispatchEvent(freshInput);
+						const afterFreshInput = {
+							defaultPrevented: freshInput.defaultPrevented,
+							cmContent: cm.state.doc.toString(),
+							recoveryPersistRequests,
+						};
+						cm.dispatch(cm.state.update({
+							changes: { from: cm.state.doc.length, insert: "x" },
+							selection: { anchor: cm.state.doc.length + 1 },
+							annotations: Transaction.userEvent.of("input.type"),
+							filter: false,
+						}));
+						sourceDrainOrder.push("input-completed");
+						await Promise.resolve();
+						await Promise.resolve();
+						await Promise.resolve();
+						const beforePriorSaveSettlement = {
+							unloadOutcome,
+							nativeUnloadCalls,
+							forcedSourceSaveCalls,
+							cmContent: cm.state.doc.toString(),
+						};
+						if (releasePreexistingSave === null) throw new Error("missing preexisting save release");
+						releasePreexistingSave();
+						await awaitOrdering(priorSave, "prior-save-settlement");
+						await awaitOrdering(unload, "source-unload-settlement");
+						const afterUnload = {
+							unloadOutcome,
+							nativeUnloadCalls,
+							forcedSourceSaveCalls,
+							nativeSaveCalls,
+							hostSaveSnapshots: [...hostSaveSnapshots],
+						};
+						view.file = fileB;
+						await awaitOrdering(view.onLoadFile(fileB), "target-load-settlement");
+						for (let index = 0; index < 30 && manager.getBinding(view)?.path !== pathB; index += 1) {
+							await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+							await Promise.resolve();
+						}
+						const afterLoad = {
+							nativeLoadCalls,
+							cmContent: cm.state.doc.toString(),
+							ytextA: ytextA.toString(),
+							ytextB: ytextB.toString(),
+							boundPath: manager.getBinding(view)?.path ?? null,
+							recoveryPersistRequests,
+						};
+						const closingRuntime = manager.managedSessions.get(leaf.id);
+						const closingGuard = closingRuntime?.cmGuard ?? null;
+						const exactCloseCount = manager.reconcileManagedWorkspaceViews(
+							[],
+							"task9-source-drain-exact-close",
+						);
+						const cleanup = {
+							exactCloseCount,
+							managedRemoved: !manager.managedSessions.has(leaf.id),
+							cmInert: closingGuard?.snapshot().inert ?? null,
+							targetSelectionFence:
+								closingGuard?.snapshot().targetSelectionFence ?? null,
+							sourceUnloadDrain:
+								closingGuard?.snapshot().sourceUnloadDrain ?? null,
+							wrappersRestored: view.onUnloadFile === originalOnUnloadFile
+								&& view.onLoadFile === originalOnLoadFile
+								&& view.setViewData === originalSetViewData
+								&& view.save === originalSave,
+						};
+						const result = {
+							activeInputPrevented: activeInput.defaultPrevented,
+							beforeCompletion,
+							afterFreshInput,
+							beforePriorSaveSettlement,
+							afterUnload,
+							afterLoad,
+							sourceDrainOrder,
+							cleanup,
+						};
+						cm.destroy();
+						doc.destroy();
+						return result;
+					}
 					await view.onUnloadFile(fileA);
 					view.file = fileB;
+					let nextEventTurnReached = false;
+					const nextEventTurnTimer = probeTargetFirstBeforePresentationProof
+						? setTimeout(() => { nextEventTurnReached = true; }, 0)
+						: null;
 					const loadPromises = [view.onLoadFile(fileB)];
-					for (let index = 0; index < 40 && !releasePresentationByPath.has(pathB); index += 1) {
-						await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+					if (probeDeferredTargetBytes) {
+						await Promise.resolve();
+						const runtimeBeforeTarget = manager.managedSessions.get(leaf.id);
+						const beforeTarget = {
+							cmContent: cm.state.doc.toString(),
+							gateClosed: runtimeBeforeTarget?.cmGuard?.snapshot().gateClosed ?? null,
+							handoffCleared: manager.getManagedSession(view)?.handoff === null,
+						};
+						cm.contentDOM.dispatchEvent(new InputEvent("beforeinput", {
+							bubbles: true,
+							cancelable: true,
+							inputType: "insertText",
+							data: "?",
+						}));
+						cm.dispatch(cm.state.update({
+							changes: { from: cm.state.doc.length, insert: "?" },
+							selection: { anchor: cm.state.doc.length + 1 },
+							annotations: Transaction.userEvent.of("input.type"),
+							filter: false,
+						}));
+						const whileTargetMissing = {
+							cmContent: cm.state.doc.toString(),
+							recoveryPersistRequests,
+							ytextA: ytextA.toString(),
+							ytextB: ytextB.toString(),
+						};
+						if (releaseTargetBytes === null) throw new Error("missing target-byte release");
+						releaseTargetBytes();
+						await loadPromises[0];
+						const runtimeAfterTarget = manager.managedSessions.get(leaf.id);
+						const afterTarget = {
+							cmContent: cm.state.doc.toString(),
+							gateClosed: runtimeAfterTarget?.cmGuard?.snapshot().gateClosed ?? null,
+							handoffCleared: manager.getManagedSession(view)?.handoff === null,
+						};
+						cm.contentDOM.dispatchEvent(new InputEvent("beforeinput", {
+							bubbles: true,
+							inputType: "insertText",
+							data: "!",
+						}));
+						cm.dispatch(cm.state.update({
+							changes: { from: cm.state.doc.length, insert: "!" },
+							selection: { anchor: cm.state.doc.length + 1 },
+							annotations: Transaction.userEvent.of("input.type"),
+							filter: false,
+						}));
+						const result = {
+							beforeTarget,
+							whileTargetMissing,
+							afterTarget,
+							afterTargetInput: {
+								cmContent: cm.state.doc.toString(),
+								recoveryPersistRequests,
+							},
+							transitionCmDocuments,
+						};
+						manager.unbindAll();
+						cm.destroy();
+						doc.destroy();
+						return result;
 					}
-					let finalPath = pathB;
-					let finalContent = contentB;
+					if (probePendingHostFailure) {
+						let hostLoadSettled = false;
+						const observedHostLoad = loadPromises[0].then(
+							() => { hostLoadSettled = true; return "fulfilled"; },
+							() => { hostLoadSettled = true; return "rejected"; },
+						);
+						await Promise.resolve();
+						const runtimeBeforeInput = manager.managedSessions.get(leaf.id);
+						const beforeInput = {
+							hostLoadSettled,
+							cmContent: cm.state.doc.toString(),
+							viewData: view.data,
+							gateClosed: runtimeBeforeInput?.cmGuard?.snapshot().gateClosed ?? null,
+							handoffCleared: manager.getManagedSession(view)?.handoff === null,
+						};
+						cm.contentDOM.dispatchEvent(new InputEvent("beforeinput", {
+							bubbles: true,
+							inputType: "insertText",
+							data: "!",
+						}));
+						cm.dispatch(cm.state.update({
+							changes: { from: cm.state.doc.length, insert: "!" },
+							selection: { anchor: cm.state.doc.length + 1 },
+							annotations: Transaction.userEvent.of("input.type"),
+							filter: false,
+						}));
+						const afterInput = {
+							cmContent: cm.state.doc.toString(),
+							ytextA: ytextA.toString(),
+							ytextB: ytextB.toString(),
+						};
+						if (rejectPendingHostLoad === null) throw new Error("missing pending host reject");
+						rejectPendingHostLoad(new Error("late host load failure"));
+						const hostOutcome = await observedHostLoad;
+						await Promise.resolve();
+						const runtimeAfterFailure = manager.managedSessions.get(leaf.id);
+						const displayedAfterFailure = runtimeAfterFailure?.session.displayedLineage ?? null;
+						const result = {
+							beforeInput,
+								afterInput,
+								afterHostFailure: {
+								hostOutcome,
+								cmContent: cm.state.doc.toString(),
+								gateClosed: runtimeAfterFailure?.cmGuard?.snapshot().gateClosed ?? null,
+								displayedContent: displayedAfterFailure?.kind === "known"
+									? displayedAfterFailure.document.toString()
+									: null,
+							},
+							transitionCmDocuments,
+							recoveryPersistRequests,
+						};
+						manager.unbindAll();
+						cm.destroy();
+						doc.destroy();
+						return result;
+					}
+					if (probeTargetFirstBeforePresentationProof) {
+						await loadPromises[0];
+						const runtime = manager.managedSessions.get(leaf.id);
+						const beforeInput = {
+							nextEventTurnReached,
+							cmContent: cm.state.doc.toString(),
+							viewData: view.data,
+							gateClosed: runtime?.cmGuard?.snapshot().gateClosed ?? null,
+							inputGateInstalled:
+								manager.getManagedSession(view)?.handoff?.inputGateInstalled ?? false,
+							undoDepth: undoDepth(cm.state),
+							ytextA: ytextA.toString(),
+							ytextB: ytextB.toString(),
+						};
+						cm.contentDOM.dispatchEvent(new InputEvent("beforeinput", {
+							bubbles: true,
+							inputType: "insertText",
+							data: "!",
+						}));
+						cm.dispatch(cm.state.update({
+							changes: { from: cm.state.doc.length, insert: "!" },
+							selection: { anchor: cm.state.doc.length + 1 },
+							annotations: Transaction.userEvent.of("input.type"),
+							filter: false,
+						}));
+						const afterInput = {
+							cmContent: cm.state.doc.toString(),
+							undoDepth: undoDepth(cm.state),
+							ytextA: ytextA.toString(),
+							ytextB: ytextB.toString(),
+						};
+						for (let index = 0; index < 30; index += 1) {
+							const current = manager.managedSessions.get(leaf.id);
+							const displayed = current?.session.displayedLineage ?? null;
+							if (
+								current?.adoption.kind === "planning"
+								&& displayed?.kind === "known"
+								&& displayed.document.toString() === "local target B!"
+							) break;
+							await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+						}
+						const admissionWhileInputVisible = (() => {
+							const current = manager.managedSessions.get(leaf.id);
+							const displayed = current?.session.displayedLineage ?? null;
+							return {
+								adoptionKind: current?.adoption.kind ?? null,
+								displayedContent:
+									displayed?.kind === "known"
+										? displayed.document.toString()
+										: null,
+								requiredPath:
+									manager.samePathAdoptionRequiredPathByLeafId.get(leaf.id) ?? null,
+								bindingPath: manager.getBinding(view)?.path ?? null,
+							};
+						})();
+						const undoApplied = undo(cm);
+						const afterUndo = {
+							cmContent: cm.state.doc.toString(),
+							undoDepth: undoDepth(cm.state),
+							ytextA: ytextA.toString(),
+							ytextB: ytextB.toString(),
+							ytextAMutations,
+							ytextBMutations,
+						};
+						if (nextEventTurnTimer !== null) clearTimeout(nextEventTurnTimer);
+						const result = {
+							beforeInput,
+							afterInput,
+							admissionWhileInputVisible,
+							afterUndo,
+							undoApplied,
+							transitionCmDocuments,
+							adoptionRequestPaths,
+							adoptionRequestOutcomes,
+							recoveryPersistRequests,
+						};
+						manager.unbindAll();
+						cm.destroy();
+						doc.destroy();
+							return result;
+						}
+						if (probeMissingTarget) {
+							await loadPromises[0];
+							for (let index = 0; index < 20 && adoptionRequests === 0; index += 1) {
+								await Promise.resolve();
+							}
+							const firstTargetPresentation = {
+								cmContent: cm.state.doc.toString(),
+								viewData: view.data,
+								gateClosed:
+									manager.managedSessions.get(leaf.id)?.cmGuard?.snapshot().gateClosed
+										?? null,
+								inputGateInstalled:
+									manager.getManagedSession(view)?.handoff?.inputGateInstalled ?? false,
+								ytextA: ytextA.toString(),
+								ytextB: ytextB.toString(),
+							};
+							cm.contentDOM.dispatchEvent(new InputEvent("beforeinput", {
+								bubbles: true,
+								inputType: "insertText",
+								data: "!",
+							}));
+							cm.dispatch(cm.state.update({
+								changes: { from: cm.state.doc.length, insert: "!" },
+								selection: { anchor: cm.state.doc.length + 1 },
+								annotations: Transaction.userEvent.of("input.type"),
+								filter: false,
+							}));
+							cm.contentDOM.dispatchEvent(new InputEvent("input", {
+								bubbles: true,
+								inputType: "insertText",
+								data: "!",
+							}));
+							const afterInput = {
+								cmContent: cm.state.doc.toString(),
+								viewData: view.data,
+								undoDepth: undoDepth(cm.state),
+								ytextA: ytextA.toString(),
+								ytextB: ytextB.toString(),
+							};
+							for (let index = 0; index < 60; index += 1) {
+								if (
+									missingTargetSeedContents.length > 0
+									&& manager.getBinding(view)?.path === pathB
+								) break;
+								await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+								await Promise.resolve();
+							}
+							if (releaseMissingPreInputRequest === null) {
+								throw new Error("missing held pre-input adoption release");
+							}
+							releaseMissingPreInputRequest();
+							await Promise.resolve();
+							const targetBinding = manager.getBinding(view);
+							const result = {
+								firstTargetPresentation,
+								afterInput,
+								cmContent: cm.state.doc.toString(),
+								yContent: ytextB.toString(),
+								boundPath: targetBinding?.path ?? null,
+								sourceUndoDestroyed,
+								controllerCalls,
+								adoptionRequestPaths,
+								adoptionRequestOutcomes,
+								adoptionRequestFileIds,
+								adoptionRequestHasYText,
+								adoptionRequestAuthorityKinds,
+								transitionCmDocuments,
+								recoveryPersistRequests,
+								handoffCleared: manager.getManagedSession(view)?.handoff === null,
+								missingTargetSeedContents,
+								ytextBMutations,
+							};
+							manager.unbindAll();
+							cm.destroy();
+							doc.destroy();
+							return result;
+						}
+						await loadPromises[0];
+					for (let index = 0; index < 20 && adoptionRequests === 0; index += 1) {
+						await Promise.resolve();
+					}
+					const firstTargetPresentation = {
+						cmContent: cm.state.doc.toString(),
+						viewData: view.data,
+						editorRevision:
+							manager.editorRevisionByCm.get(cm) ?? 0,
+						editorAuthorityRevision:
+							manager.editorAuthorityRevisionByCm.get(cm) ?? 0,
+						editorAuthorityContent:
+							manager.editorAuthorityContentByCm.get(cm) ?? null,
+						gateClosed:
+							manager.managedSessions.get(leaf.id)?.cmGuard?.snapshot().gateClosed
+								?? null,
+						inputGateInstalled:
+							manager.getManagedSession(view)?.handoff?.inputGateInstalled ?? false,
+						ytextA: ytextA.toString(),
+						ytextB: ytextB.toString(),
+					};
+						let inputOnB = null;
+						if (probeSupersededInput) {
+							cm.contentDOM.dispatchEvent(new InputEvent("beforeinput", {
+								bubbles: true,
+								inputType: "insertText",
+								data: "!",
+							}));
+							cm.dispatch(cm.state.update({
+								changes: { from: cm.state.doc.length, insert: "!" },
+								selection: { anchor: cm.state.doc.length + 1 },
+								annotations: Transaction.userEvent.of("input.type"),
+								filter: false,
+							}));
+							cm.contentDOM.dispatchEvent(new InputEvent("input", {
+								bubbles: true,
+								inputType: "insertText",
+								data: "!",
+							}));
+							inputOnB = {
+								cmContent: cm.state.doc.toString(),
+								viewData: view.data,
+								undoDepth: undoDepth(cm.state),
+								ytextA: ytextA.toString(),
+								ytextB: ytextB.toString(),
+							};
+							for (let index = 0; index < 30; index += 1) {
+								const current = manager.managedSessions.get(leaf.id);
+								const displayed = current?.session.displayedLineage ?? null;
+								if (
+									adoptionRequestPaths.filter((path) => path === pathB).length >= 2
+									&& current?.adoption.kind === "planning"
+									&& displayed?.kind === "known"
+									&& displayed.document.toString() === "stale target B!"
+								) break;
+								await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+								await Promise.resolve();
+							}
+						}
+						let finalPath = pathB;
 					let finalYText = ytextB;
 					if (contentC !== null) {
-						await loadPromises[0];
 						await view.onUnloadFile(fileB);
 						view.file = fileC;
 						loadPromises.push(view.onLoadFile(fileC));
 						finalPath = pathC;
-						finalContent = contentC;
 						finalYText = ytextC;
-						for (let index = 0; index < 40 && !releasePresentationByPath.has(pathC); index += 1) {
-							await new Promise((resolve) => requestAnimationFrame(() => resolve()));
-						}
 					}
-					view.requestSave();
-					const beforeReceipt = {
-						cmContent: cm.state.doc.toString(),
-						bindingDetached: manager.getBinding(view) === null,
-						gateInstalled: manager.getManagedSession(view)?.handoff?.inputGateInstalled === true,
-						originalSaveCalls,
-						activityTransferred: manager.getLastEditorActivityForPath(finalPath) !== null,
-						releaseReady: releasePresentationByPath.has(finalPath),
-					};
-					releasePresentationByPath.get(finalPath)?.();
 					await Promise.all(loadPromises);
 					for (let index = 0; index < 30 && manager.getBinding(view)?.path !== finalPath; index += 1) {
 						await new Promise((resolve) => requestAnimationFrame(() => resolve()));
 						await Promise.resolve();
 					}
 					const targetBinding = manager.getBinding(view);
-					const beforeUndo = finalYText.toString();
-						targetBinding?.undoManager.undo();
-						await Promise.resolve();
-						view.requestSave();
-						await view.requestSave.flush();
-						const result = {
-						beforeReceipt,
-						cmContent: cm.state.doc.toString(),
-						yContent: finalYText.toString(),
+					const result = {
+							firstTargetPresentation,
+							inputOnB,
+							cmContent: cm.state.doc.toString(),
+							undoDepth: undoDepth(cm.state),
+							yContent: finalYText.toString(),
 						boundPath: targetBinding?.path ?? null,
 						sourceUndoDestroyed,
-						targetLoadUndoable: finalYText.toString() !== beforeUndo,
-						originalSaveCalls,
 						controllerCalls,
-						presentationRequestedInsideHostLoad,
-						presentationReadyNotifications,
-						handoffCleared: manager.getManagedSession(view)?.handoff === null,
-						finalContent,
+						adoptionRequestPaths,
+						adoptionRequestOutcomes,
+						adoptionRequestFileIds,
+						adoptionRequestHasYText,
+						adoptionRequestAuthorityKinds,
+						transitionCmDocuments,
+							recoveryPersistRequests,
+							handoffCleared: manager.getManagedSession(view)?.handoff === null,
+							hostSaveSnapshots,
 					};
 					manager.unbindAll();
 					cm.destroy();
@@ -5691,6 +6533,12 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 					return result;
 					};
 					return {
+						sourceDrainOrdering: await runScenario({
+							suffix: "source-drain-ordering",
+							contentA: "source A",
+							contentB: "target B",
+							probeSourceDrainOrdering: true,
+						}),
 						different: await runScenario({
 							suffix: "different",
 							contentA: "source A",
@@ -5701,29 +6549,36 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 							contentA: "same bytes",
 							contentB: "same bytes",
 						}),
-						retried: await runScenario({
-							suffix: "retried",
-							contentA: "source before stale bind proof",
-							contentB: "target after fresh bind proof",
-							failFirstBindFreshness: true,
+						targetFirstBeforePresentationProof: await runScenario({
+							suffix: "target-first-before-presentation-proof",
+							contentA: "source A must never roll back",
+							contentB: "local target B",
+							probeTargetFirstBeforePresentationProof: true,
 						}),
-						presentationRetried: await runScenario({
-							suffix: "presentation-retried",
-							contentA: "source before deferred presentation",
-							contentB: "target after fresh presentation proof",
-							deferFirstPresentation: true,
+						pendingHostFailure: await runScenario({
+							suffix: "pending-host-failure",
+							contentA: "pending source A",
+							contentB: "pending local B",
+							probePendingHostFailure: true,
 						}),
-						completionRetried: await runScenario({
-							suffix: "completion-retried",
-							contentA: "source before completion replan",
-							contentB: "target after completion reproof",
-							replanFirstCompletion: true,
+						deferredTargetBytes: await runScenario({
+							suffix: "deferred-target-bytes",
+							contentA: "deferred source A",
+							contentB: "deferred target B",
+							probeDeferredTargetBytes: true,
+						}),
+						missingTarget: await runScenario({
+							suffix: "missing-target",
+							contentA: "missing source A",
+							contentB: "disk-only target B",
+							probeMissingTarget: true,
 						}),
 						superseded: await runScenario({
 							suffix: "superseded",
 							contentA: "source before supersession",
 							contentB: "stale target B",
 							contentC: "current target C",
+							probeSupersededInput: true,
 						}),
 					};
 				})();
@@ -5788,189 +6643,796 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 			bindingDetached: boolean;
 			lineagePath: string | null;
 			admissionCount: number;
+			handoffActive: boolean;
+			gateClosed: boolean | null;
+			containerInert: boolean;
+			transitionState: string | null;
+			transitionTargetPath: string | null;
+			emergencySaveBlocked: boolean;
+			targetLoadCalls: number;
+			setViewDataCalls: number;
+			sourceUnloadPrefixSaveBlocked: boolean;
 		};
 		assertEq(result.initiallyBound, true, "real guard fixture starts with A bound");
 		assertEq(result.cmContent, "source", "stale user dispatch never reaches CodeMirror");
 		assertEq(result.yContent, "source", "stale user dispatch never reaches Y.Text");
-		assertEq(result.bindingDetached, true, "stale user dispatch leaves the binding detached");
+		assertEq(result.bindingDetached, true, "stale user dispatch detaches the exact settled A binding");
 		assertEq(result.lineagePath, "Notes/browser-A.md", "stale user dispatch preserves A lineage");
-		assertEq(result.admissionCount, 1, "stale user dispatch requests B admission exactly once");
+		assertEq(result.admissionCount, 0, "observed file-first mismatch requests no B admission");
+		assertEq(result.handoffActive, false, "observed file-first mismatch mints no handoff");
+		assertEq(result.gateClosed, true, "real CodeMirror input gate remains closed");
+		assertEq(result.containerInert, true, "real pane container remains inert");
+		assertEq(result.transitionState, "reopen-required", "real transition owner requires pane reopen");
+		assertEq(
+			result.transitionTargetPath,
+			"Notes/browser-B.md",
+			"real terminal owner retains exact B identity",
+		);
+		assertEq(result.emergencySaveBlocked, true, "real native save entry points remain blocked");
+		assertEq(result.targetLoadCalls, 0, "real terminal path performs no target load");
+		assertEq(result.setViewDataCalls, 0, "real terminal path performs no target apply or replay");
+		assertEq(
+			result.sourceUnloadPrefixSaveBlocked,
+			true,
+			"source-unload-not-provable prefix synchronously installs the emergency save fence",
+		);
 
-		const task9Line = child.stdout.split("\n").find((line) => line.startsWith("TASK9_RESULT="));
-		type Task9ScenarioResult = {
-			beforeReceipt: {
+			const task9Line = child.stdout.split("\n").find((line) => line.startsWith("TASK9_RESULT="));
+			type Task9InputOnB = {
 				cmContent: string;
-				bindingDetached: boolean;
-				gateInstalled: boolean;
-				originalSaveCalls: number;
-				activityTransferred: boolean;
-				releaseReady: boolean;
+				viewData: string;
+				undoDepth: number;
+				ytextA: string;
+				ytextB: string;
 			};
-			cmContent: string;
-			yContent: string;
+			type Task9ScenarioResult = {
+			firstTargetPresentation: {
+				cmContent: string;
+				viewData: string;
+				editorRevision: number;
+				editorAuthorityRevision: number;
+				editorAuthorityContent: string | null;
+				gateClosed: boolean | null;
+				inputGateInstalled: boolean;
+				ytextA: string;
+				ytextB: string;
+					};
+				inputOnB: Task9InputOnB | null;
+				cmContent: string;
+				undoDepth: number;
+				yContent: string;
 			boundPath: string | null;
 			sourceUndoDestroyed: number;
-			targetLoadUndoable: boolean;
-			originalSaveCalls: number;
 			controllerCalls: string[];
-			presentationRequestedInsideHostLoad: boolean;
-			presentationReadyNotifications: Array<{
-				path: string;
+			adoptionRequestPaths: string[];
+			adoptionRequestOutcomes: string[];
+			adoptionRequestFileIds: Array<string | null>;
+			adoptionRequestHasYText: boolean[];
+			adoptionRequestAuthorityKinds: string[];
+			transitionCmDocuments: string[];
+				recoveryPersistRequests: number;
+				handoffCleared: boolean;
+				hostSaveSnapshots: Array<{
+					path: string | null;
+					content: string;
+				}>;
+			};
+			type MissingTargetResult = Omit<
+				Task9ScenarioResult,
+				"inputOnB" | "undoDepth" | "hostSaveSnapshots"
+			> & {
+				afterInput: Task9InputOnB;
+				missingTargetSeedContents: string[];
+				ytextBMutations: number;
+			};
+			type SupersededScenarioResult = Omit<Task9ScenarioResult, "inputOnB"> & {
+				inputOnB: Task9InputOnB;
+			};
+		type TargetFirstBeforePresentationProofResult = {
+			beforeInput: {
+				nextEventTurnReached: boolean;
+				cmContent: string;
+				viewData: string;
+				gateClosed: boolean | null;
+				inputGateInstalled: boolean;
+				undoDepth: number;
+				ytextA: string;
+				ytextB: string;
+			};
+			afterInput: {
+				cmContent: string;
+				undoDepth: number;
+				ytextA: string;
+				ytextB: string;
+			};
+			admissionWhileInputVisible: {
+				adoptionKind: string | null;
+				displayedContent: string | null;
+				requiredPath: string | null;
 				bindingPath: string | null;
-				presentation: string | null;
-			}>;
-			handoffCleared: boolean;
-			finalContent: string;
+			};
+			afterUndo: {
+				cmContent: string;
+				undoDepth: number;
+				ytextA: string;
+				ytextB: string;
+				ytextAMutations: number;
+				ytextBMutations: number;
+			};
+			undoApplied: boolean;
+			transitionCmDocuments: string[];
+			adoptionRequestPaths: string[];
+			adoptionRequestOutcomes: string[];
+			recoveryPersistRequests: number;
+		};
+		type PendingHostFailureResult = {
+			beforeInput: {
+				hostLoadSettled: boolean;
+				cmContent: string;
+				viewData: string;
+				gateClosed: boolean | null;
+				handoffCleared: boolean;
+			};
+			afterInput: {
+				cmContent: string;
+				ytextA: string;
+				ytextB: string;
+			};
+			afterHostFailure: {
+				hostOutcome: string;
+				cmContent: string;
+				gateClosed: boolean | null;
+				displayedContent: string | null;
+			};
+			transitionCmDocuments: string[];
+			recoveryPersistRequests: number;
+		};
+		type DeferredTargetBytesResult = {
+			beforeTarget: {
+				cmContent: string;
+				gateClosed: boolean | null;
+				handoffCleared: boolean;
+			};
+			whileTargetMissing: {
+				cmContent: string;
+				recoveryPersistRequests: number;
+				ytextA: string;
+				ytextB: string;
+			};
+			afterTarget: {
+				cmContent: string;
+				gateClosed: boolean | null;
+				handoffCleared: boolean;
+			};
+			afterTargetInput: {
+				cmContent: string;
+				recoveryPersistRequests: number;
+			};
+			transitionCmDocuments: string[];
+		};
+		type SourceDrainOrderingResult = {
+			activeInputPrevented: boolean;
+			beforeCompletion: {
+				unloadOutcome: string;
+				nativeUnloadCalls: number;
+				forcedSourceSaveCalls: number;
+				cmContent: string;
+			};
+			afterFreshInput: {
+				defaultPrevented: boolean;
+				cmContent: string;
+				recoveryPersistRequests: number;
+			};
+			beforePriorSaveSettlement: {
+				unloadOutcome: string;
+				nativeUnloadCalls: number;
+				forcedSourceSaveCalls: number;
+				cmContent: string;
+			};
+			afterUnload: {
+				unloadOutcome: string;
+				nativeUnloadCalls: number;
+				forcedSourceSaveCalls: number;
+				nativeSaveCalls: number;
+				hostSaveSnapshots: Array<{ path: string | null; content: string }>;
+			};
+			afterLoad: {
+				nativeLoadCalls: number;
+				cmContent: string;
+				ytextA: string;
+				ytextB: string;
+				boundPath: string | null;
+				recoveryPersistRequests: number;
+			};
+			sourceDrainOrder: string[];
+			cleanup: {
+				exactCloseCount: number;
+				managedRemoved: boolean;
+				cmInert: boolean | null;
+				targetSelectionFence: unknown;
+				sourceUnloadDrain: unknown;
+				wrappersRestored: boolean;
+			};
 		};
 		const task9Scenarios = JSON.parse(
 			task9Line?.slice("TASK9_RESULT=".length) ?? "null",
 		) as {
+			sourceDrainOrdering: SourceDrainOrderingResult;
 			different: Task9ScenarioResult;
 			identical: Task9ScenarioResult;
-			retried: Task9ScenarioResult;
-			presentationRetried: Task9ScenarioResult;
-			completionRetried: Task9ScenarioResult;
-			superseded: Task9ScenarioResult;
+			targetFirstBeforePresentationProof: TargetFirstBeforePresentationProofResult;
+			pendingHostFailure: PendingHostFailureResult;
+			deferredTargetBytes: DeferredTargetBytesResult;
+				missingTarget: MissingTargetResult;
+				superseded: SupersededScenarioResult;
 		};
-		const task9 = task9Scenarios.different;
-		assertEq(task9.beforeReceipt.releaseReady, true, "target presentation proof is requested for held B");
+
+		const sourceDrain = task9Scenarios.sourceDrainOrdering;
+		assertEq(sourceDrain.activeInputPrevented, false, "the already-started A input remains the one drainable lane");
+		assertEq(sourceDrain.beforeCompletion.unloadOutcome, "pending", "native unload waits while exact A input is unresolved");
+		assertEq(sourceDrain.beforeCompletion.nativeUnloadCalls, 0, "native unload has not entered before A completion");
+		assertEq(sourceDrain.beforeCompletion.forcedSourceSaveCalls, 0, "forced source save has not entered before A completion");
+		assertEq(sourceDrain.beforeCompletion.cmContent, "source A", "unresolved input leaves A unchanged");
+		assertEq(sourceDrain.afterFreshInput.defaultPrevented, true, "fresh input is rejected during source drain");
+		assertEq(sourceDrain.afterFreshInput.cmContent, "source A", "fresh input contributes zero bytes");
+		assertEq(sourceDrain.afterFreshInput.recoveryPersistRequests, 0, "fresh input is never persisted for replay");
+		assertEq(sourceDrain.beforePriorSaveSettlement.cmContent, "source Ax", "the exact predecessor reaches A once");
+		assertEq(sourceDrain.beforePriorSaveSettlement.unloadOutcome, "pending", "unload still waits for the preexisting save tail");
+		assertEq(sourceDrain.beforePriorSaveSettlement.nativeUnloadCalls, 0, "preexisting save settles before native unload entry");
+		assertEq(sourceDrain.beforePriorSaveSettlement.forcedSourceSaveCalls, 0, "preexisting save settles before the forced A+x save");
+		assertEq(sourceDrain.afterUnload.unloadOutcome, "fulfilled", "exact source drain completes native unload");
+		assertEq(sourceDrain.afterUnload.nativeUnloadCalls, 1, "native unload enters exactly once");
+		assertEq(sourceDrain.afterUnload.forcedSourceSaveCalls, 1, "forced source save enters exactly once");
+		assertEq(sourceDrain.afterUnload.nativeSaveCalls, 2, "one prior save and one forced save reach native code");
+		assertEq(sourceDrain.afterUnload.hostSaveSnapshots.length, 1, "only the forced source save records a retirement snapshot");
+		assertEq(sourceDrain.afterUnload.hostSaveSnapshots[0]?.content, "source Ax", "forced source save owns exact A+x bytes");
+		assertEq(sourceDrain.afterLoad.nativeLoadCalls, 1, "native B load enters exactly once");
+		assertEq(sourceDrain.afterLoad.cmContent, "target B", "B replaces A only through native host load");
+		assertEq(sourceDrain.afterLoad.ytextA, "source Ax", "A+x remains saved on A authority");
+		assertEq(sourceDrain.afterLoad.ytextB, "target B", "B authority receives no replayed A bytes");
+		assertEq(sourceDrain.afterLoad.recoveryPersistRequests, 0, "ordinary drain creates no recovery persistence");
 		assertEq(
-			task9.presentationReadyNotifications.length,
-			1,
-			"target presentation readiness is published exactly once",
+			sourceDrain.sourceDrainOrder.join(","),
+			"prior-save-enter,input-completed,prior-save-settled,native-unload-enter,forced-save-enter,native-load-enter",
+			"source completion, prior save, forced save, and B load retain strict order",
+		);
+		assertEq(sourceDrain.cleanup.exactCloseCount, 1, "exact close consumes the managed pane once");
+		assertEq(sourceDrain.cleanup.managedRemoved, true, "exact close releases manager ownership");
+		assertEq(sourceDrain.cleanup.cmInert, true, "exact close leaves the retired CM guard inert");
+		assertEq(sourceDrain.cleanup.targetSelectionFence, null, "exact close releases the target-less token");
+		assertEq(sourceDrain.cleanup.sourceUnloadDrain, null, "exact close releases the source drain");
+		assertEq(sourceDrain.cleanup.wrappersRestored, true, "exact close restores native host wrappers");
+
+		const targetFirst = task9Scenarios.targetFirstBeforePresentationProof;
+		assertEq(
+			targetFirst.adoptionRequestOutcomes.length > 0
+				&& targetFirst.adoptionRequestOutcomes.every((outcome) => outcome === "unresolved"),
+			true,
+			"target-first fixture keeps every background same-path admission unresolved",
 		);
 		assertEq(
-			task9.presentationReadyNotifications[0]?.path,
-			"Notes/task9-browser-different-B.md",
-			"presentation readiness carries the exact B path",
+			targetFirst.adoptionRequestPaths.length > 0
+				&& targetFirst.adoptionRequestPaths.every(
+					(path) => path === "Notes/task9-browser-target-first-before-presentation-proof-B.md",
+				),
+			true,
+			"every background admission remains scoped to exact B",
 		);
 		assertEq(
-			task9.presentationReadyNotifications[0]?.bindingPath,
-			null,
-			"presentation readiness is published before target binding",
-		);
-		assertEq(
-			task9.presentationReadyNotifications[0]?.presentation,
-			"target-proven",
-			"presentation readiness is published only after reducer proof",
-		);
-		assertEq(
-			task9.presentationRequestedInsideHostLoad,
+			targetFirst.beforeInput.nextEventTurnReached,
 			false,
-			"target presentation admission starts only after the exact host load dispatch returns",
+			"awaiting B load returns before the next event turn",
 		);
-		assertEq(task9.beforeReceipt.cmContent, "source A", "B does not enter CodeMirror before proof");
-		assertEq(task9.beforeReceipt.bindingDetached, true, "B remains unbound before proof");
-		assertEq(task9.beforeReceipt.gateInstalled, true, "input gate remains installed before proof");
 		assertEq(
-			task9.beforeReceipt.originalSaveCalls,
-			1,
-			"only the forced source-retirement save runs before proof",
+			targetFirst.beforeInput.cmContent,
+			"local target B",
+			"the first statement after awaiting B load observes local B in CodeMirror",
 		);
-		assertEq(task9.beforeReceipt.activityTransferred, false, "A activity is not relabelled B before proof");
-		assertEq(task9.cmContent, "target B", "certified B host transaction is presented exactly once");
-		assertEq(task9.yContent, "target B", "B Y.Text remains authoritative after binding");
-		assertEq(task9.boundPath, "Notes/task9-browser-different-B.md", "replacement token binds exact B path");
+		assertEq(
+			targetFirst.beforeInput.viewData,
+			"local target B",
+			"the first statement after awaiting B load observes local B in the host cache",
+		);
+		assertEq(
+			[
+				task9Scenarios.different.firstTargetPresentation.editorRevision,
+				task9Scenarios.different.firstTargetPresentation.editorAuthorityRevision,
+			].join("|"),
+			"1|1",
+			"local B presentation advances editor content and authority revisions together",
+		);
+		assertEq(
+			task9Scenarios.different.firstTargetPresentation.editorAuthorityContent,
+			"target B",
+			"local B presentation publishes exact B as the current editor authority",
+		);
+		assertEq(
+			targetFirst.beforeInput.gateClosed,
+			false,
+			"B is editable immediately after the host load promise returns",
+		);
+		assertEq(
+			targetFirst.beforeInput.inputGateInstalled,
+			false,
+			"the reducer exposes no transition input gate after local B presentation",
+		);
+		assertEq(
+			targetFirst.beforeInput.undoDepth,
+			0,
+			"local B presentation starts with no source-native undo history",
+		);
+		assertEq(
+			targetFirst.afterInput.cmContent,
+			"local target B!",
+			"the immediate post-load input applies normally to B",
+		);
+		assertEq(
+			targetFirst.transitionCmDocuments.filter(
+				(content) => content === "local target B!",
+			).length,
+			1,
+			"the immediate B input reaches the editor update boundary exactly once",
+		);
+		assertEq(
+			targetFirst.admissionWhileInputVisible.adoptionKind,
+			"planning",
+			"background admission advances to planning while the immediate B input remains visible",
+		);
+		assertEq(
+			targetFirst.admissionWhileInputVisible.displayedContent,
+			"local target B!",
+			"background admission observes the exact B successor document",
+		);
+		assertEq(
+			targetFirst.admissionWhileInputVisible.requiredPath,
+			"Notes/task9-browser-target-first-before-presentation-proof-B.md",
+			"the retry hold remains scoped to exact B while its plan is unresolved",
+		);
+		assertEq(
+			targetFirst.admissionWhileInputVisible.bindingPath,
+			null,
+			"unresolved admission does not publish a premature B binding",
+		);
+		assertEq(
+			targetFirst.recoveryPersistRequests,
+			0,
+			"normal target-first input creates no recovery persistence request",
+		);
+		assertEq(
+			[
+				targetFirst.beforeInput.ytextA,
+				targetFirst.afterInput.ytextA,
+				targetFirst.afterUndo.ytextA,
+			].join("|"),
+			[
+				"source A must never roll back",
+				"source A must never roll back",
+				"source A must never roll back",
+			].join("|"),
+			"A Y.Text remains unchanged before background admission",
+		);
+		assertEq(
+			[
+				targetFirst.beforeInput.ytextB,
+				targetFirst.afterInput.ytextB,
+				targetFirst.afterUndo.ytextB,
+			].join("|"),
+			["local target B", "local target B", "local target B"].join("|"),
+			"B Y.Text remains unchanged before background admission",
+		);
+		assertEq(
+			[
+				targetFirst.afterUndo.ytextAMutations,
+				targetFirst.afterUndo.ytextBMutations,
+			].join("|"),
+			"0|0",
+			"target-first local input and undo perform no transient CRDT mutation",
+		);
+		assertEq(
+			targetFirst.transitionCmDocuments.join("|"),
+			["local target B", "local target B!", "local target B"].join("|"),
+			"local B, its input, and its undo contain no rollback to source A",
+		);
+		assertEq(
+			targetFirst.afterInput.undoDepth,
+			1,
+			"native undo history contains only the B user input",
+		);
+		assertEq(targetFirst.undoApplied, true, "native undo consumes the one B input");
+		assertEq(
+			targetFirst.afterUndo.cmContent,
+			"local target B",
+			"native undo returns only to local B, never source A",
+		);
+		assertEq(
+			targetFirst.afterUndo.undoDepth,
+			0,
+			"native undo exhausts the B-only history after one step",
+		);
+
+		const pendingHostFailure = task9Scenarios.pendingHostFailure;
+		assertEq(
+			pendingHostFailure.beforeInput.hostLoadSettled,
+			false,
+			"B local authority does not wait for the host load promise",
+		);
+		assertEq(
+			[
+				pendingHostFailure.beforeInput.cmContent,
+				pendingHostFailure.beforeInput.viewData,
+			].join("|"),
+			"pending local B|pending local B",
+			"pending host load already presents exact B in editor and host cache",
+		);
+		assertEq(
+			[
+				pendingHostFailure.beforeInput.gateClosed,
+				pendingHostFailure.beforeInput.handoffCleared,
+			].join("|"),
+			"false|true",
+			"pending host load leaves B editable with no transition handoff",
+		);
+		assertEq(
+			pendingHostFailure.afterInput.cmContent,
+			"pending local B!",
+			"input applies once to B while the host promise is still pending",
+		);
+		assertEq(
+			pendingHostFailure.transitionCmDocuments.filter(
+				(content) => content === "pending local B!",
+			).length,
+			1,
+			"pending-host B input crosses the editor boundary exactly once",
+		);
+		assertEq(
+			[
+				pendingHostFailure.afterInput.ytextA,
+				pendingHostFailure.afterInput.ytextB,
+			].join("|"),
+			"pending source A|pending local B",
+			"pending-host input causes no transient A or B CRDT mutation",
+		);
+		assertEq(
+			pendingHostFailure.afterHostFailure.hostOutcome,
+			"fulfilled",
+			"the locally committed host wrapper does not expose a late native rejection as target failure",
+		);
+		assertEq(
+			[
+				pendingHostFailure.afterHostFailure.cmContent,
+				pendingHostFailure.afterHostFailure.displayedContent,
+				pendingHostFailure.afterHostFailure.gateClosed,
+			].join("|"),
+			"pending local B!|pending local B!|false",
+			"late host failure cannot roll B back or close its input gate",
+		);
+		assertEq(
+			pendingHostFailure.recoveryPersistRequests,
+			0,
+			"pending or rejected host load creates no replay recovery intent",
+		);
+
+		const deferredTarget = task9Scenarios.deferredTargetBytes;
+		assertEq(
+			[
+				deferredTarget.beforeTarget.cmContent,
+				deferredTarget.beforeTarget.gateClosed,
+				deferredTarget.beforeTarget.handoffCleared,
+			].join("|"),
+			"deferred source A|true|false",
+			"before B bytes arrive the old surface is explicitly non-editable",
+		);
+		assertEq(
+			[
+				deferredTarget.whileTargetMissing.cmContent,
+				deferredTarget.whileTargetMissing.recoveryPersistRequests,
+			].join("|"),
+			"deferred source A|0",
+			"pre-target input is rejected without capture, replay, or visible mutation",
+		);
+		assertEq(
+			[
+				deferredTarget.whileTargetMissing.ytextA,
+				deferredTarget.whileTargetMissing.ytextB,
+			].join("|"),
+			"deferred source A|deferred target B",
+			"blocked pre-target input mutates neither source nor target CRDT",
+		);
+		assertEq(
+			[
+				deferredTarget.afterTarget.cmContent,
+				deferredTarget.afterTarget.gateClosed,
+				deferredTarget.afterTarget.handoffCleared,
+			].join("|"),
+			"deferred target B|false|true",
+			"B becomes local editable authority as soon as its bytes arrive",
+		);
+		assertEq(
+			[
+				deferredTarget.afterTargetInput.cmContent,
+				deferredTarget.afterTargetInput.recoveryPersistRequests,
+			].join("|"),
+			"deferred target B!|0",
+			"the first post-target input applies normally once with no replay intent",
+		);
+		assertEq(
+			deferredTarget.transitionCmDocuments.includes("deferred source A?"),
+			false,
+			"rejected pre-target input never appears and therefore cannot roll back",
+		);
+		assertEq(
+			deferredTarget.transitionCmDocuments.filter(
+				(content) => content === "deferred target B!",
+			).length,
+			1,
+			"post-target input crosses the editor boundary exactly once",
+		);
+
+		const missingTarget = task9Scenarios.missingTarget;
+			assertEq(
+				[
+					missingTarget.firstTargetPresentation.cmContent,
+					missingTarget.firstTargetPresentation.viewData,
+					missingTarget.firstTargetPresentation.gateClosed,
+					missingTarget.handoffCleared,
+				].join("|"),
+				"disk-only target B|disk-only target B|false|true",
+				"missing-sync B is still immediate stable local authority",
+			);
+			assertEq(
+				[
+					missingTarget.afterInput.cmContent,
+					missingTarget.afterInput.viewData,
+				].join("|"),
+				"disk-only target B!|disk-only target B!",
+				"input advances the missing-sync B editor and host cache exactly once",
+			);
+			assertEq(
+				[
+					missingTarget.afterInput.ytextA,
+					missingTarget.afterInput.ytextB,
+				].join("|"),
+				"missing source A|disk-only target B",
+				"the local B input mutates neither CRDT before certified seed",
+			);
+			assertEq(
+				missingTarget.missingTargetSeedContents.join("|"),
+				"disk-only target B!",
+				"missing target is seeded once from the latest B successor, not stale B",
+			);
+			assertEq(
+				missingTarget.ytextBMutations,
+				1,
+				"latest B successor is committed to the target CRDT in one transaction",
+			);
+			assertEq(
+				[
+					missingTarget.cmContent,
+					missingTarget.yContent,
+					missingTarget.boundPath,
+				].join("|"),
+				[
+					"disk-only target B!",
+					"disk-only target B!",
+					"Notes/task9-browser-missing-target-B.md",
+				].join("|"),
+				"seed replan binds exact latest B without a visible replacement dispatch",
+			);
+			assertEq(
+				missingTarget.adoptionRequestPaths.length >= 3
+					&& missingTarget.adoptionRequestPaths.every(
+						(path) => path === "Notes/task9-browser-missing-target-B.md",
+					),
+				true,
+				"held, seed, and bind requests all remain scoped to exact B",
+			);
+			assertEq(
+				missingTarget.adoptionRequestOutcomes.join("|"),
+				"held-before-input|seeded-replan|planned",
+				"stale pre-input planning is replaced by one latest-successor seed and bind",
+			);
+			assertEq(
+				missingTarget.adoptionRequestFileIds.map((value) => value ?? "null").join("|"),
+				"null|null|file-B",
+				"file identity appears only after the missing target has been seeded",
+			);
+			assertEq(
+				missingTarget.adoptionRequestHasYText.join("|"),
+				"false|false|true",
+				"Y.Text authority appears only on the post-seed bind request",
+			);
+			assertEq(
+				missingTarget.adoptionRequestAuthorityKinds.every(
+					(kind) => kind === "proven-single",
+				),
+				true,
+				"every missing-target step retains single-editor B authority",
+			);
+			assertEq(
+				missingTarget.transitionCmDocuments.join("|"),
+				"disk-only target B|disk-only target B!",
+				"missing-target adoption never rolls the visible editor back to A or stale B",
+			);
+			assertEq(
+				missingTarget.recoveryPersistRequests,
+				0,
+				"missing-sync input and seed create no handoff replay intent",
+			);
+
+		const task9 = task9Scenarios.different;
+		assertEq(
+			task9.firstTargetPresentation.cmContent,
+			"target B",
+			"ordinary A-to-B switch presents B before sync admission settles",
+		);
+		assertEq(
+			task9.firstTargetPresentation.viewData,
+			"target B",
+			"ordinary A-to-B switch publishes B to the host cache",
+		);
+		assertEq(
+			task9.firstTargetPresentation.gateClosed,
+			false,
+			"ordinary local B is editable",
+		);
+		assertEq(
+			task9.firstTargetPresentation.inputGateInstalled,
+			false,
+			"ordinary local B has no transition input gate",
+		);
+		assertEq(task9.cmContent, "target B", "ordinary B remains displayed after admission");
+		assertEq(task9.yContent, "target B", "ordinary admission retains exact B Y.Text");
+		assertEq(
+			task9.boundPath,
+			"Notes/task9-browser-different-B.md",
+			"same-path admission binds exact B",
+		);
 		assertEq(task9.sourceUndoDestroyed, 1, "A Y.UndoManager is destroyed exactly once");
-		assertEq(task9.targetLoadUndoable, false, "B host load is absent from the new Y undo history");
+		assertEq(task9.recoveryPersistRequests, 0, "ordinary A-to-B switch creates no recovery");
+		assertEq(task9.handoffCleared, true, "ordinary B admission leaves stable state");
 		assertEq(
-			task9.originalSaveCalls,
-			2,
-			"ordinary save pass-through resumes only after target proof",
+			task9.transitionCmDocuments.join("|"),
+			"target B",
+			"ordinary transition contains B and no rollback to A",
 		);
-		assertEq(task9.handoffCleared, true, "successful bind returns the managed leaf to stable state");
-		assertEq(task9.controllerCalls.join("|"), [
-			"request-presentation",
-			"consume-presentation",
-			"complete-presentation",
-			"request-open-admission",
-			"check-bind-freshness",
-			"consume-bind",
-		].join("|"), "presentation and bind permits are consumed in order");
+		assertEq(
+			task9.adoptionRequestPaths.join("|"),
+			"Notes/task9-browser-different-B.md",
+			"ordinary admission request is scoped to exact B",
+		);
+		assertEq(task9.adoptionRequestOutcomes.join("|"), "planned", "ordinary B admission is planned");
+		assertEq(
+			task9.controllerCalls.join("|"),
+			[
+				"request-same-path-adoption",
+				"consume-same-path-mutation",
+				"consume-same-path-bind",
+				"note-same-path-bound",
+			].join("|"),
+			"same-path admission consumes mutation and bind authority in order",
+		);
+
 		const identical = task9Scenarios.identical;
-		assertEq(identical.beforeReceipt.cmContent, "same bytes", "equal A/B bytes still wait for identity proof");
-		assertEq(identical.beforeReceipt.bindingDetached, true, "equal bytes cannot retain A's binding as B");
-		assertEq(identical.boundPath, "Notes/task9-browser-identical-B.md", "equal bytes bind only the exact B token");
-		assertEq(identical.handoffCleared, true, "equal-byte handoff also returns to stable state");
-		assertEq(identical.controllerCalls.join("|"), task9.controllerCalls.join("|"), "equal bytes use the same one-shot permit sequence");
-		const retried = task9Scenarios.retried;
 		assertEq(
-			retried.boundPath,
-			"Notes/task9-browser-retried-B.md",
-			"a stale final freshness check schedules a fresh target admission and eventually binds B",
+			identical.firstTargetPresentation.cmContent,
+			"same bytes",
+			"equal A/B bytes still present through the target-first boundary",
 		);
 		assertEq(
-			retried.controllerCalls.filter((call) => call === "request-open-admission").length,
-			2,
-			"stale final freshness performs exactly one fresh admission retry",
+			identical.firstTargetPresentation.gateClosed,
+			false,
+			"equal-byte B is editable without waiting behind an identity gate",
 		);
 		assertEq(
-			retried.controllerCalls.filter((call) => call === "check-bind-freshness").length,
-			2,
-			"the retry rechecks freshness instead of reusing the stale decision",
+			identical.boundPath,
+			"Notes/task9-browser-identical-B.md",
+			"equal bytes bind only the exact B identity",
 		);
 		assertEq(
-			retried.controllerCalls.filter((call) => call === "consume-bind").length,
-			1,
-			"only the fresh retry consumes the one-shot bind permit",
-		);
-		assertEq(retried.handoffCleared, true, "successful retry closes the managed handoff");
-		const presentationRetried = task9Scenarios.presentationRetried;
-		assertEq(
-			presentationRetried.boundPath,
-			"Notes/task9-browser-presentation-retried-B.md",
-			"a deferred target presentation schedules a fresh proof and eventually binds B",
+			identical.adoptionRequestPaths.join("|"),
+			"Notes/task9-browser-identical-B.md",
+			"equal bytes request admission for exact B",
 		);
 		assertEq(
-			presentationRetried.controllerCalls.filter((call) => call === "request-presentation").length,
-			2,
-			"deferred presentation is retried with one fresh controller request",
+			identical.controllerCalls.join("|"),
+			task9.controllerCalls.join("|"),
+			"equal bytes use the same identity-safe same-path permit sequence",
 		);
-		assertEq(
-			presentationRetried.controllerCalls.filter((call) => call === "consume-presentation").length,
-			1,
-			"only the fresh presentation plan consumes a one-shot permit",
-		);
-		assertEq(presentationRetried.handoffCleared, true, "presentation retry closes the handoff");
-		const completionRetried = task9Scenarios.completionRetried;
-		assertEq(
-			completionRetried.boundPath,
-			"Notes/task9-browser-completion-retried-B.md",
-			"a transient completion replan retries the same host receipt and eventually binds B",
-		);
-		assertEq(
-			completionRetried.controllerCalls.filter((call) => call === "consume-presentation").length,
-			1,
-			"completion retry never consumes a second presentation permit",
-		);
-		assertEq(
-			completionRetried.controllerCalls.filter((call) => call === "complete-presentation").length,
-			2,
-			"completion retry revalidates the same completed host mutation",
-		);
-		assertEq(completionRetried.handoffCleared, true, "completion retry closes the handoff");
+		assertEq(identical.recoveryPersistRequests, 0, "equal-byte transition creates no recovery");
+		assertEq(identical.handoffCleared, true, "equal-byte B admission leaves stable state");
+
 		const superseded = task9Scenarios.superseded;
-		assertEq(superseded.beforeReceipt.cmContent, "source before supersession", "stale B never enters CM before C proof");
-		assertEq(superseded.cmContent, "current target C", "only the current C host load is presented");
-		assertEq(superseded.yContent, "current target C", "only C Y.Text becomes bound authority");
-		assertEq(superseded.boundPath, "Notes/task9-browser-superseded-C.md", "B presentation cannot bind across C supersession");
-		assertEq(superseded.sourceUndoDestroyed, 1, "A authority detaches once across B-to-C supersession");
 		assertEq(
-			superseded.beforeReceipt.originalSaveCalls,
-			1,
-			"only proven source A is saved while unproven B rolls its exact held receipt",
-		);
-		assertEq(superseded.handoffCleared, true, "C binding closes the superseded handoff");
-		assertEq(
-			superseded.controllerCalls.filter((call) => call === "request-presentation").length,
-			2,
-			"B and C each request proof without sharing a permit",
+			superseded.firstTargetPresentation.cmContent,
+			"stale target B",
+			"superseded flow still presents B locally before C is selected",
 		);
 		assertEq(
-			superseded.controllerCalls.filter((call) => call === "consume-presentation").length,
-			1,
-			"only C consumes a presentation permit",
+			superseded.firstTargetPresentation.viewData,
+			"stale target B",
+			"superseded flow publishes B to the host cache before C",
 		);
+			assertEq(
+				superseded.firstTargetPresentation.gateClosed,
+			false,
+				"locally presented B remains editable while its admission is unresolved",
+			);
+			assertEq(
+				[
+					superseded.inputOnB.cmContent,
+					superseded.inputOnB.viewData,
+					superseded.inputOnB.undoDepth,
+				].join("|"),
+				"stale target B!|stale target B!|1",
+				"input immediately before C advances only the visible B editor and host cache",
+			);
+			assertEq(
+				[
+					superseded.inputOnB.ytextA,
+					superseded.inputOnB.ytextB,
+				].join("|"),
+				"source before supersession|stale target B",
+				"pre-C B input does not transiently mutate A or unresolved B CRDT",
+			);
+			assertEq(
+				superseded.hostSaveSnapshots.filter(
+					(snapshot) => snapshot.path === "Notes/task9-browser-superseded-B.md"
+						&& snapshot.content === "stale target B!",
+				).length,
+				1,
+				"the B successor reaches the host save boundary once before C replaces it",
+			);
+			assertEq(
+				superseded.transitionCmDocuments.join("|"),
+				["stale target B", "stale target B!", "current target C"].join("|"),
+				"B input and C presentation occur once each with no rollback to A",
+			);
+			assertEq(superseded.cmContent, "current target C", "C remains the displayed target");
+			assertEq(
+				superseded.undoDepth,
+				0,
+				"C starts with fresh native history and cannot undo back into B",
+			);
+		assertEq(superseded.yContent, "current target C", "only exact C becomes bound authority");
+		assertEq(
+			superseded.boundPath,
+			"Notes/task9-browser-superseded-C.md",
+			"the unresolved B admission cannot bind across C supersession",
+		);
+			assertEq(
+				superseded.adoptionRequestPaths.length >= 2
+					&& superseded.adoptionRequestPaths.at(-1)
+						=== "Notes/task9-browser-superseded-C.md"
+					&& superseded.adoptionRequestPaths.slice(0, -1).every(
+						(path) => path === "Notes/task9-browser-superseded-B.md",
+					),
+				true,
+				"B and C keep distinct same-path admission identities",
+			);
+			assertEq(
+				superseded.adoptionRequestOutcomes.length >= 2
+					&& superseded.adoptionRequestOutcomes.at(-1) === "planned"
+					&& superseded.adoptionRequestOutcomes.slice(0, -1).every(
+						(outcome) => outcome === "unresolved",
+					),
+				true,
+				"B admission remains unresolved while C receives a fresh plan",
+			);
+			assertEq(
+				superseded.controllerCalls.filter(
+					(call) => call === "request-same-path-adoption",
+				).length,
+				superseded.adoptionRequestPaths.length,
+				"every B or C adoption has exactly one controller request",
+			);
+			assertEq(
+				superseded.controllerCalls.slice(-3).join("|"),
+				"consume-same-path-mutation|consume-same-path-bind|note-same-path-bound",
+				"only C consumes mutation and bind authority after supersession",
+		);
+		assertEq(superseded.sourceUndoDestroyed, 1, "A authority detaches once across B-to-C");
+		assertEq(superseded.recoveryPersistRequests, 0, "B-to-C supersession creates no recovery");
+		assertEq(superseded.handoffCleared, true, "C admission leaves stable state");
 	}
 }
 
@@ -6488,19 +7950,48 @@ console.log("\n--- Test 40: uncertain rename identity remains quarantined ---");
 		oldPath,
 		"unproven TFile replacement does not translate displayed lineage",
 	);
-	assertEq(session?.handoff?.targetFile, replacementFile, "uncertain rename retains exact target TFile");
-	assertEq(session?.handoff?.targetPath, renamedPath, "uncertain rename waits on target admission");
-	assertEq(admissions.length, 1, "uncertain rename requests one target admission");
-	assertEq(admissions[0]?.targetFile, replacementFile, "rename admission carries exact replacement TFile");
+	assertEq(session?.handoff, null, "uncertain rename mints no automatic handoff");
+	assertEq(admissions.length, 0, "uncertain rename requests no target admission");
+	const uncertainRuntime = (manager as unknown as {
+		managedSessions: Map<string, {
+			transitionInputFence: {
+				state: string;
+				targetFile: unknown;
+				targetPath: string;
+			} | null;
+			emergencySaveFence: { isCurrent(): boolean } | null;
+		}>;
+	}).managedSessions.get("leaf-1");
+	assertEq(
+		uncertainRuntime?.transitionInputFence?.state,
+		"reopen-required",
+		"uncertain rename retains an explicit reopen boundary",
+	);
+	assertEq(
+		uncertainRuntime?.transitionInputFence?.targetFile,
+		replacementFile,
+		"uncertain rename terminal retains the exact replacement identity",
+	);
+	assertEq(
+		uncertainRuntime?.transitionInputFence?.targetPath,
+		renamedPath,
+		"uncertain rename terminal retains the exact replacement path",
+	);
+	assertEq(
+		uncertainRuntime?.emergencySaveFence?.isCurrent(),
+		true,
+		"uncertain rename blocks native saves until explicit reopen",
+	);
 	assertEq(
 		manager.capturePathEditorAuthority(renamedPath).kind,
 		"blocked",
 		"uncertain rename keeps the path authority gate closed",
 	);
+	manager.reconcileManagedWorkspaceViews([], "test-40-close");
 	clearPendingHealthChecks(manager);
 }
 
-console.log("\n--- Test 41: public A-to-B-to-C wakes supersede the detached B generation ---");
+console.log("\n--- Test 41: public A-to-B-to-C wakes stay inside one observed terminal owner ---");
 {
 	const admissions: Array<{
 		targetFile: unknown;
@@ -6528,29 +8019,28 @@ console.log("\n--- Test 41: public A-to-B-to-C wakes supersede the detached B ge
 	(binding.view as unknown as { file: unknown }).file = fileC;
 	manager.bind(binding.view as never, "TestDevice");
 	const current = manager.getManagedSession(binding.view as never);
+	const terminalRuntime = (manager as unknown as {
+		managedSessions: Map<string, {
+			transitionInputFence: { state: string; targetFile: unknown; targetPath: string } | null;
+			emergencySaveFence: { isCurrent(): boolean } | null;
+		}>;
+	}).managedSessions.get("leaf-1");
 
-	assertEq(manager.getBinding(binding.view as never), null, "first public wake detaches A binding");
-	assertEq(undoDestroyCalls, 1, "A UndoManager is destroyed once across B-to-C supersession");
-	assertEq(admissions.length, 2, "B and C each request one exact admission wake");
-	assertEq(admissions[0]?.targetFile, fileB, "first wake carries exact B TFile");
-	assertEq(admissions[0]?.handoffGeneration, generationB, "B wake carries the B generation");
-	assertEq(admissions[1]?.targetFile, fileC, "second wake carries exact C TFile");
-	assertEq(
-		admissions[1]?.handoffGeneration,
-		current?.generation,
-		"C wake carries only the current C generation",
-	);
-	assertEq(
-		(admissions[1]?.handoffGeneration ?? -1) > generationB,
-		true,
-		"C never reuses the detached B generation",
-	);
-	assertEq(current?.handoff?.targetFile, fileC, "managed handoff retains only C target identity");
+	assertEq(manager.getBinding(binding.view as never), binding, "unprovable source binding remains owned until reopen");
+	assertEq(undoDestroyCalls, 0, "unprovable A binding is never silently detached");
+	assertEq(admissions.length, 0, "B and C create no target admission wakes");
+	assertEq(current?.generation, generationB, "B-to-C terminal retargeting advances no handoff generation");
+	assertEq(current?.handoff, null, "B-to-C terminal retargeting mints no handoff");
+	assertEq(terminalRuntime?.transitionInputFence?.state, "reopen-required", "terminal fence remains reopen-required");
+	assertEq(terminalRuntime?.transitionInputFence?.targetFile, fileC, "terminal owner retains only current C identity");
+	assertEq(terminalRuntime?.transitionInputFence?.targetPath, fileC.path, "terminal owner retains only current C path");
+	assertEq(terminalRuntime?.emergencySaveFence?.isCurrent(), true, "B-to-C keeps native saving blocked");
 	assertEq(
 		current?.displayedLineage.kind === "known" ? current.displayedLineage.file : null,
 		binding.file,
 		"B-to-C supersession retains source A displayed lineage",
 	);
+	manager.reconcileManagedWorkspaceViews([], "test-41-close");
 	clearPendingHealthChecks(manager);
 }
 
@@ -6605,6 +8095,7 @@ console.log("\n--- Test 42a: exact stable presentation opens the initial null-co
 	if (!runtime) throw new Error("Expected late-managed runtime");
 	const hostMethod = () => {};
 	runtime.hostGuard = {
+		cancelTerminalHostLifecycle: () => true,
 		markInert: () => true,
 		restoreIfCurrent: () => true,
 		snapshot: () => ({
@@ -6617,12 +8108,18 @@ console.log("\n--- Test 42a: exact stable presentation opens the initial null-co
 			hostCapability: "owned-scheduler-with-unload-flush",
 			hostCapabilityState: "ready",
 			saveEpoch: 0,
+			pendingLoadEpoch: 0,
 			clearLoadCapability: "observable",
+			wrappersCurrent: true,
+			loadWrappersCurrent: true,
+			emergencySaveBlocked: false,
 			mode: { kind: "pass-through" },
 			inFlight: new Map(),
 			pendingTargetSave: false,
 			pendingOwnedSave: null,
 			sourceUnload: null,
+			pendingDeferredLoadAdmission: null,
+			pendingSourceUnloadDrain: null,
 		}),
 	};
 	let gateClosed = true;
@@ -6703,19 +8200,28 @@ console.log("\n--- Test 43: same-path TFile replacement fences user, provider, a
 	});
 	binding.ytext.unobserve(observeOld);
 	const userSession = manager.getManagedSession(binding.view as never);
-	assertEq(userFence !== null, true, "user extender removes old yCollab on same-path replacement");
-	assertEq(manager.getBinding(binding.view as never), null, "user lane detaches old binding");
+	assertEq(userFence !== null, true, "user extender rejects input on same-path identity replacement");
+	assertEq(manager.getBinding(binding.view as never), binding, "unprovable source binding remains owned behind terminal fences");
 	assertEq(oldYTextMutations, 0, "user lane performs no old-Y.Text mutation");
-	assertEq(userSession?.handoff?.targetFile, replacementFile, "user handoff targets exact replacement TFile");
+	assertEq(userSession?.handoff, null, "user lane mints no automatic handoff");
 	const handoffContext = (manager as unknown as {
 		getCodeMirrorHandoffContext: (leafId: string) => {
 			kind?: string;
 			targetFile?: unknown;
 		} | null;
 	}).getCodeMirrorHandoffContext("leaf-1");
-	assertEq(handoffContext?.kind, "handoff", "Task4 final context enters the closed handoff lane");
-	assertEq(handoffContext?.targetFile, replacementFile, "Task4 handoff context carries exact replacement TFile");
-	assertEq(admissions.length, 1, "same-path replacement waits for controller admission");
+	assertEq(handoffContext, null, "same-path identity replacement has no usable editor authority context");
+	assertEq(admissions.length, 0, "same-path replacement creates no controller admission");
+	const userRuntime = (manager as unknown as {
+		managedSessions: Map<string, {
+			transitionInputFence: { state: string; targetFile: unknown } | null;
+			emergencySaveFence: { isCurrent(): boolean } | null;
+		}>;
+	}).managedSessions.get("leaf-1");
+	assertEq(userRuntime?.transitionInputFence?.state, "reopen-required", "user lane retains terminal input ownership");
+	assertEq(userRuntime?.transitionInputFence?.targetFile, replacementFile, "user terminal owner keeps replacement identity");
+	assertEq(userRuntime?.emergencySaveFence?.isCurrent(), true, "user lane retains native-save ownership");
+	manager.reconcileManagedWorkspaceViews([], "test-43-user-close");
 	clearPendingHealthChecks(manager);
 }
 {
@@ -6739,9 +8245,19 @@ console.log("\n--- Test 43: same-path TFile replacement fences user, provider, a
 	});
 	assertEq(Array.isArray(providerResult), true, "provider patch is cancelled before old yCollab projection");
 	assertEq((providerResult as unknown[]).length, 0, "provider cancellation has no doc change");
-	assertEq(manager.getBinding(binding.view as never), null, "provider lane detaches old binding");
+	assertEq(manager.getBinding(binding.view as never), binding, "provider lane retains unprovable source ownership");
 	assertEq(binding.ytext.toString(), "server text", "provider lane leaves old Y.Text unchanged");
-	assertEq(admissions.length, 1, "provider replacement requests exact admission once");
+	assertEq(admissions.length, 0, "provider replacement creates no target admission");
+	const providerRuntime = (manager as unknown as {
+		managedSessions: Map<string, {
+			transitionInputFence: { state: string; targetFile: unknown } | null;
+			emergencySaveFence: { isCurrent(): boolean } | null;
+		}>;
+	}).managedSessions.get("leaf-1");
+	assertEq(providerRuntime?.transitionInputFence?.state, "reopen-required", "provider lane retains terminal input ownership");
+	assertEq(providerRuntime?.transitionInputFence?.targetFile, replacementFile, "provider terminal owner keeps replacement identity");
+	assertEq(providerRuntime?.emergencySaveFence?.isCurrent(), true, "provider lane retains native-save ownership");
+	manager.reconcileManagedWorkspaceViews([], "test-43-provider-close");
 	clearPendingHealthChecks(manager);
 }
 
@@ -6827,8 +8343,28 @@ console.log("\n--- Test 45: applyBinding never publishes across awareness, dispa
 	});
 	assertEq(applied, false, "awareness reentry invalidates binding publication");
 	assertEq(liveDispatches, 0, "stale awareness lease reaches no target CM dispatch");
-	assertEq(manager.getBinding(binding.view as never), null, "awareness reentry leaves old binding detached");
+	assertEq(
+		manager.getBinding(binding.view as never),
+		binding,
+		"awareness reentry retains the unprovable source binding behind the terminal boundary",
+	);
+	const awarenessRuntime = (manager as unknown as {
+		managedSessions: Map<string, {
+			transitionInputFence: { state: string; targetFile: unknown } | null;
+		}>;
+	}).managedSessions.get("leaf-1");
+	assertEq(
+		awarenessRuntime?.transitionInputFence?.state,
+		"reopen-required",
+		"awareness reentry closes on explicit reopen",
+	);
+	assertEq(
+		awarenessRuntime?.transitionInputFence?.targetFile,
+		fileC,
+		"awareness reentry terminal retains the exact replacement identity",
+	);
 	assertEq(binding.ytext.toString(), "server text", "awareness reentry mutates no Y.Text");
+	manager.reconcileManagedWorkspaceViews([], "test-45-awareness-close");
 	clearPendingHealthChecks(manager);
 }
 {
@@ -6870,11 +8406,27 @@ console.log("\n--- Test 45: applyBinding never publishes across awareness, dispa
 	assertEq(applied, false, "post-publication awareness reentry invalidates the outer apply");
 	assertEq(manager.getBinding(binding.view as never), null, "publication callback cannot retain stale binding");
 	assertEq(
-		manager.getManagedSession(binding.view as never)?.handoff?.targetFile,
+		manager.getManagedSession(binding.view as never)?.handoff,
+		null,
+		"publication callback mints no superseding handoff without selected provenance",
+	);
+	const publicationRuntime = (manager as unknown as {
+		managedSessions: Map<string, {
+			transitionInputFence: { state: string; targetFile: unknown } | null;
+		}>;
+	}).managedSessions.get("leaf-1");
+	assertEq(
+		publicationRuntime?.transitionInputFence?.state,
+		"reopen-required",
+		"publication callback retains a terminal input owner",
+	);
+	assertEq(
+		publicationRuntime?.transitionInputFence?.targetFile,
 		fileC,
-		"publication callback leaves only the superseding C handoff",
+		"publication callback terminal retains exact C identity",
 	);
 	assertEq(binding.ytext.toString(), "server text", "publication callback mutates no Y.Text");
+	manager.reconcileManagedWorkspaceViews([], "test-45-publication-close");
 	clearPendingHealthChecks(manager);
 }
 {
@@ -6961,8 +8513,28 @@ console.log("\n--- Test 45: applyBinding never publishes across awareness, dispa
 	});
 	assertEq(reentered, true, "post-dispatch host read exercises synchronous reentry");
 	assertEq(applied, false, "final central continuation CAS rejects host-read reentry");
-	assertEq(manager.getBinding(binding.view as never), null, "host-read reentry publishes no stale binding");
+	assertEq(
+		manager.getBinding(binding.view as never),
+		binding,
+		"host-read reentry retains the unprovable source binding behind the terminal boundary",
+	);
+	const hostReadRuntime = (manager as unknown as {
+		managedSessions: Map<string, {
+			transitionInputFence: { state: string; targetFile: unknown } | null;
+		}>;
+	}).managedSessions.get("leaf-1");
+	assertEq(
+		hostReadRuntime?.transitionInputFence?.state,
+		"reopen-required",
+		"host-read reentry closes on explicit reopen",
+	);
+	assertEq(
+		hostReadRuntime?.transitionInputFence?.targetFile,
+		fileC,
+		"host-read terminal retains the exact replacement identity",
+	);
 	assertEq(binding.ytext.toString(), "server text", "host-read reentry mutates no Y.Text");
+	manager.reconcileManagedWorkspaceViews([], "test-45-host-read-close");
 	clearPendingHealthChecks(manager);
 }
 
@@ -7054,6 +8626,13 @@ for (const targetKind of ["excluded", "tombstoned"] as const) {
 		managedSessions: Map<string, {
 			cmGuard: { snapshot: () => { inert: boolean; gateClosed: boolean } } | null;
 		}>;
+		beginPathHandoff: (
+			view: unknown,
+			targetFile: unknown,
+			reason: string,
+			provenance: "selected",
+			sourceUnloadReceiptId: string,
+		) => boolean;
 		pendingAdmissionByLeafId: Map<string, unknown>;
 		vaultSync: {
 			getTextForPath: (path: string) => Y.Text | null;
@@ -7062,30 +8641,7 @@ for (const targetKind of ["excluded", "tombstoned"] as const) {
 		};
 	};
 	const managedRuntime = internals.managedSessions.get("leaf-1");
-	let guardInert = false;
-	let guardGateClosed = false;
-	const guard = {
-		refreshGate: () => {
-			guardGateClosed = !guardInert;
-			return true;
-		},
-		markInert: () => {
-			guardInert = true;
-			guardGateClosed = false;
-			return true;
-		},
-		restoreIfCurrent: () => {
-			guardInert = true;
-			guardGateClosed = false;
-			return true;
-		},
-		snapshot: () => ({
-			view: binding.cm,
-			inert: guardInert,
-			gateClosed: guardGateClosed,
-		}),
-	};
-	if (managedRuntime) managedRuntime.cmGuard = guard;
+	const guard = managedRuntime?.cmGuard ?? null;
 	let undoDestroyCalls = 0;
 	const originalDestroy = binding.undoManager.destroy.bind(binding.undoManager);
 	(binding.undoManager as unknown as { destroy: () => void }).destroy = () => {
@@ -7100,11 +8656,25 @@ for (const targetKind of ["excluded", "tombstoned"] as const) {
 		internals.vaultSync.isMarkdownTombstoned = (path) => path === targetFile.path;
 		internals.vaultSync.isPendingRenameTarget = () => false;
 	}
+	assertEq(
+		internals.beginPathHandoff(
+			binding.view,
+			targetFile,
+			`test-47-${targetKind}-selected`,
+			"selected",
+			`source-unload:test-47-${targetKind}`,
+		),
+		true,
+		`${targetKind}: exact host selection establishes the tested handoff`,
+	);
 	(binding.view as unknown as { file: unknown }).file = targetFile;
 	manager.bind(binding.view as never, "TestDevice");
 
 	const initialEffects = traceRecords
-		.filter((record) => record.msg === "handoff-effect-applied" && record.details?.reason === "bind")
+		.filter((record) => (
+			record.msg === "handoff-effect-applied"
+			&& record.details?.reason === `test-47-${targetKind}-selected`
+		))
 		.map((record) => record.details?.effect);
 	assertEq(initialEffects.length, 5, `${targetKind}: target selection applies five ordered effects`);
 	assertEq(initialEffects[0], "cancel-pending-save", `${targetKind}: pending save cancels first`);
@@ -7193,6 +8763,131 @@ console.log("\n--- Test 48: failed CodeMirror guard inerting retains its managed
 	clearPendingHealthChecks(manager);
 }
 
+console.log("\n--- Test 48a: an emergency host-save lease survives unmanage until explicit safe teardown ---");
+{
+	const { manager, binding, traceRecords } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const targetFile = { path: "Notes/emergency-save-fence-B.md" };
+	const handoffApi = manager as unknown as {
+		beginPathHandoff: (
+			view: unknown,
+			target: unknown,
+			reason: string,
+			provenance: "selected",
+			sourceUnloadReceiptId: string,
+		) => boolean;
+	};
+	assertEq(
+		handoffApi.beginPathHandoff(
+			binding.view,
+			targetFile,
+			"test-48a-selected",
+			"selected",
+			"source-unload:test-48a",
+		),
+		true,
+		"fixture establishes an exact selected A-to-B handoff",
+	);
+	(binding.view as unknown as { file: unknown }).file = targetFile;
+	const internals = manager as unknown as {
+		managedSessions: Map<string, {
+			session: ManagedLeafSession;
+			cmGuard: unknown;
+			hostGuard: unknown;
+			emergencySaveFence: unknown;
+		}>;
+	};
+	const runtime = internals.managedSessions.get("leaf-1");
+	if (!runtime) throw new Error("Expected managed runtime for emergency save-fence test");
+	assertEq(runtime.session.handoff !== null, true, "fixture enters an active A-to-B handoff");
+	let cmMarkInertCalls = 0;
+	let cmRestoreCalls = 0;
+	let hostRestoreCalls = 0;
+	let emergencyRefreshCalls = 0;
+	let emergencyReleaseCalls = 0;
+	let emergencyReleased = false;
+	runtime.cmGuard = {
+		refreshGate: () => true,
+		markInert: () => {
+			cmMarkInertCalls += 1;
+			return true;
+		},
+		restoreIfCurrent: () => {
+			cmRestoreCalls += 1;
+			return true;
+		},
+		snapshot: () => ({
+			gateClosed: true,
+			gateFailureReason: null,
+			commitState: "none",
+		}),
+	};
+	const emergencyFence = Object.freeze({
+		view: binding.view,
+		refresh: (): boolean => {
+			emergencyRefreshCalls += 1;
+			return !emergencyReleased;
+		},
+		isCurrent: (): boolean => !emergencyReleased,
+		release: (): boolean => {
+			if (emergencyReleased) return false;
+			emergencyReleased = true;
+			emergencyReleaseCalls += 1;
+			return true;
+		},
+	});
+	runtime.hostGuard = {
+		acquireEmergencySaveFence: () => emergencyFence,
+		beginBlockingHandoff: () => {},
+		markInert: () => {},
+		restoreIfCurrent: () => {
+			hostRestoreCalls += 1;
+			return true;
+		},
+		snapshot: () => ({
+			view: binding.view,
+			mode: { kind: "blocking-handoff" },
+		}),
+	};
+	runtime.emergencySaveFence = emergencyFence;
+
+	const unmanaged = manager.unmanageView(binding.view as never, "capability-lost-terminal");
+	assertEq(unmanaged, false, "active emergency save ownership rejects ordinary unmanage");
+	assertEq(emergencyRefreshCalls, 1, "ordinary unmanage revalidates the emergency wrapper identities");
+	assertEq(emergencyReleaseCalls, 0, "ordinary unmanage cannot release the emergency save owner");
+	assertEq(cmMarkInertCalls, 0, "ordinary unmanage cannot open the CodeMirror gate");
+	assertEq(cmRestoreCalls, 0, "ordinary unmanage cannot restore CodeMirror wrappers");
+	assertEq(hostRestoreCalls, 0, "ordinary unmanage cannot restore native save wrappers");
+	assertEq(
+		internals.managedSessions.get("leaf-1"),
+		runtime,
+		"ordinary unmanage retains the exact managed runtime",
+	);
+	assertEq(
+		traceRecords.some((record) => record.msg === "managed-view-emergency-save-fence-retained"),
+		true,
+		"ordinary unmanage records retained emergency ownership",
+	);
+
+	assertEq(
+		manager.reconcileManagedWorkspaceViews([], "test-explicit-close"),
+		1,
+		"exact workspace removal is an explicit safe teardown boundary",
+	);
+	assertEq(emergencyReleaseCalls, 1, "explicit safe teardown releases the emergency owner once");
+	assertEq(cmMarkInertCalls, 1, "explicit safe teardown may inert CodeMirror after release");
+	assertEq(cmRestoreCalls, 1, "explicit safe teardown restores CodeMirror wrappers after release");
+	assertEq(hostRestoreCalls, 1, "explicit safe teardown restores native save wrappers after release");
+	assertEq(
+		internals.managedSessions.has("leaf-1"),
+		false,
+		"explicit safe teardown removes managed ownership",
+	);
+	clearPendingHealthChecks(manager);
+}
+
 console.log("\n--- Test 49: unmanaged equal-bytes CM never becomes target lineage by observation ---");
 {
 	const { manager, binding, setLiveEditorContent } = buildManagerFixture({
@@ -7266,13 +8961,39 @@ console.log("\n--- Test 51: workspace wakeups never fabricate switch-intent prov
 	(binding.view as unknown as { file: unknown }).file = observedFile;
 	manager.bind(binding.view as never, "TestDevice");
 	const session = manager.getManagedSession(binding.view as never);
+	const runtime = (manager as unknown as {
+		managedSessions: Map<string, {
+			transitionInputFence: { state: string; targetFile: unknown } | null;
+			emergencySaveFence: { isCurrent(): boolean } | null;
+		}>;
+	}).managedSessions.get("leaf-1");
 
-	assertEq(session?.handoff?.targetFile, observedFile, "wake observation still closes the B handoff gate");
+	assertEq(
+		session?.handoff,
+		null,
+		"wake observation never fabricates a selected A-to-B handoff",
+	);
 	assertEq(
 		session?.currentSwitchIntentSeq ?? null,
 		null,
 		"bind wake observation does not claim a guarded host switch intent",
 	);
+	assertEq(
+		runtime?.transitionInputFence?.state,
+		"reopen-required",
+		"unselected wake mismatch stays behind the explicit reopen boundary",
+	);
+	assertEq(
+		runtime?.transitionInputFence?.targetFile,
+		observedFile,
+		"the terminal wake owner retains the exact observed target identity",
+	);
+	assertEq(
+		runtime?.emergencySaveFence?.isCurrent(),
+		true,
+		"unselected wake mismatch also retains native-save ownership",
+	);
+	manager.reconcileManagedWorkspaceViews([], "test-51-close");
 	clearPendingHealthChecks(manager);
 }
 
@@ -7634,6 +9355,11 @@ console.log("\n--- Test 58: stable IME receipt certifies only the exact same-CM 
 				cm: object;
 				startDocument: object;
 				finalDocument: object;
+				samePathDispatch: Readonly<{
+					batchStartDocument: object;
+					nativeHistoryEpochBefore: number;
+					nativeHistoryEpochAfter: number;
+				}>;
 			}>,
 		): boolean;
 		acceptHostLoadCandidate(candidate: PendingHostLoadCandidate): boolean;
@@ -7807,9 +9533,347 @@ console.log("\n--- Test 58: stable IME receipt certifies only the exact same-CM 
 	assertEq(runtime.session.completedSamePathInput, null, "certified pre-clear consumes its one-shot completion receipt");
 	assertEq(
 		appliedEffects.join(","),
-		"host-preclear-candidate-held,request-target-presentation",
+		"host-preclear-candidate-held",
 		"certified pre-clear uses the dedicated effect boundary",
 	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 58b: unload waits for the exact active A input, then owns one target-less fence ---");
+{
+	const { manager, binding, traceRecords, setLiveEditorContent } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	type DrainRuntime = {
+		session: ManagedLeafSession;
+		sourceUnloadDrain: {
+			state: string;
+			reservation: ManagedLeafInputStartReservation | null;
+			targetSelectionToken: object | null;
+		} | null;
+		cmGuard: {
+			snapshot(): Readonly<{
+				inert: boolean;
+				sourceUnloadDrain: Readonly<{
+					reservation: ManagedLeafInputStartReservation;
+				}> | null;
+				targetSelectionFence: object | null;
+			}>;
+		} | null;
+	};
+	const internals = manager as unknown as {
+		managedSessions: Map<string, DrainRuntime>;
+		editorRevisionByCm: WeakMap<object, number>;
+		beginSourceUnloadDrain(
+			runtime: DrainRuntime,
+			sourceFile: unknown,
+		): null | PromiseLike<void>;
+		acceptSamePathInputCompletion(
+			runtime: DrainRuntime,
+			completion: Readonly<{
+				reservation: ManagedLeafInputStartReservation;
+				cm: object;
+				startDocument: object;
+				finalDocument: object;
+				samePathDispatch: Readonly<{
+					batchStartDocument: object;
+					nativeHistoryEpochBefore: number;
+					nativeHistoryEpochAfter: number;
+				}>;
+			}>,
+		): boolean;
+	};
+	const runtime = internals.managedSessions.get("leaf-1");
+	if (!runtime?.cmGuard) throw new Error("Expected managed drain runtime");
+	const source = runtime.session.displayedLineage;
+	if (source.kind !== "known") throw new Error("Expected known source lineage");
+
+	const sourceState = EditorState.create({ doc: source.document.toString() });
+	const cmState = (binding.cm as unknown as { state: Record<string, unknown> }).state;
+	(binding.cm as unknown as { state: Record<string, unknown> }).state = {
+		...cmState,
+		doc: sourceState.doc,
+	};
+	runtime.session = {
+		...runtime.session,
+		displayedLineage: {
+			...source,
+			document: sourceState.doc,
+		},
+	};
+	const reserved = reserveManagedLeafInputStart(runtime.session, {
+		sessionId: runtime.session.sessionId,
+		expectedGeneration: runtime.session.generation,
+		inputEpoch: 1,
+		compositionEpoch: null,
+	});
+	if (!reserved.accepted || reserved.state.pendingInputStartReservation === null) {
+		throw new Error("Expected exact A input reservation");
+	}
+	const reservation = reserved.state.pendingInputStartReservation;
+	runtime.session = reserved.state;
+
+	let drainSettled = false;
+	let drainRejected = false;
+	const drain = internals.beginSourceUnloadDrain(runtime, source.file);
+	if (drain === null) throw new Error("Active A input must return a drain promise");
+	void Promise.resolve(drain).then(
+		() => { drainSettled = true; },
+		() => { drainRejected = true; },
+	);
+	assertEq(runtime.sourceUnloadDrain?.state, "draining", "native unload owns the exact A input lane");
+	assertEq(
+		runtime.cmGuard.snapshot().sourceUnloadDrain?.reservation,
+		reservation,
+		"CodeMirror exposes only the reducer-owned predecessor reservation",
+	);
+	assertEq(drainSettled, false, "native unload has not entered while A input is unresolved");
+	const prematureTarget = reduceManagedLeafSession(runtime.session, {
+		type: "target-selected",
+		sessionId: runtime.session.sessionId,
+		expectedGeneration: runtime.session.generation,
+		targetFile: { path: "Notes/source-drain-B.md" } as typeof source.file,
+		switchIntentSeq: runtime.session.eventOrderSeq + 1,
+		sourceUnloadReceiptId: "source-unload:premature",
+	});
+	assertEq(prematureTarget.accepted, false, "B selection cannot overtake the unresolved A input");
+
+	const finalState = sourceState.update({
+		changes: { from: sourceState.doc.length, insert: "x" },
+	});
+	(binding.cm as unknown as { state: Record<string, unknown> }).state = {
+		...(binding.cm as unknown as { state: Record<string, unknown> }).state,
+		doc: finalState.state.doc,
+	};
+	setLiveEditorContent(finalState.state.doc.toString());
+	runtime.session = {
+		...runtime.session,
+		displayedLineage: {
+			...source,
+			document: finalState.state.doc,
+			editorRevision: 1,
+		},
+	};
+	internals.editorRevisionByCm.set(binding.cm, 1);
+	const settleDrain = captureSingleMicrotask(() => {
+		assertEq(
+			internals.acceptSamePathInputCompletion(runtime, {
+				reservation,
+				cm: binding.cm,
+				startDocument: sourceState.doc,
+				finalDocument: finalState.state.doc,
+				samePathDispatch: {
+					batchStartDocument: sourceState.doc,
+					nativeHistoryEpochBefore: 0,
+					nativeHistoryEpochAfter: 1,
+				},
+			}),
+			true,
+			"the exact A+x successor completes the owned lane once",
+		);
+	});
+	assertEq(drainSettled, false, "completion waits for the queued fence publication boundary");
+	assertEq(runtime.sourceUnloadDrain?.state, "draining", "the source owner remains singular before publication");
+	settleDrain();
+	await Promise.resolve();
+	await Promise.resolve();
+	const drainTerminal = traceRecords.find(
+		(record) => record.msg === "source-unload-drain-terminal",
+	);
+	const drainFenceRejected = traceRecords.find(
+		(record) => record.msg === "source-unload-drain-fence-cas-rejected",
+	);
+	assertEq(
+		drainTerminal === undefined
+			? null
+			: `${String(drainTerminal.details?.reason)}:${JSON.stringify(drainFenceRejected?.details ?? null)}`,
+		null,
+		"exact A completion never emits a source-drain terminal reason",
+	);
+	assertEq(drainSettled, true, "the exact A completion releases native unload");
+	assertEq(drainRejected, false, "exact A completion never enters terminal recovery");
+	assertEq(runtime.sourceUnloadDrain?.state, "fenced", "settled A input converts to one target-less fence");
+	assertEq(
+		runtime.cmGuard.snapshot().sourceUnloadDrain,
+		null,
+		"target-less fence consumes the CodeMirror drain owner",
+	);
+	assertEq(
+		runtime.cmGuard.snapshot().targetSelectionFence,
+		runtime.sourceUnloadDrain?.targetSelectionToken ?? null,
+		"manager and CodeMirror retain the same single target-less token",
+	);
+
+	const closingGuard = runtime.cmGuard;
+	assertEq(
+		manager.reconcileManagedWorkspaceViews([], "test-58b-exact-close"),
+		1,
+		"exact workspace removal consumes the retained source owner",
+	);
+	assertEq(runtime.sourceUnloadDrain, null, "exact close releases the manager source-drain owner");
+	assertEq(closingGuard.snapshot().targetSelectionFence, null, "exact close releases its target-less token");
+	assertEq(closingGuard.snapshot().inert, true, "exact close leaves the retired CodeMirror guard inert");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 58c: ambiguous A input rejects unload and never creates replay authority ---");
+{
+	let recoveryPersistCalls = 0;
+	let exportOffers = 0;
+	let exportedContent: string | null = null;
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		handoffRecoveryActionHost: {
+			chooseVerifiedExporter: async () => {
+				exportOffers += 1;
+				return async (content: string) => { exportedContent = content; };
+			},
+		},
+	});
+	Object.assign(binding.view, {
+		data: "typing now",
+		getViewData: () => binding.cm.state.doc.toString(),
+	});
+	type AmbiguousRuntime = {
+		session: ManagedLeafSession;
+		sourceUnloadDrain: {
+			state: string;
+			targetSelectionToken: object | null;
+		} | null;
+		emergencySaveFence: { isCurrent(): boolean } | null;
+		cmGuard: {
+			snapshot(): Readonly<{
+				inert: boolean;
+				gateClosed: boolean;
+				targetSelectionFence: object | null;
+			}>;
+		} | null;
+	};
+	const internals = manager as unknown as {
+		managedSessions: Map<string, AmbiguousRuntime>;
+		beginSourceUnloadDrain(
+			runtime: AmbiguousRuntime,
+			sourceFile: unknown,
+		): null | PromiseLike<void>;
+		acceptSamePathInputRejection(
+			runtime: AmbiguousRuntime,
+			rejection: Readonly<{
+				reservation: ManagedLeafInputStartReservation;
+				cm: object;
+				startDocument: object;
+				finalDocument: object;
+				reason: "input-result-ambiguous";
+				samePathDispatch: Readonly<{
+					batchStartDocument: object;
+					nativeHistoryEpochBefore: number;
+					nativeHistoryEpochAfter: number;
+				}>;
+			}>,
+		): boolean;
+		beginPathHandoff(
+			view: unknown,
+			targetFile: unknown,
+			reason: string,
+			provenance: "selected",
+			sourceUnloadReceiptId: string,
+		): boolean;
+	};
+	const runtime = internals.managedSessions.get("leaf-1");
+	if (!runtime?.cmGuard) throw new Error("Expected managed ambiguous-input runtime");
+	const source = runtime.session.displayedLineage;
+	if (source.kind !== "known") throw new Error("Expected known source lineage");
+	const sourceState = EditorState.create({ doc: source.document.toString() });
+	const cmState = (binding.cm as unknown as { state: Record<string, unknown> }).state;
+	(binding.cm as unknown as { state: Record<string, unknown> }).state = {
+		...cmState,
+		doc: sourceState.doc,
+	};
+	runtime.session = {
+		...runtime.session,
+		displayedLineage: {
+			...source,
+			document: sourceState.doc,
+		},
+	};
+	const reserved = reserveManagedLeafInputStart(runtime.session, {
+		sessionId: runtime.session.sessionId,
+		expectedGeneration: runtime.session.generation,
+		inputEpoch: 7,
+		compositionEpoch: null,
+	});
+	if (!reserved.accepted || reserved.state.pendingInputStartReservation === null) {
+		throw new Error("Expected ambiguous-input reservation");
+	}
+	const reservation = reserved.state.pendingInputStartReservation;
+	runtime.session = reserved.state;
+	const drain = internals.beginSourceUnloadDrain(runtime, source.file);
+	if (drain === null) throw new Error("Ambiguous input must hold native unload");
+	let drainOutcome = "pending";
+	void Promise.resolve(drain).then(
+		() => { drainOutcome = "fulfilled"; },
+		() => { drainOutcome = "rejected"; },
+	);
+	assertEq(
+		internals.acceptSamePathInputRejection(runtime, {
+			reservation,
+			cm: binding.cm,
+			startDocument: sourceState.doc,
+			finalDocument: sourceState.doc,
+			reason: "input-result-ambiguous",
+			samePathDispatch: {
+				batchStartDocument: sourceState.doc,
+				nativeHistoryEpochBefore: 0,
+				nativeHistoryEpochAfter: 0,
+			},
+		}),
+		true,
+		"the reducer consumes the ambiguous predecessor exactly once",
+	);
+	await Promise.resolve();
+	await Promise.resolve();
+	await Promise.resolve();
+	assertEq(drainOutcome, "rejected", "ambiguous predecessor rejects native unload");
+	assertEq(runtime.sourceUnloadDrain?.state, "terminal", "ambiguity retains a persistent terminal owner");
+	assertEq(runtime.cmGuard.snapshot().gateClosed, true, "terminal ambiguity keeps fresh input fenced");
+	assertEq(
+		runtime.cmGuard.snapshot().targetSelectionFence,
+		runtime.sourceUnloadDrain?.targetSelectionToken ?? null,
+		"terminal ambiguity retains one manager-owned target-less token",
+	);
+	assertEq(runtime.emergencySaveFence?.isCurrent(), true, "terminal ambiguity blocks native saves");
+	assertEq(recoveryPersistCalls, 0, "ambiguous input creates no hidden recovery persistence");
+	assertEq(
+		Reflect.has(internals, "orphanSamePathInputWatches"),
+		false,
+		"the old orphan replay registry no longer exists",
+	);
+	assertEq(exportOffers, 1, "terminal ambiguity offers one explicit verified export");
+	assertEq(exportedContent, "typing now", "verified export receives only stable visible A bytes");
+	const targetFile = { path: "Notes/ambiguous-input-B.md" };
+	assertEq(
+		internals.beginPathHandoff(
+			binding.view,
+			targetFile,
+			"test-58c-ambiguous",
+			"selected",
+			"source-unload:ambiguous-must-not-exist",
+		),
+		false,
+		"B selection cannot escape a rejected source-unload owner",
+	);
+	assertEq(runtime.session.handoff, null, "ambiguous A input mints no B handoff or replay context");
+
+	const closingGuard = runtime.cmGuard;
+	assertEq(
+		manager.reconcileManagedWorkspaceViews([], "test-58c-exact-close"),
+		1,
+		"exact close consumes the terminal source owner",
+	);
+	assertEq(runtime.sourceUnloadDrain, null, "exact close releases the terminal manager owner");
+	assertEq(closingGuard.snapshot().targetSelectionFence, null, "exact close releases the terminal token");
+	assertEq(closingGuard.snapshot().inert, true, "exact close leaves the retired guard inert");
 	clearPendingHealthChecks(manager);
 }
 
@@ -7897,6 +9961,263 @@ console.log("\n--- Test 59: teardown starts pending owned saves before revoking 
 		);
 	}
 	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 60: plugin teardown releases only its exact emergency host-save owner ---");
+{
+	const runPluginTeardownCase = async (cmCanInert: boolean): Promise<void> => {
+		const caseLabel = cmCanInert ? "settled-cm" : "blocked-cm";
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		installManagedGuardStubs: false,
+	});
+	let nativeRequestSaveCalls = 0;
+	let nativeRunCalls = 0;
+	let nativeFlushCalls = 0;
+	let nativeSaveCalls = 0;
+	const originalRequestSave = Object.assign(
+		function requestSave(): void { nativeRequestSaveCalls += 1; },
+		{
+			cancel(): void {},
+			run(): void { nativeRunCalls += 1; },
+			flush(): void { nativeFlushCalls += 1; },
+		},
+	);
+	const originalSave = async function save(): Promise<void> {
+		nativeSaveCalls += 1;
+	};
+	const view = binding.view as unknown as {
+		file: { path: string } | null;
+		data: string;
+		dirty: boolean;
+		lastSavedData: string | null;
+		getViewData(): string;
+		onLoadFile(file: { path: string }): Promise<void>;
+		onUnloadFile(file: { path: string }): Promise<void>;
+		setViewData(data: string, clear: boolean): void;
+		requestSave: typeof originalRequestSave;
+		save: typeof originalSave;
+	};
+	view.data = "typing now";
+	view.dirty = false;
+	view.lastSavedData = "typing now";
+	view.getViewData = function getViewData(): string { return this.data; };
+	view.onLoadFile = async function onLoadFile(file): Promise<void> { this.file = file; };
+	view.onUnloadFile = async function onUnloadFile(_file): Promise<void> {};
+	view.setViewData = function setViewData(data, _clear): void { this.data = data; };
+	view.requestSave = originalRequestSave;
+	view.save = originalSave;
+
+	type TeardownCmGuard = {
+		refreshGate(): boolean;
+		markInert(): boolean;
+		restoreIfCurrent(): boolean;
+		snapshot(): Record<string, unknown>;
+	};
+	type TeardownHostGuard = {
+		acquireEmergencySaveFence(): Readonly<{
+			view: unknown;
+			refresh(): boolean;
+			isCurrent(): boolean;
+			release(): boolean;
+		}>;
+		beginBlockingHandoff(input: Readonly<{
+			handoffGeneration: number;
+			sourceLineagePath: string | null;
+			targetPath: string;
+		}>): void;
+		markInert(): void;
+		restoreIfCurrent(): void;
+		snapshot(): Record<string, unknown>;
+	};
+	type TeardownRuntime = {
+		session: ManagedLeafSession;
+		hostGuard: TeardownHostGuard | null;
+		emergencySaveFence: Readonly<{
+			view: unknown;
+			refresh(): boolean;
+			isCurrent(): boolean;
+			release(): boolean;
+		}> | null;
+		cmGuard: TeardownCmGuard | null;
+	};
+	type TeardownInternals = {
+		vaultSync: unknown;
+		managedSessions: Map<string, TeardownRuntime>;
+		installManagedCmGuard(runtime: TeardownRuntime, cm: unknown): boolean;
+	};
+	const internals = manager as unknown as TeardownInternals;
+	let cmInert = false;
+	let cmMarkInertCalls = 0;
+	let cmRestoreCalls = 0;
+	internals.installManagedCmGuard = (runtime, cm) => {
+		if (cm !== binding.cm) return false;
+		runtime.cmGuard = {
+			refreshGate: () => true,
+			markInert: () => {
+				cmMarkInertCalls += 1;
+				if (!cmCanInert) return false;
+				cmInert = true;
+				return true;
+			},
+			restoreIfCurrent: () => {
+				cmInert = true;
+				cmRestoreCalls += 1;
+				return true;
+			},
+			snapshot: () => ({
+				view: binding.cm,
+				inert: cmInert,
+				gateClosed: !cmInert && runtime.session.handoff !== null,
+				activeComposition: null,
+				pendingHostLoadCandidate: null,
+				commitState: "none",
+			}),
+		};
+		return true;
+	};
+	manager.manageView(binding.view as never);
+	const runtime = internals.managedSessions.get("leaf-1");
+	const oldGuard = runtime?.hostGuard ?? null;
+	if (!runtime || !oldGuard) throw new Error("Expected real managed guards for teardown owner test");
+	let hostRestoreCalls = 0;
+	const restoreOldHostGuard = oldGuard.restoreIfCurrent.bind(oldGuard);
+	oldGuard.restoreIfCurrent = () => {
+		hostRestoreCalls += 1;
+		restoreOldHostGuard();
+	};
+	const targetFile = { path: `Notes/plugin-teardown-B-${caseLabel}.md` };
+	view.file = targetFile;
+	const selected = reduceManagedLeafSession(runtime.session, {
+		type: "target-selected",
+		sessionId: runtime.session.sessionId,
+		expectedGeneration: runtime.session.generation,
+		targetFile: targetFile as never,
+		switchIntentSeq: runtime.session.eventOrderSeq + 1,
+		sourceUnloadReceiptId: `source-unload:plugin-teardown:${caseLabel}`,
+	});
+	const detached = reduceManagedLeafSession(selected.state, {
+		type: "detach-completed",
+		sessionId: selected.state.sessionId,
+		expectedGeneration: selected.state.generation,
+		bindingEpochAfterDetach: 60,
+	});
+	if (!selected.accepted || !detached.accepted) {
+		throw new Error("Expected an active A-to-B teardown handoff");
+	}
+	runtime.session = detached.state;
+	oldGuard.beginBlockingHandoff({
+		handoffGeneration: runtime.session.generation,
+		sourceLineagePath: runtime.session.handoff?.sourceAuthorityPath ?? null,
+		targetPath: targetFile.path,
+	});
+	const actualFence = oldGuard.acquireEmergencySaveFence();
+	let emergencyReleaseCalls = 0;
+	runtime.emergencySaveFence = Object.freeze({
+		view: actualFence.view,
+		refresh: () => actualFence.refresh(),
+		isCurrent: () => actualFence.isCurrent(),
+		release: () => {
+			emergencyReleaseCalls += 1;
+			return actualFence.release();
+		},
+	});
+
+	assertEq(
+		manager.unmanageView(binding.view as never, "ordinary-before-plugin-teardown"),
+		false,
+		"ordinary unmanage still rejects the active emergency owner",
+	);
+	assertEq(emergencyReleaseCalls, 0, "ordinary unmanage still releases no emergency owner");
+	view.requestSave();
+	view.requestSave.run();
+	view.requestSave.flush();
+	await view.save();
+	assertEq(
+		[nativeRequestSaveCalls, nativeRunCalls, nativeFlushCalls, nativeSaveCalls].join(","),
+		"0,0,0,0",
+		"all native save entry points remain blocked before teardown",
+	);
+
+	let replacementManager: EditorBindingManager | null = null;
+	try {
+		manager.revokeAsyncAuthority();
+		assertEq(
+			emergencyReleaseCalls,
+			0,
+			"async authority revocation retains the emergency owner across awaited teardown drains",
+		);
+		view.requestSave();
+		view.requestSave.run();
+		view.requestSave.flush();
+		await view.save();
+		assertEq(
+			[nativeRequestSaveCalls, nativeRunCalls, nativeFlushCalls, nativeSaveCalls].join(","),
+			"0,0,0,0",
+			"native saves remain suppressed after revoke and before synchronous unbind",
+		);
+		manager.unbindAll();
+		assertEq(emergencyReleaseCalls, 1, "plugin teardown releases the emergency owner exactly once");
+		assertEq(hostRestoreCalls, 1, "plugin teardown restores the host save wrapper exactly once");
+		assertEq(cmMarkInertCalls >= 1, true, "plugin teardown inerts the CodeMirror guard");
+		assertEq(
+			cmRestoreCalls,
+			cmCanInert ? 1 : 0,
+			cmCanInert
+				? "plugin teardown restores a settled CodeMirror wrapper once"
+				: "blocked CodeMirror teardown retains its reopen-required wrapper",
+		);
+		assertEq(
+			internals.managedSessions.has("leaf-1"),
+			!cmCanInert,
+			cmCanInert
+				? "plugin teardown removes the exact settled managed runtime"
+				: "plugin teardown may retain the blocked CM runtime without retaining host save ownership",
+		);
+		assertEq(view.requestSave, originalRequestSave, "plugin teardown restores native requestSave identity");
+		assertEq(view.save, originalSave, "plugin teardown restores native save identity");
+		view.requestSave();
+		view.requestSave.run();
+		view.requestSave.flush();
+		await view.save();
+		assertEq(
+			[nativeRequestSaveCalls, nativeRunCalls, nativeFlushCalls, nativeSaveCalls].join(","),
+			"1,1,1,1",
+			"restored native requestSave, run, flush, and save all delegate normally",
+		);
+
+		replacementManager = new EditorBindingManager(
+			internals.vaultSync as never,
+			false,
+			(path) => path.endsWith(".md"),
+		);
+		replacementManager.manageView(binding.view as never);
+		const replacementRuntime = (replacementManager as unknown as {
+			managedSessions: Map<string, { hostGuard: TeardownHostGuard | null }>;
+		}).managedSessions.get("leaf-1");
+		assertEq(
+			replacementRuntime?.hostGuard === oldGuard,
+			false,
+			"a new manager installs a fresh host guard instead of reusing the retired guard",
+		);
+	} finally {
+		// RED cleanup also retires an owner left behind by a failing implementation.
+		actualFence.release();
+		oldGuard.markInert();
+		oldGuard.restoreIfCurrent();
+		replacementManager?.revokeAsyncAuthority();
+		replacementManager?.unbindAll();
+		if (!cmCanInert) {
+			runtime.cmGuard = null;
+			manager.unbindAll();
+		}
+		clearPendingHealthChecks(manager);
+		if (replacementManager) clearPendingHealthChecks(replacementManager);
+	}
+	};
+	await runPluginTeardownCase(true);
+	await runPluginTeardownCase(false);
 }
 
 console.log("\n──────────────────────────────────────────────────");

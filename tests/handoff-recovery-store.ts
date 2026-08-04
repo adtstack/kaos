@@ -97,6 +97,13 @@ function jsonClone<T>(value: T): T {
 	return JSON.parse(JSON.stringify(value)) as T;
 }
 
+function recoveryPayload(
+	record: ActiveHandoffRecoveryRecord,
+): Omit<ActiveHandoffRecoveryRecord, "status" | "checksum"> {
+	const { status: _status, checksum: _checksum, ...payload } = record;
+	return payload;
+}
+
 function uniqueDbName(label: string): string {
 	return `kaos-handoff-recovery-${label}-${Date.now()}-${Math.random()}`;
 }
@@ -490,6 +497,21 @@ const replayPending = await withChecksum({
 }) as unknown as ActiveHandoffRecoveryRecord;
 assert.equal((await validateHandoffRecoveryRecord(replayPending)).status, "replay-pending");
 
+const strictReplayPending = await withChecksum({
+	...jsonClone(stored),
+	status: "replay-pending",
+	applyWitness: {
+		...witness,
+		kind: "strict-nonoverlap-rebase" as const,
+	},
+}) as unknown as ActiveHandoffRecoveryRecord;
+const validatedStrictReplayPending = await validateHandoffRecoveryRecord(strictReplayPending);
+assert.equal(validatedStrictReplayPending.status, "replay-pending");
+assert.equal(
+	(validatedStrictReplayPending as ActiveHandoffRecoveryRecord).applyWitness?.kind,
+	"strict-nonoverlap-rebase",
+);
+
 const replayedAwaiting = await withChecksum({
 	...jsonClone(replayPending),
 	status: "replayed-awaiting-settlement",
@@ -707,6 +729,56 @@ console.log("\n--- Handoff Recovery IndexedDB: frozen replay witness transitions
 	if (resolved.kind !== "updated") throw new Error("settled replay was not finalized");
 	assert.equal(resolved.record.status, "resolved");
 	assert.equal("body" in resolved.record, false);
+}
+
+console.log("\n--- Handoff Recovery IndexedDB: strict replay witness survives manual demotion ---");
+{
+	const dbName = uniqueDbName("strict-witness-demotion");
+	const store = new IndexedDbHandoffRecoveryStore(
+		SCOPE,
+		indexedDB,
+		dbName,
+		() => 1_800_000_000_100,
+	);
+	const put = await store.putIntent(makeIntent("strict-witness-intent"));
+	assert.equal(put.kind, "stored");
+	if (put.kind !== "stored") throw new Error("strict witness fixture did not store");
+	const pending = await store.storeApplyWitness(
+		put.record.recordId,
+		put.record.checksum,
+		{
+			...makeWitness(put.record),
+			kind: "strict-nonoverlap-rebase",
+		},
+	);
+	assert.equal(pending.kind, "updated");
+	if (pending.kind !== "updated") throw new Error("strict witness was not stored");
+	assert.equal(pending.record.status, "replay-pending");
+	assert.equal(pending.record.applyWitness?.kind, "strict-nonoverlap-rebase");
+	const payloadBeforeDemotion = jsonClone(recoveryPayload(pending.record));
+	const demoted = await store.compareAndSetStatus(
+		pending.record.recordId,
+		pending.record.checksum,
+		{ from: "replay-pending", to: "needs-review" },
+	);
+	assert.equal(demoted.kind, "updated");
+	if (demoted.kind !== "updated") throw new Error("strict witness was not demoted");
+	assert.equal(demoted.record.status, "needs-review");
+	assert.notEqual(demoted.record.checksum, pending.record.checksum);
+	assert.deepEqual(recoveryPayload(demoted.record), payloadBeforeDemotion);
+	assert.equal(demoted.record.applyWitness?.kind, "strict-nonoverlap-rebase");
+	const hydration = await new IndexedDbHandoffRecoveryStore(
+		SCOPE,
+		indexedDB,
+		dbName,
+	).hydrateScope();
+	assert.equal(hydration.active.length, 1);
+	const rehydrated = hydration.active[0];
+	assert.ok(rehydrated, "demoted strict witness remains durable");
+	assert.equal(rehydrated.status, "needs-review");
+	assert.equal(rehydrated.checksum, demoted.record.checksum);
+	assert.deepEqual(recoveryPayload(rehydrated), payloadBeforeDemotion);
+	assert.equal(rehydrated.applyWitness?.kind, "strict-nonoverlap-rebase");
 }
 
 console.log("\n--- Handoff Recovery IndexedDB: terminal replacement and duplicate identity ---");

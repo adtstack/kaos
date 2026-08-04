@@ -71,9 +71,6 @@ import { s10cDisableReenablePreservesEdits } from "./scenarios/s10c-disable-reen
 import { s10dRecoveryAmplifierOrchestration } from "./scenarios/s10d-recovery-amplifier-orchestration";
 import { s10gSuppressionDelayRace } from "./scenarios/s10g-suppression-delay-race";
 import { s13aEditorHandoffHostFences } from "./scenarios/s13a-editor-handoff-host-fences";
-import { s13bEditorHandoffRecovery } from "./scenarios/s13b-editor-handoff-recovery";
-import { s13cEditorHandoffRecoveryReload } from "./scenarios/s13c-editor-handoff-recovery-reload";
-import { s13dEditorHandoffExactReplay } from "./scenarios/s13d-editor-handoff-exact-replay";
 import { s13eSamePathAdoption } from "./scenarios/s13e-same-path-adoption";
 
 const ALL_SCENARIOS: QaScenario[] = [
@@ -123,11 +120,6 @@ const ALL_SCENARIOS: QaScenario[] = [
 	s10gSuppressionDelayRace,
 	// S13a: supported-host editor handoff fences
 	s13aEditorHandoffHostFences,
-	// S13b/S13c: device-local manual Recovery and reload hydration
-	s13bEditorHandoffRecovery,
-	s13cEditorHandoffRecoveryReload,
-	// S13d: exact physical-input replay and manual counterexamples
-	s13dEditorHandoffExactReplay,
 	// S13e: live-host same-path adoption and fallback
 	s13eSamePathAdoption,
 ];

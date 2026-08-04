@@ -5,7 +5,6 @@
 import type { App } from "obsidian";
 import type { KaosQaDebugApi } from "../../src/qaDebugApi";
 
-export type { ExactHandoffReplayExternalPhase } from "../contracts/exact-handoff-replay";
 export type { SamePathAdoptionExternalPhase } from "../contracts/same-path-adoption";
 
 // -----------------------------------------------------------------------
@@ -50,17 +49,6 @@ export type EditorHandoffExternalPhaseName =
 	| "ime-and-click-while-composing"
 	| "input-while-host-load-held"
 	| "supersede-b-with-c";
-
-export type HandoffRecoveryExternalPhaseName =
-	| "quota-failed-retry"
-	| "hung-put-copy-failure"
-	| "hung-put-copy-success"
-	| "release-copy-late-put"
-	| "verified-export"
-	| "confirmed-discard";
-
-export type HandoffRecoveryReloadExternalPhaseName =
-	| "hydrated-dashboard-review";
 
 export type QaExternalPhaseTicket<Name extends string = string> = Readonly<{
 	runId: string;

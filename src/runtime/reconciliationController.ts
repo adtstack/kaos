@@ -25,31 +25,6 @@ import type {
 	OpenEditorMutationTicket,
 	OpenEditorMutationViewTicket,
 } from "../sync/editorBinding";
-import {
-	isExactHandoffReplayScrollDispatchPostcondition,
-	planExactHandoffReplay,
-	verifyFreshStoredHandoffClaim,
-	type CreateExactHandoffReplayDispatchReceiptRequest,
-	type ConsumeExactHandoffReplayPermitRequest,
-	type ConsumeExactHandoffReplayPermitResult,
-	type ExactHandoffReplayPlanRequest,
-	type ExactHandoffReplayPlanResult,
-	type HandoffCompositionProof,
-	type HandoffReplayDispatchReceipt,
-	type HandoffReplayPermit,
-	type HandoffReplayTargetSnapshot,
-	type ObserveExactHandoffReplaySettlementRequest,
-	type ObserveExactHandoffReplaySettlementResult,
-	type RedeemExactHandoffReplayDispatchPermitResult,
-} from "../sync/editorHandoffReplay";
-import {
-	canonicalHandoffRecoveryJson,
-	hashHandoffRecoveryDispatchReceipt,
-	sha256HandoffRecoveryHex,
-	validateHandoffRecoveryRecord,
-	type ActiveHandoffRecoveryRecord,
-	type HandoffRecoveryApplyWitness,
-} from "../sync/handoffRecoveryStore";
 import type {
 	EditorAuthorityLease,
 	PathEditorAuthority,
@@ -123,7 +98,6 @@ import {
 import { normalizeEditorText } from "../utils/editorTextNormalization";
 import type {
 	HostLoadCompletionReceipt,
-	HandoffReplayPlan,
 	MissingTargetSeedPlan,
 	MissingTargetSeedReceipt,
 	PendingHostLoadCandidate,
@@ -136,9 +110,6 @@ import {
 	type ActivePathAuthoritySnapshot,
 	type AuthorityFreshnessContext,
 	type BindPermitContext,
-	type HandoffReplayRecoveryAdmissionEvidence,
-	type HandoffReplayRecoveryClaim,
-	type HandoffReplayRecoveryOpenEditorMutationViewTicket,
 	type MissingTargetSeedResult,
 	type OpenPathAdmissionRequest,
 	type OpenPathAdmissionResult,
@@ -451,11 +422,6 @@ interface MarkdownConflictArtifactResult {
 
 export type ReconciliationEditorBindingsPort = Pick<
 	EditorBindingManager,
-	| "captureHandoffCompositionProof"
-	| "captureCurrentTargetReadyToken"
-	| "captureHandoffReplayTargetSnapshot"
-	| "captureHandoffReplaySettlementSnapshot"
-	| "clearHandoffReplaySettlementProofs"
 	| "captureOpenEditorMutationTicket"
 	| "capturePathEditorAuthority"
 	| "getBindingDebugInfoForView"
@@ -547,8 +513,6 @@ export interface ReconciliationControllerDeps {
 	 * Must not be wired in production main.ts.
 	 */
 	registerDiskIngestPort?(port: DiskIngestPort): void;
-	/** Test-only deterministic source; production must use crypto.randomUUID(). */
-	handoffReplayLifecycleNonceFactory?(): string;
 }
 
 const RECONCILE_COOLDOWN_MS = 10_000;
@@ -610,10 +574,6 @@ interface EditorAdmissionAuthoritySnapshot {
 	readonly leafId: string;
 	readonly handoffGeneration: number;
 	readonly switchIntentSeq: number;
-	readonly admissionReason:
-		| "open-editor-missing-target"
-		| "handoff-replay-target-bind";
-	readonly recoveryClaim: HandoffReplayRecoveryClaim | null;
 	readonly presentation: "target-candidate" | "target-proven";
 	readonly hostLoadTokenId: string | null;
 	readonly expectedEditorContent: string;
@@ -711,42 +671,6 @@ interface InternalDiskBaselineSettlementAdmission {
 	readonly lifecycleGeneration: number;
 	readonly baselineRevision: number;
 	readonly adoptionSettlement: SamePathAdoptionDiskSettlement | null;
-}
-
-interface InternalHandoffReplayPlanEntry {
-	readonly plan: HandoffReplayPlan;
-	readonly intent: ExactHandoffReplayPlanRequest["intent"];
-	readonly storedRecordId: string;
-	readonly storedIntentEnvelopeHash: string;
-	readonly storedChecksum: string;
-	readonly replayPendingChecksum: string;
-	readonly recoveryOperationEpoch: number;
-	readonly targetReadyToken: TargetReadyToken;
-	readonly applyWitness: HandoffRecoveryApplyWitness;
-	readonly expectedSnapshot: HandoffReplayTargetSnapshot;
-	readonly expectedSnapshotFingerprint: string;
-}
-
-interface InternalHandoffReplayDispatchPermitEntry {
-	readonly permit: HandoffReplayPermit;
-	readonly plan: HandoffReplayPlan;
-	readonly record: ActiveHandoffRecoveryRecord & Readonly<{
-		status: "replay-pending";
-	}>;
-	readonly expectedSnapshot: HandoffReplayTargetSnapshot;
-	readonly expectedSnapshotFingerprint: string;
-	readonly targetReadyToken: TargetReadyToken;
-	readonly applyWitness: HandoffRecoveryApplyWitness;
-}
-
-interface InternalHandoffReplaySettlementAuthority {
-	readonly plan: HandoffReplayPlan;
-	readonly record: ActiveHandoffRecoveryRecord & Readonly<{
-		status: "replay-pending";
-	}>;
-	readonly expectedSnapshot: HandoffReplayTargetSnapshot;
-	readonly targetReadyToken: TargetReadyToken;
-	readonly applyWitness: HandoffRecoveryApplyWitness;
 }
 
 /**
@@ -902,19 +826,6 @@ export class ReconciliationController {
 	private externalCandidateIdentityEpochs = new Map<string, number>();
 	/** Invalidates fire-and-forget preservation work across reset/reinitialization. */
 	private lifecycleGeneration = 0;
-	private readonly handoffReplayLifecycleNonce: string;
-	private handoffReplayIdSequence = 0;
-	private readonly handoffReplayPlans = new Map<string, InternalHandoffReplayPlanEntry>();
-	private readonly consumedHandoffReplayPlanIds = new Set<string>();
-	private readonly handoffReplayDispatchPermits =
-		new Map<HandoffReplayPermit, InternalHandoffReplayDispatchPermitEntry>();
-	private readonly consumedHandoffReplayDispatchPermits =
-		new WeakSet<HandoffReplayPermit>();
-	private readonly handoffReplaySettlementAuthorities =
-		new Map<string, InternalHandoffReplaySettlementAuthority>();
-	/** Synchronous fence for Recovery Clear/manual invalidation of async planning. */
-	private handoffReplayRecoveryAuthorityEpoch = 0;
-	private readonly handoffReplayRecordAuthorityEpochs = new Map<string, number>();
 	/** Nominal controller-owned freshness and one-shot mutation capability store. */
 	private readonly editorAuthorityAdmission = new EditorAuthorityAdmissionRegistry();
 	private editorAuthorityAdmissionOpen = true;
@@ -978,12 +889,6 @@ export class ReconciliationController {
 	private static readonly AMPLIFICATION_NOTICE_COOLDOWN_MS = 60_000;
 
 	constructor(private readonly deps: ReconciliationControllerDeps) {
-		const nonce = deps.handoffReplayLifecycleNonceFactory?.()
-			?? globalThis.crypto?.randomUUID?.();
-		if (typeof nonce !== "string" || nonce.length === 0) {
-			throw new Error("Secure handoff replay lifecycle nonce is unavailable");
-		}
-		this.handoffReplayLifecycleNonce = nonce;
 		// If a QA harness is attached, register the disk-ingest control port now.
 		// In normal production, registerDiskIngestHarnessPort is absent.
 		deps.registerDiskIngestPort?.({
@@ -1492,789 +1397,6 @@ export class ReconciliationController {
 			&& this.editorAuthorityAdmission.isFreshnessCurrent(handleId, context);
 	}
 
-	private nextHandoffReplayId(kind: "plan" | "permit" | "snapshot"): string {
-		this.handoffReplayIdSequence += 1;
-		return [
-			"handoff-replay",
-			kind,
-			this.handoffReplayLifecycleNonce,
-			this.lifecycleGeneration,
-			this.handoffReplayIdSequence,
-		].join(":");
-	}
-
-	private handoffReplayFreshnessContext(
-		snapshot: HandoffReplayTargetSnapshot,
-	): AuthorityFreshnessContext {
-		return Object.freeze({
-			sessionId: snapshot.sessionId,
-			leafId: snapshot.leafId,
-			handoffGeneration: snapshot.handoffGeneration,
-			targetReadyTokenId: snapshot.targetReadyTokenId,
-			targetFile: snapshot.targetFile,
-			hostLoadReceiptId: snapshot.hostLoadReceiptId,
-			cm: snapshot.cm,
-			editorRevision: snapshot.editorRevision,
-			nativeHistoryEpoch: snapshot.nativeHistoryEpoch,
-			selectionEpoch: snapshot.selectionEpoch,
-			scrollEpoch: snapshot.scrollEpoch,
-		});
-	}
-
-	private sameHandoffReplaySnapshot(
-		left: HandoffReplayTargetSnapshot,
-		right: HandoffReplayTargetSnapshot,
-	): boolean {
-		return left.sessionId === right.sessionId
-			&& left.leafId === right.leafId
-			&& left.handoffGeneration === right.handoffGeneration
-			&& left.recoveryOperationEpoch === right.recoveryOperationEpoch
-			&& left.targetReadyTokenId === right.targetReadyTokenId
-			&& left.hostLoadTokenId === right.hostLoadTokenId
-			&& left.hostLoadReceiptId === right.hostLoadReceiptId
-			&& left.targetPath === right.targetPath
-			&& left.targetFile === right.targetFile
-			&& left.targetFileId === right.targetFileId
-			&& left.cm === right.cm
-			&& left.ytext === right.ytext
-			&& left.ytextIdentity === right.ytextIdentity
-			&& left.ytextMutationEpoch === right.ytextMutationEpoch
-			&& left.bindingEpoch === right.bindingEpoch
-			&& left.editorRevision === right.editorRevision
-			&& left.nativeHistoryEpoch === right.nativeHistoryEpoch
-			&& left.selectionEpoch === right.selectionEpoch
-			&& left.scrollEpoch === right.scrollEpoch
-			&& left.selection.eq(right.selection)
-			&& Object.is(left.scrollAnchor, right.scrollAnchor)
-			&& left.cmDocument === right.cmDocument
-			&& left.cmDocument.toString() === right.cmDocument.toString()
-			&& left.editorFacadeContent === right.editorFacadeContent
-			&& left.runtimeCacheContent === right.runtimeCacheContent
-			&& left.ytextContent === right.ytextContent;
-	}
-
-	private async replayPendingChecksum(
-		request: ExactHandoffReplayPlanRequest,
-		witness: HandoffRecoveryApplyWitness,
-	): Promise<string> {
-		const storedWithoutChecksum: Record<string, unknown> = { ...request.record };
-		Reflect.deleteProperty(storedWithoutChecksum, "checksum");
-		return sha256HandoffRecoveryHex(canonicalHandoffRecoveryJson({
-			...storedWithoutChecksum,
-			applyWitness: witness,
-			status: "replay-pending",
-		}));
-	}
-
-	async requestExactHandoffReplayPlan(
-		request: ExactHandoffReplayPlanRequest,
-	): Promise<ExactHandoffReplayPlanResult> {
-		const recoveryAuthorityEpoch = this.handoffReplayRecoveryAuthorityEpoch;
-		const recordAuthorityEpoch =
-			this.handoffReplayRecordAuthorityEpochs.get(request.record.recordId) ?? 0;
-		if (
-			request.sessionId !== request.intent.sessionId
-			|| request.expectedGeneration !== request.intent.handoffGeneration
-		) {
-			return { kind: "replan", reason: request.sessionId !== request.intent.sessionId
-				? "session-stale"
-				: "generation-stale" };
-		}
-		if (
-			!Number.isSafeInteger(request.recoveryOperationEpoch)
-			|| request.recoveryOperationEpoch < 0
-		) {
-			return { kind: "replan", reason: "generation-stale" };
-		}
-		try {
-			const validated = await validateHandoffRecoveryRecord(request.record);
-			if (validated !== request.record || validated.status !== "stored") {
-				return { kind: "manual", reason: "stored-codec-invalid" };
-			}
-		} catch {
-			return { kind: "manual", reason: "stored-codec-invalid" };
-		}
-		const editorBindings = this.deps.getEditorBindings();
-		if (!editorBindings) {
-			return { kind: "replan", reason: "target-authority-stale" };
-		}
-		const capturedComposition =
-			editorBindings.captureHandoffCompositionProof(request.intent);
-		let compositionProof: HandoffCompositionProof | null = null;
-		if (request.intent.compositionEpoch === null) {
-			if (
-				request.record.body.eventProof.compositionEpoch !== null
-				|| request.compositionProof !== null
-				|| capturedComposition.kind !== "not-ime"
-			) {
-				return { kind: "manual", reason: "user-composition-invalid" };
-			}
-		} else {
-			if (
-				capturedComposition.kind !== "ready"
-				|| request.compositionProof !== capturedComposition.proof
-			) {
-				return { kind: "manual", reason: "ime-composition-missing" };
-			}
-			compositionProof = capturedComposition.proof;
-		}
-		const claimed = await verifyFreshStoredHandoffClaim(
-			request.intent,
-			request.record,
-			compositionProof,
-		);
-		if (claimed.kind !== "claimed") return claimed;
-		const currentToken = editorBindings.captureCurrentTargetReadyToken({
-			sessionId: request.sessionId,
-			expectedGeneration: request.expectedGeneration,
-			targetPath: request.intent.targetPath,
-			targetFile: request.intent.targetFile,
-		});
-		if (currentToken !== request.targetReadyToken) {
-			return { kind: "replan", reason: "target-token-stale" };
-		}
-		const captured = editorBindings.captureHandoffReplayTargetSnapshot({
-			sessionId: request.sessionId,
-			expectedGeneration: request.expectedGeneration,
-			recoveryOperationEpoch: request.recoveryOperationEpoch,
-			recoveryClaim: Object.freeze({
-				intentId: request.intent.intentId,
-				recordId: request.record.recordId,
-			}),
-			targetReadyToken: request.targetReadyToken,
-		});
-		if (captured.kind !== "ready") {
-			switch (captured.reason) {
-				case "session-stale":
-					return { kind: "replan", reason: "session-stale" };
-				case "generation-stale":
-					return { kind: "replan", reason: "generation-stale" };
-				case "target-token-stale":
-					return { kind: "replan", reason: "target-token-stale" };
-				case "target-not-proven":
-				case "binding-missing":
-				case "target-identity-stale":
-				case "editor-identity-stale":
-					return { kind: "replan", reason: "target-authority-stale" };
-			}
-		}
-		const snapshot = captured.snapshot;
-		if (snapshot.recoveryOperationEpoch !== request.recoveryOperationEpoch) {
-			return { kind: "replan", reason: "target-authority-stale" };
-		}
-		const freshness = this.handoffReplayFreshnessContext(snapshot);
-		if (!this.isAuthorityFreshnessCurrent(
-			request.targetReadyToken.authorityFreshnessHandleId,
-			freshness,
-		)) {
-			return { kind: "replan", reason: "target-authority-stale" };
-		}
-		const result = planExactHandoffReplay(
-			claimed.claim,
-			request.targetReadyToken,
-			snapshot,
-			{
-				planId: this.nextHandoffReplayId("plan"),
-				replayPermitId: this.nextHandoffReplayId("permit"),
-			},
-		);
-		if (result.kind !== "planned") return result;
-		const expectedSnapshotFingerprint = this.nextHandoffReplayId("snapshot");
-		const replayPendingChecksum = await this.replayPendingChecksum(
-			request,
-			result.applyWitness,
-		);
-		const finalToken = editorBindings.captureCurrentTargetReadyToken({
-			sessionId: request.sessionId,
-			expectedGeneration: request.expectedGeneration,
-			targetPath: request.intent.targetPath,
-			targetFile: request.intent.targetFile,
-		});
-		const finalCapture = editorBindings.captureHandoffReplayTargetSnapshot({
-			sessionId: request.sessionId,
-			expectedGeneration: request.expectedGeneration,
-			recoveryOperationEpoch: request.recoveryOperationEpoch,
-			recoveryClaim: Object.freeze({
-				intentId: request.intent.intentId,
-				recordId: request.record.recordId,
-			}),
-			targetReadyToken: request.targetReadyToken,
-		});
-		if (
-			recoveryAuthorityEpoch !== this.handoffReplayRecoveryAuthorityEpoch
-			|| recordAuthorityEpoch
-				!== (this.handoffReplayRecordAuthorityEpochs.get(request.record.recordId) ?? 0)
-			|| finalToken !== request.targetReadyToken
-			|| finalCapture.kind !== "ready"
-			|| !this.sameHandoffReplaySnapshot(snapshot, finalCapture.snapshot)
-			|| !this.isAuthorityFreshnessCurrent(
-				request.targetReadyToken.authorityFreshnessHandleId,
-				this.handoffReplayFreshnessContext(finalCapture.snapshot),
-			)
-		) {
-			return { kind: "replan", reason: "target-authority-stale" };
-		}
-		this.handoffReplayPlans.set(result.plan.planId, Object.freeze({
-			plan: result.plan,
-			intent: request.intent,
-			storedRecordId: request.record.recordId,
-			storedIntentEnvelopeHash: request.record.intentEnvelopeHash,
-			storedChecksum: request.record.checksum,
-			replayPendingChecksum,
-			recoveryOperationEpoch: request.recoveryOperationEpoch,
-			targetReadyToken: request.targetReadyToken,
-			applyWitness: result.applyWitness,
-			expectedSnapshot: snapshot,
-			expectedSnapshotFingerprint,
-		}));
-		return result;
-	}
-
-	consumeExactHandoffReplayPermit(
-		request: ConsumeExactHandoffReplayPermitRequest,
-	): ConsumeExactHandoffReplayPermitResult {
-		if (this.consumedHandoffReplayPlanIds.has(request.plan.planId)) {
-			return { kind: "rejected", reason: "plan-consumed" };
-		}
-		const entry = this.handoffReplayPlans.get(request.plan.planId);
-		if (!entry) return { kind: "rejected", reason: "plan-unknown" };
-		this.handoffReplayPlans.delete(request.plan.planId);
-		this.consumedHandoffReplayPlanIds.add(request.plan.planId);
-		if (entry.plan !== request.plan) {
-			return { kind: "rejected", reason: "record-mismatch" };
-		}
-		if (request.record.status !== "replay-pending") {
-			return { kind: "rejected", reason: "recovery-state-stale" };
-		}
-		if (request.recoveryOperationEpoch !== entry.recoveryOperationEpoch) {
-			return { kind: "rejected", reason: "recovery-operation-stale" };
-		}
-		let witnessMatches = false;
-		try {
-			witnessMatches = request.record.applyWitness !== null
-				&& request.record.applyWitness.dispatchReceiptHash === null
-				&& canonicalHandoffRecoveryJson(request.record.applyWitness)
-					=== canonicalHandoffRecoveryJson(entry.applyWitness);
-		} catch {
-			witnessMatches = false;
-		}
-		if (
-			!witnessMatches
-			|| request.record.recordId !== entry.storedRecordId
-			|| request.record.intentId !== entry.intent.intentId
-			|| request.record.intentEnvelopeHash !== entry.storedIntentEnvelopeHash
-			|| request.record.checksum !== entry.replayPendingChecksum
-			|| request.record.targetPath !== entry.expectedSnapshot.targetPath
-			|| request.record.applyWitness?.planId !== entry.plan.planId
-			|| request.record.applyWitness?.targetFileId
-				!== entry.expectedSnapshot.targetFileId
-			|| request.record.applyWitness?.targetYtextIdentity
-				!== entry.expectedSnapshot.ytextIdentity
-		) {
-			return { kind: "rejected", reason: "record-mismatch" };
-		}
-		const editorBindings = this.deps.getEditorBindings();
-		if (!editorBindings) {
-			return { kind: "rejected", reason: "target-snapshot-stale" };
-		}
-		const currentToken = editorBindings.captureCurrentTargetReadyToken({
-			sessionId: entry.expectedSnapshot.sessionId,
-			expectedGeneration: entry.expectedSnapshot.handoffGeneration,
-			targetPath: entry.expectedSnapshot.targetPath,
-			targetFile: entry.expectedSnapshot.targetFile,
-		});
-		const captured = editorBindings.captureHandoffReplayTargetSnapshot({
-			sessionId: entry.expectedSnapshot.sessionId,
-			expectedGeneration: entry.expectedSnapshot.handoffGeneration,
-			recoveryOperationEpoch: entry.recoveryOperationEpoch,
-			recoveryClaim: Object.freeze({
-				intentId: entry.intent.intentId,
-				recordId: entry.storedRecordId,
-			}),
-			targetReadyToken: entry.targetReadyToken,
-		});
-		if (
-			currentToken !== entry.targetReadyToken
-			|| captured.kind !== "ready"
-			|| !this.sameHandoffReplaySnapshot(entry.expectedSnapshot, captured.snapshot)
-		) {
-			return { kind: "rejected", reason: "target-snapshot-stale" };
-		}
-		if (!this.isAuthorityFreshnessCurrent(
-			entry.targetReadyToken.authorityFreshnessHandleId,
-			this.handoffReplayFreshnessContext(captured.snapshot),
-		)) {
-			return { kind: "rejected", reason: "authority-stale" };
-		}
-		const permit: HandoffReplayPermit = Object.freeze({
-			permitId: entry.plan.replayPermitId,
-			planId: entry.plan.planId,
-			recordId: request.record.recordId,
-			replayPendingChecksum: request.record.checksum,
-			recoveryOperationEpoch: entry.recoveryOperationEpoch,
-			expectedSnapshotFingerprint: entry.expectedSnapshotFingerprint,
-		});
-		this.handoffReplayDispatchPermits.set(permit, Object.freeze({
-			permit,
-			plan: request.plan,
-			record: request.record,
-			expectedSnapshot: entry.expectedSnapshot,
-			expectedSnapshotFingerprint: entry.expectedSnapshotFingerprint,
-			targetReadyToken: entry.targetReadyToken,
-			applyWitness: entry.applyWitness,
-		}));
-		return { kind: "accepted", permit };
-	}
-
-	redeemExactHandoffReplayDispatchPermit(
-		permit: HandoffReplayPermit,
-	): RedeemExactHandoffReplayDispatchPermitResult {
-		if (this.consumedHandoffReplayDispatchPermits.has(permit)) {
-			return { kind: "rejected", reason: "plan-already-consumed" };
-		}
-		const entry = this.handoffReplayDispatchPermits.get(permit);
-		if (
-			!entry
-			|| entry.permit !== permit
-			|| entry.expectedSnapshotFingerprint
-				!== permit.expectedSnapshotFingerprint
-		) {
-			return { kind: "rejected", reason: "permit-mismatch" };
-		}
-		this.handoffReplayDispatchPermits.delete(permit);
-		this.consumedHandoffReplayDispatchPermits.add(permit);
-		if (
-			this.handoffReplaySettlementAuthorities.size
-				>= ReconciliationController.EDITOR_ADMISSION_RECORD_LIMIT
-		) {
-			const oldestPlanId = this.handoffReplaySettlementAuthorities
-				.keys()
-				.next().value as string | undefined;
-			if (oldestPlanId !== undefined) {
-				this.handoffReplaySettlementAuthorities.delete(oldestPlanId);
-			}
-		}
-		this.handoffReplaySettlementAuthorities.set(
-			entry.plan.planId,
-			Object.freeze({
-				plan: entry.plan,
-				record: entry.record,
-				expectedSnapshot: entry.expectedSnapshot,
-				targetReadyToken: entry.targetReadyToken,
-				applyWitness: entry.applyWitness,
-			}),
-		);
-		return {
-			kind: "accepted",
-			snapshot: entry.expectedSnapshot,
-			plan: entry.plan,
-			record: entry.record,
-		};
-	}
-
-	createExactHandoffReplayDispatchReceipt(
-		request: CreateExactHandoffReplayDispatchReceiptRequest,
-	): HandoffReplayDispatchReceipt | null {
-		try {
-			const { plan, record, recoveryOperationEpoch, postcondition } = request;
-			const entry = this.handoffReplaySettlementAuthorities.get(plan.planId);
-			const witness = record.applyWitness;
-			if (
-				entry === undefined
-				|| entry.plan !== plan
-				|| entry.record !== record
-				|| witness === null
-				|| witness.dispatchReceiptHash !== null
-				|| canonicalHandoffRecoveryJson(witness)
-					!== canonicalHandoffRecoveryJson(entry.applyWitness)
-				|| !Number.isSafeInteger(request.appliedAt)
-				|| request.appliedAt < 0
-				|| !Number.isSafeInteger(recoveryOperationEpoch)
-				|| recoveryOperationEpoch < 0
-			) return null;
-			const snapshot = entry.expectedSnapshot;
-			const token = entry.targetReadyToken;
-			if (
-				token.targetAuthority.kind !== "existing"
-				|| plan.planId !== witness.planId
-				|| plan.kind !== witness.kind
-				|| plan.intentId !== record.intentId
-				|| snapshot.sessionId !== record.body.eventProof.sessionId
-				|| snapshot.handoffGeneration
-					!== record.body.eventProof.handoffGeneration
-				|| plan.switchIntentSeq !== record.body.eventProof.switchIntentSeq
-				|| plan.switchIntentSeq !== witness.switchIntentSeq
-				|| snapshot.targetPath !== record.targetPath
-				|| plan.targetReadyTokenId !== token.tokenId
-				|| plan.targetReadyTokenId !== snapshot.targetReadyTokenId
-				|| token.sessionId !== snapshot.sessionId
-				|| token.handoffGeneration !== snapshot.handoffGeneration
-				|| token.switchIntentSeq !== plan.switchIntentSeq
-				|| token.targetPath !== snapshot.targetPath
-				|| token.targetFile !== snapshot.targetFile
-				|| token.hostLoadTokenId !== snapshot.hostLoadTokenId
-				|| token.hostLoadReceiptId !== snapshot.hostLoadReceiptId
-				|| token.targetAuthority.fileId !== snapshot.targetFileId
-				|| token.targetAuthority.ytextIdentity !== snapshot.ytextIdentity
-				|| token.targetAuthority.ytextMutationEpoch
-					!== snapshot.ytextMutationEpoch
-			) return null;
-			const serializedSelection = canonicalHandoffRecoveryJson(
-				postcondition.selection.toJSON(),
-			);
-			const expectedSelectionEpoch = snapshot.selectionEpoch
-				+ (snapshot.selection.eq(plan.mappedSelection) ? 0 : 1);
-			if (
-				recoveryOperationEpoch !== postcondition.recoveryOperationEpoch
-				|| recoveryOperationEpoch !== snapshot.recoveryOperationEpoch
-				|| postcondition.planId !== plan.planId
-				|| postcondition.recordId !== record.recordId
-				|| postcondition.targetFileId !== snapshot.targetFileId
-				|| postcondition.ytextIdentity !== snapshot.ytextIdentity
-				|| postcondition.ytextMutationEpoch
-					!== snapshot.ytextMutationEpoch + 1
-				|| postcondition.bindingEpoch !== snapshot.bindingEpoch
-				|| postcondition.editorRevision !== snapshot.editorRevision + 1
-				|| postcondition.nativeHistoryEpoch
-					!== snapshot.nativeHistoryEpoch + 1
-				|| postcondition.selectionEpoch !== expectedSelectionEpoch
-				|| !isExactHandoffReplayScrollDispatchPostcondition({
-					beforeEpoch: snapshot.scrollEpoch,
-					afterEpoch: postcondition.scrollEpoch,
-					mappedAnchor: plan.mappedScrollAnchor,
-					observedAnchor: postcondition.scrollAnchor,
-				})
-				|| !postcondition.selection.eq(plan.mappedSelection)
-				|| postcondition.scrollAnchor !== plan.mappedScrollAnchor
-				|| witness.targetFileId !== snapshot.targetFileId
-				|| witness.targetYtextIdentity !== snapshot.ytextIdentity
-				|| witness.targetMutationEpochAtPlan
-					!== snapshot.ytextMutationEpoch
-				|| witness.nativeHistoryEpoch !== snapshot.nativeHistoryEpoch
-				|| witness.targetSelectionEpoch !== snapshot.selectionEpoch
-				|| witness.targetScrollEpoch !== snapshot.scrollEpoch
-				|| witness.hostLoadTokenId !== snapshot.hostLoadTokenId
-				|| witness.plannedStartHash !== record.startContentHash
-				|| witness.plannedResultContent !== record.body.afterContent
-				|| witness.plannedResultHash !== record.afterContentHash
-				|| witness.serializedMappedSelection !== serializedSelection
-			) return null;
-			return Object.freeze({
-				receiptSchemaVersion: 1,
-				planId: plan.planId,
-				intentId: record.intentId,
-				recordId: record.recordId,
-				sessionId: snapshot.sessionId,
-				handoffGeneration: snapshot.handoffGeneration,
-				recoveryOperationEpoch,
-				switchIntentSeq: plan.switchIntentSeq,
-				targetReadyTokenId: snapshot.targetReadyTokenId,
-				hostLoadTokenId: snapshot.hostLoadTokenId,
-				hostLoadReceiptId: snapshot.hostLoadReceiptId,
-				targetPath: snapshot.targetPath,
-				targetFileId: snapshot.targetFileId,
-				targetYtextIdentity: snapshot.ytextIdentity,
-				targetMutationEpochAtPlan: snapshot.ytextMutationEpoch,
-				targetMutationEpochAfter: postcondition.ytextMutationEpoch,
-				bindingEpochAfter: postcondition.bindingEpoch,
-				editorRevisionAfter: postcondition.editorRevision,
-				nativeHistoryEpochAfter: postcondition.nativeHistoryEpoch,
-				selectionEpochBefore: snapshot.selectionEpoch,
-				selectionEpochAfter: postcondition.selectionEpoch,
-				scrollEpochBefore: snapshot.scrollEpoch,
-				scrollEpochAfter: postcondition.scrollEpoch,
-				plannedStartHash: witness.plannedStartHash,
-				plannedResultHash: witness.plannedResultHash,
-				serializedMappedSelection: serializedSelection,
-				mappedScrollAnchor: postcondition.scrollAnchor,
-				appliedAt: request.appliedAt,
-			});
-		} catch {
-			return null;
-		}
-	}
-
-	async observeExactHandoffReplaySettlement(
-		request: ObserveExactHandoffReplaySettlementRequest,
-	): Promise<ObserveExactHandoffReplaySettlementResult> {
-		const { record, mode, receipt } = request;
-		let witness: HandoffRecoveryApplyWitness;
-		try {
-			const validated = await validateHandoffRecoveryRecord(record);
-			if (
-				validated !== record
-				|| validated.status !== "replayed-awaiting-settlement"
-				|| validated.applyWitness === null
-				|| validated.applyWitness.dispatchReceiptHash === null
-			) {
-				return { kind: "uncertain", reason: "witness-invalid" };
-			}
-			witness = validated.applyWitness;
-		} catch {
-			return { kind: "uncertain", reason: "witness-invalid" };
-		}
-		if (mode === "live" && receipt === null) {
-			return { kind: "uncertain", reason: "receipt-required" };
-		}
-		if (mode === "hydrated" && receipt !== null) {
-			return { kind: "uncertain", reason: "receipt-required" };
-		}
-		const authority = this.handoffReplaySettlementAuthorities.get(witness.planId);
-		if (mode === "live") {
-			if (receipt === null) {
-				return { kind: "uncertain", reason: "receipt-required" };
-			}
-			let receiptHash: string;
-			try {
-				receiptHash = await hashHandoffRecoveryDispatchReceipt(
-					receipt as unknown as Readonly<
-						Record<string, string | number | boolean | null>
-					>,
-				);
-			} catch {
-				return { kind: "uncertain", reason: "receipt-hash-mismatch" };
-			}
-			if (receiptHash !== witness.dispatchReceiptHash) {
-				return { kind: "uncertain", reason: "receipt-hash-mismatch" };
-			}
-			if (
-				authority === undefined
-				|| authority.plan.planId !== witness.planId
-				|| authority.record.recordId !== record.recordId
-				|| authority.record.intentId !== record.intentId
-				|| authority.record.intentEnvelopeHash !== record.intentEnvelopeHash
-				|| authority.applyWitness.planId !== witness.planId
-			) {
-				return { kind: "uncertain", reason: "plan-identity-mismatch" };
-			}
-			if (
-				receipt.receiptSchemaVersion !== 1
-				|| receipt.planId !== witness.planId
-				|| receipt.intentId !== record.intentId
-				|| receipt.recordId !== record.recordId
-				|| receipt.targetPath !== record.targetPath
-				|| receipt.plannedStartHash !== witness.plannedStartHash
-				|| receipt.plannedResultHash !== witness.plannedResultHash
-				|| receipt.serializedMappedSelection
-					!== witness.serializedMappedSelection
-				|| !Number.isSafeInteger(receipt.appliedAt)
-				|| receipt.appliedAt < 0
-			) {
-				return { kind: "uncertain", reason: "plan-identity-mismatch" };
-			}
-		}
-
-		const editorBindings = this.deps.getEditorBindings();
-		if (!editorBindings) {
-			return { kind: "uncertain", reason: "snapshot-unavailable" };
-		}
-		const captured = editorBindings.captureHandoffReplaySettlementSnapshot({
-			targetPath: record.targetPath,
-			planId: witness.planId,
-			mode,
-		});
-		if (captured.kind !== "ready") {
-			return { kind: "uncertain", reason: "snapshot-unavailable" };
-		}
-		const snapshot = captured.snapshot;
-		if (snapshot.planId !== witness.planId) {
-			return {
-				kind: "uncertain",
-				reason: snapshot.planId === null && mode === "hydrated"
-					? "receipt-required"
-					: "plan-identity-mismatch",
-			};
-		}
-		const eventProof = record.body.eventProof;
-		if (
-			snapshot.sessionId !== eventProof.sessionId
-			|| snapshot.leafId !== eventProof.leafId
-			|| snapshot.handoffGeneration !== eventProof.handoffGeneration
-			|| snapshot.recoveryOperationEpoch
-				!== (receipt?.recoveryOperationEpoch ?? snapshot.recoveryOperationEpoch)
-			|| snapshot.targetPath !== record.targetPath
-			|| snapshot.targetFile.path !== record.targetPath
-			|| snapshot.targetFileId !== witness.targetFileId
-			|| snapshot.ytextIdentity !== witness.targetYtextIdentity
-			|| snapshot.hostLoadTokenId !== witness.hostLoadTokenId
-		) {
-			return { kind: "uncertain", reason: "target-identity-mismatch" };
-		}
-		if (mode === "live") {
-			if (receipt === null || authority === undefined) {
-				return { kind: "uncertain", reason: "plan-identity-mismatch" };
-			}
-			const expected = authority.expectedSnapshot;
-			if (
-				snapshot.targetFile !== expected.targetFile
-				|| snapshot.cm !== expected.cm
-				|| snapshot.ytext !== expected.ytext
-				|| snapshot.sessionId !== expected.sessionId
-				|| snapshot.leafId !== expected.leafId
-				|| snapshot.handoffGeneration !== expected.handoffGeneration
-				|| snapshot.recoveryOperationEpoch
-					!== expected.recoveryOperationEpoch
-				|| snapshot.targetReadyTokenId !== expected.targetReadyTokenId
-				|| snapshot.hostLoadTokenId !== expected.hostLoadTokenId
-				|| snapshot.hostLoadReceiptId !== expected.hostLoadReceiptId
-				|| snapshot.targetPath !== expected.targetPath
-				|| snapshot.targetFileId !== expected.targetFileId
-				|| snapshot.ytextIdentity !== expected.ytextIdentity
-				|| snapshot.bindingEpoch !== receipt.bindingEpochAfter
-				|| snapshot.editorRevision !== receipt.editorRevisionAfter
-				|| receipt.sessionId !== expected.sessionId
-				|| receipt.handoffGeneration !== expected.handoffGeneration
-				|| receipt.recoveryOperationEpoch
-					!== expected.recoveryOperationEpoch
-				|| receipt.switchIntentSeq !== witness.switchIntentSeq
-				|| receipt.targetReadyTokenId !== expected.targetReadyTokenId
-				|| receipt.hostLoadTokenId !== expected.hostLoadTokenId
-				|| receipt.hostLoadReceiptId !== expected.hostLoadReceiptId
-				|| receipt.targetFileId !== expected.targetFileId
-				|| receipt.targetYtextIdentity !== expected.ytextIdentity
-				|| receipt.targetMutationEpochAtPlan
-					!== expected.ytextMutationEpoch
-			) {
-				return { kind: "uncertain", reason: "target-identity-mismatch" };
-			}
-		}
-		const expectedYtextEpoch = witness.targetMutationEpochAtPlan + 1;
-		if (
-			snapshot.ytextMutationEpoch !== expectedYtextEpoch
-			|| (receipt !== null
-				&& receipt.targetMutationEpochAfter !== expectedYtextEpoch)
-		) {
-			return { kind: "uncertain", reason: "ytext-epoch-mismatch" };
-		}
-		const expectedHistoryEpoch = witness.nativeHistoryEpoch + 1;
-		if (
-			snapshot.nativeHistoryEpoch !== expectedHistoryEpoch
-			|| (receipt !== null
-				&& receipt.nativeHistoryEpochAfter !== expectedHistoryEpoch)
-		) {
-			return { kind: "uncertain", reason: "history-mismatch" };
-		}
-		let serializedSelection: string;
-		try {
-			serializedSelection = canonicalHandoffRecoveryJson(
-				snapshot.selection.toJSON(),
-			);
-		} catch {
-			return { kind: "uncertain", reason: "selection-mismatch" };
-		}
-		if (
-			serializedSelection !== witness.serializedMappedSelection
-			|| (receipt !== null
-				&& (
-					snapshot.selectionEpoch !== receipt.selectionEpochAfter
-					|| receipt.selectionEpochBefore !== witness.targetSelectionEpoch
-					|| receipt.serializedMappedSelection !== serializedSelection
-				))
-			|| (receipt === null
-				&& snapshot.selectionEpoch !== witness.targetSelectionEpoch
-				&& snapshot.selectionEpoch !== witness.targetSelectionEpoch + 1)
-		) {
-			return { kind: "uncertain", reason: "selection-mismatch" };
-		}
-		if (
-			snapshot.scrollEpoch !== witness.targetScrollEpoch
-			|| (receipt !== null
-				&& (
-					receipt.scrollEpochBefore !== witness.targetScrollEpoch
-					|| snapshot.scrollEpoch !== receipt.scrollEpochAfter
-					|| snapshot.scrollAnchor !== receipt.mappedScrollAnchor
-				))
-		) {
-			return { kind: "uncertain", reason: "scroll-mismatch" };
-		}
-		let resultHash: string;
-		try {
-			resultHash = await sha256HandoffRecoveryHex(
-				witness.plannedResultContent,
-			);
-		} catch {
-			return { kind: "uncertain", reason: "witness-invalid" };
-		}
-		if (
-			resultHash !== witness.plannedResultHash
-			|| witness.plannedStartHash !== record.startContentHash
-			|| witness.plannedResultContent !== record.body.afterContent
-			|| witness.plannedResultHash !== record.afterContentHash
-		) {
-			return { kind: "uncertain", reason: "witness-invalid" };
-		}
-		if (
-			snapshot.cmDocument.toString() !== witness.plannedResultContent
-			|| snapshot.editorFacadeContent !== witness.plannedResultContent
-			|| snapshot.runtimeCacheContent !== witness.plannedResultContent
-		) {
-			return { kind: "uncertain", reason: "editor-content-mismatch" };
-		}
-		if (snapshot.ytextContent !== witness.plannedResultContent) {
-			return { kind: "uncertain", reason: "ytext-content-mismatch" };
-		}
-
-		const disk = await this.readStableMarkdownFile(
-			record.targetPath,
-			"modify",
-			snapshot.targetFile,
-		);
-		if (disk.kind === "unstable") {
-			return mode === "live"
-				? { kind: "pending", reason: "disk-unstable" }
-				: { kind: "uncertain", reason: "disk-content-mismatch" };
-		}
-		if (disk.kind === "missing") {
-			return { kind: "uncertain", reason: "disk-missing" };
-		}
-		if (disk.file !== snapshot.targetFile) {
-			return { kind: "uncertain", reason: "target-identity-mismatch" };
-		}
-		if (disk.content === witness.plannedResultContent) {
-			return { kind: "settled" };
-		}
-		if (mode === "live" && disk.content === record.body.startContent) {
-			return { kind: "pending", reason: "disk-not-yet-saved" };
-		}
-		return { kind: "uncertain", reason: "disk-content-mismatch" };
-	}
-
-	/**
-	 * Clear/manual Recovery actions use this narrower fence instead of reset():
-	 * retire every plan and unconsumed dispatch permit synchronously while
-	 * preserving the controller lifecycle nonce, ID sequence, and already-applied
-	 * settlement evidence.
-	 */
-	invalidateExactHandoffReplayForRecoveryClear(): void {
-		this.handoffReplayRecoveryAuthorityEpoch += 1;
-		for (const planId of this.handoffReplayPlans.keys()) {
-			this.consumedHandoffReplayPlanIds.add(planId);
-		}
-		this.handoffReplayPlans.clear();
-		for (const permit of this.handoffReplayDispatchPermits.keys()) {
-			this.consumedHandoffReplayDispatchPermits.add(permit);
-		}
-		this.handoffReplayDispatchPermits.clear();
-	}
-
-	/** Retire only one Recovery row; another leaf's executable replay stays live. */
-	invalidateExactHandoffReplayForRecord(recordId: string): void {
-		this.handoffReplayRecordAuthorityEpochs.set(
-			recordId,
-			(this.handoffReplayRecordAuthorityEpochs.get(recordId) ?? 0) + 1,
-		);
-		for (const [planId, entry] of this.handoffReplayPlans) {
-			if (entry.storedRecordId !== recordId) continue;
-			this.consumedHandoffReplayPlanIds.add(planId);
-			this.handoffReplayPlans.delete(planId);
-		}
-		for (const [permit, entry] of this.handoffReplayDispatchPermits) {
-			if (entry.record.recordId !== recordId) continue;
-			this.consumedHandoffReplayDispatchPermits.add(permit);
-			this.handoffReplayDispatchPermits.delete(permit);
-		}
-	}
-
 	consumeBindPermit(permitId: string, context: BindPermitContext): boolean {
 		return this.editorAuthorityAdmissionOpen
 			&& this.editorAuthorityAdmission.consumeBindPermit(permitId, context);
@@ -2286,17 +1408,6 @@ export class ReconciliationController {
 	 * performs no I/O, scheduling, or state cleanup of its own.
 	 */
 	revokeAsyncAuthority(): void {
-		this.handoffReplayRecoveryAuthorityEpoch += 1;
-		this.handoffReplayRecordAuthorityEpochs.clear();
-		for (const planId of this.handoffReplayPlans.keys()) {
-			this.consumedHandoffReplayPlanIds.add(planId);
-		}
-		this.handoffReplayPlans.clear();
-		for (const permit of this.handoffReplayDispatchPermits.keys()) {
-			this.consumedHandoffReplayDispatchPermits.add(permit);
-		}
-		this.handoffReplayDispatchPermits.clear();
-		this.handoffReplaySettlementAuthorities.clear();
 		const pendingAdoptionSettlements = Array.from(
 			this.samePathAdoptionDiskSettlements.values(),
 		);
@@ -2308,11 +1419,6 @@ export class ReconciliationController {
 				"controller-authority-revoked",
 				false,
 			);
-		}
-		try {
-			this.deps.getEditorBindings()?.clearHandoffReplaySettlementProofs();
-		} catch {
-			// Reset still retires controller authority if the observer owner is gone.
 		}
 		this.lifecycleGeneration += 1;
 		this.editorAuthorityAdmissionOpen = false;
@@ -6784,17 +5890,7 @@ export class ReconciliationController {
 			request.openEditorTicket,
 			request.leafId,
 		);
-		if (
-			!primary
-			|| (
-				request.reason === "handoff-replay-target-bind"
-				&& (
-					primary.cm !== anchor.candidate.cm
-					|| primary.editorDocument !== anchor.candidate.cm.state.doc
-					|| primary.editorContent !== anchor.token.certifiedBaseContent
-				)
-			)
-		) {
+		if (!primary) {
 			return { kind: "replan", reason: "authority-changed" };
 		}
 		const capture = await this.captureEditorAdmissionAuthority({
@@ -6807,13 +5903,7 @@ export class ReconciliationController {
 			presentation: "target-proven",
 			hostLoadTokenId: null,
 			openEditorTicket: request.openEditorTicket,
-			expectedContent: request.reason === "handoff-replay-target-bind"
-				? anchor.token.certifiedBaseContent
-				: (primary.editorContent ?? ""),
-			admissionReason: request.reason,
-			recoveryClaim: request.reason === "handoff-replay-target-bind"
-				? request.recoveryClaim
-				: null,
+			expectedContent: primary.editorContent ?? "",
 		});
 		if (capture.kind !== "ready") return capture;
 		const snapshot = capture.snapshot;
@@ -7712,8 +6802,6 @@ export class ReconciliationController {
 			hostLoadTokenId: request.candidate.hostLoadTokenId,
 			openEditorTicket: request.openEditorTicket,
 			expectedContent: request.candidate.incomingContent,
-			admissionReason: "open-editor-missing-target",
-			recoveryClaim: null,
 		});
 		if (capture.kind === "replan") {
 			return { kind: "replan", reason: "authority-changed" };
@@ -7814,8 +6902,6 @@ export class ReconciliationController {
 			hostLoadTokenId: record.request.candidate.hostLoadTokenId,
 			openEditorTicket: currentTicket,
 			expectedContent: record.request.candidate.incomingContent,
-			admissionReason: "open-editor-missing-target",
-			recoveryClaim: null,
 		});
 		if (capture.kind !== "ready") {
 			this.deps.trace("reconcile", "target-presentation-completion-replan", {
@@ -8077,10 +7163,6 @@ export class ReconciliationController {
 		hostLoadTokenId: string | null;
 		openEditorTicket: OpenEditorMutationTicket;
 		expectedContent: string;
-		admissionReason:
-			| "open-editor-missing-target"
-			| "handoff-replay-target-bind";
-		recoveryClaim: HandoffReplayRecoveryClaim | null;
 	}>): Promise<EditorAdmissionCaptureResult> {
 		const authorityStartLifecycleGeneration = this.lifecycleGeneration;
 		const authorityStartVaultSync = this.deps.getVaultSync();
@@ -8134,26 +7216,14 @@ export class ReconciliationController {
 		if (
 			input.presentation === "target-proven"
 			&& (
-				input.admissionReason === "handoff-replay-target-bind"
-					? (
-						input.recoveryClaim === null
-						|| input.openEditorTicket.views.length !== 1
-						|| !this.isExactRecoveryAdmissionViewTicket(
-							primary,
-							input.recoveryClaim,
-							input.expectedContent,
-						)
-					)
-					: (
-						!this.isTargetProvenIntentSettled(primary.intentStateKind)
-						|| input.openEditorTicket.views.some((view) =>
-							view.targetFile !== input.targetFile
-								|| view.handoffPresentation !== "target-proven"
-								|| view.pendingHostLoadTokenId !== null
-								|| view.editorContent !== input.expectedContent
-								|| !this.isTargetProvenIntentSettled(view.intentStateKind)
-						)
-					)
+				!this.isTargetProvenIntentSettled(primary.intentStateKind)
+				|| input.openEditorTicket.views.some((view) =>
+					view.targetFile !== input.targetFile
+						|| view.handoffPresentation !== "target-proven"
+						|| view.pendingHostLoadTokenId !== null
+						|| view.editorContent !== input.expectedContent
+						|| !this.isTargetProvenIntentSettled(view.intentStateKind)
+				)
 			)
 		) {
 			return { kind: "deferred", reason: "transitioning" };
@@ -8250,8 +7320,6 @@ export class ReconciliationController {
 			leafId: input.leafId,
 			handoffGeneration: input.handoffGeneration,
 			switchIntentSeq: input.switchIntentSeq,
-			admissionReason: input.admissionReason,
-			recoveryClaim: input.recoveryClaim,
 			presentation: input.presentation,
 			hostLoadTokenId: input.hostLoadTokenId,
 			expectedEditorContent: input.expectedContent,
@@ -8310,10 +7378,6 @@ export class ReconciliationController {
 			allowTargetPresentedTransition?: boolean;
 			receipt?: HostLoadCompletionReceipt;
 			candidate?: PendingHostLoadCandidate;
-			recoveryPostBind?: Readonly<{
-				targetReadyToken: TargetReadyToken;
-				claim: HandoffReplayRecoveryClaim;
-			}>;
 		}> = {},
 	): boolean {
 		if (
@@ -8366,20 +7430,7 @@ export class ReconciliationController {
 			snapshot.openEditorTicket,
 			openMarkdownViews,
 		);
-		if (validation?.current) {
-			if (snapshot.admissionReason !== "handoff-replay-target-bind") return true;
-			const primary = this.getAdmissionPrimaryTicket(
-				snapshot.openEditorTicket,
-				snapshot.leafId,
-			);
-			return snapshot.recoveryClaim !== null
-				&& primary !== null
-				&& this.isExactRecoveryAdmissionViewTicket(
-					primary,
-					snapshot.recoveryClaim,
-					snapshot.expectedEditorContent,
-				);
-		}
+		if (validation?.current) return true;
 		const targetPresentedTransitionCurrent = options.allowTargetPresentedTransition === true
 			&& !!options.receipt
 			&& !!options.candidate
@@ -8389,93 +7440,7 @@ export class ReconciliationController {
 				options.candidate,
 				openMarkdownViews,
 			);
-		if (targetPresentedTransitionCurrent) return true;
-		return snapshot.admissionReason === "handoff-replay-target-bind"
-			&& !!options.receipt
-			&& !!options.candidate
-			&& !!options.recoveryPostBind
-			&& this.isExactRecoveryPostBindAuthorityCurrent(
-				snapshot,
-				options.receipt,
-				options.candidate,
-				options.recoveryPostBind.targetReadyToken,
-				options.recoveryPostBind.claim,
-			);
-	}
-
-	private isExactRecoveryPostBindAuthorityCurrent(
-		snapshot: EditorAdmissionAuthoritySnapshot,
-		hostReceipt: HostLoadCompletionReceipt,
-		candidate: PendingHostLoadCandidate,
-		targetReadyToken: TargetReadyToken,
-		claim: HandoffReplayRecoveryClaim,
-	): boolean {
-		if (
-			snapshot.recoveryClaim === null
-			|| !this.sameHandoffReplayRecoveryClaim(snapshot.recoveryClaim, claim)
-			|| targetReadyToken.sessionId !== snapshot.sessionId
-			|| targetReadyToken.leafId !== snapshot.leafId
-			|| targetReadyToken.handoffGeneration !== snapshot.handoffGeneration
-			|| targetReadyToken.switchIntentSeq !== snapshot.switchIntentSeq
-			|| targetReadyToken.targetPath !== snapshot.path
-			|| targetReadyToken.targetFile !== snapshot.file
-			|| targetReadyToken.hostLoadTokenId !== candidate.hostLoadTokenId
-			|| targetReadyToken.hostLoadReceiptId !== hostReceipt.receiptId
-			|| targetReadyToken.targetAuthority.kind !== "existing"
-		) return false;
-		const primary = this.getAdmissionPrimaryTicket(
-			snapshot.openEditorTicket,
-			snapshot.leafId,
-		);
-		const active = snapshot.activeAuthority;
-		if (
-			!primary?.cm
-			|| !active.fileId
-			|| !active.ytext
-			|| !active.ytextIdentity
-			|| targetReadyToken.targetAuthority.fileId !== active.fileId
-			|| targetReadyToken.targetAuthority.ytextIdentity !== active.ytextIdentity
-			|| targetReadyToken.targetAuthority.ytextMutationEpoch
-				!== active.ytextMutationEpoch
-		) return false;
-		const editorBindings = this.deps.getEditorBindings();
-		const request = Object.freeze({
-			sessionId: snapshot.sessionId,
-			expectedGeneration: snapshot.handoffGeneration,
-			recoveryOperationEpoch: claim.recoveryOperationEpoch,
-			recoveryClaim: Object.freeze({
-				intentId: claim.intentId,
-				recordId: claim.recordId,
-			}),
-			targetReadyToken,
-		});
-		const captured = editorBindings?.captureHandoffReplayTargetSnapshot?.(request);
-		if (captured?.kind !== "ready") return false;
-		const current = captured.snapshot;
-		return current.sessionId === snapshot.sessionId
-			&& current.leafId === snapshot.leafId
-			&& current.handoffGeneration === snapshot.handoffGeneration
-			&& current.recoveryOperationEpoch === claim.recoveryOperationEpoch
-			&& current.targetReadyTokenId === targetReadyToken.tokenId
-			&& current.hostLoadTokenId === targetReadyToken.hostLoadTokenId
-			&& current.hostLoadReceiptId === targetReadyToken.hostLoadReceiptId
-			&& current.targetPath === snapshot.path
-			&& current.targetFile === snapshot.file
-			&& current.targetFileId === active.fileId
-			&& current.cm === primary.cm
-			&& current.ytext === active.ytext
-			&& current.ytextIdentity === active.ytextIdentity
-			&& current.ytextMutationEpoch === active.ytextMutationEpoch
-			&& current.bindingEpoch === primary.bindingEpoch + 1
-			&& current.editorRevision === primary.editorRevision
-			&& current.nativeHistoryEpoch === hostReceipt.nativeHistoryEpoch
-			&& current.selectionEpoch === hostReceipt.targetSelectionEpoch
-			&& current.scrollEpoch === hostReceipt.targetScrollEpoch
-			&& current.selection.eq(hostReceipt.targetSelection)
-			&& current.cmDocument === primary.editorDocument
-			&& current.editorFacadeContent === snapshot.expectedEditorContent
-			&& current.runtimeCacheContent === snapshot.expectedEditorContent
-			&& current.ytextContent === snapshot.expectedEditorContent;
+		return targetPresentedTransitionCurrent;
 	}
 
 	private isTargetPresentedTicketTransitionCurrent(
@@ -8566,22 +7531,12 @@ export class ReconciliationController {
 			selectionEpoch: hostReceipt.targetSelectionEpoch,
 			scrollEpoch: hostReceipt.targetScrollEpoch,
 		});
-		let issuedToken: TargetReadyToken | null = null;
 		const freshnessHandleId = this.editorAuthorityAdmission.issueFreshness(
 			context,
 			() => this.isEditorAdmissionAuthorityCurrent(snapshot, {
 				allowTargetPresentedTransition: true,
 				receipt: hostReceipt,
 				candidate,
-				recoveryPostBind:
-					snapshot.admissionReason === "handoff-replay-target-bind"
-						&& snapshot.recoveryClaim !== null
-						&& issuedToken !== null
-						? {
-							targetReadyToken: issuedToken,
-							claim: snapshot.recoveryClaim,
-						}
-						: undefined,
 			}),
 		);
 		const active = snapshot.activeAuthority;
@@ -8651,7 +7606,6 @@ export class ReconciliationController {
 				snapshot.openEditorTicket,
 			),
 		});
-		issuedToken = token;
 		return Object.freeze({ token, context, snapshot, hostReceipt, candidate });
 	}
 
@@ -8683,10 +7637,7 @@ export class ReconciliationController {
 	): boolean {
 		if (
 			request.requestId.length === 0
-			|| (
-				request.reason !== "open-editor-missing-target"
-				&& request.reason !== "handoff-replay-target-bind"
-			)
+			|| request.reason !== "open-editor-missing-target"
 			|| request.targetPath.length === 0
 			|| request.targetFile.path !== request.targetPath
 			|| request.openEditorTicket.path !== request.targetPath
@@ -8700,20 +7651,6 @@ export class ReconciliationController {
 			|| primary.switchIntentSeq !== request.switchIntentSeq
 			|| primary.targetFile !== request.targetFile
 			|| !primary.stableTargetIdentityProven
-		) return false;
-		if (
-			request.reason === "handoff-replay-target-bind"
-			&& (
-				request.presentation !== "target-proven"
-				|| request.hostLoadTokenId !== null
-				|| request.openEditorTicket.views.length !== 1
-				|| !this.isValidHandoffReplayRecoveryClaim(request.recoveryClaim)
-				|| !this.isExactRecoveryAdmissionViewTicket(
-					primary,
-					request.recoveryClaim,
-					primary.editorContent ?? "",
-				)
-			)
 		) return false;
 		switch (request.presentation) {
 			case "source":
@@ -8729,81 +7666,6 @@ export class ReconciliationController {
 					&& primary.displayedFile === request.targetFile
 					&& primary.displayedPath === request.targetPath;
 		}
-	}
-
-	private isValidHandoffReplayRecoveryClaim(
-		claim: HandoffReplayRecoveryClaim | null | undefined,
-	): claim is HandoffReplayRecoveryClaim {
-		return typeof claim === "object"
-			&& claim !== null
-			&& Number.isSafeInteger(claim.recoveryOperationEpoch)
-			&& claim.recoveryOperationEpoch >= 0
-			&& claim.intentId.length > 0
-			&& claim.recordId.length > 0;
-	}
-
-	private sameHandoffReplayRecoveryClaim(
-		left: HandoffReplayRecoveryClaim,
-		right: HandoffReplayRecoveryClaim,
-	): boolean {
-		return left.recoveryOperationEpoch === right.recoveryOperationEpoch
-			&& left.intentId === right.intentId
-			&& left.recordId === right.recordId;
-	}
-
-	private getHandoffReplayRecoveryAdmissionEvidence(
-		view: OpenEditorMutationViewTicket,
-	): HandoffReplayRecoveryAdmissionEvidence | null {
-		const evidence = (
-			view as OpenEditorMutationViewTicket & Readonly<{
-				handoffReplayRecovery?: HandoffReplayRecoveryAdmissionEvidence;
-			}>
-		).handoffReplayRecovery;
-		return evidence ?? null;
-	}
-
-	private isExactRecoveryAdmissionViewTicket(
-		view: OpenEditorMutationViewTicket,
-		claim: HandoffReplayRecoveryClaim,
-		expectedContent: string,
-	): view is HandoffReplayRecoveryOpenEditorMutationViewTicket {
-		const evidence = this.getHandoffReplayRecoveryAdmissionEvidence(view);
-		if (
-			!evidence
-			|| evidence.purpose !== "handoff-replay-target-bind"
-			|| !this.isValidHandoffReplayRecoveryClaim(evidence.recoveryClaim)
-			|| !this.sameHandoffReplayRecoveryClaim(evidence.recoveryClaim, claim)
-			|| evidence.recoveryTargetBindingRequest === null
-			|| !this.sameHandoffReplayRecoveryClaim(
-				evidence.recoveryTargetBindingRequest,
-				claim,
-			)
-			|| evidence.inputGateInstalled !== true
-			|| evidence.saveGuardInstalled !== false
-			|| evidence.pendingHostLoadCandidate !== null
-			|| evidence.intentState.intentId !== claim.intentId
-			|| evidence.intentState.recordId !== claim.recordId
-			|| (
-				evidence.intentState.kind !== "stored"
-				&& evidence.intentState.kind !== "replay-pending"
-			)
-			|| evidence.binding.kind !== "unbound"
-			|| evidence.binding.bindingEpoch !== view.bindingEpoch
-			|| view.displayedFile !== view.targetFile
-			|| view.displayedPath !== view.targetFile.path
-			|| view.cm === null
-			|| view.handoffPresentation !== "target-proven"
-			|| view.pendingHostLoadTokenId !== null
-			|| view.intentStateKind !== evidence.intentState.kind
-			|| view.handoffPhase !== (
-				evidence.intentState.kind === "stored"
-					? "awaiting-recovery-commit"
-					: "awaiting-replay-settlement"
-			)
-			|| view.editorDocument !== view.cm.state.doc
-			|| view.editorContent !== expectedContent
-		) return false;
-		return true;
 	}
 
 	private isTargetPresentationRequestStructurallyValid(
@@ -8892,6 +7754,7 @@ export class ReconciliationController {
 			case "failed":
 				return false;
 		}
+		return false;
 	}
 
 	private getAdmissionPrimaryTicket(

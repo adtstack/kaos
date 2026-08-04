@@ -54,37 +54,42 @@ const scopeInitializationSource = sourceBetween(
 assert.doesNotMatch(scopeRotationSource, /host|deviceName/);
 assert.ok(
 	scopeRotationSource.indexOf("++this.handoffRecoveryActivationEpoch")
-		< scopeRotationSource.indexOf("replaceHandoffRecoveryPort(null"),
-	"scope epoch advances before the old editor port is detached",
-);
-assert.ok(
-	scopeRotationSource.indexOf("replaceHandoffRecoveryPort(null")
 		< scopeRotationSource.indexOf("initializeHandoffRecovery("),
-	"old port is detached before asynchronous hydration starts",
+	"scope epoch advances before asynchronous manual hydration starts",
+);
+assert.doesNotMatch(
+	scopeRotationSource,
+	/replaceHandoffRecoveryPort/,
+	"scope rotation has no editor recovery/replay port",
 );
 assert.match(
 	scopeRotationSource,
-	/requestedScopeKey !== null[\s\S]*handoffRecoveryCoordinator !== null[\s\S]*handoffReplayCoordinator !== null/,
-	"a same-scope cold-start retry is skipped only after both Recovery coordinators exist",
+	/requestedScopeKey !== null[\s\S]*handoffRecoveryCoordinator !== null/,
+	"a same-scope cold-start retry is skipped only after the manual coordinator exists",
+);
+assert.doesNotMatch(
+	scopeInitializationSource,
+	/HandoffReplayCoordinator|classifyStoredIntent|replayActions|observeAwaitingSettlement/,
+	"scope activation cannot wire persisted rows back into automatic editor replay",
 );
 assert.match(
 	sourceBetween("private applyRuntimeSettings(", "private buildEffectiveRuntimeConfig("),
 	/rotateHandoffRecoveryScope\(reason\)/,
 );
-assert.match(
+assert.doesNotMatch(
 	scopeInitializationSource,
-	/catch\s*\{[\s\S]*replaceHandoffRecoveryPort\(coordinator, activationEpoch\)/,
-	"an operational hydration failure keeps the escape-capable coordinator port",
+	/replaceHandoffRecoveryPort/,
+	"hydration never attaches stored rows to the editor",
 );
 assert.doesNotMatch(
 	sourceBetween("// 2. EditorBindingManager", "// 3. Global CM6 extension"),
-	/handoffRecoveryReady\s*\?\s*this\.handoffRecoveryCoordinator\s*:\s*null/,
-	"manager construction does not hide the escape port behind dashboard readiness",
+	/handoffRecoveryCoordinator|HandoffReplayCoordinator/,
+	"manager construction has no recovery apply or replay port",
 );
 assert.match(
 	sourceBetween("// 2. EditorBindingManager", "// 3. Global CM6 extension"),
 	/this\.rotateHandoffRecoveryScope\("editor-bindings-ready"\)/,
-	"cold start explicitly retries Recovery activation after EditorBindingManager exists",
+	"cold start explicitly retries manual Recovery activation after editor startup",
 );
 for (const source of [
 	sourceBetween("private async teardownSync(", "private resetLocalCache("),
@@ -155,6 +160,13 @@ async function withRecoveryChecksum<T extends HandoffRecoveryRecord>(
 			canonicalHandoffRecoveryJson(withoutChecksum),
 		),
 	} as T;
+}
+
+function recoveryPayload(
+	record: ActiveHandoffRecoveryRecord,
+): Omit<ActiveHandoffRecoveryRecord, "status" | "checksum"> {
+	const { status: _status, checksum: _checksum, ...payload } = record;
+	return payload;
 }
 
 function makeApplyWitness(
@@ -336,7 +348,6 @@ console.log("\n--- Handoff Recovery lifecycle: hydrated CAS converges before/aft
 		const coordinator = new ManualHandoffRecoveryCoordinator({
 			store,
 			isScopeCurrent: () => true,
-			observeAwaitingSettlement: async () => "uncertain",
 		});
 		const hydration = await coordinator.hydrateScope();
 		assert.equal(hydration.active[0]?.status, "needs-review");
@@ -345,7 +356,7 @@ console.log("\n--- Handoff Recovery lifecycle: hydrated CAS converges before/aft
 	}
 }
 
-console.log("\n--- Handoff Recovery lifecycle: hydrated resolve converges before/after throws ---");
+console.log("\n--- Handoff Recovery lifecycle: hydration never auto-finalizes settlement ---");
 {
 	for (const fault of ["before-once", "after-once"] as const) {
 		const awaiting = await makeAwaitingRecord(`restart-resolve-${fault}`);
@@ -354,19 +365,11 @@ console.log("\n--- Handoff Recovery lifecycle: hydrated resolve converges before
 		const coordinator = new ManualHandoffRecoveryCoordinator({
 			store,
 			isScopeCurrent: () => true,
-			observeAwaitingSettlement: async () => "settled",
 		});
 		const hydration = await coordinator.hydrateScope();
-		assert.equal(store.resolveCalls, 1, "ambiguous resolve is never blindly retried");
-		assert.ok(store.hydrateCalls >= 3, "ambiguous resolve performs an exact reread");
-		if (fault === "before-once") {
-			assert.equal(hydration.active[0]?.status, "replayed-awaiting-settlement");
-			assert.equal(hydration.terminal.length, 0);
-		} else {
-			assert.equal(hydration.active.length, 0);
-			assert.equal(hydration.terminal[0]?.status, "resolved");
-			assert.equal(hydration.terminal[0]?.disposition, "settled-replay");
-		}
+		assert.equal(store.resolveCalls, 0, "hydration has no automatic settlement finalize path");
+		assert.equal(hydration.active[0]?.status, "needs-review");
+		assert.equal(hydration.terminal.length, 0);
 	}
 }
 
@@ -489,16 +492,28 @@ console.log("\n--- Handoff Recovery lifecycle: restart hydration is manual-only 
 		makeIntent("restart-terminal"),
 		1_800_000_000_104,
 	);
-	const replayPending = await withRecoveryChecksum({
+	const strictReplayPending = await withRecoveryChecksum({
 		...replayPendingBase,
 		status: "replay-pending",
-		applyWitness: makeApplyWitness(replayPendingBase, null),
+		applyWitness: {
+			...makeApplyWitness(replayPendingBase, null),
+			kind: "strict-nonoverlap-rebase" as const,
+		},
 	} as ActiveHandoffRecoveryRecord);
-	const awaiting = await withRecoveryChecksum({
+	const strictAwaiting = await withRecoveryChecksum({
 		...awaitingBase,
 		status: "replayed-awaiting-settlement",
-		applyWitness: makeApplyWitness(awaitingBase, "9".repeat(64)),
+		applyWitness: {
+			...makeApplyWitness(awaitingBase, "9".repeat(64)),
+			kind: "strict-nonoverlap-rebase" as const,
+		},
 	} as ActiveHandoffRecoveryRecord);
+	const strictReplayPendingPayloadSnapshot = structuredClone(
+		recoveryPayload(strictReplayPending),
+	);
+	const strictAwaitingPayloadSnapshot = structuredClone(
+		recoveryPayload(strictAwaiting),
+	);
 	const manual = await withRecoveryChecksum({
 		...manualBase,
 		status: "needs-review",
@@ -518,25 +533,38 @@ console.log("\n--- Handoff Recovery lifecycle: restart hydration is manual-only 
 		disposition: "manual-resolution",
 	} as TerminalHandoffRecoveryReceipt);
 	const store = new HydrationStore({
-		active: [stored, replayPending, awaiting, manual],
+		active: [stored, strictReplayPending, strictAwaiting, manual],
 		terminal: [terminal],
 	});
-	let settlementObservations = 0;
 	const coordinator = new ManualHandoffRecoveryCoordinator({
 		store,
 		isScopeCurrent: () => true,
-		observeSettlement: async () => {
-			settlementObservations++;
-			return "uncertain";
-		},
 	});
 	const hydration = await coordinator.hydrateScope();
 	assert.deepEqual(
 		hydration.active.map((record) => record.status),
 		["needs-review", "needs-review", "needs-review", "needs-review"],
 	);
+	const demotedStrictReplayPending = hydration.active.find(
+		(record) => record.recordId === strictReplayPending.recordId,
+	);
+	assert.ok(demotedStrictReplayPending, "strict replay-pending row remains visible");
+	assert.equal(demotedStrictReplayPending.status, "needs-review");
+	assert.deepEqual(
+		recoveryPayload(demotedStrictReplayPending),
+		strictReplayPendingPayloadSnapshot,
+	);
+	const demotedStrictAwaiting = hydration.active.find(
+		(record) => record.recordId === strictAwaiting.recordId,
+	);
+	assert.ok(demotedStrictAwaiting, "strict awaiting-settlement row remains visible");
+	assert.equal(demotedStrictAwaiting.status, "needs-review");
+	assert.deepEqual(
+		recoveryPayload(demotedStrictAwaiting),
+		strictAwaitingPayloadSnapshot,
+	);
 	assert.equal(store.compareCalls, 3);
-	assert.equal(settlementObservations, 1);
+	assert.equal(store.resolveCalls, 0);
 	assert.equal(store.applyWitnessCalls, 0);
 	assert.equal(store.dispatchReceiptCalls, 0);
 	assert.equal(hydration.terminal.length, 1);

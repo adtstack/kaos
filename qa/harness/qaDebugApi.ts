@@ -25,10 +25,6 @@ import { yTextToString } from "../../src/utils/format";
 import { forceReplaceYText } from "../../src/sync/diff";
 import type {
 	EditorHandoffDebugSnapshot,
-	HandoffRecoveryQaFault,
-	HandoffRecoveryQaInventory,
-	HandoffRecoveryQaManualRow,
-	HandoffRecoveryQaSnapshot,
 } from "../../src/runtime/engineControlPort";
 
 declare const __KAOS_QA_HARNESS_ENABLED__: boolean;
@@ -133,11 +129,6 @@ export interface KaosQaDebugApi {
 	releaseHeldNativeSave(): void;
 	getEditorHandoffDebugSnapshot(): EditorHandoffDebugSnapshot;
 	getContentFreeSnapshot(): EditorHandoffDebugSnapshot;
-	__qaOnlyArmHandoffRecoveryFaultUnsafe(fault: HandoffRecoveryQaFault): void;
-	__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe(operationId: string): void;
-	getHandoffRecoveryQaSnapshot(): HandoffRecoveryQaSnapshot;
-	getHandoffRecoveryQaManualRows(): Promise<readonly HandoffRecoveryQaManualRow[]>;
-	getHandoffRecoveryQaInventory(): Promise<HandoffRecoveryQaInventory>;
 
 	// Path sets
 	getActiveMarkdownPaths(): string[];
@@ -777,21 +768,6 @@ export function buildQaDebugApi(plugin: PluginHandle): KaosQaDebugApi {
 		},
 		getContentFreeSnapshot(): EditorHandoffDebugSnapshot {
 			return plugin.getEngineControlPort().getContentFreeSnapshot();
-		},
-		__qaOnlyArmHandoffRecoveryFaultUnsafe(fault: HandoffRecoveryQaFault): void {
-			plugin.getEngineControlPort().__qaOnlyArmHandoffRecoveryFaultUnsafe(fault);
-		},
-		__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe(operationId: string): void {
-			plugin.getEngineControlPort().__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe(operationId);
-		},
-		getHandoffRecoveryQaSnapshot(): HandoffRecoveryQaSnapshot {
-			return plugin.getEngineControlPort().getHandoffRecoveryQaSnapshot();
-		},
-		getHandoffRecoveryQaManualRows(): Promise<readonly HandoffRecoveryQaManualRow[]> {
-			return plugin.getEngineControlPort().getHandoffRecoveryQaManualRows();
-		},
-		getHandoffRecoveryQaInventory(): Promise<HandoffRecoveryQaInventory> {
-			return plugin.getEngineControlPort().getHandoffRecoveryQaInventory();
 		},
 		async setDiskIngestSuspended(suspended: boolean): Promise<{ previous: boolean }> {
 			const previous = plugin.getEngineControlPort().setDiskIngestSuspended(suspended);
