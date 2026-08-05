@@ -157,6 +157,12 @@ export type EditorHandoffManagedLeafDebugSnapshot = Readonly<{
 export type EditorHandoffDebugSnapshot = Readonly<{
 	hostLoad: EditorHandoffHostOperationDebugSnapshot | null;
 	nativeSave: EditorHandoffHostOperationDebugSnapshot | null;
+	lastInterceptedExternalDiskMutation: Readonly<{
+		path: string;
+		sequence: number;
+		observedAt: number;
+		contentHash: string;
+	}> | null;
 	leaves: readonly EditorHandoffManagedLeafDebugSnapshot[];
 }>;
 

@@ -526,6 +526,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.remoteProjectionPolicyGate.isRemoteProjectionAllowed(path),
 			getMarkdownAttentionGeneration: () => this.markdownAttentionGeneration,
 			getMarkdownSyncScopeGeneration: () => this.markdownSyncScopeGeneration,
+			persistPreservedUnresolvedStateDurably: async (stateChanged) => {
+				if (stateChanged) this.markdownAttentionGeneration++;
+				await this.persistPreservedUnresolvedStateDurably();
+			},
 			shouldTombstoneIntrinsicMarkdownPath: (path) => this.isIntrinsicMarkdownPathExcluded(path),
 			shouldTombstoneIntrinsicBlobPath: (path) => this.isIntrinsicBlobPathExcluded(path),
 			shouldBlockFrontmatterIngest: (path, previousContent, nextContent, reason) =>
@@ -3835,6 +3839,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					runReconciliation: (mode) => this.runReconciliation(mode),
 					runSchemaMigrationToV2: () => this.runSchemaMigrationToV2(),
 					importUntrackedFiles: () => this.importUntrackedFiles(),
+					retryBlockedHandoffRecoveryExport: () =>
+						this.editorBindings?.retryPendingStructuralSourceCloseExport() ?? 0,
 					clearLocalServerReceiptState: () => this.clearLocalServerReceiptState(),
 					resetLocalCache: () => this.resetLocalCache(),
 					nuclearReset: () => this.nuclearReset(),
@@ -4147,11 +4153,20 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						size: typeof file.stat?.size === "number" ? file.stat.size : null,
 					};
 					const editorBindingsAtEvent = this.editorBindings;
-					if (editorBindingsAtEvent?.isBound(file.path)) {
+					if (editorBindingsAtEvent?.tracksExternalDiskMutationPath(file.path)) {
 						const sequence = ++this.externalDiskMutationSequence;
+						const controllerProbeTicket =
+							this.reconciliationController.beginExternalDiskMutationProbe({
+								file,
+								revision: diskMutationRevision,
+								sequence,
+								observedAt,
+							});
 						editorBindingsAtEvent.beginExternalDiskMutation(file.path, sequence);
 						void (async () => {
 							let content: string | null = null;
+							let disposition: "current" | "stale" | "unavailable" =
+								dm ? "current" : "unavailable";
 							if (dm) {
 								if (writerGuess === "kaos-write") {
 									// Timing is diagnostic only. The exact event revision must match
@@ -4160,15 +4175,45 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 										file,
 										diskMutationRevision,
 									);
-									if (probe.kind === "self-write") return;
-									if (probe.kind !== "stale-or-unreadable") {
+									if (
+										this.diskMirror !== dm ||
+										this.editorBindings !== editorBindingsAtEvent
+									) {
+										return;
+									}
+									if (probe.kind === "self-write") {
+										editorBindingsAtEvent.noteSelfWriteExternalDiskMutation({
+											...diskMutationRevision,
+											sequence,
+											observedAt,
+											content: probe.content,
+										});
+										if (controllerProbeTicket) {
+											void this.reconciliationController
+												.noteSelfWriteExternalDiskMutationProbeOutcome(
+													controllerProbeTicket,
+													probe.content,
+												);
+										}
+										return;
+									}
+									if (
+										probe.kind === "stale" || probe.kind === "unavailable"
+									) {
+										disposition = probe.kind;
+									} else {
 										content = probe.content;
 									}
 								} else {
-									content = await dm.readExactObservedDiskRevision(
+									const probe = await dm.probeExactObservedDiskRevision(
 										file,
 										diskMutationRevision,
 									);
+									if (probe.kind === "current") {
+										content = probe.content;
+									} else {
+										disposition = probe.kind;
+									}
 								}
 							}
 
@@ -4177,16 +4222,45 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 							if (this.diskMirror !== dm || this.editorBindings !== editorBindingsAtEvent) {
 								return;
 							}
-							editorBindingsAtEvent.noteExternalDiskMutation({
+							if (disposition !== "current" && controllerProbeTicket) {
+								this.reconciliationController.noteExternalDiskMutationProbeDisposition({
+									disposition,
+									ticket: controllerProbeTicket,
+								});
+							}
+							const completion = editorBindingsAtEvent.noteExternalDiskMutation({
 								...diskMutationRevision,
 								sequence,
 								observedAt,
 								content,
 							});
+							if (completion === "terminal-no-candidate" && controllerProbeTicket) {
+								void this.reconciliationController.noteExternalDiskMutationProbeSettled(
+									controllerProbeTicket,
+								);
+							}
 						})().catch((err) => {
 							this.trace("editor", "external-disk-reload-guard-probe-failed", {
-								path: file.path,
+								path: diskMutationRevision.path,
 								error: formatUnknown(err),
+							});
+							if (
+								this.diskMirror !== dm ||
+								this.editorBindings !== editorBindingsAtEvent
+							) {
+								return;
+							}
+							if (controllerProbeTicket) {
+								this.reconciliationController.noteExternalDiskMutationProbeDisposition({
+									disposition: "unavailable",
+									ticket: controllerProbeTicket,
+								});
+							}
+							editorBindingsAtEvent.noteExternalDiskMutation({
+								...diskMutationRevision,
+								sequence,
+								observedAt,
+								content: null,
 							});
 						});
 					}

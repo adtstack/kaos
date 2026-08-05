@@ -9,7 +9,10 @@
 
 import type { KaosDebugPort } from "../src/telemetry/debug/ports/kaosDebugPort";
 import type { KaosUnsafeQaPort } from "../qa/harness/ports/kaosUnsafeQaPort";
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
+import { EDITOR_HANDOFF_HELD_EXTERNAL_TARGET_REVISION } from
+	"../qa/contracts/editor-handoff-host-fence";
 
 let passed = 0;
 let failed = 0;
@@ -88,11 +91,13 @@ console.log("\n--- Test 2: KaosUnsafeQaPort interface shape ---");
 		getEditorHandoffDebugSnapshot: () => ({
 			hostLoad: null,
 			nativeSave: null,
+			lastInterceptedExternalDiskMutation: null,
 			leaves: [],
 		}),
 		getContentFreeSnapshot: () => ({
 			hostLoad: null,
 			nativeSave: null,
+			lastInterceptedExternalDiskMutation: null,
 			leaves: [],
 		}),
 		setQaNetworkHold: () => {},
@@ -342,6 +347,8 @@ console.log("\n--- Test 5: product policy is absent and QA suspension is build-g
 			productionGuardSource.includes('"clipboard-rejected"') &&
 			productionGuardSource.includes("QA_PRODUCT_REQUIRED") &&
 			productionGuardSource.includes('"associateEditorHandoffHostQaBarrier"') &&
+			productionGuardSource.includes('"recordInterceptedExternalDiskMutation"') &&
+			productionGuardSource.includes('"lastInterceptedExternalDiskMutation"') &&
 			productionGuardSource.includes('"setExternalEditPolicyOverride"'),
 		"production bundle guard bans both new and legacy unsafe controls",
 	);
@@ -358,6 +365,46 @@ console.log("\n--- Test 5: product policy is absent and QA suspension is build-g
 			!qaScenarioSource.includes("replaceFileContent(") &&
 			!qaScenarioSource.includes("setValue("),
 		"S13a uses the six-phase host protocol without renderer text mutation helpers",
+	);
+	const heldExternalProofSource = qaControllerSource.slice(
+		qaControllerSource.indexOf("async function waitForHeldExternalTargetProof"),
+		qaControllerSource.indexOf("async function serviceSaveBeforeSwitch"),
+	);
+	const exactExternalAdmissionSource = qaScenarioSource.slice(
+		qaScenarioSource.indexOf("async function waitForExactExternalTargetAdmission"),
+		qaScenarioSource.indexOf("async function waitForExactExternalTargetConvergence"),
+	);
+	assert(
+		createHash("sha256")
+			.update(EDITOR_HANDOFF_HELD_EXTERNAL_TARGET_REVISION.content, "utf8")
+			.digest("hex") === EDITOR_HANDOFF_HELD_EXTERNAL_TARGET_REVISION.sha256 &&
+			qaControllerSource.includes("EDITOR_HANDOFF_HELD_EXTERNAL_TARGET_REVISION.content") &&
+			qaScenarioSource.includes("EDITOR_HANDOFF_HELD_EXTERNAL_TARGET_REVISION.sha256"),
+		"S13a controller and scenario share one exact external B revision and SHA-256 contract",
+	);
+	assert(
+		heldExternalProofSource.includes("snapshot.lastInterceptedExternalDiskMutation") &&
+			heldExternalProofSource.includes("receipt.sequence > beforeSequence") &&
+			heldExternalProofSource.includes("receipt.contentHash === expectedHash") &&
+			heldExternalProofSource.includes("last.leafViewPath === PATH_B") &&
+			heldExternalProofSource.includes("last.leafDisplayedPath !== PATH_B") &&
+			heldExternalProofSource.includes("last.leafBindingPath !== PATH_B") &&
+			!heldExternalProofSource.includes("interceptedExternalDiskMutations") &&
+			!heldExternalProofSource.includes("crdtHash"),
+		"S13a held-load proof requires a newer exact public receipt at the target-only seam",
+	);
+	assert(
+		exactExternalAdmissionSource.includes("leaf.viewPath === EDITOR_HANDOFF_HOST_FENCE_PATHS.b") &&
+			exactExternalAdmissionSource.includes("leaf.displayedPath === EDITOR_HANDOFF_HOST_FENCE_PATHS.b") &&
+			exactExternalAdmissionSource.includes("leaf.bindingPath === EDITOR_HANDOFF_HOST_FENCE_PATHS.b") &&
+			exactExternalAdmissionSource.includes("leaf.gateClosed === false") &&
+			exactExternalAdmissionSource.includes("leaf.saveGuardInstalled === false") &&
+			exactExternalAdmissionSource.includes("activeViewLeafId === leafId") &&
+			exactExternalAdmissionSource.includes("activeEditorContent === expected.content") &&
+			exactExternalAdmissionSource.includes("activeEditorHash === expected.sha256") &&
+			qaScenarioSource.includes("waitForExactExternalTargetConvergence(ctx)") &&
+			!qaScenarioSource.includes("heldExternalTargetHash"),
+		"S13a waits through host retry for exact same-leaf B admission and fixed disk/CRDT convergence",
 	);
 	assert(
 		controllerClientSource.includes('type: "rawKeyDown"') &&
@@ -506,6 +553,7 @@ console.log("\n--- Test 5: product policy is absent and QA suspension is build-g
 			"releaseHeldNativeSave",
 			"getEditorHandoffDebugSnapshot",
 			"getContentFreeSnapshot",
+			"lastInterceptedExternalDiskMutation",
 			"setEditorHandoffHostApiVersionOverride",
 			"baseRetained",
 			"installEditorHandoffHostQaBarrier",

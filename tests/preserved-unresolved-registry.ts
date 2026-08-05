@@ -183,4 +183,31 @@ assert.deepEqual(
 	"a new conflict episode never inherits candidate authority from the previous episode",
 );
 
+const exactResolutionPath = "Notes/exact-resolution.md";
+const exactResolutionRegistry = new PreservedUnresolvedRegistry([{
+	path: exactResolutionPath,
+	kind: "markdown",
+	reason: "external-disk-read-unavailable",
+	episodeId: "exhausted-read-episode",
+	firstSeenAt,
+	lastSeenAt,
+}]);
+assert.equal(
+	exactResolutionRegistry.resolveEpisode(exactResolutionPath, "older-episode"),
+	false,
+	"an older owner cannot resolve a same-path replacement episode",
+);
+assert.equal(
+	exactResolutionRegistry.get(exactResolutionPath)?.episodeId,
+	"exhausted-read-episode",
+	"failed exact resolution leaves the current episode intact",
+);
+assert.equal(
+	exactResolutionRegistry.resolveEpisode(exactResolutionPath, "exhausted-read-episode"),
+	true,
+	"the exact exhausted-read owner can resolve its episode",
+);
+assert.equal(exactResolutionRegistry.has(exactResolutionPath), false);
+assert.equal(exactResolutionRegistry.paths.has(exactResolutionPath), false);
+
 console.log("preserved-unresolved registry tests passed");

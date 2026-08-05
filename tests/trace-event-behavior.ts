@@ -291,7 +291,7 @@ console.log("\n--- Test 4c: fingerprint proof cannot cross a file revision chang
 	releaseRead?.();
 
 	assert(
-		(await probe).kind === "stale-or-unreadable",
+		(await probe).kind === "stale",
 		"later same-size bytes cannot prove that the older modify event was a self-write",
 	);
 	assert(

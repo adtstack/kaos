@@ -6,16 +6,23 @@ import type {
 	EditorHandoffDebugSnapshot,
 	EditorHandoffManagedLeafDebugSnapshot,
 } from "../../src/runtime/engineControlPort";
+import {
+	EDITOR_HANDOFF_HELD_EXTERNAL_TARGET_REVISION,
+	EDITOR_HANDOFF_HOST_FENCE_PATHS,
+	EDITOR_HANDOFF_HOST_FENCES_SCENARIO_ID,
+} from "../contracts/editor-handoff-host-fence";
 import type {
 	EditorHandoffExternalPhaseName,
 	QaExternalPhaseTicket,
 } from "../obsidian-harness/types";
 import { ObsidianClient } from "./obsidian-client";
 
-const SCENARIO_ID = "s13a-editor-handoff-host-fences";
-const PATH_A = "QA-handoff-fences-A.md";
-const PATH_B = "QA-handoff-fences-B.md";
-const PATH_C = "QA-handoff-fences-C.md";
+const SCENARIO_ID = EDITOR_HANDOFF_HOST_FENCES_SCENARIO_ID;
+const {
+	a: PATH_A,
+	b: PATH_B,
+	c: PATH_C,
+} = EDITOR_HANDOFF_HOST_FENCE_PATHS;
 const SNAPSHOT_TIMEOUT_MS = 20_000;
 type ScenarioResult = Awaited<ReturnType<ObsidianClient["runScenario"]>>;
 let activeScenarioRun: Promise<ScenarioResult> | null = null;
@@ -160,6 +167,67 @@ async function waitForExactSourceAuthority(
 		"unsupported-host:source authority did not settle to the exact pre-target successor; "
 		+ `expectedLength=${expectedContent.length};diskLength=${last?.disk?.length ?? -1};`
 		+ `crdtLength=${last?.crdt?.length ?? -1}`,
+	);
+}
+
+async function waitForHeldExternalTargetProof(
+	client: ObsidianClient,
+	leafId: string,
+	beforeSequence: number,
+): Promise<void> {
+	const expectedHash = EDITOR_HANDOFF_HELD_EXTERNAL_TARGET_REVISION.sha256;
+	const startedAt = Date.now();
+	let last: Readonly<{
+		hostState: string | null;
+		hostPath: string | null;
+		leafViewPath: string | null;
+		leafDisplayedPath: string | null;
+		leafBindingPath: string | null;
+		leafGateClosed: boolean;
+		diskHash: string | null;
+		receipt: EditorHandoffDebugSnapshot["lastInterceptedExternalDiskMutation"];
+	}> | null = null;
+	while (Date.now() - startedAt < SNAPSHOT_TIMEOUT_MS) {
+		last = await client.evalRaw(`(async () => {
+			const debug = window.__KAOS_DEBUG__;
+			if (!debug) throw new Error("__KAOS_DEBUG__ unavailable");
+			const path = ${JSON.stringify(PATH_B)};
+			const leafId = ${JSON.stringify(leafId)};
+			const snapshot = debug.getEditorHandoffDebugSnapshot();
+			const leaf = snapshot.leaves.find((candidate) => candidate.leafId === leafId);
+			return {
+				hostState: snapshot.hostLoad?.state ?? null,
+				hostPath: snapshot.hostLoad?.path ?? null,
+				leafViewPath: leaf?.viewPath ?? null,
+				leafDisplayedPath: leaf?.displayedPath ?? null,
+				leafBindingPath: leaf?.bindingPath ?? null,
+				leafGateClosed: leaf?.gateClosed === true,
+				diskHash: await debug.getDiskHash(path),
+				receipt: snapshot.lastInterceptedExternalDiskMutation ?? null,
+			};
+		})()`);
+		const receipt = last.receipt;
+		if (
+			last.hostState === "held"
+			&& last.hostPath === PATH_B
+			&& last.leafViewPath === PATH_B
+			&& last.leafDisplayedPath !== PATH_B
+			&& last.leafBindingPath !== PATH_B
+			&& last.leafGateClosed
+			&& last.diskHash === expectedHash
+			&& receipt?.path === PATH_B
+			&& receipt.sequence > beforeSequence
+			&& Number.isFinite(receipt.observedAt)
+			&& receipt.observedAt > 0
+			&& receipt.contentHash === expectedHash
+		) return;
+		await delay(25);
+	}
+	throw new Error(
+		"unsupported-host:external target revision has no newer exact receipt at the "
+		+ "target-only B seam while its load stayed held; "
+		+ `beforeSequence=${beforeSequence};expectedHash=${expectedHash};`
+		+ `last=${JSON.stringify(last)}`,
 	);
 }
 
@@ -383,7 +451,10 @@ async function serviceImeClickWhileComposing(client: ObsidianClient): Promise<vo
 	await client.resumeExternalPhase(ticket);
 }
 
-async function serviceInputWhileHostLoadHeld(client: ObsidianClient): Promise<void> {
+async function serviceInputWhileHostLoadHeld(
+	client: ObsidianClient,
+	vaultPath: string,
+): Promise<void> {
 	const ticket = await phase(client, "input-while-host-load-held");
 	const source = requireLeaf(
 		await getSnapshot(client),
@@ -403,7 +474,14 @@ async function serviceInputWhileHostLoadHeld(client: ObsidianClient): Promise<vo
 		(leaf) => leaf.leafId === leafId,
 		"held-input target",
 	);
+	const beforeSequence = held.lastInterceptedExternalDiskMutation?.sequence ?? 0;
 	const beforeContent = await readActiveEditorContent(client);
+	await client.writeNodeFile(
+		vaultPath,
+		PATH_B,
+		EDITOR_HANDOFF_HELD_EXTERNAL_TARGET_REVISION.content,
+	);
+	await waitForHeldExternalTargetProof(client, leafId, beforeSequence);
 	await physicalKeyAtCurrentFocus(client, {
 		key: "y",
 		code: "KeyY",
@@ -494,7 +572,7 @@ async function main(): Promise<void> {
 		await serviceAsciiAfterSwitchIntent(client);
 		await serviceCompletedImeAfterSwitchIntent(client);
 		await serviceImeClickWhileComposing(client);
-		await serviceInputWhileHostLoadHeld(client);
+		await serviceInputWhileHostLoadHeld(client, expectedVault);
 		await serviceSupersession(client);
 
 		const result = await runPromise;

@@ -129,6 +129,8 @@ const MAIN_FORBIDDEN = [
 	"installEditorHandoffHostQaBarrier",
 	"getEditorHandoffQaDebugSnapshot",
 	"associateEditorHandoffHostQaBarrier",
+	"recordInterceptedExternalDiskMutation",
+	"lastInterceptedExternalDiskMutation",
 	"__qaOnlyArmHandoffRecoveryFaultUnsafe",
 	"__qaOnlyReleaseHeldHandoffRecoveryPutUnsafe",
 	"getHandoffRecoveryQaSnapshot",
@@ -158,6 +160,8 @@ const QA_PRODUCT_REQUIRED = [
 	"installEditorHandoffHostQaBarrier",
 	"getEditorHandoffQaDebugSnapshot",
 	"associateEditorHandoffHostQaBarrier",
+	"recordInterceptedExternalDiskMutation",
+	"lastInterceptedExternalDiskMutation",
 ];
 
 // P2 regression guard — these seams were removed in P2 and must never return.

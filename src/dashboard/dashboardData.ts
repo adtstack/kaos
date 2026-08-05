@@ -171,6 +171,8 @@ export function collectDashboardAttention(
 				? downloadConflictArtifactAvailable
 					? "Choose Keep local or Use remote copy in the Conflicts section."
 					: "The preserved remote copy is missing or was moved. Restore the exact copy from trash, or review the local attachment manually."
+				: entry.reason === "external-disk-read-unavailable"
+					? "Repeated reads could not obtain one stable disk snapshot. Disk and shared text were left unchanged; retry after the external writer settles."
 				: entry.reason,
 			structuralChange: null,
 			firstSeenAt: new Date(entry.firstSeenAt).toISOString(),

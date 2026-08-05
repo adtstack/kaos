@@ -9,15 +9,16 @@ import type {
 	QaContext,
 	QaScenario,
 } from "../types";
+import {
+	EDITOR_HANDOFF_HELD_EXTERNAL_TARGET_REVISION,
+	EDITOR_HANDOFF_HOST_FENCE_PATHS,
+	EDITOR_HANDOFF_HOST_FENCES_SCENARIO_ID,
+} from "../../contracts/editor-handoff-host-fence";
 
-export const EDITOR_HANDOFF_HOST_FENCES_SCENARIO_ID =
-	"s13a-editor-handoff-host-fences";
-
-export const EDITOR_HANDOFF_HOST_FENCE_PATHS = Object.freeze({
-	a: "QA-handoff-fences-A.md",
-	b: "QA-handoff-fences-B.md",
-	c: "QA-handoff-fences-C.md",
-});
+export {
+	EDITOR_HANDOFF_HOST_FENCE_PATHS,
+	EDITOR_HANDOFF_HOST_FENCES_SCENARIO_ID,
+};
 
 const SAME_CONTENT = [
 	"# Editor handoff host fences",
@@ -182,11 +183,23 @@ async function finishRejectedInputPhase(
 	ctx: QaContext,
 	name: EditorHandoffExternalPhaseName,
 	leafId: string,
+	options: Readonly<{
+		targetOnlyPath?: string;
+		verifyAfterRelease?: () => Promise<void>;
+	}> = {},
 ): Promise<void> {
 	const beforeRelease = await waitForSnapshot(ctx, `${name} input rejection`, (snapshot) => {
 		const leaf = leafFor(snapshot, (candidate) => candidate.leafId === leafId);
 		return snapshot.hostLoad?.state === "held"
 			&& leaf?.gateClosed === true
+			&& (
+				options.targetOnlyPath === undefined
+				|| (
+					leaf.viewPath === options.targetOnlyPath
+					&& leaf.displayedPath !== options.targetOnlyPath
+					&& leaf.bindingPath !== options.targetOnlyPath
+				)
+			)
 			&& leaf.intent === null
 			&& leaf.compositionActive === false
 			&& leaf.editorLength !== null
@@ -200,7 +213,83 @@ async function finishRejectedInputPhase(
 		snapshot.hostLoad?.state === "released"
 		|| snapshot.hostLoad?.state === "rejected",
 	);
+	await options.verifyAfterRelease?.();
 	await teardownManagedLeaf(ctx);
+}
+
+async function waitForExactExternalTargetAdmission(
+	ctx: QaContext,
+	leafId: string,
+): Promise<void> {
+	const expected = EDITOR_HANDOFF_HELD_EXTERNAL_TARGET_REVISION;
+	const startedAt = Date.now();
+	let last: Readonly<{
+		leaf: EditorHandoffManagedLeafDebugSnapshot | null;
+		activeViewPath: string | null;
+		activeViewLeafId: string | null;
+		activeEditorLength: number | null;
+		activeEditorMatches: boolean;
+		activeEditorHash: string | null;
+	}> | null = null;
+	while (Date.now() - startedAt < 20_000) {
+		if (ctx.signal.aborted) throw ctx.signal.reason;
+		const snapshot = ctx.kaos.getContentFreeSnapshot();
+		const leaf = leafFor(snapshot, (candidate) => candidate.leafId === leafId);
+		const view = ctx.app.workspace.getActiveViewOfType(MarkdownView);
+		const activeViewLeafId = view
+			? ((view.leaf as unknown as { id?: string }).id ?? null)
+			: null;
+		const activeEditorContent = view?.editor.getValue() ?? null;
+		const activeEditorHash = await ctx.kaos.getEditorHash(
+			EDITOR_HANDOFF_HOST_FENCE_PATHS.b,
+		);
+		last = Object.freeze({
+			leaf,
+			activeViewPath: view?.file?.path ?? null,
+			activeViewLeafId,
+			activeEditorLength: activeEditorContent?.length ?? null,
+			activeEditorMatches: activeEditorContent === expected.content,
+			activeEditorHash,
+		});
+		if (
+			leaf?.active === true
+			&& leaf.viewPath === EDITOR_HANDOFF_HOST_FENCE_PATHS.b
+			&& leaf.displayedPath === EDITOR_HANDOFF_HOST_FENCE_PATHS.b
+			&& leaf.bindingPath === EDITOR_HANDOFF_HOST_FENCE_PATHS.b
+			&& leaf.gateClosed === false
+			&& leaf.saveGuardInstalled === false
+			&& leaf.intent === null
+			&& activeViewLeafId === leafId
+			&& view?.file?.path === EDITOR_HANDOFF_HOST_FENCE_PATHS.b
+			&& activeEditorContent === expected.content
+			&& activeEditorHash === expected.sha256
+		) return;
+		await ctx.sleep(25);
+	}
+	throw new Error(
+		"s13a: released/retried host load never admitted exact external B bytes on the "
+		+ `same leaf; expectedHash=${expected.sha256};last=${JSON.stringify(last)}`,
+	);
+}
+
+async function waitForExactExternalTargetConvergence(ctx: QaContext): Promise<void> {
+	const expectedHash = EDITOR_HANDOFF_HELD_EXTERNAL_TARGET_REVISION.sha256;
+	const startedAt = Date.now();
+	let last: Readonly<{ diskHash: string | null; crdtHash: string | null }> | null = null;
+	while (Date.now() - startedAt < 20_000) {
+		if (ctx.signal.aborted) throw ctx.signal.reason;
+		const [diskHash, crdtHash] = await Promise.all([
+			ctx.kaos.getDiskHash(EDITOR_HANDOFF_HOST_FENCE_PATHS.b),
+			ctx.kaos.getCrdtHash(EDITOR_HANDOFF_HOST_FENCE_PATHS.b),
+		]);
+		last = Object.freeze({ diskHash, crdtHash });
+		if (diskHash === expectedHash && crdtHash === expectedHash) return;
+		await ctx.sleep(25);
+	}
+	throw new Error(
+		"s13a: external B did not converge to the shared Node-write contract; "
+		+ `expectedHash=${expectedHash};last=${JSON.stringify(last)}`,
+	);
 }
 
 function requireEvidence(name: EditorHandoffExternalPhaseName): PhaseEvidence {
@@ -343,7 +432,9 @@ export const s13aEditorHandoffHostFences: QaScenario = {
 		);
 		await teardownManagedLeaf(ctx);
 
-		// 5. Physical input remains rejected for the full held host-load interval.
+		// 5. A real Node fs write changes B while its native load is held. Physical
+		//    input remains rejected, and the exact external B revision must settle
+		//    after the transition without being replayed into A or dropped.
 		await prepareFreshA(ctx);
 		const heldInputSwitch = armHeldHostSwitch(ctx, EDITOR_HANDOFF_HOST_FENCE_PATHS.b);
 		await ctx.awaitExternalPhase<EditorHandoffExternalPhaseName>("input-while-host-load-held");
@@ -351,7 +442,15 @@ export const s13aEditorHandoffHostFences: QaScenario = {
 			ctx,
 			"input-while-host-load-held",
 			heldInputSwitch.leafId,
+			{
+				targetOnlyPath: EDITOR_HANDOFF_HOST_FENCE_PATHS.b,
+				verifyAfterRelease: () => waitForExactExternalTargetAdmission(
+					ctx,
+					heldInputSwitch.leafId,
+				),
+			},
 		);
+		await waitForExactExternalTargetConvergence(ctx);
 
 		// 6. The controller performs real rapid B then C explorer clicks. Synthetic
 		//    host-load suspension is intentionally excluded here because Obsidian does
@@ -420,7 +519,9 @@ export const s13aEditorHandoffHostFences: QaScenario = {
 			]);
 			const expectedHash = path === EDITOR_HANDOFF_HOST_FENCE_PATHS.a
 				? compositionSourceHash
-				: baselineHash;
+				: path === EDITOR_HANDOFF_HOST_FENCE_PATHS.b
+					? EDITOR_HANDOFF_HELD_EXTERNAL_TARGET_REVISION.sha256
+					: baselineHash;
 			if (diskHash !== expectedHash || crdtHash !== expectedHash) {
 				throw new Error(
 					`s13a: editor input escaped its exact path authority for ${path}; `

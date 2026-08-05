@@ -21,6 +21,8 @@ import {
 } from "../src/sync/remoteTypingGuard";
 import { isMarkdownSyncable } from "../src/types";
 import { normalizeEditorText } from "../src/utils/editorTextNormalization";
+import { sha256HandoffRecoveryHexSync } from "../src/sync/handoffRecoveryStore";
+import { registerCommands } from "../src/commands";
 import {
 	reduceManagedLeafSession,
 	reserveManagedLeafInputStart,
@@ -129,6 +131,47 @@ function clearPendingHealthChecks(manager: unknown): void {
 	pendingUnmanage?.clear();
 	(manager as { unmanageRetryAttempts?: Map<string, number> })
 		.unmanageRetryAttempts?.clear();
+
+	const candidateRetries = (manager as {
+		pendingExternalDiskCandidateDeliveryRetries?: Map<
+			string,
+			Map<number, { timer: ReturnType<typeof setTimeout> | null }>
+		>;
+	}).pendingExternalDiskCandidateDeliveryRetries;
+	for (const retries of candidateRetries?.values() ?? []) {
+		for (const retry of retries.values()) {
+			if (retry.timer !== null) clearTimeout(retry.timer);
+		}
+	}
+	candidateRetries?.clear();
+
+	const correlationTimers = (manager as {
+		pendingExternalDiskCorrelationTimers?: Set<ReturnType<typeof setTimeout>>;
+	}).pendingExternalDiskCorrelationTimers;
+	for (const timer of correlationTimers ?? []) clearTimeout(timer);
+	correlationTimers?.clear();
+
+	for (const ledger of [
+		(manager as {
+			deliveredExternalDiskCandidateSequencesByPath?: Map<
+				string,
+				Map<number, { timer: ReturnType<typeof setTimeout> | null }>
+			>;
+		}).deliveredExternalDiskCandidateSequencesByPath,
+		(manager as {
+			selfWriteExternalDiskMutationSequencesByPath?: Map<
+				string,
+				Map<number, { timer: ReturnType<typeof setTimeout> | null }>
+			>;
+		}).selfWriteExternalDiskMutationSequencesByPath,
+	]) {
+		for (const entries of ledger?.values() ?? []) {
+			for (const entry of entries.values()) {
+				if (entry.timer !== null) clearTimeout(entry.timer);
+			}
+		}
+		ledger?.clear();
+	}
 
 }
 
@@ -286,8 +329,11 @@ function installManagedBoundaryStubs(
 			return targetSelectionFence;
 		},
 		forceTargetSelectionFenceForTerminal: (ownerId: string) => {
-			sourceUnloadDrain = null;
 			gateClosed = true;
+			// The real guard cannot replace a still-pending predecessor reservation
+			// with a target-less token. That source drain itself remains the terminal
+			// fresh-input fence until exact teardown.
+			if (sourceUnloadDrain !== null) return null;
 			targetSelectionFence = { ownerId };
 			return targetSelectionFence;
 		},
@@ -489,6 +535,65 @@ function buildManagerFixture(options: {
 	};
 }
 
+type StructuralMutationDrainRuntime = {
+	session: ManagedLeafSession;
+	sourceUnloadDrain: {
+		state: string;
+		targetSelectionToken: object | null;
+	} | null;
+	emergencySaveFence: { isCurrent(): boolean } | null;
+	cmGuard: {
+		snapshot(): Readonly<{
+			inert: boolean;
+			gateClosed: boolean;
+			targetSelectionFence: object | null;
+		}>;
+	} | null;
+};
+
+function beginStructuralMutationSourceDrain(
+	manager: EditorBindingManager,
+	binding: ReturnType<typeof buildManagerFixture>["binding"],
+	inputEpoch: number,
+): {
+	runtime: StructuralMutationDrainRuntime;
+	owner: NonNullable<StructuralMutationDrainRuntime["sourceUnloadDrain"]>;
+	drain: PromiseLike<void>;
+} {
+	const internals = manager as unknown as {
+		managedSessions: Map<string, StructuralMutationDrainRuntime>;
+		beginSourceUnloadDrain(
+			runtime: StructuralMutationDrainRuntime,
+			sourceFile: unknown,
+		): null | PromiseLike<void>;
+	};
+	const runtime = internals.managedSessions.get("leaf-1");
+	if (!runtime?.cmGuard) throw new Error("Expected managed structural-mutation drain runtime");
+	const source = runtime.session.displayedLineage;
+	if (source.kind !== "known") throw new Error("Expected known structural-mutation source");
+	const visibleContent = source.document.toString();
+	Object.assign(binding.view, {
+		data: visibleContent,
+		getViewData: () => binding.cm.state.doc.toString(),
+	});
+	const reserved = reserveManagedLeafInputStart(runtime.session, {
+		sessionId: runtime.session.sessionId,
+		expectedGeneration: runtime.session.generation,
+		inputEpoch,
+		compositionEpoch: null,
+	});
+	if (!reserved.accepted || reserved.state.pendingInputStartReservation === null) {
+		throw new Error("Expected exact structural-mutation input reservation");
+	}
+	runtime.session = reserved.state;
+	const drain = internals.beginSourceUnloadDrain(runtime, source.file);
+	const owner = runtime.sourceUnloadDrain;
+	if (drain === null || owner === null || owner.state !== "draining") {
+		throw new Error("Expected active structural-mutation source drain");
+	}
+	return { runtime, owner, drain };
+}
+
 function installLiveCmReplacement(manager: unknown, binding: {
 	cm: { dom: { isConnected: boolean }; state: unknown };
 	view: { containerEl: { contains: (node: unknown) => boolean } };
@@ -542,6 +647,122 @@ console.log("\n--- Test 0: editor binding boot IDs require cryptographic uniquen
 		true,
 		"getRandomValues fallback produces a canonical random UUID",
 	);
+}
+
+console.log("\n--- Test 0a: blocked handoff recovery has an explicit command retry path ---");
+{
+	const commands: Array<{
+		id?: string;
+		name?: string;
+		callback?: () => void;
+	}> = [];
+	let retryCalls = 0;
+	registerCommands({
+		addCommand(command) {
+			commands.push(command);
+			return command;
+		},
+	} as never, {
+		retryBlockedHandoffRecoveryExport: () => {
+			retryCalls += 1;
+			return 2;
+		},
+	} as never);
+	const retry = commands.find(
+		(command) => command.id === "retry-blocked-handoff-recovery-export",
+	);
+	assertEq(retry?.name, "Retry blocked handoff recovery export", "recovery retry command has a user-facing name");
+	retry?.callback?.();
+	assertEq(retryCalls, 1, "recovery retry command invokes the exact public host action once");
+}
+
+console.log("\n--- Test 0b: one recovery command retries only the oldest exact pending owner ---");
+{
+	type RetryOwner = {
+		state: "terminal";
+		structuralEditorOnlyCompletion: true;
+		reservation: object;
+	};
+	type RetryRuntime = {
+		session: { leafId: string };
+		sourceUnloadDrain: RetryOwner | null;
+	};
+	type RetryPending = {
+		runtime: RetryRuntime;
+		owner: RetryOwner;
+		recoveryContent: string;
+		exactRecovery: boolean;
+		timer: null;
+		settling: boolean;
+	};
+	const { manager } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const internals = manager as unknown as {
+		managedSessions: Map<string, RetryRuntime>;
+		pendingStructuralSourceCloseSettlements: Map<string, RetryPending>;
+		settleStructuralSourceClose(
+			pending: RetryPending,
+			content: string,
+			exact: boolean,
+			reason: string,
+		): void;
+	};
+	const originalManaged = internals.managedSessions;
+	const originalPending = internals.pendingStructuralSourceCloseSettlements;
+	const originalSettle = internals.settleStructuralSourceClose;
+	const pendingByLeaf = new Map<string, RetryPending>();
+	const managedByLeaf = new Map<string, RetryRuntime>();
+	const makePending = (leafId: string, settling = false): RetryPending => {
+		const owner: RetryOwner = {
+			state: "terminal",
+			structuralEditorOnlyCompletion: true,
+			reservation: {},
+		};
+		const runtime: RetryRuntime = { session: { leafId }, sourceUnloadDrain: owner };
+		managedByLeaf.set(leafId, runtime);
+		return {
+			runtime,
+			owner,
+			recoveryContent: leafId,
+			exactRecovery: true,
+			timer: null,
+			settling,
+		};
+	};
+	const stale = makePending("stale");
+	stale.runtime.sourceUnloadDrain = {
+		...stale.owner,
+		reservation: {},
+	};
+	const busy = makePending("busy", true);
+	const oldest = makePending("oldest");
+	const next = makePending("next");
+	pendingByLeaf.set("stale", stale);
+	pendingByLeaf.set("busy", busy);
+	pendingByLeaf.set("oldest", oldest);
+	pendingByLeaf.set("next", next);
+	const settled: string[] = [];
+	try {
+		internals.managedSessions = managedByLeaf;
+		internals.pendingStructuralSourceCloseSettlements = pendingByLeaf;
+		internals.settleStructuralSourceClose = (pending) => {
+			pending.settling = true;
+			settled.push(pending.runtime.session.leafId);
+		};
+		assertEq(manager.retryPendingStructuralSourceCloseExport(), 1, "first command starts one exact pending export");
+		assertEq(settled.join("|"), "oldest", "stale and concurrent owners are skipped before the oldest exact owner");
+		assertEq(next.settling, false, "one command never opens a second exporter modal");
+		assertEq(manager.retryPendingStructuralSourceCloseExport(), 1, "a later command may start the next exact owner");
+		assertEq(settled.join("|"), "oldest|next", "pending exports retain deterministic insertion order");
+		assertEq(manager.retryPendingStructuralSourceCloseExport(), 0, "no command touches stale or already-settling owners");
+	} finally {
+		internals.managedSessions = originalManaged;
+		internals.pendingStructuralSourceCloseSettlements = originalPending;
+		internals.settleStructuralSourceClose = originalSettle;
+		clearPendingHealthChecks(manager);
+	}
 }
 
 console.log("\n--- Test 1: recent editor activity defers unhealthy binding repair ---");
@@ -1978,6 +2199,529 @@ console.log("\n--- Test 19a3b3a: host merge is held while the exact raw event re
 	clearPendingHealthChecks(manager);
 }
 
+console.log("\n--- Test 19a3b3a1: late self-write host projection cannot roll back a newer editor ---");
+for (const projection of ["exact", "three-way"] as const) {
+	const baselineContent = "work: base\nlife: base\n";
+	const selfWriteContent = "work: server K0\nlife: base\n";
+	const editorSuccessor = "work: editor K1\nlife: base\n";
+	const lateProjection = projection === "exact"
+		? selfWriteContent
+		: "work: editor K1\nlife: self-write K0 merge\n";
+	const ordinaryPluginContent = `work: plugin after ${projection}\nlife: base\n`;
+	const {
+		manager,
+		binding,
+		interceptedExternalReloads,
+		setLiveEditorContent,
+	} = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, selfWriteContent);
+	setLiveEditorContent(selfWriteContent);
+	const eventState = EditorState.create({
+		doc: selfWriteContent,
+		extensions: manager.getBaseExtension(),
+	});
+	(binding.cm as unknown as { state: EditorState }).state = eventState;
+	Object.assign(binding.view, {
+		data: selfWriteContent,
+		lastSavedData: baselineContent,
+	});
+	const selfWriteNotice = externalDiskMutationNotice(
+		binding.path,
+		selfWriteContent,
+		1340.35,
+		{
+			ctime: 1340.3,
+			sequence: projection === "exact" ? 13401 : 13402,
+			observedAt: 1340.4,
+		},
+	);
+	manager.beginExternalDiskMutation(binding.path, selfWriteNotice.sequence);
+
+	// K1 becomes both visible and collaborative authority while the exact K0
+	// fingerprint read is still pending.
+	const successor = eventState.update({
+		changes: { from: 0, to: eventState.doc.length, insert: editorSuccessor },
+	});
+	(binding.cm as unknown as { state: EditorState }).state = successor.state;
+	setLiveEditorContent(editorSuccessor);
+	Object.assign(binding.view, { data: editorSuccessor });
+	(manager as unknown as {
+		handleLiveEditorUpdate: (update: unknown) => void;
+	}).handleLiveEditorUpdate({
+		view: binding.cm,
+		docChanged: true,
+		transactions: [successor],
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, editorSuccessor);
+
+	manager.noteSelfWriteExternalDiskMutation(selfWriteNotice);
+	Object.assign(binding.view, {
+		data: lateProjection,
+		lastSavedData: selfWriteContent,
+	});
+	const rejectedLateProjection = successor.state.update({
+		changes: {
+			from: 0,
+			to: successor.state.doc.length,
+			insert: lateProjection,
+		},
+		annotations: Transaction.userEvent.of("set"),
+	});
+
+	assertEq(
+		rejectedLateProjection.docChanged,
+		false,
+		`${projection}: late exact self-write projection is blocked`,
+	);
+	assertEq(
+		binding.ytext.toString(),
+		editorSuccessor,
+		`${projection}: late self-write projection never rolls back Y.Text K1`,
+	);
+	assertEq(
+		(binding.view as unknown as { data: string }).data,
+		editorSuccessor,
+		`${projection}: late self-write projection restores host cache K1`,
+	);
+	assertEq(
+		interceptedExternalReloads.length,
+		0,
+		`${projection}: exact self-write emits no controller candidate`,
+	);
+
+	Object.assign(binding.view, { data: ordinaryPluginContent });
+	const ordinaryPluginSet = successor.state.update({
+		changes: {
+			from: 0,
+			to: successor.state.doc.length,
+			insert: ordinaryPluginContent,
+		},
+		annotations: Transaction.userEvent.of("set"),
+	});
+	assertEq(
+		ordinaryPluginSet.docChanged,
+		true,
+		`${projection}: a later unrelated plugin set remains normal`,
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a3b3a1a: host-first self-write projection resolves without controller delivery ---");
+{
+	const baselineContent = "work: base\nlife: base\n";
+	const localContent = "work: local\nlife: base\n";
+	const selfWriteContent = "work: base\nlife: self-write\n";
+	const hostMergedContent = "work: local\nlife: self-write\n";
+	const { manager, binding, interceptedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, localContent);
+	const state = EditorState.create({
+		doc: localContent,
+		extensions: manager.getBaseExtension(),
+	});
+	(binding.cm as unknown as { state: EditorState }).state = state;
+	Object.assign(binding.view, { data: localContent, lastSavedData: baselineContent });
+	const notice = externalDiskMutationNotice(binding.path, selfWriteContent, 1340.45, {
+		ctime: 1340.4,
+		sequence: 13403,
+		observedAt: 1340.5,
+	});
+	manager.beginExternalDiskMutation(binding.path, notice.sequence);
+	Object.assign(binding.view, { data: hostMergedContent, lastSavedData: selfWriteContent });
+	const held = state.update({
+		changes: { from: 0, to: state.doc.length, insert: hostMergedContent },
+		annotations: Transaction.userEvent.of("set"),
+	});
+	assertEq(held.docChanged, false, "host-first self-write projection is held while raw proof is pending");
+	assertEq((binding.view as unknown as { data: string }).data, localContent, "held self-write restores the current host cache");
+
+	manager.noteSelfWriteExternalDiskMutation(notice);
+
+	assertEq(interceptedExternalReloads.length, 0, "matching self-write raw proof emits no controller candidate");
+	assertEq(binding.ytext.toString(), localContent, "held self-write never mutates Y.Text");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a3b3a1b: self-write replacement retains older external delivery for retry ---");
+{
+	let managerAtCallback: EditorBindingManager | null = null;
+	let callbackInvocations = 0;
+	let failCallback = true;
+	let olderNotice: InterceptedExternalDiskMutation | null = null;
+	const { manager, binding, interceptedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		onExternalDiskReloadIntercepted: (candidate) => {
+			callbackInvocations += 1;
+			if (!failCallback) return;
+			// Re-enter with the same exact notice before throwing. Candidate disposition
+			// must already be claimed, so this cannot invoke the controller twice.
+			managerAtCallback?.noteExternalDiskMutation(candidate);
+			throw new Error("synthetic controller callback failure");
+		},
+	});
+	managerAtCallback = manager;
+	olderNotice = externalDiskMutationNotice(
+		binding.path,
+		"older external candidate",
+		1340.55,
+		{ ctime: 1340.5, sequence: 13404, observedAt: 1340.6 },
+	);
+	manager.beginExternalDiskMutation(binding.path, olderNotice.sequence);
+	manager.noteExternalDiskMutation(olderNotice);
+	assertEq(callbackInvocations, 0, "older external marker remains pending before replacement");
+
+	const selfWriteNotice = externalDiskMutationNotice(
+		binding.path,
+		"newer exact self-write",
+		1340.65,
+		{ ctime: 1340.6, sequence: 13405, observedAt: 1340.7 },
+	);
+	manager.beginExternalDiskMutation(binding.path, selfWriteNotice.sequence);
+	manager.noteSelfWriteExternalDiskMutation(selfWriteNotice);
+
+	assertEq(callbackInvocations, 1, "older external candidate is attempted exactly once before self replacement");
+	assertEq(interceptedExternalReloads.length, 1, "callback failure/reentry cannot duplicate the older candidate");
+	assertCandidateMatchesNotice(
+		interceptedExternalReloads[0],
+		olderNotice,
+		"external-before-self interception",
+	);
+	const internals = manager as unknown as {
+		pendingExternalDiskMutations: Map<string, { sequence: number; provenance: string }>;
+		pendingExternalDiskCandidateDeliveryRetries: Map<string, Map<number, unknown>>;
+		retryExternalDiskCandidateDelivery(path: string, sequence: number): void;
+	};
+	const marker = internals.pendingExternalDiskMutations.get(binding.path);
+	assertEq(
+		marker?.sequence,
+		selfWriteNotice.sequence,
+		"callback failure does not prevent the newer self-write marker from arming",
+	);
+	assertEq(
+		marker?.provenance,
+		"self-write",
+		"the newer negative provenance remains available for its queued host reload",
+	);
+	assertEq(
+		internals.pendingExternalDiskCandidateDeliveryRetries
+			.get(binding.path)?.has(olderNotice.sequence),
+		true,
+		"the older raw revision moves to an exact delivery-retry owner",
+	);
+	failCallback = false;
+	internals.retryExternalDiskCandidateDelivery(binding.path, olderNotice.sequence);
+	assertEq(callbackInvocations, 2, "the failed older candidate is delivered by its exact retry");
+	assertEq(
+		internals.pendingExternalDiskCandidateDeliveryRetries
+			.get(binding.path)?.has(olderNotice.sequence) ?? false,
+		false,
+		"successful retry removes the exact retry record and timer",
+	);
+	(manager as unknown as {
+		claimedExternalDiskCandidateSequencesByPath: Map<string, Set<number>>;
+	}).claimedExternalDiskCandidateSequencesByPath.clear();
+	manager.noteExternalDiskMutation(selfWriteNotice);
+	assertEq(callbackInvocations, 2, "generic completion cannot publish self-write bytes after claim expiry");
+	assertEq(interceptedExternalReloads.length, 2, "self-write disposition remains callback-free across completion APIs");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a3b3a1b2: old-marker callback cannot retire an in-flight self start ---");
+{
+	let managerAtCallback: EditorBindingManager | null = null;
+	let selfWriteNotice: InterceptedExternalDiskMutation | null = null;
+	const { manager, binding, interceptedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		onExternalDiskReloadIntercepted: (candidate) => {
+			if (!selfWriteNotice || candidate.sequence === selfWriteNotice.sequence) return;
+			// Re-enter the generic completion API for N+1 while the outer exact
+			// self-write completion is preserving N's external marker.
+			managerAtCallback?.noteExternalDiskMutation(selfWriteNotice);
+		},
+	});
+	managerAtCallback = manager;
+	const olderNotice = externalDiskMutationNotice(
+		binding.path,
+		"older external before self classification",
+		1340.67,
+		{ ctime: 1340.66, sequence: 134051, observedAt: 1340.68 },
+	);
+	selfWriteNotice = externalDiskMutationNotice(
+		binding.path,
+		"newer exact self classification",
+		1340.7,
+		{ ctime: 1340.69, sequence: 134052, observedAt: 1340.71 },
+	);
+	manager.beginExternalDiskMutation(binding.path, olderNotice.sequence);
+	manager.noteExternalDiskMutation(olderNotice);
+	manager.beginExternalDiskMutation(binding.path, selfWriteNotice.sequence);
+	manager.noteSelfWriteExternalDiskMutation(selfWriteNotice);
+
+	const internals = manager as unknown as {
+		pendingExternalDiskMutationStarts: Map<string, {
+			sequence: number;
+			views: Map<string, unknown>;
+		}>;
+		pendingExternalDiskMutations: Map<string, {
+			sequence: number;
+			provenance: string;
+		}>;
+	};
+	const selfStart = internals.pendingExternalDiskMutationStarts.get(binding.path);
+	const selfMarker = internals.pendingExternalDiskMutations.get(binding.path);
+	assertEq(selfStart?.sequence, selfWriteNotice.sequence, "N+1 exact self start survives callback reentry");
+	assertEq(selfStart?.views.size, 1, "N+1 event-time owner remains correlated");
+	assertEq(selfMarker?.sequence, selfWriteNotice.sequence, "outer self completion arms the N+1 marker");
+	assertEq(selfMarker?.provenance, "self-write", "N+1 marker retains negative provenance");
+	assertEq(
+		interceptedExternalReloads.filter(
+			(candidate) => candidate.sequence === selfWriteNotice?.sequence,
+		).length,
+		0,
+		"generic N+1 reentry emits no external callback for known self bytes",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a3b3a1b3: active self provenance survives bounded-ledger churn ---");
+{
+	let managerAtCallback: EditorBindingManager | null = null;
+	let selfWriteNotice: InterceptedExternalDiskMutation | null = null;
+	const { manager, binding, interceptedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		onExternalDiskReloadIntercepted: (candidate) => {
+			if (!managerAtCallback || !selfWriteNotice) return;
+			if (candidate.sequence === selfWriteNotice.sequence) return;
+			// Evict N+1 from the bounded negative-provenance ledger while its outer
+			// self completion is still on the stack, then re-enter generic completion.
+			for (let index = 0; index < 65; index++) {
+				managerAtCallback.noteSelfWriteExternalDiskMutation(
+					externalDiskMutationNotice(
+						binding.path,
+						`reentrant self churn ${index}`,
+						6000.1 + index,
+						{
+							ctime: 6000 + index,
+							sequence: 6000 + index,
+							observedAt: 6000.2 + index,
+						},
+					),
+				);
+			}
+			managerAtCallback.noteExternalDiskMutation(selfWriteNotice);
+		},
+	});
+	managerAtCallback = manager;
+	const olderNotice = externalDiskMutationNotice(
+		binding.path,
+		"older external before bounded self churn",
+		5000.1,
+		{ ctime: 5000, sequence: 5000, observedAt: 5000.2 },
+	);
+	selfWriteNotice = externalDiskMutationNotice(
+		binding.path,
+		"active exact self after bounded churn",
+		10_000.1,
+		{ ctime: 10_000, sequence: 10_000, observedAt: 10_000.2 },
+	);
+	manager.beginExternalDiskMutation(binding.path, olderNotice.sequence);
+	manager.noteExternalDiskMutation(olderNotice);
+	manager.beginExternalDiskMutation(binding.path, selfWriteNotice.sequence);
+	manager.noteSelfWriteExternalDiskMutation(selfWriteNotice);
+
+	const internals = manager as unknown as {
+		selfWriteExternalDiskMutationSequencesByPath: Map<string, Map<number, unknown>>;
+		activeSelfWriteExternalDiskMutationSequencesByPath?: Map<string, Set<number>>;
+		pendingExternalDiskMutationStarts: Map<string, { sequence: number; views: Map<string, unknown> }>;
+		pendingExternalDiskMutations: Map<string, { sequence: number; provenance: string }>;
+	};
+	assertEq(
+		internals.selfWriteExternalDiskMutationSequencesByPath
+			.get(binding.path)?.has(selfWriteNotice.sequence),
+		false,
+		"fixture evicts N+1 from the bounded self ledger",
+	);
+	assertEq(
+		interceptedExternalReloads.filter(
+			(candidate) => candidate.sequence === selfWriteNotice?.sequence,
+		).length,
+		0,
+		"stack-active N+1 self bytes never reach the external callback",
+	);
+	assertEq(
+		internals.pendingExternalDiskMutationStarts.get(binding.path)?.sequence,
+		selfWriteNotice.sequence,
+		"stack-active N+1 keeps its exact start after ledger eviction",
+	);
+	assertEq(
+		internals.pendingExternalDiskMutationStarts.get(binding.path)?.views.size,
+		1,
+		"stack-active N+1 keeps its event-time owner after ledger eviction",
+	);
+	assertEq(
+		[
+			internals.pendingExternalDiskMutations.get(binding.path)?.sequence,
+			internals.pendingExternalDiskMutations.get(binding.path)?.provenance,
+		].join("|"),
+		`${selfWriteNotice.sequence}|self-write`,
+		"outer N+1 completion arms its negative-provenance marker",
+	);
+	assertEq(
+		internals.activeSelfWriteExternalDiskMutationSequencesByPath?.size ?? -1,
+		0,
+		"active self provenance is stack-scoped and empty after outer finally",
+	);
+	internals.activeSelfWriteExternalDiskMutationSequencesByPath?.set(
+		"Notes/synthetic-active-self.md",
+		new Set([1]),
+	);
+	manager.unbindAll();
+	assertEq(
+		internals.activeSelfWriteExternalDiskMutationSequencesByPath?.size ?? -1,
+		0,
+		"unbind-all clears any remaining active self provenance",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a3b3a1c: older self completion cannot erase newer state or cross path identity ---");
+{
+	const { manager, binding, interceptedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const internals = manager as unknown as {
+		pendingExternalDiskMutationStarts: Map<string, { sequence: number }>;
+		pendingExternalDiskMutations: Map<string, { sequence: number; provenance: string }>;
+	};
+	const olderSelf = externalDiskMutationNotice(binding.path, "older self", 1340.75, {
+		ctime: 1340.7,
+		sequence: 13406,
+		observedAt: 1340.8,
+	});
+	const newerNotice = externalDiskMutationNotice(binding.path, "newer external", 1340.85, {
+		ctime: 1340.8,
+		sequence: 13407,
+		observedAt: 1340.9,
+	});
+	manager.beginExternalDiskMutation(binding.path, olderSelf.sequence);
+	manager.beginExternalDiskMutation(binding.path, newerNotice.sequence);
+	manager.noteExternalDiskMutation(newerNotice);
+	manager.noteSelfWriteExternalDiskMutation(olderSelf);
+	assertEq(
+		internals.pendingExternalDiskMutationStarts.get(binding.path)?.sequence,
+		newerNotice.sequence,
+		"older self completion preserves a newer event-start snapshot",
+	);
+	assertEq(
+		internals.pendingExternalDiskMutations.get(binding.path)?.sequence,
+		newerNotice.sequence,
+		"older self completion preserves a newer external marker",
+	);
+
+	const oldPath = binding.path;
+	const renamedPath = "Notes/typing-renamed-before-self-proof.md";
+	const renamedSelf = externalDiskMutationNotice(oldPath, "old-path self", 1340.95, {
+		ctime: 1340.9,
+		sequence: 13408,
+		observedAt: 1341,
+	});
+	manager.beginExternalDiskMutation(oldPath, renamedSelf.sequence);
+	(binding.file as unknown as { path: string }).path = renamedPath;
+	manager.noteSelfWriteExternalDiskMutation(renamedSelf);
+	assertEq(
+		internals.pendingExternalDiskMutations.get(oldPath)?.sequence === renamedSelf.sequence,
+		false,
+		"old-path self completion cannot arm a path-mutated owner",
+	);
+	assertEq(
+		internals.pendingExternalDiskMutations.has(renamedPath),
+		false,
+		"event-time self completion never migrates to the live TFile path",
+	);
+	assertEq(interceptedExternalReloads.length, 0, "self completion emits no external candidate across ordering/path races");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a3b3a1d: self-write completion cannot arm a reopened leaf ABA ---");
+{
+	const localContent = "local successor authority";
+	const selfWriteContent = "old lifetime self write";
+	const { manager, binding, interceptedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, localContent);
+	const notice = externalDiskMutationNotice(binding.path, selfWriteContent, 1341.01, {
+		ctime: 1341,
+		sequence: 13411,
+		observedAt: 1341.02,
+	});
+	manager.beginExternalDiskMutation(binding.path, notice.sequence);
+	manager.unbind(binding.view as never);
+
+	const successorState = EditorState.create({
+		doc: localContent,
+		extensions: manager.getBaseExtension(),
+	});
+	const successorFile = { path: binding.path, stat: binding.view.file.stat };
+	const successorCm = {
+		dom: { isConnected: true },
+		hasFocus: true,
+		state: successorState,
+		dispatch: () => {},
+	};
+	const successorView = {
+		file: successorFile,
+		leaf: { id: "leaf-1" },
+		containerEl: { contains: (node: unknown) => node === successorCm.dom },
+		editor: { getValue: () => localContent },
+		data: localContent,
+		lastSavedData: localContent,
+	};
+	const successorBinding = {
+		...binding,
+		view: successorView,
+		file: successorFile,
+		cm: successorCm,
+		cmId: "cm-self-write-aba-successor",
+		undoManager: new Y.UndoManager(binding.ytext),
+	};
+	const internals = manager as unknown as {
+		bindings: Map<string, typeof successorBinding>;
+		knownCmViews: Set<unknown>;
+		pendingExternalDiskMutations: Map<string, unknown>;
+	};
+	internals.bindings.set("leaf-1", successorBinding);
+	internals.knownCmViews.add(successorCm);
+	manager.noteSelfWriteExternalDiskMutation(notice);
+	assertEq(
+		internals.pendingExternalDiskMutations.has(binding.path),
+		false,
+		"old lifetime self completion cannot arm the reopened leaf",
+	);
+	const successorSet = successorState.update({
+		changes: { from: 0, to: successorState.doc.length, insert: selfWriteContent },
+		annotations: Transaction.userEvent.of("set"),
+	});
+	assertEq(successorSet.docChanged, true, "reopened leaf does not consume another lifetime's self marker");
+	assertEq(interceptedExternalReloads.length, 0, "self-write ABA emits no external candidate");
+	successorBinding.undoManager.destroy();
+	clearPendingHealthChecks(manager);
+}
+
 console.log("\n--- Test 19a3b3a2: early host proof coordinates held and pending panes exactly once ---");
 {
 	const baselineContent = "work: base\nlife: base\n";
@@ -2040,6 +2784,7 @@ console.log("\n--- Test 19a3b3a2: early host proof coordinates held and pending 
 		secondBinding,
 	);
 	(manager as unknown as { knownCmViews: Set<unknown> }).knownCmViews.add(secondCm);
+	installManagedBoundaryStubs(manager, secondView, secondCm);
 
 	const notice = externalDiskMutationNotice(
 		binding.path,
@@ -2093,6 +2838,332 @@ console.log("\n--- Test 19a3b3a2: early host proof coordinates held and pending 
 		"all pane-level start snapshots retire after both panes are handled",
 	);
 	secondBinding.undoManager.destroy();
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a3b3a3: a reopened leaf cannot consume another binding lifetime's disk marker ---");
+{
+	const localContent = "local before external reload";
+	const externalContent = "external reload candidate";
+	const { manager, binding, interceptedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, localContent);
+	const firstState = EditorState.create({
+		doc: localContent,
+		extensions: manager.getBaseExtension(),
+	});
+	(binding.cm as unknown as { state: EditorState }).state = firstState;
+	Object.assign(binding.view, { data: localContent, lastSavedData: localContent });
+
+	const secondCmDom = { isConnected: true };
+	const secondState = EditorState.create({
+		doc: localContent,
+		extensions: manager.getBaseExtension(),
+	});
+	const secondCm = {
+		dom: secondCmDom,
+		hasFocus: false,
+		state: secondState,
+		dispatch: () => {},
+	};
+	const secondFile = { path: binding.path, stat: binding.view.file.stat };
+	const secondView = {
+		file: secondFile,
+		leaf: { id: "leaf-2" },
+		containerEl: { contains: (node: unknown) => node === secondCmDom },
+		editor: { getValue: () => localContent },
+		data: localContent,
+		lastSavedData: localContent,
+	};
+	const secondBinding = {
+		...binding,
+		view: secondView,
+		file: secondFile,
+		cm: secondCm,
+		cmId: "cm-2-marker-owner",
+		undoManager: new Y.UndoManager(binding.ytext),
+	};
+	const internals = manager as unknown as {
+		bindings: Map<string, typeof binding>;
+		knownCmViews: Set<unknown>;
+	};
+	internals.bindings.set("leaf-2", secondBinding as typeof binding);
+	internals.knownCmViews.add(secondCm);
+
+	const notice = externalDiskMutationNotice(
+		binding.path,
+		externalContent,
+		1340.95,
+		{ ctime: 1340.9, sequence: 13403, observedAt: 1340.975 },
+	);
+	manager.beginExternalDiskMutation(binding.path, notice.sequence);
+	manager.noteExternalDiskMutation(notice);
+	assertEq(interceptedExternalReloads.length, 0, "pending two-pane marker is not delivered before consumption");
+
+	manager.unbind(binding.view as never);
+	const successorCmDom = { isConnected: true };
+	const successorState = EditorState.create({
+		doc: localContent,
+		extensions: manager.getBaseExtension(),
+	});
+	const successorCm = {
+		dom: successorCmDom,
+		hasFocus: true,
+		state: successorState,
+		dispatch: () => {},
+	};
+	const successorFile = { path: binding.path, stat: binding.view.file.stat };
+	const successorView = {
+		file: successorFile,
+		leaf: { id: "leaf-1" },
+		containerEl: { contains: (node: unknown) => node === successorCmDom },
+		editor: { getValue: () => localContent },
+		data: localContent,
+		lastSavedData: localContent,
+	};
+	const successorBinding = {
+		...binding,
+		view: successorView,
+		file: successorFile,
+		cm: successorCm,
+		cmId: "cm-1-successor",
+		undoManager: new Y.UndoManager(binding.ytext),
+	};
+	internals.bindings.set("leaf-1", successorBinding as typeof binding);
+	internals.knownCmViews.add(successorCm);
+
+	const successorSet = successorState.update({
+		changes: { from: 0, to: successorState.doc.length, insert: externalContent },
+		annotations: Transaction.userEvent.of("set"),
+	});
+	assertEq(successorSet.docChanged, true, "successor binding lifetime cannot consume the old leaf marker");
+	assertEq(interceptedExternalReloads.length, 0, "successor binding emits no candidate for another lifetime");
+
+	const originalSecondSet = secondState.update({
+		changes: { from: 0, to: secondState.doc.length, insert: externalContent },
+		annotations: Transaction.userEvent.of("set"),
+	});
+	assertEq(originalSecondSet.docChanged, false, "original second-pane owner may consume the exact marker");
+	assertEq(interceptedExternalReloads.length, 1, "the exact original owner emits the candidate once");
+	assertEq(binding.ytext.toString(), localContent, "marker ownership never rewrites shared Y.Text");
+	secondBinding.undoManager.destroy();
+	successorBinding.undoManager.destroy();
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a3b3a4: sole-owner cache reentry preserves exact bytes off the retired marker ---");
+{
+	const baselineContent = "work: base\nlife: base\n";
+	const localContent = "work: local\nlife: base\n";
+	const externalContent = "work: base\nlife: external\n";
+	const hostMergedContent = "work: local\nlife: external\n";
+	const { manager, binding, interceptedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, localContent);
+	const state = EditorState.create({
+		doc: localContent,
+		extensions: manager.getBaseExtension(),
+	});
+	(binding.cm as unknown as { state: EditorState }).state = state;
+	Object.assign(binding.view, { data: localContent, lastSavedData: baselineContent });
+	const notice = externalDiskMutationNotice(
+		binding.path,
+		externalContent,
+		1340.99,
+		{ ctime: 1340.98, sequence: 13404, observedAt: 1340.995 },
+	);
+	manager.beginExternalDiskMutation(binding.path, notice.sequence);
+	manager.noteExternalDiskMutation(notice);
+
+	let hostData = hostMergedContent;
+	let reentered = false;
+	let candidateCountAtSetter = -1;
+	Object.defineProperty(binding.view, "data", {
+		configurable: true,
+		get: () => hostData,
+		set: (content: string) => {
+			hostData = content;
+			candidateCountAtSetter = interceptedExternalReloads.length;
+			if (!reentered) {
+				reentered = true;
+				manager.unbind(binding.view as never);
+			}
+		},
+	});
+	Object.assign(binding.view, { lastSavedData: externalContent });
+	const transaction = state.update({
+		changes: { from: 0, to: state.doc.length, insert: hostMergedContent },
+		annotations: Transaction.userEvent.of("set"),
+	});
+
+	assertEq(reentered, true, "host cache restoration exercises lifecycle reentry");
+	assertEq(transaction.docChanged, false, "stale sole-owner host projection remains fail-closed");
+	assertEq(interceptedExternalReloads.length, 1, "retired sole-owner marker hands exact bytes to reconciliation");
+	assertCandidateMatchesNotice(
+		interceptedExternalReloads[0],
+		notice,
+		"sole-owner cache-reentry interception",
+	);
+	assertEq(binding.ytext.toString(), localContent, "cache reentry never mutates Y.Text authority");
+	assertEq(
+		candidateCountAtSetter,
+		1,
+		"exact candidate disposition completes before cache lifecycle reentry",
+	);
+	const runtime = (manager as unknown as {
+		managedSessions: Map<string, { emergencySaveFence: { isCurrent(): boolean } | null }>;
+	}).managedSessions.get("leaf-1");
+	assertEq(
+		runtime?.emergencySaveFence?.isCurrent(),
+		true,
+		"cache lifecycle reentry retains native-save suppression",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a3b3a5: proven host merge stays fail-closed when cache restore cannot complete ---");
+for (const cacheFailure of ["setter-throws", "post-set-getter-mismatch"] as const) {
+	const baselineContent = "work: base\nlife: base\n";
+	const localContent = "work: local\nlife: base\n";
+	const externalContent = `work: base\nlife: external ${cacheFailure}\n`;
+	const hostMergedContent = `work: local\nlife: external ${cacheFailure}\n`;
+	const { manager, binding, interceptedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, localContent);
+	const state = EditorState.create({
+		doc: localContent,
+		extensions: manager.getBaseExtension(),
+	});
+	(binding.cm as unknown as { state: EditorState }).state = state;
+	Object.assign(binding.view, { data: localContent, lastSavedData: baselineContent });
+	const sequence = cacheFailure === "setter-throws" ? 13405 : 13406;
+	const notice = externalDiskMutationNotice(
+		binding.path,
+		externalContent,
+		1341.01,
+		{ ctime: 1341, sequence, observedAt: 1341.015 },
+	);
+	manager.beginExternalDiskMutation(binding.path, notice.sequence);
+	manager.noteExternalDiskMutation(notice);
+
+	let hostData = hostMergedContent;
+	let setterCalls = 0;
+	let candidateCountAtSetter = -1;
+	Object.defineProperty(binding.view, "data", {
+		configurable: true,
+		get: () => hostData,
+		set: () => {
+			setterCalls += 1;
+			candidateCountAtSetter = interceptedExternalReloads.length;
+			manager.unbind(binding.view as never);
+			if (cacheFailure === "setter-throws") {
+				throw new Error("synthetic cache setter failure");
+			}
+			hostData = "cache value rejected after lifecycle reentry";
+		},
+	});
+	Object.assign(binding.view, { lastSavedData: externalContent });
+	const transaction = state.update({
+		changes: { from: 0, to: state.doc.length, insert: hostMergedContent },
+		annotations: Transaction.userEvent.of("set"),
+	});
+
+	assertEq(setterCalls, 1, `${cacheFailure}: exact cache restore setter is exercised once`);
+	assertEq(
+		candidateCountAtSetter,
+		1,
+		`${cacheFailure}: exact external disposition is final before the cache setter`,
+	);
+	assertEq(transaction.docChanged, false, `${cacheFailure}: proven host merge remains fail-closed`);
+	assertEq(
+		interceptedExternalReloads.length,
+		1,
+		`${cacheFailure}: lifecycle failure preserves the exact raw candidate once`,
+	);
+	assertCandidateMatchesNotice(
+		interceptedExternalReloads[0],
+		notice,
+		`${cacheFailure} host-cache interception`,
+	);
+	assertEq(
+		binding.ytext.toString(),
+		localContent,
+		`${cacheFailure}: failed cache restore never mutates Y.Text authority`,
+	);
+	const runtime = (manager as unknown as {
+		managedSessions: Map<string, {
+			emergencySaveFence: { isCurrent(): boolean } | null;
+			hostGuard: { snapshot(): { emergencySaveBlocked: boolean } } | null;
+		}>;
+	}).managedSessions.get("leaf-1");
+	assertEq(
+		runtime?.emergencySaveFence?.isCurrent(),
+		true,
+		`${cacheFailure}: cache failure retains an exact emergency save owner`,
+	);
+	assertEq(
+		runtime?.hostGuard?.snapshot().emergencySaveBlocked,
+		true,
+		`${cacheFailure}: unreviewed hostMerged view.data cannot pass native autosave`,
+	);
+	assertEq(
+		manager.unmanageView(binding.view as never, `test-cache-failure-${cacheFailure}`, false),
+		false,
+		`${cacheFailure}: ordinary lifecycle reentry cannot release native-save suppression`,
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a3b3a6: unreadable completion retires only its exact pending start ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const internals = manager as unknown as {
+		pendingExternalDiskMutationStarts: Map<string, { sequence: number }>;
+		pendingExternalDiskMutations: Map<string, { sequence: number }>;
+	};
+	const failedNotice = externalDiskMutationNotice(binding.path, "unreadable", 1341.05, {
+		ctime: 1341,
+		sequence: 13409,
+		observedAt: 1341.1,
+	});
+	manager.beginExternalDiskMutation(binding.path, failedNotice.sequence);
+	manager.noteExternalDiskMutation({ ...failedNotice, content: null });
+	assertEq(
+		internals.pendingExternalDiskMutationStarts.has(binding.path),
+		false,
+		"unreadable exact completion cannot leave a host-projection start armed",
+	);
+
+	const newerNotice = externalDiskMutationNotice(binding.path, "newer external", 1341.15, {
+		ctime: 1341.1,
+		sequence: 13410,
+		observedAt: 1341.2,
+	});
+	manager.beginExternalDiskMutation(binding.path, newerNotice.sequence);
+	manager.noteExternalDiskMutation(newerNotice);
+	manager.noteExternalDiskMutation({ ...failedNotice, content: null });
+	assertEq(
+		internals.pendingExternalDiskMutationStarts.get(binding.path)?.sequence,
+		newerNotice.sequence,
+		"older unreadable completion preserves the newer start",
+	);
+	assertEq(
+		internals.pendingExternalDiskMutations.get(binding.path)?.sequence,
+		newerNotice.sequence,
+		"older unreadable completion preserves the newer marker",
+	);
 	clearPendingHealthChecks(manager);
 }
 
@@ -3548,6 +4619,7 @@ console.log("\n--- Test 19a3d: event order survives delayed exact-content proof 
 	);
 	setLiveFileStat(coarseMtime, notice.size ?? 0, notice.ctime ?? 0);
 	manager.beginExternalDiskMutation(binding.path, notice.sequence);
+	manager.beginExternalDiskMutation(binding.path, notice.sequence);
 	const transaction = {
 		docChanged: true,
 		startState: binding.cm.state,
@@ -3741,8 +4813,21 @@ console.log("\n--- Test 19a6: coarse-mtime plugin autosave cannot roll back or p
 		editorRevisionByCm: WeakMap<object, number>;
 	}).editorRevisionByCm.set(binding.cm, 1);
 	recordExpectedEditorYTextPatch(manager, binding);
-	manager.noteExternalDiskMutation(notice);
+	manager.beginExternalDiskMutation(binding.path, notice.sequence);
+	const completion = manager.noteExternalDiskMutation(notice);
 
+	assertEq(
+		completion,
+		"terminal-no-candidate",
+		"ambiguous current editor completion asks main to settle its exact probe ticket",
+	);
+	assertEq(
+		(manager as unknown as {
+			pendingExternalDiskMutationStarts: Map<string, { sequence: number }>;
+		}).pendingExternalDiskMutationStarts.has(binding.path),
+		false,
+		"terminal-no-candidate retires the exact manager start snapshot immediately",
+	);
 	assertEq(
 		binding.ytext.toString(),
 		"plugin now",
@@ -3767,6 +4852,278 @@ console.log("\n--- Test 19a6: coarse-mtime plugin autosave cannot roll back or p
 		nextResult,
 		nextPluginTransaction,
 		"the autosave event does not poison the plugin's next non-user editor edit",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a6a: external marker terminal paths publish exactly once ---");
+{
+	type Marker = {
+		path: string;
+		sequence: number;
+		at: number;
+		candidatePublished: boolean;
+	};
+	type MarkerInternals = {
+		pendingExternalDiskMutations: Map<string, Marker>;
+		claimedExternalDiskCandidateSequencesByPath: Map<string, Set<number>>;
+		notifyPendingExternalDiskReloadIntercepted(marker: Marker): boolean;
+		getFreshPendingExternalDiskMutation(path: string): Marker | null;
+		invalidateExternalDiskReloadCorrelation(path: string, sequence: number): void;
+	};
+
+	const timeoutFixture = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const originalSetTimeout = globalThis.setTimeout;
+	let markerTimeout: (() => void) | null = null;
+	globalThis.setTimeout = ((handler: TimerHandler, delay?: number, ...args: unknown[]) => {
+		if (delay === 5000 && markerTimeout === null && typeof handler === "function") {
+			markerTimeout = () => handler(...args);
+			return 0 as unknown as ReturnType<typeof setTimeout>;
+		}
+		return originalSetTimeout(handler, delay, ...args);
+	}) as typeof setTimeout;
+	const timeoutNotice = externalDiskMutationNotice(
+		timeoutFixture.binding.path,
+		"timeout external candidate",
+		1565.1,
+		{ ctime: 1565, sequence: 1565, observedAt: 1565.2 },
+	);
+	try {
+		timeoutFixture.manager.beginExternalDiskMutation(
+			timeoutNotice.path,
+			timeoutNotice.sequence,
+		);
+		timeoutFixture.manager.noteExternalDiskMutation(timeoutNotice);
+	} finally {
+		globalThis.setTimeout = originalSetTimeout;
+	}
+	const timeoutInternals = timeoutFixture.manager as unknown as MarkerInternals;
+	const timeoutMarker = timeoutInternals.pendingExternalDiskMutations.get(
+		timeoutNotice.path,
+	);
+	assertEq(timeoutMarker !== undefined, true, "timeout fixture arms one exact marker");
+	if (timeoutMarker) {
+		timeoutFixture.manager.noteExternalDiskMutation(timeoutNotice);
+		assertEq(
+			timeoutMarker.candidatePublished,
+			true,
+			"equal-sequence generic completion publishes through the current marker",
+		);
+		timeoutInternals.claimedExternalDiskCandidateSequencesByPath.clear();
+	}
+	markerTimeout?.();
+	markerTimeout?.();
+	assertEq(
+		timeoutFixture.interceptedExternalReloads.length,
+		1,
+		"candidatePublished survives claim-TTL expiry and prevents timeout redelivery",
+	);
+	assertEq(
+		timeoutInternals.pendingExternalDiskMutations.has(timeoutNotice.path),
+		false,
+		"successful timeout publication retires the exact marker",
+	);
+	clearPendingHealthChecks(timeoutFixture.manager);
+
+	const lazyFixture = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const lazyNotice = externalDiskMutationNotice(
+		lazyFixture.binding.path,
+		"lazy expiry external candidate",
+		1566.1,
+		{ ctime: 1566, sequence: 1566, observedAt: 1566.2 },
+	);
+	lazyFixture.manager.beginExternalDiskMutation(lazyNotice.path, lazyNotice.sequence);
+	lazyFixture.manager.noteExternalDiskMutation(lazyNotice);
+	const lazyInternals = lazyFixture.manager as unknown as MarkerInternals;
+	const lazyMarker = lazyInternals.pendingExternalDiskMutations.get(lazyNotice.path);
+	if (lazyMarker) lazyMarker.at = Date.now() - 5001;
+	assertEq(
+		lazyInternals.getFreshPendingExternalDiskMutation(lazyNotice.path),
+		null,
+		"lazy expiry publishes then retires the exact marker",
+	);
+	assertEq(
+		lazyFixture.interceptedExternalReloads.length,
+		1,
+		"lazy expiry publishes the raw candidate exactly once",
+	);
+	clearPendingHealthChecks(lazyFixture.manager);
+
+	const invalidationFixture = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const invalidationNotice = externalDiskMutationNotice(
+		invalidationFixture.binding.path,
+		"invalidation external candidate",
+		1567.1,
+		{ ctime: 1567, sequence: 1567, observedAt: 1567.2 },
+	);
+	invalidationFixture.manager.beginExternalDiskMutation(
+		invalidationNotice.path,
+		invalidationNotice.sequence,
+	);
+	invalidationFixture.manager.noteExternalDiskMutation(invalidationNotice);
+	const invalidationInternals =
+		invalidationFixture.manager as unknown as MarkerInternals;
+	invalidationInternals.invalidateExternalDiskReloadCorrelation(
+		invalidationNotice.path,
+		invalidationNotice.sequence,
+	);
+	invalidationInternals.invalidateExternalDiskReloadCorrelation(
+		invalidationNotice.path,
+		invalidationNotice.sequence,
+	);
+	assertEq(
+		invalidationFixture.interceptedExternalReloads.length,
+		1,
+		"path invalidation publishes the raw candidate exactly once",
+	);
+	assertEq(
+		invalidationInternals.pendingExternalDiskMutations.has(invalidationNotice.path),
+		false,
+		"successful invalidation publication clears the exact correlation",
+	);
+	clearPendingHealthChecks(invalidationFixture.manager);
+}
+
+console.log("\n--- Test 19a6b: marker-timeout callback failure schedules an exact retry ---");
+{
+	let callbackAttempts = 0;
+	let failCallback = true;
+	const { manager, binding, interceptedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		onExternalDiskReloadIntercepted: () => {
+			callbackAttempts += 1;
+			if (failCallback) throw new Error("synthetic timeout delivery failure");
+		},
+	});
+	const notice = externalDiskMutationNotice(
+		binding.path,
+		"timeout retry raw revision",
+		1568.1,
+		{ ctime: 1568, sequence: 1568, observedAt: 1568.2 },
+	);
+	const originalSetTimeout = globalThis.setTimeout;
+	let markerTimer: (() => void) | null = null;
+	let retryTimer: (() => void) | null = null;
+	globalThis.setTimeout = ((handler: TimerHandler, delay?: number, ...args: unknown[]) => {
+		if (delay === 5000 && markerTimer === null && typeof handler === "function") {
+			markerTimer = () => handler(...args);
+			return 0 as unknown as ReturnType<typeof setTimeout>;
+		}
+		if (delay === 250 && retryTimer === null && typeof handler === "function") {
+			retryTimer = () => handler(...args);
+			return 0 as unknown as ReturnType<typeof setTimeout>;
+		}
+		return originalSetTimeout(handler, delay, ...args);
+	}) as typeof setTimeout;
+	try {
+		manager.beginExternalDiskMutation(notice.path, notice.sequence);
+		manager.noteExternalDiskMutation(notice);
+		markerTimer?.();
+	} finally {
+		globalThis.setTimeout = originalSetTimeout;
+	}
+	const internals = manager as unknown as {
+		pendingExternalDiskMutations: Map<string, unknown>;
+		pendingExternalDiskCandidateDeliveryRetries: Map<string, Map<number, unknown>>;
+	};
+	assertEq(callbackAttempts, 1, "marker timeout makes one immediate callback attempt");
+	assertEq(
+		internals.pendingExternalDiskMutations.has(notice.path),
+		false,
+		"failed timeout delivery transfers ownership away from the editor marker",
+	);
+	assertEq(
+		internals.pendingExternalDiskCandidateDeliveryRetries
+			.get(notice.path)?.has(notice.sequence),
+		true,
+		"failed timeout delivery retains the exact raw candidate",
+	);
+	assertEq(retryTimer !== null, true, "failed timeout delivery schedules a new retry timer");
+	failCallback = false;
+	retryTimer?.();
+	assertEq(callbackAttempts, 2, "the timeout retry eventually delivers the exact candidate");
+	assertEq(interceptedExternalReloads.length, 2, "timeout delivery has one failed and one successful attempt");
+	assertEq(
+		internals.pendingExternalDiskCandidateDeliveryRetries
+			.get(notice.path)?.has(notice.sequence) ?? false,
+		false,
+		"successful timeout retry clears its exact owner",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a6c: invalidation callback reentry preserves newer path owners ---");
+{
+	let managerAtCallback: EditorBindingManager | null = null;
+	let newerNotice: InterceptedExternalDiskMutation | null = null;
+	const { manager, binding, interceptedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		onExternalDiskReloadIntercepted: (candidate) => {
+			if (!newerNotice || candidate.sequence === newerNotice.sequence) return;
+			managerAtCallback?.beginExternalDiskMutation(
+				newerNotice.path,
+				newerNotice.sequence,
+			);
+			managerAtCallback?.noteExternalDiskMutation(newerNotice);
+		},
+	});
+	managerAtCallback = manager;
+	const olderNotice = externalDiskMutationNotice(
+		binding.path,
+		"older invalidated raw revision",
+		1569.1,
+		{ ctime: 1569, sequence: 1569, observedAt: 1569.2 },
+	);
+	newerNotice = externalDiskMutationNotice(
+		binding.path,
+		"newer callback-reentry raw revision",
+		1570.1,
+		{ ctime: 1570, sequence: 1570, observedAt: 1570.2 },
+	);
+	manager.beginExternalDiskMutation(olderNotice.path, olderNotice.sequence);
+	manager.noteExternalDiskMutation(olderNotice);
+	const internals = manager as unknown as {
+		pendingExternalDiskMutations: Map<string, { sequence: number; provenance: string }>;
+		pendingExternalDiskMutationStarts: Map<string, { sequence: number }>;
+		pendingExternalDiskCandidateDeliveryRetries: Map<string, Map<number, unknown>>;
+		invalidateExternalDiskReloadCorrelation(path: string, sequence: number): void;
+	};
+	internals.invalidateExternalDiskReloadCorrelation(
+		olderNotice.path,
+		olderNotice.sequence,
+	);
+	assertEq(
+		internals.pendingExternalDiskMutations.get(binding.path)?.sequence,
+		newerNotice.sequence,
+		"old-marker callback cannot erase the newer reentrant marker",
+	);
+	assertEq(
+		internals.pendingExternalDiskMutationStarts.get(binding.path)?.sequence,
+		newerNotice.sequence,
+		"old-marker callback cannot erase the newer reentrant event start",
+	);
+	assertEq(
+		internals.pendingExternalDiskCandidateDeliveryRetries
+			.get(binding.path)?.has(olderNotice.sequence) ?? false,
+		false,
+		"outer callback success cancels the claim-reentry retry for the old sequence",
+	);
+	assertEq(interceptedExternalReloads.length, 1, "old sequence is externally published exactly once");
+	assertCandidateMatchesNotice(
+		interceptedExternalReloads[0],
+		olderNotice,
+		"invalidation callback reentry",
 	);
 	clearPendingHealthChecks(manager);
 }
@@ -4144,6 +5501,684 @@ console.log("\n--- Test 19a9: out-of-order exact reads cannot replace a newer ma
 	clearPendingHealthChecks(manager);
 }
 
+console.log("\n--- Test 19a9a: a proof completing after transition detach remains controller-owned ---");
+{
+	const { manager, binding, interceptedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const notice = externalDiskMutationNotice(
+		binding.path,
+		"external revision captured before detach",
+		1801.5,
+		{ ctime: 1801.25, sequence: 1801, observedAt: 1801.75 },
+	);
+	manager.beginExternalDiskMutation(binding.path, notice.sequence);
+	manager.unbind(binding.view as never);
+	manager.noteExternalDiskMutation(notice);
+
+	assertEq(
+		interceptedExternalReloads.length,
+		1,
+		"detached completion hands the exact external revision to reconciliation",
+	);
+	assertCandidateMatchesNotice(
+		interceptedExternalReloads[0],
+		notice,
+		"detached external proof",
+	);
+	const pending = (manager as unknown as {
+		pendingExternalDiskMutations: Map<string, unknown>;
+	}).pendingExternalDiskMutations.get(binding.path);
+	assertEq(pending, undefined, "detached proof never arms an unrelated editor binding");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a9a1: detached direct delivery failure retries the exact raw notice ---");
+{
+	let callbackAttempts = 0;
+	let failCallback = true;
+	const { manager, binding, interceptedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		onExternalDiskReloadIntercepted: () => {
+			callbackAttempts += 1;
+			if (failCallback) throw new Error("synthetic detached delivery failure");
+		},
+	});
+	const notice = externalDiskMutationNotice(
+		binding.path,
+		"detached retry raw revision",
+		1801.85,
+		{ ctime: 1801.8, sequence: 18011, observedAt: 1801.9 },
+	);
+	manager.beginExternalDiskMutation(binding.path, notice.sequence);
+	manager.unbind(binding.view as never);
+	const originalSetTimeout = globalThis.setTimeout;
+	let retryTimer: (() => void) | null = null;
+	globalThis.setTimeout = ((handler: TimerHandler, delay?: number, ...args: unknown[]) => {
+		if (delay === 250 && retryTimer === null && typeof handler === "function") {
+			retryTimer = () => handler(...args);
+			return 0 as unknown as ReturnType<typeof setTimeout>;
+		}
+		return originalSetTimeout(handler, delay, ...args);
+	}) as typeof setTimeout;
+	try {
+		manager.noteExternalDiskMutation(notice);
+	} finally {
+		globalThis.setTimeout = originalSetTimeout;
+	}
+	const internals = manager as unknown as {
+		pendingExternalDiskCandidateDeliveryRetries: Map<string, Map<number, unknown>>;
+		pendingExternalDiskMutationStarts: Map<string, unknown>;
+	};
+	assertEq(callbackAttempts, 1, "detached direct route attempts delivery once inline");
+	assertEq(
+		internals.pendingExternalDiskCandidateDeliveryRetries
+			.get(notice.path)?.has(notice.sequence),
+		true,
+		"callback throw retains the exact detached raw notice",
+	);
+	assertEq(
+		internals.pendingExternalDiskMutationStarts.has(notice.path),
+		false,
+		"the delivery retry owns raw bytes without retaining an editor start",
+	);
+	assertEq(retryTimer !== null, true, "callback throw schedules a real automatic retry");
+	failCallback = false;
+	retryTimer?.();
+	assertEq(callbackAttempts, 2, "automatic retry re-delivers the exact detached notice");
+	assertEq(interceptedExternalReloads.length, 2, "only the failed attempt and successful retry reach the callback");
+	assertCandidateMatchesNotice(
+		interceptedExternalReloads[1],
+		notice,
+		"detached delivery retry",
+	);
+	assertEq(
+		internals.pendingExternalDiskCandidateDeliveryRetries
+			.get(notice.path)?.has(notice.sequence) ?? false,
+		false,
+		"successful automatic delivery clears the exact retry owner",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a9a2: absent delivery callback is terminal and timer-free ---");
+{
+	const { manager, binding, interceptedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const notice = externalDiskMutationNotice(
+		binding.path,
+		"no callback raw revision",
+		1801.95,
+		{ ctime: 1801.9, sequence: 18012, observedAt: 1802 },
+	);
+	manager.beginExternalDiskMutation(binding.path, notice.sequence);
+	const internals = manager as unknown as {
+		bindings: Map<string, unknown>;
+		onExternalDiskReloadIntercepted?: undefined;
+		pendingExternalDiskMutationStarts: Map<string, unknown>;
+		pendingExternalDiskCandidateDeliveryRetries: Map<string, Map<number, unknown>>;
+	};
+	internals.bindings.clear();
+	internals.onExternalDiskReloadIntercepted = undefined;
+	manager.noteExternalDiskMutation(notice);
+	assertEq(interceptedExternalReloads.length, 0, "absent callback cannot receive a candidate");
+	assertEq(
+		internals.pendingExternalDiskCandidateDeliveryRetries.has(notice.path),
+		false,
+		"absent callback does not create a permanently repeating retry timer",
+	);
+	assertEq(
+		internals.pendingExternalDiskMutationStarts.has(notice.path),
+		false,
+		"absent callback still retires the completed editor-start correlation",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a9a3: async-authority revoke cancels candidate retry delivery ---");
+{
+	let callbackAttempts = 0;
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		onExternalDiskReloadIntercepted: () => {
+			callbackAttempts += 1;
+			throw new Error("synthetic pre-revoke delivery failure");
+		},
+	});
+	const notice = externalDiskMutationNotice(
+		binding.path,
+		"revoked retry raw revision",
+		1802.05,
+		{ ctime: 1802, sequence: 18013, observedAt: 1802.1 },
+	);
+	const internals = manager as unknown as {
+		bindings: Map<string, unknown>;
+		pendingExternalDiskCandidateDeliveryRetries: Map<string, Map<number, unknown>>;
+	};
+	internals.bindings.clear();
+	const originalSetTimeout = globalThis.setTimeout;
+	let retryTimer: (() => void) | null = null;
+	globalThis.setTimeout = ((handler: TimerHandler, delay?: number, ...args: unknown[]) => {
+		if (delay === 250 && retryTimer === null && typeof handler === "function") {
+			retryTimer = () => handler(...args);
+			return 0 as unknown as ReturnType<typeof setTimeout>;
+		}
+		return originalSetTimeout(handler, delay, ...args);
+	}) as typeof setTimeout;
+	try {
+		manager.noteExternalDiskMutation(notice);
+	} finally {
+		globalThis.setTimeout = originalSetTimeout;
+	}
+	assertEq(callbackAttempts, 1, "pre-revoke callback failure creates one retry attempt");
+	assertEq(retryTimer !== null, true, "pre-revoke callback failure owns a timer");
+	manager.revokeAsyncAuthority();
+	assertEq(
+		internals.pendingExternalDiskCandidateDeliveryRetries.size,
+		0,
+		"authority revoke clears every retained candidate retry",
+	);
+	retryTimer?.();
+	manager.noteExternalDiskMutation(notice);
+	assertEq(callbackAttempts, 1, "revoked timer and late completion cannot invoke controller code");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a9a4: long-running disposition ledgers stay timer-bounded ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	type LedgerEntry = {
+		sequence: number;
+		timer: ReturnType<typeof setTimeout> | null;
+	};
+	type DispositionLedger = Map<string, Map<number, LedgerEntry>>;
+	const internals = manager as unknown as {
+		bindings: Map<string, unknown>;
+		deliveredExternalDiskCandidateSequencesByPath: DispositionLedger;
+		selfWriteExternalDiskMutationSequencesByPath: DispositionLedger;
+		claimedExternalDiskCandidateSequencesByPath: Map<string, Set<number>>;
+		pendingExternalDiskCandidateDeliveryRetries: Map<string, Map<number, unknown>>;
+	};
+	internals.bindings.clear();
+	for (let index = 0; index < 256; index++) {
+		manager.noteExternalDiskMutation(externalDiskMutationNotice(
+			binding.path,
+			`bounded external ${index}`,
+			20_000.1 + index,
+			{
+				ctime: 20_000 + index,
+				sequence: 20_000 + index,
+				observedAt: 20_000.2 + index,
+			},
+		));
+	}
+	for (let index = 0; index < 256; index++) {
+		manager.noteSelfWriteExternalDiskMutation(externalDiskMutationNotice(
+			binding.path,
+			`bounded self ${index}`,
+			30_000.1 + index,
+			{
+				ctime: 30_000 + index,
+				sequence: 30_000 + index,
+				observedAt: 30_000.2 + index,
+			},
+		));
+	}
+	const deliveredEntries = internals.deliveredExternalDiskCandidateSequencesByPath
+		.get(binding.path);
+	const selfEntries = internals.selfWriteExternalDiskMutationSequencesByPath
+		.get(binding.path);
+	assertEq(deliveredEntries?.size, 64, "many external events retain at most one path cap");
+	assertEq(selfEntries?.size, 64, "many self events retain at most one path cap");
+	const retainedTimers = [
+		...Array.from(deliveredEntries?.values() ?? []),
+		...Array.from(selfEntries?.values() ?? []),
+	].map((entry) => entry.timer);
+	assertEq(retainedTimers.length, 128, "bounded entries own only bounded expiry timers");
+	assertEq(
+		retainedTimers.every((timer) => {
+			if (timer === null) return false;
+			const hasRef = (timer as unknown as { hasRef?: () => boolean }).hasRef;
+			return typeof hasRef !== "function" || hasRef.call(timer) === false;
+		}),
+		true,
+		"every retained disposition timer is unrefed when the runtime supports it",
+	);
+	assertEq(
+		internals.claimedExternalDiskCandidateSequencesByPath.size,
+		0,
+		"successful synchronous callbacks leave no active claim ledger",
+	);
+	assertEq(
+		internals.pendingExternalDiskCandidateDeliveryRetries.size,
+		0,
+		"successful long-running delivery creates no retry residue",
+	);
+	const expiringEntry = deliveredEntries?.values().next().value as LedgerEntry | undefined;
+	if (expiringEntry?.timer) captureNodeTimerCallback(expiringEntry.timer)();
+	assertEq(deliveredEntries?.size, 63, "expiry removes only its exact retained disposition");
+	assertEq(selfEntries?.size, 64, "external expiry cannot change the self ledger");
+	manager.revokeAsyncAuthority();
+	assertEq(
+		internals.deliveredExternalDiskCandidateSequencesByPath.size,
+		0,
+		"authority revoke clears delivered dispositions and timers",
+	);
+	assertEq(
+		internals.selfWriteExternalDiskMutationSequencesByPath.size,
+		0,
+		"authority revoke clears self dispositions and timers",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a9a5: revoked external authority cannot regenerate state ---");
+{
+	let callbackAttempts = 0;
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		onExternalDiskReloadIntercepted: () => { callbackAttempts += 1; },
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "typing now");
+	const editorCandidate = {
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "pre-revoke editor candidate" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	};
+	(manager as unknown as {
+		filterRiskyNonUserPatch(transaction: unknown): unknown;
+	}).filterRiskyNonUserPatch(editorCandidate);
+	const pendingNotice = externalDiskMutationNotice(
+		binding.path,
+		"pre-revoke pending external raw",
+		40_000.1,
+		{ ctime: 40_000, sequence: 40_000, observedAt: 40_000.2 },
+	);
+	manager.beginExternalDiskMutation(binding.path, pendingNotice.sequence);
+	manager.noteExternalDiskMutation(pendingNotice);
+	type ExternalStateInternals = {
+		pendingExternalDiskMutations: Map<string, unknown>;
+		pendingExternalDiskMutationStarts: Map<string, unknown>;
+		recentEditorOriginChanges: Map<string, unknown>;
+		claimedExternalDiskCandidateSequencesByPath: Map<string, Set<number>>;
+		pendingExternalDiskCandidateDeliveryRetries: Map<string, Map<number, unknown>>;
+		deliveredExternalDiskCandidateSequencesByPath: Map<string, Map<number, unknown>>;
+		selfWriteExternalDiskMutationSequencesByPath: Map<string, Map<number, unknown>>;
+		activeSelfWriteExternalDiskMutationSequencesByPath: Map<string, Set<number>>;
+		lastExternalDiskMutationSequenceByPath: Map<string, number>;
+		observedExternalDiskMutationSequenceByPath: Map<string, number>;
+		pendingExternalDiskCorrelationTimers?: Set<ReturnType<typeof setTimeout>>;
+		pendingExternalDiskHostProjectionFences: WeakMap<object, unknown>;
+	};
+	const internals = manager as unknown as ExternalStateInternals;
+	assertEq(internals.pendingExternalDiskMutations.size, 1, "fixture owns one pre-revoke raw marker");
+	assertEq(internals.pendingExternalDiskMutationStarts.size, 1, "fixture owns one pre-revoke start");
+	assertEq(internals.recentEditorOriginChanges.size, 1, "fixture owns one recent editor candidate");
+	const oldHostProjectionFenceRegistry = internals.pendingExternalDiskHostProjectionFences;
+
+	manager.revokeAsyncAuthority();
+	assertEq(internals.pendingExternalDiskMutations.size, 0, "revoke clears pending raw markers without callback");
+	assertEq(internals.pendingExternalDiskMutationStarts.size, 0, "revoke clears event-start owners");
+	assertEq(internals.recentEditorOriginChanges.size, 0, "revoke clears recent editor candidates");
+	assertEq(internals.claimedExternalDiskCandidateSequencesByPath.size, 0, "revoke clears active callback claims");
+	assertEq(internals.pendingExternalDiskCandidateDeliveryRetries.size, 0, "revoke clears exact retries");
+	assertEq(internals.deliveredExternalDiskCandidateSequencesByPath.size, 0, "revoke clears delivered ledger");
+	assertEq(internals.selfWriteExternalDiskMutationSequencesByPath.size, 0, "revoke clears self ledger");
+	assertEq(internals.activeSelfWriteExternalDiskMutationSequencesByPath.size, 0, "revoke clears active self state");
+	assertEq(internals.lastExternalDiskMutationSequenceByPath.size, 0, "revoke clears completion sequence state");
+	assertEq(internals.observedExternalDiskMutationSequenceByPath.size, 0, "revoke clears observed sequence state");
+	assertEq(
+		internals.pendingExternalDiskCorrelationTimers?.size ?? -1,
+		0,
+		"revoke cancels every marker/recent expiry timer",
+	);
+	assertEq(
+		internals.pendingExternalDiskHostProjectionFences === oldHostProjectionFenceRegistry,
+		false,
+		"revoke replaces the weak host-projection fence registry",
+	);
+	assertEq(callbackAttempts, 0, "revoke does not publish a pending raw marker after controller revoke");
+
+	const originalSetTimeout = globalThis.setTimeout;
+	let postRevokeTimers = 0;
+	globalThis.setTimeout = ((handler: TimerHandler, delay?: number, ...args: unknown[]) => {
+		postRevokeTimers += 1;
+		return originalSetTimeout(handler, delay, ...args);
+	}) as typeof setTimeout;
+	let postRevokeDisposition: unknown;
+	try {
+		manager.beginExternalDiskMutation(binding.path, 40_001);
+		manager.noteSelfWriteExternalDiskMutation(externalDiskMutationNotice(
+			binding.path,
+			"post-revoke self",
+			40_001.1,
+			{ ctime: 40_001, sequence: 40_001, observedAt: 40_001.2 },
+		));
+		postRevokeDisposition = manager.noteExternalDiskMutation(externalDiskMutationNotice(
+			binding.path,
+			"post-revoke external",
+			40_002.1,
+			{ ctime: 40_002, sequence: 40_002, observedAt: 40_002.2 },
+		));
+	} finally {
+		globalThis.setTimeout = originalSetTimeout;
+	}
+	assertEq(postRevokeDisposition, "terminal-no-candidate", "post-revoke external completion is terminal");
+	assertEq(postRevokeTimers, 0, "post-revoke event APIs schedule zero timers");
+	assertEq(callbackAttempts, 0, "post-revoke event APIs invoke zero external callbacks");
+	assertEq(
+		internals.pendingExternalDiskCorrelationTimers?.size ?? -1,
+		0,
+		"post-revoke event APIs retain zero external timers",
+	);
+	assertEq(
+		[
+			internals.pendingExternalDiskMutations.size,
+			internals.pendingExternalDiskMutationStarts.size,
+			internals.recentEditorOriginChanges.size,
+			internals.claimedExternalDiskCandidateSequencesByPath.size,
+			internals.lastExternalDiskMutationSequenceByPath.size,
+			internals.observedExternalDiskMutationSequenceByPath.size,
+		].join("|"),
+		"0|0|0|0|0|0",
+		"post-revoke event APIs regenerate no external authority state",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a9b: managed handoff keeps both source and target paths event-trackable ---");
+{
+	const { manager, binding, interceptedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const internals = manager as unknown as {
+		bindings: Map<string, unknown>;
+		managedSessions: Map<string, {
+			session: ManagedLeafSession;
+		}>;
+		tracksExternalDiskMutationPath?: (path: string) => boolean;
+	};
+	const [leafId, runtime] = Array.from(internals.managedSessions.entries())[0] ?? [];
+	assertEq(runtime !== undefined, true, "managed runtime exists for transition tracking");
+	if (runtime && leafId) {
+		const targetPath = "Notes/managed-external-target.md";
+		const detachedSourceText = binding.ytext.toString();
+		runtime.session = {
+			...runtime.session,
+			binding: { kind: "unbound" },
+			handoff: {
+				sourceAuthorityPath: binding.path,
+				sourceUnloadReceiptId: null,
+				targetPath,
+				targetFile: { path: targetPath } as never,
+				bindingEpochAfterDetach: 1,
+				presentation: "source",
+				inputGateInstalled: true,
+				saveGuardInstalled: true,
+				pendingHostLoadCandidate: null,
+			},
+		};
+		internals.bindings.delete(leafId);
+		assertEq(
+			internals.tracksExternalDiskMutationPath?.(binding.path) ?? false,
+			true,
+			"detached source path remains externally trackable",
+		);
+		assertEq(
+			internals.tracksExternalDiskMutationPath?.(targetPath) ?? false,
+			true,
+			"unbound target path remains externally trackable",
+		);
+		const targetNotice = externalDiskMutationNotice(
+			targetPath,
+			"target changed outside Obsidian while unbound",
+			1802.5,
+			{ ctime: 1802.25, sequence: 1802, observedAt: 1802.75 },
+		);
+		manager.beginExternalDiskMutation(targetPath, targetNotice.sequence);
+		manager.noteExternalDiskMutation(targetNotice);
+		assertEq(
+			interceptedExternalReloads.length,
+			1,
+			"unbound target revision is handed to path-scoped reconciliation",
+		);
+		assertCandidateMatchesNotice(
+			interceptedExternalReloads[0],
+			targetNotice,
+			"unbound managed target proof",
+		);
+		assertEq(
+			binding.ytext.toString(),
+			detachedSourceText,
+			"unbound target proof never replays into the detached source Y.Text",
+		);
+	}
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a9c: an ownerless selected target stays exact-trackable and its late proof stays controller-owned ---");
+{
+	const {
+		manager,
+		binding,
+		interceptedExternalReloads,
+		setLiveEditorContent,
+	} = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const internals = manager as unknown as {
+		bindings: Map<string, typeof binding>;
+		managedSessions: Map<string, { session: ManagedLeafSession }>;
+		pendingExternalDiskMutationStarts: Map<string, {
+			sequence: number;
+			views: Map<string, unknown>;
+		}>;
+		pendingExternalDiskMutations: Map<string, unknown>;
+		tracksExternalDiskMutationPath: (path: string) => boolean;
+	};
+	const runtime = internals.managedSessions.get("leaf-1");
+	assertEq(runtime !== undefined, true, "managed source runtime exists before ownerless selection");
+	if (runtime) {
+		const sourceFile = binding.file;
+		const sourceText = binding.ytext.toString();
+		const targetPath = "Notes/ownerless-external-target.md";
+		const targetFile = {
+			path: targetPath,
+			stat: { ctime: 2, mtime: 2, size: 13 },
+		};
+		const targetDoc = new Y.Doc();
+		const targetText = targetDoc.getText("target");
+		targetText.insert(0, "target server");
+
+		// Model the real ownerless seam: Obsidian has published B on the view, while
+		// KAOS still owns A's binding/displayed lineage and has not installed handoff
+		// or target-fence metadata yet.
+		(binding.view as unknown as { file: unknown }).file = targetFile;
+		assertEq(binding.path, sourceFile.path, "source binding still names A in the ownerless seam");
+		assertEq(runtime.session.handoff, null, "ownerless seam precedes handoff metadata");
+		assertEq(
+			internals.tracksExternalDiskMutationPath(targetPath),
+			true,
+			"selected view path B is exact-trackable before handoff metadata exists",
+		);
+		assertEq(binding.ytext.toString(), sourceText, "tracking B does not authorize stale A bytes for B");
+
+		const notice = externalDiskMutationNotice(
+			targetPath,
+			"target external while ownerless",
+			1803.5,
+			{ ctime: 1803.25, sequence: 1803, observedAt: 1803.75 },
+		);
+		manager.beginExternalDiskMutation(targetPath, notice.sequence);
+		const start = internals.pendingExternalDiskMutationStarts.get(targetPath);
+		assertEq(start?.sequence, notice.sequence, "unbound event start survives the held exact read");
+		assertEq(start?.views.size, 0, "unbound event start records that no editor owned B at event time");
+
+		// The handoff completes while the exact raw read is still pending. Publishing
+		// this healthy B binding must not retroactively correlate it with the earlier
+		// ownerless event.
+		setLiveEditorContent("target server");
+		const targetBinding = {
+			...binding,
+			file: targetFile,
+			path: targetPath,
+			ytext: targetText,
+			undoManager: new Y.UndoManager(targetText),
+		};
+		internals.bindings.set("leaf-1", targetBinding);
+		runtime.session = {
+			...runtime.session,
+			generation: runtime.session.generation + 1,
+			displayedLineage: {
+				kind: "known",
+				file: targetFile as never,
+				path: targetPath,
+				fileId: "target-file",
+				cm: targetBinding.cm as never,
+				document: targetBinding.cm.state.doc as never,
+				editorRevision: 0,
+			},
+			binding: {
+				kind: "bound",
+				path: targetPath,
+				fileId: "target-file",
+				ytext: targetText,
+			},
+			handoff: null,
+		};
+		manager.noteExternalDiskMutation(notice);
+
+		assertEq(
+			interceptedExternalReloads.length,
+			1,
+			"ownerless-start exact revision is handed directly to reconciliation",
+		);
+		assertCandidateMatchesNotice(
+			interceptedExternalReloads[0],
+			notice,
+			"ownerless-start external proof",
+		);
+		assertEq(
+			internals.pendingExternalDiskMutations.get(targetPath),
+			undefined,
+			"later B binding is never armed with the ownerless-start reload marker",
+		);
+		assertEq(binding.ytext.toString(), sourceText, "ownerless proof never mutates source A Y.Text");
+		assertEq(targetText.toString(), "target server", "ownerless proof never mutates target B Y.Text");
+		targetBinding.undoManager.destroy();
+	}
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a9d: an older ownerless completion cannot erase a newer bound event start ---");
+{
+	const { manager, binding, interceptedExternalReloads } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const internals = manager as unknown as {
+		bindings: Map<string, typeof binding>;
+		managedSessions: Map<string, { session: ManagedLeafSession }>;
+		pendingExternalDiskMutationStarts: Map<string, {
+			sequence: number;
+			views: Map<string, unknown>;
+		}>;
+		pendingExternalDiskMutations: Map<string, { sequence: number; content: string | null }>;
+	};
+	const runtime = internals.managedSessions.get("leaf-1");
+	assertEq(runtime !== undefined, true, "managed runtime exists for overlapping exact reads");
+	if (runtime) {
+		const sourceText = binding.ytext.toString();
+		const targetPath = "Notes/ownerless-overlap-target.md";
+		const targetFile = {
+			path: targetPath,
+			stat: { ctime: 3, mtime: 3, size: 13 },
+		};
+		const targetDoc = new Y.Doc();
+		const targetText = targetDoc.getText("target-overlap");
+		targetText.insert(0, "target server");
+		(binding.view as unknown as { file: unknown }).file = targetFile;
+		const older = externalDiskMutationNotice(
+			targetPath,
+			"older ownerless external",
+			1804.5,
+			{ ctime: 1804.25, sequence: 1804, observedAt: 1804.75 },
+		);
+		manager.beginExternalDiskMutation(targetPath, older.sequence);
+
+		const targetBinding = {
+			...binding,
+			file: targetFile,
+			path: targetPath,
+			ytext: targetText,
+			undoManager: new Y.UndoManager(targetText),
+		};
+		internals.bindings.set("leaf-1", targetBinding);
+		runtime.session = {
+			...runtime.session,
+			generation: runtime.session.generation + 1,
+			displayedLineage: {
+				kind: "known",
+				file: targetFile as never,
+				path: targetPath,
+				fileId: "target-overlap-file",
+				cm: targetBinding.cm as never,
+				document: targetBinding.cm.state.doc as never,
+				editorRevision: 0,
+			},
+			binding: {
+				kind: "bound",
+				path: targetPath,
+				fileId: "target-overlap-file",
+				ytext: targetText,
+			},
+			handoff: null,
+		};
+		const newer = externalDiskMutationNotice(
+			targetPath,
+			"newer bound external",
+			1805.5,
+			{ ctime: 1805.25, sequence: 1805, observedAt: 1805.75 },
+		);
+		manager.beginExternalDiskMutation(targetPath, newer.sequence);
+		assertEq(
+			internals.pendingExternalDiskMutationStarts.get(targetPath)?.views.size,
+			1,
+			"newer event captures the live target binding",
+		);
+
+		manager.noteExternalDiskMutation(older);
+		assertEq(interceptedExternalReloads.length, 1, "older ownerless revision goes to reconciliation");
+		assertEq(
+			internals.pendingExternalDiskMutationStarts.get(targetPath)?.sequence,
+			newer.sequence,
+			"older completion preserves the newer event-start snapshot",
+		);
+		manager.noteExternalDiskMutation(newer);
+		const pending = internals.pendingExternalDiskMutations.get(targetPath);
+		assertEq(pending?.sequence, newer.sequence, "newer bound event still arms its exact reload marker");
+		assertEq(pending?.content, newer.content, "newer marker retains its exact raw content");
+		assertEq(binding.ytext.toString(), sourceText, "overlapping reads never mutate source A Y.Text");
+		assertEq(targetText.toString(), "target server", "overlapping reads never mutate target B Y.Text");
+		targetBinding.undoManager.destroy();
+	}
+	clearPendingHealthChecks(manager);
+}
+
 console.log("\n--- Test 19a10: an old async proof cannot cross close and reopen ---");
 {
 	const { manager, binding, interceptedExternalReloads } = buildManagerFixture({
@@ -4361,16 +6396,11 @@ console.log("\n--- Test 19a13: multi-pane interception retains the complete noti
 	assertEq(Array.isArray(firstResult), true, "first pane blocks the proven reload");
 	assertEq(Array.isArray(secondResult), true, "second pane blocks the proven reload");
 	assertEq(binding.ytext.toString(), "typing now", "multi-pane reload never reaches shared Y.Text");
-	assertEq(interceptedExternalReloads.length, 2, "each live pane reports its interception once");
+	assertEq(interceptedExternalReloads.length, 1, "one exact disk event reaches the controller exactly once");
 	assertCandidateMatchesNotice(
 		interceptedExternalReloads[0],
 		notice,
-		"first multi-pane interception",
-	);
-	assertCandidateMatchesNotice(
-		interceptedExternalReloads[1],
-		notice,
-		"second multi-pane interception",
+		"multi-pane interception",
 	);
 	clearPendingHealthChecks(manager);
 }
@@ -5550,7 +7580,13 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 				import { EditorState, Transaction } from "@codemirror/state";
 				import { history, undo, undoDepth } from "@codemirror/commands";
 				import { EditorView } from "@codemirror/view";
-				import { EditorBindingManager } from "./src/sync/editorBinding";
+				import {
+					EditorBindingManager,
+					getEditorHandoffQaDebugSnapshot,
+					holdNextEditorHostLoadForQa,
+					installEditorHandoffHostQaBarrier,
+					releaseHeldEditorHostLoadForQa,
+				} from "./src/sync/editorBinding";
 
 				window.__TASK6_STALE_DISPATCH__ = (async () => {
 					const pathA = "Notes/browser-A.md";
@@ -5562,6 +7598,7 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 					ytext.insert(0, "source");
 					const awareness = new Awareness(doc);
 					const admissions = [];
+					const interceptedExternalReloads = [];
 					const vaultSync = {
 						provider: { awareness },
 						getTextForPath: (path) => path === pathA ? ytext : null,
@@ -5578,10 +7615,11 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 						undefined,
 						undefined,
 						undefined,
-						undefined,
+						(candidate) => { interceptedExternalReloads.push(candidate); },
 						undefined,
 						(request) => admissions.push(request),
 					);
+					installEditorHandoffHostQaBarrier(manager);
 					const parent = document.createElement("div");
 					document.body.appendChild(parent);
 					const leaf = {
@@ -5636,6 +7674,28 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 					});
 					manager.bind(view, "Browser");
 					const initiallyBound = manager.getBinding(view) !== null;
+					const externalReceiptContent = "external receipt raw\r\n";
+					const externalReceiptSequence = 4242;
+					const externalReceiptObservedAt = 4343;
+					manager.beginExternalDiskMutation(pathA, externalReceiptSequence);
+					manager.noteExternalDiskMutation({
+						path: pathA,
+						ctime: 41,
+						mtime: 42,
+						size: new TextEncoder().encode(externalReceiptContent).byteLength,
+						sequence: externalReceiptSequence,
+						observedAt: externalReceiptObservedAt,
+						content: externalReceiptContent,
+					});
+					cm.dispatch({
+						changes: { from: 0, to: cm.state.doc.length, insert: externalReceiptContent },
+						annotations: Transaction.userEvent.of("set"),
+					});
+					const externalReceipt =
+						getEditorHandoffQaDebugSnapshot(manager).lastInterceptedExternalDiskMutation;
+					manager.beginExternalDiskMutation(pathA, externalReceiptSequence + 1);
+					const externalReceiptAfterNewerBegin =
+						getEditorHandoffQaDebugSnapshot(manager).lastInterceptedExternalDiskMutation;
 					const rejectedUnload = view.onUnloadFile(fileA);
 					void rejectedUnload.catch(() => undefined);
 					const sourceUnloadPrefixSaveBlocked =
@@ -5651,6 +7711,9 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 					const cmSnapshot = runtime?.cmGuard?.snapshot() ?? null;
 					const result = {
 						initiallyBound,
+						externalReceipt,
+						externalReceiptAfterNewerBegin,
+						interceptedExternalReloadCount: interceptedExternalReloads.length,
 						cmContent: cm.state.doc.toString(),
 						yContent: ytext.toString(),
 						bindingDetached: manager.getBinding(view) === null,
@@ -5686,6 +7749,13 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 						probeMissingTarget = false,
 						probeSupersededInput = false,
 						probeSourceDrainOrdering = false,
+						probeStructuralMutationTerminal = false,
+						probeStructuralImeTerminal = false,
+						probeStructuralCloseBeforeSuccessor = false,
+						probeStructuralCloseExpiry = false,
+						probeStructuralCloseExportFailure = false,
+						probeExternalDuringHeldLoad = false,
+						probeExactBoundPeer = false,
 					}) => {
 					const pathA = "Notes/task9-browser-" + suffix + "-A.md";
 					const pathB = "Notes/task9-browser-" + suffix + "-B.md";
@@ -5717,7 +7787,24 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 						const adoptionRequestHasYText = [];
 						const adoptionRequestAuthorityKinds = [];
 						const transitionCmDocuments = [];
+						const interceptedExternalReloads = [];
+						let externalCandidateReplanCount = 0;
+						let externalCandidateDrainSawProjectionHeld = null;
+						let externalCandidateProjectionProofCaptured = false;
+						let externalCandidateThrowingProofReturnedNull = false;
+						let externalCandidateProofRecoveredAfterThrow = false;
+						let externalCandidateProofCurrentAfterPresentationChurn = false;
+						let exactBoundPeerInitiallyBound = false;
+						let exactBoundPeerTicketViewCount = 0;
+						let exactBoundPeerBoundAtProof = false;
+						let peerView = null;
+						let peerCm = null;
+						let peerParent = null;
+						let peerHostData = contentB;
+						let installExactBoundPeer = () => {};
 						const hostSaveSnapshots = [];
+						const terminalExportContents = [];
+						let exporterChooseCalls = 0;
 						const sourceDrainOrder = [];
 						let nativeUnloadCalls = 0;
 						let nativeLoadCalls = 0;
@@ -5738,9 +7825,87 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 							adoptionRequestPaths.push(request.path);
 							adoptionRequestFileIds.push(request.fileId);
 								adoptionRequestHasYText.push(request.ytext !== null);
-								adoptionRequestAuthorityKinds.push(request.editorAuthority.kind);
-								adoptionRequests += 1;
-								if (probeMissingTarget && !missingTargetSeeded) {
+							adoptionRequestAuthorityKinds.push(request.editorAuthority.kind);
+							adoptionRequests += 1;
+							if (
+								probeExternalDuringHeldLoad
+								&& request.path === pathB
+								&& request.editorAuthority.kind === "proven-single"
+								&& ytextB.toString() !== request.editorAuthority.content
+							) {
+								externalCandidateReplanCount += 1;
+								adoptionRequestOutcomes.push("external-disk-candidate");
+								if (externalCandidateReplanCount === 1) {
+									const exactExternalContent = request.editorAuthority.content;
+									setTimeout(() => {
+										externalCandidateDrainSawProjectionHeld =
+											manager.isSamePathAdoptionProjectionHeld(pathB);
+										if (!externalCandidateDrainSawProjectionHeld) return;
+										let authority = request.editorAuthority;
+										let openEditorTicket = request.openEditorTicket;
+										if (probeExactBoundPeer) {
+											doc.transact(() => {
+												if (ytextB.length > 0) ytextB.delete(0, ytextB.length);
+												ytextB.insert(0, exactExternalContent);
+											}, "task9-exact-bound-peer-pre-settlement");
+											installExactBoundPeer();
+											if (peerView === null) return;
+											openEditorTicket = manager.captureOpenEditorMutationTicket(
+												pathB,
+												[view, peerView],
+											);
+											authority = manager.capturePathEditorAuthority(pathB);
+											exactBoundPeerTicketViewCount = openEditorTicket.views.length;
+											exactBoundPeerBoundAtProof = peerView !== null
+												&& manager.getBinding(peerView)?.path === pathB;
+										}
+										if (authority.kind !== "proven-single") return;
+										const proofInput = {
+											path: pathB,
+											file: fileB,
+											content: exactExternalContent,
+											openEditorTicket,
+											editorAuthorityLease: authority.lease,
+										};
+										const workspace = view.app.workspace;
+										const originalIterateAllLeaves = workspace.iterateAllLeaves;
+										let throwingProof = null;
+										try {
+											workspace.iterateAllLeaves = () => {
+												throw new Error("task9 projection proof validation failed");
+											};
+											throwingProof =
+												manager.captureSamePathExternalCandidateProjectionProof(proofInput);
+										} finally {
+											workspace.iterateAllLeaves = originalIterateAllLeaves;
+										}
+										externalCandidateThrowingProofReturnedNull = throwingProof === null;
+										const proof =
+											manager.captureSamePathExternalCandidateProjectionProof(proofInput);
+										externalCandidateProofRecoveredAfterThrow = proof !== null;
+										if (proof === null) return;
+										externalCandidateProjectionProofCaptured = true;
+										try {
+											cm.dispatch({ selection: { anchor: 0 } });
+											cm.scrollDOM.dispatchEvent(new Event("scroll"));
+											externalCandidateProofCurrentAfterPresentationChurn =
+												manager.isSamePathExternalCandidateProjectionProofCurrent(proof);
+											if (!externalCandidateProofCurrentAfterPresentationChurn) return;
+											if (ytextB.toString() !== exactExternalContent) {
+												doc.transact(() => {
+													if (ytextB.length > 0) ytextB.delete(0, ytextB.length);
+													ytextB.insert(0, exactExternalContent);
+												}, "task9-held-external-candidate-drain");
+											}
+										} finally {
+											manager.releaseSamePathExternalCandidateProjectionProof(proof);
+										}
+										manager.bind(view, "Browser");
+									}, 0);
+								}
+								return Promise.resolve({ kind: "replan", reason: "external-disk-candidate" });
+							}
+							if (probeMissingTarget && !missingTargetSeeded) {
 									if (adoptionRequests === 1) {
 										adoptionRequestOutcomes.push("held-before-input");
 										return new Promise((resolve) => {
@@ -5873,22 +8038,38 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 						false,
 						(path) => path.endsWith(".md"),
 						(_source, message, details) => {
-							if (message.startsWith("source-unload-drain")) {
+							if (
+								message.startsWith("source-unload-drain")
+								|| message.startsWith("terminal-visible-content-export")
+								|| message.startsWith("managed-emergency-save-fence")
+								|| message === "managed-host-capability-lost"
+							) {
 								managerTrace.push({ message, details });
 							}
 						},
 						undefined,
 						undefined,
 						undefined,
-						undefined,
+						(candidate) => { interceptedExternalReloads.push(candidate); },
 						undefined,
 						undefined,
 							controller,
+							{
+								chooseVerifiedExporter: async () => {
+									exporterChooseCalls += 1;
+									return probeStructuralCloseExportFailure && exporterChooseCalls === 1
+										? null
+										: async (content) => { terminalExportContents.push(content); };
+								},
+							},
 					);
 					const parent = document.createElement("div");
 					document.body.appendChild(parent);
-					let cm;
-					let hostData = contentA;
+						let cm;
+						let loadContentB = contentB;
+						let hostData = contentA;
+						let clearFalseSetDataPreassignedContent = null;
+						let clearFalseSetViewDataCalls = 0;
 					let rejectPendingHostLoad = null;
 					const pendingHostLoad = probePendingHostFailure
 						? new Promise((_resolve, reject) => { rejectPendingHostLoad = reject; })
@@ -5901,7 +8082,10 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 						id: "task9-browser-leaf",
 						workspace: {
 							activeLeaf: null,
-							iterateAllLeaves(callback) { callback({ view }); },
+							iterateAllLeaves(callback) {
+								callback({ view });
+								if (peerView !== null) callback({ view: peerView });
+							},
 						},
 					};
 					const requestSave = Object.assign(function requestSave() {}, { cancel() {} });
@@ -5910,7 +8094,10 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 						leaf,
 						app: {
 							workspace: {
-								iterateAllLeaves(callback) { callback({ view }); },
+								iterateAllLeaves(callback) {
+									callback({ view });
+									if (peerView !== null) callback({ view: peerView });
+								},
 							},
 						},
 						containerEl: parent,
@@ -5918,8 +8105,8 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 						data: hostData,
 						dirty: false,
 						lastSavedData: hostData,
-						getViewData: () => hostData,
-						onUnloadFile: async function onUnloadFile(_file) {
+							getViewData: () => hostData,
+							onUnloadFile: async function onUnloadFile(_file) {
 							nativeUnloadCalls += 1;
 							sourceDrainOrder.push("native-unload-enter");
 							await this.save(true);
@@ -5928,20 +8115,53 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 							nativeLoadCalls += 1;
 							sourceDrainOrder.push("native-load-enter");
 							if (targetBytesGate !== null) await targetBytesGate;
-							this.setViewData(targetFile === fileC ? contentC : contentB, true);
-							if (pendingHostLoad !== null) await pendingHostLoad;
-							else await Promise.resolve();
-						},
-						setViewData: function setViewData(data, _clear) {
-							hostData = data;
-							this.data = data;
-							this.lastSavedData = data;
-							cm.dispatch({
-								changes: { from: 0, to: cm.state.doc.length, insert: data },
-								selection: { anchor: data.length },
-								annotations: Transaction.addToHistory.of(false),
-							});
-						},
+							this.setViewData(targetFile === fileC ? contentC : loadContentB, true);
+								if (pendingHostLoad !== null) await pendingHostLoad;
+								else await Promise.resolve();
+							},
+							setData: function setData(data, clear) {
+								hostData = data;
+								this.data = data;
+								if (clear === false) clearFalseSetDataPreassignedContent = this.data;
+								this.setViewData(data, clear);
+							},
+							setViewData: function setViewData(data, _clear) {
+								hostData = data;
+								this.data = data;
+								this.lastSavedData = data;
+								if (_clear === false) {
+									clearFalseSetViewDataCalls += 1;
+									const before = cm.state.doc.toString();
+									let from = 0;
+									while (from < before.length && from < data.length && before[from] === data[from]) {
+										from += 1;
+									}
+									let to = before.length;
+									let incomingTo = data.length;
+									while (
+										to > from
+										&& incomingTo > from
+										&& before[to - 1] === data[incomingTo - 1]
+									) {
+										to -= 1;
+										incomingTo -= 1;
+									}
+									cm.dispatch({
+										changes: { from, to, insert: data.slice(from, incomingTo) },
+										selection: { anchor: data.length },
+										annotations: [
+											Transaction.addToHistory.of(false),
+											Transaction.userEvent.of("set"),
+										],
+									});
+									return;
+								}
+								cm.dispatch({
+									changes: { from: 0, to: cm.state.doc.length, insert: data },
+									selection: { anchor: data.length },
+									annotations: Transaction.addToHistory.of(false),
+								});
+							},
 						requestSave,
 							save: async function save(clear) {
 								nativeSaveCalls += 1;
@@ -6009,8 +8229,438 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 						lastEditorDocChangeAtMs: null,
 						settleWindowMs: 0,
 					});
-					manager.bind(view, "Browser");
-					if (probeSourceDrainOrdering) {
+						if (probeExternalDuringHeldLoad) {
+							installEditorHandoffHostQaBarrier(manager);
+						}
+						manager.bind(view, "Browser");
+						if (probeExactBoundPeer) {
+							installExactBoundPeer = () => {
+							if (peerView !== null) return;
+							peerHostData = ytextB.toString();
+							peerParent = document.createElement("div");
+							document.body.appendChild(peerParent);
+							const peerLeaf = {
+								id: "task9-browser-bound-peer",
+								workspace: {
+									activeLeaf: null,
+									iterateAllLeaves: view.app.workspace.iterateAllLeaves,
+								},
+							};
+							const peerRequestSave = Object.assign(
+								function peerRequestSave() {},
+								{ cancel() {} },
+							);
+							peerView = {
+								file: fileB,
+								leaf: peerLeaf,
+								app: view.app,
+								containerEl: peerParent,
+								editor: { getValue: () => peerCm.state.doc.toString() },
+								data: peerHostData,
+								dirty: false,
+								lastSavedData: peerHostData,
+								getViewData: () => peerHostData,
+								onUnloadFile: async function onUnloadFile(_file) {},
+								onLoadFile: async function onLoadFile(_file) {},
+								setData: function setData(data, clear) {
+									this.setViewData(data, clear);
+								},
+								setViewData: function setViewData(data, _clear) {
+									peerHostData = data;
+									this.data = data;
+									this.lastSavedData = data;
+									if (peerCm.state.doc.toString() === data) return;
+									peerCm.dispatch({
+										changes: { from: 0, to: peerCm.state.doc.length, insert: data },
+										annotations: Transaction.addToHistory.of(false),
+									});
+								},
+								requestSave: peerRequestSave,
+								save: async function save() { this.dirty = false; },
+							};
+							peerLeaf.workspace.activeLeaf = peerLeaf;
+							peerCm = new EditorView({
+								parent: peerParent,
+								state: EditorState.create({
+									doc: peerHostData,
+									extensions: [history(), manager.getBaseExtension()],
+								}),
+							});
+							const peerBound = manager.applyBinding({
+								action: "bind",
+								deviceName: "Browser",
+								view: peerView,
+								cm: peerCm,
+								cmId: "task9-exact-bound-peer-cm",
+								leafId: peerLeaf.id,
+								file: fileB,
+								filePath: pathB,
+								ytext: ytextB,
+								fileId: "file-B",
+								reason: "task9-exact-bound-peer",
+							});
+							exactBoundPeerInitiallyBound = peerBound
+								&&
+								manager.getBinding(peerView)?.path === pathB;
+							};
+						}
+						if (probeStructuralImeTerminal) {
+							const compositionStart = new CompositionEvent("compositionstart", {
+								bubbles: true,
+								cancelable: true,
+								data: "",
+							});
+							cm.contentDOM.dispatchEvent(compositionStart);
+							let unloadOutcome = "pending";
+							const unload = view.onUnloadFile(fileA).then(
+								() => { unloadOutcome = "fulfilled"; },
+								() => { unloadOutcome = "rejected"; },
+							);
+							await Promise.resolve();
+							const compositionUpdate = new CompositionEvent("compositionupdate", {
+								bubbles: true,
+								data: "한",
+							});
+							cm.contentDOM.dispatchEvent(compositionUpdate);
+							const activeCompositionInput = new InputEvent("beforeinput", {
+								bubbles: true,
+								cancelable: true,
+								inputType: "insertCompositionText",
+								data: "한",
+								isComposing: true,
+							});
+							cm.contentDOM.dispatchEvent(activeCompositionInput);
+							const reservedSuccessor = cm.state.update({
+								changes: { from: cm.state.selection.main.head, insert: "한" },
+								selection: { anchor: cm.state.selection.main.head + 1 },
+								annotations: Transaction.userEvent.of("input.type.compose"),
+								filter: false,
+							});
+							const ytextAMutationsAtStructural = ytextAMutations;
+							view.file = null;
+							manager.unbindByPath(pathA);
+							const emergencySaveBlockedBeforeSuccessor =
+								manager.managedSessions.get(leaf.id)?.emergencySaveFence?.isCurrent() === true;
+							let successorDispatchThrew = false;
+							try {
+								cm.dispatch(reservedSuccessor);
+							} catch {
+								successorDispatchThrew = true;
+							}
+							const compositionEnd = new CompositionEvent("compositionend", {
+								bubbles: true,
+								data: "한",
+							});
+							cm.contentDOM.dispatchEvent(compositionEnd);
+							await Promise.resolve();
+							await Promise.resolve();
+							await Promise.resolve();
+							const retained = manager.managedSessions.get(leaf.id);
+							const retainedGuard = retained?.cmGuard?.snapshot() ?? null;
+							const emergencySaveBlockedAfterCompositionEnd =
+								retained?.emergencySaveFence?.isCurrent() === true;
+							const emergencySaveFencePresentAfterCompositionEnd =
+								retained?.emergencySaveFence !== null;
+							const freshCompositionStart = new CompositionEvent("compositionstart", {
+								bubbles: true,
+								cancelable: true,
+								data: "",
+							});
+							cm.contentDOM.dispatchEvent(freshCompositionStart);
+							const closingGuard = retained?.cmGuard ?? null;
+							const exactCloseCount = manager.reconcileManagedWorkspaceViews(
+								[],
+								"task9-structural-ime-terminal-exact-close",
+							);
+							await unload;
+							const cleanupSnapshot = closingGuard?.snapshot() ?? null;
+							const result = {
+								compositionStartPrevented: compositionStart.defaultPrevented,
+								activeCompositionInputPrevented: activeCompositionInput.defaultPrevented,
+								successorDispatchThrew,
+								freshCompositionStartPrevented: freshCompositionStart.defaultPrevented,
+								unloadOutcome,
+								cmContent: cm.state.doc.toString(),
+								ytextA: ytextA.toString(),
+								ytextAMutationsAfterStructural:
+									ytextAMutations - ytextAMutationsAtStructural,
+								activeComposition: retainedGuard?.activeComposition ?? null,
+								targetSelectionFencePresent:
+									retainedGuard?.targetSelectionFence !== null,
+								gateClosed: retainedGuard?.gateClosed ?? null,
+								emergencySaveBlocked: emergencySaveBlockedAfterCompositionEnd,
+								emergencySaveBlockedBeforeSuccessor,
+								emergencySaveFencePresent:
+									emergencySaveFencePresentAfterCompositionEnd,
+								nativeUnloadCalls,
+								forcedSourceSaveCalls,
+								recoveryPersistRequests,
+								pendingHealthChecks: manager.pendingHealthChecks.size,
+								terminalExportContents: [...terminalExportContents],
+								cleanup: {
+									exactCloseCount,
+									managedRemoved: !manager.managedSessions.has(leaf.id),
+									cmInert: cleanupSnapshot?.inert ?? null,
+									sourceUnloadDrain: cleanupSnapshot?.sourceUnloadDrain ?? null,
+									targetSelectionFence: cleanupSnapshot?.targetSelectionFence ?? null,
+									wrappersRestored: view.onUnloadFile === originalOnUnloadFile
+										&& view.onLoadFile === originalOnLoadFile
+										&& view.setViewData === originalSetViewData
+										&& view.save === originalSave,
+								},
+							};
+							cm.destroy();
+							doc.destroy();
+							return result;
+						}
+						if (
+							probeStructuralCloseBeforeSuccessor
+							|| probeStructuralCloseExpiry
+							|| probeStructuralCloseExportFailure
+						) {
+							const activeInput = new InputEvent("beforeinput", {
+								bubbles: true,
+								cancelable: true,
+								inputType: "insertText",
+								data: "x",
+							});
+							cm.contentDOM.dispatchEvent(activeInput);
+							const reservedSuccessor = cm.state.update({
+								changes: { from: cm.state.selection.main.head, insert: "x" },
+								selection: { anchor: cm.state.selection.main.head + 1 },
+								annotations: Transaction.userEvent.of("input.type"),
+								filter: false,
+							});
+							let unloadOutcome = "pending";
+							const unload = view.onUnloadFile(fileA).then(
+								() => { unloadOutcome = "fulfilled"; },
+								() => { unloadOutcome = "rejected"; },
+							);
+							await Promise.resolve();
+							const ytextAMutationsAtStructural = ytextAMutations;
+							view.file = null;
+							manager.unbindByPath(pathA);
+							const closingGuard = manager.managedSessions.get(leaf.id)?.cmGuard ?? null;
+							const firstCloseCount = manager.reconcileManagedWorkspaceViews(
+								[],
+								"task9-structural-close-before-successor",
+							);
+							const retainedAcrossClose = manager.managedSessions.has(leaf.id);
+							const boundedCloseOwner =
+								manager.pendingStructuralSourceCloseSettlements.get(leaf.id) ?? null;
+							const withholdSuccessor =
+								probeStructuralCloseExpiry || probeStructuralCloseExportFailure;
+							let successorDispatchThrew = false;
+							if (!withholdSuccessor) {
+								try {
+									cm.dispatch(reservedSuccessor);
+								} catch {
+									successorDispatchThrew = true;
+								}
+							}
+							await Promise.resolve();
+							await Promise.resolve();
+							await new Promise((resolve) => setTimeout(resolve, 120));
+							const unloadOutcomeAfterFirstSettlement = unloadOutcome;
+							if (!probeStructuralCloseExportFailure) await unload;
+							const retainedAfterSettlement = manager.managedSessions.get(leaf.id) ?? null;
+							const pendingAfterSettlement =
+								manager.pendingStructuralSourceCloseSettlements.get(leaf.id) ?? null;
+							const cleanupSnapshot = closingGuard?.snapshot() ?? null;
+							const terminalExportContentsAfterFirstSettlement =
+								[...terminalExportContents];
+							const managedRemovedAfterFirstSettlement =
+								!manager.managedSessions.has(leaf.id);
+							const emergencySaveBlockedAfterFirstSettlement =
+								retainedAfterSettlement?.emergencySaveFence?.isCurrent() === true;
+							const wrappersRestoredAfterFirstSettlement =
+								view.onUnloadFile === originalOnUnloadFile
+								&& view.onLoadFile === originalOnLoadFile
+								&& view.setViewData === originalSetViewData
+								&& view.save === originalSave;
+							let retryCloseCount = null;
+							let retryManagedRemoved = null;
+							let retryCmInert = null;
+							let retrySourceUnloadDrain = null;
+							let retryTargetSelectionFence = null;
+							let retryWrappersRestored = null;
+							let staleOwnerRetryCount = null;
+							let concurrentRetryCount = null;
+							let freshInputPreventedAfterFirstSettlement = null;
+							if (probeStructuralCloseExportFailure) {
+								const freshInput = new InputEvent("beforeinput", {
+									bubbles: true,
+									cancelable: true,
+									inputType: "insertText",
+									data: "z",
+								});
+								cm.contentDOM.dispatchEvent(freshInput);
+								freshInputPreventedAfterFirstSettlement = freshInput.defaultPrevented;
+								const exactOwner = retainedAfterSettlement?.sourceUnloadDrain ?? null;
+								if (retainedAfterSettlement !== null && exactOwner !== null) {
+									retainedAfterSettlement.sourceUnloadDrain = { ...exactOwner };
+									staleOwnerRetryCount =
+										manager.retryPendingStructuralSourceCloseExport();
+									retainedAfterSettlement.sourceUnloadDrain = exactOwner;
+								}
+								retryCloseCount = manager.retryPendingStructuralSourceCloseExport();
+								concurrentRetryCount = manager.retryPendingStructuralSourceCloseExport();
+								await Promise.resolve();
+								await Promise.resolve();
+								await Promise.resolve();
+								await unload;
+								const retrySnapshot = closingGuard?.snapshot() ?? null;
+								retryManagedRemoved = !manager.managedSessions.has(leaf.id);
+								retryCmInert = retrySnapshot?.inert ?? null;
+								retrySourceUnloadDrain = retrySnapshot?.sourceUnloadDrain ?? null;
+								retryTargetSelectionFence = retrySnapshot?.targetSelectionFence ?? null;
+								retryWrappersRestored = view.onUnloadFile === originalOnUnloadFile
+									&& view.onLoadFile === originalOnLoadFile
+									&& view.setViewData === originalSetViewData
+									&& view.save === originalSave;
+							}
+							const result = {
+								activeInputPrevented: activeInput.defaultPrevented,
+								firstCloseCount,
+								retainedAcrossClose,
+								boundedRecoveryContent: boundedCloseOwner?.recoveryContent ?? null,
+								boundedRecoveryExact: boundedCloseOwner?.exactRecovery ?? null,
+								successorDispatched: !withholdSuccessor,
+								successorDispatchThrew,
+								unloadOutcomeAfterFirstSettlement,
+								unloadOutcome,
+								cmContent: cm.state.doc.toString(),
+								ytextA: ytextA.toString(),
+								ytextAMutationsAfterStructural:
+									ytextAMutations - ytextAMutationsAtStructural,
+								nativeUnloadCalls,
+								forcedSourceSaveCalls,
+								recoveryPersistRequests,
+								exporterChooseCalls,
+								terminalExportContentsAfterFirstSettlement,
+								terminalExportContents: [...terminalExportContents],
+								managerTrace: [...managerTrace],
+								emergencySaveBlocked:
+									emergencySaveBlockedAfterFirstSettlement,
+								pendingCloseRetained: pendingAfterSettlement === boundedCloseOwner,
+								exportRequiredTraceCount: managerTrace.filter(
+									(entry) => entry.message === "source-unload-drain-workspace-close-export-required",
+								).length,
+								managedRemoved: managedRemovedAfterFirstSettlement,
+								cmInert: cleanupSnapshot?.inert ?? null,
+								sourceUnloadDrain: cleanupSnapshot?.sourceUnloadDrain ?? null,
+								targetSelectionFence: cleanupSnapshot?.targetSelectionFence ?? null,
+								wrappersRestored: wrappersRestoredAfterFirstSettlement,
+								retryCloseCount,
+								retryManagedRemoved,
+								retryCmInert,
+								retrySourceUnloadDrain,
+								retryTargetSelectionFence,
+								retryWrappersRestored,
+								staleOwnerRetryCount,
+								concurrentRetryCount,
+								freshInputPreventedAfterFirstSettlement,
+							};
+							if (probeStructuralCloseExportFailure) {
+								manager.unbindAll();
+							}
+							cm.destroy();
+							doc.destroy();
+							return result;
+						}
+						if (probeStructuralMutationTerminal) {
+							const activeInput = new InputEvent("beforeinput", {
+								bubbles: true,
+								cancelable: true,
+								inputType: "insertText",
+								data: "x",
+							});
+							cm.contentDOM.dispatchEvent(activeInput);
+							const reservedSuccessor = cm.state.update({
+								changes: { from: cm.state.selection.main.head, insert: "x" },
+								selection: { anchor: cm.state.selection.main.head + 1 },
+								annotations: Transaction.userEvent.of("input.type"),
+								filter: false,
+							});
+							let unloadOutcome = "pending";
+							const unload = view.onUnloadFile(fileA).then(
+								() => { unloadOutcome = "fulfilled"; },
+								() => { unloadOutcome = "rejected"; },
+							);
+							await Promise.resolve();
+							const beforeStructural = manager.managedSessions.get(leaf.id);
+							const beforeGuard = beforeStructural?.cmGuard?.snapshot() ?? null;
+							const beforeManagerDrainState = beforeStructural?.sourceUnloadDrain?.state ?? null;
+							const ytextAMutationsAtStructural = ytextAMutations;
+							view.file = null;
+							manager.unbindByPath(pathA);
+							cm.dispatch(reservedSuccessor);
+							await Promise.resolve();
+							await Promise.resolve();
+							await Promise.resolve();
+							const retained = manager.managedSessions.get(leaf.id);
+							const retainedGuard = retained?.cmGuard?.snapshot() ?? null;
+							const retainedManagerDrainState = retained?.sourceUnloadDrain?.state ?? null;
+							const retainedEmergencySaveBlocked =
+								retained?.emergencySaveFence?.isCurrent() === true;
+							const freshInput = new InputEvent("beforeinput", {
+								bubbles: true,
+								cancelable: true,
+								inputType: "insertText",
+								data: "y",
+							});
+							cm.contentDOM.dispatchEvent(freshInput);
+							const closingGuard = retained?.cmGuard ?? null;
+							const exactCloseCount = manager.reconcileManagedWorkspaceViews(
+								[],
+								"task9-structural-terminal-exact-close",
+							);
+							await unload;
+							const cleanupSnapshot = closingGuard?.snapshot() ?? null;
+							const result = {
+								activeInputPrevented: activeInput.defaultPrevented,
+								beforeStructural: {
+									unloadOutcome: "pending",
+									managerDrainState: beforeManagerDrainState,
+									cmSourceDrain: beforeGuard?.sourceUnloadDrain !== null,
+									gateClosed: beforeGuard?.gateClosed ?? null,
+								},
+								afterStructural: {
+									unloadOutcome,
+									managerDrainState: retainedManagerDrainState,
+									cmSourceDrain: retainedGuard?.sourceUnloadDrain !== null,
+										targetSelectionFencePresent:
+											retainedGuard?.targetSelectionFence !== null,
+									gateClosed: retainedGuard?.gateClosed ?? null,
+									emergencySaveBlocked: retainedEmergencySaveBlocked,
+									freshInputPrevented: freshInput.defaultPrevented,
+									cmContent: cm.state.doc.toString(),
+										ytextA: ytextA.toString(),
+										ytextAMutationsAfterStructural:
+											ytextAMutations - ytextAMutationsAtStructural,
+									nativeUnloadCalls,
+									forcedSourceSaveCalls,
+										recoveryPersistRequests,
+										pendingHealthChecks: manager.pendingHealthChecks.size,
+										terminalExportContents: [...terminalExportContents],
+									},
+								cleanup: {
+									exactCloseCount,
+									managedRemoved: !manager.managedSessions.has(leaf.id),
+									cmInert: cleanupSnapshot?.inert ?? null,
+									sourceUnloadDrain: cleanupSnapshot?.sourceUnloadDrain ?? null,
+									targetSelectionFence: cleanupSnapshot?.targetSelectionFence ?? null,
+									wrappersRestored: view.onUnloadFile === originalOnUnloadFile
+										&& view.onLoadFile === originalOnLoadFile
+										&& view.setViewData === originalSetViewData
+										&& view.save === originalSave,
+								},
+							};
+							cm.destroy();
+							doc.destroy();
+							return result;
+						}
+						if (probeSourceDrainOrdering) {
 						const orderingSnapshot = (stage) => {
 							const runtime = manager.managedSessions.get(leaf.id);
 							const host = runtime?.hostGuard?.snapshot() ?? null;
@@ -6158,7 +8808,92 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 					const nextEventTurnTimer = probeTargetFirstBeforePresentationProof
 						? setTimeout(() => { nextEventTurnReached = true; }, 0)
 						: null;
+					if (probeExternalDuringHeldLoad) {
+						holdNextEditorHostLoadForQa(manager, pathB, "load-entry");
+					}
 					const loadPromises = [view.onLoadFile(fileB)];
+					if (probeExternalDuringHeldLoad) {
+						for (let index = 0; index < 10; index += 1) {
+							if (getEditorHandoffQaDebugSnapshot(manager).hostLoad?.state === "held") break;
+							await Promise.resolve();
+						}
+						const held = getEditorHandoffQaDebugSnapshot(manager);
+						const heldLeaf = held.leaves.find((candidate) => candidate.leafId === leaf.id) ?? null;
+						const externalContent = "external target B while native load is held";
+						const sequence = 9091;
+						loadContentB = externalContent;
+						manager.beginExternalDiskMutation(pathB, sequence);
+						manager.noteExternalDiskMutation({
+							path: pathB,
+							ctime: 90,
+							mtime: 91,
+							size: new TextEncoder().encode(externalContent).byteLength,
+							sequence,
+							observedAt: 92,
+							content: externalContent,
+						});
+							const cmBeforeExternalProjection = cm.state.doc.toString();
+							view.setData(externalContent, false);
+							const whileHeld = {
+								cmContent: cm.state.doc.toString(),
+								hostData: view.data,
+								setDataPreassignedContent: clearFalseSetDataPreassignedContent,
+								setViewDataCalls: clearFalseSetViewDataCalls,
+							ytextA: ytextA.toString(),
+								ytextB: ytextB.toString(),
+							};
+							releaseHeldEditorHostLoadForQa(manager);
+						await loadPromises[0];
+						for (let index = 0; index < 30 && manager.getBinding(view)?.path !== pathB; index += 1) {
+							await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+							await Promise.resolve();
+						}
+						const receipt = interceptedExternalReloads[0] ?? null;
+						const result = {
+							held: {
+								hostLoadState: held.hostLoad?.state ?? null,
+								viewPath: heldLeaf?.viewPath ?? null,
+								displayedPath: heldLeaf?.displayedPath ?? null,
+								bindingPath: heldLeaf?.bindingPath ?? null,
+								gateClosed: heldLeaf?.gateClosed ?? null,
+								},
+								cmBeforeExternalProjection,
+								whileHeld,
+							receipt: receipt === null ? null : {
+								path: receipt.path,
+								sequence: receipt.sequence,
+								content: receipt.content,
+							},
+								interceptedExternalReloadCount: interceptedExternalReloads.length,
+									externalCandidateReplanCount,
+									externalCandidateDrainSawProjectionHeld,
+									externalCandidateProjectionProofCaptured,
+									externalCandidateThrowingProofReturnedNull,
+									externalCandidateProofRecoveredAfterThrow,
+									externalCandidateProofCurrentAfterPresentationChurn,
+									exactBoundPeerInitiallyBound,
+									exactBoundPeerTicketViewCount,
+									exactBoundPeerBoundAtProof,
+								afterRelease: {
+									cmContent: cm.state.doc.toString(),
+									hostData: view.data,
+								ytextA: ytextA.toString(),
+								ytextB: ytextB.toString(),
+									bindingPath: manager.getBinding(view)?.path ?? null,
+									peerBindingPath: peerView === null
+										? null
+										: manager.getBinding(peerView)?.path ?? null,
+									peerCmContent: peerCm?.state.doc.toString() ?? null,
+									peerHostData: peerView === null ? null : peerHostData,
+								},
+							};
+							manager.unbindAll();
+							peerCm?.destroy();
+							peerParent?.remove();
+							cm.destroy();
+						doc.destroy();
+						return result;
+					}
 					if (probeDeferredTargetBytes) {
 						await Promise.resolve();
 						const runtimeBeforeTarget = manager.managedSessions.get(leaf.id);
@@ -6532,8 +9267,66 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 					doc.destroy();
 					return result;
 					};
-					return {
-						sourceDrainOrdering: await runScenario({
+						const runBoundedStructuralScenario = async (name, scenario) => {
+							let timer = null;
+							try {
+								return await Promise.race([
+									scenario,
+									new Promise((_resolve, reject) => {
+										timer = setTimeout(
+											() => reject(new Error("structural scenario timed out: " + name)),
+											5000,
+										);
+									}),
+								]);
+							} finally {
+								if (timer !== null) clearTimeout(timer);
+							}
+						};
+						return {
+							structuralImeTerminal: await runBoundedStructuralScenario(
+								"structural-ime-terminal",
+								runScenario({
+								suffix: "structural-ime-terminal",
+								contentA: "source ime",
+								contentB: "unused target",
+								probeStructuralImeTerminal: true,
+								}),
+							),
+							structuralCloseBeforeSuccessor: await runBoundedStructuralScenario(
+								"structural-close-before-successor",
+								runScenario({
+								suffix: "structural-close-before-successor",
+								contentA: "source close",
+								contentB: "unused target",
+								probeStructuralCloseBeforeSuccessor: true,
+								}),
+							),
+							structuralCloseExpiry: await runBoundedStructuralScenario(
+								"structural-close-expiry",
+								runScenario({
+								suffix: "structural-close-expiry",
+								contentA: "source close expiry",
+								contentB: "unused target",
+								probeStructuralCloseExpiry: true,
+								}),
+							),
+							structuralCloseExportFailure: await runBoundedStructuralScenario(
+								"structural-close-export-failure",
+								runScenario({
+								suffix: "structural-close-export-failure",
+								contentA: "source close export failure",
+								contentB: "unused target",
+								probeStructuralCloseExportFailure: true,
+								}),
+							),
+							structuralMutationTerminal: await runScenario({
+								suffix: "structural-mutation-terminal",
+								contentA: "source terminal",
+								contentB: "unused target",
+								probeStructuralMutationTerminal: true,
+							}),
+							sourceDrainOrdering: await runScenario({
 							suffix: "source-drain-ordering",
 							contentA: "source A",
 							contentB: "target B",
@@ -6561,6 +9354,19 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 							contentB: "pending local B",
 							probePendingHostFailure: true,
 						}),
+							externalDuringHeldLoad: await runScenario({
+								suffix: "external-during-held-load",
+								contentA: "source A remains visible while B load is held",
+								contentB: "target B before external write",
+								probeExternalDuringHeldLoad: true,
+							}),
+							exactBoundPeerDuringHeldLoad: await runScenario({
+								suffix: "exact-bound-peer-during-held-load",
+								contentA: "source A remains isolated from exact B peers",
+								contentB: "target B before exact peer settlement",
+								probeExternalDuringHeldLoad: true,
+								probeExactBoundPeer: true,
+							}),
 						deferredTargetBytes: await runScenario({
 							suffix: "deferred-target-bytes",
 							contentA: "deferred source A",
@@ -6595,6 +9401,7 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 			format: "iife",
 			platform: "browser",
 			target: "chrome120",
+			define: { "__KAOS_QA_HARNESS_ENABLED__": "true" },
 			write: false,
 			plugins: [{
 				name: "task6-obsidian-mock",
@@ -6628,7 +9435,7 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 	const child = spawnSync(
 		process.execPath,
 		["--input-type=module", "--eval", childScript],
-		{ cwd: repoRoot, encoding: "utf8", timeout: 30_000 },
+		{ cwd: repoRoot, encoding: "utf8", timeout: 60_000 },
 	);
 	if (child.status !== 0) {
 		console.error(child.stderr || child.error?.message || "browser subprocess failed without stderr");
@@ -6638,6 +9445,19 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 		const resultLine = child.stdout.split("\n").find((line) => line.startsWith("TASK6_RESULT="));
 		const result = JSON.parse(resultLine?.slice("TASK6_RESULT=".length) ?? "null") as {
 			initiallyBound: boolean;
+			externalReceipt: {
+				path: string;
+				sequence: number;
+				observedAt: number;
+				contentHash: string;
+			} | null;
+			externalReceiptAfterNewerBegin: {
+				path: string;
+				sequence: number;
+				observedAt: number;
+				contentHash: string;
+			} | null;
+			interceptedExternalReloadCount: number;
 			cmContent: string;
 			yContent: string;
 			bindingDetached: boolean;
@@ -6654,6 +9474,24 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 			sourceUnloadPrefixSaveBlocked: boolean;
 		};
 		assertEq(result.initiallyBound, true, "real guard fixture starts with A bound");
+		assertEq(
+			result.interceptedExternalReloadCount,
+			1,
+			"QA receipt is latched only after one normal external interception callback",
+		);
+		assertEq(result.externalReceipt?.path, "Notes/browser-A.md", "QA receipt preserves the exact path");
+		assertEq(result.externalReceipt?.sequence, 4242, "QA receipt preserves the exact sequence");
+		assertEq(result.externalReceipt?.observedAt, 4343, "QA receipt preserves the exact observation time");
+		assertEq(
+			result.externalReceipt?.contentHash,
+			sha256HandoffRecoveryHexSync("external receipt raw\r\n"),
+			"QA receipt hashes the exact raw external bytes",
+		);
+		assertEq(
+			result.externalReceiptAfterNewerBegin?.contentHash,
+			result.externalReceipt?.contentHash,
+			"a newer external-event begin does not clear the last completed receipt",
+		);
 		assertEq(result.cmContent, "source", "stale user dispatch never reaches CodeMirror");
 		assertEq(result.yContent, "source", "stale user dispatch never reaches Y.Text");
 		assertEq(result.bindingDetached, true, "stale user dispatch detaches the exact settled A binding");
@@ -6810,7 +9648,46 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 			};
 			transitionCmDocuments: string[];
 		};
-		type SourceDrainOrderingResult = {
+		type ExternalDuringHeldLoadResult = {
+			held: {
+				hostLoadState: string | null;
+				viewPath: string | null;
+				displayedPath: string | null;
+				bindingPath: string | null;
+				gateClosed: boolean | null;
+			};
+			cmBeforeExternalProjection: string;
+			whileHeld: {
+				cmContent: string;
+				hostData: string;
+				setDataPreassignedContent: string | null;
+				setViewDataCalls: number;
+				ytextA: string;
+				ytextB: string;
+			};
+			receipt: { path: string; sequence: number; content: string } | null;
+			interceptedExternalReloadCount: number;
+			externalCandidateReplanCount: number;
+			externalCandidateDrainSawProjectionHeld: boolean | null;
+			externalCandidateProjectionProofCaptured: boolean;
+			externalCandidateThrowingProofReturnedNull: boolean;
+			externalCandidateProofRecoveredAfterThrow: boolean;
+			externalCandidateProofCurrentAfterPresentationChurn: boolean;
+			exactBoundPeerInitiallyBound: boolean;
+			exactBoundPeerTicketViewCount: number;
+			exactBoundPeerBoundAtProof: boolean;
+			afterRelease: {
+				cmContent: string;
+				hostData: string;
+				ytextA: string;
+				ytextB: string;
+				bindingPath: string | null;
+				peerBindingPath: string | null;
+				peerCmContent: string | null;
+				peerHostData: string | null;
+			};
+		};
+			type SourceDrainOrderingResult = {
 			activeInputPrevented: boolean;
 			beforeCompletion: {
 				unloadOutcome: string;
@@ -6853,21 +9730,260 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 				sourceUnloadDrain: unknown;
 				wrappersRestored: boolean;
 			};
-		};
-		const task9Scenarios = JSON.parse(
+			};
+			type StructuralMutationTerminalResult = {
+				activeInputPrevented: boolean;
+				beforeStructural: {
+					unloadOutcome: string;
+					managerDrainState: string | null;
+					cmSourceDrain: boolean;
+					gateClosed: boolean | null;
+				};
+				afterStructural: {
+					unloadOutcome: string;
+					managerDrainState: string | null;
+					cmSourceDrain: boolean;
+					targetSelectionFencePresent: boolean;
+					gateClosed: boolean | null;
+					emergencySaveBlocked: boolean;
+					freshInputPrevented: boolean;
+					cmContent: string;
+					ytextA: string;
+					ytextAMutationsAfterStructural: number;
+					nativeUnloadCalls: number;
+					forcedSourceSaveCalls: number;
+					recoveryPersistRequests: number;
+					pendingHealthChecks: number;
+					terminalExportContents: string[];
+				};
+				cleanup: {
+					exactCloseCount: number;
+					managedRemoved: boolean;
+					cmInert: boolean | null;
+					sourceUnloadDrain: unknown;
+					targetSelectionFence: unknown;
+					wrappersRestored: boolean;
+				};
+			};
+			type StructuralImeTerminalResult = {
+				compositionStartPrevented: boolean;
+				activeCompositionInputPrevented: boolean;
+				successorDispatchThrew: boolean;
+				freshCompositionStartPrevented: boolean;
+				unloadOutcome: string;
+				cmContent: string;
+				ytextA: string;
+				ytextAMutationsAfterStructural: number;
+				activeComposition: unknown;
+				targetSelectionFencePresent: boolean;
+				gateClosed: boolean | null;
+				emergencySaveBlocked: boolean;
+				emergencySaveBlockedBeforeSuccessor: boolean;
+				emergencySaveFencePresent: boolean;
+				nativeUnloadCalls: number;
+				forcedSourceSaveCalls: number;
+				recoveryPersistRequests: number;
+				pendingHealthChecks: number;
+				terminalExportContents: string[];
+				cleanup: {
+					exactCloseCount: number;
+					managedRemoved: boolean;
+					cmInert: boolean | null;
+					sourceUnloadDrain: unknown;
+					targetSelectionFence: unknown;
+					wrappersRestored: boolean;
+				};
+			};
+			type StructuralCloseBeforeSuccessorResult = {
+				activeInputPrevented: boolean;
+				firstCloseCount: number;
+				retainedAcrossClose: boolean;
+				boundedRecoveryContent: string | null;
+				boundedRecoveryExact: boolean | null;
+				successorDispatched: boolean;
+				successorDispatchThrew: boolean;
+				unloadOutcomeAfterFirstSettlement: string;
+				unloadOutcome: string;
+				cmContent: string;
+				ytextA: string;
+				ytextAMutationsAfterStructural: number;
+				nativeUnloadCalls: number;
+				forcedSourceSaveCalls: number;
+				recoveryPersistRequests: number;
+				exporterChooseCalls: number;
+				terminalExportContentsAfterFirstSettlement: string[];
+				terminalExportContents: string[];
+				managerTrace: Array<{ message: string; details: unknown }>;
+				emergencySaveBlocked: boolean;
+				pendingCloseRetained: boolean;
+				exportRequiredTraceCount: number;
+				managedRemoved: boolean;
+				cmInert: boolean | null;
+				sourceUnloadDrain: unknown;
+				targetSelectionFence: unknown;
+				wrappersRestored: boolean;
+				retryCloseCount: number | null;
+				retryManagedRemoved: boolean | null;
+				retryCmInert: boolean | null;
+				retrySourceUnloadDrain: unknown;
+				retryTargetSelectionFence: unknown;
+				retryWrappersRestored: boolean | null;
+				staleOwnerRetryCount: number | null;
+				concurrentRetryCount: number | null;
+				freshInputPreventedAfterFirstSettlement: boolean | null;
+			};
+			const task9Scenarios = JSON.parse(
 			task9Line?.slice("TASK9_RESULT=".length) ?? "null",
-		) as {
-			sourceDrainOrdering: SourceDrainOrderingResult;
+			) as {
+				structuralImeTerminal: StructuralImeTerminalResult;
+				structuralCloseBeforeSuccessor: StructuralCloseBeforeSuccessorResult;
+				structuralCloseExpiry: StructuralCloseBeforeSuccessorResult;
+				structuralCloseExportFailure: StructuralCloseBeforeSuccessorResult;
+				structuralMutationTerminal: StructuralMutationTerminalResult;
+				sourceDrainOrdering: SourceDrainOrderingResult;
 			different: Task9ScenarioResult;
 			identical: Task9ScenarioResult;
 			targetFirstBeforePresentationProof: TargetFirstBeforePresentationProofResult;
 			pendingHostFailure: PendingHostFailureResult;
+			externalDuringHeldLoad: ExternalDuringHeldLoadResult;
+			exactBoundPeerDuringHeldLoad: ExternalDuringHeldLoadResult;
 			deferredTargetBytes: DeferredTargetBytesResult;
 				missingTarget: MissingTargetResult;
 				superseded: SupersededScenarioResult;
-		};
+			};
 
-		const sourceDrain = task9Scenarios.sourceDrainOrdering;
+			const structuralIme = task9Scenarios.structuralImeTerminal;
+			assertEq(structuralIme.compositionStartPrevented, false, "real structural IME fixture starts one source composition");
+			assertEq(structuralIme.activeCompositionInputPrevented, false, "the exact active IME continuation crosses the source drain");
+			assertEq(structuralIme.successorDispatchThrew, false, "the exact compose successor remains dispatchable after yCollab isolation");
+			assertEq(structuralIme.freshCompositionStartPrevented, true, "fresh composition remains blocked after structural settlement");
+			assertEq(structuralIme.unloadOutcome, "rejected", "structural IME rejects native unload instead of entering it");
+			assertEq(structuralIme.cmContent, "source ime한", "structural IME applies the exact reserved compose transaction once");
+			assertEq(structuralIme.ytextA, "source ime", "structural IME never late-writes the old Y.Text");
+			assertEq(structuralIme.ytextAMutationsAfterStructural, 0, "structural IME produces zero post-event old-Y.Text mutations");
+			assertEq(structuralIme.activeComposition, null, "compositionend consumes the exact structural IME sequence");
+			assertEq(structuralIme.targetSelectionFencePresent, true, "structural IME ends on one target-less terminal token");
+			assertEq(structuralIme.gateClosed, true, "structural IME closes fresh CodeMirror input");
+			assertEq(structuralIme.emergencySaveBlockedBeforeSuccessor, true, "structural IME blocks native saves before its compose successor");
+			assertEq(structuralIme.emergencySaveFencePresent, true, "structural IME retains one emergency save owner after compositionend");
+			assertEq(structuralIme.emergencySaveBlocked, true, "structural IME retains native-save suppression");
+			assertEq(structuralIme.nativeUnloadCalls, 0, "structural IME never enters native unload");
+			assertEq(structuralIme.forcedSourceSaveCalls, 0, "structural IME never force-saves deleted source bytes");
+			assertEq(structuralIme.recoveryPersistRequests, 0, "structural IME creates no replay persistence");
+			assertEq(structuralIme.pendingHealthChecks, 0, "structural IME schedules no binding-health loop");
+			assertEq(structuralIme.terminalExportContents.join("|"), "source ime한", "structural IME exports the final exact compose bytes once");
+			assertEq(structuralIme.cleanup.exactCloseCount, 1, "exact close reclaims the structural IME owner");
+			assertEq(structuralIme.cleanup.managedRemoved, true, "exact close removes structural IME manager ownership");
+			assertEq(structuralIme.cleanup.cmInert, true, "exact close inerts the structural IME guard");
+			assertEq(structuralIme.cleanup.sourceUnloadDrain, null, "exact close clears the structural IME drain");
+			assertEq(structuralIme.cleanup.targetSelectionFence, null, "exact close clears the structural IME token");
+			assertEq(structuralIme.cleanup.wrappersRestored, true, "exact close restores structural IME host wrappers");
+
+			const closeBeforeSuccessor = task9Scenarios.structuralCloseBeforeSuccessor;
+			assertEq(closeBeforeSuccessor.activeInputPrevented, false, "close-before-successor owns one exact started input");
+			assertEq(closeBeforeSuccessor.firstCloseCount, 0, "workspace close enters bounded settlement instead of tombstoning the reservation");
+			assertEq(closeBeforeSuccessor.retainedAcrossClose, true, "bounded close retains the exact guard until its successor dispatch");
+			assertEq(closeBeforeSuccessor.boundedRecoveryContent, "source closex", "bounded close captures the exact native recovery bytes before waiting");
+			assertEq(closeBeforeSuccessor.boundedRecoveryExact, true, "bounded close marks only proven recovery bytes exact");
+			assertEq(closeBeforeSuccessor.successorDispatchThrew, false, "bounded close keeps the exact prebuilt successor dispatchable");
+			assertEq(closeBeforeSuccessor.unloadOutcome, "rejected", "bounded close never enters native unload");
+			assertEq(closeBeforeSuccessor.cmContent, "source closex", "successor after workspace close applies once to quarantined CM");
+			assertEq(closeBeforeSuccessor.ytextA, "source close", "close-before-successor never late-writes old Y.Text");
+			assertEq(closeBeforeSuccessor.ytextAMutationsAfterStructural, 0, "close-before-successor produces zero old-Y.Text mutations");
+			assertEq(closeBeforeSuccessor.nativeUnloadCalls, 0, "bounded close never enters native unload");
+			assertEq(closeBeforeSuccessor.forcedSourceSaveCalls, 0, "bounded close never force-saves old source bytes");
+			assertEq(closeBeforeSuccessor.recoveryPersistRequests, 0, "bounded close creates no replay persistence");
+			assertEq(closeBeforeSuccessor.terminalExportContents.join("|"), "source closex", "bounded close verifies the final successor bytes before teardown");
+			assertEq(closeBeforeSuccessor.managedRemoved, true, "bounded close automatically removes A ownership");
+			assertEq(closeBeforeSuccessor.cmInert, true, "bounded close ends with an inert guard");
+			assertEq(closeBeforeSuccessor.sourceUnloadDrain, null, "bounded close clears the source drain");
+			assertEq(closeBeforeSuccessor.targetSelectionFence, null, "bounded close clears the terminal token");
+			assertEq(closeBeforeSuccessor.wrappersRestored, true, "bounded close restores host wrappers without a second wake");
+
+			const closeExpiry = task9Scenarios.structuralCloseExpiry;
+			assertEq(closeExpiry.activeInputPrevented, false, "expiry fixture owns one exact started input");
+			assertEq(closeExpiry.firstCloseCount, 0, "expiry fixture enters the same bounded close owner");
+			assertEq(closeExpiry.retainedAcrossClose, true, "expiry fixture is retained only during the bounded settlement window");
+			assertEq(closeExpiry.boundedRecoveryContent, "source close expiryx", "expiry owns exact export bytes before its timer starts");
+			assertEq(closeExpiry.boundedRecoveryExact, true, "expiry never labels fallback diagnostic text as exact input");
+			assertEq(closeExpiry.successorDispatched, false, "expiry fixture intentionally withholds the CodeMirror successor");
+			assertEq(closeExpiry.unloadOutcome, "rejected", "expiry fixture never enters native unload");
+			assertEq(closeExpiry.cmContent, "source close expiry", "expiry never synthesizes or replays input into CodeMirror");
+			assertEq(closeExpiry.ytextA, "source close expiry", "expiry never mutates old Y.Text");
+			assertEq(closeExpiry.ytextAMutationsAfterStructural, 0, "expiry produces zero old-Y.Text mutations");
+			assertEq(closeExpiry.terminalExportContents.join("|"), "source close expiryx", "expiry exports the exact native recovery bytes without replay");
+			assertEq(closeExpiry.managedRemoved, true, "expiry automatically removes A after verified export");
+			assertEq(closeExpiry.cmInert, true, "expiry ends with an inert guard");
+			assertEq(closeExpiry.sourceUnloadDrain, null, "expiry clears the source drain");
+			assertEq(closeExpiry.targetSelectionFence, null, "expiry leaves no target token");
+			assertEq(closeExpiry.wrappersRestored, true, "expiry restores host wrappers automatically");
+
+			const closeExportFailure = task9Scenarios.structuralCloseExportFailure;
+			assertEq(closeExportFailure.activeInputPrevented, false, "failed-export fixture owns one exact started input");
+			assertEq(closeExportFailure.firstCloseCount, 0, "failed-export close enters bounded settlement");
+			assertEq(closeExportFailure.retainedAcrossClose, true, "failed-export close retains its exact source owner");
+			assertEq(closeExportFailure.boundedRecoveryContent, "source close export failurex", "failed-export close retains exact recovery bytes");
+			assertEq(closeExportFailure.boundedRecoveryExact, true, "failed-export close proves its retained recovery bytes");
+			assertEq(closeExportFailure.successorDispatched, false, "failed-export fixture does not replay the reserved successor");
+			assertEq(closeExportFailure.unloadOutcomeAfterFirstSettlement, "pending", "cancelled export retains the exact pending native close owner");
+			assertEq(closeExportFailure.unloadOutcome, "rejected", "failed-export fixture never enters native unload");
+			assertEq(closeExportFailure.cmContent, "source close export failure", "failed export never synthesizes input into CodeMirror");
+			assertEq(closeExportFailure.ytextA, "source close export failure", "failed export never mutates old Y.Text");
+			assertEq(closeExportFailure.ytextAMutationsAfterStructural, 0, "failed export produces zero old-Y.Text mutations");
+			assertEq(closeExportFailure.terminalExportContentsAfterFirstSettlement.length, 0, "failed export cannot be reported as a verified artifact");
+			assertEq(closeExportFailure.managedRemoved, false, "failed export retains manager ownership");
+			assertEq(closeExportFailure.cmInert, false, "failed export retains the live reject-only guard");
+			assertEq(closeExportFailure.sourceUnloadDrain !== null, true, "failed export retains the terminal source drain");
+			assertEq(closeExportFailure.freshInputPreventedAfterFirstSettlement, true, "failed export keeps fresh native input reject-only");
+			assertEq(closeExportFailure.targetSelectionFence, null, "failed export does not fabricate a target-selection token");
+			assertEq(closeExportFailure.emergencySaveBlocked, true, "failed export retains native-save suppression");
+			assertEq(closeExportFailure.pendingCloseRetained, true, "failed export retains the exact user-action close owner");
+			assertEq(closeExportFailure.exportRequiredTraceCount, 1, "failed export records one required user action without claiming success");
+			assertEq(closeExportFailure.wrappersRestored, false, "failed export does not reopen host wrappers");
+			assertEq(closeExportFailure.staleOwnerRetryCount, 0, "public retry never touches a stale pending owner after identity replacement");
+			assertEq(closeExportFailure.retryCloseCount, 1, "explicit public retry starts one exact pending export");
+			assertEq(closeExportFailure.concurrentRetryCount, 0, "concurrent public retry cannot duplicate an active exporter prompt");
+			assertEq(closeExportFailure.exporterChooseCalls, 2, "one explicit retry command makes exactly one fresh export attempt");
+			assertEq(closeExportFailure.terminalExportContents.join("|"), "source close export failurex", "retry exports the exact retained recovery bytes");
+			assertEq(closeExportFailure.retryManagedRemoved, true, "successful retry automatically removes A ownership");
+			assertEq(closeExportFailure.retryCmInert, true, "successful retry inerts the retained guard");
+			assertEq(closeExportFailure.retrySourceUnloadDrain, null, "successful retry clears the terminal source drain");
+			assertEq(closeExportFailure.retryTargetSelectionFence, null, "successful retry clears the terminal token");
+			assertEq(closeExportFailure.retryWrappersRestored, true, "successful retry restores host wrappers");
+
+			const structuralTerminal = task9Scenarios.structuralMutationTerminal;
+			assertEq(structuralTerminal.activeInputPrevented, false, "real structural fixture owns one already-started input");
+			assertEq(structuralTerminal.beforeStructural.unloadOutcome, "pending", "real native unload waits on the genuine reservation");
+			assertEq(structuralTerminal.beforeStructural.managerDrainState, "draining", "real manager starts with a draining source owner");
+			assertEq(structuralTerminal.beforeStructural.cmSourceDrain, true, "real CodeMirror guard owns the exact reservation");
+			assertEq(structuralTerminal.beforeStructural.gateClosed, false, "real source drain owns the exact lane before terminal gate publication");
+			assertEq(structuralTerminal.afterStructural.unloadOutcome, "rejected", "structural deletion rejects native unload instead of entering it");
+			assertEq(structuralTerminal.afterStructural.managerDrainState, "terminal", "structural deletion retains a terminal manager owner");
+			assertEq(structuralTerminal.afterStructural.cmSourceDrain, false, "the exact reserved successor retires the CodeMirror source drain");
+			assertEq(structuralTerminal.afterStructural.targetSelectionFencePresent, true, "terminal ownership closes on one target-less token after reserved input");
+			assertEq(structuralTerminal.afterStructural.gateClosed, true, "real structural terminal keeps fresh input closed");
+			assertEq(structuralTerminal.afterStructural.emergencySaveBlocked, true, "real structural terminal blocks native saves");
+			assertEq(structuralTerminal.afterStructural.freshInputPrevented, true, "real structural terminal rejects new input");
+			assertEq(structuralTerminal.afterStructural.cmContent, "source terminalx", "structural terminal applies the exact already-reserved source input once");
+			assertEq(structuralTerminal.afterStructural.ytextA, "source terminal", "structural completion never late-writes the deleted source Y.Text");
+			assertEq(structuralTerminal.afterStructural.ytextAMutationsAfterStructural, 0, "old Y.Text receives zero mutations after the structural event");
+			assertEq(structuralTerminal.afterStructural.nativeUnloadCalls, 0, "structural terminal never enters native unload");
+			assertEq(structuralTerminal.afterStructural.forcedSourceSaveCalls, 0, "structural terminal never clears or force-saves source bytes");
+			assertEq(structuralTerminal.afterStructural.recoveryPersistRequests, 0, "structural terminal creates no hidden replay persistence");
+			assertEq(structuralTerminal.afterStructural.pendingHealthChecks, 0, "structural terminal schedules no binding-health retry loop");
+			assertEq(
+				structuralTerminal.afterStructural.terminalExportContents.join("|"),
+				"source terminalx",
+				"verified terminal export is offered once with the final reserved successor bytes",
+			);
+			assertEq(structuralTerminal.cleanup.exactCloseCount, 1, "real exact close reclaims the structural terminal once");
+			assertEq(structuralTerminal.cleanup.managedRemoved, true, "real exact close removes terminal manager ownership");
+			assertEq(structuralTerminal.cleanup.cmInert, true, "real exact close inerts the structural CM guard");
+			assertEq(structuralTerminal.cleanup.sourceUnloadDrain, null, "real exact close clears the genuine source drain");
+			assertEq(structuralTerminal.cleanup.targetSelectionFence, null, "real exact close leaves no target token");
+			assertEq(structuralTerminal.cleanup.wrappersRestored, true, "real exact close restores all host wrappers");
+
+			const sourceDrain = task9Scenarios.sourceDrainOrdering;
 		assertEq(sourceDrain.activeInputPrevented, false, "the already-started A input remains the one drainable lane");
 		assertEq(sourceDrain.beforeCompletion.unloadOutcome, "pending", "native unload waits while exact A input is unresolved");
 		assertEq(sourceDrain.beforeCompletion.nativeUnloadCalls, 0, "native unload has not entered before A completion");
@@ -7110,6 +10226,154 @@ console.log("\n--- Test 32: real EditorView rejects a stale user dispatch at the
 			pendingHostFailure.recoveryPersistRequests,
 			0,
 			"pending or rejected host load creates no replay recovery intent",
+		);
+
+		const externalDuringHeldLoad = task9Scenarios.externalDuringHeldLoad;
+		assertEq(
+			[
+				externalDuringHeldLoad.held.hostLoadState,
+				externalDuringHeldLoad.held.viewPath,
+				externalDuringHeldLoad.held.displayedPath,
+				externalDuringHeldLoad.held.bindingPath,
+				externalDuringHeldLoad.held.gateClosed,
+			].join("|"),
+			[
+				"held",
+				"Notes/task9-browser-external-during-held-load-B.md",
+				"Notes/task9-browser-external-during-held-load-A.md",
+				"",
+				"true",
+			].join("|"),
+			"external-write fixture holds B load behind an unbound, gated A presentation",
+		);
+		assertEq(
+			externalDuringHeldLoad.cmBeforeExternalProjection,
+			"source A remains visible while B load is held",
+			"held-load fixture begins with exact source A bytes in CodeMirror",
+		);
+		assertEq(
+			[
+				externalDuringHeldLoad.whileHeld.setDataPreassignedContent,
+				externalDuringHeldLoad.whileHeld.setViewDataCalls,
+			].join("|"),
+			"external target B while native load is held|1",
+			"Obsidian-like setData preassigns B and reaches the original clear=false setViewData once",
+		);
+		assertEq(
+			externalDuringHeldLoad.whileHeld.cmContent,
+			externalDuringHeldLoad.cmBeforeExternalProjection,
+			"a clear=false external B projection cannot mutate still-displayed source A CodeMirror",
+		);
+		assertEq(
+			externalDuringHeldLoad.whileHeld.hostData,
+			externalDuringHeldLoad.cmBeforeExternalProjection,
+			"the rejected external B projection CAS-restores the exact displayed source cache",
+		);
+		assertEq(
+			[
+				externalDuringHeldLoad.whileHeld.ytextA,
+				externalDuringHeldLoad.whileHeld.ytextB,
+			].join("|"),
+			[
+				"source A remains visible while B load is held",
+				"target B before external write",
+			].join("|"),
+			"the held external receipt remains separate from both source and target CRDT authority",
+		);
+		assertEq(
+			[
+				externalDuringHeldLoad.interceptedExternalReloadCount,
+				externalDuringHeldLoad.receipt?.path,
+				externalDuringHeldLoad.receipt?.sequence,
+				externalDuringHeldLoad.receipt?.content,
+			].join("|"),
+			[
+				"1",
+				"Notes/task9-browser-external-during-held-load-B.md",
+				"9091",
+				"external target B while native load is held",
+			].join("|"),
+			"the held-load CM fence does not consume or lose the exact external B disk receipt",
+		);
+		assertEq(
+			[
+				externalDuringHeldLoad.externalCandidateReplanCount >= 1,
+				externalDuringHeldLoad.externalCandidateDrainSawProjectionHeld,
+				externalDuringHeldLoad.externalCandidateProjectionProofCaptured,
+			].join("|"),
+			"true|true|true",
+			"external-candidate drain crosses only the exact manager-owned required-retry proof",
+		);
+		assertEq(
+			[
+				externalDuringHeldLoad.externalCandidateThrowingProofReturnedNull,
+				externalDuringHeldLoad.externalCandidateProofRecoveredAfterThrow,
+				externalDuringHeldLoad.externalCandidateProofCurrentAfterPresentationChurn,
+			].join("|"),
+			"true|true|true",
+			"throwing proof validation rolls back ownership and presentation-only churn stays current",
+		);
+		assertEq(
+			[
+				externalDuringHeldLoad.afterRelease.cmContent,
+				externalDuringHeldLoad.afterRelease.hostData,
+				externalDuringHeldLoad.afterRelease.ytextA,
+				externalDuringHeldLoad.afterRelease.ytextB,
+				externalDuringHeldLoad.afterRelease.bindingPath,
+			].join("|"),
+			[
+				"external target B while native load is held",
+				"external target B while native load is held",
+				"source A remains visible while B load is held",
+				"external target B while native load is held",
+				"Notes/task9-browser-external-during-held-load-B.md",
+			].join("|"),
+			"releasing the native load adopts exact external B once without modifying source A",
+		);
+
+		const exactBoundPeer = task9Scenarios.exactBoundPeerDuringHeldLoad;
+		assertEq(
+			[
+				exactBoundPeer.exactBoundPeerInitiallyBound,
+				exactBoundPeer.exactBoundPeerTicketViewCount,
+				exactBoundPeer.exactBoundPeerBoundAtProof,
+				exactBoundPeer.externalCandidateReplanCount,
+				exactBoundPeer.externalCandidateProjectionProofCaptured,
+			].join("|"),
+			"true|2|true|1|true",
+			"one required unbound pane can prove alongside one exact healthy bound peer",
+		);
+		assertEq(
+			[
+				exactBoundPeer.externalCandidateThrowingProofReturnedNull,
+				exactBoundPeer.externalCandidateProofRecoveredAfterThrow,
+				exactBoundPeer.externalCandidateProofCurrentAfterPresentationChurn,
+			].join("|"),
+			"true|true|true",
+			"two-pane proof ownership recovers from a thrown validation and ignores only cursor/scroll churn",
+		);
+		assertEq(
+			[
+				exactBoundPeer.afterRelease.cmContent,
+				exactBoundPeer.afterRelease.hostData,
+				exactBoundPeer.afterRelease.peerCmContent,
+				exactBoundPeer.afterRelease.peerHostData,
+				exactBoundPeer.afterRelease.ytextA,
+				exactBoundPeer.afterRelease.ytextB,
+				exactBoundPeer.afterRelease.bindingPath,
+				exactBoundPeer.afterRelease.peerBindingPath,
+			].join("|"),
+			[
+				"external target B while native load is held",
+				"external target B while native load is held",
+				"external target B while native load is held",
+				"external target B while native load is held",
+				"source A remains isolated from exact B peers",
+				"external target B while native load is held",
+				"",
+				"Notes/task9-browser-exact-bound-peer-during-held-load-B.md",
+			].join("|"),
+			"two-pane proof preserves source A, keeps the required owner unbound, and leaves the exact peer bound",
 		);
 
 		const deferredTarget = task9Scenarios.deferredTargetBytes;
@@ -7908,6 +11172,331 @@ console.log("\n--- Test 39: exact TFile rename translates managed lineage withou
 		runtime.pendingYTextPatches.get(binding.ytext)?.path,
 		renamedPath,
 		"provider provenance follows the exact renamed path",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 39a: rename invalidates an unbound handoff that still owns the old path ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const internals = manager as unknown as {
+		bindings: Map<string, unknown>;
+		managedSessions: Map<string, { session: ManagedLeafSession }>;
+	};
+	const [leafId, runtime] = Array.from(internals.managedSessions.entries())[0] ?? [];
+	assertEq(runtime !== undefined, true, "managed runtime exists for rename invalidation");
+	if (runtime && leafId) {
+		const targetPath = "Notes/unbound-rename-target.md";
+		const renamedTargetPath = "Notes/unbound-renamed-target.md";
+		const targetFile = { path: targetPath } as TFile;
+		const sourceText = binding.ytext.toString();
+		runtime.session = {
+			...runtime.session,
+			binding: { kind: "unbound" },
+			handoff: {
+				sourceAuthorityPath: binding.path,
+				sourceUnloadReceiptId: null,
+				targetPath,
+				targetFile,
+				bindingEpochAfterDetach: 1,
+				presentation: "source",
+				inputGateInstalled: true,
+				saveGuardInstalled: true,
+				pendingHostLoadCandidate: null,
+			},
+		};
+		internals.bindings.delete(leafId);
+		(targetFile as { path: string }).path = renamedTargetPath;
+
+		manager.updatePathsAfterRename(new Map([[targetPath, renamedTargetPath]]));
+
+		assertEq(
+			manager.getManagedSession(binding.view as never),
+			null,
+			"unbound handoff is revoked instead of retaining a stale target path",
+		);
+		assertEq(binding.ytext.toString(), sourceText, "rename invalidation never replays target bytes into source Y.Text");
+	}
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 39b: delete revokes source authority even after handoff detach ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const internals = manager as unknown as {
+		bindings: Map<string, unknown>;
+		managedSessions: Map<string, { session: ManagedLeafSession }>;
+	};
+	const [leafId, runtime] = Array.from(internals.managedSessions.entries())[0] ?? [];
+	assertEq(runtime !== undefined, true, "managed runtime exists for delete invalidation");
+	if (runtime && leafId) {
+		const targetPath = "Notes/unbound-delete-target.md";
+		const sourceText = binding.ytext.toString();
+		runtime.session = {
+			...runtime.session,
+			binding: { kind: "unbound" },
+			handoff: {
+				sourceAuthorityPath: binding.path,
+				sourceUnloadReceiptId: null,
+				targetPath,
+				targetFile: { path: targetPath } as never,
+				bindingEpochAfterDetach: 1,
+				presentation: "source",
+				inputGateInstalled: true,
+				saveGuardInstalled: true,
+				pendingHostLoadCandidate: null,
+			},
+		};
+		internals.bindings.delete(leafId);
+
+		manager.unbindByPath(binding.path);
+
+		assertEq(
+			manager.getManagedSession(binding.view as never),
+			null,
+			"deleted detached source cannot remain as managed authority",
+		);
+		assertEq(binding.ytext.toString(), sourceText, "delete invalidation never replays or rewrites source Y.Text");
+	}
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 39c: delete terminalizes an active source drain until exact workspace close ---");
+{
+	let exportOffers = 0;
+	let exportedContent: string | null = null;
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		handoffRecoveryActionHost: {
+			chooseVerifiedExporter: async () => {
+				exportOffers += 1;
+				return async (content: string) => { exportedContent = content; };
+			},
+		},
+	});
+	const { runtime, owner } = beginStructuralMutationSourceDrain(manager, binding, 3901);
+	const expectedVisibleContent = binding.cm.state.doc.toString();
+
+	manager.unbindByPath(binding.path);
+
+	assertEq(runtime.sourceUnloadDrain, owner, "delete retains the exact source-drain owner");
+	assertEq(owner.state, "terminal", "delete terminalizes unresolved source input");
+	assertEq(runtime.emergencySaveFence?.isCurrent(), true, "delete retains native-save suppression");
+	assertEq(runtime.cmGuard?.snapshot().gateClosed, true, "delete retains the CodeMirror reopen fence");
+	assertEq(
+		runtime.cmGuard?.snapshot().targetSelectionFence,
+		owner.targetSelectionToken,
+		"delete keeps the manager and CodeMirror on one terminal token",
+	);
+	assertEq(manager.getManagedSession(binding.view as never) !== null, true, "delete cannot unmanage unresolved input");
+	manager.bind(binding.view as never, "TestDevice");
+	manager.auditBindings("test-39c-delete-reentry");
+	assertEq(runtime.sourceUnloadDrain, owner, "bind and validation reentry cannot escape delete recovery");
+	assertEq(runtime.emergencySaveFence?.isCurrent(), true, "reentry cannot release delete save ownership");
+	await Promise.resolve();
+	await Promise.resolve();
+	assertEq(exportOffers, 1, "delete offers one verified export");
+	assertEq(exportedContent, expectedVisibleContent, "delete export receives stable visible source bytes");
+	assertEq(
+		manager.reconcileManagedWorkspaceViews([], "test-39c-exact-close"),
+		1,
+		"exact workspace close reclaims the delete terminal owner",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 39d: file-first rename terminalizes an unbound active source drain ---");
+{
+	let exportOffers = 0;
+	let exportedContent: string | null = null;
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+		handoffRecoveryActionHost: {
+			chooseVerifiedExporter: async () => {
+				exportOffers += 1;
+				return async (content: string) => { exportedContent = content; };
+			},
+		},
+	});
+	const { runtime, owner } = beginStructuralMutationSourceDrain(manager, binding, 3902);
+	const oldPath = binding.path;
+	const renamedPath = "Notes/typing-during-drain-renamed.md";
+	const expectedVisibleContent = binding.cm.state.doc.toString();
+	// Model the file-first seam: the collab binding has detached, while the native
+	// unload promise still owns the reducer reservation and visible source bytes.
+	manager.unbind(binding.view as never);
+	(binding.file as unknown as { path: string }).path = renamedPath;
+
+	manager.updatePathsAfterRename(new Map([[oldPath, renamedPath]]));
+
+	assertEq(runtime.sourceUnloadDrain, owner, "rename retains the exact source-drain owner");
+	assertEq(owner.state, "terminal", "rename terminalizes unresolved source input");
+	assertEq(runtime.emergencySaveFence?.isCurrent(), true, "rename retains native-save suppression");
+	assertEq(runtime.cmGuard?.snapshot().gateClosed, true, "rename retains the CodeMirror reopen fence");
+	assertEq(
+		runtime.cmGuard?.snapshot().targetSelectionFence,
+		owner.targetSelectionToken,
+		"rename keeps the manager and CodeMirror on one terminal token",
+	);
+	assertEq(manager.getManagedSession(binding.view as never) !== null, true, "rename cannot unmanage unresolved input");
+	manager.bind(binding.view as never, "TestDevice");
+	manager.auditBindings("test-39d-rename-reentry");
+	assertEq(runtime.sourceUnloadDrain, owner, "bind and validation reentry cannot escape rename recovery");
+	assertEq(runtime.emergencySaveFence?.isCurrent(), true, "reentry cannot release rename save ownership");
+	await Promise.resolve();
+	await Promise.resolve();
+	assertEq(exportOffers, 1, "rename offers one verified export");
+	assertEq(exportedContent, expectedVisibleContent, "rename export receives stable visible source bytes");
+	assertEq(
+		manager.reconcileManagedWorkspaceViews([], "test-39d-exact-close"),
+		1,
+		"exact workspace close reclaims the rename terminal owner",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 39e: target-path lifecycle cannot tear down the active source drain ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const { runtime, owner } = beginStructuralMutationSourceDrain(manager, binding, 3903);
+	const selectedTarget = { path: "Notes/selected-target-during-source-drain.md" };
+	(binding.view as unknown as { file: unknown }).file = selectedTarget;
+
+	manager.unbindByPath(selectedTarget.path);
+
+	assertEq(runtime.sourceUnloadDrain, owner, "target delete retains the exact A source-drain owner");
+	assertEq(owner.state, "terminal", "target delete terminalizes the unresolved A input");
+	assertEq(runtime.emergencySaveFence?.isCurrent(), true, "target delete keeps A native saves fenced");
+	assertEq(runtime.cmGuard?.snapshot().gateClosed, true, "target delete keeps the source CM gate closed");
+	assertEq(
+		manager.reconcileManagedWorkspaceViews([], "test-39e-exact-close"),
+		1,
+		"exact close reclaims the target-event source owner",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 39f: a safely settled target-less fence still permits structural teardown ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const internals = manager as unknown as {
+		managedSessions: Map<string, StructuralMutationDrainRuntime>;
+		beginSourceUnloadDrain(
+			runtime: StructuralMutationDrainRuntime,
+			sourceFile: unknown,
+		): null | PromiseLike<void>;
+	};
+	const runtime = internals.managedSessions.get("leaf-1");
+	const source = runtime?.session.displayedLineage;
+	if (!runtime || !source || source.kind !== "known") {
+		throw new Error("Expected safely fenced structural fixture");
+	}
+	assertEq(
+		internals.beginSourceUnloadDrain(runtime, source.file),
+		null,
+		"source without pending input settles synchronously",
+	);
+	assertEq(runtime.sourceUnloadDrain?.state, "fenced", "fixture owns one safely settled target-less fence");
+
+	manager.unbindByPath(binding.path);
+
+	assertEq(runtime.sourceUnloadDrain, null, "safe fenced owner is torn down by structural deletion");
+	assertEq(manager.getManagedSession(binding.view as never), null, "safe fenced owner does not permanently block deletion");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 39g: target rename cannot bypass a still-bound source drain owner ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const { runtime, owner } = beginStructuralMutationSourceDrain(manager, binding, 3904);
+	const targetPath = "Notes/selected-target-before-rename.md";
+	const renamedTargetPath = "Notes/selected-target-after-rename.md";
+	const selectedTarget = { path: targetPath };
+	(binding.view as unknown as { file: unknown }).file = selectedTarget;
+	// Obsidian mutates the selected TFile before publishing the rename map. The
+	// manager still owns bound A and cannot have reducer handoff metadata for B
+	// while the A reservation is unresolved.
+	selectedTarget.path = renamedTargetPath;
+
+	manager.updatePathsAfterRename(new Map([[targetPath, renamedTargetPath]]));
+
+	assertEq(runtime.sourceUnloadDrain, owner, "target rename retains the exact A source-drain owner");
+	assertEq(owner.state, "terminal", "target rename terminalizes the unresolved A input");
+	assertEq(runtime.emergencySaveFence?.isCurrent(), true, "target rename keeps A native saves fenced");
+	assertEq(runtime.cmGuard?.snapshot().gateClosed, true, "target rename keeps the source CM gate closed");
+	assertEq(
+		manager.reconcileManagedWorkspaceViews([], "test-39g-exact-close"),
+		1,
+		"exact close reclaims the target-rename source owner",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 39h: exact source rename releases a safely fenced unload owner before translation ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const internals = manager as unknown as {
+		managedSessions: Map<string, StructuralMutationDrainRuntime>;
+		beginSourceUnloadDrain(
+			runtime: StructuralMutationDrainRuntime,
+			sourceFile: unknown,
+		): null | PromiseLike<void>;
+	};
+	const runtime = internals.managedSessions.get("leaf-1");
+	const source = runtime?.session.displayedLineage;
+	if (!runtime || !source || source.kind !== "known" || !runtime.cmGuard) {
+		throw new Error("Expected fenced source-rename fixture");
+	}
+	assertEq(
+		internals.beginSourceUnloadDrain(runtime, source.file),
+		null,
+		"settled source unload establishes its target-less fence",
+	);
+	const retiredOwner = runtime.sourceUnloadDrain;
+	assertEq(retiredOwner?.state, "fenced", "source rename starts with one safely fenced owner");
+	const oldPath = binding.path;
+	const renamedPath = "Notes/typing-fenced-renamed.md";
+	(binding.file as unknown as { path: string }).path = renamedPath;
+
+	manager.updatePathsAfterRename(new Map([[oldPath, renamedPath]]));
+
+	assertEq(binding.path, renamedPath, "exact rename still translates the binding path");
+	assertEq(runtime.sourceUnloadDrain, null, "exact rename retires the old-path fenced owner");
+	assertEq(runtime.cmGuard.snapshot().targetSelectionFence, null, "exact rename releases the old target-less token");
+	assertEq(runtime.cmGuard.snapshot().gateClosed, false, "exact rename reopens the settled input gate");
+	const renamedSource = runtime.session.displayedLineage;
+	if (renamedSource.kind !== "known") throw new Error("Expected translated source lineage");
+	assertEq(
+		internals.beginSourceUnloadDrain(runtime, renamedSource.file),
+		null,
+		"the renamed source can enter the next normal unload boundary",
+	);
+	assertEq(runtime.sourceUnloadDrain?.state, "fenced", "next unload owns a fresh renamed-path fence");
+	assertEq(runtime.sourceUnloadDrain === retiredOwner, false, "next unload never reuses the retired old-path owner");
+	assertEq(
+		manager.reconcileManagedWorkspaceViews([], "test-39h-exact-close"),
+		1,
+		"exact close reclaims the fresh renamed-path owner",
 	);
 	clearPendingHealthChecks(manager);
 }

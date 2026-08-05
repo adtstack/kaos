@@ -15,6 +15,7 @@ export type PreservedUnresolvedReason =
 	| "conflict-artifact-write-failed"
 	| "three-way-preserve-failed"
 	| "open-external-targeted-diff-failed"
+	| "external-disk-read-unavailable"
 	| "conflict-winner-flush-deferred"
 	| "restore-disk-settlement-failed"
 	| "multiple-editor-authorities"
@@ -235,6 +236,23 @@ export class PreservedUnresolvedRegistry {
 
 	resolve(path: string): boolean {
 		const normalized = normalizePath(path);
+		this.paths.delete(normalized);
+		return this.entries.delete(normalized);
+	}
+
+	/**
+	 * Resolve only the exact occurrence observed by the caller. A same-path
+	 * replacement with a newer/manual episode is left untouched.
+	 */
+	resolveEpisode(path: string, expectedEpisodeId: string): boolean {
+		const normalized = normalizePath(path);
+		const current = this.entries.get(normalized);
+		if (
+			!current
+			|| getPreservedUnresolvedEpisodeId(current) !== expectedEpisodeId
+		) {
+			return false;
+		}
 		this.paths.delete(normalized);
 		return this.entries.delete(normalized);
 	}

@@ -306,6 +306,20 @@ function makeDirtyFixture(options: DirtyFixtureOptions = {}) {
 		getDiskMirror: () => ({
 			getPreservedUnresolvedEntries: () => entry ? [{ ...entry }] : [],
 			isPreservedUnresolved: () => entry !== null,
+			clearPreservedUnresolvedEpisode: (
+				candidatePath: string,
+				expectedEpisodeId: string,
+			) => {
+				if (
+					candidatePath !== path
+					|| entry === null
+					|| getPreservedUnresolvedEpisodeId(entry) !== expectedEpisodeId
+				) return false;
+				operationOrder.push("marker-clear");
+				clearCalls++;
+				entry = null;
+				return true;
+			},
 			clearPreservedUnresolved: () => {
 				operationOrder.push("marker-clear");
 				clearCalls++;

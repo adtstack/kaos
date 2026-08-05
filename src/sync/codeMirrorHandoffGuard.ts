@@ -10,7 +10,7 @@ import {
 	type Annotation as TransactionAnnotation,
 	type EditorSelection,
 	type Extension,
-	type Text,
+	Text,
 } from "@codemirror/state";
 import { historyField } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
@@ -280,6 +280,22 @@ export interface CodeMirrorHandoffGuard {
 		reservation: ManagedLeafInputStartReservation,
 	): boolean;
 	/**
+	 * Certify that structural lifecycle handling removed collaborative projection,
+	 * so only the already-reserved ordinary source transaction may finish locally.
+	 */
+	certifyStructuralSourceDrainEditorOnlyCompletion(
+		ownerId: string,
+		reservation: ManagedLeafInputStartReservation,
+	): boolean;
+	/**
+	 * Capture exact bytes for the one quarantined native successor. This never
+	 * applies or replays input; it is only a verified close-time export fallback.
+	 */
+	captureStructuralSourceDrainRecoveryContent(
+		ownerId: string,
+		reservation: ManagedLeafInputStartReservation,
+	): string | null;
+	/**
 	 * Settle all provable source input and synchronously install a target-less
 	 * reject-only boundary before a reducer may publish target selection.
 	 */
@@ -434,6 +450,7 @@ type StableSamePathInputBatch = Readonly<{
 	nativeHistoryEpochBefore: number;
 	nativeBoundaryObserved: boolean;
 	disposition: "completed" | "pending" | "ambiguous";
+	structuralEditorOnly: boolean;
 }>;
 type SourceUnloadDrain = Readonly<{
 	ownerId: string;
@@ -744,6 +761,16 @@ function isSameHandoffContext(
 		&& context.editorRevisionBefore === expected.editorRevisionBefore;
 }
 
+function isSameRejectBeforeTargetHandoffContext(
+	context: CodeMirrorHandoffContext | null,
+	expected: Extract<CodeMirrorHandoffContext, { kind: "handoff" }>,
+): context is Extract<CodeMirrorHandoffContext, { kind: "handoff" }> {
+	return expected.inputPolicy === "reject-before-target"
+		&& context?.kind === "handoff"
+		&& context.inputPolicy === "reject-before-target"
+		&& isSameHandoffContext(context, expected);
+}
+
 function isSamePathContext(
 	context: CodeMirrorHandoffContext | null,
 	expected: SamePathOriginContext,
@@ -874,6 +901,7 @@ export function installCodeMirrorHandoffGuard(
 	let pendingImplicitCompositionCommit: PendingImplicitCompositionCommit | null = null;
 	let pendingOrdinarySpanningSuccessor: PendingOrdinarySpanningSuccessor | null = null;
 	let sourceUnloadDrain: SourceUnloadDrain | null = null;
+	let structuralSourceDrainEditorOnly: SourceUnloadDrain | null = null;
 	let targetSelectionFence: TargetSelectionFenceToken | null = null;
 	let rejectBeforeTargetDomFence: RejectBeforeTargetDomFence | null = null;
 	let gateReconfigurationDepth = 0;
@@ -1614,12 +1642,19 @@ export function installCodeMirrorHandoffGuard(
 				|| sequence.beforeHandoffAssociation.kind === "candidate"
 			)
 			&& isExactBeforeHandoffCandidate(sequence, context);
+		const completesStructuralEditorOnly = structuralSourceDrainEditorOnly !== null
+			&& sourceUnloadDrain === structuralSourceDrainEditorOnly
+			&& structuralSourceDrainEditorOnly.reservation === sequence.reservation;
 		if (
 			inputHandoffAuthority(sequence) !== null
 			|| samePathOrigin === null
 			|| !flushed
 			|| successor !== null
-			|| (!completesOnOriginalSamePath && !completesOnHeldSourceAfterSelection)
+			|| (
+				!completesOnOriginalSamePath
+				&& !completesOnHeldSourceAfterSelection
+				&& !completesStructuralEditorOnly
+			)
 		) return false;
 		if (certifyNativeCompletion && callbackRef?.onSamePathInputCompleted) {
 			let acknowledged = false;
@@ -1637,21 +1672,29 @@ export function installCodeMirrorHandoffGuard(
 			const completionStillOnHeldSource = completesOnHeldSourceAfterSelection
 				&& completionContext?.kind === "handoff"
 				&& isExactBeforeHandoffCandidate(sequence, completionContext);
+			const completionStillStructuralEditorOnly = completesStructuralEditorOnly
+				&& structuralSourceDrainEditorOnly !== null
+				&& sourceUnloadDrain === structuralSourceDrainEditorOnly
+				&& structuralSourceDrainEditorOnly.reservation === sequence.reservation;
 			if (
 				!acknowledged
 				|| (
 					!isSamePathContext(completionContext, samePathOrigin)
 					&& !completionStillOnHeldSource
+					&& !completionStillStructuralEditorOnly
 				)
 			) {
 				gateFailureReason = "pending-input-not-flushable";
 				return false;
 			}
+			if (completionStillStructuralEditorOnly) {
+				structuralSourceDrainEditorOnly = null;
+			}
 		}
 		lastComposition = frozen({
 			compositionEpoch: sequence.compositionEpoch ?? compositionEpoch,
 			startGeneration: sequence.startGeneration,
-			endGeneration: context.handoffGeneration,
+			endGeneration: context?.handoffGeneration ?? sequence.startGeneration,
 			updates: completed.updates,
 			replayEligible: false,
 		});
@@ -1775,6 +1818,65 @@ export function installCodeMirrorHandoffGuard(
 			&& exactSingleSelectionReplacement(transaction, expectedInserted);
 	}
 
+	function exactStructuralSourceDrainRecoveryDocument(
+		ownerId: string,
+		reservation: ManagedLeafInputStartReservation,
+	): Text | null {
+		const owner = structuralSourceDrainEditorOnly;
+		const sequence = pendingInput;
+		if (
+			owner === null
+			|| sourceUnloadDrain !== owner
+			|| owner.ownerId !== ownerId
+			|| owner.reservation !== reservation
+			|| sequence === null
+			|| sequence.reservation !== reservation
+			|| view.state.doc !== sequence.samePathChainDocument
+			|| !view.state.selection.eq(sequence.samePathChainSelection)
+		) return null;
+		const ranges = sequence.samePathChainSelection.ranges;
+		const range = ranges[0];
+		if (ranges.length !== 1 || range === undefined) return null;
+		let inserted: string | null = null;
+		if (sequence.compositionEpoch !== null) {
+			const composition = activeComposition;
+			if (
+				composition === null
+				|| composition.sequence !== sequence
+				|| composition.updates <= composition.lastCapturedUpdate
+				|| composition.latestUpdateData === null
+			) return null;
+			inserted = composition.latestUpdateData;
+		} else {
+			const nativeInput = sequence.nativeInput;
+			if (nativeInput === null) return null;
+			if (
+				nativeInput.inputType === "insertText"
+				|| nativeInput.inputType === "insertFromPaste"
+				|| nativeInput.inputType === "insertFromDrop"
+			) {
+				inserted = nativeInput.data;
+			} else if (
+				nativeInput.inputType === "insertLineBreak"
+				|| nativeInput.inputType === "insertParagraph"
+			) {
+				inserted = "\n";
+			} else if (nativeInput.inputType.startsWith("delete") && !range.empty) {
+				inserted = "";
+			}
+		}
+		if (inserted === null) return null;
+		try {
+			return sequence.samePathChainDocument.replace(
+				range.from,
+				range.to,
+				Text.of(inserted.split("\n")),
+			);
+		} catch {
+			return null;
+		}
+	}
+
 	function exactReservedSourceDrainTransaction(transaction: Transaction): boolean {
 		const draining = sourceUnloadDrain;
 		const sequence = pendingInput;
@@ -1797,6 +1899,49 @@ export function installCodeMirrorHandoffGuard(
 			&& composition.latestUpdateData !== null
 			&& transaction.isUserEvent("input.type.compose")
 			&& exactSingleSelectionReplacement(transaction, composition.latestUpdateData);
+	}
+
+	function rebaseExactStructuralSourceDrainTransaction(
+		transaction: Transaction,
+		expectedState: EditorState,
+	): Transaction | null {
+		if (
+			structuralSourceDrainEditorOnly === null
+			|| sourceUnloadDrain !== structuralSourceDrainEditorOnly
+			|| pendingInput?.reservation !== structuralSourceDrainEditorOnly.reservation
+			|| transaction.startState.doc !== expectedState.doc
+			|| !transaction.startState.selection.eq(expectedState.selection)
+			|| transaction.effects.length !== 0
+			|| !exactReservedSourceDrainTransaction(transaction)
+		) return null;
+		const userEvent = transaction.annotation(Transaction.userEvent);
+		if (userEvent === undefined) return null;
+		const annotations: TransactionAnnotation<unknown>[] = [
+			Transaction.time.of(transaction.annotation(Transaction.time) ?? Date.now()),
+			Transaction.userEvent.of(userEvent),
+		];
+		const addToHistory = transaction.annotation(Transaction.addToHistory);
+		if (addToHistory !== undefined) {
+			annotations.push(Transaction.addToHistory.of(addToHistory));
+		}
+		let rebased: Transaction;
+		try {
+			rebased = expectedState.update({
+				changes: transaction.changes,
+				selection: transaction.newSelection,
+				annotations,
+				scrollIntoView: transaction.scrollIntoView,
+				filter: false,
+			});
+		} catch {
+			return null;
+		}
+		return rebased.startState === expectedState
+			&& rebased.newDoc.eq(transaction.newDoc)
+			&& rebased.newSelection.eq(transaction.newSelection)
+			&& exactReservedSourceDrainTransaction(rebased)
+				? rebased
+				: null;
 	}
 
 	function certifyAppliedSamePathCompositionTransaction(transaction: Transaction): void {
@@ -1830,13 +1975,21 @@ export function installCodeMirrorHandoffGuard(
 		const context = currentContext();
 		const firstTransaction = transactions[0] ?? null;
 		const finalTransaction = transactions[transactions.length - 1] ?? null;
+		const structuralEditorOnly = sequence !== null
+			&& sequence.compositionEpoch === null
+			&& structuralSourceDrainEditorOnly !== null
+			&& sourceUnloadDrain === structuralSourceDrainEditorOnly
+			&& structuralSourceDrainEditorOnly.reservation === sequence.reservation
+			&& transactions.length === 1
+			&& firstTransaction !== null
+			&& exactReservedSourceDrainTransaction(firstTransaction);
 		if (
 			sequence === null
 			|| sequence.compositionEpoch !== null
 			|| samePathOrigin === null
 			|| sequence.beforeHandoffAssociation.kind !== "unseen"
 			|| inputHandoffAuthority(sequence) !== null
-			|| !isSamePathContext(context, samePathOrigin)
+			|| (!isSamePathContext(context, samePathOrigin) && !structuralEditorOnly)
 			|| firstTransaction === null
 			|| finalTransaction === null
 			|| sequence.samePathChainDocument !== firstTransaction.startState.doc
@@ -1863,6 +2016,7 @@ export function installCodeMirrorHandoffGuard(
 			nativeHistoryEpochBefore: nativeHistoryEpoch,
 			nativeBoundaryObserved: transactions.some(isUserDocumentTransaction),
 			disposition,
+			structuralEditorOnly,
 		});
 	}
 
@@ -1915,6 +2069,13 @@ export function installCodeMirrorHandoffGuard(
 		if (!acknowledged) {
 			gateFailureReason = "pending-input-not-flushable";
 			return false;
+		}
+		if (
+			structuralSourceDrainEditorOnly !== null
+			&& sourceUnloadDrain === structuralSourceDrainEditorOnly
+			&& structuralSourceDrainEditorOnly.reservation === sequence.reservation
+		) {
+			structuralSourceDrainEditorOnly = null;
 		}
 		if (pendingInput === sequence) pendingInput = null;
 		gateFailureReason = null;
@@ -1971,6 +2132,13 @@ export function installCodeMirrorHandoffGuard(
 			gateFailureReason = "pending-input-not-flushable";
 			return false;
 		}
+		if (
+			structuralSourceDrainEditorOnly !== null
+			&& sourceUnloadDrain === structuralSourceDrainEditorOnly
+			&& structuralSourceDrainEditorOnly.reservation === sequence.reservation
+		) {
+			structuralSourceDrainEditorOnly = null;
+		}
 		if (pendingInput === sequence) pendingInput = null;
 		gateFailureReason = null;
 		return true;
@@ -1985,6 +2153,7 @@ export function installCodeMirrorHandoffGuard(
 			samePathOrigin,
 			batchStartDocument,
 			finalDocument,
+			structuralEditorOnly,
 		} = batch;
 		if (
 			pendingInput !== sequence
@@ -1994,10 +2163,16 @@ export function installCodeMirrorHandoffGuard(
 		sequence.nativeBoundaryObserved ||= batch.nativeBoundaryObserved;
 		const context = currentContext();
 		const remainsOnSamePath = isSamePathContext(context, samePathOrigin);
+		const completesStructuralEditorOnly = structuralEditorOnly
+			&& structuralSourceDrainEditorOnly !== null
+			&& sourceUnloadDrain === structuralSourceDrainEditorOnly
+			&& structuralSourceDrainEditorOnly.reservation === sequence.reservation;
 		const selectedTargetDuringApply = context?.kind === "handoff"
 			&& sequence.beforeHandoffAssociation.kind === "unseen"
 			&& isExactBeforeHandoffCandidate(sequence, context);
-		if (!remainsOnSamePath && !selectedTargetDuringApply) return false;
+		if (!remainsOnSamePath && !selectedTargetDuringApply && !completesStructuralEditorOnly) {
+			return false;
+		}
 		if (batch.disposition === "pending") {
 			return selectedTargetDuringApply
 				? settleAmbiguousSamePathInput(sequence, {
@@ -2017,6 +2192,9 @@ export function installCodeMirrorHandoffGuard(
 			});
 		}
 		if (callbackRef?.onSamePathInputCompleted === undefined) return false;
+		// The locally applied structural successor is one-shot even if the manager's
+		// completion callback later fails. It must never authorize a second insert.
+		if (completesStructuralEditorOnly) structuralSourceDrainEditorOnly = null;
 		let acknowledged = false;
 		try {
 			acknowledged = callbackRef.onSamePathInputCompleted({
@@ -2118,6 +2296,13 @@ export function installCodeMirrorHandoffGuard(
 			gateFailureReason = "pending-input-not-flushable";
 			return false;
 		}
+		if (
+			structuralSourceDrainEditorOnly !== null
+			&& sourceUnloadDrain === structuralSourceDrainEditorOnly
+			&& structuralSourceDrainEditorOnly.reservation === sequence.reservation
+		) {
+			structuralSourceDrainEditorOnly = null;
+		}
 		if (pendingInput === sequence) pendingInput = null;
 		gateFailureReason = null;
 		return true;
@@ -2125,6 +2310,16 @@ export function installCodeMirrorHandoffGuard(
 
 	function settleUnresolvedOrdinarySamePathInput(sequence: InputSequence): boolean {
 		if (pendingInput !== sequence || sequence.compositionEpoch !== null) return true;
+		if (
+			structuralSourceDrainEditorOnly !== null
+			&& sourceUnloadDrain === structuralSourceDrainEditorOnly
+			&& structuralSourceDrainEditorOnly.reservation === sequence.reservation
+		) {
+			// Structural close owns a bounded exact-successor/export window. The
+			// ordinary same-path rAF fallback must not consume that reservation merely
+			// because the source context intentionally disappeared.
+			return false;
+		}
 		if (!flushPendingDom()) return false;
 		if (pendingInput !== sequence) return true;
 		if (
@@ -2177,9 +2372,27 @@ export function installCodeMirrorHandoffGuard(
 		});
 	}
 
+	function isExactActiveCompositionContinuationBeforeInput(event: InputEvent): boolean {
+		const draining = sourceUnloadDrain;
+		const composition = activeComposition;
+		const sequence = pendingInput;
+		return draining !== null
+			&& composition !== null
+			&& sequence !== null
+			&& composition.sequence === sequence
+			&& sequence.reservation === draining.reservation
+			&& sequence.compositionEpoch !== null
+			&& composition.updates > composition.lastCapturedUpdate
+			&& composition.latestUpdateData !== null
+			&& event.isComposing
+			&& event.inputType === "insertCompositionText"
+			&& event.data === composition.latestUpdateData;
+	}
+
 	const beforeInputListener = (event: InputEvent): void => {
 		if (inert) return;
 		if (sourceUnloadDrain !== null) {
+			if (isExactActiveCompositionContinuationBeforeInput(event)) return;
 			// The already-reserved source lane completes through CodeMirror's
 			// transaction/composition-end path. Every later native start is fresh and
 			// is rejected before the DOM can expose bytes that have no source owner.
@@ -2436,6 +2649,71 @@ export function installCodeMirrorHandoffGuard(
 		if (!compareAndSetRuntimeData(held.candidate.runtimeView, expected, replacement)) return false;
 		return exactHeldTarget(held)
 			&& runtimeData(held.candidate.runtimeView) === replacement;
+	}
+
+	function restoreRejectedUnarmedHostProjection(input: Readonly<{
+		context: Extract<CodeMirrorHandoffContext, { kind: "handoff" }>;
+		startState: EditorState;
+		startDocument: Text;
+		targetDocument: Text;
+		isProvenHostReplacement: boolean;
+	}>): void {
+		// A certified clear=true load has its own stronger capture/CAS path below.
+		// This repair is only for an opaque host projection that will be rejected,
+		// after the host has already assigned its target bytes to TextFileView.data.
+		if (armedHostLoad !== null || !input.isProvenHostReplacement) return;
+		const sourceContent = input.startDocument.toString();
+		const incomingContent = input.targetDocument.toString();
+		if (incomingContent === sourceContent) return;
+		const reject = (reason: Parameters<NonNullable<
+			CodeMirrorHandoffGuardCallbacks["onHostLoadCaptureRejected"]
+		>>[0]): void => {
+			callbackRef?.onHostLoadCaptureRejected?.(reason);
+		};
+		if (
+			view.state !== input.startState
+			|| input.startState.doc !== input.startDocument
+			|| view.state.doc !== input.startDocument
+		) {
+			reject("start-state-mismatch");
+			return;
+		}
+		if (!isSameRejectBeforeTargetHandoffContext(currentContext(), input.context)) {
+			reject("context-mismatch");
+			return;
+		}
+		if (!runtimeViewTargets(
+			input.context.runtimeView,
+			input.context.targetFile,
+			input.context.targetPath,
+		)) {
+			reject("target-mismatch");
+			return;
+		}
+		if (runtimeData(input.context.runtimeView) !== incomingContent) {
+			reject("runtime-data-mismatch");
+			return;
+		}
+		if (!compareAndSetRuntimeData(
+			input.context.runtimeView,
+			incomingContent,
+			sourceContent,
+		)) {
+			reject("runtime-data-cas-failed");
+			return;
+		}
+		if (
+			view.state !== input.startState
+			|| input.startState.doc !== input.startDocument
+			|| view.state.doc !== input.startDocument
+			|| !isSameRejectBeforeTargetHandoffContext(currentContext(), input.context)
+			|| !runtimeViewTargets(
+				input.context.runtimeView,
+				input.context.targetFile,
+				input.context.targetPath,
+			)
+			|| runtimeData(input.context.runtimeView) !== sourceContent
+		) reject("post-cas-context-mismatch");
 	}
 
 	function makeHeldHostLoad(
@@ -2810,6 +3088,14 @@ export function installCodeMirrorHandoffGuard(
 		) {
 			return frozen({ kind: "drop" });
 		}
+		const exactStructuralEditorOnlySourceInput = structuralSourceDrainEditorOnly !== null
+			&& sourceUnloadDrain === structuralSourceDrainEditorOnly
+			&& pendingInput?.reservation === structuralSourceDrainEditorOnly.reservation
+			&& transaction.docChanged
+			&& exactReservedSourceDrainTransaction(transaction);
+		if (structuralSourceDrainEditorOnly !== null && !exactStructuralEditorOnlySourceInput) {
+			return frozen({ kind: "drop" });
+		}
 		if (
 			sourceUnloadDrain !== null
 			&& transaction.docChanged
@@ -2820,6 +3106,9 @@ export function installCodeMirrorHandoffGuard(
 				reason: "stale-generation",
 				effectOnly: effectOnly(transaction.startState),
 			});
+		}
+		if (exactStructuralEditorOnlySourceInput) {
+			return frozen({ kind: "forward", transaction });
 		}
 		const context = currentContext();
 		if (!transaction.docChanged) return frozen({ kind: "forward", transaction });
@@ -2890,6 +3179,21 @@ export function installCodeMirrorHandoffGuard(
 			publishHeldHostLoad(held);
 			return frozen({ kind: "hold-host-load", candidate: held.candidate });
 		}
+		if (!userDocumentTransaction) {
+			restoreRejectedUnarmedHostProjection({
+				context,
+				startState: transaction.startState,
+				startDocument: transaction.startState.doc,
+				targetDocument: transaction.newDoc,
+				// Obsidian's setData -> setViewData path may express the same full
+				// document result as a minimal diff carrying the exact "set" event.
+				// The restore helper still requires runtimeData === transaction.newDoc
+				// and the exact reject-before-target handoff before touching the cache.
+				isProvenHostReplacement:
+					isExactFullReplacement(transaction, transaction.newDoc.toString())
+					|| transaction.annotation(Transaction.userEvent) === "set",
+			});
+		}
 		if (userDocumentTransaction && pendingInput !== null) {
 			terminalizeUnresolvedInput(pendingInput, "spanning-input");
 		}
@@ -2909,11 +3213,21 @@ export function installCodeMirrorHandoffGuard(
 		if (inert || callbackRef === null) return apply(transactions);
 		const safe: Transaction[] = [];
 		let expectedState = view.state;
-		for (const transaction of transactions) {
+		for (const requestedTransaction of transactions) {
+			let transaction = requestedTransaction;
 			if (transaction.startState !== expectedState) {
-				if (targetSelectionFence !== null) break;
-				safe.push(effectOnly(expectedState));
-				break;
+				const rebased = rebaseExactStructuralSourceDrainTransaction(
+					transaction,
+					expectedState,
+				);
+				if (rebased === null) {
+					if (targetSelectionFence !== null || structuralSourceDrainEditorOnly !== null) {
+						break;
+					}
+					safe.push(effectOnly(expectedState));
+					break;
+				}
+				transaction = rebased;
 			}
 			const decision = decide(transaction, boundary);
 			switch (decision.kind) {
@@ -3031,8 +3345,21 @@ export function installCodeMirrorHandoffGuard(
 		if (targetSelectionFence !== null || sourceUnloadDrain !== null) return undefined;
 		const context = currentContext();
 		if (context?.kind === "handoff") {
+			const startState = view.state;
+			const startDocument = startState.doc;
 			const held = makeHeldHostState(targetState, context);
-			if (held !== null) publishHeldHostLoad(held);
+			if (held !== null) {
+				publishHeldHostLoad(held);
+			} else {
+				restoreRejectedUnarmedHostProjection({
+					context,
+					startState,
+					startDocument,
+					targetDocument: targetState.doc,
+					isProvenHostReplacement: targetState !== startState
+						&& targetState.doc !== startDocument,
+				});
+			}
 			return undefined;
 		}
 		if (context === null || !flushPendingDom()) return undefined;
@@ -3658,6 +3985,7 @@ export function installCodeMirrorHandoffGuard(
 		pendingImplicitCompositionCommit = null;
 		pendingOrdinarySpanningSuccessor = null;
 		sourceUnloadDrain = null;
+		structuralSourceDrainEditorOnly = null;
 		targetSelectionFence = null;
 		removeListeners();
 		restoreOwnedWrappers();
@@ -3755,6 +4083,9 @@ export function installCodeMirrorHandoffGuard(
 				|| currentContext()?.kind !== "same-path"
 			) {
 				if (sourceUnloadDrain === owner) sourceUnloadDrain = null;
+				if (structuralSourceDrainEditorOnly === owner) {
+					structuralSourceDrainEditorOnly = null;
+				}
 				return false;
 			}
 			return true;
@@ -3766,6 +4097,30 @@ export function installCodeMirrorHandoffGuard(
 				&& sourceUnloadDrain.reservation === reservation
 				&& pendingInput?.reservation === reservation
 				&& currentContext()?.kind === "same-path";
+		},
+		certifyStructuralSourceDrainEditorOnlyCompletion(ownerId, reservation): boolean {
+			const owner = sourceUnloadDrain;
+			if (
+				inert
+				|| callbackRef === null
+				|| owner === null
+				|| owner.ownerId !== ownerId
+				|| owner.reservation !== reservation
+				|| pendingInput?.reservation !== reservation
+				|| pendingInput.documentAtStart !== reservation.sourceDocumentAtStart
+				|| view.state.doc !== pendingInput.samePathChainDocument
+				|| !view.state.selection.eq(pendingInput.samePathChainSelection)
+				|| targetSelectionFence !== null
+			) return false;
+			structuralSourceDrainEditorOnly = owner;
+			return true;
+		},
+		captureStructuralSourceDrainRecoveryContent(ownerId, reservation): string | null {
+			if (inert || callbackRef === null) return null;
+			return exactStructuralSourceDrainRecoveryDocument(
+				ownerId,
+				reservation,
+			)?.toString() ?? null;
 		},
 		prepareTargetSelectionFence(
 			ownerId,
@@ -3846,6 +4201,9 @@ export function installCodeMirrorHandoffGuard(
 			});
 			targetSelectionFence = token;
 			if (sourceUnloadDrain === draining) sourceUnloadDrain = null;
+			if (structuralSourceDrainEditorOnly === draining) {
+				structuralSourceDrainEditorOnly = null;
+			}
 			synchronizeRejectBeforeTargetDomFence(currentContext());
 			// Even if a callback drifted an epoch while the DOM fence was being
 			// synchronized, return the installed opaque owner.  The manager will
@@ -3880,6 +4238,7 @@ export function installCodeMirrorHandoffGuard(
 			});
 			targetSelectionFence = token;
 			sourceUnloadDrain = null;
+			structuralSourceDrainEditorOnly = null;
 			// A failed CM compartment update must not hide the owner.  The dispatch,
 			// setState, beforeinput, composition, and contentDOM boundaries all consult
 			// targetSelectionFence directly, so the pane remains reject-only until an
@@ -4234,6 +4593,7 @@ export function installCodeMirrorHandoffGuard(
 			if (inert) return true;
 			cancelActiveCommitSettlement();
 			sourceUnloadDrain = null;
+			structuralSourceDrainEditorOnly = null;
 			targetSelectionFence = null;
 			releaseRejectBeforeTargetDomFence(false);
 			inert = true;

@@ -81,6 +81,7 @@ function makeHarness(options: {
 	openEditorContent?: string | (() => string);
 	initialDiskContent?: string;
 	onRead?: () => void | Promise<void>;
+	onAdapterRead?: () => void | Promise<void>;
 	onGetAbstractFile?: (path: string, file: TFile | null, callCount: number) => void;
 	onBeforeProcess?: () => void | Promise<void>;
 	onAfterProcess?: () => void | Promise<void>;
@@ -287,7 +288,10 @@ function makeHarness(options: {
 					: content;
 			},
 			adapter: {
-				read: async (path: string) => diskFiles.get(path) ?? "",
+				read: async (path: string) => {
+					await options.onAdapterRead?.();
+					return diskFiles.get(path) ?? "";
+				},
 			},
 			modify: async (file: { path: string }, content: string) => {
 				modifyCalls++;
@@ -1143,6 +1147,114 @@ console.log("\n--- Test 12: expectedDiskContent rejects a stale reconciliation p
 	assert(fixture.getProcessCalls() === 0, "snapshot mismatch is rejected before atomic commit");
 	assert(fixture.getModifyCalls() === 0, "snapshot mismatch performs no fallback modify");
 
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 12a0: exact raw revision probe distinguishes current, stale, and unavailable ---");
+{
+	const rawDiskContent = "\ufeff한글 raw authority\r\nsecond line\r\n";
+	const fixture = makeHarness({ initialDiskContent: rawDiskContent });
+	const file = fixture.getCurrentDiskFile();
+	if (!file) throw new Error("expected raw revision fixture file");
+	const revision = {
+		path: file.path,
+		ctime: file.stat.ctime,
+		mtime: file.stat.mtime,
+		size: file.stat.size,
+	};
+
+	const current = await fixture.mirror.probeExactObservedDiskRevision(file, revision);
+	assert(
+		current.kind === "current" && current.content === rawDiskContent,
+		"raw revision probe returns the exact BOM/CRLF adapter representation",
+	);
+	const currentFingerprint = await fixture.mirror.probeRecentWriteFingerprint(
+		file,
+		revision,
+	);
+	assert(
+		currentFingerprint.kind === "unproven" &&
+			currentFingerprint.content === rawDiskContent,
+		"recent-write attribution retains exact current bytes without a fingerprint",
+	);
+
+	fixture.advanceDiskFileRevision();
+	const stale = await fixture.mirror.probeExactObservedDiskRevision(file, revision);
+	assert(stale.kind === "stale", "raw revision probe distinguishes a later file revision");
+	const staleFingerprint = await fixture.mirror.probeRecentWriteFingerprint(file, revision);
+	assert(
+		staleFingerprint.kind === "stale",
+		"recent-write attribution preserves stale as a distinct disposition",
+	);
+	fixture.doc.destroy();
+
+	const unavailableFixture = makeHarness({
+		initialDiskContent: rawDiskContent,
+		onAdapterRead: () => { throw new Error("deterministic adapter read failure"); },
+	});
+	const unavailableFile = unavailableFixture.getCurrentDiskFile();
+	if (!unavailableFile) throw new Error("expected unavailable raw revision fixture file");
+	const unavailable = await unavailableFixture.mirror.probeExactObservedDiskRevision(
+		unavailableFile,
+		{
+			path: unavailableFile.path,
+			ctime: unavailableFile.stat.ctime,
+			mtime: unavailableFile.stat.mtime,
+			size: unavailableFile.stat.size,
+		},
+	);
+	assert(
+		unavailable.kind === "unavailable",
+		"raw revision probe distinguishes adapter read failure from stale replacement",
+	);
+	const unavailableFingerprint = await unavailableFixture.mirror.probeRecentWriteFingerprint(
+		unavailableFile,
+		{
+			path: unavailableFile.path,
+			ctime: unavailableFile.stat.ctime,
+			mtime: unavailableFile.stat.mtime,
+			size: unavailableFile.stat.size,
+		},
+	);
+	assert(
+		unavailableFingerprint.kind === "unavailable",
+		"recent-write attribution preserves adapter unavailability distinctly",
+	);
+	unavailableFixture.doc.destroy();
+}
+
+console.log("\n--- Test 12a0b: fingerprint failure preserves already-proven raw bytes ---");
+{
+	const rawDiskContent = "exact current raw bytes survive hash failure\r\n";
+	const fixture = makeHarness({ initialDiskContent: rawDiskContent });
+	const file = fixture.getCurrentDiskFile();
+	if (!file) throw new Error("expected fingerprint failure fixture file");
+	await (fixture.mirror as unknown as {
+		suppressWrite(path: string, content: string): Promise<unknown>;
+	}).suppressWrite(file.path, rawDiskContent);
+	const internals = fixture.mirror as unknown as {
+		fingerprintContent(content: string): Promise<{ bytes: number; hash: string }>;
+	};
+	internals.fingerprintContent = async () => {
+		throw new Error("deterministic fingerprint failure");
+	};
+	let outcome: Awaited<ReturnType<DiskMirror["probeRecentWriteFingerprint"]>> | null = null;
+	let failure: unknown = null;
+	try {
+		outcome = await fixture.mirror.probeRecentWriteFingerprint(file, {
+			path: file.path,
+			ctime: file.stat.ctime,
+			mtime: file.stat.mtime,
+			size: file.stat.size,
+		});
+	} catch (error) {
+		failure = error;
+	}
+	assert(failure === null, "hash failure does not discard an exact current raw revision");
+	assert(
+		outcome?.kind === "unproven" && outcome.content === rawDiskContent,
+		"hash failure conservatively returns unproven with the proven raw bytes",
+	);
 	fixture.doc.destroy();
 }
 

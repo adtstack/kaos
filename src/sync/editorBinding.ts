@@ -104,8 +104,10 @@ import {
 	type SamePathAdoptionState,
 } from "./samePathAdoption";
 import { buildSamePathAdoptionChangeSet } from "../runtime/reconcile/samePathAdoptionPlanner";
+import { sha256HandoffRecoveryHexSync } from "./handoffRecoveryStore";
 
 declare const __KAOS_QA_HARNESS_ENABLED__: boolean;
+declare const samePathExternalCandidateProjectionProofBrand: unique symbol;
 const EDITOR_HANDOFF_QA_ENABLED = typeof __KAOS_QA_HARNESS_ENABLED__ !== "undefined"
 	&& __KAOS_QA_HARNESS_ENABLED__;
 let editorHandoffHostApiVersionOverrideForQa: string | null = null;
@@ -144,6 +146,9 @@ const LIVE_UPDATE_HEALTH_RETRY_DELAY_MS = 120;
 const RECENT_EDITOR_REPAIR_DEFER_MS = 1200;
 const RECENT_EDITOR_PATCH_SHIELD_MS = 5000;
 const EXTERNAL_DISK_RELOAD_CORRELATION_MS = 5000;
+const EXTERNAL_DISK_CANDIDATE_RETRY_DELAYS_MS = [250, 500, 1000, 2000, 5000] as const;
+const EXTERNAL_DISK_CANDIDATE_DISPOSITION_TTL_MS = 15_000;
+const EXTERNAL_DISK_CANDIDATE_DISPOSITION_PER_PATH_LIMIT = 64;
 const TYPING_AWARENESS_MIN_INTERVAL_MS = 750;
 const CONCURRENT_TYPING_NOTICE_COOLDOWN_MS = 8_000;
 const EDITOR_AUTHORITY_SHIELD_ORIGINS = new Set<string>([
@@ -156,6 +161,7 @@ const CM_RESOLVE_DELAYED_ATTEMPT = 5;
 const CM_RESOLVE_IDLE_RETRY_DELAY_MS = 5000;
 const UNMANAGE_RETRY_DELAYS_MS = [120, 250, 500, 1000, 2000, 5000] as const;
 const SAME_PATH_ADOPTION_RETRY_DELAYS_MS = [120, 250, 500, 1000, 2000, 5000] as const;
+const STRUCTURAL_SOURCE_CLOSE_SETTLEMENT_MS = 50;
 
 function sameCompositionSnapshot(
 	left: CodeMirrorHandoffGuardSnapshot["activeComposition"]
@@ -524,10 +530,21 @@ type ManagedSourceUnloadDrainOwner = {
 	readonly promise: Promise<void>;
 	state: "draining" | "fenced" | "terminal" | "transferred";
 	targetSelectionToken: TargetSelectionFenceToken | null;
+	structuralEditorOnlyCompletion: boolean;
 	settlementQueued: boolean;
 	settled: boolean;
 	readonly resolve: () => void;
 	readonly reject: (reason: Error) => void;
+};
+
+type PendingStructuralSourceCloseSettlement = {
+	readonly runtime: ManagedLeafRuntime;
+	readonly owner: ManagedSourceUnloadDrainOwner;
+	readonly reason: string;
+	readonly recoveryContent: string;
+	readonly exactRecovery: boolean;
+	timer: ReturnType<typeof setTimeout> | null;
+	settling: boolean;
 };
 
 type ManagedLeafRuntime = {
@@ -577,13 +594,60 @@ export type InterceptedExternalDiskMutation = Readonly<
 	Omit<ExternalDiskMutationNotice, "content"> & { content: string }
 >;
 
+export type ExternalDiskMutationCompletionDisposition =
+	| "controller-owned"
+	| "terminal-no-candidate";
+
+type ExternalDiskMutationProvenance = "external" | "self-write";
+
 interface PendingExternalDiskMutation extends ExternalDiskMutationNotice {
+	/** Exact fingerprint disposition for this event revision. */
+	provenance: ExternalDiskMutationProvenance;
 	at: number;
 	consumedLeafIds: Set<string>;
+	/**
+	 * Exact binding lifetimes that were already present, and still correlated,
+	 * when this event's raw read completed. A leaf ID alone is not authority: a
+	 * pane may close and reopen under the same ID while another pane keeps this
+	 * path-scoped marker alive. `null` is retained only for direct/legacy notices
+	 * that did not pass through beginExternalDiskMutation.
+	 */
+	eligibleOwners: Map<string, PendingExternalDiskMutationOwner> | null;
 	retireScheduled: boolean;
-	/** Raw candidate was already emitted while an early host projection was held. */
-	candidateDeliveredFromEarlyHostProjection: boolean;
+	candidatePublished: boolean;
 }
+
+interface PendingExternalDiskMutationOwner {
+	continuation: ManagedContinuationTicket;
+	binding: EditorBinding;
+	bindingEpoch: number;
+}
+
+interface PendingExternalDiskCandidateDeliveryRetry {
+	readonly candidate: InterceptedExternalDiskMutation;
+	retryAttempt: number;
+	timer: ReturnType<typeof setTimeout> | null;
+}
+
+interface ExternalDiskCandidateDispositionEntry {
+	readonly sequence: number;
+	timer: ReturnType<typeof setTimeout> | null;
+}
+
+type ExternalDiskCandidateDispositionLedger =
+	Map<string, Map<number, ExternalDiskCandidateDispositionEntry>>;
+
+type ExternalDiskCandidateDeliveryAttempt =
+	| "delivered"
+	| "already-resolved"
+	| "callback-unavailable"
+	| "claim-busy"
+	| "callback-failed";
+
+type ExternalDiskCandidateDeliveryDisposition =
+	| "delivered"
+	| "retained-for-retry"
+	| "callback-unavailable";
 
 interface HeldExternalDiskHostProjection {
 	beforeContent: string;
@@ -615,6 +679,18 @@ interface ExternalDiskHostProjectionProof {
 	snapshot: ExternalDiskHostViewSnapshot;
 	runtimeView: MarkdownView & { data?: unknown; lastSavedData?: unknown };
 	externalLogicalContent: string;
+}
+
+interface ExternalDiskHostSnapshotProof {
+	start: PendingExternalDiskMutationStart;
+	snapshot: ExternalDiskHostViewSnapshot;
+	runtimeView: MarkdownView & { data?: unknown; lastSavedData?: unknown };
+}
+
+interface ExternalDiskHostSaveFenceLease {
+	runtime: ManagedLeafRuntime;
+	fence: TextFileViewEmergencySaveFence;
+	acquiredForProjection: boolean;
 }
 
 interface RecentEditorOriginChange {
@@ -751,6 +827,27 @@ export interface OpenEditorMutationTicket {
 	readonly views: readonly OpenEditorMutationViewTicket[];
 }
 
+/**
+ * Exact, read-only evidence for the one projection-hold exception owned by the
+ * reconciliation controller.  The controller still owns external-candidate
+ * identity and disk CAS; the binding manager proves only that the hold is a
+ * same-path required retry over the exact visible bytes, not a handoff,
+ * conflict, awaiting-disk, or in-flight adoption proposal.
+ */
+export interface SamePathExternalCandidateProjectionProofInput {
+	readonly path: string;
+	readonly file: TFile;
+	readonly content: string;
+	readonly openEditorTicket: OpenEditorMutationTicket;
+	readonly editorAuthorityLease: EditorAuthorityLease;
+}
+
+export type SamePathExternalCandidateProjectionProof = Readonly<
+	SamePathExternalCandidateProjectionProofInput & {
+		readonly [samePathExternalCandidateProjectionProofBrand]: true;
+	}
+>;
+
 export type OpenEditorMutationTicketValidation =
 	| { current: true }
 	| {
@@ -788,6 +885,9 @@ type EditorHandoffHostQaBarrierState = EditorHandoffHostQaBarrier & Readonly<{
 	releaseHeldHostLoad(): void;
 	holdNextNativeSave(path: string): void;
 	releaseHeldNativeSave(): void;
+	recordInterceptedExternalDiskMutation(receipt: NonNullable<
+		EditorHandoffDebugSnapshot["lastInterceptedExternalDiskMutation"]
+	>): void;
 	snapshot(): EditorHandoffDebugSnapshot;
 }>;
 
@@ -818,6 +918,9 @@ function createEditorHandoffHostQaBarrierState(
 	let nativeSaveSnapshot: EditorHandoffHostOperationDebugSnapshot | null = null;
 	let heldHostLoad: HeldHostLoad | null = null;
 	let heldNativeSave: HeldNativeSave | null = null;
+	let lastInterceptedExternalDiskMutation: EditorHandoffDebugSnapshot[
+		"lastInterceptedExternalDiskMutation"
+	] = null;
 
 	const currentIdentity = (leafId: string): Readonly<{
 		sessionId: string | null;
@@ -1138,10 +1241,15 @@ function createEditorHandoffHostQaBarrierState(
 			}
 		},
 
+		recordInterceptedExternalDiskMutation(receipt): void {
+			lastInterceptedExternalDiskMutation = Object.freeze({ ...receipt });
+		},
+
 		snapshot(): EditorHandoffDebugSnapshot {
 			return Object.freeze({
 				hostLoad: hostLoadSnapshot,
 				nativeSave: nativeSaveSnapshot,
+				lastInterceptedExternalDiskMutation,
 				leaves: Object.freeze(snapshotLeaves()),
 			});
 		},
@@ -1263,6 +1371,8 @@ export class EditorBindingManager {
 	private cmResolveDelayedLogged = new Set<string>();
 	private pendingCmResolveRetries = new Map<string, ReturnType<typeof setTimeout>>();
 	private pendingUnmanageRetries = new Map<string, ReturnType<typeof setTimeout>>();
+	private pendingStructuralSourceCloseSettlements =
+		new Map<string, PendingStructuralSourceCloseSettlement>();
 	private unmanageRetryAttempts = new Map<string, number>();
 	private localTargetPresentationIdByCandidate =
 		new WeakMap<PendingHostLoadCandidate, string>();
@@ -1284,6 +1394,12 @@ export class EditorBindingManager {
 		new Map<string, ReturnType<typeof setTimeout>>();
 	private samePathAdoptionRetryAttempts = new Map<string, number>();
 	private samePathAdoptionRequiredPathByLeafId = new Map<string, string>();
+	private activeSamePathExternalCandidateProjectionProofByPath =
+		new Map<string, SamePathExternalCandidateProjectionProof>();
+	private samePathExternalCandidateProjectionProofOwners = new WeakMap<
+		SamePathExternalCandidateProjectionProof,
+		ReadonlyMap<string, ManagedLeafRuntime>
+	>();
 	private editorAuthorityRevisionByCm = new WeakMap<EditorView, number>();
 	private editorAuthorityContentByCm = new WeakMap<EditorView, string>();
 	private bindingPublicationOwnerByCm = new WeakMap<EditorView, object>();
@@ -1296,8 +1412,22 @@ export class EditorBindingManager {
 	private concurrentTypingNoticeAtByPath = new Map<string, number>();
 	private pendingExternalDiskMutations = new Map<string, PendingExternalDiskMutation>();
 	private pendingExternalDiskMutationStarts = new Map<string, PendingExternalDiskMutationStart>();
+	private pendingExternalDiskCorrelationTimers = new Set<ReturnType<typeof setTimeout>>();
+	private pendingExternalDiskCandidateDeliveryRetries =
+		new Map<string, Map<number, PendingExternalDiskCandidateDeliveryRetry>>();
+	private deliveredExternalDiskCandidateSequencesByPath: ExternalDiskCandidateDispositionLedger =
+		new Map();
+	private selfWriteExternalDiskMutationSequencesByPath: ExternalDiskCandidateDispositionLedger =
+		new Map();
+	private activeSelfWriteExternalDiskMutationSequencesByPath = new Map<string, Set<number>>();
 	private pendingExternalDiskHostProjectionFences =
 		new WeakMap<EditorState, PendingExternalDiskHostProjectionFence>();
+	/**
+	 * Callback delivery is claimed before invoking controller code. The short
+	 * in-flight claim is separate from the durable delivered/self disposition and
+	 * the replaceable path marker, so callback reentry cannot duplicate delivery.
+	 */
+	private claimedExternalDiskCandidateSequencesByPath = new Map<string, Set<number>>();
 	private recentEditorOriginChanges = new Map<string, RecentEditorOriginChange>();
 	private lastExternalDiskMutationSequenceByPath = new Map<string, number>();
 	private observedExternalDiskMutationSequenceByPath = new Map<string, number>();
@@ -1721,6 +1851,225 @@ export class EditorBindingManager {
 			) return true;
 		}
 		return false;
+	}
+
+	captureSamePathExternalCandidateProjectionProof(
+		input: SamePathExternalCandidateProjectionProofInput,
+	): SamePathExternalCandidateProjectionProof | null {
+		if (this.activeSamePathExternalCandidateProjectionProofByPath.has(input.path)) {
+			return null;
+		}
+		const owners = new Map<string, ManagedLeafRuntime>();
+		for (const [leafId, requiredPath] of this.samePathAdoptionRequiredPathByLeafId) {
+			if (requiredPath !== input.path) continue;
+			const runtime = this.managedSessions.get(leafId);
+			if (!runtime) return null;
+			owners.set(leafId, runtime);
+		}
+		if (owners.size === 0) return null;
+		const proof = Object.freeze({ ...input }) as SamePathExternalCandidateProjectionProof;
+		this.samePathExternalCandidateProjectionProofOwners.set(proof, owners);
+		this.activeSamePathExternalCandidateProjectionProofByPath.set(input.path, proof);
+		let current = false;
+		try {
+			current = this.isSamePathExternalCandidateProjectionProofCurrent(proof);
+		} catch {
+			// A host/workspace callback may throw while the proof is validated.
+			// Roll back both registries before failing closed so an exception can
+			// never leave adoption permanently blocked by an orphaned proof.
+		}
+		if (!current) {
+			this.releaseSamePathExternalCandidateProjectionProof(proof);
+			return null;
+		}
+		return proof;
+	}
+
+	isSamePathExternalCandidateProjectionProofCurrent(
+		proof: SamePathExternalCandidateProjectionProof,
+	): boolean {
+		const capturedOwners =
+			this.samePathExternalCandidateProjectionProofOwners.get(proof) ?? null;
+		if (
+			!this.asyncAuthorityOpen
+			|| capturedOwners === null
+			|| this.activeSamePathExternalCandidateProjectionProofByPath.get(proof.path)
+				!== proof
+			|| proof.path.length === 0
+			|| proof.file.path !== proof.path
+			|| proof.openEditorTicket.path !== proof.path
+			|| proof.openEditorTicket.views.length === 0
+		) return false;
+
+		const requiredLeafIds: string[] = [];
+		for (const [leafId, requiredPath] of this.samePathAdoptionRequiredPathByLeafId) {
+			if (requiredPath === proof.path) requiredLeafIds.push(leafId);
+		}
+		if (
+			requiredLeafIds.length === 0
+			|| requiredLeafIds.length !== capturedOwners.size
+			|| requiredLeafIds.some((leafId) =>
+				this.managedSessions.get(leafId) !== capturedOwners.get(leafId)
+			)
+		) return false;
+
+		// A required retry marker is the only hold subtype this proof may cross.
+		// Conflict, awaiting-disk, capturing, and planning identities remain held.
+		for (const runtime of this.managedSessions.values()) {
+			if (
+				runtime.adoption.kind !== "none"
+				&& runtime.adoption.path === proof.path
+			) return false;
+		}
+
+		const openViews = this.captureOpenViewsForAdmission(proof.path);
+		if (
+			openViews.length !== proof.openEditorTicket.views.length
+			|| !this.validateOpenEditorMutationTicket(
+				proof.openEditorTicket,
+				openViews,
+				{ ignoreSelectionAndScroll: true },
+			).current
+		) return false;
+
+		const ticketByLeafId = new Map(
+			proof.openEditorTicket.views.map((ticket) => [ticket.leafId, ticket] as const),
+		);
+		if (requiredLeafIds.some((leafId) => !ticketByLeafId.has(leafId))) return false;
+
+		for (const ticket of proof.openEditorTicket.views) {
+			const runtime = this.managedSessions.get(ticket.leafId);
+			const session = runtime?.session;
+			const cm = ticket.cm;
+			const host = runtime?.hostGuard?.snapshot() ?? null;
+			const guard = runtime?.cmGuard?.snapshot() ?? null;
+			const requiredOwner = capturedOwners.get(ticket.leafId) === runtime;
+			const exactBoundPeer = !requiredOwner
+				&& this.isExactBoundPeerForSamePathExternalCandidateProjection(
+					ticket,
+					proof,
+				);
+			if (
+				!runtime
+				|| !session
+				|| cm === null
+				|| ticket.targetFile !== proof.file
+				|| !ticket.stableTargetIdentityProven
+				|| ticket.editorDocument !== cm.state.doc
+				|| cm.state.doc.toString() !== proof.content
+				|| ticket.editorContent !== proof.content
+				|| session.view !== ticket.view
+				|| session.view.file !== proof.file
+				|| session.handoff !== null
+				|| (
+					!exactBoundPeer
+					&& (
+						session.binding.kind !== "unbound"
+						|| this.bindings.has(ticket.leafId)
+					)
+				)
+				|| session.displayedLineage.kind !== "known"
+				|| session.displayedLineage.file !== proof.file
+				|| session.displayedLineage.path !== proof.path
+				|| session.displayedLineage.cm !== cm
+				|| session.displayedLineage.document !== ticket.editorDocument
+				|| runtime.adoption.kind !== "none"
+				|| runtime.sourceUnloadDrain !== null
+				|| host === null
+				|| host.view !== (session.view as unknown as TextFileView)
+				|| host.clearLoadCapability !== "observable"
+				|| host.hostCapabilityState !== "ready"
+				|| host.mode.kind !== "pass-through"
+				|| host.sourceUnload !== null
+				|| (host.pendingSourceUnloadDrain ?? null) !== null
+				|| !hasExactHostGuardWrappers(host)
+				|| !hasNoPendingHostLoadOwner(host)
+				|| guard === null
+				|| guard.view !== cm
+				|| guard.inert
+				|| guard.gateClosed
+				|| guard.pendingHostLoadCandidate !== null
+				|| guard.activeComposition !== null
+			) return false;
+			try {
+				if (
+					session.view.editor.getValue() !== proof.content
+					|| (session.view as unknown as TextFileView).getViewData()
+						!== proof.content
+				) return false;
+			} catch {
+				return false;
+			}
+		}
+
+		const authority = this.capturePathEditorAuthority(proof.path);
+		return authority.kind === "proven-single"
+			&& authority.content === proof.content
+			&& authority.lease === proof.editorAuthorityLease
+			&& this.isPathEditorAuthorityLeaseCurrent(proof.editorAuthorityLease)
+			&& requiredLeafIds.every((leafId) =>
+				this.samePathAdoptionRequiredPathByLeafId.get(leafId) === proof.path
+			);
+	}
+
+	private isExactBoundPeerForSamePathExternalCandidateProjection(
+		ticket: OpenEditorMutationTicket["views"][number],
+		proof: SamePathExternalCandidateProjectionProof,
+	): boolean {
+		if (ticket.cm === null) return false;
+		const runtime = this.managedSessions.get(ticket.leafId);
+		const session = runtime?.session;
+		const binding = this.bindings.get(ticket.leafId);
+		const displayed = session?.displayedLineage;
+		const expectedYText = this.vaultSync.getTextForPath(proof.path);
+		const expectedFileId = expectedYText
+			? (
+				this.vaultSync.getFileIdForText(expectedYText)
+				?? this.vaultSync.getFileId(proof.path)
+				?? null
+			)
+			: null;
+		return !!runtime
+			&& !!session
+			&& !!binding
+			&& expectedYText !== null
+			&& expectedFileId !== null
+			&& expectedYText.toJSON() === proof.content
+			&& runtime.adoption.kind === "none"
+			&& session.view === ticket.view
+			&& session.view.file === proof.file
+			&& session.handoff === null
+			&& session.binding.kind === "bound"
+			&& session.binding.path === proof.path
+			&& session.binding.fileId === expectedFileId
+			&& session.binding.ytext === expectedYText
+			&& displayed?.kind === "known"
+			&& displayed.file === proof.file
+			&& displayed.path === proof.path
+			&& displayed.cm === ticket.cm
+			&& displayed.document === ticket.editorDocument
+			&& binding.view === ticket.view
+			&& binding.file === proof.file
+			&& binding.path === proof.path
+			&& binding.fileId === expectedFileId
+			&& binding.ytext === expectedYText
+			&& binding.cm === ticket.cm
+			&& this.getCmView(ticket.view) === ticket.cm
+			&& ticket.cm.state.doc === ticket.editorDocument
+			&& ticket.cm.state.doc.toString() === proof.content
+			&& ticket.editorContent === proof.content;
+	}
+
+	releaseSamePathExternalCandidateProjectionProof(
+		proof: SamePathExternalCandidateProjectionProof,
+	): void {
+		if (
+			this.activeSamePathExternalCandidateProjectionProofByPath.get(proof.path)
+			=== proof
+		) {
+			this.activeSamePathExternalCandidateProjectionProofByPath.delete(proof.path);
+		}
+		this.samePathExternalCandidateProjectionProofOwners.delete(proof);
 	}
 
 	private isSamePathAdoptionReplanHeld(path: string): boolean {
@@ -2313,9 +2662,24 @@ export class EditorBindingManager {
 		let revoked = 0;
 		for (const runtime of Array.from(this.managedSessions.values())) {
 			const view = runtime.session.view;
-			if (exactWorkspaceViews.has(view)) continue;
+			if (exactWorkspaceViews.has(view)) {
+				this.cancelPendingStructuralSourceCloseSettlement(
+					runtime.session.leafId,
+					runtime,
+				);
+				continue;
+			}
 			const leafId = runtime.session.leafId;
 			if (this.managedSessions.get(leafId) !== runtime) continue;
+			const sourceOwner = runtime.sourceUnloadDrain;
+			if (
+				sourceOwner !== null
+				&& this.scheduleStructuralSourceCloseSettlement(
+					runtime,
+					sourceOwner,
+					`workspace-view-removed:${reason}`,
+				)
+			) continue;
 			this.teardownSourceUnloadDrain(
 				runtime,
 				`workspace-view-removed:${reason}`,
@@ -2547,6 +2911,7 @@ export class EditorBindingManager {
 			promise,
 			state: "draining",
 			targetSelectionToken: null,
+			structuralEditorOnlyCompletion: false,
 			settlementQueued: false,
 			settled: false,
 			resolve,
@@ -2598,9 +2963,21 @@ export class EditorBindingManager {
 		runtime: ManagedLeafRuntime,
 		owner: ManagedSourceUnloadDrainOwner,
 		reason: string,
+		deferVisibleExport = false,
 	): void {
 		if (runtime.sourceUnloadDrain !== owner || owner.state === "transferred") return;
 		owner.state = "terminal";
+		if (owner.targetSelectionToken !== null) {
+			let tokenCurrent = false;
+			try {
+				tokenCurrent = owner.cmGuard.isTargetSelectionFenceCurrent(
+					owner.targetSelectionToken,
+				);
+			} catch {
+				tokenCurrent = false;
+			}
+			if (!tokenCurrent) owner.targetSelectionToken = null;
+		}
 		if (owner.targetSelectionToken === null) {
 			try {
 				owner.targetSelectionToken = owner.cmGuard
@@ -2610,13 +2987,30 @@ export class EditorBindingManager {
 			}
 		}
 		this.ensureEmergencyHostSaveFence(runtime, `source-unload-drain:${reason}`);
-		const visible = this.captureStableVisibleManagedContent(runtime);
+		const visible = deferVisibleExport || owner.structuralEditorOnlyCompletion
+			? null
+			: this.captureStableVisibleManagedContent(runtime);
 		if (visible !== null) {
-			this.offerTerminalVisibleContentExport(
-				runtime,
-				visible,
-				`source-unload-drain:${reason}`,
+			const pendingClose = this.pendingStructuralSourceCloseSettlements.get(
+				runtime.session.leafId,
 			);
+			if (
+				pendingClose?.runtime === runtime
+				&& pendingClose.owner === owner
+			) {
+				this.settleStructuralSourceClose(
+					pendingClose,
+					visible,
+					true,
+					`input-completed:${reason}`,
+				);
+			} else {
+				this.offerTerminalVisibleContentExport(
+					runtime,
+					visible,
+					`source-unload-drain:${reason}`,
+				);
+			}
 		}
 		if (!owner.settled) {
 			owner.settled = true;
@@ -3035,6 +3429,25 @@ export class EditorBindingManager {
 				queueMicrotask(() => {
 					const current = this.managedSessions.get(runtime.session.leafId);
 					if (current !== runtime) return;
+					const structuralSourceOwner = current.sourceUnloadDrain;
+					if (
+						structuralSourceOwner?.state === "terminal"
+						&& structuralSourceOwner.structuralEditorOnlyCompletion
+					) {
+						// The exact native successor or bounded close recovery owns these
+						// bytes now. Generic host-capability recovery must not offer the old
+						// visible document first and consume the one explicit exporter prompt.
+						this.ensureEmergencyHostSaveFence(
+							current,
+							`host-capability-lost:${reason}:structural-source-close`,
+						);
+						this.trace?.("editor", "source-unload-drain-host-recovery-deferred", {
+							leafId: current.session.leafId,
+							path: structuralSourceOwner.sourcePath,
+							reason,
+						});
+						return;
+					}
 					const handoff = runtime.session.handoff;
 					const candidate = handoff?.pendingHostLoadCandidate ?? null;
 					if (handoff !== null) {
@@ -3777,6 +4190,10 @@ export class EditorBindingManager {
 	): boolean {
 		const owner = runtime.sourceUnloadDrain;
 		if (owner === null) return true;
+		this.cancelPendingStructuralSourceCloseSettlement(
+			runtime.session.leafId,
+			runtime,
+		);
 		let released = owner.targetSelectionToken === null;
 		if (owner.targetSelectionToken !== null) {
 			try {
@@ -3808,6 +4225,357 @@ export class EditorBindingManager {
 			reason,
 		});
 		return true;
+	}
+
+	private isolateStructuralSourceDrainEditorOnlyCompletion(
+		runtime: ManagedLeafRuntime,
+		owner: ManagedSourceUnloadDrainOwner,
+		reason: string,
+	): boolean {
+		const reservation = owner.reservation;
+		const binding = owner.sourceBinding;
+		if (
+			reservation === null
+			|| binding === undefined
+			|| owner.structuralEditorOnlyCompletion
+			|| runtime.sourceUnloadDrain !== owner
+			|| owner.state !== "terminal"
+			|| this.bindings.get(runtime.session.leafId) !== binding
+			|| (this.bindingEpochByLeafId.get(runtime.session.leafId) ?? 0)
+				!== owner.sourceBindingEpoch
+			|| binding.cm.state.doc !== reservation.sourceDocumentAtStart
+		) return false;
+		let before: CodeMirrorHandoffGuardSnapshot;
+		try {
+			before = owner.cmGuard.snapshot();
+		} catch {
+			return false;
+		}
+		if (
+			before.inert
+			|| before.view !== binding.cm
+			|| before.sourceUnloadDrain?.ownerId !== owner.ownerId
+			|| before.sourceUnloadDrain.reservation !== reservation
+			|| before.targetSelectionFence !== null
+		) return false;
+		try {
+			binding.cm.dispatch({ effects: this.compartment.reconfigure([]) });
+		} catch {
+			return false;
+		}
+		let syncFacet: unknown = null;
+		let after: CodeMirrorHandoffGuardSnapshot;
+		try {
+			syncFacet = binding.cm.state.facet(ySyncFacet);
+			after = owner.cmGuard.snapshot();
+		} catch {
+			return false;
+		}
+		const isolationPreconditions = this.managedSessions.get(runtime.session.leafId) === runtime
+			&& runtime.sourceUnloadDrain === owner
+			&& owner.state === "terminal"
+			&& this.bindings.get(runtime.session.leafId) === binding
+			&& (this.bindingEpochByLeafId.get(runtime.session.leafId) ?? 0)
+				=== owner.sourceBindingEpoch
+			&& binding.cm.state.doc === reservation.sourceDocumentAtStart
+			&& syncFacet == null
+			&& !after.inert
+			&& after.sourceUnloadDrain?.ownerId === owner.ownerId
+			&& after.sourceUnloadDrain.reservation === reservation
+			&& after.targetSelectionFence === null;
+		let isolated = false;
+		if (isolationPreconditions) {
+			try {
+				isolated = owner.cmGuard.certifyStructuralSourceDrainEditorOnlyCompletion(
+					owner.ownerId,
+					reservation,
+				);
+			} catch {
+				isolated = false;
+			}
+		}
+		owner.structuralEditorOnlyCompletion = isolated;
+		this.trace?.("editor", isolated
+			? "source-unload-drain-structural-editor-only"
+			: "source-unload-drain-structural-isolation-failed", {
+			leafId: runtime.session.leafId,
+			path: owner.sourcePath,
+			reason,
+		});
+		return isolated;
+	}
+
+	private retainSourceUnloadDrainAcrossStructuralMutation(
+		runtime: ManagedLeafRuntime,
+		reason: string,
+	): boolean {
+		const owner = runtime.sourceUnloadDrain;
+		// A fenced owner has no unresolved predecessor input and its native unload
+		// promise has already settled, so the existing structural teardown remains
+		// safe. Draining and terminal owners still own visible source bytes and can be
+		// reclaimed only by exact workspace close or plugin teardown.
+		if (owner === null || (owner.state !== "draining" && owner.state !== "terminal")) {
+			return false;
+		}
+		this.clearScheduledHealthCheck(runtime.session.leafId);
+		const mayFinishStructurally = owner.reservation !== null;
+		this.terminalizeSourceUnloadDrain(runtime, owner, reason, mayFinishStructurally);
+		if (owner.reservation !== null) {
+			const isolated = owner.structuralEditorOnlyCompletion
+				|| this.isolateStructuralSourceDrainEditorOnlyCompletion(runtime, owner, reason);
+			if (!isolated) {
+				const visible = this.captureStableVisibleManagedContent(runtime);
+				if (visible !== null) {
+					this.offerTerminalVisibleContentExport(
+						runtime,
+						visible,
+						`source-unload-drain:${reason}:isolation-failed`,
+					);
+				}
+			}
+		}
+		this.trace?.("editor", "source-unload-drain-structural-owner-retained", {
+			leafId: runtime.session.leafId,
+			path: owner.sourcePath,
+			reason,
+		});
+		return true;
+	}
+
+	private cancelPendingStructuralSourceCloseSettlement(
+		leafId: string,
+		runtime?: ManagedLeafRuntime,
+	): void {
+		const pending = this.pendingStructuralSourceCloseSettlements.get(leafId);
+		if (!pending || (runtime !== undefined && pending.runtime !== runtime)) return;
+		if (pending.timer !== null) clearTimeout(pending.timer);
+		this.pendingStructuralSourceCloseSettlements.delete(leafId);
+	}
+
+	private structuralSourceCloseRecovery(
+		runtime: ManagedLeafRuntime,
+		owner: ManagedSourceUnloadDrainOwner,
+	): Readonly<{ content: string; exact: boolean }> {
+		const reservation = owner.reservation;
+		let exact: string | null = null;
+		if (reservation !== null) {
+			try {
+				exact = owner.cmGuard.captureStructuralSourceDrainRecoveryContent(
+					owner.ownerId,
+					reservation,
+				);
+			} catch {
+				exact = null;
+			}
+		}
+		if (exact !== null) return Object.freeze({ content: exact, exact: true });
+		const visible = this.captureStableVisibleManagedContent(runtime)
+			?? reservation?.sourceDocumentAtStart?.toString()
+			?? owner.sourceBinding?.cm.state.doc.toString()
+			?? "";
+		const artifact = [
+			"KAOS structural input recovery artifact",
+			"",
+			"The already-started input could not be materialized exactly before the pane closed.",
+			"No replay or source-file write was attempted. The last verified visible source text follows.",
+			"",
+			visible,
+		].join("\n");
+		return Object.freeze({ content: artifact, exact: false });
+	}
+
+	private scheduleStructuralSourceCloseSettlement(
+		runtime: ManagedLeafRuntime,
+		owner: ManagedSourceUnloadDrainOwner,
+		reason: string,
+	): boolean {
+		const leafId = runtime.session.leafId;
+		if (
+			this.managedSessions.get(leafId) !== runtime
+			|| runtime.sourceUnloadDrain !== owner
+			|| owner.state !== "terminal"
+			|| !owner.structuralEditorOnlyCompletion
+			|| owner.reservation === null
+		) return false;
+		const existing = this.pendingStructuralSourceCloseSettlements.get(leafId);
+		if (existing !== undefined) {
+			return existing.runtime === runtime && existing.owner === owner;
+		}
+		const recovery = this.structuralSourceCloseRecovery(runtime, owner);
+		const pending: PendingStructuralSourceCloseSettlement = {
+			runtime,
+			owner,
+			reason,
+			recoveryContent: recovery.content,
+			exactRecovery: recovery.exact,
+			timer: null,
+			settling: false,
+		};
+		pending.timer = setTimeout(() => {
+			if (this.pendingStructuralSourceCloseSettlements.get(leafId) !== pending) return;
+			this.settleStructuralSourceClose(
+				pending,
+				pending.recoveryContent,
+				pending.exactRecovery,
+				"bounded-expiry",
+			);
+		}, STRUCTURAL_SOURCE_CLOSE_SETTLEMENT_MS);
+		this.pendingStructuralSourceCloseSettlements.set(leafId, pending);
+		this.trace?.("editor", "source-unload-drain-workspace-close-bounded", {
+			leafId,
+			path: owner.sourcePath,
+			reason,
+			exactRecovery: recovery.exact,
+			settlementMs: STRUCTURAL_SOURCE_CLOSE_SETTLEMENT_MS,
+		});
+		return true;
+	}
+
+	private settleStructuralSourceClose(
+		pending: PendingStructuralSourceCloseSettlement,
+		content: string,
+		exactRecovery: boolean,
+		reason: string,
+	): void {
+		const runtime = pending.runtime;
+		const owner = pending.owner;
+		const leafId = runtime.session.leafId;
+		if (
+			pending.settling
+			|| this.pendingStructuralSourceCloseSettlements.get(leafId) !== pending
+			|| this.managedSessions.get(leafId) !== runtime
+			|| runtime.sourceUnloadDrain !== owner
+		) return;
+		pending.settling = true;
+		if (pending.timer !== null) {
+			clearTimeout(pending.timer);
+			pending.timer = null;
+		}
+		this.terminalVisibleContentExportByRuntime.set(runtime, content);
+		const actionHost = this.handoffRecoveryActionHost;
+		void (async () => {
+			let exported = false;
+			try {
+				const exportVerified = await actionHost?.chooseVerifiedExporter() ?? null;
+				if (
+					exportVerified !== null
+					&& this.pendingStructuralSourceCloseSettlements.get(leafId) === pending
+					&& this.managedSessions.get(leafId) === runtime
+					&& runtime.sourceUnloadDrain === owner
+				) {
+					await exportVerified(content);
+					exported = true;
+				}
+			} catch {
+				exported = false;
+			}
+			if (
+				this.pendingStructuralSourceCloseSettlements.get(leafId) !== pending
+				|| this.managedSessions.get(leafId) !== runtime
+				|| runtime.sourceUnloadDrain !== owner
+			) return;
+			if (!exported) {
+				pending.settling = false;
+				this.terminalVisibleContentExportByRuntime.delete(runtime);
+				this.trace?.("editor", "source-unload-drain-workspace-close-export-required", {
+					leafId,
+					path: owner.sourcePath,
+					reason,
+					exactRecovery,
+					contentHash: sha256HandoffRecoveryHexSync(content),
+				});
+				try {
+					new Notice(
+						"The closed pane still owns verified recovery text. Use the command palette action named “retry blocked handoff recovery export” before KAOS can release it.",
+						10_000,
+					);
+				} catch {
+					// The exact pending close owner retains the bytes for a later user action.
+				}
+				return;
+			}
+			this.trace?.("editor", "source-unload-drain-workspace-close-exported", {
+				leafId,
+				path: owner.sourcePath,
+				reason,
+				exactRecovery,
+				contentHash: sha256HandoffRecoveryHexSync(content),
+			});
+			this.pendingStructuralSourceCloseSettlements.delete(leafId);
+			this.teardownSourceUnloadDrain(
+				runtime,
+				`workspace-close-bounded:${reason}`,
+			);
+			const emergencyReleased = this.releaseEmergencyHostSaveFence(
+				runtime,
+				`workspace-close-bounded:${reason}`,
+				true,
+			);
+			if (emergencyReleased) {
+				runtime.hostGuard?.cancelTerminalHostLifecycle?.(
+					`workspace-close-bounded:${reason}`,
+				);
+				this.tombstoneDetachedTransitionBoundary(
+					runtime,
+					`workspace-close-bounded:${reason}`,
+				);
+			}
+			this.cancelManagedHandoffAndUnmanage(
+				runtime.session.view,
+				`workspace-close-bounded:${reason}`,
+				"closed",
+			);
+		})();
+	}
+
+	/**
+	 * Explicit user action for retrying a cancelled/failed closed-pane export.
+	 * Timed first attempts and concurrent exporter prompts are never duplicated.
+	 */
+	retryPendingStructuralSourceCloseExport(): number {
+		for (const [leafId, pending] of this.pendingStructuralSourceCloseSettlements) {
+			const runtime = pending.runtime;
+			const owner = pending.owner;
+			if (
+				pending.timer !== null
+				|| pending.settling
+				|| this.pendingStructuralSourceCloseSettlements.get(leafId) !== pending
+				|| runtime.session.leafId !== leafId
+				|| this.managedSessions.get(leafId) !== runtime
+				|| runtime.sourceUnloadDrain !== owner
+				|| owner.state !== "terminal"
+				|| !owner.structuralEditorOnlyCompletion
+				|| owner.reservation === null
+			) continue;
+			this.settleStructuralSourceClose(
+				pending,
+				pending.recoveryContent,
+				pending.exactRecovery,
+				"explicit-user-retry",
+			);
+			// One command invocation owns at most one file-picker/modal. Additional
+			// pending panes remain ordered in the map for later explicit commands.
+			return 1;
+		}
+		return 0;
+	}
+
+	private blocksSourceUnloadBindingReentry(runtime: ManagedLeafRuntime | undefined): boolean {
+		const owner = runtime?.sourceUnloadDrain ?? null;
+		if (
+			!runtime
+			|| owner === null
+			|| (owner.state !== "draining" && owner.state !== "terminal")
+		) return false;
+		if (owner.state === "terminal") {
+			this.terminalizeSourceUnloadDrain(runtime, owner, "terminal-reentry");
+		}
+		return true;
+	}
+
+	private hasActiveSourceUnloadDrain(runtime: ManagedLeafRuntime | undefined): boolean {
+		const state = runtime?.sourceUnloadDrain?.state;
+		return state === "draining" || state === "terminal";
 	}
 
 	private retainManagedTargetCompletionFence(
@@ -4028,6 +4796,15 @@ export class EditorBindingManager {
 					) {
 						current.adoption = NO_SAME_PATH_ADOPTION;
 						this.advanceAuthorityEpoch();
+					}
+					if (
+						current.sourceUnloadDrain?.state === "terminal"
+						&& current.sourceUnloadDrain.structuralEditorOnlyCompletion
+					) {
+						// Structural completion has no same-path target left to adopt. A
+						// composition-end refresh would treat the deliberate target-less
+						// quarantine as ordinary context loss and release its save owner.
+						return;
 					}
 					this.scheduleSamePathAdoptionRefresh(current, "composition-end");
 				}
@@ -4267,6 +5044,11 @@ export class EditorBindingManager {
 	): boolean {
 		const current = this.managedSessions.get(runtime.session.leafId);
 		if (current !== runtime || !this.asyncAuthorityOpen) return false;
+		const structuralOwner = current.sourceUnloadDrain;
+		const completesStructuralEditorOnly = structuralOwner !== null
+			&& structuralOwner.state === "terminal"
+			&& structuralOwner.structuralEditorOnlyCompletion
+			&& structuralOwner.reservation === completion.reservation;
 		const editorRevision = this.editorRevisionByCm.get(completion.cm) ?? 0;
 		const reduction = reduceManagedLeafSession(current.session, {
 			type: "same-path-input-completed",
@@ -4287,6 +5069,21 @@ export class EditorBindingManager {
 			current,
 			"same-path-input-completed",
 		);
+		if (completesStructuralEditorOnly && structuralOwner !== null) {
+			queueMicrotask(() => {
+				if (
+					this.managedSessions.get(current.session.leafId) !== current
+					|| current.sourceUnloadDrain !== structuralOwner
+					|| structuralOwner.state !== "terminal"
+				) return;
+				structuralOwner.structuralEditorOnlyCompletion = false;
+				this.terminalizeSourceUnloadDrain(
+					current,
+					structuralOwner,
+					"structural-editor-only-input-completed",
+				);
+			});
+		}
 		return true;
 	}
 
@@ -4314,6 +5111,11 @@ export class EditorBindingManager {
 	): boolean {
 		const current = this.managedSessions.get(runtime.session.leafId);
 		if (current !== runtime || !this.asyncAuthorityOpen) return false;
+		const structuralOwner = current.sourceUnloadDrain;
+		const rejectsStructuralEditorOnly = structuralOwner !== null
+			&& structuralOwner.state === "terminal"
+			&& structuralOwner.structuralEditorOnlyCompletion
+			&& structuralOwner.reservation === rejection.reservation;
 		const reduction = rejection.reason === "input-result-ambiguous"
 			? reduceManagedLeafSession(current.session, {
 				type: "same-path-input-rejected",
@@ -4364,6 +5166,21 @@ export class EditorBindingManager {
 			current,
 			`same-path-input-rejected:${rejection.reason}`,
 		);
+		if (rejectsStructuralEditorOnly && structuralOwner !== null) {
+			queueMicrotask(() => {
+				if (
+					this.managedSessions.get(current.session.leafId) !== current
+					|| current.sourceUnloadDrain !== structuralOwner
+					|| structuralOwner.state !== "terminal"
+				) return;
+				structuralOwner.structuralEditorOnlyCompletion = false;
+				this.terminalizeSourceUnloadDrain(
+					current,
+					structuralOwner,
+					`structural-editor-only-input-${rejection.reason}`,
+				);
+			});
+		}
 		return true;
 	}
 
@@ -4692,6 +5509,10 @@ export class EditorBindingManager {
 		) return;
 		if (this.terminalVisibleContentExportByRuntime.get(runtime) === content) return;
 		this.terminalVisibleContentExportByRuntime.set(runtime, content);
+		this.trace?.("editor", "terminal-visible-content-export-offered", {
+			leafId,
+			reason,
+		});
 		const actionHost = this.handoffRecoveryActionHost;
 		if (!actionHost) {
 			try {
@@ -6117,6 +6938,7 @@ export class EditorBindingManager {
 	 * editor/API transaction even when both share the same millisecond timestamp.
 	 */
 	beginExternalDiskMutation(path: string, sequence: number): void {
+		if (!this.asyncAuthorityOpen) return;
 		const previous = this.observedExternalDiskMutationSequenceByPath.get(path) ?? 0;
 		if (sequence <= previous) return;
 		this.observedExternalDiskMutationSequenceByPath.set(path, sequence);
@@ -6157,16 +6979,163 @@ export class EditorBindingManager {
 				heldProjection: null,
 			});
 		}
-		if (views.size === 0) {
-			this.pendingExternalDiskMutationStarts.delete(path);
-			return;
-		}
+		// Keep an empty start snapshot as positive proof that no editor binding owned
+		// this path when the event began. A target can become bound while the exact
+		// raw read is in flight; that later binding must not be retroactively armed
+		// with an event it never observed at start.
 		this.pendingExternalDiskMutationStarts.set(path, {
 			path,
 			sequence,
 			at: Date.now(),
 			views,
 		});
+	}
+
+	/**
+	 * Complete the exact observed revision as a KAOS self-write. The raw bytes are
+	 * retained as a short-lived negative-provenance marker: a host reload that was
+	 * already queued for K0 must still be rejected if the editor advanced to K1,
+	 * but self bytes are never handed to the external-reconciliation callback.
+	 */
+	noteSelfWriteExternalDiskMutation(notice: ExternalDiskMutationNotice): void {
+		if (!this.asyncAuthorityOpen) return;
+		const ownsActiveDisposition = this.activateSelfWriteExternalDiskMutation(
+			notice.path,
+			notice.sequence,
+		);
+		try {
+			this.noteSelfWriteExternalDiskMutationWhileActive(notice);
+		} finally {
+			this.releaseActiveSelfWriteExternalDiskMutation(
+				notice.path,
+				notice.sequence,
+				ownsActiveDisposition,
+			);
+		}
+	}
+
+	private noteSelfWriteExternalDiskMutationWhileActive(
+		notice: ExternalDiskMutationNotice,
+	): void {
+		this.rememberExternalDiskCandidateDisposition(
+			this.selfWriteExternalDiskMutationSequencesByPath,
+			notice.path,
+			notice.sequence,
+		);
+		this.clearExternalDiskCandidateDeliveryRetry(notice.path, notice.sequence);
+		if (!this.isExternalDiskReloadGuardEnabled() || notice.content === null) {
+			this.retireExternalDiskReloadCorrelationThrough(notice.path, notice.sequence);
+			return;
+		}
+		// The bounded negative-provenance ledger is installed before any
+		// owner/sequence branch so synchronous generic-completion reentry cannot
+		// publish known self-written bytes as an external candidate.
+		const previousSequence =
+			this.lastExternalDiskMutationSequenceByPath.get(notice.path) ?? 0;
+		const currentMarker = this.pendingExternalDiskMutations.get(notice.path);
+		if (
+			notice.sequence < previousSequence
+			|| (
+				notice.sequence === previousSequence
+				&& currentMarker?.sequence === notice.sequence
+				&& currentMarker.provenance === "self-write"
+			)
+		) {
+			// Sequence-scoped retirement cannot erase a newer start/marker. Equal
+			// completion is an idempotent callback/probe retry.
+			if (notice.sequence < previousSequence) {
+				this.retireExternalDiskReloadCorrelationThrough(notice.path, notice.sequence);
+			}
+			return;
+		}
+
+		const start = this.pendingExternalDiskMutationStarts.get(notice.path);
+		if (!start || start.sequence !== notice.sequence) {
+			this.retireExternalDiskReloadCorrelationThrough(notice.path, notice.sequence);
+			return;
+		}
+		let eligibleOwners = this.resolveExternalDiskMutationStartOwners(notice);
+		if (eligibleOwners === null || eligibleOwners.size === 0) {
+			this.retireExternalDiskReloadCorrelationThrough(notice.path, notice.sequence);
+			return;
+		}
+
+		// Publish the newer sequence before invoking an older external callback. A
+		// re-entrant callback can observe, but cannot recursively complete or erase,
+		// the self-write that is currently being classified.
+		this.lastExternalDiskMutationSequenceByPath.set(notice.path, notice.sequence);
+		if (!this.preserveSupersededExternalDiskMarker(notice.path, notice.sequence)) {
+			return;
+		}
+		eligibleOwners = this.resolveExternalDiskMutationStartOwners(notice);
+		if (eligibleOwners === null || eligibleOwners.size === 0) {
+			this.retireExternalDiskReloadCorrelationThrough(notice.path, notice.sequence);
+			return;
+		}
+
+		const now = Date.now();
+		const normalizedDiskContent = normalizeEditorText(notice.content);
+		if (this.promoteHeldExternalDiskHostProjection(
+			notice,
+			normalizedDiskContent,
+			now,
+			eligibleOwners,
+			"self-write",
+		)) {
+			return;
+		}
+		this.rememberPendingExternalDiskMutation({
+			...notice,
+			provenance: "self-write",
+			at: now,
+			consumedLeafIds: new Set<string>(),
+			eligibleOwners,
+			retireScheduled: false,
+			candidatePublished: false,
+		});
+		this.trace?.("editor", "self-write-host-reload-marker-armed", {
+			path: notice.path,
+			sequence: notice.sequence,
+			ownerCount: eligibleOwners.size,
+		});
+	}
+
+	/**
+	 * Resolve the bindings that still have the exact identity captured when this
+	 * event began. `null` means no begin record exists (legacy/direct caller), an
+	 * empty set means a begin record exists but no current binding is correlated.
+	 */
+	private resolveExternalDiskMutationStartOwners(
+		notice: ExternalDiskMutationNotice,
+	): Map<string, PendingExternalDiskMutationOwner> | null {
+		const latestObservedSequence =
+			this.observedExternalDiskMutationSequenceByPath.get(notice.path) ?? 0;
+		if (latestObservedSequence < notice.sequence) return null;
+		const start = this.pendingExternalDiskMutationStarts.get(notice.path);
+		if (!start || start.sequence !== notice.sequence) {
+			return new Map<string, PendingExternalDiskMutationOwner>();
+		}
+		const owners = new Map<string, PendingExternalDiskMutationOwner>();
+		for (const [leafId, snapshot] of start.views) {
+			if (
+				this.bindings.get(leafId) === snapshot.binding
+				&& (this.bindingEpochByLeafId.get(leafId) ?? 0) === snapshot.bindingEpoch
+				&& snapshot.binding.path === notice.path
+				&& snapshot.binding.file.path === notice.path
+				&& snapshot.binding.view.file === snapshot.binding.file
+				&& this.isManagedBindingContinuationCurrent(
+					snapshot.continuation,
+					snapshot.binding,
+				)
+			) {
+				owners.set(leafId, Object.freeze({
+					continuation: snapshot.continuation,
+					binding: snapshot.binding,
+					bindingEpoch: snapshot.bindingEpoch,
+				}));
+			}
+		}
+		return owners;
 	}
 
 	/**
@@ -6181,10 +7150,13 @@ export class EditorBindingManager {
 	 * proves the disk write preceded it. Every captured editor/Y.Text identity,
 	 * content, epoch, and revision must still match before rollback.
 	 */
-	noteExternalDiskMutation(notice: ExternalDiskMutationNotice): void {
+	noteExternalDiskMutation(
+		notice: ExternalDiskMutationNotice,
+	): ExternalDiskMutationCompletionDisposition {
+		if (!this.asyncAuthorityOpen) return "terminal-no-candidate";
 		if (!this.isExternalDiskReloadGuardEnabled()) {
 			this.invalidateExternalDiskReloadCorrelation(notice.path, notice.sequence);
-			return;
+			return notice.content === null ? "controller-owned" : "terminal-no-candidate";
 		}
 		const hasLiveBinding = Array.from(this.bindings.values()).some(
 			(binding) =>
@@ -6192,17 +7164,58 @@ export class EditorBindingManager {
 				&& binding.view.file === binding.file
 				&& binding.file.path === notice.path,
 		);
+		const eligibleOwners = this.resolveExternalDiskMutationStartOwners(notice);
 		if (!hasLiveBinding) {
-			this.invalidateExternalDiskReloadCorrelation(notice.path, notice.sequence);
-			return;
+			// The exact read may finish after a managed source was detached or before
+			// its selected target was bound. The editor guard no longer owns a surface
+			// in that case, but the path-scoped reconciliation controller must still
+			// own the proven disk revision. Never arm a later editor with this marker.
+			if (notice.content !== null) {
+				this.deliverExternalDiskReloadOrRetain(notice);
+			}
+			this.retireExternalDiskReloadCorrelationThrough(
+				notice.path,
+				notice.sequence,
+			);
+			return "controller-owned";
 		}
 		const previousSequence =
 			this.lastExternalDiskMutationSequenceByPath.get(notice.path) ?? 0;
 		if (notice.sequence <= previousSequence) {
 			// Async reads may finish out of order. Never replace a newer exact
 			// marker with an older revision; preserve the older proven bytes instead.
-			if (notice.content !== null) {
-				this.notifyExternalDiskReloadIntercepted(notice);
+			const currentMarker = this.pendingExternalDiskMutations.get(notice.path);
+			const knownSelfWrite = this.hasSelfWriteExternalDiskMutationDisposition(
+				notice.path,
+				notice.sequence,
+			);
+			if (
+				notice.sequence === previousSequence
+				&& currentMarker?.sequence === notice.sequence
+			) {
+				if (currentMarker.provenance === "external") {
+					this.notifyPendingExternalDiskReloadIntercepted(currentMarker);
+				}
+				if (!knownSelfWrite) {
+					this.retireExternalDiskMutationStartThrough(
+						notice.path,
+						notice.sequence,
+					);
+				}
+			} else if (
+				notice.content !== null
+				&& !knownSelfWrite
+			) {
+				this.deliverExternalDiskReloadOrRetain(notice);
+				this.retireExternalDiskReloadCorrelationThrough(
+					notice.path,
+					notice.sequence,
+				);
+			} else if (!knownSelfWrite) {
+				this.retireExternalDiskMutationStartThrough(
+					notice.path,
+					notice.sequence,
+				);
 			}
 			this.trace?.("editor", "external-disk-reload-guard-stale-event", {
 				path: notice.path,
@@ -6210,16 +7223,44 @@ export class EditorBindingManager {
 				currentSequence: previousSequence,
 				contentPreserved: notice.content !== null,
 			});
-			return;
+			return "controller-owned";
+		}
+		if (eligibleOwners !== null && eligibleOwners.size === 0) {
+			// beginExternalDiskMutation observed this exact event, but none of its
+			// event-time binding identities still owns the path. A binding that appeared
+			// during the async raw read has no authority to consume this revision as a
+			// host reload marker; reconciliation owns it durably instead.
+			if (notice.content !== null) {
+				this.deliverExternalDiskReloadOrRetain(notice);
+			}
+			this.trace?.("editor", "external-disk-reload-start-owner-changed", {
+				path: notice.path,
+				sequence: notice.sequence,
+				contentPreserved: notice.content !== null,
+			});
+			this.retireExternalDiskReloadCorrelationThrough(
+				notice.path,
+				notice.sequence,
+			);
+			return "controller-owned";
 		}
 		this.lastExternalDiskMutationSequenceByPath.set(notice.path, notice.sequence);
+		if (!this.preserveSupersededExternalDiskMarker(notice.path, notice.sequence)) {
+			return "controller-owned";
+		}
 		const now = Date.now();
 		const candidate = this.getFreshRecentEditorOriginChange(notice.path, now);
 		const normalizedDiskContent = notice.content === null
 			? null
 			: normalizeEditorText(notice.content);
-		if (this.promoteHeldExternalDiskHostProjection(notice, normalizedDiskContent, now)) {
-			return;
+		if (this.promoteHeldExternalDiskHostProjection(
+			notice,
+			normalizedDiskContent,
+			now,
+			eligibleOwners,
+			"external",
+		)) {
+			return "controller-owned";
 		}
 		const candidateContentMatches =
 			candidate !== null &&
@@ -6255,7 +7296,7 @@ export class EditorBindingManager {
 
 		if (candidate && diskMutationPredatesEditorChange) {
 			this.recentEditorOriginChanges.delete(notice.path);
-			this.notifyExternalDiskReloadIntercepted(notice);
+			this.deliverExternalDiskReloadOrRetain(notice);
 			if (this.isRecentEditorOriginChangeCurrent(candidate)) {
 				applyDiffToYText(
 					candidate.ytext,
@@ -6283,7 +7324,11 @@ export class EditorBindingManager {
 					editorChangeAt: candidate.at,
 				});
 			}
-			return;
+			this.retireExternalDiskReloadCorrelationThrough(
+				notice.path,
+				notice.sequence,
+			);
+			return "controller-owned";
 		} else if (candidate && candidateContentMatches && exactDiskRevisionMatches) {
 			// Exact bytes/revision are known, but a coarse or non-monotonic clock
 			// cannot safely distinguish an editor API change from an editor-first
@@ -6292,7 +7337,7 @@ export class EditorBindingManager {
 			this.recentEditorOriginChanges.delete(notice.path);
 			const candidateStillCurrent = this.isRecentEditorOriginChangeCurrent(candidate);
 			if (!candidateStillCurrent) {
-				this.notifyExternalDiskReloadIntercepted(notice);
+				this.deliverExternalDiskReloadOrRetain(notice);
 			}
 			this.trace?.("editor", "external-disk-editor-reload-ambiguous-preserved", {
 				path: notice.path,
@@ -6303,7 +7348,13 @@ export class EditorBindingManager {
 				editorChangeAt: candidate.at,
 				externalCandidatePreserved: !candidateStillCurrent,
 			});
-			return;
+			this.retireExternalDiskReloadCorrelationThrough(
+				notice.path,
+				notice.sequence,
+			);
+			return candidateStillCurrent
+				? "terminal-no-candidate"
+				: "controller-owned";
 		} else if (
 			candidate &&
 			candidateContentMatches &&
@@ -6323,7 +7374,11 @@ export class EditorBindingManager {
 				editorChangeAt: candidate.at,
 				exactDiskRevisionMatches,
 			});
-			return;
+			this.retireExternalDiskReloadCorrelationThrough(
+				notice.path,
+				notice.sequence,
+			);
+			return "terminal-no-candidate";
 		}
 		if (notice.content === null) {
 			this.trace?.("editor", "external-disk-reload-guard-proof-unavailable", {
@@ -6332,16 +7387,23 @@ export class EditorBindingManager {
 				mtime: notice.mtime,
 				size: notice.size,
 			});
-			return;
+			this.retireExternalDiskReloadCorrelationThrough(
+				notice.path,
+				notice.sequence,
+			);
+			return "controller-owned";
 		}
 
 		this.rememberPendingExternalDiskMutation({
 			...notice,
+			provenance: "external",
 			at: now,
 			consumedLeafIds: new Set<string>(),
+			eligibleOwners,
 			retireScheduled: false,
-			candidateDeliveredFromEarlyHostProjection: false,
+			candidatePublished: false,
 		});
+		return "controller-owned";
 	}
 
 	/**
@@ -6351,6 +7413,16 @@ export class EditorBindingManager {
 	bind(view: MarkdownView, deviceName: string): void {
 		this.lastDeviceName = deviceName;
 		this.manageView(view);
+		const managedLeafId = this.getLeafId(view);
+		const managedRuntime = this.managedSessions.get(managedLeafId);
+		if (this.blocksSourceUnloadBindingReentry(managedRuntime)) {
+			this.trace?.("editor", "source-unload-drain-bind-reentry-blocked", {
+				leafId: managedLeafId,
+				path: managedRuntime?.sourceUnloadDrain?.sourcePath ?? null,
+				viewCurrent: managedRuntime?.session.view === view,
+			});
+			return;
+		}
 		const file = view.file;
 		if (!file) return;
 		if (!this.requireManagedBoundary(view, "bind")) return;
@@ -6472,6 +7544,15 @@ export class EditorBindingManager {
 	repair(view: MarkdownView, deviceName: string, reason: string): boolean {
 		this.lastDeviceName = deviceName;
 		this.manageView(view);
+		const managedRuntime = this.managedSessions.get(this.getLeafId(view));
+		if (this.blocksSourceUnloadBindingReentry(managedRuntime)) {
+			this.trace?.("editor", "source-unload-drain-repair-reentry-blocked", {
+				leafId: this.getLeafId(view),
+				path: managedRuntime?.sourceUnloadDrain?.sourcePath ?? null,
+				reason,
+			});
+			return true;
+		}
 		const file = view.file;
 		if (!file) return false;
 		if (!this.requireManagedBoundary(view, `repair:${reason}`)) return false;
@@ -6555,6 +7636,15 @@ export class EditorBindingManager {
 	heal(view: MarkdownView, deviceName: string, reason: string): boolean {
 		this.lastDeviceName = deviceName;
 		this.manageView(view);
+		const managedRuntime = this.managedSessions.get(this.getLeafId(view));
+		if (this.blocksSourceUnloadBindingReentry(managedRuntime)) {
+			this.trace?.("editor", "source-unload-drain-heal-reentry-blocked", {
+				leafId: this.getLeafId(view),
+				path: managedRuntime?.sourceUnloadDrain?.sourcePath ?? null,
+				reason,
+			});
+			return true;
+		}
 		const file = view.file;
 		if (!file) return false;
 		if (!this.requireManagedBoundary(view, `heal:${reason}`)) return false;
@@ -6581,6 +7671,15 @@ export class EditorBindingManager {
 	rebind(view: MarkdownView, deviceName: string, reason: string): void {
 		this.lastDeviceName = deviceName;
 		this.manageView(view);
+		const managedRuntime = this.managedSessions.get(this.getLeafId(view));
+		if (this.blocksSourceUnloadBindingReentry(managedRuntime)) {
+			this.trace?.("editor", "source-unload-drain-rebind-reentry-blocked", {
+				leafId: this.getLeafId(view),
+				path: managedRuntime?.sourceUnloadDrain?.sourcePath ?? null,
+				reason,
+			});
+			return;
+		}
 		const file = view.file;
 		if (!file) return;
 		if (!this.requireManagedBoundary(view, `rebind:${reason}`)) return;
@@ -6615,6 +7714,13 @@ export class EditorBindingManager {
 	 * Unbind a MarkdownView's editor (clear yCollab extension).
 	 */
 	unbind(view: MarkdownView): void {
+		const runtime = this.managedSessions.get(this.getLeafId(view));
+		if (runtime?.session.view === view) {
+			if (this.retainSourceUnloadDrainAcrossStructuralMutation(runtime, "unbind")) {
+				return;
+			}
+			this.teardownSourceUnloadDrain(runtime, "unbind");
+		}
 		this.detachBinding(view, "unbind", false);
 	}
 
@@ -6739,12 +7845,17 @@ export class EditorBindingManager {
 			runtime.cmGuard?.markInert();
 		}
 		this.samePathAdoptionRequiredPathByLeafId.clear();
+		this.activeSamePathExternalCandidateProjectionProofByPath.clear();
 		for (const timer of this.pendingHealthChecks.values()) clearTimeout(timer);
 		this.pendingHealthChecks.clear();
 		for (const timer of this.pendingCmResolveRetries.values()) clearTimeout(timer);
 		this.pendingCmResolveRetries.clear();
 		for (const timer of this.pendingUnmanageRetries.values()) clearTimeout(timer);
 		this.pendingUnmanageRetries.clear();
+		for (const pending of this.pendingStructuralSourceCloseSettlements.values()) {
+			if (pending.timer !== null) clearTimeout(pending.timer);
+		}
+		this.pendingStructuralSourceCloseSettlements.clear();
 		this.unmanageRetryAttempts.clear();
 		this.cmResolveAttempts.clear();
 		this.cmResolveDelayedLogged.clear();
@@ -6756,6 +7867,28 @@ export class EditorBindingManager {
 		this.samePathAdoptionRetryAttempts.clear();
 		this.samePathAdoptionRefreshScheduled.clear();
 		this.editorAuthorityShieldContinuations.clear();
+		this.clearExternalDiskCorrelationTimers();
+		this.clearAllExternalDiskCandidateDeliveryRetries();
+		this.clearExternalDiskCandidateDispositionLedger(
+			this.deliveredExternalDiskCandidateSequencesByPath,
+		);
+		this.clearExternalDiskCandidateDispositionLedger(
+			this.selfWriteExternalDiskMutationSequencesByPath,
+		);
+		this.activeSelfWriteExternalDiskMutationSequencesByPath.clear();
+		// Plugin teardown revokes the reconciliation controller before this manager.
+		// No pending raw marker can be transferred after that boundary; cancel every
+		// editor-side owner and timer without invoking the now-revoked callback.
+		this.pendingExternalDiskMutations.clear();
+		this.pendingExternalDiskMutationStarts.clear();
+		this.pendingExternalDiskHostProjectionFences = new WeakMap<
+			EditorState,
+			PendingExternalDiskHostProjectionFence
+		>();
+		this.claimedExternalDiskCandidateSequencesByPath.clear();
+		this.recentEditorOriginChanges.clear();
+		this.lastExternalDiskMutationSequenceByPath.clear();
+		this.observedExternalDiskMutationSequenceByPath.clear();
 	}
 
 	/**
@@ -6826,8 +7959,25 @@ export class EditorBindingManager {
 			restoreExactTeardownHostBoundary(runtime, runtime.session.view);
 			this.unmanageView(runtime.session.view, "unbind-all", true);
 		}
-		this.pendingExternalDiskMutations.clear();
+		for (const marker of Array.from(this.pendingExternalDiskMutations.values())) {
+			if (this.notifyPendingExternalDiskReloadIntercepted(marker)) {
+				this.retireExternalDiskReloadCorrelationThrough(
+					marker.path,
+					marker.sequence,
+				);
+			}
+		}
 		this.pendingExternalDiskMutationStarts.clear();
+		this.clearExternalDiskCorrelationTimers();
+		this.clearAllExternalDiskCandidateDeliveryRetries();
+		this.claimedExternalDiskCandidateSequencesByPath.clear();
+		this.clearExternalDiskCandidateDispositionLedger(
+			this.deliveredExternalDiskCandidateSequencesByPath,
+		);
+		this.clearExternalDiskCandidateDispositionLedger(
+			this.selfWriteExternalDiskMutationSequencesByPath,
+		);
+		this.activeSelfWriteExternalDiskMutationSequencesByPath.clear();
 		this.recentEditorOriginChanges.clear();
 		this.lastExternalDiskMutationSequenceByPath.clear();
 		this.observedExternalDiskMutationSequenceByPath.clear();
@@ -6839,18 +7989,60 @@ export class EditorBindingManager {
 	 * Called when a file is deleted (locally or remotely).
 	 */
 	unbindByPath(path: string): void {
+		const cancelledViews = new Set<MarkdownView>();
 		for (const [leafId, binding] of Array.from(this.bindings.entries())) {
 			if (binding.path === path) {
+				const runtime = this.managedSessions.get(leafId);
+				if (runtime?.session.view === binding.view) {
+					if (this.retainSourceUnloadDrainAcrossStructuralMutation(
+						runtime,
+						"unbind-by-path",
+					)) {
+						cancelledViews.add(binding.view);
+						this.lastTypingAwarenessAtByLeaf.delete(leafId);
+						this.lastEditorDocChangeAtByPath.delete(path);
+						this.log(`unbindByPath: retained terminal source "${path}" (leaf=${leafId})`);
+						continue;
+					}
+					this.teardownSourceUnloadDrain(runtime, "unbind-by-path");
+				}
 				this.cancelManagedHandoffAndUnmanage(
 					binding.view,
 					"unbind-by-path",
 					"deleted",
 				);
+				cancelledViews.add(binding.view);
 				this.lastTypingAwarenessAtByLeaf.delete(leafId);
 				this.lastEditorDocChangeAtByPath.delete(path);
 				this.log(`unbindByPath: unbound "${path}" (leaf=${leafId})`);
 				// Don't break — a path could theoretically be open in multiple leaves
 			}
+		}
+		for (const runtime of Array.from(this.managedSessions.values())) {
+			const view = runtime.session.view;
+			if (
+				cancelledViews.has(view)
+				|| !this.managedRuntimeNamesPath(runtime, path)
+				) continue;
+			const leafId = runtime.session.leafId;
+			if (this.retainSourceUnloadDrainAcrossStructuralMutation(
+				runtime,
+				"unbind-managed-path",
+			)) {
+				this.lastTypingAwarenessAtByLeaf.delete(leafId);
+				this.lastEditorDocChangeAtByPath.delete(path);
+				this.log(`unbindByPath: retained managed terminal source "${path}" (leaf=${leafId})`);
+				continue;
+			}
+			this.teardownSourceUnloadDrain(runtime, "unbind-managed-path");
+			this.cancelManagedHandoffAndUnmanage(
+				view,
+				"unbind-managed-path",
+				"deleted",
+			);
+			this.lastTypingAwarenessAtByLeaf.delete(leafId);
+			this.lastEditorDocChangeAtByPath.delete(path);
+			this.log(`unbindByPath: revoked managed path "${path}" (leaf=${leafId})`);
 		}
 		this.invalidateExternalDiskReloadCorrelation(path);
 	}
@@ -6866,20 +8058,64 @@ export class EditorBindingManager {
 	}
 
 	/**
+	 * Whether a managed editor lifetime still names this path as a displayed,
+	 * source-unload, or selected-target lineage. External disk observation uses
+	 * this broader boundary than `isBound`: handoff deliberately detaches A before
+	 * B can be attached, but neither path may lose exact filesystem revisions in
+	 * that interval.
+	 */
+	tracksExternalDiskMutationPath(path: string): boolean {
+		if (this.isBound(path)) return true;
+		for (const runtime of this.managedSessions.values()) {
+			if (this.managedRuntimeNamesPath(runtime, path)) return true;
+		}
+		return false;
+	}
+
+	private managedRuntimeNamesPath(runtime: ManagedLeafRuntime, path: string): boolean {
+		const session = runtime.session;
+		return (
+			// `view.file` is selection provenance only. Including it here makes the
+			// ownerless A-to-B seam observable to the disk reader; it does not admit the
+			// still-visible editor document as B authority.
+			session.view.file?.path === path
+			|| (session.displayedLineage.kind === "known"
+				&& session.displayedLineage.path === path)
+			|| (session.binding.kind === "bound" && session.binding.path === path)
+			|| session.handoff?.sourceAuthorityPath === path
+			|| session.handoff?.targetPath === path
+			|| runtime.sourceUnloadDrain?.sourcePath === path
+			|| runtime.transitionInputFence?.targetPath === path
+		);
+	}
+
+	/**
 	 * Update binding metadata after a batch rename. If any bound editor's
 	 * tracked path was renamed, update the tracking. The yCollab binding
 	 * itself doesn't need to change (stable file IDs), but our bookkeeping does.
 	 */
 	updatePathsAfterRename(renames: Map<string, string>): void {
+		const structurallyRetainedRuntimes = new Set<ManagedLeafRuntime>();
 		for (const [leafId, binding] of this.bindings) {
 			const newPath = renames.get(binding.path);
 			if (newPath) {
 				const previousPath = binding.path;
 				this.manageView(binding.view);
 				const runtime = this.managedSessions.get(leafId);
+				if (
+					runtime?.session.view === binding.view
+					&& this.retainSourceUnloadDrainAcrossStructuralMutation(
+						runtime,
+						`bound-path-renamed:${previousPath}->${newPath}`,
+					)
+				) {
+					structurallyRetainedRuntimes.add(runtime);
+					this.invalidateExternalDiskReloadCorrelation(previousPath);
+					continue;
+				}
 				const session = runtime?.session;
 				const displayed = session?.displayedLineage;
-				const exactRename = !!runtime
+					const exactRename = !!runtime
 					&& session?.view === binding.view
 					&& session.handoff === null
 					&& displayed?.kind === "known"
@@ -6889,9 +8125,29 @@ export class EditorBindingManager {
 					&& binding.file.path === newPath
 					&& session.binding.kind === "bound"
 					&& session.binding.path === previousPath
-					&& session.binding.fileId === binding.fileId
-					&& session.binding.ytext === binding.ytext;
-				const translated = exactRename && session
+						&& session.binding.fileId === binding.fileId
+						&& session.binding.ytext === binding.ytext;
+					const settledSourceOwner = runtime?.sourceUnloadDrain ?? null;
+					if (exactRename && settledSourceOwner?.state === "fenced") {
+						const exactSettledSource = settledSourceOwner.sourceFile === binding.file
+							&& settledSourceOwner.sourcePath === previousPath;
+						const released = exactSettledSource
+							&& this.teardownSourceUnloadDrain(
+								runtime,
+								`bound-path-renamed-settled:${previousPath}->${newPath}`,
+							);
+						if (!released) {
+							this.terminalizeSourceUnloadDrain(
+								runtime,
+								settledSourceOwner,
+								"bound-path-renamed-settled-release-unprovable",
+							);
+							structurallyRetainedRuntimes.add(runtime);
+							this.invalidateExternalDiskReloadCorrelation(previousPath);
+							continue;
+						}
+					}
+					const translated = exactRename && session
 					? reduceManagedLeafSession(session, {
 						type: "target-observed",
 						sessionId: session.sessionId,
@@ -6960,6 +8216,69 @@ export class EditorBindingManager {
 				this.publishLocalActiveFile(binding);
 			}
 		}
+		// A source drain may still own bound A while the host has selected target B.
+		// In that seam `binding.path` is A, so a B rename never enters the bound loop;
+		// the reducer also cannot publish a B handoff before the A input settles. Scan
+		// every managed runtime once for either the old path or the already-mutated
+		// target identity and retain the active source owner before unbound cleanup.
+		for (const runtime of Array.from(this.managedSessions.values())) {
+			if (structurallyRetainedRuntimes.has(runtime)) continue;
+			const renamedPath = Array.from(renames.entries()).find(([oldPath, newPath]) =>
+				this.managedRuntimeNamesPath(runtime, oldPath)
+				|| runtime.session.view.file?.path === newPath
+				|| (
+					runtime.sourceUnloadDrain?.sourcePath === oldPath
+					&& runtime.sourceUnloadDrain.sourceFile.path === newPath
+				)
+			);
+			if (!renamedPath) continue;
+			const [oldPath, newPath] = renamedPath;
+			if (!this.retainSourceUnloadDrainAcrossStructuralMutation(
+				runtime,
+				`managed-path-renamed:${oldPath}->${newPath}`,
+			)) continue;
+			structurallyRetainedRuntimes.add(runtime);
+			this.invalidateExternalDiskReloadCorrelation(oldPath);
+			this.trace?.("editor", "managed-source-drain-rename-retained", {
+				leafId: runtime.session.leafId,
+				oldPath,
+				newPath,
+			});
+		}
+		for (const runtime of Array.from(this.managedSessions.values())) {
+			if (structurallyRetainedRuntimes.has(runtime)) continue;
+			if (runtime.session.binding.kind !== "unbound") continue;
+			const renamedPath = Array.from(renames.entries()).find(([oldPath]) =>
+				this.managedRuntimeNamesPath(runtime, oldPath)
+			);
+			if (!renamedPath) continue;
+			const [oldPath, newPath] = renamedPath;
+			const leafId = runtime.session.leafId;
+			if (this.retainSourceUnloadDrainAcrossStructuralMutation(
+				runtime,
+				`unbound-path-renamed:${oldPath}->${newPath}`,
+			)) {
+				this.invalidateExternalDiskReloadCorrelation(oldPath);
+				this.trace?.("editor", "unbound-source-drain-rename-retained", {
+					leafId,
+					oldPath,
+					newPath,
+				});
+				continue;
+			}
+			this.teardownSourceUnloadDrain(runtime, "unbound-path-renamed");
+			this.cancelManagedHandoffAndUnmanage(
+				runtime.session.view,
+				`unbound-path-renamed:${oldPath}->${newPath}`,
+				"renamed",
+			);
+			this.invalidateExternalDiskReloadCorrelation(oldPath);
+			this.trace?.("editor", "unbound-handoff-rename-invalidated", {
+				leafId,
+				oldPath,
+				newPath,
+			});
+		}
 	}
 
 	getBindingDebugInfoForView(view: MarkdownView): BindingDebugInfo | null {
@@ -7026,6 +8345,15 @@ export class EditorBindingManager {
 		const snapshot = Array.from(this.bindings.entries());
 		for (const [leafId, binding] of snapshot) {
 			if (this.bindings.get(leafId) !== binding) continue;
+			const runtime = this.managedSessions.get(leafId);
+			if (this.blocksSourceUnloadBindingReentry(runtime)) {
+				this.trace?.("editor", "source-unload-drain-audit-reentry-blocked", {
+					leafId,
+					path: runtime?.sourceUnloadDrain?.sourcePath ?? null,
+					source,
+				});
+				continue;
+			}
 			if (this.healthWorkInFlight.has(leafId)) continue;
 			if (!this.isMarkdownPathSyncable(binding.path)) {
 				triggered += 1;
@@ -7134,6 +8462,7 @@ export class EditorBindingManager {
 	validateOpenEditorMutationTicket(
 		ticket: OpenEditorMutationTicket,
 		views: readonly MarkdownView[],
+		options: { ignoreSelectionAndScroll?: boolean } = {},
 	): OpenEditorMutationTicketValidation {
 		const validationAuthorityEpoch = this.readAuthorityEpoch();
 		if (views.length !== ticket.views.length) {
@@ -7290,10 +8619,16 @@ export class EditorBindingManager {
 				};
 			}
 			const guardSnapshot = this.managedSessions.get(snapshot.leafId)?.cmGuard?.snapshot() ?? null;
-			if ((guardSnapshot?.selectionEpoch ?? 0) !== snapshot.selectionEpoch) {
+			if (
+				!options.ignoreSelectionAndScroll
+				&& (guardSnapshot?.selectionEpoch ?? 0) !== snapshot.selectionEpoch
+			) {
 				return { current: false, reason: "selection-epoch-changed", leafId: snapshot.leafId };
 			}
-			if ((guardSnapshot?.scrollEpoch ?? 0) !== snapshot.scrollEpoch) {
+			if (
+				!options.ignoreSelectionAndScroll
+				&& (guardSnapshot?.scrollEpoch ?? 0) !== snapshot.scrollEpoch
+			) {
 				return { current: false, reason: "scroll-epoch-changed", leafId: snapshot.leafId };
 			}
 
@@ -7403,10 +8738,16 @@ export class EditorBindingManager {
 				return { current: false, reason: "editor-authority-content-changed", leafId: snapshot.leafId };
 			}
 			const finalGuard = this.managedSessions.get(snapshot.leafId)?.cmGuard?.snapshot() ?? null;
-			if ((finalGuard?.selectionEpoch ?? 0) !== snapshot.selectionEpoch) {
+			if (
+				!options.ignoreSelectionAndScroll
+				&& (finalGuard?.selectionEpoch ?? 0) !== snapshot.selectionEpoch
+			) {
 				return { current: false, reason: "selection-epoch-changed", leafId: snapshot.leafId };
 			}
-			if ((finalGuard?.scrollEpoch ?? 0) !== snapshot.scrollEpoch) {
+			if (
+				!options.ignoreSelectionAndScroll
+				&& (finalGuard?.scrollEpoch ?? 0) !== snapshot.scrollEpoch
+			) {
 				return { current: false, reason: "scroll-epoch-changed", leafId: snapshot.leafId };
 			}
 			if (
@@ -7863,15 +9204,32 @@ export class EditorBindingManager {
 		} else if (
 			pendingDiskMutation &&
 			pendingDiskMutation.content !== null &&
+			this.isPendingExternalDiskMutationEligibleForBinding(
+				pendingDiskMutation,
+				leafId,
+				binding,
+			) &&
 			!pendingDiskMutation.consumedLeafIds.has(leafId) &&
 			incomingContent === normalizeEditorText(pendingDiskMutation.content)
 		) {
 			// The external disk event is stronger evidence than a transient
 			// editor/Y.Text mismatch. This also covers a provider advance landing
 			// between the disk event and Obsidian's editor reload.
+			this.rejectPendingExternalDiskProjection({
+				leafId,
+				binding,
+				currentText: editorContent,
+				incomingText: incomingContent,
+				candidate: pendingDiskMutation,
+				proof: this.resolveExternalDiskHostSnapshotProof({
+					leafId,
+					binding,
+					currentText: editorContent,
+					incomingText: incomingContent,
+				}),
+				lane: "transaction-filter-exact",
+			});
 			this.recentEditorOriginChanges.delete(binding.path);
-			this.consumePendingExternalDiskMutation(pendingDiskMutation, leafId);
-			this.notifyPendingExternalDiskReloadIntercepted(pendingDiskMutation);
 			this.trace?.("editor", "external-disk-editor-reload-blocked", {
 				path: binding.path,
 				leafId,
@@ -7886,6 +9244,11 @@ export class EditorBindingManager {
 		} else if (
 			pendingDiskMutation &&
 			pendingDiskMutation.content !== null &&
+			this.isPendingExternalDiskMutationEligibleForBinding(
+				pendingDiskMutation,
+				leafId,
+				binding,
+			) &&
 			!pendingDiskMutation.consumedLeafIds.has(leafId) &&
 			transaction.annotation(Transaction.userEvent) === "set" &&
 			this.prepareExternalDiskHostProjection({
@@ -7905,8 +9268,6 @@ export class EditorBindingManager {
 			// not an unrelated editor API call. The reconciliation controller alone
 			// chooses and applies any resulting plan Y.Text-first.
 			this.recentEditorOriginChanges.delete(binding.path);
-			this.consumePendingExternalDiskMutation(pendingDiskMutation, leafId);
-			this.notifyPendingExternalDiskReloadIntercepted(pendingDiskMutation);
 			this.trace?.("editor", "external-disk-editor-host-merge-blocked", {
 				path: binding.path,
 				leafId,
@@ -8021,13 +9382,11 @@ export class EditorBindingManager {
 		) {
 			return false;
 		}
-		return this.restoreExternalDiskHostViewCache(
+		return this.rejectPendingExternalDiskProjection({
+			...input,
 			proof,
-			input.currentText,
-			input.incomingText,
-			input.candidate.sequence,
-			true,
-		);
+			lane: "host-projection",
+		});
 	}
 
 	private prepareHeldExternalDiskHostProjection(input: {
@@ -8045,17 +9404,68 @@ export class EditorBindingManager {
 			hostMergedContent: input.incomingText,
 			externalLogicalContent: proof.externalLogicalContent,
 		};
-		if (!this.restoreExternalDiskHostViewCache(
+		const lease = this.acquireExternalDiskHostSaveFence(input.leafId, proof);
+		const restored = lease !== null && this.restoreExternalDiskHostViewCache(
 			proof,
+			input.leafId,
 			input.currentText,
 			input.incomingText,
 			proof.start.sequence,
 			false,
-		)) {
-			proof.snapshot.heldProjection = null;
-			return null;
+			lease,
+		);
+		if (restored && lease) {
+			this.releaseExternalDiskHostSaveFence(lease, "held-host-cache-restored");
 		}
+		// Once event-time host provenance is proven, cache setter failure cannot turn
+		// the projection back into an ordinary plugin edit. Keep the held raw-proof
+		// correlation and the emergency save owner fail-closed.
 		return proof.start.sequence;
+	}
+
+	private rejectPendingExternalDiskProjection(input: {
+		leafId: string;
+		binding: EditorBinding;
+		currentText: string;
+		incomingText: string;
+		candidate: PendingExternalDiskMutation;
+		proof: ExternalDiskHostSnapshotProof | null;
+		lane: string;
+	}): boolean {
+		const lease = input.proof
+			? this.acquireExternalDiskHostSaveFence(input.leafId, input.proof)
+			: null;
+		const consumed = this.consumePendingExternalDiskMutation(
+			input.candidate,
+			input.leafId,
+			input.binding,
+			input.lane,
+		);
+		if (!consumed) {
+			// The projection was already proven against this event-time owner. Never
+			// admit it merely because a fence acquisition or callback re-entered lifecycle.
+			return true;
+		}
+		// Candidate/self-write disposition is finalized before touching TextFileView
+		// cache. Callback reentry and callback failure are both exactly-once.
+		if (!this.notifyPendingExternalDiskReloadIntercepted(input.candidate)) {
+			input.candidate.retireScheduled = false;
+			return true;
+		}
+		if (!input.proof || !lease) return true;
+		const restored = this.restoreExternalDiskHostViewCache(
+			input.proof,
+			input.leafId,
+			input.currentText,
+			input.incomingText,
+			input.candidate.sequence,
+			true,
+			lease,
+		);
+		if (restored) {
+			this.releaseExternalDiskHostSaveFence(lease, "external-host-cache-restored");
+		}
+		return true;
 	}
 
 	private resolveExternalDiskHostProjectionProof(input: {
@@ -8064,6 +9474,26 @@ export class EditorBindingManager {
 		currentText: string;
 		incomingText: string;
 	}): ExternalDiskHostProjectionProof | null {
+		const snapshotProof = this.resolveExternalDiskHostSnapshotProof(input);
+		if (!snapshotProof) return null;
+		const { start, snapshot, runtimeView } = snapshotProof;
+		if (typeof runtimeView.lastSavedData !== "string") return null;
+		const externalLogicalContent = normalizeEditorText(runtimeView.lastSavedData);
+		if (
+			snapshot.lastSavedData !== null &&
+			normalizeEditorText(snapshot.lastSavedData) === externalLogicalContent
+		) {
+			return null;
+		}
+		return { start, snapshot, runtimeView, externalLogicalContent };
+	}
+
+	private resolveExternalDiskHostSnapshotProof(input: {
+		leafId: string;
+		binding: EditorBinding;
+		currentText: string;
+		incomingText: string;
+	}): ExternalDiskHostSnapshotProof | null {
 		const start = this.pendingExternalDiskMutationStarts.get(input.binding.path);
 		if (!start || Date.now() - start.at > EXTERNAL_DISK_RELOAD_CORRELATION_MS) {
 			if (start) {
@@ -8101,16 +9531,12 @@ export class EditorBindingManager {
 			data?: unknown;
 			lastSavedData?: unknown;
 		};
-		if (runtimeView.data !== input.incomingText) return null;
-		if (typeof runtimeView.lastSavedData !== "string") return null;
-		const externalLogicalContent = normalizeEditorText(runtimeView.lastSavedData);
-		if (
-			snapshot.lastSavedData !== null &&
-			normalizeEditorText(snapshot.lastSavedData) === externalLogicalContent
-		) {
+		try {
+			if (runtimeView.data !== input.incomingText) return null;
+		} catch {
 			return null;
 		}
-		return { start, snapshot, runtimeView, externalLogicalContent };
+		return { start, snapshot, runtimeView };
 	}
 
 	private isExactExternalDiskHostSuccessorPreimage(
@@ -8178,14 +9604,58 @@ export class EditorBindingManager {
 		);
 	}
 
+	private acquireExternalDiskHostSaveFence(
+		leafId: string,
+		proof: ExternalDiskHostSnapshotProof,
+	): ExternalDiskHostSaveFenceLease | null {
+		const runtime = this.managedSessions.get(leafId);
+		if (
+			!runtime ||
+			runtime.session.view !== proof.snapshot.view ||
+			proof.snapshot.binding.view !== runtime.session.view
+		) return null;
+		const previousFence = runtime.emergencySaveFence;
+		if (!this.ensureEmergencyHostSaveFence(runtime, "external-host-cache-projection")) {
+			return null;
+		}
+		const fence = runtime.emergencySaveFence;
+		if (!fence) return null;
+		return {
+			runtime,
+			fence,
+			acquiredForProjection: previousFence === null,
+		};
+	}
+
+	private releaseExternalDiskHostSaveFence(
+		lease: ExternalDiskHostSaveFenceLease,
+		reason: string,
+	): void {
+		if (!lease.acquiredForProjection) return;
+		if (
+			this.managedSessions.get(lease.runtime.session.leafId) !== lease.runtime ||
+			lease.runtime.emergencySaveFence !== lease.fence
+		) return;
+		this.releaseEmergencyHostSaveFence(lease.runtime, reason, true);
+	}
+
 	private restoreExternalDiskHostViewCache(
-		proof: ExternalDiskHostProjectionProof,
+		proof: ExternalDiskHostSnapshotProof,
+		leafId: string,
 		currentText: string,
 		incomingText: string,
 		sequence: number,
 		retireSnapshot: boolean,
+		lease: ExternalDiskHostSaveFenceLease,
 	): boolean {
 		try {
+			if (
+				this.managedSessions.get(leafId) !== lease.runtime ||
+				lease.runtime.emergencySaveFence !== lease.fence ||
+				!lease.fence.isCurrent() ||
+				this.bindings.get(leafId) !== proof.snapshot.binding ||
+				(this.bindingEpochByLeafId.get(leafId) ?? 0) !== proof.snapshot.bindingEpoch
+			) return false;
 			if (!this.isManagedBindingContinuationCurrent(
 				proof.snapshot.continuation,
 				proof.snapshot.binding,
@@ -8202,6 +9672,17 @@ export class EditorBindingManager {
 			this.advanceAuthorityEpoch();
 			proof.runtimeView.data = currentText;
 			if (proof.runtimeView.data !== currentText) return false;
+			if (
+				this.managedSessions.get(leafId) !== lease.runtime ||
+				lease.runtime.emergencySaveFence !== lease.fence ||
+				!lease.fence.isCurrent() ||
+				this.bindings.get(leafId) !== proof.snapshot.binding ||
+				(this.bindingEpochByLeafId.get(leafId) ?? 0) !== proof.snapshot.bindingEpoch ||
+				!this.isManagedBindingContinuationCurrent(
+					proof.snapshot.continuation,
+					proof.snapshot.binding,
+				)
+			) return false;
 			if (retireSnapshot) {
 				for (const [leafId, candidate] of proof.start.views) {
 					if (candidate !== proof.snapshot) continue;
@@ -8335,18 +9816,32 @@ export class EditorBindingManager {
 		if (
 			pendingDiskMutation &&
 			pendingDiskMutation.content !== null &&
+			this.isPendingExternalDiskMutationEligibleForBinding(
+				pendingDiskMutation,
+				leafId,
+				binding,
+			) &&
 			incomingContent === normalizeEditorText(pendingDiskMutation.content)
 		) {
 			// A document-changing transaction reaching the extender proves that the
 			// regular filter was bypassed (`filter: false`) or rewritten later. Preserve
 			// the exact external bytes, then restore the previous editor document with a
 			// post-update compare-and-revert.
+			this.rejectPendingExternalDiskProjection({
+				leafId,
+				binding,
+				currentText: editorContent,
+				incomingText: incomingContent,
+				candidate: pendingDiskMutation,
+				proof: this.resolveExternalDiskHostSnapshotProof({
+					leafId,
+					binding,
+					currentText: editorContent,
+					incomingText: incomingContent,
+				}),
+				lane: "transaction-extender-exact",
+			});
 			this.recentEditorOriginChanges.delete(binding.path);
-			const alreadyConsumed = pendingDiskMutation.consumedLeafIds.has(leafId);
-			this.consumePendingExternalDiskMutation(pendingDiskMutation, leafId);
-			if (!alreadyConsumed) {
-				this.notifyPendingExternalDiskReloadIntercepted(pendingDiskMutation);
-			}
 			this.trace?.("editor", "external-disk-editor-reload-filter-bypassed", {
 				path: binding.path,
 				leafId,
@@ -8364,6 +9859,11 @@ export class EditorBindingManager {
 		if (
 			pendingDiskMutation &&
 			pendingDiskMutation.content !== null &&
+			this.isPendingExternalDiskMutationEligibleForBinding(
+				pendingDiskMutation,
+				leafId,
+				binding,
+			) &&
 			!pendingDiskMutation.consumedLeafIds.has(leafId) &&
 			transaction.annotation(Transaction.userEvent) === "set" &&
 			this.prepareExternalDiskHostProjection({
@@ -8378,8 +9878,6 @@ export class EditorBindingManager {
 			// exact host lineage proof here, then schedule the same post-update CAS
 			// rollback used for an exact external replacement.
 			this.recentEditorOriginChanges.delete(binding.path);
-			this.consumePendingExternalDiskMutation(pendingDiskMutation, leafId);
-			this.notifyPendingExternalDiskReloadIntercepted(pendingDiskMutation);
 			this.trace?.("editor", "external-disk-editor-host-merge-filter-bypassed", {
 				path: binding.path,
 				leafId,
@@ -8449,6 +9947,7 @@ export class EditorBindingManager {
 		startState: EditorState,
 		fence: PendingExternalDiskHostProjectionFence,
 	): void {
+		if (!this.asyncAuthorityOpen) return;
 		this.pendingExternalDiskHostProjectionFences.set(startState, fence);
 		queueMicrotask(() => {
 			if (this.pendingExternalDiskHostProjectionFences.get(startState) === fence) {
@@ -8489,6 +9988,7 @@ export class EditorBindingManager {
 		afterContent: string,
 		startState: EditorState,
 	): void {
+		if (!this.asyncAuthorityOpen) return;
 		this.manageView(binding.view);
 		const continuation = this.captureManagedBindingContinuation(binding);
 		if (
@@ -8540,6 +10040,8 @@ export class EditorBindingManager {
 		notice: ExternalDiskMutationNotice,
 		normalizedDiskContent: string | null,
 		now: number,
+		eligibleOwners: Map<string, PendingExternalDiskMutationOwner> | null,
+		provenance: ExternalDiskMutationProvenance,
 	): boolean {
 		const start = this.pendingExternalDiskMutationStarts.get(notice.path);
 		if (
@@ -8551,6 +10053,7 @@ export class EditorBindingManager {
 		}
 
 		const matchedLeafIds = new Set<string>();
+		const matchedOwners = new Map<string, PendingExternalDiskMutationOwner>();
 		let heldCount = 0;
 		for (const [leafId, snapshot] of start.views) {
 			const held = snapshot.heldProjection;
@@ -8559,9 +10062,14 @@ export class EditorBindingManager {
 			snapshot.heldProjection = null;
 			if (
 				normalizedDiskContent !== null &&
-				held.externalLogicalContent === normalizedDiskContent
+					held.externalLogicalContent === normalizedDiskContent
 			) {
 				matchedLeafIds.add(leafId);
+				matchedOwners.set(leafId, Object.freeze({
+					continuation: snapshot.continuation,
+					binding: snapshot.binding,
+					bindingEpoch: snapshot.bindingEpoch,
+				}));
 				start.views.delete(leafId);
 			}
 		}
@@ -8581,15 +10089,22 @@ export class EditorBindingManager {
 
 		const marker: PendingExternalDiskMutation = {
 			...notice,
+			provenance,
 			at: now,
 			consumedLeafIds: matchedLeafIds,
+			eligibleOwners: eligibleOwners ?? matchedOwners,
 			retireScheduled: false,
-			candidateDeliveredFromEarlyHostProjection: true,
+			candidatePublished: false,
 		};
 		this.recentEditorOriginChanges.delete(notice.path);
-		this.notifyExternalDiskReloadIntercepted(notice);
+		if (provenance === "external") {
+			marker.candidatePublished =
+				this.deliverExternalDiskReloadOrRetain(notice) === "delivered";
+		}
 		this.rememberPendingExternalDiskMutation(marker);
-		this.trace?.("editor", "external-disk-editor-host-merge-held-proven", {
+		this.trace?.("editor", provenance === "external"
+			? "external-disk-editor-host-merge-held-proven"
+			: "self-write-editor-host-merge-held-proven", {
 			path: notice.path,
 			sequence: notice.sequence,
 			heldLeafCount: matchedLeafIds.size,
@@ -8597,11 +10112,55 @@ export class EditorBindingManager {
 		return true;
 	}
 
+	private preserveSupersededExternalDiskMarker(path: string, sequence: number): boolean {
+		const previous = this.pendingExternalDiskMutations.get(path);
+		if (!previous || previous.sequence >= sequence) return true;
+		if (previous.provenance === "external") {
+			if (!this.notifyPendingExternalDiskReloadIntercepted(previous)) return false;
+		}
+		this.retireExternalDiskReloadCorrelationThrough(path, previous.sequence);
+		this.trace?.("editor", "external-disk-marker-superseded", {
+			path,
+			previousSequence: previous.sequence,
+			sequence,
+			previousProvenance: previous.provenance,
+		});
+		return true;
+	}
+
+	private scheduleExternalDiskCorrelationTimer(
+		callback: () => void,
+		delay: number,
+	): ReturnType<typeof setTimeout> | null {
+		if (!this.asyncAuthorityOpen) return null;
+		let timer: ReturnType<typeof setTimeout>;
+		timer = setTimeout(() => {
+			this.pendingExternalDiskCorrelationTimers.delete(timer);
+			if (!this.asyncAuthorityOpen) return;
+			callback();
+		}, delay);
+		this.pendingExternalDiskCorrelationTimers.add(timer);
+		(timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+		return timer;
+	}
+
+	private clearExternalDiskCorrelationTimers(): void {
+		for (const timer of this.pendingExternalDiskCorrelationTimers) {
+			clearTimeout(timer);
+		}
+		this.pendingExternalDiskCorrelationTimers.clear();
+	}
+
 	private rememberPendingExternalDiskMutation(marker: PendingExternalDiskMutation): void {
+		if (!this.asyncAuthorityOpen) return;
 		this.pendingExternalDiskMutations.set(marker.path, marker);
-		setTimeout(() => {
+		this.scheduleExternalDiskCorrelationTimer(() => {
 			if (this.pendingExternalDiskMutations.get(marker.path) === marker) {
-				this.pendingExternalDiskMutations.delete(marker.path);
+				if (!this.notifyPendingExternalDiskReloadIntercepted(marker)) return;
+				this.retireExternalDiskReloadCorrelationThrough(
+					marker.path,
+					marker.sequence,
+				);
 			}
 		}, EXTERNAL_DISK_RELOAD_CORRELATION_MS);
 	}
@@ -8612,14 +10171,80 @@ export class EditorBindingManager {
 		if (Date.now() - marker.at <= EXTERNAL_DISK_RELOAD_CORRELATION_MS) {
 			return marker;
 		}
-		this.pendingExternalDiskMutations.delete(path);
+		if (!this.notifyPendingExternalDiskReloadIntercepted(marker)) return marker;
+		this.retireExternalDiskReloadCorrelationThrough(path, marker.sequence);
 		return null;
+	}
+
+	private isPendingExternalDiskMutationEligibleForBinding(
+		marker: PendingExternalDiskMutation,
+		leafId: string,
+		binding: EditorBinding,
+	): boolean {
+		if (marker.eligibleOwners === null) return true;
+		const owner = marker.eligibleOwners.get(leafId);
+		return !!owner
+			&& owner.binding === binding
+			&& this.bindings.get(leafId) === binding
+			&& (this.bindingEpochByLeafId.get(leafId) ?? 0) === owner.bindingEpoch
+			&& binding.path === marker.path
+			&& binding.file.path === marker.path
+			&& binding.view.file === binding.file
+			&& this.isManagedBindingContinuationCurrent(owner.continuation, binding);
+	}
+
+	private preserveOrphanedExternalDiskMutationAfterOwnerChange(
+		marker: PendingExternalDiskMutation,
+	): void {
+		if (marker.eligibleOwners === null) return;
+		const hasCurrentUnconsumedOwner = Array.from(marker.eligibleOwners.entries()).some(
+			([leafId]) => {
+				if (marker.consumedLeafIds.has(leafId)) return false;
+				const currentBinding = this.bindings.get(leafId);
+				return !!currentBinding
+					&& this.isPendingExternalDiskMutationEligibleForBinding(
+						marker,
+						leafId,
+						currentBinding,
+					);
+			},
+		);
+		if (hasCurrentUnconsumedOwner) return;
+
+		// A cache setter/getter can synchronously close the sole pane while the exact
+		// host projection is being rejected. If no original owner remains and no pane
+		// already delivered these bytes, hand the exact raw revision to the controller
+		// before sequence-scoped retirement. Never let a successor binding consume it.
+		const alreadyDelivered = marker.provenance === "self-write"
+			|| marker.candidatePublished;
+		if (!this.notifyPendingExternalDiskReloadIntercepted(marker)) return;
+		this.retireExternalDiskReloadCorrelationThrough(marker.path, marker.sequence);
+		this.trace?.("editor", "external-disk-reload-orphaned-owner-preserved", {
+			path: marker.path,
+			sequence: marker.sequence,
+			alreadyDelivered,
+		});
 	}
 
 	private consumePendingExternalDiskMutation(
 		marker: PendingExternalDiskMutation,
 		leafId: string,
-	): void {
+		binding: EditorBinding,
+		lane: string,
+	): boolean {
+		// Revalidate at the final consumption boundary. Host/cache inspection can
+		// synchronously re-enter pane lifecycle code after the earlier filter check.
+		if (!this.isPendingExternalDiskMutationEligibleForBinding(marker, leafId, binding)) {
+			this.trace?.("editor", "external-disk-reload-consume-owner-changed", {
+				path: marker.path,
+				leafId,
+				sequence: marker.sequence,
+				lane,
+				bindingCurrent: this.bindings.get(leafId) === binding,
+			});
+			this.preserveOrphanedExternalDiskMutationAfterOwnerChange(marker);
+			return false;
+		}
 		const start = this.pendingExternalDiskMutationStarts.get(marker.path);
 		if (start?.sequence === marker.sequence) {
 			start.views.delete(leafId);
@@ -8628,15 +10253,22 @@ export class EditorBindingManager {
 			}
 		}
 		marker.consumedLeafIds.add(leafId);
-		if (marker.retireScheduled) return;
+		if (marker.retireScheduled) return true;
 		const allLiveBindingsConsumed = () => Array.from(this.bindings.entries())
 			.filter(([, binding]) =>
 				binding.path === marker.path
-				&& binding.view.file === binding.file
-				&& binding.file.path === marker.path
+					&& binding.view.file === binding.file
+					&& binding.file.path === marker.path
+			)
+			.filter(([candidateLeafId, candidateBinding]) =>
+				this.isPendingExternalDiskMutationEligibleForBinding(
+					marker,
+					candidateLeafId,
+					candidateBinding,
+				)
 			)
 			.every(([candidateLeafId]) => marker.consumedLeafIds.has(candidateLeafId));
-		if (!allLiveBindingsConsumed()) return;
+		if (!allLiveBindingsConsumed()) return true;
 
 		// Keep the marker through the remainder of transaction construction. A
 		// later filter may recreate changes after our filter returned [], and the
@@ -8644,17 +10276,19 @@ export class EditorBindingManager {
 		marker.retireScheduled = true;
 		queueMicrotask(() => {
 			if (this.pendingExternalDiskMutations.get(marker.path) !== marker) return;
-			if (allLiveBindingsConsumed()) {
+			if (marker.retireScheduled && allLiveBindingsConsumed()) {
 				this.pendingExternalDiskMutations.delete(marker.path);
 			} else {
 				marker.retireScheduled = false;
 			}
 		});
+		return true;
 	}
 
 	private rememberRecentEditorOriginChange(candidate: RecentEditorOriginChange): void {
+		if (!this.asyncAuthorityOpen) return;
 		this.recentEditorOriginChanges.set(candidate.path, candidate);
-		setTimeout(() => {
+		this.scheduleExternalDiskCorrelationTimer(() => {
 			if (this.recentEditorOriginChanges.get(candidate.path) === candidate) {
 				this.recentEditorOriginChanges.delete(candidate.path);
 			}
@@ -8727,17 +10361,95 @@ export class EditorBindingManager {
 			&& candidate.ytext.toJSON() === candidate.afterContent;
 	}
 
-	private clearExternalDiskReloadCorrelation(path: string): void {
-		this.pendingExternalDiskMutations.delete(path);
-		this.pendingExternalDiskMutationStarts.delete(path);
-		this.recentEditorOriginChanges.delete(path);
+	private clearExternalDiskReloadCorrelation(
+		path: string,
+		throughSequence = this.observedExternalDiskMutationSequenceByPath.get(path) ?? 0,
+	): boolean {
+		if (!this.asyncAuthorityOpen) return true;
+		// Candidate delivery may synchronously re-enter begin/completion for a newer
+		// event on this path. Capture every exact owner before the callback and clear
+		// it only if both identity and sequence are still the ones being invalidated.
+		const pending = this.pendingExternalDiskMutations.get(path);
+		const start = this.pendingExternalDiskMutationStarts.get(path);
+		const recentEditorChange = this.recentEditorOriginChanges.get(path);
+		if (pending && pending.sequence <= throughSequence) {
+			this.notifyPendingExternalDiskReloadIntercepted(pending);
+		}
+		if (
+			pending
+			&& pending.sequence <= throughSequence
+			&& this.pendingExternalDiskMutations.get(path) === pending
+		) {
+			this.pendingExternalDiskMutations.delete(path);
+		}
+		if (
+			start
+			&& start.sequence <= throughSequence
+			&& this.pendingExternalDiskMutationStarts.get(path) === start
+		) {
+			this.pendingExternalDiskMutationStarts.delete(path);
+		}
+		if (
+			recentEditorChange
+			&& recentEditorChange.observedDiskSequence <= throughSequence
+			&& this.recentEditorOriginChanges.get(path) === recentEditorChange
+		) {
+			this.recentEditorOriginChanges.delete(path);
+		}
+		return true;
+	}
+
+	private retireExternalDiskMutationStartThrough(
+		path: string,
+		throughSequence: number,
+	): void {
+		if (!this.asyncAuthorityOpen) return;
+		const start = this.pendingExternalDiskMutationStarts.get(path);
+		if (start && start.sequence <= throughSequence) {
+			this.pendingExternalDiskMutationStarts.delete(path);
+		}
+	}
+
+	/**
+	 * Retire one completed exact notice without erasing a newer in-flight event on
+	 * the same path. Lifecycle invalidation remains path-wide; async read
+	 * completion is sequence-scoped.
+	 */
+	private retireExternalDiskReloadCorrelationThrough(
+		path: string,
+		throughSequence: number,
+	): void {
+		if (!this.asyncAuthorityOpen) return;
+		const pending = this.pendingExternalDiskMutations.get(path);
+		if (pending && pending.sequence <= throughSequence) {
+			this.pendingExternalDiskMutations.delete(path);
+		}
+		const start = this.pendingExternalDiskMutationStarts.get(path);
+		if (start && start.sequence <= throughSequence) {
+			this.pendingExternalDiskMutationStarts.delete(path);
+		}
+		const recentEditorChange = this.recentEditorOriginChanges.get(path);
+		const latestObservedSequence =
+			this.observedExternalDiskMutationSequenceByPath.get(path) ?? 0;
+		if (
+			recentEditorChange
+			&& latestObservedSequence <= throughSequence
+			&& recentEditorChange.observedDiskSequence <= throughSequence
+		) {
+			this.recentEditorOriginChanges.delete(path);
+		}
+		const previous = this.lastExternalDiskMutationSequenceByPath.get(path) ?? 0;
+		if (throughSequence > previous) {
+			this.lastExternalDiskMutationSequenceByPath.set(path, throughSequence);
+		}
 	}
 
 	private invalidateExternalDiskReloadCorrelation(
 		path: string,
 		throughSequence = this.observedExternalDiskMutationSequenceByPath.get(path) ?? 0,
 	): void {
-		this.clearExternalDiskReloadCorrelation(path);
+		if (!this.asyncAuthorityOpen) return;
+		if (!this.clearExternalDiskReloadCorrelation(path, throughSequence)) return;
 		const previous = this.lastExternalDiskMutationSequenceByPath.get(path) ?? 0;
 		if (throughSequence > previous) {
 			// A proof started for an earlier binding/runtime lifetime must not arm a
@@ -8746,8 +10458,28 @@ export class EditorBindingManager {
 		}
 	}
 
-	private notifyExternalDiskReloadIntercepted(notice: ExternalDiskMutationNotice): void {
-		if (notice.content === null) return;
+	private attemptExternalDiskReloadDelivery(
+		notice: ExternalDiskMutationNotice,
+	): ExternalDiskCandidateDeliveryAttempt {
+		if (!this.asyncAuthorityOpen || notice.content === null) {
+			return "callback-unavailable";
+		}
+		if (
+			this.hasSelfWriteExternalDiskMutationDisposition(
+				notice.path,
+				notice.sequence,
+			)
+			|| this.hasExternalDiskCandidateDisposition(
+				this.deliveredExternalDiskCandidateSequencesByPath,
+				notice.path,
+				notice.sequence,
+			)
+		) return "already-resolved";
+		const callback = this.onExternalDiskReloadIntercepted;
+		if (!callback) return "callback-unavailable";
+		if (!this.claimExternalDiskCandidate(notice.path, notice.sequence)) {
+			return "claim-busy";
+		}
 		const candidate: InterceptedExternalDiskMutation = Object.freeze({
 			path: notice.path,
 			ctime: notice.ctime,
@@ -8758,21 +10490,293 @@ export class EditorBindingManager {
 			content: notice.content,
 		});
 		try {
-			this.onExternalDiskReloadIntercepted?.(candidate);
+			callback(candidate);
 		} catch (error) {
+			this.releaseExternalDiskCandidateClaim(notice.path, notice.sequence);
 			this.trace?.("editor", "external-disk-candidate-callback-failed", {
 				path: notice.path,
 				sequence: notice.sequence,
 				error: error instanceof Error ? error.message : String(error),
 			});
+			return "callback-failed";
+		}
+		this.rememberExternalDiskCandidateDisposition(
+			this.deliveredExternalDiskCandidateSequencesByPath,
+			notice.path,
+			notice.sequence,
+		);
+		// Callback reentry may have observed the in-flight claim and installed an
+		// exact retry. The outer success is authoritative and cancels that retry.
+		this.clearExternalDiskCandidateDeliveryRetry(notice.path, notice.sequence);
+		this.releaseExternalDiskCandidateClaim(notice.path, notice.sequence);
+		if (
+			typeof __KAOS_QA_HARNESS_ENABLED__ !== "undefined"
+			&& __KAOS_QA_HARNESS_ENABLED__
+		) {
+			editorHandoffHostQaBarriers?.get(this)?.recordInterceptedExternalDiskMutation(
+				Object.freeze({
+					path: notice.path,
+					sequence: notice.sequence,
+					observedAt: notice.observedAt,
+					contentHash: sha256HandoffRecoveryHexSync(notice.content),
+				}),
+			);
+		}
+		return "delivered";
+	}
+
+	private deliverExternalDiskReloadOrRetain(
+		notice: ExternalDiskMutationNotice,
+	): ExternalDiskCandidateDeliveryDisposition {
+		// Once callback failure transfers the raw revision here, that first frozen
+		// candidate remains the exact retry payload even if a malformed duplicate
+		// completion later reuses the sequence with different fields.
+		const retainedCandidate = this.pendingExternalDiskCandidateDeliveryRetries
+			.get(notice.path)?.get(notice.sequence)?.candidate;
+		const exactNotice = retainedCandidate ?? notice;
+		const attempt = this.attemptExternalDiskReloadDelivery(exactNotice);
+		if (attempt === "delivered" || attempt === "already-resolved") {
+			this.clearExternalDiskCandidateDeliveryRetry(notice.path, notice.sequence);
+			return "delivered";
+		}
+		if (attempt === "callback-unavailable") {
+			// There is no downstream owner in this manager configuration. In
+			// particular, do not create an unbounded retry timer that can never fire.
+			return "callback-unavailable";
+		}
+		return this.rememberExternalDiskCandidateDeliveryRetry(exactNotice)
+			? "retained-for-retry"
+			: "callback-unavailable";
+	}
+
+	private rememberExternalDiskCandidateDeliveryRetry(
+		notice: ExternalDiskMutationNotice,
+	): boolean {
+		if (
+			!this.asyncAuthorityOpen
+			|| notice.content === null
+			|| !this.onExternalDiskReloadIntercepted
+			|| this.hasSelfWriteExternalDiskMutationDisposition(
+				notice.path,
+				notice.sequence,
+			)
+			|| this.hasExternalDiskCandidateDisposition(
+				this.deliveredExternalDiskCandidateSequencesByPath,
+				notice.path,
+				notice.sequence,
+			)
+		) return false;
+		let retries = this.pendingExternalDiskCandidateDeliveryRetries.get(notice.path);
+		if (!retries) {
+			retries = new Map<number, PendingExternalDiskCandidateDeliveryRetry>();
+			this.pendingExternalDiskCandidateDeliveryRetries.set(notice.path, retries);
+		}
+		let retry = retries.get(notice.sequence);
+		if (!retry) {
+			retry = {
+				candidate: Object.freeze({
+					path: notice.path,
+					ctime: notice.ctime,
+					mtime: notice.mtime,
+					size: notice.size,
+					sequence: notice.sequence,
+					observedAt: notice.observedAt,
+					content: notice.content,
+				}),
+				retryAttempt: 0,
+				timer: null,
+			};
+			retries.set(notice.sequence, retry);
+		}
+		this.scheduleExternalDiskCandidateDeliveryRetry(retry);
+		return retry.timer !== null;
+	}
+
+	private scheduleExternalDiskCandidateDeliveryRetry(
+		retry: PendingExternalDiskCandidateDeliveryRetry,
+	): void {
+		if (retry.timer !== null || !this.asyncAuthorityOpen) return;
+		const delay = EXTERNAL_DISK_CANDIDATE_RETRY_DELAYS_MS[
+			Math.min(
+				retry.retryAttempt,
+				EXTERNAL_DISK_CANDIDATE_RETRY_DELAYS_MS.length - 1,
+			)
+		];
+		const timer = setTimeout(() => {
+			const retries = this.pendingExternalDiskCandidateDeliveryRetries.get(
+				retry.candidate.path,
+			);
+			if (
+				retries?.get(retry.candidate.sequence) !== retry
+				|| retry.timer !== timer
+			) return;
+			retry.timer = null;
+			this.retryExternalDiskCandidateDelivery(
+				retry.candidate.path,
+				retry.candidate.sequence,
+			);
+		}, delay);
+		retry.timer = timer;
+		(timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+	}
+
+	private retryExternalDiskCandidateDelivery(path: string, sequence: number): void {
+		const retry = this.pendingExternalDiskCandidateDeliveryRetries
+			.get(path)?.get(sequence);
+		if (!retry || !this.asyncAuthorityOpen) return;
+		if (retry.timer !== null) {
+			clearTimeout(retry.timer);
+			retry.timer = null;
+		}
+		retry.retryAttempt += 1;
+		const disposition = this.deliverExternalDiskReloadOrRetain(retry.candidate);
+		if (disposition === "callback-unavailable") {
+			this.clearExternalDiskCandidateDeliveryRetry(path, sequence);
+		}
+	}
+
+	private clearExternalDiskCandidateDeliveryRetry(path: string, sequence: number): void {
+		const retries = this.pendingExternalDiskCandidateDeliveryRetries.get(path);
+		const retry = retries?.get(sequence);
+		if (!retries || !retry) return;
+		if (retry.timer !== null) clearTimeout(retry.timer);
+		retries.delete(sequence);
+		if (retries.size === 0) {
+			this.pendingExternalDiskCandidateDeliveryRetries.delete(path);
+		}
+	}
+
+	private clearAllExternalDiskCandidateDeliveryRetries(): void {
+		for (const retries of this.pendingExternalDiskCandidateDeliveryRetries.values()) {
+			for (const retry of retries.values()) {
+				if (retry.timer !== null) clearTimeout(retry.timer);
+			}
+		}
+		this.pendingExternalDiskCandidateDeliveryRetries.clear();
+	}
+
+	private rememberExternalDiskCandidateDisposition(
+		dispositions: ExternalDiskCandidateDispositionLedger,
+		path: string,
+		sequence: number,
+	): void {
+		if (!this.asyncAuthorityOpen) return;
+		let entries = dispositions.get(path);
+		if (!entries) {
+			entries = new Map<number, ExternalDiskCandidateDispositionEntry>();
+			dispositions.set(path, entries);
+		}
+		if (entries.has(sequence)) return;
+		const entry: ExternalDiskCandidateDispositionEntry = {
+			sequence,
+			timer: null,
+		};
+		entries.set(sequence, entry);
+		while (entries.size > EXTERNAL_DISK_CANDIDATE_DISPOSITION_PER_PATH_LIMIT) {
+			const oldest = entries.values().next().value as
+				| ExternalDiskCandidateDispositionEntry
+				| undefined;
+			if (!oldest) break;
+			if (oldest.timer !== null) clearTimeout(oldest.timer);
+			entries.delete(oldest.sequence);
+		}
+		const timer = setTimeout(() => {
+			const currentEntries = dispositions.get(path);
+			if (currentEntries?.get(sequence) !== entry || entry.timer !== timer) return;
+			currentEntries.delete(sequence);
+			if (currentEntries.size === 0) dispositions.delete(path);
+		}, EXTERNAL_DISK_CANDIDATE_DISPOSITION_TTL_MS);
+		entry.timer = timer;
+		(timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+	}
+
+	private hasExternalDiskCandidateDisposition(
+		dispositions: ExternalDiskCandidateDispositionLedger,
+		path: string,
+		sequence: number,
+	): boolean {
+		return dispositions.get(path)?.has(sequence) ?? false;
+	}
+
+	private activateSelfWriteExternalDiskMutation(path: string, sequence: number): boolean {
+		let sequences = this.activeSelfWriteExternalDiskMutationSequencesByPath.get(path);
+		if (!sequences) {
+			sequences = new Set<number>();
+			this.activeSelfWriteExternalDiskMutationSequencesByPath.set(path, sequences);
+		}
+		if (sequences.has(sequence)) return false;
+		sequences.add(sequence);
+		return true;
+	}
+
+	private releaseActiveSelfWriteExternalDiskMutation(
+		path: string,
+		sequence: number,
+		ownsDisposition: boolean,
+	): void {
+		if (!ownsDisposition) return;
+		const sequences = this.activeSelfWriteExternalDiskMutationSequencesByPath.get(path);
+		if (!sequences) return;
+		sequences.delete(sequence);
+		if (sequences.size === 0) {
+			this.activeSelfWriteExternalDiskMutationSequencesByPath.delete(path);
+		}
+	}
+
+	private hasSelfWriteExternalDiskMutationDisposition(
+		path: string,
+		sequence: number,
+	): boolean {
+		return this.activeSelfWriteExternalDiskMutationSequencesByPath
+			.get(path)?.has(sequence) === true
+			|| this.hasExternalDiskCandidateDisposition(
+				this.selfWriteExternalDiskMutationSequencesByPath,
+				path,
+				sequence,
+			);
+	}
+
+	private clearExternalDiskCandidateDispositionLedger(
+		dispositions: ExternalDiskCandidateDispositionLedger,
+	): void {
+		for (const entries of dispositions.values()) {
+			for (const entry of entries.values()) {
+				if (entry.timer !== null) clearTimeout(entry.timer);
+			}
+		}
+		dispositions.clear();
+	}
+
+	private claimExternalDiskCandidate(path: string, sequence: number): boolean {
+		let sequences = this.claimedExternalDiskCandidateSequencesByPath.get(path);
+		if (!sequences) {
+			sequences = new Set<number>();
+			this.claimedExternalDiskCandidateSequencesByPath.set(path, sequences);
+		}
+		if (sequences.has(sequence)) return false;
+		sequences.add(sequence);
+		return true;
+	}
+
+	private releaseExternalDiskCandidateClaim(path: string, sequence: number): void {
+		const sequences = this.claimedExternalDiskCandidateSequencesByPath.get(path);
+		if (!sequences) return;
+		sequences.delete(sequence);
+		if (sequences.size === 0) {
+			this.claimedExternalDiskCandidateSequencesByPath.delete(path);
 		}
 	}
 
 	private notifyPendingExternalDiskReloadIntercepted(
 		marker: PendingExternalDiskMutation,
-	): void {
-		if (marker.candidateDeliveredFromEarlyHostProjection) return;
-		this.notifyExternalDiskReloadIntercepted(marker);
+	): boolean {
+		if (marker.provenance === "self-write") return true;
+		if (marker.candidatePublished) return true;
+		const disposition = this.deliverExternalDiskReloadOrRetain(marker);
+		if (disposition === "delivered") marker.candidatePublished = true;
+		// A failed immediate callback is an admitted exact retry owner. The path
+		// marker can now retire or be replaced without losing its raw revision.
+		return true;
 	}
 
 	private fenceStaleUserBinding(transaction: Transaction): TransactionSpec | null {
@@ -9410,6 +11414,7 @@ export class EditorBindingManager {
 	): void {
 		if (this.healthWorkInFlight.has(leafId)) return;
 		if (this.bindings.get(leafId) !== binding) return;
+		if (this.hasActiveSourceUnloadDrain(this.managedSessions.get(leafId))) return;
 		const currentFile = binding.view.file;
 		if (
 			currentFile
@@ -9626,6 +11631,7 @@ export class EditorBindingManager {
 	): void {
 		this.clearScheduledHealthCheck(leafId);
 		const runtime = this.managedSessions.get(leafId);
+		if (this.hasActiveSourceUnloadDrain(runtime)) return;
 		const continuation = runtime
 			? this.captureManagedContinuation(runtime.session.view)
 			: null;
@@ -9634,6 +11640,7 @@ export class EditorBindingManager {
 			if (this.pendingHealthChecks.get(leafId) !== timer) return;
 			this.pendingHealthChecks.delete(leafId);
 			if (!this.isManagedContinuationCurrent(continuation)) return;
+			if (this.hasActiveSourceUnloadDrain(this.managedSessions.get(leafId))) return;
 			const binding = this.bindings.get(leafId);
 			if (!binding) return;
 			this.maybeHealBinding(leafId, binding, source);
@@ -11116,6 +13123,13 @@ export class EditorBindingManager {
 	): boolean {
 		const port = this.editorAuthorityControllerPort;
 		if (!port?.requestSamePathAdoption || !this.asyncAuthorityOpen) return false;
+		if (this.activeSamePathExternalCandidateProjectionProofByPath.has(file.path)) {
+			this.trace?.("editor", "same-path-adoption-deferred-for-external-candidate", {
+				path: file.path,
+				reason,
+			});
+			return true;
+		}
 		const leafId = this.getLeafId(view);
 		const runtime = this.managedSessions.get(leafId);
 		const session = runtime?.session;
@@ -11704,7 +13718,7 @@ export class EditorBindingManager {
 	private cancelManagedHandoffAndUnmanage(
 		view: MarkdownView,
 		reason: string,
-		cancelReason: "deleted" | "closed" | "excluded" | "teardown" | "unsupported-host",
+		cancelReason: "deleted" | "closed" | "excluded" | "renamed" | "teardown" | "unsupported-host",
 		scheduleRetry = true,
 	): void {
 		const leafId = this.getLeafId(view);
