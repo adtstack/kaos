@@ -263,8 +263,8 @@ console.log("\n--- Test 9c: modify attribution cannot hide suppression-window ex
 	assert(modifySection !== null, "vault modify handler section found");
 	assert(bindingWiringSection !== null, "EditorBindingManager wiring section found");
 	assert(
-		modifySection?.includes("editorBindingsAtEvent?.isBound(file.path)"),
-		"every bound external modify event enters mutation attribution",
+		modifySection?.includes("editorBindingsAtEvent?.tracksExternalDiskMutationPath(file.path)"),
+		"every managed source or target path enters mutation attribution during handoff",
 	);
 	assert(
 		(modifySection?.indexOf("editorBindingsAtEvent.beginExternalDiskMutation") ?? Infinity) <
@@ -275,9 +275,50 @@ console.log("\n--- Test 9c: modify attribution cannot hide suppression-window ex
 		modifySection?.includes("dm.probeRecentWriteFingerprint("),
 		"timing-attributed KAOS writes are verified against their exact event revision",
 	);
+	const selfWriteBranch = sliceBetween(
+		modifySection,
+		'if (probe.kind === "self-write") {',
+		'probe.kind === "stale" || probe.kind === "unavailable"',
+	);
 	assert(
-		modifySection?.includes('if (probe.kind === "self-write") return;'),
-		"only an exact self-write fingerprint bypasses the external reload guard",
+		selfWriteBranch !== null &&
+			selfWriteBranch.includes("editorBindingsAtEvent.noteSelfWriteExternalDiskMutation({") &&
+			selfWriteBranch.includes("...diskMutationRevision,") &&
+			selfWriteBranch.includes("content: probe.content,"),
+		"an exact self-write completes with raw bytes and the event-time revision",
+	);
+	assert(
+		(selfWriteBranch?.indexOf("this.diskMirror !== dm || this.editorBindings !== editorBindingsAtEvent") ?? Infinity) <
+			(selfWriteBranch?.indexOf("editorBindingsAtEvent.noteSelfWriteExternalDiskMutation({") ?? -1),
+		"self-write completion revalidates its runtime and manager before admission",
+	);
+	assert(
+		(selfWriteBranch?.indexOf("editorBindingsAtEvent.noteSelfWriteExternalDiskMutation({") ?? Infinity) <
+			(selfWriteBranch?.indexOf("return;") ?? -1),
+		"self-write provenance completion happens before the early return",
+	);
+	assert(
+		modifySection?.includes('path: diskMutationRevision.path,') &&
+			modifySection?.includes("content: null,"),
+		"a rejected probe closes the exact event-time correlation with an unreadable completion",
+	);
+	assert(
+		(modifySection?.indexOf("this.reconciliationController.noteExternalDiskMutationSequence(") ?? Infinity) <
+			(modifySection?.indexOf("editorBindingsAtEvent.beginExternalDiskMutation") ?? -1),
+		"the controller observes exact event ordering before asynchronous raw proof",
+	);
+	assert(
+		modifySection?.includes("this.reconciliationController.noteExternalDiskMutationProbeDisposition({") &&
+			modifySection?.includes("disposition,") &&
+			modifySection?.includes("revision: diskMutationRevision,") &&
+			modifySection?.includes("sequence,") &&
+			modifySection?.includes("observedAt,"),
+		"stale and unavailable raw probes retain exact event identity in the controller",
+	);
+	assert(
+		(modifySection?.lastIndexOf("this.diskMirror !== dm || this.editorBindings !== editorBindingsAtEvent") ?? -1) <
+			(modifySection?.lastIndexOf("editorBindingsAtEvent.noteExternalDiskMutation({") ?? -1),
+		"probe failure completion is fenced to the event-time runtime and manager",
 	);
 	assert(
 		modifySection?.includes("this.diskMirror !== dm || this.editorBindings !== editorBindingsAtEvent"),

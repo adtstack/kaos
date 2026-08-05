@@ -102,6 +102,7 @@ function fixture(
 	const routedTransactions: Transaction[] = [];
 	const candidates: unknown[] = [];
 	const completions: unknown[] = [];
+	const hostLoadCaptureRejections: string[] = [];
 	const samePathCompletions: unknown[] = [];
 	const samePathRejections: unknown[] = [];
 	const nativeHistoryAdvances: Array<Readonly<{
@@ -256,6 +257,9 @@ function fixture(
 				completionCallbackDepth -= 1;
 			}
 		},
+		onHostLoadCaptureRejected(reason) {
+			hostLoadCaptureRejections.push(reason);
+		},
 		isExactHostStateReplacement(targetState, input) {
 			return exactHostStateReplacementDepth === 1
 				&& context?.kind === "handoff"
@@ -336,6 +340,7 @@ function fixture(
 		routedTransactions,
 		candidates,
 		completions,
+		hostLoadCaptureRejections,
 		samePathCompletions,
 		samePathRejections,
 		nativeHistoryAdvances,
@@ -430,6 +435,19 @@ function fixture(
 			return context;
 		},
 	};
+}
+
+function beginRejectBeforeTargetHandoff(
+	item: Fixture,
+	path = "B.md",
+): Extract<CodeMirrorHandoffContext, { kind: "handoff" }> {
+	const selected = item.selectHandoff(path);
+	item.setContext({ ...selected, inputPolicy: "reject-before-target" });
+	assert(
+		item.guard?.refreshGate() === true,
+		"reject-before-target handoff gate reconfigures after target selection",
+	);
+	return item.currentHandoff();
 }
 
 function destroy(item: Fixture): void {
@@ -715,6 +733,134 @@ async function runBrowserSuite(): Promise<BrowserResult> {
 			localPresentationId: "local:B:2",
 		});
 		assert(duplicate?.kind !== "accepted", "the same held candidate cannot be presented twice");
+		destroy(item);
+	}
+
+	console.log("\n--- Contract Test 6: an unarmed target projection cannot poison the source host cache ---");
+	{
+		const item = fixture("source A");
+		beginRejectBeforeTargetHandoff(item, "B.md");
+		const descriptorBefore = Object.getOwnPropertyDescriptor(item.host, "data");
+		item.host.data = "external B before certified load";
+		item.view.dispatch(item.view.state.update({
+			changes: {
+				from: 0,
+				to: item.view.state.doc.length,
+				insert: "external B before certified load",
+			},
+			filter: false,
+		}));
+		equal(
+			item.view.state.doc.toString(),
+			"source A",
+			"the unarmed full replacement remains outside CodeMirror",
+		);
+		equal(
+			item.host.data,
+			"source A",
+			"the rejected unarmed projection restores the exact source host cache",
+		);
+		equal(item.candidates.length, 0, "the unarmed projection invents no certified host candidate");
+
+		const held = holdClearHostLoad(item, "host-load:B:after-external", "certified target B");
+		equal(
+			item.host.data,
+			"source A",
+			"the certified clear=true load still holds its host cache behind source A",
+		);
+		const presented = item.guard?.presentHeldHostLoadLocally({
+			candidate: held.candidate as Parameters<
+				NonNullable<typeof item.guard>["presentHeldHostLoadLocally"]
+			>[0]["candidate"],
+			localPresentationId: "local:B:after-external",
+		});
+		equal(presented?.kind, "accepted", "the later certified clear=true target remains admissible");
+		equal(item.view.state.doc.toString(), "certified target B", "the certified target reaches CodeMirror once");
+		equal(item.host.data, "certified target B", "the certified target reaches the host cache once");
+		const descriptorAfter = Object.getOwnPropertyDescriptor(item.host, "data");
+		assert(
+			descriptorBefore !== undefined
+				&& descriptorAfter !== undefined
+				&& descriptorAfter.configurable === descriptorBefore.configurable
+				&& descriptorAfter.enumerable === descriptorBefore.enumerable
+				&& descriptorAfter.writable === descriptorBefore.writable,
+			"runtime data restoration preserves its original data descriptor",
+		);
+		destroy(item);
+	}
+
+	console.log("\n--- Contract Test 7: an unarmed setState projection restores the same source cache ---");
+	{
+		const item = fixture("source A");
+		beginRejectBeforeTargetHandoff(item, "B.md");
+		item.host.data = "external state B";
+		item.view.setState(EditorState.create({
+			doc: "external state B",
+			extensions: item.extensions,
+		}));
+		equal(item.view.state.doc.toString(), "source A", "the unarmed setState stays outside CodeMirror");
+		equal(item.host.data, "source A", "the unarmed setState restores the exact source host cache");
+		equal(item.candidates.length, 0, "the unarmed setState invents no certified host candidate");
+		destroy(item);
+	}
+
+	console.log("\n--- Contract Test 8: a failed runtime-data CAS never overwrites host bytes ---");
+	{
+		const item = fixture("source A");
+		beginRejectBeforeTargetHandoff(item, "B.md");
+		const incoming = "external B with failed CAS";
+		const transaction = item.view.state.update({
+			changes: { from: 0, to: item.view.state.doc.length, insert: incoming },
+			filter: false,
+		});
+		item.host.data = incoming;
+		const definePropertyDescriptor = Object.getOwnPropertyDescriptor(Object, "defineProperty");
+		assert(definePropertyDescriptor !== undefined, "Object.defineProperty has a restorable descriptor");
+		if (definePropertyDescriptor !== undefined) {
+			const installedFailure = Reflect.defineProperty(Object, "defineProperty", {
+				...definePropertyDescriptor,
+				value(target: object, property: PropertyKey, attributes: PropertyDescriptor): object {
+					if (target === item.host && property === "data") {
+						throw new TypeError("synthetic runtime-data CAS failure");
+					}
+					return definePropertyDescriptor.value.call(Object, target, property, attributes) as object;
+				},
+			});
+			assert(installedFailure, "the exact synthetic CAS failure is installed");
+			try {
+				item.view.dispatch(transaction);
+			} finally {
+				assert(
+					Reflect.defineProperty(Object, "defineProperty", definePropertyDescriptor),
+					"Object.defineProperty is restored after the exact CAS failure",
+				);
+			}
+		}
+		equal(item.view.state.doc.toString(), "source A", "CAS failure still rejects the target projection");
+		equal(item.host.data, incoming, "CAS failure does not overwrite the expected incoming host bytes");
+		assert(
+			item.hostLoadCaptureRejections.includes("runtime-data-cas-failed"),
+			"CAS failure is exposed through the existing capture rejection trace",
+		);
+		equal(item.candidates.length, 0, "CAS failure invents no certified host candidate");
+		destroy(item);
+	}
+
+	console.log("\n--- Contract Test 9: stable same-path replacement remains untouched ---");
+	{
+		const item = fixture("source A");
+		item.host.data = "stable same-path reload";
+		item.view.dispatch(item.view.state.update({
+			changes: {
+				from: 0,
+				to: item.view.state.doc.length,
+				insert: "stable same-path reload",
+			},
+			filter: false,
+		}));
+		equal(item.view.state.doc.toString(), "stable same-path reload", "same-path replacement reaches CodeMirror");
+		equal(item.host.data, "stable same-path reload", "same-path replacement keeps the host cache");
+		equal(item.hostLoadCaptureRejections.length, 0, "same-path replacement emits no handoff rejection");
 		destroy(item);
 	}
 

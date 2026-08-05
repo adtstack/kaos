@@ -252,11 +252,17 @@ export interface ObservedDiskMutationRevision {
 	size: number | null;
 }
 
+export type ExactObservedDiskRevisionProbe =
+	| { kind: "current"; content: string }
+	| { kind: "stale" }
+	| { kind: "unavailable" };
+
 export type RecentWriteFingerprintProbe =
 	| { kind: "self-write"; content: string }
 	| { kind: "not-self-write"; content: string }
 	| { kind: "unproven"; content: string }
-	| { kind: "stale-or-unreadable" };
+	| { kind: "stale" }
+	| { kind: "unavailable" };
 
 interface PendingRemoteRename {
 	oldPath: string;
@@ -3041,22 +3047,39 @@ export class DiskMirror {
 		file: TFile,
 		revision: ObservedDiskMutationRevision,
 	): Promise<string | null> {
-		if (!this.isObservedDiskRevisionCurrent(file, revision)) return null;
+		const probe = await this.probeExactObservedDiskRevision(file, revision);
+		return probe.kind === "current" ? probe.content : null;
+	}
+
+	/**
+	 * Rich form of `readExactObservedDiskRevision` used by fail-closed callers.
+	 * A stale identity/stat/byte-size is ordinary replacement work, while an
+	 * adapter read failure means the exact raw representation cannot be proven.
+	 */
+	async probeExactObservedDiskRevision(
+		file: TFile,
+		revision: ObservedDiskMutationRevision,
+	): Promise<ExactObservedDiskRevisionProbe> {
+		if (!this.isObservedDiskRevisionCurrent(file, revision)) {
+			return { kind: "stale" };
+		}
 		try {
 			// Vault.read is a document API and strips a UTF-8 BOM. The modify-event
 			// proof needs the exact disk representation so byte-size validation and
 			// conflict preservation remain lossless for BOM/mixed-EOL files.
 			const content = await this.app.vault.adapter.read(file.path);
-			if (!this.isObservedDiskRevisionCurrent(file, revision)) return null;
+			if (!this.isObservedDiskRevisionCurrent(file, revision)) {
+				return { kind: "stale" };
+			}
 			if (
 				revision.size !== null &&
 				new TextEncoder().encode(content).byteLength !== revision.size
 			) {
-				return null;
+				return { kind: "stale" };
 			}
-			return content;
+			return { kind: "current", content };
 		} catch {
-			return null;
+			return { kind: "unavailable" };
 		}
 	}
 
@@ -3078,13 +3101,21 @@ export class DiskMirror {
 			this.recentWriteFingerprints.delete(path);
 		}
 
-		const content = await this.readExactObservedDiskRevision(file, revision);
-		if (content === null) return { kind: "stale-or-unreadable" };
+		const exactRevision = await this.probeExactObservedDiskRevision(file, revision);
+		if (exactRevision.kind !== "current") return exactRevision;
+		const content = exactRevision.content;
 		if (!expectedIsFresh || !expected) return { kind: "unproven", content };
 
-		const observed = await this.fingerprintContent(content);
+		let observed: { bytes: number; hash: string };
+		try {
+			observed = await this.fingerprintContent(content);
+		} catch {
+			return this.isObservedDiskRevisionCurrent(file, revision)
+				? { kind: "unproven", content }
+				: { kind: "stale" };
+		}
 		if (!this.isObservedDiskRevisionCurrent(file, revision)) {
-			return { kind: "stale-or-unreadable" };
+			return { kind: "stale" };
 		}
 		return observed.bytes === expected.expectedBytes &&
 			observed.hash === expected.expectedHash
@@ -3169,6 +3200,21 @@ export class DiskMirror {
 		}
 	}
 
+	/** Clear one controller-owned occurrence without touching a replacement. */
+	clearPreservedUnresolvedEpisode(path: string, expectedEpisodeId: string): boolean {
+		const normalized = normalizePath(path);
+		if (!this.preservedUnresolved.resolveEpisode(normalized, expectedEpisodeId)) {
+			return false;
+		}
+		this.onPreservedUnresolvedChanged?.();
+		this.trace?.("disk", "preserved-unresolved-cleared", {
+			path: normalized,
+			reason: "exact-episode-settled",
+			episodeId: expectedEpisodeId,
+		});
+		return true;
+	}
+
 	/**
 	 * Carry an unresolved episode across a path rename. A destination owned by a
 	 * different episode is never overwritten; both namespaces become an explicit
@@ -3221,6 +3267,7 @@ export class DiskMirror {
 	recordPreservedUnresolved(
 		path: string,
 		reason: PreservedUnresolvedReason,
+		notify = true,
 	): void {
 		const normalized = normalizePath(path);
 		const remoteDeleteEntry = isRemoteDeletePreservedUnresolvedEntry({
@@ -3247,7 +3294,7 @@ export class DiskMirror {
 		// discovered the ambiguity. Retire every pending form now; a batch already
 		// handed to the drain loop is still stopped by flushWrite's hard guard.
 		this.retirePendingWritesForPreservedPath(normalized);
-		this.onPreservedUnresolvedChanged?.();
+		if (notify) this.onPreservedUnresolvedChanged?.();
 	}
 
 	private retirePendingWritesForPreservedPath(path: string): void {

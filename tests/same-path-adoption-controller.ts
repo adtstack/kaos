@@ -8,6 +8,7 @@ import {
 } from "../src/runtime/editorAuthorityAdmission";
 import {
 	ReconciliationController,
+	type ExternalDiskMutationProbeTicket,
 	type StableMarkdownReadResult,
 } from "../src/runtime/reconciliationController";
 import { EditorBindingManager } from "../src/sync/editorBinding";
@@ -61,6 +62,7 @@ interface ControllerFixtureOptions {
 	advanceProviderBeforeDiskFlush?: boolean;
 	rejectBoundSettlementCurrent?: boolean;
 	frontmatterBlocked?: boolean;
+	pauseArtifactCreate?: boolean;
 }
 
 function makeFixture(input: boolean | ControllerFixtureOptions = false): {
@@ -98,6 +100,14 @@ function makeFixture(input: boolean | ControllerFixtureOptions = false): {
 	diskCompletionCount(): number;
 	diskInvalidationCount(): number;
 	attemptOrdinaryBaselineSettlement(): Promise<boolean>;
+	beginExternalProbe(sequence: number): ExternalDiskMutationProbeTicket;
+	settleExternalProbe(ticket: ExternalDiskMutationProbeTicket): Promise<boolean>;
+	markExternalProbeDisposition(
+		ticket: ExternalDiskMutationProbeTicket,
+		disposition: "stale" | "unavailable",
+	): boolean;
+	artifactCreateStarted(): boolean;
+	releaseArtifactCreate(): void;
 } {
 	const options: ControllerFixtureOptions = typeof input === "boolean"
 		? { remoteMissing: input }
@@ -143,6 +153,13 @@ function makeFixture(input: boolean | ControllerFixtureOptions = false): {
 	const createdArtifacts = new Map<string, { file: MutableFile; content: string }>();
 	const conflictMergeBases = new Map<string, string>();
 	let artifactCreateCount = 0;
+	let artifactCreateStarted = false;
+	let releaseArtifactCreate = () => {};
+	const artifactCreateGate = options.pauseArtifactCreate
+		? new Promise<void>((resolve) => {
+			releaseArtifactCreate = resolve;
+		})
+		: null;
 	const cm = {
 		state: EditorState.create({ doc: local }),
 	} as unknown as EditorView & { state: EditorState };
@@ -391,6 +408,10 @@ function makeFixture(input: boolean | ControllerFixtureOptions = false): {
 			getMarkdownFiles: () => Array.from(createdArtifacts.values(), (entry) => entry.file),
 			read: async () => disk,
 			create: async (candidate: string, content: string) => {
+				if (artifactCreateGate) {
+					artifactCreateStarted = true;
+					await artifactCreateGate;
+				}
 				if (options.failArtifactCreate) {
 					throw new Error("private-note-body: injected artifact create failure");
 				}
@@ -640,6 +661,36 @@ function makeFixture(input: boolean | ControllerFixtureOptions = false): {
 				expectedCrdtContent: activeRemote?.toJSON() ?? null,
 			},
 		),
+		beginExternalProbe(sequence) {
+			const ticket = controller.beginExternalDiskMutationProbe({
+				file: currentFile,
+				revision: Object.freeze({
+					path,
+					ctime: currentFile.stat.ctime,
+					mtime: currentFile.stat.mtime,
+					size: currentFile.stat.size,
+				}),
+				sequence,
+				observedAt: sequence + 0.5,
+			});
+			assert.ok(ticket, "expected exact external probe ticket");
+			return ticket;
+		},
+		settleExternalProbe(ticket) {
+			return (controller as unknown as {
+				noteExternalDiskMutationProbeSettled(
+					candidate: ExternalDiskMutationProbeTicket,
+				): Promise<boolean>;
+			}).noteExternalDiskMutationProbeSettled(ticket);
+		},
+		markExternalProbeDisposition(ticket, disposition) {
+			return controller.noteExternalDiskMutationProbeDisposition({
+				ticket,
+				disposition,
+			});
+		},
+		artifactCreateStarted: () => artifactCreateStarted,
+		releaseArtifactCreate,
 	};
 }
 
@@ -784,6 +835,312 @@ async function proposalInvalidationMatrix(): Promise<void> {
 			`${name} invalidates the proposal`,
 		);
 	}
+}
+
+async function externalProbeAuthorityFencesAdoption(): Promise<void> {
+	for (const disposition of [null, "unavailable", "stale"] as const) {
+		const fixture = makeFixture();
+		const ticket = fixture.beginExternalProbe(41);
+		if (disposition !== null) {
+			assert.equal(
+				fixture.markExternalProbeDisposition(ticket, disposition),
+				true,
+				`${disposition} owns the exact event-start marker`,
+			);
+		}
+		const result = await fixture.controller.requestSamePathAdoption(fixture.request());
+		assert.equal(
+			result.kind,
+			"replan",
+			`${disposition ?? "active"} external probe authority blocks same-path adoption`,
+		);
+		fixture.controller.reset();
+	}
+}
+
+async function externalProbeAuthorityAbaInvalidatesPlanningAndPermit(): Promise<void> {
+	const duringPlanning = makeFixture();
+	const planning = duringPlanning.controller.requestSamePathAdoption(
+		duringPlanning.request(),
+	);
+	const inFlight = duringPlanning.beginExternalProbe(51);
+	assert.equal(
+		await duringPlanning.settleExternalProbe(inFlight),
+		true,
+		"ordinary current completion retires the exact active ticket",
+	);
+	assert.equal(
+		(await planning).kind,
+		"replan",
+		"a start-and-settle ABA during an awaited capture invalidates planning",
+	);
+
+	const afterProposal = makeFixture();
+	const proposal = await afterProposal.plan();
+	const replacement = afterProposal.beginExternalProbe(52);
+	assert.equal(await afterProposal.settleExternalProbe(replacement), true);
+	assert.equal(
+		afterProposal.controller.consumeSamePathAdoptionMutationPermit(
+			proposal.mutationPermit,
+			afterProposal.mutationContext(proposal),
+		),
+		false,
+		"a completed replacement event invalidates the final mutation permit CAS",
+	);
+}
+
+async function equalSequenceStaleDispositionAbsorbsContentfulCandidate(): Promise<void> {
+	const fixture = makeFixture();
+	const ticket = fixture.beginExternalProbe(61);
+	assert.equal(fixture.markExternalProbeDisposition(ticket, "stale"), true);
+	const internals = fixture.controller as unknown as {
+		pendingExternalDiskProbeDispositions: Map<string, object>;
+		interceptedExternalDiskMutations: Map<string, object>;
+	};
+	const path = ticket.revision.path;
+	const staleMarker = internals.pendingExternalDiskProbeDispositions.get(path);
+	fixture.controller.noteInterceptedExternalDiskMutation(Object.freeze({
+		path,
+		ctime: ticket.revision.ctime,
+		mtime: ticket.revision.mtime,
+		size: ticket.revision.size,
+		sequence: ticket.sequence,
+		observedAt: ticket.observedAt,
+		content: "same-sequence content must remain quarantined",
+	}));
+	assert.equal(
+		internals.pendingExternalDiskProbeDispositions.get(path),
+		staleMarker,
+		"equal-sequence stale authority remains absorbing",
+	);
+	assert.equal(
+		internals.interceptedExternalDiskMutations.has(path),
+		false,
+		"contentful completion cannot override an equal-sequence stale proof",
+	);
+	fixture.controller.reset();
+}
+
+async function outOfOrderProbeObligationWaitsForDurablePreservation(): Promise<void> {
+	const fixture = makeFixture({ pauseArtifactCreate: true });
+	const older = fixture.beginExternalProbe(71);
+	const newer = fixture.beginExternalProbe(72);
+	assert.equal(
+		await fixture.settleExternalProbe(newer),
+		true,
+		"the higher no-candidate completion settles only its own exact obligation",
+	);
+	fixture.controller.noteInterceptedExternalDiskMutation(Object.freeze({
+		path: older.revision.path,
+		ctime: older.revision.ctime,
+		mtime: older.revision.mtime,
+		size: older.revision.size,
+		sequence: older.sequence,
+		observedAt: older.observedAt,
+		content: "late older external bytes",
+	}));
+	for (let index = 0; index < 10 && !fixture.artifactCreateStarted(); index++) {
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+	}
+	assert.equal(
+		fixture.artifactCreateStarted(),
+		true,
+		"the late lower candidate enters durable artifact preservation",
+	);
+	const internals = fixture.controller as unknown as {
+		externalDiskMutationProbeObligations: Map<string, ReadonlyMap<number, object>>;
+	};
+	assert.equal(
+		internals.externalDiskMutationProbeObligations
+			.get(older.revision.path)?.has(older.sequence),
+		true,
+		"the lower exact obligation remains while artifact creation is paused",
+	);
+	assert.equal(
+		(await fixture.controller.requestSamePathAdoption(fixture.request())).kind,
+		"replan",
+		"adoption stays closed throughout the paused durable-preservation window",
+	);
+
+	fixture.releaseArtifactCreate();
+	for (let index = 0; index < 20; index++) {
+		if (!internals.externalDiskMutationProbeObligations.has(older.revision.path)) break;
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+	}
+	assert.equal(
+		internals.externalDiskMutationProbeObligations.has(older.revision.path),
+		false,
+		"durable preservation retires the final lower obligation",
+	);
+	assert.equal(
+		fixture.createdArtifacts().size,
+		1,
+		"the late lower bytes are preserved exactly once",
+	);
+	assert.equal(
+		(await fixture.controller.requestSamePathAdoption(fixture.request())).kind,
+		"planned",
+		"a fresh adoption may resume only after the durable barrier commits",
+	);
+	fixture.controller.reset();
+}
+
+async function samePathTFileReplacementRetiresOwnedProbeObligations(): Promise<void> {
+	type ProbeInternals = {
+		externalDiskMutationProbeObligations: Map<string, ReadonlyMap<number, object>>;
+		pendingExternalDiskProbeDispositions: Map<string, object>;
+		interceptedExternalDiskMutations: Map<string, object>;
+	};
+	const waitForObligationsToRetire = async (
+		internals: ProbeInternals,
+		path: string,
+	): Promise<void> => {
+		for (let index = 0; index < 40; index++) {
+			if (!internals.externalDiskMutationProbeObligations.has(path)) return;
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		}
+	};
+
+	for (const [index, disposition] of (["stale", "unavailable"] as const).entries()) {
+		const fixture = makeFixture();
+		const older = fixture.beginExternalProbe(81 + index * 2);
+		fixture.replaceFile();
+		const newer = fixture.beginExternalProbe(82 + index * 2);
+		const internals = fixture.controller as unknown as ProbeInternals;
+
+		assert.equal(
+			fixture.markExternalProbeDisposition(older, disposition),
+			true,
+			`a superseded ${disposition} result still owns its exact retirement obligation`,
+		);
+		assert.equal(
+			await fixture.settleExternalProbe(newer),
+			true,
+			"the replacement TFile event settles its own exact obligation",
+		);
+		await waitForObligationsToRetire(internals, older.revision.path);
+		assert.equal(
+			internals.externalDiskMutationProbeObligations.has(older.revision.path),
+			false,
+			`the old ${disposition} result cannot strand same-path adoption`,
+		);
+		assert.equal(
+			internals.pendingExternalDiskProbeDispositions.has(older.revision.path),
+			false,
+			"an old-TFile disposition never becomes the current TFile marker",
+		);
+		assert.equal(
+			(await fixture.controller.requestSamePathAdoption(fixture.request())).kind,
+			"planned",
+			`adoption resumes after both ${disposition} obligations retire`,
+		);
+		fixture.controller.reset();
+	}
+
+	for (const [index, disposition] of (["stale", "unavailable"] as const).entries()) {
+		const fixture = makeFixture();
+		const replacedTicket = fixture.beginExternalProbe(87 + index);
+		fixture.replaceFile();
+		const internals = fixture.controller as unknown as ProbeInternals;
+
+		assert.equal(
+			fixture.markExternalProbeDisposition(replacedTicket, disposition),
+			true,
+			`same-sequence old-TFile ${disposition} is accepted for exact retirement`,
+		);
+		await waitForObligationsToRetire(internals, replacedTicket.revision.path);
+		assert.equal(
+			internals.pendingExternalDiskProbeDispositions.has(replacedTicket.revision.path),
+			false,
+			`same-sequence old-TFile ${disposition} never becomes current-path authority`,
+		);
+		assert.equal(
+			internals.externalDiskMutationProbeObligations.has(replacedTicket.revision.path),
+			false,
+			`same-sequence old-TFile ${disposition} retires after its durable barrier`,
+		);
+		assert.equal(
+			(await fixture.controller.requestSamePathAdoption(fixture.request())).kind,
+			"planned",
+			`adoption resumes after same-sequence old-TFile ${disposition}`,
+		);
+		fixture.controller.reset();
+	}
+
+	const lateCandidate = makeFixture();
+	const older = lateCandidate.beginExternalProbe(91);
+	lateCandidate.replaceFile();
+	const newer = lateCandidate.beginExternalProbe(92);
+	const lateInternals = lateCandidate.controller as unknown as ProbeInternals;
+	const oldContent = "late bytes read from the replaced TFile";
+	lateCandidate.controller.noteInterceptedExternalDiskMutation(Object.freeze({
+		path: older.revision.path,
+		ctime: older.revision.ctime,
+		mtime: older.revision.mtime,
+		size: older.revision.size,
+		sequence: older.sequence,
+		observedAt: older.observedAt,
+		content: oldContent,
+	}));
+	assert.equal(
+		await lateCandidate.settleExternalProbe(newer),
+		true,
+		"the successor waits for and settles the old candidate's durable barrier",
+	);
+	await waitForObligationsToRetire(lateInternals, older.revision.path);
+	assert.equal(
+		lateInternals.externalDiskMutationProbeObligations.has(older.revision.path),
+		false,
+		"durably preserved old-TFile bytes retire the final exact obligation",
+	);
+	assert.deepEqual(
+		Array.from(lateCandidate.createdArtifacts().values()),
+		[oldContent],
+		"old-TFile bytes survive only as exact durable evidence",
+	);
+	assert.equal(
+		lateInternals.interceptedExternalDiskMutations.has(older.revision.path),
+		false,
+		"old-TFile bytes are never admitted as the current external candidate",
+	);
+	assert.equal(
+		(await lateCandidate.controller.requestSamePathAdoption(lateCandidate.request())).kind,
+		"planned",
+		"adoption resumes after the durable old-candidate handoff",
+	);
+	lateCandidate.controller.reset();
+
+	const currentFileCas = makeFixture();
+	const replacedTicket = currentFileCas.beginExternalProbe(101);
+	currentFileCas.replaceFile();
+	const casInternals = currentFileCas.controller as unknown as ProbeInternals;
+	const replacedContent = "same-sequence bytes from a no-longer-current TFile";
+	currentFileCas.controller.noteInterceptedExternalDiskMutation(Object.freeze({
+		path: replacedTicket.revision.path,
+		ctime: replacedTicket.revision.ctime,
+		mtime: replacedTicket.revision.mtime,
+		size: replacedTicket.revision.size,
+		sequence: replacedTicket.sequence,
+		observedAt: replacedTicket.observedAt,
+		content: replacedContent,
+	}));
+	await waitForObligationsToRetire(casInternals, replacedTicket.revision.path);
+	assert.equal(
+		casInternals.interceptedExternalDiskMutations.has(replacedTicket.revision.path),
+		false,
+		"content admission retains the current-TFile identity CAS",
+	);
+	assert.deepEqual(
+		Array.from(currentFileCas.createdArtifacts().values()),
+		[replacedContent],
+		"a same-sequence old-TFile callback is quarantined durably",
+	);
+	assert.equal(
+		casInternals.externalDiskMutationProbeObligations.has(replacedTicket.revision.path),
+		false,
+		"durable quarantine retires the old exact obligation without a successor",
+	);
+	currentFileCas.controller.reset();
 }
 
 async function missingRemoteSeedsCertifiedDiskOnly(): Promise<void> {
@@ -1311,6 +1668,11 @@ await exactProposalAndCoalescing();
 await diskCannotBecomeAnImplicitFourthMergeBranch();
 await distinctOneShotPermits();
 await proposalInvalidationMatrix();
+await externalProbeAuthorityFencesAdoption();
+await externalProbeAuthorityAbaInvalidatesPlanningAndPermit();
+await equalSequenceStaleDispositionAbsorbsContentfulCandidate();
+await outOfOrderProbeObligationWaitsForDurablePreservation();
+await samePathTFileReplacementRetiresOwnedProbeObligations();
 await missingRemoteSeedsCertifiedDiskOnly();
 await concurrentProviderCreationWinsSeedRace();
 await frontmatterQuarantineFencesOnlyNewSharedBytes();

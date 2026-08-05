@@ -15,6 +15,7 @@ export interface CommandsRuntimeHost {
 	runReconciliation(mode: ReconcileMode): Promise<void>;
 	runSchemaMigrationToV2(): void;
 	importUntrackedFiles(): Promise<void>;
+	retryBlockedHandoffRecoveryExport(): number;
 	clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined>;
 	resetLocalCache(): void;
 	nuclearReset(): void;
@@ -145,6 +146,20 @@ export function registerCommands(
 			void host.importUntrackedFiles().then(() => {
 				new Notice(`Imported ${count} untracked file(s).`);
 			});
+		},
+	});
+
+	registrar.addCommand({
+		id: "retry-blocked-handoff-recovery-export",
+		name: "Retry blocked handoff recovery export",
+		callback: () => {
+			const count = host.retryBlockedHandoffRecoveryExport();
+			new Notice(
+				count === 0
+					? "No blocked handoff recovery export is waiting."
+					: `Retrying ${count} blocked handoff recovery export${count === 1 ? "" : "s"}...`,
+				5000,
+			);
 		},
 	});
 

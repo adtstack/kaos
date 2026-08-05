@@ -341,7 +341,7 @@ export type EditorHandoffEvent =
 		type: "cancelled";
 		sessionId: string;
 		expectedGeneration: number;
-		reason: "closed" | "deleted" | "excluded" | "teardown" | "unsupported-host";
+		reason: "closed" | "deleted" | "excluded" | "renamed" | "teardown" | "unsupported-host";
 	}>;
 
 type EditorHandoffEffectIdentity = Readonly<{

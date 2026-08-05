@@ -107,6 +107,7 @@ export class EditorWorkspaceOrchestrator {
 				this.deps.log(`Rename batch: moved observer "${oldPath}" -> "${newPath}"`);
 			}
 		}
+		this.validateOpenBindings("rename-batch-flushed");
 	}
 
 	validateOpenBindings(reason: string): void {
