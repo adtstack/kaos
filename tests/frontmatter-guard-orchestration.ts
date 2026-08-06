@@ -238,7 +238,6 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 	const repairCalls: Array<{ deviceName: string; reason: string }> = [];
 	const transactionOrigins: unknown[] = [];
 	const ensureFileCalls: Array<{ path: string; content: string }> = [];
-	const editorAuthorityLease = Object.freeze({ leaseId: `frontmatter:${path}` });
 
 	doc.on("afterTransaction", (txn) => {
 		transactionOrigins.push(txn.origin);
@@ -253,11 +252,6 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 
 	const editorBindings = {
 		isBound: () => true,
-		capturePathEditorAuthority: (candidate: string) => candidate === path
-			? { kind: "proven-single" as const, content: editorContent, lease: editorAuthorityLease }
-			: { kind: "none" as const },
-		isPathEditorAuthorityLeaseCurrent: (lease: unknown) =>
-			lease === editorAuthorityLease && view.file === file && file.path === path,
 		getBindingDebugInfoForView: () => ({
 			leafId: "stub-leaf-1",
 			storedCmId: "stub-cm-1",

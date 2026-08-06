@@ -2,7 +2,6 @@ import { type App, MarkdownView, type WorkspaceLeaf } from "obsidian";
 import type { EditorBindingManager } from "../sync/editorBinding";
 import type { DiskMirror } from "../sync/diskMirror";
 import type { VaultSyncSettings } from "../settings";
-import { isMarkdownEditorView } from "./markdownEditorView";
 
 interface EditorWorkspaceOrchestratorDeps {
 	app: App;
@@ -17,8 +16,6 @@ interface EditorWorkspaceOrchestratorDeps {
 export class EditorWorkspaceOrchestrator {
 	private openFilePaths = new Set<string>();
 	private activeMarkdownPath: string | null = null;
-	private admissionWakeScheduled = false;
-	private lifecycleGeneration = 0;
 
 	constructor(private readonly deps: EditorWorkspaceOrchestratorDeps) {}
 
@@ -27,21 +24,8 @@ export class EditorWorkspaceOrchestrator {
 	}
 
 	reset(): void {
-		this.lifecycleGeneration += 1;
-		this.admissionWakeScheduled = false;
 		this.openFilePaths.clear();
 		this.activeMarkdownPath = null;
-	}
-
-	onOpenPathAdmissionWake(path: string): void {
-		if (this.admissionWakeScheduled) return;
-		this.admissionWakeScheduled = true;
-		const generation = this.lifecycleGeneration;
-		queueMicrotask(() => {
-			if (generation !== this.lifecycleGeneration) return;
-			this.admissionWakeScheduled = false;
-			this.validateOpenBindings(`editor-authority-admission:${path}`);
-		});
 	}
 
 	onReconciled(reason: string): void {
@@ -63,7 +47,7 @@ export class EditorWorkspaceOrchestrator {
 	}
 
 	onActiveLeafChange(leaf: WorkspaceLeaf | null): void {
-		const view = isMarkdownEditorView(leaf?.view) ? leaf.view : null;
+		const view = leaf?.view instanceof MarkdownView ? leaf.view : null;
 		const candidatePath = view?.file?.path ?? null;
 		const nextPath = candidatePath && this.deps.isMarkdownPathSyncable(candidatePath)
 			? candidatePath
@@ -107,7 +91,6 @@ export class EditorWorkspaceOrchestrator {
 				this.deps.log(`Rename batch: moved observer "${oldPath}" -> "${newPath}"`);
 			}
 		}
-		this.validateOpenBindings("rename-batch-flushed");
 	}
 
 	validateOpenBindings(reason: string): void {
@@ -117,12 +100,11 @@ export class EditorWorkspaceOrchestrator {
 		if (!editorBindings) return;
 
 		this.deps.app.workspace.iterateAllLeaves((leaf) => {
-			if (!isMarkdownEditorView(leaf.view) || !leaf.view.file) {
+			if (!(leaf.view instanceof MarkdownView) || !leaf.view.file) {
 				return;
 			}
-			editorBindings.manageView(leaf.view);
 			if (!this.deps.isMarkdownPathSyncable(leaf.view.file.path)) {
-				editorBindings.excludeView(leaf.view, `validate:${reason}`);
+				editorBindings.unbind(leaf.view);
 				return;
 			}
 
@@ -162,7 +144,7 @@ export class EditorWorkspaceOrchestrator {
 
 	private reconcileOpenEditors(): void {
 		this.deps.app.workspace.iterateAllLeaves((leaf) => {
-			if (isMarkdownEditorView(leaf.view)) {
+			if (leaf.view instanceof MarkdownView) {
 				this.bindView(leaf.view);
 			}
 		});
@@ -171,10 +153,9 @@ export class EditorWorkspaceOrchestrator {
 
 	private bindView(view: MarkdownView): void {
 		const bindings = this.deps.getEditorBindings();
-		bindings?.manageView(view);
 		const path = view.file?.path;
 		if (!path || !this.deps.isMarkdownPathSyncable(path)) {
-			bindings?.excludeView(view, "workspace-bind");
+			bindings?.unbind(view);
 			return;
 		}
 		bindings?.bind(view, this.deps.getSettings().deviceName);
@@ -193,23 +174,20 @@ export class EditorWorkspaceOrchestrator {
 
 	private reconcileTrackedOpenFiles(reason: string): void {
 		const currentlyOpen = new Set<string>();
-		const workspaceMarkdownViews: MarkdownView[] = [];
-		const addWorkspaceView = (view: unknown): void => {
-			if (
-				!isMarkdownEditorView(view)
-				|| workspaceMarkdownViews.includes(view)
-			) return;
-			workspaceMarkdownViews.push(view);
-			if (view.file && this.deps.isMarkdownPathSyncable(view.file.path)) {
-				currentlyOpen.add(view.file.path);
+		const liveMarkdownViews = new Set<MarkdownView>();
+		this.deps.app.workspace.iterateAllLeaves((leaf) => {
+			if (leaf.view instanceof MarkdownView) {
+				liveMarkdownViews.add(leaf.view);
 			}
-		};
-		addWorkspaceView(this.deps.app.workspace.getActiveViewOfType(MarkdownView));
-		this.deps.app.workspace.iterateAllLeaves((leaf) => addWorkspaceView(leaf.view));
-		this.deps.getEditorBindings()?.reconcileManagedWorkspaceViews(
-			workspaceMarkdownViews,
-			reason,
-		);
+			if (
+				leaf.view instanceof MarkdownView
+				&& leaf.view.file
+				&& this.deps.isMarkdownPathSyncable(leaf.view.file.path)
+			) {
+				currentlyOpen.add(leaf.view.file.path);
+			}
+		});
+		this.deps.getEditorBindings()?.pruneTransitionViews(liveMarkdownViews);
 
 		for (const tracked of this.openFilePaths) {
 			if (!currentlyOpen.has(tracked)) {
@@ -235,6 +213,10 @@ export class EditorWorkspaceOrchestrator {
 		}
 
 		this.deps.getEditorBindings()?.clearLocalCursor(reason);
-		void this.deps.getDiskMirror()?.flushOpenPath(previousPath, reason);
+		// A same-view file change is flushed by EditorBindingManager's awaited
+		// TextFileView unload boundary after any active IME composition settles.
+		// A plain focus change leaves the previous editor open, so its normal
+		// DiskMirror schedule remains authoritative. Fire-and-forget flushing here
+		// would race both cases and could publish a pre-composition snapshot.
 	}
 }

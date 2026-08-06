@@ -166,6 +166,7 @@ points:
 - [Attachment sync](./engineering/attachment-sync.md)
 - [Zero-config auth](./engineering/zero-config-auth.md)
 - [Zero-ops update pipeline](./engineering/zero-ops-update-pipeline.md)
+- [Local multi-device QA (no Cloudflare deploy)](./docs/testing/local-multidevice-qa.md)
 - [Warts and limits](./engineering/warts-and-limits.md)
 
 ## Local Development

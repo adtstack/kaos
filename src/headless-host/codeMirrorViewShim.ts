@@ -28,6 +28,9 @@ export class EditorView {
 	static updateListener = extensionPoint("EditorView.updateListener");
 	static decorations = extensionPoint("EditorView.decorations");
 	static editable = extensionPoint("EditorView.editable");
+	static domEventHandlers(value: unknown): ExtensionRecord {
+		return { kind: "codemirror-view-extension", name: "EditorView.domEventHandlers", value };
+	}
 	static theme(value: unknown): ExtensionRecord {
 		return { kind: "codemirror-view-theme", name: "theme", value };
 	}

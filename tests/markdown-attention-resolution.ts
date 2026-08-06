@@ -68,8 +68,6 @@ function makeFixture(options: FixtureOptions = {}) {
 	let diskPort: DiskIngestPort | null = null;
 	let diskIndex = {};
 	let opaqueOpenFileView = options.opaqueOpenFileView === true;
-	let editorAuthorityLeaseSequence = 0;
-	const editorAuthorityLeases = new Map<string, string>();
 	const openView = options.editorContent === undefined
 		? null
 		: Object.assign(new MarkdownView(), {
@@ -143,30 +141,7 @@ function makeFixture(options: FixtureOptions = {}) {
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => diskMirror as any,
 		getBlobSync: () => null,
-		getEditorBindings: () => ({
-			capturePathEditorAuthority: (candidate: string) => {
-				if (candidate !== path) return { kind: "none" as const };
-				if (opaqueOpenFileView) {
-					return { kind: "blocked" as const, reason: "unmanaged-view" as const };
-				}
-				if (!openView) return { kind: "none" as const };
-				const content = options.editorContent!;
-				const leaseId = `attention-editor-${++editorAuthorityLeaseSequence}`;
-				editorAuthorityLeases.set(leaseId, content);
-				return {
-					kind: "proven-single" as const,
-					content,
-					lease: { leaseId },
-				};
-			},
-			isPathEditorAuthorityLeaseCurrent: (lease: { leaseId: string }) => {
-				const content = editorAuthorityLeases.get(lease.leaseId);
-				return content !== undefined
-					&& !opaqueOpenFileView
-					&& openView !== null
-					&& options.editorContent === content;
-			},
-		}) as any,
+		getEditorBindings: () => null,
 		getDiskIndex: () => diskIndex,
 		setDiskIndex: (next) => { diskIndex = next; },
 		recordBaselineText: () => {

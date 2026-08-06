@@ -181,8 +181,6 @@ function buildFixture(opts: FixtureOptions): Fixture {
 	};
 
 	const editorBindings = {
-		capturePathEditorAuthority: () => ({ kind: "none" as const }),
-		isPathEditorAuthorityLeaseCurrent: () => false,
 		unbindByPath: (): void => {},
 		updatePathsAfterRename: (): void => {},
 	};

@@ -160,41 +160,6 @@ console.log("\n--- Persisted blob queue: absence and delete-resolution authority
 	);
 }
 
-console.log("\n--- Persisted blob queue: settlement-deferred intent has no borrowed base ---");
-{
-	const deferred: BlobQueueSnapshot = {
-		uploads: [{
-			path: "assets/deferred-during-settlement.png",
-			sizeBytes: 23,
-			baseRefKnown: false,
-			status: "pending",
-			deferredUntilSettlement: true,
-		}],
-		downloads: [],
-	};
-	assert.deepEqual(
-		jsonValue(readPersistedBlobQueueSnapshot(
-			createPersistedBlobQueueSnapshot(deferred, SCOPE),
-			SCOPE,
-		)),
-		jsonValue(deferred),
-		"the exact deferred marker survives durable queue persistence",
-	);
-	assert.throws(
-		() => createPersistedBlobQueueSnapshot({
-			uploads: [{
-				...deferred.uploads[0]!,
-				baseRefKnown: true,
-				expectedBaseRef: LIVE_REF,
-				expectedBaseSourceVersion: SOURCE_VERSION,
-			}],
-			downloads: [],
-		}, SCOPE),
-		/invalid blob queue snapshot/i,
-		"a deferred marker cannot smuggle pre-settlement live-ref authority",
-	);
-}
-
 console.log("\n--- Blob queue import: direct legacy live-base snapshots fail closed ---");
 {
 	const legacyManager = makeManager();

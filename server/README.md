@@ -114,6 +114,10 @@ the explicit environment-token mode and does not use the claim flow. If you
 omit it, provide `KAOS_CLAIM_SECRET` as shown above, then enter that value in
 the browser to claim the server.
 
+For the canonical same-machine and LAN multi-device procedure, including
+Wrangler bind options, isolated persistence, QA vault setup, and plaintext-HTTP
+limits, see [Local Multi-Device QA](../docs/testing/local-multidevice-qa.md).
+
 ## Manual deploy
 
 ```bash

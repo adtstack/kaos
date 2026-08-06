@@ -2,12 +2,7 @@ import assert from "node:assert/strict";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { EditorState } from "../src/headless-host/codeMirrorStateShim";
-import {
-	historyField,
-	isolateHistory,
-	redoDepth,
-	undoDepth,
-} from "../src/headless-host/codeMirrorCommandsShim";
+import { EditorView } from "../src/headless-host/codeMirrorViewShim";
 
 const CORE_DIR = "src/headless-host/core";
 const forbiddenImportPatterns = [
@@ -20,17 +15,6 @@ const forbiddenImportPatterns = [
 	/\.\.\/\.\.\/dashboard/,
 	/\.\.\/\.\.\/telemetry/,
 ];
-
-function compareSemver(left: string, right: string): number {
-	const leftParts = left.split(".").map(Number);
-	const rightParts = right.split(".").map(Number);
-	for (let index = 0; index < 3; index++) {
-		if (leftParts[index] !== rightParts[index]) {
-			return leftParts[index] > rightParts[index] ? 1 : -1;
-		}
-	}
-	return 0;
-}
 
 let checked = 0;
 
@@ -59,21 +43,5 @@ console.log(`  PASS  checked ${checked} core file(s)`);
 console.log("\n--- headless host CodeMirror shim: editor safety extensions are available ---");
 assert.equal(typeof EditorState.transactionFilter.of, "function");
 assert.equal(typeof EditorState.transactionExtender.of, "function");
-console.log("  PASS  transaction filters and extenders can be installed during plugin boot");
-
-console.log("\n--- headless host CodeMirror commands shim: replay imports are boot-safe ---");
-assert.equal(typeof historyField, "symbol");
-assert.equal(typeof isolateHistory.of, "function");
-assert.equal(undoDepth({}), 0);
-assert.equal(redoDepth({}), 0);
-console.log("  PASS  replay command imports stay inert without a live editor history");
-
-const headlessVersionManifest = JSON.parse(
-	await readFile("headless-host.version.json", "utf8"),
-) as { version?: unknown };
-assert.equal(typeof headlessVersionManifest.version, "string");
-assert.ok(
-	compareSemver(headlessVersionManifest.version, "0.2.6") >= 0,
-	"the @codemirror/commands host capability must not ship under headless 0.2.5",
-);
-console.log("  PASS  commands shim is carried by headless 0.2.6 or newer");
+assert.equal(typeof EditorView.domEventHandlers, "function");
+console.log("  PASS  transaction filters, extenders, and DOM handlers can be installed during plugin boot");

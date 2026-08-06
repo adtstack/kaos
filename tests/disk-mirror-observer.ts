@@ -42,10 +42,6 @@ import { RemoteProjectionPolicyGate } from "../src/runtime/remoteProjectionPolic
 import { contentBaselineHash } from "../src/sync/diskIndex";
 import type { MetaChangeBatch } from "../src/sync/fileMeta";
 import type { EnsureFileResult } from "../src/sync/vaultSync";
-import type {
-	EditorAuthorityLease,
-	PathEditorAuthority,
-} from "../src/sync/pathEditorAuthority";
 import {
 	ORIGIN_DISK_SYNC,
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
@@ -81,7 +77,6 @@ function makeHarness(options: {
 	openEditorContent?: string | (() => string);
 	initialDiskContent?: string;
 	onRead?: () => void | Promise<void>;
-	onAdapterRead?: () => void | Promise<void>;
 	onGetAbstractFile?: (path: string, file: TFile | null, callCount: number) => void;
 	onBeforeProcess?: () => void | Promise<void>;
 	onAfterProcess?: () => void | Promise<void>;
@@ -100,13 +95,6 @@ function makeHarness(options: {
 	baselineTextProvider?: (path: string) => Promise<string | null> | string | null;
 	isMarkdownPathSyncable?: (path: string) => boolean;
 	isRemoteProjectionAllowed?: (path: string) => boolean;
-	editorAuthorityKind?:
-		| "auto"
-		| "none"
-		| "transitioning"
-		| "multiple"
-		| "read-failed"
-		| "unmanaged-view";
 	captureRemoteProjectionAdmission?: (
 		paths: readonly string[],
 	) => RemoteProjectionAdmissionLease | null;
@@ -184,6 +172,12 @@ function makeHarness(options: {
 		},
 	};
 
+	const fakeEditorBindings = {
+		getLastEditorActivityForPath: () => null,
+		unbindByPath: () => {},
+		updatePathsAfterRename: () => {},
+	};
+
 	const markdownView = options.openEditorContent === undefined
 		? null
 		: Object.assign(new MarkdownView(), {
@@ -198,48 +192,6 @@ function makeHarness(options: {
 	const workspaceView = options.opaqueOpenFileView
 		? { file: { path: filePath } }
 		: markdownView;
-	let editorAuthorityEpoch = 0;
-	let editorAuthorityLeaseSequence = 0;
-	const editorAuthorityLeases = new Map<
-		string,
-		{ epoch: number; content: string }
-	>();
-	const readConfiguredEditorAuthority = (): PathEditorAuthority | { kind: "content"; content: string } => {
-		const configured = options.editorAuthorityKind ?? "auto";
-		if (configured === "none") return { kind: "none" };
-		if (configured !== "auto") return { kind: "blocked", reason: configured };
-		if (options.opaqueOpenFileView) {
-			return { kind: "blocked", reason: "unmanaged-view" };
-		}
-		if (options.openEditorContent === undefined) return { kind: "none" };
-		const value = options.openEditorContent;
-		return {
-			kind: "content",
-			content: typeof value === "function" ? value() : value,
-		};
-	};
-	const fakeEditorBindings = {
-		getLastEditorActivityForPath: () => null,
-		unbindByPath: () => {},
-		updatePathsAfterRename: () => {},
-		capturePathEditorAuthority: (_path: string): PathEditorAuthority => {
-			const current = readConfiguredEditorAuthority();
-			if (current.kind !== "content") return current;
-			const leaseId = `test-editor-authority-${++editorAuthorityLeaseSequence}`;
-			const lease = { leaseId } as EditorAuthorityLease;
-			editorAuthorityLeases.set(leaseId, {
-				epoch: editorAuthorityEpoch,
-				content: current.content,
-			});
-			return { kind: "proven-single", content: current.content, lease };
-		},
-		isPathEditorAuthorityLeaseCurrent: (lease: EditorAuthorityLease): boolean => {
-			const captured = editorAuthorityLeases.get(lease.leaseId);
-			if (!captured || captured.epoch !== editorAuthorityEpoch) return false;
-			const current = readConfiguredEditorAuthority();
-			return current.kind === "content" && current.content === captured.content;
-		},
-	};
 	const byteLength = (content: string): number => new TextEncoder().encode(content).byteLength;
 	const makeDiskFileIdentity = (path: string, contentLength: number) => Object.assign(new TFile(), {
 		path,
@@ -288,10 +240,7 @@ function makeHarness(options: {
 					: content;
 			},
 			adapter: {
-				read: async (path: string) => {
-					await options.onAdapterRead?.();
-					return diskFiles.get(path) ?? "";
-				},
+				read: async (path: string) => diskFiles.get(path) ?? "",
 			},
 			modify: async (file: { path: string }, content: string) => {
 				modifyCalls++;
@@ -421,9 +370,6 @@ function makeHarness(options: {
 		hasNonFilePathOccupant: () => nonFilePathOccupants.has(filePath),
 		setAuthoritativeDeleteFingerprint: (fingerprint: string | null) => {
 			authoritativeDeleteFingerprint = fingerprint;
-		},
-		invalidateEditorAuthority: () => {
-			editorAuthorityEpoch++;
 		},
 		emitMetaChanges: (batch: MetaChangeBatch) => {
 			if (!metaChangeObserver) throw new Error("metadata observer is not started");
@@ -900,7 +846,7 @@ console.log("\n--- Test 6: provider update to workspace-open file schedules open
 	doc.destroy();
 }
 
-console.log("\n--- Test 6b: an opaque open Base blocks an unprovable content update ---");
+console.log("\n--- Test 6b: an open Base receives a content update without any rename/backup path ---");
 {
 	const basePath = "BACKLOG/BACKLOG.base";
 	const clean = "views:\n  - type: table\n    name: Local\n";
@@ -915,12 +861,9 @@ console.log("\n--- Test 6b: an opaque open Base blocks an unprovable content upd
 	fixture.ytext.insert(0, remote);
 
 	const result = await fixture.mirror.flushWrite(basePath, true);
-	assert(
-		result.kind === "deferred" && result.reason === "open-editor-mismatch",
-		"opaque open Base defers until its host authority can be proven absent",
-	);
-	assert(fixture.diskFiles.get(basePath) === clean, "opaque open Base preserves its local YAML bytes");
-	assert(fixture.getProcessCalls() === 0, "opaque open Base never reaches Vault.process");
+	assert(result.kind === "written", "open Base content is updated through the text-document writer");
+	assert(fixture.diskFiles.get(basePath) === remote, "open Base receives the exact validated YAML bytes");
+	assert(fixture.getProcessCalls() === 1, "open Base update commits through Vault.process CAS");
 	assert(fixture.getModifyCalls() === 0, "open Base update never uses the racy modify fallback");
 	assert(fixture.getRenameCalls() === 0, "open Base update performs zero visible backup renames");
 
@@ -976,60 +919,11 @@ console.log("\n--- Test 8: forced open flush rechecks editor after async read --
 		"force flush does not write stale CRDT content when the editor changes during read",
 	);
 	assert(
-		result.kind === "deferred" && result.reason === "authority-stale",
-		"async editor race reports exact lease invalidation",
+		result.kind === "deferred" && result.reason === "open-editor-mismatch",
+		"async editor race reports open-editor mismatch deferral",
 	);
 
 	doc.destroy();
-}
-
-console.log("\n--- Test 8b: forced write rejects a lease invalidated at atomic commit ---");
-{
-	let fixture!: ReturnType<typeof makeHarness>;
-	fixture = makeHarness({
-		openEditorContent: "REMOTE_FROM_CRDT\n",
-		initialDiskContent: "DISK_BEFORE\n",
-		onBeforeProcess: () => fixture.invalidateEditorAuthority(),
-	});
-	fixture.ytext.insert(0, "REMOTE_FROM_CRDT\n");
-
-	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
-		expectedDiskContent: "DISK_BEFORE\n",
-	});
-
-	assert(
-		result.kind === "deferred" && result.reason === "authority-stale",
-		"forced write rejects the exact editor authority lease after invalidation",
-	);
-	assert(
-		fixture.diskFiles.get(FILE_PATH) === "DISK_BEFORE\n",
-		"stale editor authority writes zero disk bytes",
-	);
-	fixture.doc.destroy();
-}
-
-for (const editorAuthorityKind of ["transitioning", "multiple"] as const) {
-	console.log(`\n--- Test 8c: ${editorAuthorityKind} authority blocks forced writes ---`);
-	const fixture = makeHarness({
-		openEditorContent: "REMOTE_FROM_CRDT\n",
-		initialDiskContent: "DISK_BEFORE\n",
-		editorAuthorityKind,
-	});
-	fixture.ytext.insert(0, "REMOTE_FROM_CRDT\n");
-
-	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
-		expectedDiskContent: "DISK_BEFORE\n",
-	});
-
-	assert(
-		result.kind === "deferred" && result.reason === "open-editor-mismatch",
-		`${editorAuthorityKind} authority fails closed instead of borrowing raw editor bytes`,
-	);
-	assert(
-		fixture.diskFiles.get(FILE_PATH) === "DISK_BEFORE\n",
-		`${editorAuthorityKind} authority permits zero disk mutation`,
-	);
-	fixture.doc.destroy();
 }
 
 // ── Test 9: async read race — CRDT changes after the write snapshot ──────────
@@ -1147,114 +1041,6 @@ console.log("\n--- Test 12: expectedDiskContent rejects a stale reconciliation p
 	assert(fixture.getProcessCalls() === 0, "snapshot mismatch is rejected before atomic commit");
 	assert(fixture.getModifyCalls() === 0, "snapshot mismatch performs no fallback modify");
 
-	fixture.doc.destroy();
-}
-
-console.log("\n--- Test 12a0: exact raw revision probe distinguishes current, stale, and unavailable ---");
-{
-	const rawDiskContent = "\ufeff한글 raw authority\r\nsecond line\r\n";
-	const fixture = makeHarness({ initialDiskContent: rawDiskContent });
-	const file = fixture.getCurrentDiskFile();
-	if (!file) throw new Error("expected raw revision fixture file");
-	const revision = {
-		path: file.path,
-		ctime: file.stat.ctime,
-		mtime: file.stat.mtime,
-		size: file.stat.size,
-	};
-
-	const current = await fixture.mirror.probeExactObservedDiskRevision(file, revision);
-	assert(
-		current.kind === "current" && current.content === rawDiskContent,
-		"raw revision probe returns the exact BOM/CRLF adapter representation",
-	);
-	const currentFingerprint = await fixture.mirror.probeRecentWriteFingerprint(
-		file,
-		revision,
-	);
-	assert(
-		currentFingerprint.kind === "unproven" &&
-			currentFingerprint.content === rawDiskContent,
-		"recent-write attribution retains exact current bytes without a fingerprint",
-	);
-
-	fixture.advanceDiskFileRevision();
-	const stale = await fixture.mirror.probeExactObservedDiskRevision(file, revision);
-	assert(stale.kind === "stale", "raw revision probe distinguishes a later file revision");
-	const staleFingerprint = await fixture.mirror.probeRecentWriteFingerprint(file, revision);
-	assert(
-		staleFingerprint.kind === "stale",
-		"recent-write attribution preserves stale as a distinct disposition",
-	);
-	fixture.doc.destroy();
-
-	const unavailableFixture = makeHarness({
-		initialDiskContent: rawDiskContent,
-		onAdapterRead: () => { throw new Error("deterministic adapter read failure"); },
-	});
-	const unavailableFile = unavailableFixture.getCurrentDiskFile();
-	if (!unavailableFile) throw new Error("expected unavailable raw revision fixture file");
-	const unavailable = await unavailableFixture.mirror.probeExactObservedDiskRevision(
-		unavailableFile,
-		{
-			path: unavailableFile.path,
-			ctime: unavailableFile.stat.ctime,
-			mtime: unavailableFile.stat.mtime,
-			size: unavailableFile.stat.size,
-		},
-	);
-	assert(
-		unavailable.kind === "unavailable",
-		"raw revision probe distinguishes adapter read failure from stale replacement",
-	);
-	const unavailableFingerprint = await unavailableFixture.mirror.probeRecentWriteFingerprint(
-		unavailableFile,
-		{
-			path: unavailableFile.path,
-			ctime: unavailableFile.stat.ctime,
-			mtime: unavailableFile.stat.mtime,
-			size: unavailableFile.stat.size,
-		},
-	);
-	assert(
-		unavailableFingerprint.kind === "unavailable",
-		"recent-write attribution preserves adapter unavailability distinctly",
-	);
-	unavailableFixture.doc.destroy();
-}
-
-console.log("\n--- Test 12a0b: fingerprint failure preserves already-proven raw bytes ---");
-{
-	const rawDiskContent = "exact current raw bytes survive hash failure\r\n";
-	const fixture = makeHarness({ initialDiskContent: rawDiskContent });
-	const file = fixture.getCurrentDiskFile();
-	if (!file) throw new Error("expected fingerprint failure fixture file");
-	await (fixture.mirror as unknown as {
-		suppressWrite(path: string, content: string): Promise<unknown>;
-	}).suppressWrite(file.path, rawDiskContent);
-	const internals = fixture.mirror as unknown as {
-		fingerprintContent(content: string): Promise<{ bytes: number; hash: string }>;
-	};
-	internals.fingerprintContent = async () => {
-		throw new Error("deterministic fingerprint failure");
-	};
-	let outcome: Awaited<ReturnType<DiskMirror["probeRecentWriteFingerprint"]>> | null = null;
-	let failure: unknown = null;
-	try {
-		outcome = await fixture.mirror.probeRecentWriteFingerprint(file, {
-			path: file.path,
-			ctime: file.stat.ctime,
-			mtime: file.stat.mtime,
-			size: file.stat.size,
-		});
-	} catch (error) {
-		failure = error;
-	}
-	assert(failure === null, "hash failure does not discard an exact current raw revision");
-	assert(
-		outcome?.kind === "unproven" && outcome.content === rawDiskContent,
-		"hash failure conservatively returns unproven with the proven raw bytes",
-	);
 	fixture.doc.destroy();
 }
 
@@ -1622,77 +1408,6 @@ console.log("\n--- Test 13c: remote edit+delete compares disk with the durable b
 	assert(fixture.deleteCalls.length === 1, "clean disk is deleted even when tombstoned Y.Text already contains B");
 	assert(!fixture.diskFiles.has(FILE_PATH), "stale clean A is not revived over the remote B+delete intent");
 	assert(!fixture.mirror.isPreservedUnresolved(FILE_PATH), "verified durable equality needs no unresolved marker");
-
-	fixture.doc.destroy();
-}
-
-console.log("\n--- Test 13c2: remote delete rejects an editor lease invalidated during inspection ---");
-{
-	const cleanDiskBaseline = "CLEAN_EDITOR_LEASE_BASELINE\n";
-	let fixture!: ReturnType<typeof makeHarness>;
-	let readCount = 0;
-	fixture = makeHarness({
-		openEditorContent: cleanDiskBaseline,
-		initialDiskContent: cleanDiskBaseline,
-		onRead: () => {
-			readCount++;
-			if (readCount === 1) fixture.invalidateEditorAuthority();
-		},
-	});
-	fixture.ytext.insert(0, cleanDiskBaseline);
-	fixture.setAuthoritativeDeleteFingerprint("remote-delete-stale-editor-lease");
-	fixture.mirror.recordPreservedUnresolved(FILE_PATH, "remote-delete-missing-baseline");
-
-	await (
-		fixture.mirror as unknown as {
-			handleRemoteDelete: (
-				path: string,
-				options: { baselineText?: string | null },
-			) => Promise<void>;
-		}
-	).handleRemoteDelete(FILE_PATH, { baselineText: cleanDiskBaseline });
-
-	assert(readCount === 1, "stale editor lease stops remote delete after its first asynchronous read");
-	assert(fixture.deleteCalls.length === 0, "stale editor lease reaches zero trash/delete calls");
-	assert(fixture.getEnsureFileCalls() === 0, "stale editor lease reaches zero revival calls");
-	assert(fixture.diskFiles.get(FILE_PATH) === cleanDiskBaseline, "stale editor lease preserves disk bytes");
-	assert(fixture.mirror.isPreservedUnresolved(FILE_PATH), "stale editor lease clears no prior marker");
-
-	fixture.doc.destroy();
-}
-
-for (const editorAuthorityKind of ["transitioning", "multiple"] as const) {
-	console.log(`\n--- Test 13c3: ${editorAuthorityKind} authority blocks remote delete ---`);
-	const cleanDiskBaseline = `CLEAN_${editorAuthorityKind.toUpperCase()}_BASELINE\n`;
-	const fixture = makeHarness({
-		openEditorContent: cleanDiskBaseline,
-		initialDiskContent: cleanDiskBaseline,
-		editorAuthorityKind,
-	});
-	fixture.ytext.insert(0, cleanDiskBaseline);
-	fixture.setAuthoritativeDeleteFingerprint(`remote-delete-${editorAuthorityKind}`);
-
-	await (
-		fixture.mirror as unknown as {
-			handleRemoteDelete: (
-				path: string,
-				options: { baselineText?: string | null },
-			) => Promise<void>;
-		}
-	).handleRemoteDelete(FILE_PATH, { baselineText: cleanDiskBaseline });
-
-	assert(fixture.deleteCalls.length === 0, `${editorAuthorityKind} authority permits zero delete calls`);
-	assert(fixture.getEnsureFileCalls() === 0, `${editorAuthorityKind} authority permits zero revival calls`);
-	assert(fixture.diskFiles.get(FILE_PATH) === cleanDiskBaseline, `${editorAuthorityKind} authority preserves disk`);
-	assert(fixture.mirror.isPreservedUnresolved(FILE_PATH), `${editorAuthorityKind} authority quarantines the path`);
-	assert(
-		fixture.mirror.getPreservedUnresolvedEntries()[0]?.reason === (
-			editorAuthorityKind === "multiple"
-				? "remote-delete-multiple-open-editor-authorities"
-				: "remote-delete-open-editor-read-failed"
-		),
-		`${editorAuthorityKind} authority retains the existing bounded quarantine reason`,
-	);
 
 	fixture.doc.destroy();
 }

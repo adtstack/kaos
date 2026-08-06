@@ -29,11 +29,6 @@ const editorBindingSource = readFileSync(
 );
 const bindingSource = editorBindingSource;
 const mainSource = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
-const diskMirrorSource = readFileSync(new URL("../src/sync/diskMirror.ts", import.meta.url), "utf8");
-const reconciliationSource = readFileSync(
-	new URL("../src/runtime/reconciliationController.ts", import.meta.url),
-	"utf8",
-);
 
 console.log("\n--- Test 1: validateOpenBindings delegates repair to guarded audit ---");
 {
@@ -213,10 +208,15 @@ console.log("\n--- Test 9a: remote typing awareness is advisory only ---");
 		"active remote typing emits an advisory warning",
 	);
 	const nonUserBranchIndex = section?.indexOf("const { leafId, binding } = match;") ?? -1;
-	const cancelledTransactionIndex = section?.indexOf("return [];") ?? -1;
+	const transitionGateIndex = section?.indexOf("this.getTransitionBlockedViewForTransaction(transaction)") ?? -1;
+	const transitionCancellationIndex = section?.indexOf("return [];", transitionGateIndex) ?? -1;
+	const warningIndex = section?.indexOf("this.warnConcurrentTyping(match.binding.path, remoteTypers)") ?? -1;
 	assert(
-		nonUserBranchIndex >= 0 && cancelledTransactionIndex > nonUserBranchIndex,
-		"only the non-user external-reload branch may cancel a transaction",
+		transitionGateIndex >= 0 &&
+		transitionCancellationIndex > transitionGateIndex &&
+		transitionCancellationIndex < warningIndex &&
+		!section?.slice(warningIndex, nonUserBranchIndex).includes("return [];"),
+		"only an explicit note-transition gate may cancel user input; remote typing stays advisory",
 	);
 	assert(
 		warningSection?.includes('"concurrent-typing-warning"'),
@@ -263,8 +263,8 @@ console.log("\n--- Test 9c: modify attribution cannot hide suppression-window ex
 	assert(modifySection !== null, "vault modify handler section found");
 	assert(bindingWiringSection !== null, "EditorBindingManager wiring section found");
 	assert(
-		modifySection?.includes("editorBindingsAtEvent?.tracksExternalDiskMutationPath(file.path)"),
-		"every managed source or target path enters mutation attribution during handoff",
+		modifySection?.includes("editorBindingsAtEvent?.isBound(file.path)"),
+		"every bound external modify event enters mutation attribution",
 	);
 	assert(
 		(modifySection?.indexOf("editorBindingsAtEvent.beginExternalDiskMutation") ?? Infinity) <
@@ -275,50 +275,9 @@ console.log("\n--- Test 9c: modify attribution cannot hide suppression-window ex
 		modifySection?.includes("dm.probeRecentWriteFingerprint("),
 		"timing-attributed KAOS writes are verified against their exact event revision",
 	);
-	const selfWriteBranch = sliceBetween(
-		modifySection,
-		'if (probe.kind === "self-write") {',
-		'probe.kind === "stale" || probe.kind === "unavailable"',
-	);
 	assert(
-		selfWriteBranch !== null &&
-			selfWriteBranch.includes("editorBindingsAtEvent.noteSelfWriteExternalDiskMutation({") &&
-			selfWriteBranch.includes("...diskMutationRevision,") &&
-			selfWriteBranch.includes("content: probe.content,"),
-		"an exact self-write completes with raw bytes and the event-time revision",
-	);
-	assert(
-		(selfWriteBranch?.indexOf("this.diskMirror !== dm || this.editorBindings !== editorBindingsAtEvent") ?? Infinity) <
-			(selfWriteBranch?.indexOf("editorBindingsAtEvent.noteSelfWriteExternalDiskMutation({") ?? -1),
-		"self-write completion revalidates its runtime and manager before admission",
-	);
-	assert(
-		(selfWriteBranch?.indexOf("editorBindingsAtEvent.noteSelfWriteExternalDiskMutation({") ?? Infinity) <
-			(selfWriteBranch?.indexOf("return;") ?? -1),
-		"self-write provenance completion happens before the early return",
-	);
-	assert(
-		modifySection?.includes('path: diskMutationRevision.path,') &&
-			modifySection?.includes("content: null,"),
-		"a rejected probe closes the exact event-time correlation with an unreadable completion",
-	);
-	assert(
-		(modifySection?.indexOf("this.reconciliationController.noteExternalDiskMutationSequence(") ?? Infinity) <
-			(modifySection?.indexOf("editorBindingsAtEvent.beginExternalDiskMutation") ?? -1),
-		"the controller observes exact event ordering before asynchronous raw proof",
-	);
-	assert(
-		modifySection?.includes("this.reconciliationController.noteExternalDiskMutationProbeDisposition({") &&
-			modifySection?.includes("disposition,") &&
-			modifySection?.includes("revision: diskMutationRevision,") &&
-			modifySection?.includes("sequence,") &&
-			modifySection?.includes("observedAt,"),
-		"stale and unavailable raw probes retain exact event identity in the controller",
-	);
-	assert(
-		(modifySection?.lastIndexOf("this.diskMirror !== dm || this.editorBindings !== editorBindingsAtEvent") ?? -1) <
-			(modifySection?.lastIndexOf("editorBindingsAtEvent.noteExternalDiskMutation({") ?? -1),
-		"probe failure completion is fenced to the event-time runtime and manager",
+		modifySection?.includes('if (probe.kind === "self-write") return;'),
+		"only an exact self-write fingerprint bypasses the external reload guard",
 	);
 	assert(
 		modifySection?.includes("this.diskMirror !== dm || this.editorBindings !== editorBindingsAtEvent"),
@@ -359,7 +318,7 @@ console.log("\n--- Test 9c: modify attribution cannot hide suppression-window ex
 	);
 }
 
-console.log("\n--- Test 10: editor-health heal is attach-only ---");
+console.log("\n--- Test 10: editor-health-heal origin remains manual-only ---");
 {
 	const healSection = sliceBetween(
 		bindingSource,
@@ -367,13 +326,21 @@ console.log("\n--- Test 10: editor-health heal is attach-only ---");
 		"rebind(view: MarkdownView, deviceName: string, reason: string): void {",
 	);
 	assert(healSection !== null, "heal section found");
+	// After the origin-constants refactor the call site uses ORIGIN_EDITOR_HEALTH_HEAL
+	// (imported from src/sync/origins.ts) instead of the raw string. Check for the
+	// constant name rather than the literal.
 	assert(
-		!healSection?.includes("applyDiffToYText("),
-		"heal does not write editor content into Y.Text",
+		healSection?.includes("ORIGIN_EDITOR_HEALTH_HEAL"),
+		"editor-health-heal origin used via named constant in heal() implementation",
 	);
+	// Strip the heal section then check that applyDiffToYText is NOT called
+	// with ORIGIN_EDITOR_HEALTH_HEAL outside it. The import declaration
+	// is allowed to remain (it's not a call site). Use [^\n)]* to stay
+	// on the same line and avoid spurious cross-line matches.
+	const strippedSource = bindingSource.replace(healSection ?? "", "");
 	assert(
-		!bindingSource.match(/applyDiffToYText[^\n)]*ORIGIN_EDITOR_HEALTH_HEAL/),
-		"editor-health-heal origin is never a binding-layer writer",
+		!strippedSource.match(/applyDiffToYText[^\n)]*ORIGIN_EDITOR_HEALTH_HEAL/),
+		"ORIGIN_EDITOR_HEALTH_HEAL not passed to applyDiffToYText outside heal()",
 	);
 }
 
@@ -425,9 +392,10 @@ console.log("\n--- Test 12: excluded Markdown is fenced before editor binding an
 		"bind checks syncability before resolving CodeMirror",
 	);
 	assert(
+		!targetSection?.includes("this.vaultSync.ensureFile(") &&
 		(targetSection?.indexOf("this.isMarkdownPathSyncable(file.path)") ?? Infinity) <
-			(targetSection?.indexOf("this.requestOpenPathAdmission(") ?? -1),
-		"binding target checks syncability before admission",
+			(targetSection?.indexOf("this.vaultSync.getTextForPath(file.path)") ?? -1),
+		"binding target checks syncability and delegates missing-file admission to the controller",
 	);
 	assert(
 		(workspaceBindSection?.indexOf("this.deps.isMarkdownPathSyncable(path)") ?? Infinity) <
@@ -439,119 +407,6 @@ console.log("\n--- Test 12: excluded Markdown is fenced before editor binding an
 			(workspaceBindSection?.indexOf("this.trackOpenFile(path)") ?? -1),
 		"workspace skips excluded views before open-file tracking",
 	);
-}
-
-console.log("\n--- Test 13: binding is attach-only and every bind site is managed ---");
-{
-	const bindSection = sliceBetween(
-		bindingSource,
-		"bind(view: MarkdownView, deviceName: string): void {",
-		"repair(view: MarkdownView, deviceName: string, reason: string): boolean {",
-	);
-	const repairSection = sliceBetween(
-		bindingSource,
-		"repair(view: MarkdownView, deviceName: string, reason: string): boolean {",
-		"heal(view: MarkdownView, deviceName: string, reason: string): boolean {",
-	);
-	const healSection = sliceBetween(
-		bindingSource,
-		"heal(view: MarkdownView, deviceName: string, reason: string): boolean {",
-		"rebind(view: MarkdownView, deviceName: string, reason: string): void {",
-	);
-	const rebindSection = sliceBetween(
-		bindingSource,
-		"rebind(view: MarkdownView, deviceName: string, reason: string): void {",
-		"/**\n\t * Unbind a MarkdownView's editor",
-	);
-	const staleUserSection = sliceBetween(
-		bindingSource,
-		"private fenceStaleUserBinding(transaction: Transaction): TransactionSpec | null {",
-		"private hasRecentUserDocumentEdit(",
-	);
-	const healthSection = sliceBetween(
-		bindingSource,
-		"private maybeHealBinding(",
-		"private scheduleCmResolveRetry(",
-	);
-	const workspaceBindSection = sliceBetween(
-		workspaceSource,
-		"private bindView(view: MarkdownView): void {",
-		"private trackOpenFile(path: string): void {",
-	);
-	const validateSection = sliceBetween(
-		workspaceSource,
-		"validateOpenBindings(reason: string): void {",
-		"auditBindings(reason: string): number {",
-	);
-
-	assert(!bindingSource.includes(".ensureFile("), "editor binding contains no ensureFile writer");
-	assert(
-		(bindingSource.match(/this\.requestOpenPathAdmission\(/g) ?? []).length === 1,
-		"editor binding has one exact admission request invocation",
-	);
-	assert(
-		!healSection?.includes("applyDiffToYText("),
-		"heal is attach-only and never writes editor bytes into Y.Text",
-	);
-	for (const [name, section] of [
-		["bind", bindSection],
-		["repair", repairSection],
-		["heal", healSection],
-		["rebind", rebindSection],
-		["stale user", staleUserSection],
-		["health", healthSection],
-	]) {
-		assert(section !== null, `${name} section found for handoff routing`);
-		assert(
-			section?.includes("this.beginPathHandoff("),
-			`${name} path mismatch routes through beginPathHandoff`,
-		);
-	}
-	assert(workspaceBindSection !== null, "workspace bind section found for managed ordering");
-	assert(
-		(workspaceBindSection?.indexOf("bindings?.manageView(view)") ?? Infinity) <
-			(workspaceBindSection?.indexOf("bindings?.bind(") ?? -1),
-		"workspace bindView manages the view before bind",
-	);
-	assert(validateSection !== null, "workspace validation section found for managed ordering");
-	assert(
-		(validateSection?.indexOf("editorBindings.manageView(leaf.view)") ?? Infinity) <
-			(validateSection?.indexOf("editorBindings.bind(leaf.view") ?? -1),
-		"workspace validation manages the view before bind",
-	);
-	assert(
-		!workspaceSource.includes("editorBindings.unbind(leaf.view)"),
-		"layout validation never performs a direct mismatch detach",
-	);
-}
-
-console.log("\n--- Test 14: reconciliation authority has one shared editor-read boundary ---");
-{
-	for (const [name, source] of [
-		["DiskMirror", diskMirrorSource],
-		["ReconciliationController", reconciliationSource],
-	]) {
-		assert(
-			!source.includes(".editor.getValue()"),
-			`${name} performs no raw editor facade authority read`,
-		);
-		assert(
-			!source.includes("getOpenEditorAuthority("),
-			`${name} has no duplicate open-editor authority helper`,
-		);
-		assert(
-			!source.includes("type OpenEditorAuthority"),
-			`${name} has no duplicate open-editor authority type`,
-		);
-		assert(
-			source.includes("capturePathEditorAuthority("),
-			`${name} consumes the shared path-scoped authority port`,
-		);
-		assert(
-			source.includes("isPathEditorAuthorityLeaseCurrent("),
-			`${name} revalidates shared editor-authority leases`,
-		);
-	}
 }
 
 console.log(`\n${"-".repeat(50)}`);

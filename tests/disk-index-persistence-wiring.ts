@@ -18,10 +18,7 @@ const mainSource = readFileSync("src/main.ts", "utf8");
 console.log("\n--- Test 1: DiskMirror write callback schedules disk-index persistence ---");
 {
 	const callbackStart = mainSource.indexOf("this.diskMirror.setDiskWriteCallback");
-	const callbackEnd = mainSource.indexOf("// 4b. BlobSyncManager", callbackStart);
-	const callbackSource = callbackStart >= 0 && callbackEnd > callbackStart
-		? mainSource.slice(callbackStart, callbackEnd)
-		: "";
+	const callbackSource = callbackStart >= 0 ? mainSource.slice(callbackStart, callbackStart + 900) : "";
 	assert(callbackStart >= 0, "disk write callback is registered");
 	assert(
 		callbackSource.includes('this.scheduleDiskIndexSave("disk-write-baseline")'),

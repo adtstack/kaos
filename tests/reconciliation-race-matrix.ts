@@ -507,18 +507,9 @@ console.log("\n--- Race 4: full reconcile equality cannot publish after provider
 		}),
 	};
 	const traces: Array<{ msg: string; details?: Record<string, unknown> }> = [];
-	let pathAuthorityLeaseSequence = 0;
 	const editorBindings = {
 		isBound: () => true,
 		getLastEditorActivityForPath: () => null,
-		capturePathEditorAuthority: (candidate: string) => candidate === path
-			? {
-				kind: "proven-single" as const,
-				content: view.editor.getValue(),
-				lease: { leaseId: `race-4-${++pathAuthorityLeaseSequence}` },
-			}
-			: { kind: "none" as const },
-		isPathEditorAuthorityLeaseCurrent: () => true,
 		captureOpenEditorMutationTicket: (
 			ticketPath: string,
 			ticketViews: readonly MarkdownView[],
@@ -678,18 +669,6 @@ for (const [advance, expectedReason] of Object.entries(
 	const editorBindings = {
 		isBound: () => true,
 		getLastEditorActivityForPath: () => null,
-		capturePathEditorAuthority: (candidate: string) => candidate === path && isOpen
-			? {
-				kind: "proven-single" as const,
-				content: settled,
-				lease: {
-					leaseId: `race-5-${bindingEpoch}-${editorRevision}-${isOpen ? "open" : "closed"}`,
-				},
-			}
-			: { kind: "none" as const },
-		isPathEditorAuthorityLeaseCurrent: (lease: { leaseId: string }) =>
-			lease.leaseId ===
-				`race-5-${bindingEpoch}-${editorRevision}-${isOpen ? "open" : "closed"}`,
 		captureOpenEditorMutationTicket: (
 			ticketPath: string,
 			ticketViews: readonly MarkdownView[],

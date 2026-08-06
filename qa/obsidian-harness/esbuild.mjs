@@ -38,11 +38,6 @@ const ctx = await esbuild.context({
 	logLevel: "info",
 	sourcemap: prod ? false : "inline",
 	treeShaking: true,
-	define: {
-		// This bundle is the mutation harness itself. Keep its dangerous fixture
-		// methods closed everywhere else, but make the QA intent explicit here.
-		"__KAOS_QA_HARNESS_ENABLED__": "true",
-	},
 	outfile: "qa/obsidian-harness/main.js",
 	minify: prod,
 });

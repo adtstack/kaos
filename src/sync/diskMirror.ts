@@ -12,10 +12,7 @@ import {
 } from "./frontmatterGuard";
 import { isLocalOrigin } from "./origins";
 import { contentBaselineHash } from "./diskIndex";
-import type {
-	EditorAuthorityLease,
-	PathEditorAuthority,
-} from "./pathEditorAuthority";
+import { getOpenFileViewsForPath } from "../utils/openFileViews";
 import {
 	PreservedUnresolvedRegistry,
 	getPreservedUnresolvedEpisodeId,
@@ -39,7 +36,6 @@ export type DiskWriteDeferReason =
 	| "missing-ytext"
 	| "path-excluded"
 	| "remote-projection-not-ready"
-	| "same-path-adoption-active"
 	| "open-editor-mismatch"
 	| "active-editor-unflushed"
 	| "recent-editor-activity"
@@ -160,12 +156,6 @@ export interface DiskWriteOptions {
 	 * caused by DiskMirror's own atomic write while retaining every other fence.
 	 */
 	isAuthorityCurrent?: (phase: DiskWriteAuthorityPhase) => boolean;
-	/**
-	 * Exact controller-owned exception for the one forced flush that settles a
-	 * bound same-path adoption. Ordinary queued/forced projections never receive
-	 * this capability and remain held for the full adoption lifetime.
-	 */
-	isSamePathAdoptionSettlementCurrent?: () => boolean;
 }
 
 type ExistingFileWriteAbortReason =
@@ -186,13 +176,11 @@ class ExistingFileWriteAborted extends Error {
 	}
 }
 
-type DiskWriteEditorAuthorityState = {
-	authority: PathEditorAuthority;
-};
-
-type DiskWriteRuntimeOptions = DiskWriteOptions & {
-	readonly editorAuthorityState: DiskWriteEditorAuthorityState;
-};
+type OpenEditorAuthority =
+	| { kind: "none" }
+	| { kind: "single"; content: string }
+	| { kind: "multiple" }
+	| { kind: "read-failed" };
 
 /**
  * Handles writeback from Y.Text -> disk with:
@@ -252,17 +240,11 @@ export interface ObservedDiskMutationRevision {
 	size: number | null;
 }
 
-export type ExactObservedDiskRevisionProbe =
-	| { kind: "current"; content: string }
-	| { kind: "stale" }
-	| { kind: "unavailable" };
-
 export type RecentWriteFingerprintProbe =
 	| { kind: "self-write"; content: string }
 	| { kind: "not-self-write"; content: string }
 	| { kind: "unproven"; content: string }
-	| { kind: "stale" }
-	| { kind: "unavailable" };
+	| { kind: "stale-or-unreadable" };
 
 interface PendingRemoteRename {
 	oldPath: string;
@@ -387,9 +369,7 @@ export class DiskMirror {
 	 * The hash is pre-computed here (where the content is in scope) to keep
 	 * the caller free of crypto concerns. Use to update disk index baselines.
 	 */
-	private _onDiskWriteCallback:
-		| ((path: string, contentHash: string, content: string) => boolean | void)
-		| null = null;
+	private _onDiskWriteCallback: ((path: string, contentHash: string, content: string) => void) | null = null;
 	/**
 	 * Supplies the durable clean-settlement hash for a path. When production
 	 * configures this provider, an unplanned CRDT write may adopt the current
@@ -422,7 +402,6 @@ export class DiskMirror {
 	private isMarkdownPathSyncable: (path: string) => boolean = () => true;
 	/** Separate from syncability so provider bootstrap never blocks local ingress. */
 	private isRemoteProjectionAllowed: (path: string) => boolean = () => true;
-	private isSamePathAdoptionProjectionHeld: (path: string) => boolean = () => false;
 	private captureRemoteProjectionAdmissionProvider:
 		(paths: readonly string[]) => RemoteProjectionAdmissionLease | null =
 			(paths) => paths.every((path) => this.isRemoteProjectionAllowed(path))
@@ -470,9 +449,7 @@ export class DiskMirror {
 	 * content written (pre-computed in diskMirror to avoid redundant re-reads).
 	 * Use this to update content-hash baselines in the disk index.
 	 */
-	setDiskWriteCallback(
-		callback: (path: string, contentHash: string, content: string) => boolean | void,
-	): void {
+	setDiskWriteCallback(callback: (path: string, contentHash: string, content: string) => void): void {
 		this._onDiskWriteCallback = callback;
 	}
 
@@ -486,12 +463,6 @@ export class DiskMirror {
 		provider: (path: string) => Promise<string | null> | string | null,
 	): void {
 		this.diskBaselineTextProvider = provider;
-	}
-
-	setSamePathAdoptionProjectionHoldPredicate(
-		predicate: (path: string) => boolean,
-	): void {
-		this.isSamePathAdoptionProjectionHeld = predicate;
 	}
 
 	setMarkdownPathSyncabilityPredicate(predicate: (path: string) => boolean): void {
@@ -806,7 +777,10 @@ export class DiskMirror {
 
 					const ytext = this.vaultSync.getTextForPath(path);
 					const crdtContent = yTextToString(ytext);
-					if (this.hasUnprovenScheduledEditorAuthority(path, crdtContent)) {
+					if (
+						this.isActivelyViewedPath(path)
+						&& this.hasFocusedEditorUnflushedChanges(path, crdtContent)
+					) {
 						this.log(`open-write: deferring "${path}" (active editor has unflushed changes)`);
 						this.scheduleOpenWrite(path);
 						return;
@@ -885,24 +859,6 @@ export class DiskMirror {
 	// Disk write
 	// -------------------------------------------------------------------
 
-	private shouldHoldSamePathAdoptionProjection(
-		path: string,
-		options: DiskWriteOptions,
-	): boolean {
-		let held = true;
-		try {
-			held = this.isSamePathAdoptionProjectionHeld(normalizePath(path));
-		} catch {
-			// A broken hold predicate fails closed.
-		}
-		if (!held) return false;
-		try {
-			return options.isSamePathAdoptionSettlementCurrent?.() !== true;
-		} catch {
-			return true;
-		}
-	}
-
 	async flushWrite(
 		path: string,
 		force = false,
@@ -913,22 +869,14 @@ export class DiskMirror {
 			this.log(`flushWrite: skipping excluded path "${path}"`);
 			return { kind: "deferred", path, reason: "path-excluded" };
 		}
-		if (this.shouldHoldSamePathAdoptionProjection(path, options)) {
-			this.log(`flushWrite: deferring "${path}" (same-path adoption active)`);
-			return { kind: "deferred", path, reason: "same-path-adoption-active" };
-		}
 		const remoteProjectionAdmission =
 			options.remoteProjectionAdmission ??
 			(options.requireRemoteProjectionAdmission === true
 				? this.captureRemoteProjectionAdmission([path])
 				: undefined);
-		const effectiveOptions: DiskWriteRuntimeOptions = {
-			...options,
-			...(remoteProjectionAdmission ? { remoteProjectionAdmission } : {}),
-			editorAuthorityState: {
-				authority: this.capturePathEditorAuthority(path),
-			},
-		};
+		const effectiveOptions: DiskWriteOptions = remoteProjectionAdmission
+			? { ...options, remoteProjectionAdmission }
+			: options;
 		if (
 			options.requireRemoteProjectionAdmission === true &&
 			(!remoteProjectionAdmission || !this.isRemoteProjectionAdmissionCurrent(
@@ -947,18 +895,11 @@ export class DiskMirror {
 	private async flushWriteUnlocked(
 		path: string,
 		force: boolean,
-		options: DiskWriteRuntimeOptions,
+		options: DiskWriteOptions,
 	): Promise<DiskWriteResult> {
 		const normalized = normalizePath(path);
 		if (this.isPreservedUnresolved(normalized)) {
 			return this.blockPreservedUnresolvedWrite(normalized, "preflight");
-		}
-		if (this.shouldHoldSamePathAdoptionProjection(normalized, options)) {
-			return {
-				kind: "deferred",
-				path: normalized,
-				reason: "same-path-adoption-active",
-			};
 		}
 		if (!this.isCallerAuthorityCurrent(path, options, "before-commit", "preflight")) {
 			return this.deferCallerAuthorityStale(path, "preflight", options);
@@ -977,13 +918,6 @@ export class DiskMirror {
 			}
 			if (!this.isCallerAuthorityCurrent(path, options, "before-commit", `attempt-${attempt}`)) {
 				return this.deferCallerAuthorityStale(path, `attempt-${attempt}`, options);
-			}
-			if (this.shouldHoldSamePathAdoptionProjection(normalized, options)) {
-				return {
-					kind: "deferred",
-					path: normalized,
-					reason: "same-path-adoption-active",
-				};
 			}
 			const ytext = this.vaultSync.getTextForPath(path);
 			if (!ytext) {
@@ -1263,13 +1197,9 @@ export class DiskMirror {
 							return this.deferCallerAuthorityStale(path, "pre-written-settlement", options);
 						}
 						this.lastDiskWriteOkAt.set(normalized, Date.now());
-						let baselineRecorded = options.recordBaseline !== false;
-						if (baselineRecorded && this._onDiskWriteCallback) {
-							baselineRecorded = this._onDiskWriteCallback(
-								normalized,
-								contentHash,
-								content,
-							) !== false;
+						const baselineRecorded = options.recordBaseline !== false;
+						if (baselineRecorded) {
+							this._onDiskWriteCallback?.(normalized, contentHash, content);
 						}
 						this._flightEventHandler?.({
 							priority: "important",
@@ -1508,13 +1438,9 @@ export class DiskMirror {
 						return this.deferCallerAuthorityStale(path, "pre-create-settlement", options);
 					}
 					this.lastDiskWriteOkAt.set(normalized, Date.now());
-					let baselineRecorded = options.recordBaseline !== false;
-					if (baselineRecorded && this._onDiskWriteCallback) {
-						baselineRecorded = this._onDiskWriteCallback(
-							normalized,
-							contentHash,
-							content,
-						) !== false;
+					const baselineRecorded = options.recordBaseline !== false;
+					if (baselineRecorded) {
+						this._onDiskWriteCallback?.(normalized, contentHash, content);
 					}
 					this._flightEventHandler?.({
 						priority: "important",
@@ -1566,7 +1492,7 @@ export class DiskMirror {
 	private async settleUnchangedWrite(
 		path: string,
 		content: string,
-		options: DiskWriteRuntimeOptions,
+		options: DiskWriteOptions,
 		expectedFile: TFile,
 		expectedYText: Y.Text,
 	): Promise<DiskWriteResult> {
@@ -1733,7 +1659,7 @@ export class DiskMirror {
 
 	private isCallerAuthorityCurrent(
 		path: string,
-		options: DiskWriteRuntimeOptions,
+		options: DiskWriteOptions,
 		phase: DiskWriteAuthorityPhase,
 		boundary: string,
 	): boolean {
@@ -1742,18 +1668,6 @@ export class DiskMirror {
 			!this.isRemoteProjectionAdmissionCurrent(options.remoteProjectionAdmission)
 		) {
 			this.trace?.("disk", "remote-projection-admission-stale", {
-				path: normalizePath(path),
-				phase,
-				boundary,
-			});
-			return false;
-		}
-		const editorAuthority = options.editorAuthorityState.authority;
-		if (
-			editorAuthority.kind === "proven-single"
-			&& !this.isPathEditorAuthorityLeaseCurrent(editorAuthority.lease)
-		) {
-			this.trace?.("disk", "editor-authority-lease-stale", {
 				path: normalizePath(path),
 				phase,
 				boundary,
@@ -1781,7 +1695,7 @@ export class DiskMirror {
 	private deferCallerAuthorityStale(
 		path: string,
 		boundary: string,
-		options?: DiskWriteRuntimeOptions,
+		options?: DiskWriteOptions,
 	): DiskWriteResult {
 		const normalized = normalizePath(path);
 		if (
@@ -1826,7 +1740,7 @@ export class DiskMirror {
 
 	private retainRemoteProjectionAdmission(
 		path: string,
-		options: DiskWriteRuntimeOptions,
+		options: DiskWriteOptions,
 	): void {
 		const admission = options.remoteProjectionAdmission;
 		if (!admission) return;
@@ -1870,51 +1784,38 @@ export class DiskMirror {
 		content: string,
 		force: boolean,
 		phase: string,
-		options: DiskWriteRuntimeOptions,
+		options: DiskWriteOptions,
 	): DiskWriteResult | null {
 		const normalized = normalizePath(path);
-		let editorAuthority = options.editorAuthorityState.authority;
-		if (editorAuthority.kind === "none") {
-			editorAuthority = this.capturePathEditorAuthority(normalized);
-			if (editorAuthority.kind !== "none") {
-				options.editorAuthorityState.authority = editorAuthority;
-			}
-		}
-		if (editorAuthority.kind === "blocked") {
-			this.log(
-				`flushWrite: deferring "${path}" ` +
-					`(editor authority blocked: ${editorAuthority.reason}, phase=${phase})`,
-			);
-			if (!force) {
-				this.retainRemoteProjectionAdmission(path, options);
-				this.scheduleOpenWrite(path);
-			}
-			return { kind: "deferred", path: normalized, reason: "open-editor-mismatch" };
-		}
-		if (
-			editorAuthority.kind === "proven-single"
-			&& !this.isPathEditorAuthorityLeaseCurrent(editorAuthority.lease)
-		) {
-			return this.deferCallerAuthorityStale(path, `editor-${phase}`, options);
-		}
-		if (
-			editorAuthority.kind === "proven-single"
-			&& editorAuthority.content !== content
-		) {
-			this.log(
-				`flushWrite: deferring open "${path}" ` +
-					`(open editor differs from CRDT, phase=${phase})`,
-			);
-			if (!force) {
-				this.retainRemoteProjectionAdmission(path, options);
-				this.scheduleOpenWrite(path);
-			}
-			return { kind: "deferred", path: normalized, reason: "open-editor-mismatch" };
-		}
 		const isOpenOrViewed = this.openPaths.has(path) || this.isOpenInWorkspace(path);
 		if (!isOpenOrViewed) return null;
 
+		if (this.hasOpenEditorContentMismatch(path, content)) {
+			this.log(
+				`flushWrite: deferring open "${path}" ` +
+				`(open editor differs from CRDT, phase=${phase})`,
+			);
+			if (!force) {
+				this.retainRemoteProjectionAdmission(path, options);
+				this.scheduleOpenWrite(path);
+			}
+			return { kind: "deferred", path: normalized, reason: "open-editor-mismatch" };
+		}
+
 		if (force) return null;
+
+		if (
+			this.isActivelyViewedPath(path)
+			&& this.hasFocusedEditorUnflushedChanges(path, content)
+		) {
+			this.log(
+				`flushWrite: deferring open "${path}" ` +
+				`(active editor has unflushed changes, phase=${phase})`,
+			);
+			this.retainRemoteProjectionAdmission(path, options);
+			this.scheduleOpenWrite(path);
+			return { kind: "deferred", path: normalized, reason: "active-editor-unflushed" };
+		}
 		if (this.hasRecentEditorActivity(path)) {
 			this.log(`flushWrite: deferring open "${path}" (recent editor activity, phase=${phase})`);
 			this.retainRemoteProjectionAdmission(path, options);
@@ -2101,35 +2002,29 @@ export class DiskMirror {
 					let decision: RemoteDeleteDecision = { kind: "apply-delete" };
 
 					let unresolvedReason: PreservedUnresolvedReason | null = null;
-					let editorAuthority = this.capturePathEditorAuthority(normalized);
 
 					if (lastKnownContent !== null) {
-						if (
-							editorAuthority.kind === "proven-single"
-							&& editorAuthority.content !== lastKnownContent
-						) {
+						const openEditorAuthority = this.getOpenEditorAuthority(normalized);
+						if (openEditorAuthority.kind === "single" && openEditorAuthority.content !== lastKnownContent) {
 							// Known baseline exists, open editor differs → known dirty,
 							// even if Obsidian has not autosaved it to disk yet.
 							decision = {
 								kind: "preserve-revive",
-								diskContent: editorAuthority.content,
+								diskContent: openEditorAuthority.content,
 								contentSource: "editor",
 							};
 							this.trace?.("disk", "remote-delete-conflict-preserved", {
 								path,
 								normalizedPath: normalized,
 								reason: "local-open-editor-modified-since-last-sync",
-								editorLength: editorAuthority.content.length,
+								editorLength: openEditorAuthority.content.length,
 								crdtLength: lastKnownContent.length,
 							});
 							this.log(
 								`handleRemoteDelete: preserved open editor content for "${path}" ` +
-								`(editor ${editorAuthority.content.length} chars !== CRDT ${lastKnownContent.length} chars)`,
+								`(editor ${openEditorAuthority.content.length} chars !== CRDT ${lastKnownContent.length} chars)`,
 							);
-						} else if (
-							editorAuthority.kind === "blocked"
-							&& editorAuthority.reason === "multiple"
-						) {
+						} else if (openEditorAuthority.kind === "multiple") {
 							decision = { kind: "preserve-unresolved" };
 							unresolvedReason = "remote-delete-multiple-open-editor-authorities";
 							this.trace?.("disk", "remote-delete-conflict-preserved", {
@@ -2141,7 +2036,7 @@ export class DiskMirror {
 								`handleRemoteDelete: preserved "${path}" ` +
 								`(multiple open editor authorities — cannot choose safely)`,
 							);
-						} else if (editorAuthority.kind === "blocked") {
+						} else if (openEditorAuthority.kind === "read-failed") {
 							decision = { kind: "preserve-unresolved" };
 							unresolvedReason = "remote-delete-open-editor-read-failed";
 							this.trace?.("disk", "remote-delete-conflict-preserved", {
@@ -2156,16 +2051,6 @@ export class DiskMirror {
 						} else {
 							try {
 								const diskContent = await this.app.vault.read(file);
-								if (
-									editorAuthority.kind === "proven-single"
-									&& !this.isPathEditorAuthorityLeaseCurrent(editorAuthority.lease)
-								) {
-									this.trace?.("disk", "remote-delete-editor-authority-stale", {
-										path: normalized,
-										phase: "after-initial-disk-read",
-									});
-									return;
-								}
 								if (diskContent !== lastKnownContent) {
 									// Known baseline exists, local file differs → known dirty.
 									// Preserve and revive: local dirty work wins over remote delete.
@@ -2247,16 +2132,6 @@ export class DiskMirror {
 						} else {
 							try {
 								const latestDiskContent = await this.app.vault.read(latestFile);
-								if (
-									editorAuthority.kind === "proven-single"
-									&& !this.isPathEditorAuthorityLeaseCurrent(editorAuthority.lease)
-								) {
-									this.trace?.("disk", "remote-delete-editor-authority-stale", {
-										path: normalized,
-										phase: "after-final-disk-read",
-									});
-									return;
-								}
 								if (!this.isExactDiskFileCurrent(normalized, latestFile)) {
 									decision = { kind: "preserve-unresolved" };
 									unresolvedReason = "remote-delete-read-failed";
@@ -2265,26 +2140,20 @@ export class DiskMirror {
 										phase: "after-final-read",
 									});
 								} else {
-									if (editorAuthority.kind === "none") {
-										editorAuthority = this.capturePathEditorAuthority(normalized);
-									}
-									const latestEditorAuthority = editorAuthority;
+									const latestEditorAuthority = this.getOpenEditorAuthority(normalized);
 									if (
-										latestEditorAuthority.kind === "proven-single"
-										&& latestEditorAuthority.content !== lastKnownContent
+									latestEditorAuthority.kind === "single"
+									&& latestEditorAuthority.content !== lastKnownContent
 									) {
 										decision = {
 											kind: "preserve-revive",
 											diskContent: latestEditorAuthority.content,
 											contentSource: "editor",
 										};
-									} else if (
-										latestEditorAuthority.kind === "blocked"
-										&& latestEditorAuthority.reason === "multiple"
-									) {
+									} else if (latestEditorAuthority.kind === "multiple") {
 										decision = { kind: "preserve-unresolved" };
 										unresolvedReason = "remote-delete-multiple-open-editor-authorities";
-									} else if (latestEditorAuthority.kind === "blocked") {
+									} else if (latestEditorAuthority.kind === "read-failed") {
 										decision = { kind: "preserve-unresolved" };
 										unresolvedReason = "remote-delete-open-editor-read-failed";
 									} else if (latestDiskContent !== lastKnownContent) {
@@ -2322,36 +2191,23 @@ export class DiskMirror {
 							expectedDeleteFingerprint,
 							"before-commit",
 						);
-						return;
-					}
-					if (
-						decision.kind !== "preserve-unresolved"
-						&& !this.isRemoteDeleteEditorAuthorityCurrent(normalized, editorAuthority)
-					) {
-						this.trace?.("disk", "remote-delete-editor-authority-stale", {
-							path: normalized,
-							phase: "before-commit",
-						});
-						return;
-					}
-					if (
-						decision.kind === "apply-delete"
-						&& (!(file instanceof TFile) || !this.isExactDiskFileCurrent(normalized, file))
-					) {
-						decision = { kind: "preserve-unresolved" };
-						unresolvedReason = "remote-delete-read-failed";
-						this.trace?.("disk", "remote-delete-file-identity-changed", {
-							path: normalized,
-							phase: "immediately-before-delete",
-						});
-					}
+							return;
+						}
+						if (
+							decision.kind === "apply-delete"
+							&& (!(file instanceof TFile) || !this.isExactDiskFileCurrent(normalized, file))
+						) {
+							decision = { kind: "preserve-unresolved" };
+							unresolvedReason = "remote-delete-read-failed";
+							this.trace?.("disk", "remote-delete-file-identity-changed", {
+								path: normalized,
+								phase: "immediately-before-delete",
+							});
+						}
 
 					if (decision.kind === "apply-delete") {
 						const fileToDelete = file;
 						if (!(fileToDelete instanceof TFile)) return;
-						if (!this.isRemoteDeleteEditorAuthorityCurrent(normalized, editorAuthority)) {
-							return;
-						}
 						const markerEpisodeBeforeTrash = this.getPreservedUnresolvedEpisode(normalized);
 
 						// A suppressed vault delete event skips the normal unbind path, so detach
@@ -2371,10 +2227,6 @@ export class DiskMirror {
 										deleteGeneration,
 										expectedDeleteFingerprint,
 										admission,
-									)) return false;
-									if (!this.isRemoteDeleteEditorAuthorityCurrent(
-										normalized,
-										editorAuthority,
 									)) return false;
 									return phase === "before"
 										? this.isExactDiskFileCurrent(normalized, fileToDelete)
@@ -2417,7 +2269,7 @@ export class DiskMirror {
 							deleteGeneration,
 							expectedDeleteFingerprint,
 							admission,
-						) && this.isRemoteDeleteEditorAuthorityCurrent(normalized, editorAuthority);
+						);
 						const pathAfterTrash = this.app.vault.getAbstractFileByPath(normalized);
 						if (deleteMode === "stale" || !deleteStillCurrent || pathAfterTrash !== null) {
 							// Either the tombstone changed while trash was in flight or a new local
@@ -2502,7 +2354,15 @@ export class DiskMirror {
 							if (!this.isExactDiskFileCurrent(normalized, file)) {
 								throw new Error("disk file identity changed before dirty revival");
 							}
-							if (decision.contentSource !== "editor") {
+							if (decision.contentSource === "editor") {
+								const latestEditorAuthority = this.getOpenEditorAuthority(normalized);
+								if (
+									latestEditorAuthority.kind !== "single"
+									|| latestEditorAuthority.content !== decision.diskContent
+								) {
+									throw new Error("editor authority changed before dirty revival");
+								}
+							} else {
 								const latestDiskContent = await this.app.vault.read(file);
 								if (
 									!this.isExactDiskFileCurrent(normalized, file)
@@ -2510,9 +2370,6 @@ export class DiskMirror {
 								) {
 									throw new Error("disk authority changed before dirty revival");
 								}
-							}
-							if (!this.isRemoteDeleteEditorAuthorityCurrent(normalized, editorAuthority)) {
-								throw new Error("editor authority changed before dirty revival");
 							}
 							if (!this.isRemoteDeleteOperationCurrent(
 								normalized,
@@ -2548,8 +2405,7 @@ export class DiskMirror {
 							const reviveSettled = activeText === revivedText
 								&& yTextToString(revivedText) === decision.diskContent
 								&& this.getAuthoritativeMarkdownDeleteFingerprint(normalized) === null
-								&& this.remoteDeleteGenerations.get(normalized) === deleteGeneration
-								&& this.isRemoteDeleteEditorAuthorityCurrent(normalized, editorAuthority);
+								&& this.remoteDeleteGenerations.get(normalized) === deleteGeneration;
 							if (!reviveSettled) {
 								throw new Error("revived Y.Text did not settle to the preserved disk authority");
 							}
@@ -3047,39 +2903,22 @@ export class DiskMirror {
 		file: TFile,
 		revision: ObservedDiskMutationRevision,
 	): Promise<string | null> {
-		const probe = await this.probeExactObservedDiskRevision(file, revision);
-		return probe.kind === "current" ? probe.content : null;
-	}
-
-	/**
-	 * Rich form of `readExactObservedDiskRevision` used by fail-closed callers.
-	 * A stale identity/stat/byte-size is ordinary replacement work, while an
-	 * adapter read failure means the exact raw representation cannot be proven.
-	 */
-	async probeExactObservedDiskRevision(
-		file: TFile,
-		revision: ObservedDiskMutationRevision,
-	): Promise<ExactObservedDiskRevisionProbe> {
-		if (!this.isObservedDiskRevisionCurrent(file, revision)) {
-			return { kind: "stale" };
-		}
+		if (!this.isObservedDiskRevisionCurrent(file, revision)) return null;
 		try {
 			// Vault.read is a document API and strips a UTF-8 BOM. The modify-event
 			// proof needs the exact disk representation so byte-size validation and
 			// conflict preservation remain lossless for BOM/mixed-EOL files.
 			const content = await this.app.vault.adapter.read(file.path);
-			if (!this.isObservedDiskRevisionCurrent(file, revision)) {
-				return { kind: "stale" };
-			}
+			if (!this.isObservedDiskRevisionCurrent(file, revision)) return null;
 			if (
 				revision.size !== null &&
 				new TextEncoder().encode(content).byteLength !== revision.size
 			) {
-				return { kind: "stale" };
+				return null;
 			}
-			return { kind: "current", content };
+			return content;
 		} catch {
-			return { kind: "unavailable" };
+			return null;
 		}
 	}
 
@@ -3101,21 +2940,13 @@ export class DiskMirror {
 			this.recentWriteFingerprints.delete(path);
 		}
 
-		const exactRevision = await this.probeExactObservedDiskRevision(file, revision);
-		if (exactRevision.kind !== "current") return exactRevision;
-		const content = exactRevision.content;
+		const content = await this.readExactObservedDiskRevision(file, revision);
+		if (content === null) return { kind: "stale-or-unreadable" };
 		if (!expectedIsFresh || !expected) return { kind: "unproven", content };
 
-		let observed: { bytes: number; hash: string };
-		try {
-			observed = await this.fingerprintContent(content);
-		} catch {
-			return this.isObservedDiskRevisionCurrent(file, revision)
-				? { kind: "unproven", content }
-				: { kind: "stale" };
-		}
+		const observed = await this.fingerprintContent(content);
 		if (!this.isObservedDiskRevisionCurrent(file, revision)) {
-			return { kind: "stale" };
+			return { kind: "stale-or-unreadable" };
 		}
 		return observed.bytes === expected.expectedBytes &&
 			observed.hash === expected.expectedHash
@@ -3200,21 +3031,6 @@ export class DiskMirror {
 		}
 	}
 
-	/** Clear one controller-owned occurrence without touching a replacement. */
-	clearPreservedUnresolvedEpisode(path: string, expectedEpisodeId: string): boolean {
-		const normalized = normalizePath(path);
-		if (!this.preservedUnresolved.resolveEpisode(normalized, expectedEpisodeId)) {
-			return false;
-		}
-		this.onPreservedUnresolvedChanged?.();
-		this.trace?.("disk", "preserved-unresolved-cleared", {
-			path: normalized,
-			reason: "exact-episode-settled",
-			episodeId: expectedEpisodeId,
-		});
-		return true;
-	}
-
 	/**
 	 * Carry an unresolved episode across a path rename. A destination owned by a
 	 * different episode is never overwritten; both namespaces become an explicit
@@ -3267,7 +3083,6 @@ export class DiskMirror {
 	recordPreservedUnresolved(
 		path: string,
 		reason: PreservedUnresolvedReason,
-		notify = true,
 	): void {
 		const normalized = normalizePath(path);
 		const remoteDeleteEntry = isRemoteDeletePreservedUnresolvedEntry({
@@ -3294,7 +3109,7 @@ export class DiskMirror {
 		// discovered the ambiguity. Retire every pending form now; a batch already
 		// handed to the drain loop is still stopped by flushWrite's hard guard.
 		this.retirePendingWritesForPreservedPath(normalized);
-		if (notify) this.onPreservedUnresolvedChanged?.();
+		this.onPreservedUnresolvedChanged?.();
 	}
 
 	private retirePendingWritesForPreservedPath(path: string): void {
@@ -3637,43 +3452,16 @@ export class DiskMirror {
 		return Date.now() - lastEditorActivity < OPEN_FILE_ACTIVE_GRACE_MS;
 	}
 
-	private capturePathEditorAuthority(path: string): PathEditorAuthority {
-		try {
-			return this.editorBindings.capturePathEditorAuthority(normalizePath(path));
-		} catch {
-			return { kind: "blocked", reason: "read-failed" };
-		}
-	}
-
-	private isPathEditorAuthorityLeaseCurrent(lease: EditorAuthorityLease): boolean {
-		try {
-			return this.editorBindings.isPathEditorAuthorityLeaseCurrent(lease) === true;
-		} catch {
-			return false;
-		}
-	}
-
-	private isRemoteDeleteEditorAuthorityCurrent(
-		path: string,
-		authority: PathEditorAuthority,
-	): boolean {
-		if (authority.kind === "proven-single") {
-			return this.isPathEditorAuthorityLeaseCurrent(authority.lease);
-		}
-		if (authority.kind === "blocked") return false;
-		return this.capturePathEditorAuthority(path).kind === "none";
-	}
-
-	private hasUnprovenScheduledEditorAuthority(
-		path: string,
-		expectedCrdtContent: string | null,
-	): boolean {
+	private hasFocusedEditorUnflushedChanges(path: string, expectedCrdtContent: string | null): boolean {
 		if (expectedCrdtContent == null) return false;
-		const authority = this.capturePathEditorAuthority(path);
-		if (authority.kind === "blocked") return true;
-		if (authority.kind === "none") return false;
-		return authority.content !== expectedCrdtContent
-			|| !this.isPathEditorAuthorityLeaseCurrent(authority.lease);
+		const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (activeView?.file?.path !== path) return false;
+		try {
+			return activeView.editor.getValue() !== expectedCrdtContent;
+		} catch {
+			// If the editor instance is in flux, conservatively defer one cycle.
+			return true;
+		}
 	}
 
 	private getOpenMarkdownViewsForPath(path: string): MarkdownView[] {
@@ -3699,12 +3487,72 @@ export class DiskMirror {
 		return views;
 	}
 
+	private getOpenFileViewsForPath(path: string): unknown[] {
+		const markdownViews = this.getOpenMarkdownViewsForPath(path);
+		return getOpenFileViewsForPath(
+			this.app.workspace as Parameters<typeof getOpenFileViewsForPath>[0],
+			path,
+			markdownViews,
+		);
+	}
+
+	private hasOpaqueOpenFileView(path: string): boolean {
+		return this.getOpenFileViewsForPath(path)
+			.some((view) => !(view instanceof MarkdownView));
+	}
+
 	private isOpenInWorkspace(path: string): boolean {
 		// Only MarkdownView has unsaved editor authority that requires the idle
 		// write scheduler. Bases are file-backed opaque views: their content
-		// writes enter the normal queue; the shared authority port still blocks
-		// any unsafe write or destructive decision at admission.
+		// writes use the normal exact-snapshot CAS path, while destructive remote
+		// deletes are still blocked by getOpenEditorAuthority below.
 		return this.getOpenMarkdownViewsForPath(path).length > 0;
+	}
+
+	private hasOpenEditorContentMismatch(path: string, expectedCrdtContent: string | null): boolean {
+		if (expectedCrdtContent == null) return false;
+		for (const view of this.getOpenMarkdownViewsForPath(path)) {
+			try {
+				if (view.editor.getValue() !== expectedCrdtContent) {
+					return true;
+				}
+			} catch {
+				// If an open editor is in flux, do not overwrite the disk under it.
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private getOpenEditorAuthority(path: string): OpenEditorAuthority {
+		const views = this.getOpenMarkdownViewsForPath(path);
+		// Bases and other opaque file views do not expose unsaved UI state.  Their
+		// presence is authority we cannot read, so destructive decisions must fail
+		// closed until the view is gone.
+		if (this.hasOpaqueOpenFileView(path)) return { kind: "read-failed" };
+		if (views.length === 0) return { kind: "none" };
+
+		const contents: string[] = [];
+		for (const view of views) {
+			try {
+				contents.push(view.editor.getValue());
+			} catch {
+				return { kind: "read-failed" };
+			}
+		}
+
+		const distinct = [...new Set(contents)];
+		if (distinct.length === 0) return { kind: "none" };
+		if (distinct.length > 1) return { kind: "multiple" };
+		return { kind: "single", content: distinct[0]! };
+	}
+
+	private isActivelyViewedPath(path: string): boolean {
+		if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+			return false;
+		}
+		const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+		return activeView?.file?.path === path;
 	}
 
 	private queueImmediateWrite(path: string, reason: string, force = false): void {

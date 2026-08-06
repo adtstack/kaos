@@ -1436,18 +1436,3 @@
 .vault-crdt-show-cursors .cm-ySelectionInfo {
 	display: none !important;
 }
-.kaos-dashboard-handoff-recovery-row {
-	padding: 10px 8px;
-}
-
-.kaos-dashboard-handoff-recovery-row .kaos-dashboard-row-actions {
-	display: flex;
-	flex-wrap: wrap;
-	gap: 6px;
-	margin-top: 8px;
-}
-
-.kaos-handoff-recovery-export-path {
-	width: 100%;
-	margin: 8px 0 12px;
-}
