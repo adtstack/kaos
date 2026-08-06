@@ -219,14 +219,6 @@ const baseInput: KaosDashboardCollectorInput = {
 			contentCheckLimited: false,
 		},
 	},
-	handoffRecovery: {
-		status: "ready",
-		activeCount: 0,
-		terminalCount: 0,
-		totalBytes: 0,
-		issues: [],
-		items: [],
-	},
 	recentChanges: {
 		status: "ready",
 		manifestCount: 1,
@@ -416,22 +408,6 @@ console.log("\n--- Test 3: attention aggregation includes all local attention ty
 	assert(remoteDelete?.resolution?.canKeepLocal === true, "Keep local is enabled only when the local file and sync engine are ready");
 	assert(remoteDelete?.resolution?.canAcceptRemoteDelete === true, "Accept remote delete is enabled for an authoritative tombstone");
 	assert(pathCollision?.resolution === null, "non-delete preserved attention is not offered delete resolution");
-	const exhaustedReadAttention = collectDashboardAttention({
-		...baseInput,
-		preservedUnresolvedEntries: [{
-			path: "notes/external-writer-still-running.md",
-			kind: "markdown",
-			reason: "external-disk-read-unavailable",
-			episodeId: "external-read-episode",
-			firstSeenAt: 1,
-			lastSeenAt: 2,
-		}],
-	}).find((item) => item.path === "notes/external-writer-still-running.md");
-	assert(
-		exhaustedReadAttention?.detail.includes("stable disk snapshot") === true
-			&& exhaustedReadAttention.detail.includes("left unchanged") === true,
-		"exhausted disk-read Attention explains the non-mutating retry outcome",
-	);
 	const structuralChange = attention.find((item) => item.kind === "structural-change");
 	assert(
 		structuralChange?.title === "ambiguous · old.md, new.md",

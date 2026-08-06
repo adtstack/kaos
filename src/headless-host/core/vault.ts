@@ -103,9 +103,9 @@ export class HeadlessVault extends HeadlessEventEmitter {
 
 	async create(path: string, content: string): Promise<TFile> {
 		return await this.runPathMutationLocked(path, async () => {
-			const createdRevision = await this.adapter.create(path, content);
+			await this.adapter.create(path, content);
 			this.fileCache.delete(normalizePath(path));
-			const file = this.fileFromStat(path, createdRevision);
+			const file = await this.getFile(path);
 			this.emit("create", file);
 			return file;
 		});
@@ -113,9 +113,9 @@ export class HeadlessVault extends HeadlessEventEmitter {
 
 	async createBinary(path: string, data: ArrayBuffer): Promise<TFile> {
 		return await this.runPathMutationLocked(path, async () => {
-			const createdRevision = await this.adapter.createBinary(path, data);
+			await this.adapter.createBinary(path, data);
 			this.fileCache.delete(normalizePath(path));
-			const file = this.fileFromStat(path, createdRevision);
+			const file = await this.getFile(path);
 			this.emit("create", file);
 			return file;
 		});
@@ -344,34 +344,19 @@ export class HeadlessVaultAdapter {
 		}
 	}
 
-	async create(path: string, content: string): Promise<ObservedHeadlessFileStats> {
+	async create(path: string, content: string): Promise<void> {
 		const abs = this.toFsPath(path);
 		await mkdir(dirname(abs), { recursive: true });
 		const tmp = this.nextTemporaryPath(abs);
-		let createdRevision: ObservedHeadlessFileStats | null = null;
 		try {
 			await writeFile(tmp, content, { encoding: "utf8", flag: "wx" });
-			const prepared = statSync(tmp);
-			const preparedRevision: ObservedHeadlessFileStats = {
-				ctime: prepared.ctimeMs,
-				mtime: prepared.mtimeMs,
-				size: prepared.size,
-				dev: prepared.dev,
-				ino: prepared.ino,
-			};
 			// Linking a fully-written inode makes the destination appear atomically.
 			// link(2) also fails with EEXIST, so a racing or pre-existing local
 			// file is never replaced.
-			await this.linkPreparedFile(tmp, abs);
-			// Keep the exact prepared revision. An out-of-band writer can observe and
-			// mutate the linked inode before this async method returns; re-statting the
-			// destination would incorrectly publish that external edit as our baseline.
-			createdRevision = preparedRevision;
+			await link(tmp, abs);
 		} finally {
 			await rm(tmp, { force: true }).catch(() => undefined);
 		}
-		if (!createdRevision) throw new Error(`File not found after create: ${path}`);
-		return createdRevision;
 	}
 
 	async process(path: string, fn: (data: string) => string): Promise<string> {
@@ -491,28 +476,16 @@ export class HeadlessVaultAdapter {
 		}
 	}
 
-	async createBinary(path: string, data: ArrayBuffer): Promise<ObservedHeadlessFileStats> {
+	async createBinary(path: string, data: ArrayBuffer): Promise<void> {
 		const abs = this.toFsPath(path);
 		await mkdir(dirname(abs), { recursive: true });
 		const tmp = this.nextTemporaryPath(abs);
-		let createdRevision: ObservedHeadlessFileStats | null = null;
 		try {
 			await writeFile(tmp, Buffer.from(data), { flag: "wx" });
-			const prepared = statSync(tmp);
-			const preparedRevision: ObservedHeadlessFileStats = {
-				ctime: prepared.ctimeMs,
-				mtime: prepared.mtimeMs,
-				size: prepared.size,
-				dev: prepared.dev,
-				ino: prepared.ino,
-			};
-			await this.linkPreparedFile(tmp, abs);
-			createdRevision = preparedRevision;
+			await link(tmp, abs);
 		} finally {
 			await rm(tmp, { force: true }).catch(() => undefined);
 		}
-		if (!createdRevision) throw new Error(`File not found after create: ${path}`);
-		return createdRevision;
 	}
 
 	async exists(path: string): Promise<boolean> {
@@ -576,10 +549,6 @@ export class HeadlessVaultAdapter {
 			await rm(newAbs, { force: true }).catch(() => undefined);
 			throw err;
 		}
-	}
-
-	private async linkPreparedFile(source: string, target: string): Promise<void> {
-		await link(source, target);
 	}
 
 	private nextTemporaryPath(abs: string): string {

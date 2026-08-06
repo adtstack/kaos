@@ -218,10 +218,6 @@ console.log("\n--- Test 4: targeted-diff failure is an ordinary persisted markdo
 		(reasonTypeMatch?.[1] ?? "").includes('"open-external-targeted-diff-failed"'),
 		"PreservedUnresolvedReason includes the targeted-diff failure literal",
 	);
-	assert(
-		(reasonTypeMatch?.[1] ?? "").includes('"external-disk-read-unavailable"'),
-		"PreservedUnresolvedReason includes the exhausted stable-read literal",
-	);
 
 	const reason: PreservedUnresolvedReason = "open-external-targeted-diff-failed";
 	const persistedEntry: PreservedUnresolvedEntry = {
@@ -252,11 +248,6 @@ console.log("\n--- Test 4: targeted-diff failure is an ordinary persisted markdo
 	assert(
 		!isRemoteDeletePreservedUnresolvedReason(reason),
 		"targeted-diff failure is not misclassified as a remote-delete reason",
-	);
-	const stableReadReason: PreservedUnresolvedReason = "external-disk-read-unavailable";
-	assert(
-		!isRemoteDeletePreservedUnresolvedReason(stableReadReason),
-		"exhausted stable-read Attention is not misclassified as a remote-delete reason",
 	);
 }
 

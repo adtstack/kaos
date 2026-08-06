@@ -16,17 +16,11 @@ export function normalizePath(path: string): string {
 	return path;
 }
 
-/** Tested host adapter used by managed-view unit regressions. */
-export const apiVersion = "1.13.4";
-
 /** Stub class. Passed as an argument to app.workspace.getActiveViewOfType(). */
 export class MarkdownView {}
 
 /** Stub class. Used in instanceof checks inside DiskMirror's vault event handlers. */
 export class TFile {}
-
-/** Stub folder class used by explicit vault export path validation. */
-export class TFolder {}
 
 /** Notice constructor used by runtime controllers. */
 export class Notice {

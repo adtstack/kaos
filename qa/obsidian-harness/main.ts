@@ -15,7 +15,7 @@
  */
 
 import { Plugin, Notice } from "obsidian";
-import { buildQaConsoleApi, disposeQaConsoleApi } from "./api";
+import { buildQaConsoleApi } from "./api";
 import type { QaScenario } from "./types";
 import { buildQaDebugApi } from "../harness/qaDebugApi";
 import { ScenarioStateController } from "../harness/scenarioStateController";
@@ -70,8 +70,6 @@ import { s10bPassiveDeletionSoak } from "./scenarios/s10b-passive-deletion-soak"
 import { s10cDisableReenablePreservesEdits } from "./scenarios/s10c-disable-reenable-preserves-edits";
 import { s10dRecoveryAmplifierOrchestration } from "./scenarios/s10d-recovery-amplifier-orchestration";
 import { s10gSuppressionDelayRace } from "./scenarios/s10g-suppression-delay-race";
-import { s13aEditorHandoffHostFences } from "./scenarios/s13a-editor-handoff-host-fences";
-import { s13eSamePathAdoption } from "./scenarios/s13e-same-path-adoption";
 
 const ALL_SCENARIOS: QaScenario[] = [
 	s00SmokeTraceExport,
@@ -118,16 +116,11 @@ const ALL_SCENARIOS: QaScenario[] = [
 	s10cDisableReenablePreservesEdits,
 	s10dRecoveryAmplifierOrchestration,
 	s10gSuppressionDelayRace,
-	// S13a: supported-host editor handoff fences
-	s13aEditorHandoffHostFences,
-	// S13e: live-host same-path adoption and fallback
-	s13eSamePathAdoption,
 ];
 
 export default class KaosQaHarnessPlugin extends Plugin {
 	private scenarioRegistry = new Map<string, QaScenario>();
 	private scenarioController = new ScenarioStateController();
-	private consoleApi: ReturnType<typeof buildQaConsoleApi> | null = null;
 
 	async onload(): Promise<void> {
 		// Register all scenarios
@@ -136,19 +129,14 @@ export default class KaosQaHarnessPlugin extends Plugin {
 		}
 
 		// Mount window.__KAOS_QA__ (harness console API)
-		const api = buildQaConsoleApi(
-			this.app,
-			this.scenarioRegistry,
-			() => this.rebindKaosDebugApi(),
-		);
-		this.consoleApi = api;
+		const api = buildQaConsoleApi(this.app, this.scenarioRegistry);
 		(window as unknown as Record<string, unknown>).__KAOS_QA__ = api;
 
 		// Mount window.__KAOS_DEBUG__ (product QA debug API).
 		// The product plugin ships as a passive black box — it never mounts
 		// __KAOS_DEBUG__ itself.  The harness is responsible for this mount
 		// because it is the only in-repo Puppeteer consumer.
-		this.rebindKaosDebugApi();
+		this.mountKaosDebugApi();
 
 		new Notice("KAOS QA Harness loaded. window.__KAOS_QA__ is available.", 5000);
 		console.log(
@@ -242,8 +230,6 @@ export default class KaosQaHarnessPlugin extends Plugin {
 	}
 
 	onunload(): void {
-		if (this.consoleApi) disposeQaConsoleApi(this.consoleApi);
-		this.consoleApi = null;
 		delete (window as unknown as Record<string, unknown>).__KAOS_QA__;
 		delete (window as unknown as Record<string, unknown>).__KAOS_DEBUG__;
 		console.log("[KAOS QA] Harness unloaded.");
@@ -269,12 +255,7 @@ export default class KaosQaHarnessPlugin extends Plugin {
 	 *
 	 * Private fields are accessed via `as any` — acceptable in a QA-only file.
 	 */
-	private rebindKaosDebugApi(): boolean {
-		delete (window as unknown as Record<string, unknown>).__KAOS_DEBUG__;
-		return this.mountKaosDebugApi();
-	}
-
-	private mountKaosDebugApi(): boolean {
+	private mountKaosDebugApi(): void {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const product = (this.app.plugins as any).plugins?.["kaos"] as Record<string, unknown> | undefined;
 
@@ -287,7 +268,7 @@ export default class KaosQaHarnessPlugin extends Plugin {
 			);
 			new Notice("KAOS QA FATAL: product plugin not found — __KAOS_DEBUG__ unavailable. " +
 				"Check plugin load order.", 15000);
-			return false;
+			return;
 		}
 
 		// Guard 2: getEngineControlPort must exist (confirms QA product build, not prod main.js)
@@ -299,7 +280,7 @@ export default class KaosQaHarnessPlugin extends Plugin {
 			);
 			new Notice("KAOS QA FATAL: wrong product build — getEngineControlPort missing. " +
 				"Run npm run build:qa-product.", 15000);
-			return false;
+			return;
 		}
 
 		// Guard 3: product.lab must exist (confirms qaDebugMode=true and telemetry loaded)
@@ -312,7 +293,7 @@ export default class KaosQaHarnessPlugin extends Plugin {
 				"Check qa/scripts/prepare-vault.ts — it must write qaDebugMode into the KAOS settings.",
 			);
 			new Notice("KAOS QA FATAL: product.lab missing — set qaDebugMode: true in KAOS settings.", 15000);
-			return false;
+			return;
 		}
 
 		// Guard 4: new accessor must exist (confirms P4B telemetry build)
@@ -322,7 +303,7 @@ export default class KaosQaHarnessPlugin extends Plugin {
 				"The telemetry.js bundle is stale — run: npm run build.",
 			);
 			new Notice("KAOS QA FATAL: stale telemetry.js — run npm run build.", 15000);
-			return false;
+			return;
 		}
 
 		const scenarioController = this.scenarioController;
@@ -370,14 +351,10 @@ export default class KaosQaHarnessPlugin extends Plugin {
 			getQaTraceSecretHash: () =>
 				((lab as any).getQaTraceSecretHash?.() ?? null) as string | null,
 			getEngineControlPort: () => (product as any).getEngineControlPort(),
-			clearMarkdownAttentionForQa: (path: string) => {
-				(product as any).diskMirror?.clearPreservedUnresolved(path);
-			},
 		});
 
 		(window as unknown as Record<string, unknown>).__KAOS_DEBUG__ = debugApi;
 		console.log("[KAOS QA] window.__KAOS_DEBUG__ mounted successfully.");
 		new Notice("KAOS QA: window.__KAOS_DEBUG__ is available.", 4000);
-		return true;
 	}
 }

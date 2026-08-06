@@ -173,39 +173,7 @@ function buildFixture(initial: {
 		captured.push(asAnyEvent(event));
 	};
 
-	let pathEditorAuthorityLeaseSequence = 0;
-	const pathEditorAuthorityLeases = new Map<object, Readonly<{
-		editorRevision: number;
-		editorContent: string;
-		file: TFile;
-		view: MarkdownView;
-	}>>();
 	const editorBindings = {
-		capturePathEditorAuthority: (candidatePath: string) => {
-			if (candidatePath !== path) return { kind: "none" as const };
-			const lease = {
-				leaseId: `amplifier-${++pathEditorAuthorityLeaseSequence}`,
-			};
-			pathEditorAuthorityLeases.set(lease, {
-				editorRevision,
-				editorContent,
-				file: view.file,
-				view,
-			});
-			return {
-				kind: "proven-single" as const,
-				content: editorContent,
-				lease,
-			};
-		},
-		isPathEditorAuthorityLeaseCurrent: (lease: object) => {
-			const capturedLease = pathEditorAuthorityLeases.get(lease);
-			return !!capturedLease
-				&& capturedLease.editorRevision === editorRevision
-				&& capturedLease.editorContent === editorContent
-				&& capturedLease.file === view.file
-				&& capturedLease.view === view;
-		},
 		isBound: () => true,
 		getBindingDebugInfoForView: () => ({
 			leafId: "stub-leaf-1",

@@ -11,14 +11,9 @@ import type {
 	QaResult,
 	QaRunOptions,
 	QaScenario,
-	QaExternalPhaseTicket,
 	VaultManifest,
 	ManifestDiff,
 } from "./types";
-import {
-	createEditorHandoffExternalPhaseCoordinator,
-	type EditorHandoffExternalPhaseCoordinator,
-} from "./external-phase";
 import { analyzeTrace } from "../analyzers/analyzer";
 import { sleep, waitForIdle, waitForMemoryReceipt, waitForFile, waitForCrdtFile, waitForDiskCrdtConverge, waitForActiveMarkdownLeaf, waitForCrdtBinding } from "./wait";
 import {
@@ -50,12 +45,6 @@ import { buildVaultManifest, diffManifests } from "./manifest-builder";
 const DEFAULT_IDLE_TIMEOUT = 15_000;
 const DEFAULT_RECEIPT_TIMEOUT = 30_000;
 const DEFAULT_FILE_TIMEOUT = 15_000;
-const qaConsoleApiDisposers = new WeakMap<QaConsoleApi, () => void>();
-
-export function disposeQaConsoleApi(api: QaConsoleApi): void {
-	qaConsoleApiDisposers.get(api)?.();
-	qaConsoleApiDisposers.delete(api);
-}
 
 function getKaos(): KaosQaDebugApi {
 	const api = (window as unknown as Record<string, unknown>).__KAOS_DEBUG__ as KaosQaDebugApi | undefined;
@@ -63,33 +52,11 @@ function getKaos(): KaosQaDebugApi {
 	return api;
 }
 
-/**
- * A scenario may deliberately reload the product plugin while the harness
- * remains alive.  Resolve every QA call against the currently mounted debug
- * API so a long-running external-phase scenario never retains the unloaded
- * product instance.
- */
-function getReloadSafeKaos(): KaosQaDebugApi {
-	return new Proxy({} as KaosQaDebugApi, {
-		get(_target, property) {
-			const current = getKaos();
-			const value = Reflect.get(current as object, property);
-			return typeof value === "function" ? value.bind(current) : value;
-		},
-	});
-}
-
-function buildContext(
-	app: App,
-	signal: AbortSignal,
-	awaitExternalPhase: QaContext["awaitExternalPhase"],
-): QaContext {
-	const kaos = getReloadSafeKaos();
+function buildContext(app: App): QaContext {
+	const kaos = getKaos();
 	return {
 		app,
 		kaos,
-		signal,
-		awaitExternalPhase,
 
 		phase: (name) => kaos.__qaOnlyEmitPhaseUnsafe(name),
 
@@ -128,192 +95,9 @@ function buildContext(
 	};
 }
 
-export function buildQaConsoleApi(
-	app: App,
-	scenarioRegistry: Map<string, QaScenario>,
-	rebindKaosDebugApi: () => boolean = () => false,
-): QaConsoleApi {
-	type ActiveQaRun = {
-		readonly runId: string;
-		readonly controller: AbortController;
-		settlement: Promise<QaResult>;
-		coordinator: EditorHandoffExternalPhaseCoordinator | null;
-	};
-	let activeRun: ActiveQaRun | null = null;
-	let runSequence = 0;
-	let api: QaConsoleApi;
+export function buildQaConsoleApi(app: App, scenarioRegistry: Map<string, QaScenario>): QaConsoleApi {
 
-	const failedResult = (id: string, error: string): QaResult => ({
-		id,
-		passed: false,
-		scenarioPassed: false,
-		analyzerPassed: false,
-		durationMs: 0,
-		errors: [error],
-		warnings: [],
-		tracePath: null,
-		analyzerReport: null,
-	});
-
-	const executeRun = async (
-		record: ActiveQaRun,
-		id: string,
-		opts?: QaRunOptions,
-	): Promise<QaResult> => {
-		const scenario = scenarioRegistry.get(id);
-		if (!scenario) return failedResult(id, `Unknown scenario: ${id}`);
-		if (record.controller.signal.aborted) return failedResult(id, "aborted:superseded");
-
-		const timeoutMs = opts?.timeoutMs ?? 120_000;
-		const errors: string[] = [];
-		const warnings: string[] = [];
-		const start = Date.now();
-		let timedOut = false;
-		const coordinator = createEditorHandoffExternalPhaseCoordinator({
-			runId: record.runId,
-			scenarioId: scenario.id,
-			signal: record.controller.signal,
-		});
-		record.coordinator = coordinator;
-		const ctx = buildContext(
-			app,
-			record.controller.signal,
-			(name) => coordinator.awaitExternalPhase(name),
-		);
-		const recordingMode = scenario.traceRecordingMode ?? "qa-safe";
-		const exportPrivacy: "safe" | "full" = scenario.traceExportPrivacy ?? "safe";
-		let tracePath: string | null = null;
-		let analyzerReport: unknown = null;
-		let analyzerPassed = true;
-		let currentPhase: "setup" | "run" | "assert" = "setup";
-
-		const timeout = setTimeout(() => {
-			timedOut = true;
-			record.controller.abort(new Error(`timeout:${timeoutMs}ms`));
-		}, timeoutMs);
-
-		try {
-			try {
-				await api.stopTrace();
-			} catch {
-				// No trace was active.
-			}
-			try {
-				await api.startTrace(recordingMode);
-			} catch (traceStartErr) {
-				warnings.push(`trace start failed: ${String(traceStartErr)}`);
-			}
-
-			let abortListener: (() => void) | null = null;
-			const aborted = new Promise<never>((_resolve, reject) => {
-				abortListener = () => reject(
-					record.controller.signal.reason instanceof Error
-						? record.controller.signal.reason
-						: new Error("QA run aborted"),
-				);
-				if (record.controller.signal.aborted) abortListener();
-				else record.controller.signal.addEventListener("abort", abortListener, { once: true });
-			});
-			const throwIfAborted = (): void => {
-				if (!record.controller.signal.aborted) return;
-				throw record.controller.signal.reason instanceof Error
-					? record.controller.signal.reason
-					: new Error("QA run aborted");
-			};
-			const scenarioWork = (async () => {
-				throwIfAborted();
-				await ctx.phase("setup");
-				throwIfAborted();
-				currentPhase = "setup";
-				await scenario.setup(ctx);
-				throwIfAborted();
-				await ctx.phase("run");
-				throwIfAborted();
-				currentPhase = "run";
-				await scenario.run(ctx);
-				throwIfAborted();
-				await ctx.phase("assert");
-				throwIfAborted();
-				currentPhase = "assert";
-				await scenario.assert(ctx);
-			})();
-
-			try {
-				await Promise.race([scenarioWork, aborted]);
-			} catch (error) {
-				coordinator.rejectCurrent(
-					error instanceof Error ? error : new Error(String(error)),
-				);
-				await scenarioWork.catch(() => undefined);
-				if (record.controller.signal.aborted) {
-					const reason = timedOut
-						? `timeout:${timeoutMs}ms`
-						: `aborted:${record.controller.signal.reason instanceof Error
-							? record.controller.signal.reason.message
-							: "superseded"}`;
-					errors.push(reason);
-				} else {
-					errors.push(`${currentPhase}:${error instanceof Error ? error.message : String(error)}`);
-				}
-			} finally {
-				if (abortListener) {
-					record.controller.signal.removeEventListener("abort", abortListener);
-				}
-			}
-
-			coordinator.rejectCurrent(new Error("scenario lifecycle settled"));
-			try {
-				await ctx.phase("cleanup");
-			} catch (phaseError) {
-				warnings.push(`cleanup phase: ${String(phaseError)}`);
-			}
-
-			try {
-				const bundle = await api.exportTraceWithAnalyzer(exportPrivacy, scenario.id);
-				tracePath = bundle.tracePath;
-				analyzerReport = bundle.report;
-				const reportPassed = (analyzerReport as { passed?: boolean } | null)?.passed;
-				analyzerPassed = reportPassed !== false;
-				if (!analyzerPassed) warnings.push("analyzer found hard failures in trace");
-			} catch (traceErr) {
-				warnings.push(`trace export/analyzer failed: ${String(traceErr)}`);
-			} finally {
-				try {
-					await api.stopTrace();
-				} catch (traceStopErr) {
-					warnings.push(`trace stop failed: ${String(traceStopErr)}`);
-				}
-			}
-
-			try {
-				await scenario.cleanup?.(ctx);
-			} catch (cleanErr) {
-				warnings.push(`cleanup: ${String(cleanErr)}`);
-			}
-		} finally {
-			clearTimeout(timeout);
-			coordinator.dispose(new Error("scenario lifecycle complete"));
-			if (record.coordinator === coordinator) record.coordinator = null;
-		}
-
-		const scenarioPassed = errors.length === 0;
-		const passed = scenarioPassed && analyzerPassed;
-		const result: QaResult = {
-			id,
-			passed,
-			scenarioPassed,
-			analyzerPassed,
-			durationMs: Date.now() - start,
-			errors,
-			warnings,
-			tracePath,
-			analyzerReport,
-		};
-		console.log(`[KAOS QA] ${passed ? "✓" : "✗"} ${id} (${result.durationMs}ms)`);
-		return result;
-	};
-
-	api = {
+	const api: QaConsoleApi = {
 		help(): void {
 			const methods = [
 				"help()                               — show this message",
@@ -361,38 +145,131 @@ export function buildQaConsoleApi(
 			return [...scenarioRegistry.keys()];
 		},
 
-		run(id, opts?: QaRunOptions): Promise<QaResult> {
-			const predecessor = activeRun;
-			predecessor?.controller.abort(new Error("superseded"));
-			const controller = new AbortController();
-			const record: ActiveQaRun = {
-				runId: `qa-run-${Date.now().toString(36)}-${++runSequence}`,
-				controller,
-				settlement: Promise.resolve(failedResult(id, "run-not-started")),
-				coordinator: null,
+		async run(id, opts?: QaRunOptions): Promise<QaResult> {
+			const scenario = scenarioRegistry.get(id);
+			if (!scenario) {
+				return {
+					id,
+					passed: false,
+					scenarioPassed: false,
+					analyzerPassed: false,
+					durationMs: 0,
+					errors: [`Unknown scenario: ${id}`],
+					warnings: [],
+					tracePath: null,
+					analyzerReport: null,
+				};
+			}
+
+			const ctx = buildContext(app);
+			const errors: string[] = [];
+			const warnings: string[] = [];
+			const start = Date.now();
+
+			// Recording mode and export privacy are separate concepts.
+			const recordingMode = scenario.traceRecordingMode ?? "qa-safe";
+			const exportPrivacy: "safe" | "full" = scenario.traceExportPrivacy ?? "safe";
+
+			let tracePath: string | null = null;
+			let analyzerReport: unknown = null;
+			let analyzerPassed = true; // assume pass unless analyzer explicitly fails
+
+			// Phase: start trace BEFORE setup so all events are captured.
+			// Stop any previously running trace first to prevent event bleed.
+			try {
+				await api.stopTrace();
+			} catch {
+				// ignore — no trace was running
+			}
+			try {
+				await api.startTrace(recordingMode);
+			} catch (traceStartErr) {
+				warnings.push(`trace start failed: ${String(traceStartErr)}`);
+			}
+
+			// Phase: setup
+			await ctx.phase("setup");
+			try {
+				await scenario.setup(ctx);
+			} catch (setupErr) {
+				errors.push(`setup: ${setupErr instanceof Error ? setupErr.message : String(setupErr)}`);
+			}
+
+			// Phase: run + assert (only if setup succeeded)
+			if (errors.length === 0) {
+				await ctx.phase("run");
+				try {
+					await scenario.run(ctx);
+				} catch (runErr) {
+					errors.push(runErr instanceof Error ? runErr.message : String(runErr));
+				}
+
+				await ctx.phase("assert");
+				try {
+					await scenario.assert(ctx);
+				} catch (assertErr) {
+					errors.push(assertErr instanceof Error ? assertErr.message : String(assertErr));
+				}
+			}
+
+			const scenarioPassed = errors.length === 0;
+
+			// Phase: cleanup marker — emitted BEFORE trace export so analyzers
+			// can see the phase boundary and know that events after this point
+			// are intentional teardown (expected tombstones, deletes, etc.).
+			// The actual cleanup() call runs AFTER export so teardown events
+			// themselves are not included in the scenario trace.
+			await ctx.phase("cleanup");
+
+			// Phase: export trace + analyze.
+			try {
+			const bundle = await api.exportTraceWithAnalyzer(exportPrivacy, scenario.id);
+				tracePath = bundle.tracePath;
+				analyzerReport = bundle.report;
+				const reportPassed = (analyzerReport as { passed?: boolean } | null)?.passed;
+				analyzerPassed = reportPassed !== false; // null/undefined = no finding = pass
+				console.log(`[KAOS QA] Trace exported: ${tracePath}`);
+				console.log("[KAOS QA] Analyzer report:", analyzerReport);
+				if (!analyzerPassed) {
+					warnings.push("analyzer found hard failures in trace");
+				}
+			} catch (traceErr) {
+				warnings.push(`trace export/analyzer failed: ${String(traceErr)}`);
+			}
+
+			// Run actual cleanup — outside trace window (after export).
+			try {
+				await scenario.cleanup?.(ctx);
+			} catch (cleanErr) {
+				warnings.push(`cleanup: ${String(cleanErr)}`);
+			}
+
+			// passed = BOTH scenario assertions AND analyzer must pass.
+			const passed = scenarioPassed && analyzerPassed;
+			const durationMs = Date.now() - start;
+
+			const result: QaResult = {
+				id,
+				passed,
+				scenarioPassed,
+				analyzerPassed,
+				durationMs,
+				errors,
+				warnings,
+				tracePath,
+				analyzerReport,
 			};
-			record.settlement = (async () => {
-				if (predecessor) await predecessor.settlement.catch(() => undefined);
-				return executeRun(record, id, opts);
-			})();
-			activeRun = record;
-			const clearOwnedRun = (): void => {
-				if (activeRun === record) activeRun = null;
-			};
-			void record.settlement.then(clearOwnedRun, clearOwnedRun);
-			return record.settlement;
-		},
 
-		getExternalPhaseTicket(): QaExternalPhaseTicket | null {
-			return activeRun?.coordinator?.getExternalPhaseTicket() ?? null;
-		},
-
-		resumeExternalPhase(runId: string, sequence: number): boolean {
-			return activeRun?.coordinator?.resumeExternalPhase(runId, sequence) ?? false;
-		},
-
-		rebindKaosDebugApi(): boolean {
-			return rebindKaosDebugApi();
+			const icon = passed ? "✓" : "✗";
+			const failParts: string[] = [];
+			if (!scenarioPassed) failParts.push(`scenario(${errors.length} errors)`);
+			if (!analyzerPassed) failParts.push("analyzer");
+			const suffix = passed ? "" : ` [${failParts.join(", ")}]`;
+			console.log(
+				`[KAOS QA] ${icon} ${id} (${durationMs}ms)${suffix}` +
+				(errors.length ? "\n  " + errors.join("\n  ") : ""),
+			);
+			return result;
 		},
 
 		// Vault ops
@@ -471,12 +348,6 @@ export function buildQaConsoleApi(
 			}));
 		},
 	};
-	qaConsoleApiDisposers.set(api, () => {
-		const current = activeRun;
-		if (!current) return;
-		current.controller.abort(new Error("harness-unloaded"));
-		current.coordinator?.dispose(new Error("harness-unloaded"));
-	});
 
 	return api;
 }

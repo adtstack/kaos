@@ -456,6 +456,7 @@ async function main(): Promise<number> {
 	const warnings: string[] = [];
 	const logLines: string[] = [];
 	let connected = false;
+	let safeToMutate = false;
 	const log = (message: string): void => {
 		const line = `[${new Date().toISOString()}] ${message}`;
 		console.log(line);
@@ -467,6 +468,8 @@ async function main(): Promise<number> {
 		await client.connect();
 		connected = true;
 		await client.waitForQaReady(30_000);
+		await client.assertVaultBasePath(vaultPath);
+		safeToMutate = true;
 		await collector.saveManifest(await client.manifest(), "manifest-pre");
 		const cases: Array<[string, string, () => Promise<void>]> = [
 			["clean", "clean non-overlap", () => runCleanNonOverlap(client, vaultPath)],
@@ -500,12 +503,14 @@ async function main(): Promise<number> {
 				errors.push(message);
 				log(message);
 			}
-			try {
-				await cleanupCase(client);
-			} catch (error) {
-				const message = `cleanup failed: ${String(error)}`;
-				errors.push(message);
-				log(message);
+			if (safeToMutate) {
+				try {
+					await cleanupCase(client);
+				} catch (error) {
+					const message = `cleanup failed: ${String(error)}`;
+					errors.push(message);
+					log(message);
+				}
 			}
 		}
 		await client.close().catch((error) => {

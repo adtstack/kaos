@@ -40,33 +40,3 @@ console.log("\n--- baseline persistence wiring: missing/corrupt bodies fail clos
 	assert.match(mainSource, /Missing bodies simply disable automatic 3-way merge and preserve a conflict artifact/);
 	console.log("  PASS  consumers await verified bodies and retain the no-base conflict path");
 }
-
-console.log("\n--- baseline persistence wiring: conflict Base pins schedule metadata persistence ---");
-{
-	const controllerWiringStart = mainSource.indexOf("recordConflictMergeBase: (artifactPath, baseHash) => {");
-	const source = controllerWiringStart >= 0
-		? mainSource.slice(controllerWiringStart, controllerWiringStart + 700)
-		: "";
-	assert.ok(controllerWiringStart >= 0);
-	assert.match(source, /this\.conflictMergeBases\[artifactPath\] = baseHash/);
-	assert.match(source, /this\.scheduleDiskIndexSave\("conflict-merge-base"\)/);
-	console.log("  PASS  verified conflict Base associations are queued for durable metadata storage");
-}
-
-console.log("\n--- baseline persistence wiring: disk callback uses two-phase adoption admission ---");
-{
-	const callbackStart = mainSource.indexOf("this.diskMirror.setDiskWriteCallback((path, contentHash, content) => {");
-	const source = callbackStart >= 0 ? mainSource.slice(callbackStart, callbackStart + 4_000) : "";
-	const capture = source.indexOf("captureDiskBaselineSettlementAdmission");
-	const publishIndex = source.indexOf("this.diskIndex[path]");
-	const publishBody = source.indexOf("this.recordBaselineText(contentHash, content)");
-	const commit = source.indexOf("commitDiskBaselineSettlementAdmission(admission)");
-	const schedule = source.indexOf("this.scheduleDiskIndexSave(\"disk-write-baseline\")");
-	assert.ok(callbackStart >= 0);
-	assert.ok(capture >= 0 && capture < publishIndex);
-	assert.ok(publishIndex < publishBody && publishBody < commit);
-	assert.ok(commit < schedule);
-	assert.match(source, /if \(!admission\) return false/);
-	assert.match(source, /if \(!this\.reconciliationController\.commitDiskBaselineSettlementAdmission\(admission\)\)/);
-	console.log("  PASS  stale callbacks fail before publication and exact commits gate persistence");
-}

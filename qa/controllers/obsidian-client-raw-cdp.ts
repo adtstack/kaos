@@ -42,14 +42,6 @@ export class RawCdpObsidianClient {
 		this.connectTimeoutMs = opts.connectTimeoutMs ?? 15_000;
 	}
 
-	private rejectPendingCommands(message: string): void {
-		const callbacks = [...this.pending.values()];
-		this.pending.clear();
-		for (const callback of callbacks) {
-			callback({ error: { message } });
-		}
-	}
-
 	/**
 	 * Discover and connect to the main Obsidian renderer page.
 	 * Selects the page whose URL identifies the Obsidian renderer.
@@ -100,88 +92,75 @@ export class RawCdpObsidianClient {
 				reject(new Error(`WebSocket connection timeout (${this.connectTimeoutMs}ms) to ${url}`));
 			}, this.connectTimeoutMs);
 
-			const socket = new WebSocket(url);
-			this.ws = socket;
+			this.ws = new WebSocket(url);
 
-			socket.on("open", () => {
+			this.ws.on("open", () => {
 				clearTimeout(timeout);
 				resolve();
 			});
 
-			socket.on("error", (err) => {
+			this.ws.on("error", (err) => {
 				clearTimeout(timeout);
 				reject(err);
 			});
 
-			socket.on("message", (data: Buffer) => {
+			this.ws.on("message", (data: Buffer) => {
 				const msg = JSON.parse(data.toString()) as { id?: number; [key: string]: unknown };
 				if (msg.id !== undefined && this.pending.has(msg.id)) {
 					this.pending.get(msg.id)!(msg);
 					this.pending.delete(msg.id);
 				}
 			});
-
-			socket.on("close", () => {
-				if (this.ws !== socket) return;
-				this.ws = null;
-				this.rejectPendingCommands(`CDP connection closed on port ${this.port}`);
-			});
-		});
-	}
-
-	/** Send one command to the exact renderer page CDP target. */
-	async sendCommand<T = Record<string, unknown>>(
-		method: string,
-		params: Record<string, unknown> = {},
-	): Promise<T> {
-		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-			throw new Error("Not connected — call connect() first");
-		}
-		const id = ++this.msgId;
-		return new Promise<T>((resolve, reject) => {
-			const timeout = setTimeout(() => {
-				this.pending.delete(id);
-				reject(new Error(
-					`CDP command timeout (${this.connectTimeoutMs}ms): ${method} on port ${this.port}`,
-				));
-			}, Math.max(60_000, this.connectTimeoutMs));
-			this.pending.set(id, (message: unknown) => {
-				clearTimeout(timeout);
-				const response = message as {
-					result?: T;
-					error?: { code?: number; message?: string; data?: unknown };
-				};
-				if (response.error) {
-					reject(new Error(
-						`CDP ${method} failed: ${response.error.message ?? JSON.stringify(response.error)}`,
-					));
-					return;
-				}
-				resolve((response.result ?? {}) as T);
-			});
-			this.ws!.send(JSON.stringify({ id, method, params }));
 		});
 	}
 
 	/** Evaluate an expression string in the Obsidian renderer process. */
 	async evalRaw<T = unknown>(expression: string): Promise<T> {
-		const result = await this.sendCommand<{
-			result?: { value?: unknown; type?: string };
-			exceptionDetails?: { text?: string; exception?: { description?: string } };
-		}>("Runtime.evaluate", {
-			expression,
-			awaitPromise: true,
-			returnByValue: true,
-		});
-		if (result.exceptionDetails) {
-			const details = result.exceptionDetails;
-			throw new Error(
-				details.exception?.description
-				|| details.text
-				|| JSON.stringify(details),
-			);
+		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+			throw new Error("Not connected — call connect() first");
 		}
-		return result.result?.value as T;
+
+		const id = ++this.msgId;
+
+		return new Promise<T>((resolve, reject) => {
+			const timeout = setTimeout(() => {
+				this.pending.delete(id);
+				reject(new Error(`CDP eval timeout (60s) on port ${this.port}`));
+			}, 60_000);
+
+			this.pending.set(id, (msg: unknown) => {
+				clearTimeout(timeout);
+				const m = msg as {
+					result?: {
+						result?: { value?: unknown; type?: string };
+						exceptionDetails?: { text?: string; exception?: { description?: string } };
+					};
+				};
+
+				if (m.result?.exceptionDetails) {
+					const details = m.result.exceptionDetails;
+					const errMsg =
+						details.exception?.description ||
+						details.text ||
+						JSON.stringify(details);
+					reject(new Error(errMsg));
+				} else {
+					resolve(m.result?.result?.value as T);
+				}
+			});
+
+			this.ws!.send(
+				JSON.stringify({
+					id,
+					method: "Runtime.evaluate",
+					params: {
+						expression,
+						awaitPromise: true,
+						returnByValue: true,
+					},
+				}),
+			);
+		});
 	}
 
 	/**
@@ -318,9 +297,10 @@ export class RawCdpObsidianClient {
 	}
 
 	async close(): Promise<void> {
-		const socket = this.ws;
-		this.ws = null;
-		this.rejectPendingCommands(`CDP connection closed on port ${this.port}`);
-		socket?.close();
+		if (this.ws) {
+			this.ws.close();
+			this.ws = null;
+		}
+		this.pending.clear();
 	}
 }

@@ -23,9 +23,6 @@ import type { EditorBindingManager } from "../../src/sync/editorBinding";
 import { FLIGHT_KIND } from "../../src/telemetry/debug/flightEvents";
 import { yTextToString } from "../../src/utils/format";
 import { forceReplaceYText } from "../../src/sync/diff";
-import type {
-	EditorHandoffDebugSnapshot,
-} from "../../src/runtime/engineControlPort";
 
 declare const __KAOS_QA_HARNESS_ENABLED__: boolean;
 
@@ -120,16 +117,6 @@ export interface KaosQaDebugApi {
 		opts: { originClass: "local" | "remote"; createIfMissing?: boolean },
 	): Promise<{ beforeHash: string | null; afterHash: string | null; fileExisted: boolean }>;
 
-	/** QA-ONLY. Clear persisted Markdown Attention for a harness-owned fixture path. */
-	__qaOnlyClearMarkdownAttentionUnsafe(path: string): void;
-
-	holdNextHostLoad(path: string, stage?: "load-entry" | "clear-load"): void;
-	releaseHeldHostLoad(): void;
-	holdNextNativeSave(path: string): void;
-	releaseHeldNativeSave(): void;
-	getEditorHandoffDebugSnapshot(): EditorHandoffDebugSnapshot;
-	getContentFreeSnapshot(): EditorHandoffDebugSnapshot;
-
 	// Path sets
 	getActiveMarkdownPaths(): string[];
 	getDiskMarkdownPaths(): string[];
@@ -169,8 +156,6 @@ export interface KaosQaDebugApi {
 	pauseEditorPropagation(path: string): Promise<boolean>;
 	/** QA-ONLY. Unsafe. Resume editor->CRDT propagation for a bound path. */
 	resumeEditorPropagation(path: string): Promise<boolean>;
-	/** QA-ONLY. Inject an exact host API version for unsupported-adapter acceptance. */
-	setEditorHandoffHostApiVersionOverride(version: string | null): void;
 
 	/**
 	 * QA-ONLY. Unsafe.
@@ -356,8 +341,6 @@ interface PluginHandle {
 	getQaTraceSecretHash?(): string | null;
 	/** Engine control port — present when Puppeteer harness is active. */
 	getEngineControlPort(): import("../../src/runtime/engineControlPort").EngineControlPort;
-	/** Remove a harness-owned path from the live Markdown Attention registry. */
-	clearMarkdownAttentionForQa(path: string): void;
 }
 
 // -----------------------------------------------------------------------
@@ -618,14 +601,6 @@ export function buildQaDebugApi(plugin: PluginHandle): KaosQaDebugApi {
 			return { beforeHash, afterHash, fileExisted };
 		},
 
-		__qaOnlyClearMarkdownAttentionUnsafe(path: string): void {
-			if (
-				typeof __KAOS_QA_HARNESS_ENABLED__ === "undefined"
-				|| !__KAOS_QA_HARNESS_ENABLED__
-			) return;
-			plugin.clearMarkdownAttentionForQa(path);
-		},
-
 		// -- Path sets ----------------------------------------------------------
 
 		getActiveMarkdownPaths(): string[] {
@@ -747,27 +722,6 @@ export function buildQaDebugApi(plugin: PluginHandle): KaosQaDebugApi {
 		},
 		async resumeEditorPropagation(path: string): Promise<boolean> {
 			return plugin.getEngineControlPort().resumeEditorPropagation(path);
-		},
-		setEditorHandoffHostApiVersionOverride(version: string | null): void {
-			plugin.getEngineControlPort().setEditorHandoffHostApiVersionOverride(version);
-		},
-		holdNextHostLoad(path: string, stage?: "load-entry" | "clear-load"): void {
-			plugin.getEngineControlPort().holdNextHostLoad(path, stage);
-		},
-		releaseHeldHostLoad(): void {
-			plugin.getEngineControlPort().releaseHeldHostLoad();
-		},
-		holdNextNativeSave(path: string): void {
-			plugin.getEngineControlPort().holdNextNativeSave(path);
-		},
-		releaseHeldNativeSave(): void {
-			plugin.getEngineControlPort().releaseHeldNativeSave();
-		},
-		getEditorHandoffDebugSnapshot(): EditorHandoffDebugSnapshot {
-			return plugin.getEngineControlPort().getEditorHandoffDebugSnapshot();
-		},
-		getContentFreeSnapshot(): EditorHandoffDebugSnapshot {
-			return plugin.getEngineControlPort().getContentFreeSnapshot();
 		},
 		async setDiskIngestSuspended(suspended: boolean): Promise<{ previous: boolean }> {
 			const previous = plugin.getEngineControlPort().setDiskIngestSuspended(suspended);

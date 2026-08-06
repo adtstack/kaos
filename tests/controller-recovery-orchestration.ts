@@ -15,15 +15,14 @@
  *
  * Plus targeted source-grep regressions on src/sync/editorBinding.ts
  * verifying that the real EditorBindingManager emits editor.repair.applied
- * from applyBinding() (action==="repair") while heal() remains attach-only
- * and performs no editor-to-Y.Text mutation.
+ * from applyBinding() (action==="repair") and editor.heal.applied from
+ * heal() after applyDiffToYText.
  */
 
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { MarkdownView, TFile } from "obsidian";
-import ts from "typescript";
 import * as Y from "yjs";
 import {
 	ReconciliationController,
@@ -34,7 +33,6 @@ import type { DiskIngestPort } from "../src/runtime/engineControlPort";
 import type { InterceptedExternalDiskMutation } from "../src/sync/editorBinding";
 import type { EnsureFileResult } from "../src/sync/vaultSync";
 import { contentBaselineHash } from "../src/sync/diskIndex";
-import { normalizeEditorText } from "../src/utils/editorTextNormalization";
 import type {
 	PreservedUnresolvedEntry,
 	PreservedUnresolvedReason,
@@ -177,22 +175,13 @@ interface Fixture {
 	setOpen(value: boolean): void;
 	setRemoteProjectionAllowed(value: boolean): void;
 	setDiskIngestSuspendedForQa(value: boolean): void;
-	setSamePathAdoptionProjectionHeld(value: boolean): void;
-	setRawAdapterReadFailure(value: boolean): void;
-	setRawAdapterReadFailureAfterSuccessfulReads(count: number | null): void;
-	setHeldExternalCandidateProjectionProofCaptureThrows(value: boolean): void;
-	invalidateHeldExternalCandidateProjectionProof(): void;
 	setBaselineContent(content: string): void;
 	setBaselineReadHook(hook: (() => Promise<void>) | null): void;
 	setEqualitySettlementReadHook(hook: (() => Promise<void>) | null): void;
-	setBaselineSettlementReadHook(hook: (() => Promise<void>) | null): void;
-	advanceEditorPresentationEpochs(): void;
 	setFlushWriteBoundaryHook(hook: (() => void | Promise<void>) | null): void;
 	setSelfWriteModifyHook(hook: (() => void | Promise<void>) | null): void;
 	advanceOpenExternalAuthority(advance: OpenExternalAuthorityAdvance): void;
 	setArtifactWriteFailure(value: boolean, message?: string): void;
-	setDiskIndexSaveFailure(value: boolean): void;
-	setDiskIndexSaveHook(hook: (() => void | Promise<void>) | null): void;
 	pauseArtifactPreservation(): void;
 	waitForArtifactPreservationStart(): Promise<void>;
 	releaseArtifactPreservation(): void;
@@ -219,11 +208,6 @@ interface Fixture {
 		activeLeaseCount: number;
 		markerPreserved: boolean;
 	}>;
-	getHeldExternalCandidateProjectionProofCounts(): {
-		captured: number;
-		released: number;
-	};
-	getReconciledReasons(): string[];
 	ingestDiskFileNow(reason?: "create" | "modify"): Promise<void>;
 }
 
@@ -235,35 +219,16 @@ function buildFixture(initial: {
 	additionalEditors?: Array<string | { readError: true }>;
 	trackPreservedUnresolvedEpisodes?: boolean;
 	stripBomOnVaultRead?: boolean;
-	reconcileSeedDiskToCrdt?: boolean;
 }): Fixture {
 	const path = initial.path;
 	let diskContent = initial.disk;
-	const toVaultReadContent = (content: string): string => {
-		const logical = initial.stripBomOnVaultRead && content.charCodeAt(0) === 0xfeff
-			? content.slice(1)
-			: content;
-		return logical;
-	};
 	let editorContent = initial.editor;
 	let ticketRevision = 0;
-	let selectionEpoch = 0;
-	let scrollEpoch = 0;
 	let bindingEpoch = 0;
 	let isBound = true;
 	let isOpen = true;
 	let remoteProjectionAllowed = true;
 	let diskIngestSuspendedForQa = false;
-	let samePathAdoptionProjectionHeld = false;
-	let rawAdapterReadFailure = false;
-	let rawAdapterReadFailureAfterSuccessfulReads: number | null = null;
-	let rawAdapterReadCount = 0;
-	let heldExternalCandidateProjectionProofCaptureThrows = false;
-	let heldExternalCandidateProjectionProofEpoch = 0;
-	let activeHeldExternalCandidateProjectionProof: object | null = null;
-	let heldExternalCandidateProjectionProofCaptureCount = 0;
-	let heldExternalCandidateProjectionProofReleaseCount = 0;
-	const reconciledReasons: string[] = [];
 	let diskIngestPort: DiskIngestPort | null = null;
 	const createdFiles = new Map<string, string>();
 	const flushWriteCalls: CapturedFlushWrite[] = [];
@@ -279,7 +244,6 @@ function buildFixture(initial: {
 	const baselineTexts = new Map<string, string>();
 	let baselineReadHook: (() => Promise<void>) | null = null;
 	let equalitySettlementReadHook: (() => Promise<void>) | null = null;
-	let baselineSettlementReadHook: (() => Promise<void>) | null = null;
 	let flushWriteBoundaryHook: (() => void | Promise<void>) | null = null;
 	let selfWriteModifyHook: (() => void | Promise<void>) | null = null;
 	const selfWriteMarkerObservations: Array<{
@@ -292,9 +256,6 @@ function buildFixture(initial: {
 	const conflictMergeBaseHashes: string[] = [];
 	let artifactWriteFailure = false;
 	let artifactWriteFailureMessage = "artifact write failed";
-	let diskIndexSaveFailure = false;
-	let diskIndexSaveHook: (() => void | Promise<void>) | null = null;
-	let exposesCrdtText = initial.reconcileSeedDiskToCrdt !== true;
 	const artifactPreservationStarts: string[] = [];
 	const artifactSuppressionRollbacks: string[] = [];
 	const activeArtifactSuppressions = new Set<number>();
@@ -320,7 +281,7 @@ function buildFixture(initial: {
 	(file as TFile & { stat: { ctime: number; mtime: number; size: number } }).stat = {
 		ctime: 1,
 		mtime: 1,
-		size: new TextEncoder().encode(initial.disk).byteLength,
+		size: initial.disk.length,
 	};
 	let currentFile = file;
 	const view = new MarkdownView() as MarkdownView & {
@@ -384,138 +345,7 @@ function buildFixture(initial: {
 	// localOnly recovery branch's binding-health-conditional repair fires.
 	// Healthy-binding behavior (no repair on every recovery) is exercised
 	// by tests/controller-recovery-orchestration-amplifier.ts.
-	let pathEditorAuthorityLeaseSequence = 0;
-	const pathEditorAuthorityLeases = new Map<object, Readonly<{
-		bindingEpoch: number;
-		ticketRevision: number;
-		views: readonly MarkdownView[];
-		contents: readonly string[];
-	}>>();
 	const editorBindings = {
-		capturePathEditorAuthority: (candidatePath: string) => {
-			if (candidatePath !== path || !isOpen) return { kind: "none" as const };
-			const contents: string[] = [];
-			try {
-				for (const candidateView of views) contents.push(candidateView.editor.getValue());
-			} catch {
-				return { kind: "blocked" as const, reason: "read-failed" as const };
-			}
-			const distinct = new Set(contents);
-			if (distinct.size !== 1) {
-				return { kind: "blocked" as const, reason: "multiple" as const };
-			}
-			const lease = {
-				leaseId: `controller-recovery-${++pathEditorAuthorityLeaseSequence}`,
-			};
-			pathEditorAuthorityLeases.set(lease, {
-				bindingEpoch,
-				ticketRevision,
-				views: [...views],
-				contents: [...contents],
-			});
-			return {
-				kind: "proven-single" as const,
-				content: contents[0]!,
-				lease,
-			};
-		},
-		isPathEditorAuthorityLeaseCurrent: (lease: object) => {
-			const captured = pathEditorAuthorityLeases.get(lease);
-			if (
-				!captured
-				|| !isOpen
-				|| captured.bindingEpoch !== bindingEpoch
-				|| captured.ticketRevision !== ticketRevision
-				|| captured.views.length !== views.length
-				|| captured.views.some((candidateView, index) => candidateView !== views[index])
-			) return false;
-			try {
-				return captured.views.every(
-					(candidateView, index) => candidateView.editor.getValue() === captured.contents[index],
-				);
-			} catch {
-				return false;
-			}
-		},
-		isSamePathAdoptionProjectionHeld: (candidatePath: string) =>
-			samePathAdoptionProjectionHeld && candidatePath === path,
-		captureSamePathExternalCandidateProjectionProof: (input: {
-			path: string;
-			file: TFile;
-			content: string;
-			openEditorTicket: {
-				path: string;
-				views: ReadonlyArray<{
-					view: MarkdownView;
-					bindingEpoch: number;
-					editorRevision: number;
-					editorContent: string | null;
-				}>;
-			};
-			editorAuthorityLease: object;
-		}) => {
-			if (heldExternalCandidateProjectionProofCaptureThrows) {
-				throw new Error("fixture projection proof capture failed");
-			}
-			if (
-				!samePathAdoptionProjectionHeld
-				|| activeHeldExternalCandidateProjectionProof !== null
-				|| input.path !== path
-				|| input.file !== currentFile
-				|| input.content !== normalizeEditorText(toVaultReadContent(diskContent))
-				|| input.openEditorTicket.path !== path
-				|| input.openEditorTicket.views.length !== views.length
-				|| input.openEditorTicket.views.some((ticket, index) =>
-					ticket.view !== views[index]
-					|| ticket.bindingEpoch !== bindingEpoch
-					|| ticket.editorRevision !== ticketRevision
-					|| ticket.editorContent !== editorContent
-				)
-				|| !pathEditorAuthorityLeases.has(input.editorAuthorityLease)
-			) return null;
-			const proof = Object.freeze({
-				...input,
-				fixtureProofEpoch: heldExternalCandidateProjectionProofEpoch,
-			});
-			activeHeldExternalCandidateProjectionProof = proof;
-			heldExternalCandidateProjectionProofCaptureCount++;
-			return proof;
-		},
-		isSamePathExternalCandidateProjectionProofCurrent: (proof: {
-			path: string;
-			file: TFile;
-			content: string;
-			openEditorTicket: {
-				path: string;
-				views: ReadonlyArray<{
-					view: MarkdownView;
-					bindingEpoch: number;
-					editorRevision: number;
-					editorContent: string | null;
-				}>;
-			};
-			editorAuthorityLease: object;
-			fixtureProofEpoch: number;
-		}) => samePathAdoptionProjectionHeld
-			&& activeHeldExternalCandidateProjectionProof === proof
-			&& proof.fixtureProofEpoch === heldExternalCandidateProjectionProofEpoch
-			&& proof.path === path
-			&& proof.file === currentFile
-			&& proof.content === normalizeEditorText(toVaultReadContent(diskContent))
-			&& proof.openEditorTicket.path === path
-			&& proof.openEditorTicket.views.length === views.length
-			&& proof.openEditorTicket.views.every((ticket, index) =>
-				ticket.view === views[index]
-				&& ticket.bindingEpoch === bindingEpoch
-				&& ticket.editorRevision === ticketRevision
-				&& ticket.editorContent === editorContent
-			)
-			&& pathEditorAuthorityLeases.has(proof.editorAuthorityLease),
-		releaseSamePathExternalCandidateProjectionProof: (proof: object) => {
-			if (activeHeldExternalCandidateProjectionProof !== proof) return;
-			activeHeldExternalCandidateProjectionProof = null;
-			heldExternalCandidateProjectionProofReleaseCount++;
-		},
 		isBound: () => isBound,
 		getBindingDebugInfoForView: () => ({
 			leafId: "stub-leaf-1",
@@ -573,8 +403,6 @@ function buildFixture(initial: {
 					cmId: null,
 					bindingEpoch,
 					editorRevision: ticketRevision,
-					selectionEpoch,
-					scrollEpoch,
 					editorAuthorityRevision: ticketRevision,
 					editorAuthorityContent: ticketEditorContent,
 					editorDocument: ticketRevision,
@@ -590,12 +418,9 @@ function buildFixture(initial: {
 					leafId: string;
 					bindingEpoch: number;
 					editorRevision: number;
-					selectionEpoch: number;
-					scrollEpoch: number;
 				}>;
 			},
 			currentViews: readonly MarkdownView[],
-			options?: { ignoreSelectionAndScroll?: boolean },
 		) => {
 			if (
 				ticket.path !== path ||
@@ -620,19 +445,6 @@ function buildFixture(initial: {
 					leafId: staleRevision.leafId,
 				};
 			}
-			if (!options?.ignoreSelectionAndScroll) {
-				const stalePresentation = ticket.views.find((snapshot) =>
-					snapshot.selectionEpoch !== selectionEpoch
-					|| snapshot.scrollEpoch !== scrollEpoch
-				);
-				if (stalePresentation) {
-					return {
-						current: false as const,
-						reason: "selection-epoch-changed" as const,
-						leafId: stalePresentation.leafId,
-					};
-				}
-			}
 			return { current: true as const };
 		},
 		separateUndoCaptureForPath: (separatedPath: string) => {
@@ -646,15 +458,19 @@ function buildFixture(initial: {
 			read: async (f: TFile & { path: string }) => {
 				if (f.path !== path && !createdFiles.has(f.path)) throw new Error(`unexpected read: ${f.path}`);
 				if (createdFiles.has(f.path)) {
-					return toVaultReadContent(createdFiles.get(f.path)!);
+					const createdContent = createdFiles.get(f.path)!;
+					return initial.stripBomOnVaultRead && createdContent.charCodeAt(0) === 0xfeff
+						? createdContent.slice(1)
+						: createdContent;
 				}
 				primaryReadCount++;
 				// Equality ingestion performs one stable read followed by the final
 				// updateDiskIndexForPath settlement read. This test-only gate pauses
 				// exactly that second boundary read without adding a production seam.
 				if (primaryReadCount === 2) await equalitySettlementReadHook?.();
-				if (primaryReadCount === 3) await baselineSettlementReadHook?.();
-				return toVaultReadContent(diskContent);
+				return initial.stripBomOnVaultRead && diskContent.charCodeAt(0) === 0xfeff
+					? diskContent.slice(1)
+					: diskContent;
 			},
 			create: async (createdPath: string, content: string) => {
 				if (artifactWriteFailure) throw new Error(artifactWriteFailureMessage);
@@ -663,24 +479,8 @@ function buildFixture(initial: {
 				createdFiles.set(createdPath, content);
 			},
 			adapter: {
-				stat: async () => ({
-					mtime: 1,
-					size: new TextEncoder().encode(diskContent).byteLength,
-				}),
+				stat: async () => ({ mtime: 1, size: diskContent.length }),
 				read: async (candidatePath: string) => {
-					if (
-						candidatePath === path
-						&& (
-							rawAdapterReadFailure
-							|| (
-								rawAdapterReadFailureAfterSuccessfulReads !== null
-								&& rawAdapterReadCount >= rawAdapterReadFailureAfterSuccessfulReads
-							)
-						)
-					) {
-						throw new Error("fixture raw adapter read failed");
-					}
-					if (candidatePath === path) rawAdapterReadCount++;
 					if (createdFiles.has(candidatePath)) return createdFiles.get(candidatePath)!;
 					if (candidatePath === path) return diskContent;
 					throw new Error(`unexpected adapter read: ${candidatePath}`);
@@ -708,52 +508,17 @@ function buildFixture(initial: {
 	const vaultSync = {
 		connected: true,
 		providerSynced: true,
-		getTextForPath: (p: string) => (p === path && exposesCrdtText ? ytext : null),
-		getActiveMarkdownPaths: () => (exposesCrdtText ? [path] : []),
-		reconcileVault: (
-			diskSnapshot: Map<string, string>,
-			_diskPresentPaths: Set<string>,
-			_mode: string,
-			_deviceName: string,
-			seedAdmissionFactory?: (seedPath: string) => {
-				opId: string;
-				emitDecision(): void;
-			},
-			canSeed?: (seedPath: string) => boolean,
-			seedSnapshotIsCurrent?: (seedPath: string, content: string) => boolean,
-		) => {
-			if (initial.reconcileSeedDiskToCrdt === true && !exposesCrdtText) {
-				const seedContent = diskSnapshot.get(path);
-				if (
-					seedContent !== undefined &&
-					(canSeed?.(path) ?? true) &&
-					(seedSnapshotIsCurrent?.(path, seedContent) ?? true)
-				) {
-					seedAdmissionFactory?.(path).emitDecision();
-					ytext.delete(0, ytext.length);
-					ytext.insert(0, seedContent);
-					exposesCrdtText = true;
-					return {
-						mode: "authoritative",
-						createdOnDisk: [],
-						updatedOnDisk: [],
-						seededToCrdt: [path],
-						untracked: [],
-						tombstonedDiskConflicts: [],
-						skipped: 0,
-					};
-				}
-			}
-			return {
-				mode: "authoritative",
-				createdOnDisk: [],
-				updatedOnDisk: [path],
-				seededToCrdt: [],
-				untracked: [],
-				tombstonedDiskConflicts: [],
-				skipped: 0,
-			};
-		},
+		getTextForPath: (p: string) => (p === path ? ytext : null),
+		getActiveMarkdownPaths: () => [path],
+		reconcileVault: () => ({
+			mode: "authoritative",
+			createdOnDisk: [],
+			updatedOnDisk: [path],
+			seededToCrdt: [],
+			untracked: [],
+			tombstonedDiskConflicts: [],
+			skipped: 0,
+		}),
 		runIntegrityChecks: () => ({ duplicateIds: 0, orphansCleaned: 0, duplicateActivePaths: 0 }),
 		isPendingRenameTarget: () => false,
 		isMarkdownTombstoned: () => false,
@@ -775,41 +540,6 @@ function buildFixture(initial: {
 		getDiskMirror: () => ({
 			shouldSuppressCreate: async () => false,
 			shouldSuppressModify: async () => false,
-			probeExactObservedDiskRevision: async (
-				candidateFile: TFile,
-				revision: {
-					path: string;
-					ctime: number | null;
-					mtime: number | null;
-					size: number | null;
-				},
-			) => {
-				const revisionIsCurrent = () => {
-					const stat = candidateFile.stat;
-					return candidateFile === currentFile
-						&& candidateFile.path === path
-						&& revision.path === path
-						&& app.vault.getAbstractFileByPath(path) === candidateFile
-						&& (revision.ctime === null || stat.ctime === revision.ctime)
-						&& (revision.mtime === null || stat.mtime === revision.mtime)
-						&& (revision.size === null || stat.size === revision.size);
-				};
-				if (!revisionIsCurrent()) return { kind: "stale" as const };
-				let raw: string;
-				try {
-					raw = await app.vault.adapter.read(path);
-				} catch {
-					return { kind: "unavailable" as const };
-				}
-				if (
-					!revisionIsCurrent()
-					|| (
-						revision.size !== null
-						&& new TextEncoder().encode(raw).byteLength !== revision.size
-					)
-				) return { kind: "stale" as const };
-				return { kind: "current" as const, content: raw };
-			},
 			suppressLocalCreate: async (_artifactPath: string, content: string) => {
 				artifactPreservationStarts.push(content);
 				markArtifactPreservationStarted?.();
@@ -837,16 +567,6 @@ function buildFixture(initial: {
 			clearPreservedUnresolved: (candidatePath: string) => {
 				preservedUnresolvedClearCalls.push(candidatePath);
 				preservedUnresolvedEntries.delete(candidatePath);
-			},
-			clearPreservedUnresolvedEpisode: (
-				candidatePath: string,
-				expectedEpisodeId: string,
-			) => {
-				const current = preservedUnresolvedEntries.get(candidatePath);
-				if (!current || current.episodeId !== expectedEpisodeId) return false;
-				preservedUnresolvedClearCalls.push(candidatePath);
-				preservedUnresolvedEntries.delete(candidatePath);
-				return true;
 			},
 			redirectPreservedUnresolved: (oldPath: string, newPath: string) => {
 				const source = preservedUnresolvedEntries.get(oldPath);
@@ -1003,13 +723,10 @@ function buildFixture(initial: {
 		shouldBlockFrontmatterIngest: () => false,
 		refreshServerCapabilities: async () => {},
 		validateOpenEditorBindings: () => {},
-		onReconciled: (reason: string) => { reconciledReasons.push(reason); },
+		onReconciled: () => {},
 		getAwaitingFirstProviderSyncAfterStartup: () => false,
 		setAwaitingFirstProviderSyncAfterStartup: () => {},
-		saveDiskIndex: async () => {
-			await diskIndexSaveHook?.();
-			if (diskIndexSaveFailure) throw new Error("disk index save failed");
-		},
+		saveDiskIndex: async () => {},
 		refreshStatusBar: () => {},
 		trace: (source: string, msg: string, details?: Record<string, unknown>) => {
 			traces.push({ source, msg, details });
@@ -1051,20 +768,6 @@ function buildFixture(initial: {
 		setOpen: (value) => { isOpen = value; },
 		setRemoteProjectionAllowed: (value) => { remoteProjectionAllowed = value; },
 		setDiskIngestSuspendedForQa: (value) => { diskIngestSuspendedForQa = value; },
-		setSamePathAdoptionProjectionHeld: (value) => {
-			samePathAdoptionProjectionHeld = value;
-		},
-		setRawAdapterReadFailure: (value) => { rawAdapterReadFailure = value; },
-		setRawAdapterReadFailureAfterSuccessfulReads: (count) => {
-			rawAdapterReadFailureAfterSuccessfulReads = count;
-			rawAdapterReadCount = 0;
-		},
-		setHeldExternalCandidateProjectionProofCaptureThrows: (value) => {
-			heldExternalCandidateProjectionProofCaptureThrows = value;
-		},
-		invalidateHeldExternalCandidateProjectionProof: () => {
-			heldExternalCandidateProjectionProofEpoch++;
-		},
 		setBaselineContent: (c) => {
 			const hash = baselineHashSync(c);
 			baselineTexts.set(hash, c);
@@ -1078,11 +781,6 @@ function buildFixture(initial: {
 		},
 		setBaselineReadHook: (hook) => { baselineReadHook = hook; },
 		setEqualitySettlementReadHook: (hook) => { equalitySettlementReadHook = hook; },
-		setBaselineSettlementReadHook: (hook) => { baselineSettlementReadHook = hook; },
-		advanceEditorPresentationEpochs: () => {
-			selectionEpoch++;
-			scrollEpoch++;
-		},
 		setFlushWriteBoundaryHook: (hook) => { flushWriteBoundaryHook = hook; },
 		setSelfWriteModifyHook: (hook) => { selfWriteModifyHook = hook; },
 		advanceOpenExternalAuthority: (advance) => {
@@ -1193,8 +891,6 @@ function buildFixture(initial: {
 			artifactWriteFailure = value;
 			if (message !== undefined) artifactWriteFailureMessage = message;
 		},
-		setDiskIndexSaveFailure: (value) => { diskIndexSaveFailure = value; },
-		setDiskIndexSaveHook: (hook) => { diskIndexSaveHook = hook; },
 		pauseArtifactPreservation: () => {
 			artifactPreservationStarted = new Promise<void>((resolve) => {
 				markArtifactPreservationStarted = resolve;
@@ -1249,11 +945,6 @@ function buildFixture(initial: {
 		getBaselineAdvanceCount: () => baselineAdvanceCount,
 		getDiskIndexPublishCount: () => diskIndexPublishCount,
 		getSelfWriteMarkerObservations: () => [...selfWriteMarkerObservations],
-		getHeldExternalCandidateProjectionProofCounts: () => ({
-			captured: heldExternalCandidateProjectionProofCaptureCount,
-			released: heldExternalCandidateProjectionProofReleaseCount,
-		}),
-		getReconciledReasons: () => [...reconciledReasons],
 		ingestDiskFileNow: (reason: "create" | "modify" = "modify") => {
 			if (!diskIngestPort) throw new Error("diskIngestPort not registered");
 			return diskIngestPort.ingestDiskFileNow(path, reason);
@@ -1271,18 +962,14 @@ interface UnboundIngestFixture {
 	setEditorContent(content: string): void;
 	setStableReader(reader: (path: string, reason: MarkdownDirtyReason) => Promise<StableMarkdownReadResult>): void;
 	setOpen(value: boolean): void;
-	setAttentionPersistenceFailure(value: boolean): void;
-	setAttentionPersistenceHook(hook: (() => Promise<void>) | null): void;
-	getAttentionPersistenceCalls(): number;
-	setPreservedUnresolved(value: boolean, reason?: PreservedUnresolvedReason, episodeId?: string): void;
+	setPreservedUnresolved(value: boolean, reason?: "remote-delete-missing-baseline" | "path-collision"): void;
 	getPreservedClearCount(): number;
-	getPreservedEntries(): PreservedUnresolvedEntry[];
 	getPreservedRedirects(): Array<{ oldPath: string; newPath: string }>;
 	getPreservedPath(): string | null;
 	setCrdtPath(path: string): void;
 	setFilePath(path: string): void;
 	ingestNow(reason?: MarkdownDirtyReason): Promise<void>;
-	processDirty(path: string, reason?: MarkdownDirtyReason, retryCount?: number): Promise<void>;
+	processDirty(path: string, reason?: MarkdownDirtyReason): Promise<void>;
 }
 
 function buildUnboundIngestFixture(initial: {
@@ -1303,15 +990,10 @@ function buildUnboundIngestFixture(initial: {
 	});
 	let isOpen = false;
 	let preservedPath: string | null = null;
-	let preservedReason: PreservedUnresolvedReason =
+	let preservedReason: "remote-delete-missing-baseline" | "path-collision" =
 		"remote-delete-missing-baseline";
-	let preservedEpisodeId = "rename-window-episode";
-	let preservedEpisodeSequence = 0;
 	let exposePreservedEntry = false;
 	let preservedClearCount = 0;
-	let attentionPersistenceFailure = false;
-	let attentionPersistenceHook: (() => Promise<void>) | null = null;
-	let attentionPersistenceCalls = 0;
 	const preservedRedirects: Array<{ oldPath: string; newPath: string }> = [];
 	let crdtPath = path;
 	let diskIndex: Record<string, { mtime: number; size: number; contentHash?: string }> = {};
@@ -1367,40 +1049,15 @@ function buildUnboundIngestFixture(initial: {
 				path: preservedPath,
 				kind: "markdown" as const,
 				reason: preservedReason,
-				episodeId: preservedEpisodeId,
+				episodeId: "rename-window-episode",
 				firstSeenAt: 1,
 				lastSeenAt: 1,
 			}],
-		recordPreservedUnresolved: (candidatePath: string, reason: PreservedUnresolvedReason) => {
-			const continuesEpisode = preservedPath === candidatePath
-				&& preservedReason === reason
-				&& exposePreservedEntry;
-			preservedPath = candidatePath;
-			preservedReason = reason;
-			if (!continuesEpisode) {
-				preservedEpisodeId = `unbound-episode-${++preservedEpisodeSequence}`;
-			}
-			exposePreservedEntry = true;
-		},
 		clearPreservedUnresolved: (candidatePath: string) => {
 			if (preservedPath === candidatePath) {
 				preservedPath = null;
 				preservedClearCount++;
 			}
-		},
-		clearPreservedUnresolvedEpisode: (
-			candidatePath: string,
-			expectedEpisodeId: string,
-		) => {
-			if (
-				preservedPath !== candidatePath
-				|| preservedEpisodeId !== expectedEpisodeId
-			) {
-				return false;
-			}
-			preservedPath = null;
-			preservedClearCount++;
-			return true;
 		},
 		redirectPreservedUnresolved: (oldPath: string, newPath: string) => {
 			preservedRedirects.push({ oldPath, newPath });
@@ -1412,7 +1069,7 @@ function buildUnboundIngestFixture(initial: {
 						path: newPath,
 						kind: "markdown" as const,
 						reason: preservedReason,
-						episodeId: preservedEpisodeId,
+						episodeId: "rename-window-episode",
 						firstSeenAt: 1,
 						lastSeenAt: 1,
 					},
@@ -1425,7 +1082,7 @@ function buildUnboundIngestFixture(initial: {
 						path: newPath,
 						kind: "markdown" as const,
 						reason: preservedReason,
-						episodeId: preservedEpisodeId,
+						episodeId: "rename-window-episode",
 						firstSeenAt: 1,
 						lastSeenAt: 1,
 					},
@@ -1434,43 +1091,6 @@ function buildUnboundIngestFixture(initial: {
 			return { kind: "missing" as const };
 		},
 		flushWrite: async () => {},
-	};
-	let pathEditorAuthorityLeaseSequence = 0;
-	const pathEditorAuthorityLeases = new Map<object, Readonly<{
-		content: string;
-		path: string;
-		file: TFile;
-	}>>();
-	const editorBindings = {
-		capturePathEditorAuthority: (candidatePath: string) => {
-			if (!isOpen || candidatePath !== currentFilePath) return { kind: "none" as const };
-			const lease = {
-				leaseId: `unbound-recovery-${++pathEditorAuthorityLeaseSequence}`,
-			};
-			pathEditorAuthorityLeases.set(lease, {
-				content: editorContent,
-				path: currentFilePath,
-				file: view.file,
-			});
-			return {
-				kind: "proven-single" as const,
-				content: editorContent,
-				lease,
-			};
-		},
-		isPathEditorAuthorityLeaseCurrent: (lease: object) => {
-			const captured = pathEditorAuthorityLeases.get(lease);
-			return !!captured
-				&& isOpen
-				&& captured.content === editorContent
-				&& captured.path === currentFilePath
-				&& captured.file === view.file;
-		},
-		getLastEditorActivityForPath: () => null,
-		isBound: () => false,
-		getBindingDebugInfoForView: () => null,
-		getCollabDebugInfoForView: () => null,
-		unbindByPath: () => {},
 	};
 
 	const controller = new ReconciliationController({
@@ -1484,16 +1104,9 @@ function buildUnboundIngestFixture(initial: {
 		getVaultSync: () => vaultSync as never,
 		getDiskMirror: () => diskMirror as never,
 		getBlobSync: () => null,
-		getEditorBindings: () => editorBindings as never,
+		getEditorBindings: () => null,
 		getDiskIndex: () => diskIndex,
 		setDiskIndex: (next: typeof diskIndex) => { diskIndex = next; },
-		persistPreservedUnresolvedStateDurably: async () => {
-			attentionPersistenceCalls++;
-			await attentionPersistenceHook?.();
-			if (attentionPersistenceFailure) {
-				throw new Error("deterministic Attention persistence failure");
-			}
-		},
 		isMarkdownPathSyncable: () => true,
 		shouldBlockFrontmatterIngest: () => false,
 		refreshServerCapabilities: async () => {},
@@ -1519,29 +1132,14 @@ function buildUnboundIngestFixture(initial: {
 		setEditorContent: (content) => { editorContent = content; },
 		setStableReader: (reader) => { stableReader = reader; },
 		setOpen: (value) => { isOpen = value; },
-		setAttentionPersistenceFailure: (value) => {
-			attentionPersistenceFailure = value;
-		},
-		setAttentionPersistenceHook: (hook) => {
-			attentionPersistenceHook = hook;
-		},
-		getAttentionPersistenceCalls: () => attentionPersistenceCalls,
-		setPreservedUnresolved: (
-			value,
-			reason = "remote-delete-missing-baseline",
-			episodeId = "rename-window-episode",
-		) => {
+		setPreservedUnresolved: (value, reason = "remote-delete-missing-baseline") => {
 			preservedPath = value ? currentFilePath : null;
 			preservedReason = reason;
-			preservedEpisodeId = episodeId;
 			// Legacy fixture cases exercise the boolean compatibility surface. The
 			// rename-window regression needs the full episode returned at admission.
-			exposePreservedEntry = value && (
-				reason === "path-collision" || reason === "external-disk-read-unavailable"
-			);
+			exposePreservedEntry = value && reason === "path-collision";
 		},
 		getPreservedClearCount: () => preservedClearCount,
-		getPreservedEntries: () => diskMirror.getPreservedUnresolvedEntries(),
 		getPreservedRedirects: () => [...preservedRedirects],
 		getPreservedPath: () => preservedPath,
 		setCrdtPath: (nextPath) => { crdtPath = nextPath; },
@@ -1553,11 +1151,7 @@ function buildUnboundIngestFixture(initial: {
 		ingestNow: (reason: MarkdownDirtyReason = "modify") =>
 			(controller as never as { syncFileFromDisk(file: TFile, reason: MarkdownDirtyReason): Promise<void> })
 				.syncFileFromDisk(file, reason),
-		processDirty: (
-			dirtyPath: string,
-			reason: MarkdownDirtyReason = "modify",
-			retryCount = 0,
-		) =>
+		processDirty: (dirtyPath: string, reason: MarkdownDirtyReason = "modify") =>
 			(controller as never as {
 				processDirtyMarkdownPath(path: string, entry: {
 					reason: MarkdownDirtyReason;
@@ -1569,7 +1163,7 @@ function buildUnboundIngestFixture(initial: {
 				reason,
 				primaryOpId: "op-test",
 				coalescedOpIds: ["op-test"],
-				retryCount,
+				retryCount: 0,
 			}),
 	};
 }
@@ -1584,31 +1178,11 @@ function clearMarkdownDrainTimer(controller: ReconciliationController): void {
 	}
 }
 
-function clearReconcileCooldownTimer(controller: ReconciliationController): void {
-	const internals = controller as never as {
-		reconcileCooldownTimer: ReturnType<typeof setTimeout> | null;
-	};
-	if (internals.reconcileCooldownTimer) {
-		clearTimeout(internals.reconcileCooldownTimer);
-		internals.reconcileCooldownTimer = null;
-	}
-}
-
 async function drainQueuedMarkdown(controller: ReconciliationController): Promise<void> {
 	clearMarkdownDrainTimer(controller);
 	await (controller as never as { drainDirtyMarkdownPaths(): Promise<void> })
 		.drainDirtyMarkdownPaths();
 	clearMarkdownDrainTimer(controller);
-}
-
-async function exhaustUnstableMarkdownReadRetries(
-	fix: UnboundIngestFixture,
-): Promise<void> {
-	await fix.processDirty(fix.path, "modify", 0);
-	for (let retry = 1; retry <= 3; retry++) {
-		await drainQueuedMarkdown(fix.controller);
-	}
-	clearMarkdownDrainTimer(fix.controller);
 }
 
 function makeInterceptedCandidate(
@@ -1627,121 +1201,12 @@ function makeInterceptedCandidate(
 	});
 }
 
-function makeCurrentInterceptedCandidate(
-	fix: Pick<Fixture, "path" | "file">,
-	content: string,
-	sequence: number,
-): InterceptedExternalDiskMutation {
-	return Object.freeze({
-		path: fix.path,
-		content,
-		sequence,
-		observedAt: sequence,
-		ctime: fix.file.stat.ctime,
-		mtime: fix.file.stat.mtime,
-		size: new TextEncoder().encode(content).byteLength,
-	});
-}
-
 function getInterceptedCandidates(
 	controller: ReconciliationController,
 ): Map<string, InterceptedExternalDiskMutation> {
 	return (controller as never as {
 		interceptedExternalDiskMutations: Map<string, InterceptedExternalDiskMutation>;
 	}).interceptedExternalDiskMutations;
-}
-
-type ExternalDiskProbeStartInput = Readonly<{
-	file: TFile;
-	revision: Readonly<{
-		path: string;
-		ctime: number | null;
-		mtime: number | null;
-		size: number | null;
-	}>;
-	sequence: number;
-	observedAt: number;
-}>;
-
-type ExternalDiskProbeTicket = ExternalDiskProbeStartInput & Readonly<{
-	readonly __externalDiskProbeTicket?: never;
-}>;
-
-type ExternalDiskProbeDispositionInput = Readonly<{
-	disposition: "stale" | "unavailable";
-	ticket: ExternalDiskProbeTicket;
-}>;
-
-function beginExternalDiskProbe(
-	fix: Pick<Fixture, "controller" | "file" | "path">,
-	sequence: number,
-): ExternalDiskProbeTicket | null | undefined {
-	const begin = (fix.controller as unknown as {
-		beginExternalDiskMutationProbe?: (
-			input: ExternalDiskProbeStartInput,
-		) => ExternalDiskProbeTicket | null;
-	}).beginExternalDiskMutationProbe;
-	if (typeof begin !== "function") return undefined;
-	return begin.call(fix.controller, {
-		file: fix.file,
-		revision: {
-			path: fix.path,
-			ctime: fix.file.stat.ctime,
-			mtime: fix.file.stat.mtime,
-			size: fix.file.stat.size,
-		},
-		sequence,
-		observedAt: sequence,
-	});
-}
-
-function completeExternalDiskProbeDisposition(
-	fix: Pick<Fixture, "controller">,
-	ticket: ExternalDiskProbeTicket,
-	disposition: ExternalDiskProbeDispositionInput["disposition"],
-): boolean {
-	const note = (fix.controller as unknown as {
-		noteExternalDiskMutationProbeDisposition?: (
-			input: ExternalDiskProbeDispositionInput,
-		) => boolean | void;
-	}).noteExternalDiskMutationProbeDisposition;
-	if (typeof note !== "function") return false;
-	return note.call(fix.controller, { disposition, ticket }) !== false;
-}
-
-async function completeSelfWriteExternalDiskProbe(
-	fix: Pick<Fixture, "controller">,
-	ticket: ExternalDiskProbeTicket,
-	content: string,
-): Promise<boolean> {
-	const complete = (fix.controller as unknown as {
-		noteSelfWriteExternalDiskMutationProbeOutcome?: (
-			ticket: ExternalDiskProbeTicket,
-			content: string,
-		) => Promise<boolean> | boolean;
-	}).noteSelfWriteExternalDiskMutationProbeOutcome;
-	if (typeof complete !== "function") return false;
-	return await complete.call(fix.controller, ticket, content) !== false;
-}
-
-function noteExternalDiskProbeDisposition(
-	fix: Pick<Fixture, "controller" | "file" | "path">,
-	disposition: ExternalDiskProbeDispositionInput["disposition"],
-	sequence: number,
-): boolean {
-	const ticket = beginExternalDiskProbe(fix, sequence);
-	return ticket ? completeExternalDiskProbeDisposition(fix, ticket, disposition) : false;
-}
-
-function getPendingExternalDiskProbeDispositions(
-	controller: ReconciliationController,
-): Map<string, ExternalDiskProbeStartInput & { disposition: "stale" | "unavailable" }> {
-	return (controller as unknown as {
-		pendingExternalDiskProbeDispositions:
-			Map<string, ExternalDiskProbeStartInput & {
-				disposition: "stale" | "unavailable";
-			}>;
-	}).pendingExternalDiskProbeDispositions ?? new Map();
 }
 
 function getPendingSupersededCandidates(
@@ -1772,22 +1237,14 @@ function getDirtyMarkdownEntry(
 	reason: MarkdownDirtyReason;
 	primaryOpId?: string;
 	coalescedOpIds: string[];
-	retryCount: number;
 	notBeforeMs?: number;
-	externalReadAttentionEpisodeIdPendingPersistence?: string;
-	externalReadAttentionPersistenceRetryCount?: number;
-	externalReadAttentionNeedsFollowupIngest?: boolean;
 } | undefined {
 	return (controller as never as {
 		dirtyMarkdownPaths: Map<string, {
 			reason: MarkdownDirtyReason;
 			primaryOpId?: string;
 			coalescedOpIds: string[];
-			retryCount: number;
 			notBeforeMs?: number;
-			externalReadAttentionEpisodeIdPendingPersistence?: string;
-			externalReadAttentionPersistenceRetryCount?: number;
-			externalReadAttentionNeedsFollowupIngest?: boolean;
 		}>;
 	}).dirtyMarkdownPaths.get(path);
 }
@@ -2004,112 +1461,6 @@ console.log("\n--- Test 0a: async lifecycle authority can be revoked synchronous
 		fix.controller.reset();
 	}
 	fix.doc.destroy();
-}
-
-console.log("\n--- Test 0a2: editor admission lifecycle is wired before awaited teardown ---");
-{
-	const mainSource = readFileSync(
-		fileURLToPath(new URL("../src/main.ts", import.meta.url)),
-		"utf8",
-	);
-	const bindingSource = readFileSync(
-		fileURLToPath(new URL("../src/sync/editorBinding.ts", import.meta.url)),
-		"utf8",
-	);
-	const managerConstructionStart = mainSource.indexOf(
-		"this.editorBindings = new EditorBindingManager(",
-	);
-	const managerConstructionEnd = mainSource.indexOf(
-		"\n\t\t\t);",
-		managerConstructionStart,
-	);
-	const managerConstruction = mainSource.slice(
-		managerConstructionStart,
-		managerConstructionEnd + "\n\t\t\t);".length,
-	);
-	const teardownStart = mainSource.indexOf("private async teardownSync(): Promise<void>");
-	const teardownEnd = mainSource.indexOf("\n\tprivate ", teardownStart + 1);
-	const teardown = mainSource.slice(teardownStart, teardownEnd);
-	const editorDrainStart = teardown.indexOf(
-		"this.editorBindings?.beginOwnedSaveDrainForTeardown()",
-	);
-	const controllerRevoke = teardown.indexOf("this.reconciliationController.revokeAsyncAuthority()");
-	const editorRevoke = teardown.indexOf("this.editorBindings?.revokeAsyncAuthority()");
-	const editorDrainAwait = teardown.indexOf("await editorSaveDrain");
-	const firstAwait = teardown.indexOf("await ");
-	const unbind = teardown.indexOf("this.editorBindings?.unbindAll()");
-	assert(
-		bindingSource.includes("export interface EditorAuthorityControllerPort"),
-		"binding manager exposes a typed controller-owned admission dependency",
-	);
-	for (const method of [
-		"requestOpenPathAdmission",
-		"seedMissingTarget",
-		"isAuthorityFreshnessCurrent",
-		"consumeBindPermit",
-	]) {
-		assert(
-			bindingSource.includes(method),
-			`binding manager consumes controller capability ${method}`,
-		);
-	}
-	for (const retiredMethod of [
-		"requestTargetPresentation",
-		"consumeTargetPresentationPermit",
-		"completeTargetPresentation",
-	]) {
-		assert(
-			!bindingSource.includes(retiredMethod),
-			`binding manager no longer delegates local target publication through ${retiredMethod}`,
-		);
-	}
-	assert(
-		managerConstructionStart >= 0
-			&& managerConstructionEnd > managerConstructionStart
-			&& managerConstruction.includes("this.reconciliationController")
-			&& managerConstruction.includes("chooseVerifiedExporter")
-			&& !managerConstruction.includes("this.handoffRecoveryCoordinator"),
-		"production manager receives controller admission plus a manual export-only terminal action, not a Recovery replay port",
-	);
-	const externalProbeStart = mainSource.indexOf(
-		"const controllerProbeTicket =",
-	);
-	const externalProbeEnd = mainSource.indexOf(
-		"this.traceSink.recordPath({",
-		externalProbeStart,
-	);
-	const externalProbeFlow = mainSource.slice(externalProbeStart, externalProbeEnd);
-	const managerSelfCompletion = externalProbeFlow.indexOf(
-		"editorBindingsAtEvent.noteSelfWriteExternalDiskMutation({",
-	);
-	const controllerSelfSettlement = externalProbeFlow.indexOf(
-		".noteSelfWriteExternalDiskMutationProbeOutcome(",
-	);
-	assert(
-		externalProbeStart >= 0
-			&& externalProbeEnd > externalProbeStart
-			&& externalProbeFlow.includes('completion === "terminal-no-candidate"')
-			&& externalProbeFlow.includes("noteExternalDiskMutationProbeSettled(")
-			&& managerSelfCompletion >= 0
-			&& controllerSelfSettlement > managerSelfCompletion,
-		"main settles exact no-candidate tickets and lets manager preservation run before self settlement",
-	);
-	assert(
-		bindingSource.includes("private presentLocalTargetOnce(runtime: ManagedLeafRuntime): void")
-			&& bindingSource.includes(
-				'this.scheduleSamePathAdoptionRefresh(runtime, "target-locally-presented")',
-			),
-		"a certified host load publishes B locally once, then enters ordinary same-path adoption",
-	);
-	assert(
-		editorDrainStart >= 0
-			&& controllerRevoke > editorDrainStart
-			&& editorRevoke > controllerRevoke
-			&& editorDrainAwait > editorRevoke
-			&& firstAwait === editorDrainAwait
-			&& unbind > firstAwait,
-		"owned saves enter before both revocations, then drain before teardown and unbind",
-	);
 }
 
 console.log("\n--- Test 0b: QA suspension consumes explicit disk ingest without state changes ---");
@@ -2543,975 +1894,6 @@ console.log("\n--- Test 5c: known-baseline external-only edit imports and settle
 		"external-only import is one targeted open-external transaction",
 	);
 	assertSettledSelfWriteLease(fix, "external-only merge");
-}
-
-console.log("\n--- Test 5c0: exact held external candidate settles before adoption retry binds ---");
-{
-	const previous = "target B before external write\n";
-	const external = "external target B while native load was held\n";
-	const fix = buildFixture({
-		path: "Notes/held-external-candidate.md",
-		disk: external,
-		editor: external,
-		crdt: previous,
-	});
-	fix.setBaselineContent(previous);
-	fix.setBound(false);
-	fix.setSamePathAdoptionProjectionHeld(true);
-	const candidate = makeCurrentInterceptedCandidate(fix, external, 9091);
-	fix.controller.noteInterceptedExternalDiskMutation(candidate);
-	clearMarkdownDrainTimer(fix.controller);
-
-	await drainQueuedMarkdown(fix.controller);
-
-	assertEq(fix.ytext.toString(), external, "exact held candidate reaches Y.Text once");
-	assertEq(
-		fix.transactionOrigins.filter((origin) => origin === ORIGIN_DISK_SYNC_RECOVER_BOUND).length,
-		1,
-		"exact held candidate uses the existing fenced open-file mutation lane",
-	);
-	assertEq(
-		fix.getDiskIndexContentHash(),
-		baselineHashSync(external),
-		"exact held candidate reaches the durable baseline",
-	);
-	assertEq(
-		getInterceptedCandidates(fix.controller).size,
-		0,
-		"durable held settlement retires only its exact candidate",
-	);
-	assertEq(
-		getDirtyMarkdownEntry(fix.controller, fix.path),
-		undefined,
-		"settled held candidate leaves no replay work queued",
-	);
-	assertEq(
-		fix.repairCalls.length,
-		0,
-		"binding repair waits until the external candidate is durably retired",
-	);
-	assertEq(
-		JSON.stringify(fix.getHeldExternalCandidateProjectionProofCounts()),
-		JSON.stringify({ captured: 1, released: 1 }),
-		"one exact projection proof is captured and released",
-	);
-	assertEq(
-		fix.getReconciledReasons().join("|"),
-		"held-external-candidate-settled",
-		"durable candidate retirement emits one immediate binding wake",
-	);
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5c0a: non-exact adoption hold never drops its dirty entry ---");
-{
-	const fix = buildFixture({
-		path: "Notes/non-exact-held-dirty.md",
-		disk: "external bytes without an intercepted candidate\n",
-		editor: "different visible bytes\n",
-		crdt: "older CRDT bytes\n",
-	});
-	fix.setBound(false);
-	fix.setSamePathAdoptionProjectionHeld(true);
-	fix.controller.markMarkdownDirty(fix.file, "modify", "op-non-exact-held");
-	clearMarkdownDrainTimer(fix.controller);
-
-	await drainQueuedMarkdown(fix.controller);
-
-	const queued = getDirtyMarkdownEntry(fix.controller, fix.path);
-	assert(queued !== undefined, "non-exact held dirty entry is requeued");
-	assert(
-		(queued?.notBeforeMs ?? 0) > Date.now(),
-		"non-exact held dirty entry uses bounded positive backoff",
-	);
-	assertEq(fix.ytext.toString(), "older CRDT bytes\n", "non-exact hold never mutates Y.Text");
-	assertEq(
-		JSON.stringify(fix.getHeldExternalCandidateProjectionProofCounts()),
-		JSON.stringify({ captured: 0, released: 0 }),
-		"non-exact hold acquires no projection proof",
-	);
-	assertEq(fix.getReconciledReasons().length, 0, "non-exact hold emits no binding wake");
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5c0a1: held proof capture failure requeues exact candidate work ---");
-{
-	const previous = "target before proof failure\n";
-	const external = "exact external bytes during proof failure\n";
-	const fix = buildFixture({
-		path: "Notes/held-proof-capture-failure.md",
-		disk: external,
-		editor: external,
-		crdt: previous,
-	});
-	fix.setBaselineContent(previous);
-	fix.setBound(false);
-	fix.setSamePathAdoptionProjectionHeld(true);
-	fix.setHeldExternalCandidateProjectionProofCaptureThrows(true);
-	const candidate = makeCurrentInterceptedCandidate(fix, external, 9150);
-	fix.controller.noteInterceptedExternalDiskMutation(candidate);
-	clearMarkdownDrainTimer(fix.controller);
-
-	await drainQueuedMarkdown(fix.controller);
-
-	assert(
-		getInterceptedCandidates(fix.controller).get(fix.path) === candidate,
-		"throwing proof capture retains the exact external candidate",
-	);
-	assert(
-		getDirtyMarkdownEntry(fix.controller, fix.path) !== undefined,
-		"throwing proof capture requeues the dequeued dirty work",
-	);
-	assertEq(fix.ytext.toString(), previous, "throwing proof capture never mutates Y.Text");
-	assertEq(
-		fix.getDiskIndexContentHash(),
-		baselineHashSync(previous),
-		"throwing proof capture never advances the baseline",
-	);
-	assertEq(fix.getReconciledReasons().length, 0, "throwing proof capture emits no wake");
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5c0a2: normalized-only held candidate cannot cross raw-byte proof ---");
-{
-	const previous = "target before normalized candidate\n";
-	const stableLf = "external line one\nexternal line two\n";
-	const candidateCrlf = "external line one\r\nexternal line two\r\n";
-	const fix = buildFixture({
-		path: "Notes/held-normalized-only-candidate.md",
-		disk: stableLf,
-		editor: stableLf,
-		crdt: previous,
-	});
-	fix.setBaselineContent(previous);
-	fix.setBound(false);
-	fix.setSamePathAdoptionProjectionHeld(true);
-	const candidate = makeCurrentInterceptedCandidate(fix, candidateCrlf, 9151);
-	fix.controller.noteInterceptedExternalDiskMutation(candidate);
-	clearMarkdownDrainTimer(fix.controller);
-
-	await drainQueuedMarkdown(fix.controller);
-
-	assert(
-		getInterceptedCandidates(fix.controller).get(fix.path) === candidate,
-		"CRLF candidate remains retained when stable/editor bytes are only normalized-equal",
-	);
-	assert(
-		getDirtyMarkdownEntry(fix.controller, fix.path) !== undefined,
-		"normalized-only held candidate keeps dirty work queued",
-	);
-	assertEq(fix.ytext.toString(), previous, "normalized-only candidate never mutates Y.Text");
-	assertEq(
-		JSON.stringify(fix.getHeldExternalCandidateProjectionProofCounts()),
-		JSON.stringify({ captured: 0, released: 0 }),
-		"normalized-only candidate acquires no held projection proof",
-	);
-	assertEq(
-		fix.getDiskIndexContentHash(),
-		baselineHashSync(previous),
-		"normalized-only candidate cannot advance the durable baseline",
-	);
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-for (const representation of [
-	{
-		kind: "CRLF",
-		path: "Notes/held-raw-crlf-candidate.md",
-		raw: "external line one\r\nexternal line two\r\n",
-		logical: "external line one\nexternal line two\n",
-		stripBomOnVaultRead: false,
-		sequence: 9152,
-	},
-	{
-		kind: "BOM",
-		path: "Notes/held-raw-bom-candidate.md",
-		raw: "\ufeffexternal BOM content\n",
-		logical: "external BOM content\n",
-		stripBomOnVaultRead: true,
-		sequence: 9153,
-	},
-] as const) {
-	console.log(
-		`\n--- Test 5c0a3 (${representation.kind}): raw candidate settles through logical proof ---`,
-	);
-	const previous = `target before ${representation.kind} external write\n`;
-	const fix = buildFixture({
-		path: representation.path,
-		disk: representation.raw,
-		editor: representation.logical,
-		crdt: previous,
-		stripBomOnVaultRead: representation.stripBomOnVaultRead,
-	});
-	fix.setBaselineContent(previous);
-	fix.setBound(false);
-	fix.setSamePathAdoptionProjectionHeld(true);
-	const candidate = makeCurrentInterceptedCandidate(
-		fix,
-		representation.raw,
-		representation.sequence,
-	);
-	fix.controller.noteInterceptedExternalDiskMutation(candidate);
-	clearMarkdownDrainTimer(fix.controller);
-
-	await drainQueuedMarkdown(fix.controller);
-
-	assertEq(
-		fix.ytext.toString(),
-		representation.logical,
-		`${representation.kind}: logical Vault/editor content reaches Y.Text once`,
-	);
-	assertEq(
-		fix.getCurrentDiskContent(),
-		representation.raw,
-		`${representation.kind}: exact raw disk representation is preserved`,
-	);
-	assertEq(
-		fix.getDiskIndexContentHash(),
-		baselineHashSync(representation.logical),
-		`${representation.kind}: durable baseline records canonical logical content`,
-	);
-	assertEq(
-		getInterceptedCandidates(fix.controller).size,
-		0,
-		`${representation.kind}: durable settlement retires the exact raw candidate`,
-	);
-	assertEq(
-		getDirtyMarkdownEntry(fix.controller, fix.path),
-		undefined,
-		`${representation.kind}: successful settlement leaves no retry work`,
-	);
-	assertEq(
-		JSON.stringify(fix.getHeldExternalCandidateProjectionProofCounts()),
-		JSON.stringify({ captured: 1, released: 1 }),
-		`${representation.kind}: one logical projection proof is captured and released`,
-	);
-	assertEq(
-		fix.getReconciledReasons().join("|"),
-		"held-external-candidate-settled",
-		`${representation.kind}: exact raw retirement emits one adoption wake`,
-	);
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5c0a4: transient raw-read failure retries and then settles ---");
-{
-	const previous = "target before transient raw-read failure\n";
-	const external = "exact external bytes after transient raw-read failure\n";
-	const fix = buildFixture({
-		path: "Notes/held-transient-raw-read.md",
-		disk: external,
-		editor: external,
-		crdt: previous,
-		trackPreservedUnresolvedEpisodes: true,
-	});
-	fix.setBaselineContent(previous);
-	fix.setBound(false);
-	fix.setSamePathAdoptionProjectionHeld(true);
-	const candidate = makeCurrentInterceptedCandidate(fix, external, 9154);
-	fix.controller.noteInterceptedExternalDiskMutation(candidate);
-	fix.setRawAdapterReadFailure(true);
-	clearMarkdownDrainTimer(fix.controller);
-
-	await drainQueuedMarkdown(fix.controller);
-
-	assertEq(
-		fix.ytext.toString(),
-		previous,
-		"one unavailable raw verification never mutates Y.Text",
-	);
-	assertEq(
-		fix.getDiskIndexContentHash(),
-		baselineHashSync(previous),
-		"one unavailable raw verification never advances the baseline",
-	);
-	assertEq(
-		getInterceptedCandidates(fix.controller).get(fix.path),
-		candidate,
-		"one unavailable raw verification retains the exact candidate object",
-	);
-	assertEq(
-		getDirtyMarkdownEntry(fix.controller, fix.path)?.retryCount,
-		1,
-		"one unavailable raw verification queues a bounded retry",
-	);
-	assertEq(
-		fix.getPreservedUnresolvedEntries().length,
-		0,
-		"one transient failure does not burden the user with Attention",
-	);
-
-	fix.setRawAdapterReadFailure(false);
-	await drainQueuedMarkdown(fix.controller);
-
-	assertEq(
-		fix.ytext.toString(),
-		external,
-		"a later exact raw read settles the logical external content",
-	);
-	assertEq(
-		getInterceptedCandidates(fix.controller).size,
-		0,
-		"successful retry retires the exact candidate",
-	);
-	assertEq(
-		getDirtyMarkdownEntry(fix.controller, fix.path),
-		undefined,
-		"successful retry leaves no replay work",
-	);
-	assertEq(
-		JSON.stringify(fix.getHeldExternalCandidateProjectionProofCounts()),
-		JSON.stringify({ captured: 1, released: 1 }),
-		"only the successful retry captures and releases a logical proof",
-	);
-	assertEq(
-		fix.getReconciledReasons().join("|"),
-		"held-external-candidate-settled",
-		"successful retry emits one adoption wake",
-	);
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5c0a5: repeated raw-read failure becomes durable Attention ---");
-{
-	const previous = "target before repeated raw-read failure\n";
-	const external = "exact external bytes that remain unreadable\n";
-	const fix = buildFixture({
-		path: "Notes/held-repeated-raw-read-failure.md",
-		disk: external,
-		editor: external,
-		crdt: previous,
-		trackPreservedUnresolvedEpisodes: true,
-	});
-	fix.setBaselineContent(previous);
-	fix.setBound(false);
-	fix.setSamePathAdoptionProjectionHeld(true);
-	const candidate = makeCurrentInterceptedCandidate(fix, external, 9155);
-	fix.controller.noteInterceptedExternalDiskMutation(candidate);
-	fix.setRawAdapterReadFailure(true);
-	clearMarkdownDrainTimer(fix.controller);
-
-	await drainQueuedMarkdown(fix.controller);
-	for (let retry = 1; retry <= 3; retry++) {
-		await drainQueuedMarkdown(fix.controller);
-	}
-
-	assertEq(
-		fix.ytext.toString(),
-		previous,
-		"repeated unavailable raw verification never mutates Y.Text",
-	);
-	assertEq(
-		fix.getDiskIndexContentHash(),
-		baselineHashSync(previous),
-		"repeated unavailable raw verification never advances the baseline",
-	);
-	assertEq(
-		getInterceptedCandidates(fix.controller).get(fix.path),
-		candidate,
-		"terminal Attention retains the exact candidate object",
-	);
-	assertEq(
-		fix.getPreservedUnresolvedEntries()[0]?.reason,
-		"external-disk-read-unavailable",
-		"bounded raw-read exhaustion publishes terminal Attention",
-	);
-	assertEq(
-		getDirtyMarkdownEntry(fix.controller, fix.path),
-		undefined,
-		"durably terminalized raw verification does not replay indefinitely",
-	);
-	assertEq(
-		JSON.stringify(fix.getHeldExternalCandidateProjectionProofCounts()),
-		JSON.stringify({ captured: 0, released: 0 }),
-		"unavailable raw verification acquires no logical projection proof",
-	);
-	assertEq(
-		fix.getReconciledReasons().length,
-		0,
-		"terminal raw verification failure emits no adoption wake",
-	);
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5c0a6: post-proof raw-read retries retain monotonic exhaustion ---");
-{
-	const previous = "target before post-proof raw-read failure\n";
-	const external = "exact external bytes whose revalidation stays unavailable\n";
-	const fix = buildFixture({
-		path: "Notes/held-post-proof-raw-read-failure.md",
-		disk: external,
-		editor: external,
-		crdt: previous,
-		trackPreservedUnresolvedEpisodes: true,
-	});
-	fix.setBaselineContent(previous);
-	fix.setBound(false);
-	fix.setSamePathAdoptionProjectionHeld(true);
-	fix.setRawAdapterReadFailureAfterSuccessfulReads(1);
-	const candidate = makeCurrentInterceptedCandidate(fix, external, 9156);
-	fix.controller.noteInterceptedExternalDiskMutation(candidate);
-	clearMarkdownDrainTimer(fix.controller);
-
-	await drainQueuedMarkdown(fix.controller);
-
-	assertEq(
-		getDirtyMarkdownEntry(fix.controller, fix.path)?.retryCount,
-		1,
-		"post-proof unavailable revalidation preserves its incremented retry",
-	);
-	assertEq(
-		JSON.stringify(fix.getHeldExternalCandidateProjectionProofCounts()),
-		JSON.stringify({ captured: 1, released: 1 }),
-		"the unavailable seam occurs after one proof was captured and released",
-	);
-	assertEq(fix.ytext.toString(), previous, "post-proof unavailable read never mutates Y.Text");
-
-	for (let retry = 1; retry <= 3; retry++) {
-		await drainQueuedMarkdown(fix.controller);
-	}
-
-	assertEq(
-		fix.getPreservedUnresolvedEntries()[0]?.reason,
-		"external-disk-read-unavailable",
-		"post-proof raw-read exhaustion reaches durable Attention on schedule",
-	);
-	assertEq(
-		getDirtyMarkdownEntry(fix.controller, fix.path),
-		undefined,
-		"terminal post-proof exhaustion leaves no ordinary replay loop",
-	);
-	assertEq(
-		getInterceptedCandidates(fix.controller).get(fix.path),
-		candidate,
-		"post-proof exhaustion retains the exact candidate",
-	);
-	assertEq(
-		fix.getDiskIndexContentHash(),
-		baselineHashSync(previous),
-		"post-proof exhaustion never advances the baseline",
-	);
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5c0a7: initially unavailable event is re-probed exactly ---");
-{
-	const previous = "target before initial exact-read outage\n";
-	const external = "external bytes recovered by an exact event re-probe\n";
-	const fix = buildFixture({
-		path: "Notes/initial-external-read-unavailable.md",
-		disk: external,
-		editor: external,
-		crdt: previous,
-		trackPreservedUnresolvedEpisodes: true,
-	});
-	fix.setBaselineContent(previous);
-	fix.setBound(false);
-	fix.setSamePathAdoptionProjectionHeld(true);
-	fix.setRawAdapterReadFailure(true);
-	fix.controller.markMarkdownDirty(fix.file, "modify", "op-initial-unavailable");
-	const hasDispositionApi = noteExternalDiskProbeDisposition(
-		fix,
-		"unavailable",
-		9157,
-	);
-	clearMarkdownDrainTimer(fix.controller);
-
-	assert(
-		hasDispositionApi,
-		"controller accepts the exact initially-unavailable event disposition",
-	);
-	if (hasDispositionApi) {
-		await drainQueuedMarkdown(fix.controller);
-		assertEq(
-			getDirtyMarkdownEntry(fix.controller, fix.path)?.retryCount,
-			1,
-			"initially unavailable exact event enters bounded retry ownership",
-		);
-		assertEq(
-			getInterceptedCandidates(fix.controller).get(fix.path),
-			undefined,
-			"unavailable event does not fabricate a candidate from Vault.read bytes",
-		);
-		assertEq(fix.ytext.toString(), previous, "unavailable event never mutates Y.Text");
-
-		fix.setRawAdapterReadFailure(false);
-		await drainQueuedMarkdown(fix.controller);
-
-		assertEq(
-			fix.ytext.toString(),
-			external,
-			"an exact current re-probe promotes and settles the original event bytes",
-		);
-		assertEq(
-			fix.getDiskIndexContentHash(),
-			baselineHashSync(external),
-			"successful exact re-probe advances the baseline to the external bytes",
-		);
-		assertEq(
-			getPendingExternalDiskProbeDispositions(fix.controller).get(fix.path),
-			undefined,
-			"successful promotion clears the exact unavailable marker",
-		);
-		assertEq(
-			getInterceptedCandidates(fix.controller).get(fix.path),
-			undefined,
-			"successful settlement clears the promoted candidate",
-		);
-		assertEq(
-			getDirtyMarkdownEntry(fix.controller, fix.path),
-			undefined,
-			"successful exact promotion leaves no replay work",
-		);
-	}
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5c0a8: unavailable and stale event markers exhaust safely ---");
-for (const disposition of ["unavailable", "stale"] as const) {
-	const previous = `target before initial ${disposition} event\n`;
-	const external = `current raw bytes must not be borrowed by ${disposition}\n`;
-	const fix = buildFixture({
-		path: `Notes/initial-external-${disposition}.md`,
-		disk: external,
-		editor: external,
-		crdt: previous,
-		trackPreservedUnresolvedEpisodes: true,
-	});
-	fix.setBaselineContent(previous);
-	fix.setBound(false);
-	fix.setSamePathAdoptionProjectionHeld(true);
-	if (disposition === "unavailable") fix.setRawAdapterReadFailure(true);
-	fix.controller.markMarkdownDirty(
-		fix.file,
-		"modify",
-		`op-initial-${disposition}`,
-	);
-	const hasDispositionApi = noteExternalDiskProbeDisposition(
-		fix,
-		disposition,
-		9158,
-	);
-	clearMarkdownDrainTimer(fix.controller);
-
-	assert(hasDispositionApi, `${disposition}: controller accepts the exact event marker`);
-	if (hasDispositionApi) {
-		await drainQueuedMarkdown(fix.controller);
-		for (let retry = 1; retry <= 3; retry++) {
-			await drainQueuedMarkdown(fix.controller);
-		}
-		assertEq(
-			fix.ytext.toString(),
-			previous,
-			`${disposition}: unresolved event never mutates Y.Text`,
-		);
-		assertEq(
-			fix.getDiskIndexContentHash(),
-			baselineHashSync(previous),
-			`${disposition}: unresolved event never advances the baseline`,
-		);
-		assertEq(
-			getInterceptedCandidates(fix.controller).get(fix.path),
-			undefined,
-			`${disposition}: current Vault bytes are never promoted for the old event`,
-		);
-		assertEq(
-			fix.getPreservedUnresolvedEntries()[0]?.reason,
-			"external-disk-read-unavailable",
-			`${disposition}: bounded exhaustion publishes durable Attention`,
-		);
-		assertEq(
-			getDirtyMarkdownEntry(fix.controller, fix.path),
-			undefined,
-			`${disposition}: terminal Attention leaves no ordinary retry loop`,
-		);
-	}
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5c0a9: newer events and path identity invalidate exact markers ---");
-{
-	const external = "external marker lifecycle bytes\n";
-	const fix = buildFixture({
-		path: "Notes/external-marker-identity.md",
-		disk: external,
-		editor: external,
-		crdt: "previous marker identity bytes\n",
-	});
-	const firstAccepted = noteExternalDiskProbeDisposition(fix, "unavailable", 9159);
-	assert(firstAccepted, "controller exposes exact event disposition ownership");
-	if (firstAccepted) {
-		noteExternalDiskProbeDisposition(fix, "stale", 9160);
-		assertEq(
-			getPendingExternalDiskProbeDispositions(fix.controller).get(fix.path)?.sequence,
-			9160,
-			"a newer event sequence replaces the older exact marker",
-		);
-
-		const candidate = makeCurrentInterceptedCandidate(fix, external, 9161);
-		fix.controller.noteInterceptedExternalDiskMutation(candidate);
-		assertEq(
-			getPendingExternalDiskProbeDispositions(fix.controller).get(fix.path),
-			undefined,
-			"a newer current candidate supersedes the old unavailable marker",
-		);
-
-		noteExternalDiskProbeDisposition(fix, "unavailable", 9162);
-		fix.controller.markMarkdownDirty(fix.file, "create", "op-recreated-marker-path");
-		assertEq(
-			getPendingExternalDiskProbeDispositions(fix.controller).get(fix.path),
-			undefined,
-			"create/recreate invalidates the previous path identity marker",
-		);
-
-		noteExternalDiskProbeDisposition(fix, "unavailable", 9163);
-		fix.controller.dropDirtyPath(fix.path);
-		assertEq(
-			getPendingExternalDiskProbeDispositions(fix.controller).get(fix.path),
-			undefined,
-			"dropping a path invalidates its exact event marker",
-		);
-
-		noteExternalDiskProbeDisposition(fix, "unavailable", 9164);
-		fix.controller.reset();
-		assertEq(
-			getPendingExternalDiskProbeDispositions(fix.controller).size,
-			0,
-			"runtime reset invalidates every exact event marker",
-		);
-	}
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5c0a10: delayed probe completion cannot cross its start epoch ---");
-for (const invalidation of ["create", "reset"] as const) {
-	const external = `event-start ticket invalidated by ${invalidation}\n`;
-	const fix = buildFixture({
-		path: `Notes/external-ticket-${invalidation}.md`,
-		disk: external,
-		editor: external,
-		crdt: "older authority\n",
-	});
-	const ticket = beginExternalDiskProbe(fix, invalidation === "create" ? 9165 : 9166);
-	assert(ticket !== undefined && ticket !== null, `${invalidation}: exact start ticket is captured`);
-	if (ticket) {
-		if (invalidation === "create") {
-			fix.controller.markMarkdownDirty(fix.file, "create", "op-ticket-recreate");
-		} else {
-			fix.controller.reset();
-		}
-		const accepted = completeExternalDiskProbeDisposition(
-			fix,
-			ticket,
-			"unavailable",
-		);
-		assert(!accepted, `${invalidation}: stale async completion loses its ticket CAS`);
-		assertEq(
-			getPendingExternalDiskProbeDispositions(fix.controller).get(fix.path),
-			undefined,
-			`${invalidation}: old completion cannot re-arm a new path/runtime epoch`,
-		);
-	}
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5c0a11: same-sequence stale disposition is absorbing ---");
-for (const first of ["stale", "unavailable"] as const) {
-	const external = `same-sequence ${first} marker bytes\n`;
-	const fix = buildFixture({
-		path: `Notes/external-disposition-absorb-${first}.md`,
-		disk: external,
-		editor: external,
-		crdt: "older disposition authority\n",
-		trackPreservedUnresolvedEpisodes: true,
-	});
-	fix.controller.markMarkdownDirty(fix.file, "modify", `op-disposition-${first}`);
-	const ticket = beginExternalDiskProbe(fix, first === "stale" ? 9167 : 9168);
-	assert(ticket !== undefined && ticket !== null, `${first}: exact start ticket is captured`);
-	if (ticket) {
-		assert(
-			completeExternalDiskProbeDisposition(fix, ticket, first),
-			`${first}: first exact disposition is accepted`,
-		);
-		clearMarkdownDrainTimer(fix.controller);
-		const duplicate = first === "stale" ? "unavailable" : "stale";
-		if (first === "unavailable") {
-			completeExternalDiskProbeDisposition(fix, ticket, duplicate);
-		}
-		await drainQueuedMarkdown(fix.controller);
-		if (first === "stale") {
-			completeExternalDiskProbeDisposition(fix, ticket, duplicate);
-		}
-		assertEq(
-			getPendingExternalDiskProbeDispositions(fix.controller).get(fix.path)?.disposition,
-			"stale",
-			`${first}: equal-sequence duplicates converge monotonically to stale`,
-		);
-		assertEq(
-			getDirtyMarkdownEntry(fix.controller, fix.path)?.retryCount,
-			1,
-			`${first}: duplicate completion cannot reset bounded retry ownership`,
-		);
-	}
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5c0a12: higher non-external outcomes supersede proven candidates ---");
-{
-	const same = "same bytes across a newer self-write revision\n";
-	const fix = buildFixture({
-		path: "Notes/external-candidate-newer-self-write.md",
-		disk: same,
-		editor: same,
-		crdt: "older self-write authority\n",
-	});
-	const oldCandidate = makeCurrentInterceptedCandidate(fix, same, 9169);
-	fix.controller.noteInterceptedExternalDiskMutation(oldCandidate);
-	const ticket = beginExternalDiskProbe(fix, 9170);
-	assert(ticket !== undefined && ticket !== null, "newer self-write captures exact start ticket");
-	if (ticket) {
-		assert(
-			await completeSelfWriteExternalDiskProbe(fix, ticket, same),
-			"newer exact self-write outcome is delivered to the controller",
-		);
-		assertEq(
-			getInterceptedCandidates(fix.controller).get(fix.path),
-			undefined,
-			"same-byte newer self-write retires the stale old revision identity",
-		);
-		assertEq(
-			fix.getArtifactPreservationStarts().length,
-			0,
-			"same bytes already present on disk need no duplicate artifact",
-		);
-	}
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-{
-	const oldExternal = "proven older external bytes requiring preservation\n";
-	const newerDisk = "newer revision whose first probe is stale\n";
-	const fix = buildFixture({
-		path: "Notes/external-candidate-newer-stale.md",
-		disk: newerDisk,
-		editor: newerDisk,
-		crdt: "older stale-outcome authority\n",
-	});
-	const oldCandidate = makeCurrentInterceptedCandidate(fix, oldExternal, 9171);
-	fix.controller.noteInterceptedExternalDiskMutation(oldCandidate);
-	const ticket = beginExternalDiskProbe(fix, 9172);
-	assert(ticket !== undefined && ticket !== null, "newer stale event captures exact start ticket");
-	if (ticket) {
-		fix.pauseArtifactPreservation();
-		fix.controller.markMarkdownDirty(fix.file, "modify", "op-newer-stale-outcome");
-		completeExternalDiskProbeDisposition(fix, ticket, "stale");
-		await fix.waitForArtifactPreservationStart();
-		assertEq(
-			fix.getArtifactPreservationStarts()[0],
-			oldExternal,
-			"newer stale disposition first transfers old proven bytes to durable preservation",
-		);
-		assertEq(
-			getInterceptedCandidates(fix.controller).get(fix.path),
-			oldCandidate,
-			"old candidate remains owned until preservation commits",
-		);
-		fix.releaseArtifactPreservation();
-		await drainQueuedMarkdown(fix.controller);
-		assertEq(
-			getInterceptedCandidates(fix.controller).get(fix.path),
-			undefined,
-			"durable preservation retires the superseded candidate identity",
-		);
-	}
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-{
-	const oldExternal = "older external bytes before a different self-write\n";
-	const selfWrite = "newer exact KAOS self-write bytes\n";
-	const fix = buildFixture({
-		path: "Notes/external-candidate-different-self-write.md",
-		disk: selfWrite,
-		editor: selfWrite,
-		crdt: "older different-self-write authority\n",
-	});
-	const oldCandidate = makeCurrentInterceptedCandidate(fix, oldExternal, 9173);
-	fix.controller.noteInterceptedExternalDiskMutation(oldCandidate);
-	const ticket = beginExternalDiskProbe(fix, 9174);
-	assert(
-		ticket !== undefined && ticket !== null,
-		"different-content self-write captures exact start ticket",
-	);
-	if (ticket) {
-		fix.pauseArtifactPreservation();
-		const completion = completeSelfWriteExternalDiskProbe(fix, ticket, selfWrite);
-		await fix.waitForArtifactPreservationStart();
-		assertEq(
-			fix.getArtifactPreservationStarts()[0],
-			oldExternal,
-			"different self-write transfers old proven bytes to durable preservation",
-		);
-		assertEq(
-			getInterceptedCandidates(fix.controller).get(fix.path),
-			oldCandidate,
-			"different self-write retains the old candidate until artifact commit",
-		);
-		fix.releaseArtifactPreservation();
-		assert(
-			await completion,
-			"different self-write outcome settles after durable old-byte preservation",
-		);
-		assertEq(
-			getInterceptedCandidates(fix.controller).get(fix.path),
-			undefined,
-			"different self-write retires the old candidate only after preservation",
-		);
-	}
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-for (const drift of ["editor-input", "adoption-proof", "newer-candidate"] as const) {
-	console.log(`\n--- Test 5c0b (${drift}): held proof drift retains candidate and dirty work ---`);
-	const previous = "target B before external write\n";
-	const external = "external target B while native load was held\n";
-	const fix = buildFixture({
-		path: `Notes/held-external-${drift}.md`,
-		disk: external,
-		editor: external,
-		crdt: previous,
-	});
-	fix.setBaselineContent(previous);
-	fix.setBound(false);
-	fix.setSamePathAdoptionProjectionHeld(true);
-	const candidate = makeCurrentInterceptedCandidate(fix, external, 9200);
-	const newerCandidate = makeCurrentInterceptedCandidate(fix, external, 9201);
-	fix.controller.noteInterceptedExternalDiskMutation(candidate);
-	clearMarkdownDrainTimer(fix.controller);
-	fix.setEqualitySettlementReadHook(async () => {
-		if (drift === "editor-input") {
-			fix.setEditorContent(`${external}newer user input\n`);
-		} else if (drift === "adoption-proof") {
-			fix.invalidateHeldExternalCandidateProjectionProof();
-		} else {
-			fix.controller.noteInterceptedExternalDiskMutation(newerCandidate);
-			clearMarkdownDrainTimer(fix.controller);
-		}
-	});
-
-	await drainQueuedMarkdown(fix.controller);
-	fix.setEqualitySettlementReadHook(null);
-
-	assertEq(fix.ytext.toString(), previous, `${drift}: stale proof never mutates Y.Text`);
-	assert(
-		getInterceptedCandidates(fix.controller).get(fix.path) === (
-			drift === "newer-candidate" ? newerCandidate : candidate
-		),
-		`${drift}: exact current candidate remains retained`,
-	);
-	assert(
-		getDirtyMarkdownEntry(fix.controller, fix.path) !== undefined,
-		`${drift}: dirty work remains queued for a fresh proof`,
-	);
-	assertEq(
-		fix.getDiskIndexContentHash(),
-		baselineHashSync(previous),
-		`${drift}: stale proof cannot advance the durable baseline`,
-	);
-	assertEq(fix.getReconciledReasons().length, 0, `${drift}: stale proof emits no binding wake`);
-	assertEq(
-		JSON.stringify(fix.getHeldExternalCandidateProjectionProofCounts()),
-		JSON.stringify({ captured: 1, released: 1 }),
-		`${drift}: failed proof is released exactly once`,
-	);
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5c0c: cursor and scroll churn cannot starve exact held settlement ---");
-{
-	const previous = "target before presentation-only churn\n";
-	const external = "external bytes survive cursor and scroll movement\n";
-	const fix = buildFixture({
-		path: "Notes/held-presentation-only-churn.md",
-		disk: external,
-		editor: external,
-		crdt: previous,
-	});
-	fix.setBaselineContent(previous);
-	fix.setBound(false);
-	fix.setSamePathAdoptionProjectionHeld(true);
-	const candidate = makeCurrentInterceptedCandidate(fix, external, 9250);
-	fix.controller.noteInterceptedExternalDiskMutation(candidate);
-	clearMarkdownDrainTimer(fix.controller);
-	fix.setEqualitySettlementReadHook(async () => {
-		fix.advanceEditorPresentationEpochs();
-	});
-	fix.setBaselineSettlementReadHook(async () => {
-		fix.advanceEditorPresentationEpochs();
-	});
-
-	await drainQueuedMarkdown(fix.controller);
-	fix.setEqualitySettlementReadHook(null);
-	fix.setBaselineSettlementReadHook(null);
-
-	assertEq(fix.ytext.toString(), external, "presentation-only churn still settles Y.Text");
-	assertEq(
-		fix.getDiskIndexContentHash(),
-		baselineHashSync(external),
-		"presentation-only churn still reaches the durable baseline",
-	);
-	assertEq(
-		getInterceptedCandidates(fix.controller).size,
-		0,
-		"presentation-only churn retires the exact candidate after durability",
-	);
-	assertEq(
-		getDirtyMarkdownEntry(fix.controller, fix.path),
-		undefined,
-		"presentation-only churn leaves no retry work",
-	);
-	assertEq(
-		fix.getReconciledReasons().join("|"),
-		"held-external-candidate-settled",
-		"presentation-only churn emits the immediate binding wake",
-	);
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
 }
 
 // -------------------------------------------------------------------
@@ -5651,15 +4033,10 @@ console.log("\n--- Test 5e: create waits when the live editor is ahead of disk -
 		// editor already contains the user's next input composition.
 		disk: "created partial",
 		editor: "created partial 한글",
-		additionalEditors: ["created partial 한글"],
 		crdt: "base",
 	});
 	const internals = fix.controller as never as {
 		dirtyMarkdownPaths: Map<string, { reason: MarkdownDirtyReason; notBeforeMs?: number }>;
-		visibleAuthorityDeferredPaths: Map<string, {
-			readComplete: boolean;
-			editorContents: string[];
-		}>;
 	};
 
 	fix.controller.markMarkdownDirty(fix.file, "create", "op-create-editor-ahead");
@@ -5673,13 +4050,6 @@ console.log("\n--- Test 5e: create waits when the live editor is ahead of disk -
 		"create is retried after the editor/disk settle window",
 	);
 	assertEq(fix.ytext.toString(), "base", "stale create snapshot does not overwrite CRDT");
-	const marker = internals.visibleAuthorityDeferredPaths.get(fix.path);
-	assert(
-		marker?.readComplete === true
-		&& marker.editorContents.length === 1
-		&& marker.editorContents[0] === "created partial 한글",
-		"identical managed panes remain one complete composite editor authority",
-	);
 	assertEq(
 		fix.captured.filter((e) => e.kind === FLIGHT_KIND.recoveryDecision).length,
 		0,
@@ -5691,46 +4061,6 @@ console.log("\n--- Test 5e: create waits when the live editor is ahead of disk -
 		"editor-ahead create emits no recovery.apply.start",
 	);
 	clearMarkdownDrainTimer(fix.controller);
-}
-
-console.log("\n--- Test 5e2: identical panes remain complete during authoritative settle ---");
-{
-	const editorContent = "two panes share one current successor";
-	const fix = buildFixture({
-		path: "Notes/settling-identical-panes.md",
-		disk: "older disk snapshot",
-		editor: editorContent,
-		additionalEditors: [editorContent],
-		crdt: "older CRDT snapshot",
-	});
-	const internals = fix.controller as never as {
-		deps: {
-			getEditorBindings(): {
-				getLastEditorActivityForPath: (path: string) => number | null;
-			};
-		};
-		visibleAuthorityDeferredPaths: Map<string, {
-			readComplete: boolean;
-			editorContents: string[];
-		}>;
-	};
-	const editorBindings = internals.deps.getEditorBindings();
-	const original = editorBindings.getLastEditorActivityForPath.bind(editorBindings);
-	editorBindings.getLastEditorActivityForPath = () => Date.now() - 100;
-	try {
-		await fix.controller.runReconciliation("authoritative");
-		const marker = internals.visibleAuthorityDeferredPaths.get(fix.path);
-		assert(
-			marker?.readComplete === true
-			&& marker.editorContents.length === 1
-			&& marker.editorContents[0] === editorContent,
-			"a composite lease for identical panes remains a complete single authority",
-		);
-	} finally {
-		editorBindings.getLastEditorActivityForPath = original;
-		fix.controller.reset();
-		fix.doc.destroy();
-	}
 }
 
 // -------------------------------------------------------------------
@@ -6029,11 +4359,6 @@ console.log("\n--- Test 5f4c1: failed superseded preservation retries durably an
 	await waitForAsyncCondition(
 		() => Array.from(fix.getCreatedFiles().values()).filter((content) => content === olderRaw).length === 1,
 		"successful superseded preservation retry",
-	);
-	await waitForAsyncCondition(
-		() => getPendingSupersededCandidates(fix.controller)
-			.filter((candidate) => candidate === older).length === 0,
-		"durable superseded preservation settlement",
 	);
 	assertEq(
 		getPendingSupersededCandidates(fix.controller).filter((candidate) => candidate === older).length,
@@ -6512,646 +4837,6 @@ console.log("\n--- Test 5f4f: current candidate clears only after successful set
 	assertEq(getInterceptedCandidates(fix.controller).size, 0, "successful settlement clears current candidate");
 	fix.controller.reset();
 	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5f4f1: a transition candidate retires after the source closes and settles ---");
-{
-	const base = "closed source base\n";
-	const external = "closed source external\n";
-	const fix = buildFixture({
-		path: "Notes/intercepted-closed-source-settlement.md",
-		disk: external,
-		editor: base,
-		crdt: base,
-	});
-	fix.setBaselineContent(base);
-	fix.setOpen(false);
-	fix.setBound(false);
-	fix.controller.noteInterceptedExternalDiskMutation(
-		makeInterceptedCandidate(fix.path, external, 32),
-	);
-	await drainQueuedMarkdown(fix.controller);
-
-	assertEq(fix.ytext.toString(), external, "closed source candidate settles into Y.Text");
-	assertEq(fix.getCurrentDiskContent(), external, "closed source keeps the exact disk revision");
-	assertEq(
-		getInterceptedCandidates(fix.controller).size,
-		0,
-		"closed source settlement retires the transition candidate",
-	);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5f4f2: a closed both-changed candidate retires after durable full reconciliation ---");
-{
-	const baseline = "## Work\nbase work\n\n## Life\nbase life\n";
-	const external = "## Work\nbase work\n\n## Life\nexternal life\n";
-	const remote = "## Work\nremote work\n\n## Life\nbase life\n";
-	const merged = "## Work\nremote work\n\n## Life\nexternal life\n";
-	const fix = buildFixture({
-		path: "Notes/intercepted-closed-both-changed-settlement.md",
-		disk: external,
-		editor: remote,
-		crdt: remote,
-	});
-	fix.setBaselineContent(baseline);
-	fix.setOpen(false);
-	fix.setBound(false);
-	const settledCandidate = makeInterceptedCandidate(fix.path, external, 33);
-	fix.controller.noteInterceptedExternalDiskMutation(settledCandidate);
-	await drainQueuedMarkdown(fix.controller);
-	clearReconcileCooldownTimer(fix.controller);
-
-	assert(
-		getInterceptedCandidates(fix.controller).get(fix.path) === settledCandidate,
-		"closed dirty both-changed handoff retains the exact candidate for the full planner",
-	);
-	await fix.controller.runReconciliation("authoritative");
-
-	assertEq(fix.ytext.toString(), merged, "full reconciliation applies the clean three-way merge");
-	assertEq(fix.getCurrentDiskContent(), merged, "clean three-way merge reaches the primary disk path");
-	assertEq(
-		fix.getDiskIndexContentHash(),
-		baselineHashSync(merged),
-		"clean three-way merge reaches the durable disk baseline",
-	);
-	assertEq(
-		getInterceptedCandidates(fix.controller).size,
-		0,
-		"durable full reconciliation retires the handed-off candidate",
-	);
-
-	const later = "## Work\nremote work\n\n## Life\nlater external life\n";
-	fix.setDiskContent(later);
-	fix.controller.noteInterceptedExternalDiskMutation(
-		makeInterceptedCandidate(fix.path, later, 34),
-	);
-	clearMarkdownDrainTimer(fix.controller);
-	await new Promise<void>((resolve) => setTimeout(resolve, 0));
-	assertEq(
-		Array.from(fix.getCreatedFiles().values()).filter((content) => content === external).length,
-		0,
-		"a later candidate does not re-emit the settled revision as a superseded artifact",
-	);
-	clearReconcileCooldownTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5f4f3: a full closed settlement retains its candidate when disk-index save fails ---");
-{
-	const baseline = "## Work\nbase work\n\n## Life\nbase life\n";
-	const external = "## Work\nbase work\n\n## Life\nexternal life\n";
-	const remote = "## Work\nremote work\n\n## Life\nbase life\n";
-	const merged = "## Work\nremote work\n\n## Life\nexternal life\n";
-	const fix = buildFixture({
-		path: "Notes/intercepted-closed-index-save-failure.md",
-		disk: external,
-		editor: remote,
-		crdt: remote,
-	});
-	fix.setBaselineContent(baseline);
-	fix.setOpen(false);
-	fix.setBound(false);
-	const candidate = makeInterceptedCandidate(fix.path, external, 35);
-	fix.controller.noteInterceptedExternalDiskMutation(candidate);
-	clearMarkdownDrainTimer(fix.controller);
-	fix.setDiskIndexSaveFailure(true);
-
-	let saveFailed = false;
-	try {
-		await fix.controller.runReconciliation("authoritative");
-	} catch (error) {
-		saveFailed = error instanceof Error && error.message === "disk index save failed";
-	}
-
-	assert(saveFailed, "full reconciliation exposes the durable disk-index save failure");
-	assertEq(fix.ytext.toString(), merged, "pre-save clean merge remains the current CRDT state");
-	assertEq(fix.getCurrentDiskContent(), merged, "pre-save clean merge remains the current disk state");
-	assert(
-		getInterceptedCandidates(fix.controller).get(fix.path) === candidate,
-		"failed durable index save retains the exact handed-off candidate",
-	);
-	clearReconcileCooldownTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5f4f4: every durable closed-file winner retires its exact candidate ---");
-{
-	const cases: Array<{
-		label: string;
-		baseline: string | null;
-		disk: string;
-		crdt: string;
-		expected: string;
-		expectedPreservedDiskCopies: number;
-	}> = [
-		{
-			label: "equal no-op",
-			baseline: "older equal baseline\n",
-			disk: "equal current\n",
-			crdt: "equal current\n",
-			expected: "equal current\n",
-			expectedPreservedDiskCopies: 0,
-		},
-		{
-			label: "disk-only import",
-			baseline: "disk import baseline\n",
-			disk: "disk import external\n",
-			crdt: "disk import baseline\n",
-			expected: "disk import external\n",
-			expectedPreservedDiskCopies: 0,
-		},
-		{
-			label: "manual conflict disk winner",
-			baseline: "conflict base\n",
-			disk: "conflict external\n",
-			crdt: "conflict remote\n",
-			expected: "conflict external\n",
-			expectedPreservedDiskCopies: 0,
-		},
-		{
-			label: "missing-baseline CRDT winner",
-			baseline: null,
-			disk: "missing baseline external\n",
-			crdt: "missing baseline remote\n",
-			expected: "missing baseline remote\n",
-			expectedPreservedDiskCopies: 1,
-		},
-		{
-			label: "CRDT-only apply remote",
-			baseline: "apply remote baseline\n",
-			disk: "apply remote baseline\n",
-			crdt: "apply remote current\n",
-			expected: "apply remote current\n",
-			expectedPreservedDiskCopies: 0,
-		},
-	];
-
-	for (const [caseIndex, scenario] of cases.entries()) {
-		const fix = buildFixture({
-			path: `Notes/intercepted-closed-${scenario.label.replaceAll(" ", "-")}.md`,
-			disk: scenario.disk,
-			editor: scenario.crdt,
-			crdt: scenario.crdt,
-		});
-		if (scenario.baseline === null) {
-			fix.clearDiskIndex();
-		} else {
-			fix.setBaselineContent(scenario.baseline);
-		}
-		fix.setOpen(false);
-		fix.setBound(false);
-		const candidate = makeInterceptedCandidate(
-			fix.path,
-			scenario.disk,
-			40 + caseIndex,
-		);
-		fix.controller.noteInterceptedExternalDiskMutation(candidate);
-		clearMarkdownDrainTimer(fix.controller);
-
-		await fix.controller.runReconciliation("authoritative");
-
-		assertEq(fix.ytext.toString(), scenario.expected, `${scenario.label}: winner reaches Y.Text`);
-		assertEq(fix.getCurrentDiskContent(), scenario.expected, `${scenario.label}: winner reaches disk`);
-		assertEq(
-			fix.getDiskIndexContentHash(),
-			baselineHashSync(scenario.expected),
-			`${scenario.label}: winner reaches the durable baseline`,
-		);
-		assertEq(
-			getInterceptedCandidates(fix.controller).size,
-			0,
-			`${scenario.label}: exact candidate retires only after durable settlement`,
-		);
-
-		const later = `${scenario.expected.trimEnd()} later\n`;
-		fix.setDiskContent(later);
-		fix.controller.noteInterceptedExternalDiskMutation(
-			makeInterceptedCandidate(fix.path, later, 50 + caseIndex),
-		);
-		clearMarkdownDrainTimer(fix.controller);
-		await new Promise<void>((resolve) => setTimeout(resolve, 0));
-		assertEq(
-			Array.from(fix.getCreatedFiles().values()).filter(
-				(content) => content === scenario.disk,
-			).length,
-			scenario.expectedPreservedDiskCopies,
-			`${scenario.label}: later candidate emits no superseded duplicate`,
-		);
-		clearReconcileCooldownTimer(fix.controller);
-		fix.controller.reset();
-		fix.doc.destroy();
-	}
-}
-
-console.log("\n--- Test 5f4f5: stale and policy-held full closed outcomes retain their candidates ---");
-{
-	const policyHeld = buildFixture({
-		path: "Notes/intercepted-closed-policy-held.md",
-		disk: "policy baseline\n",
-		editor: "policy remote\n",
-		crdt: "policy remote\n",
-	});
-	policyHeld.setBaselineContent("policy baseline\n");
-	policyHeld.setOpen(false);
-	policyHeld.setBound(false);
-	policyHeld.setRemoteProjectionAllowed(false);
-	const policyCandidate = makeInterceptedCandidate(
-		policyHeld.path,
-		"policy baseline\n",
-		60,
-	);
-	policyHeld.controller.noteInterceptedExternalDiskMutation(policyCandidate);
-	clearMarkdownDrainTimer(policyHeld.controller);
-
-	await policyHeld.controller.runReconciliation("authoritative");
-
-	assertEq(
-		policyHeld.getCurrentDiskContent(),
-		"policy baseline\n",
-		"policy-held full outcome performs no remote projection",
-	);
-	assert(
-		getInterceptedCandidates(policyHeld.controller).get(policyHeld.path) === policyCandidate,
-		"policy-held full outcome retains the exact candidate",
-	);
-	clearReconcileCooldownTimer(policyHeld.controller);
-	policyHeld.controller.reset();
-	policyHeld.doc.destroy();
-
-	const baseline = "## Work\nbase work\n\n## Life\nbase life\n";
-	const external = "## Work\nbase work\n\n## Life\nexternal life\n";
-	const remote = "## Work\nremote work\n\n## Life\nbase life\n";
-	const stale = buildFixture({
-		path: "Notes/intercepted-closed-stale-plan.md",
-		disk: external,
-		editor: remote,
-		crdt: remote,
-	});
-	stale.setBaselineContent(baseline);
-	stale.setOpen(false);
-	stale.setBound(false);
-	const staleCandidate = makeInterceptedCandidate(stale.path, external, 61);
-	stale.controller.noteInterceptedExternalDiskMutation(staleCandidate);
-	clearMarkdownDrainTimer(stale.controller);
-	stale.setBaselineReadHook(async () => {
-		stale.setDiskContent("newer disk during full plan\n");
-	});
-
-	await stale.controller.runReconciliation("authoritative");
-	stale.setBaselineReadHook(null);
-
-	assertEq(stale.ytext.toString(), remote, "stale full outcome does not mutate Y.Text");
-	assertEq(
-		stale.getCurrentDiskContent(),
-		"newer disk during full plan\n",
-		"stale full outcome preserves the newer disk revision",
-	);
-	assert(
-		getInterceptedCandidates(stale.controller).get(stale.path) === staleCandidate,
-		"stale full outcome retains the exact candidate",
-	);
-	clearReconcileCooldownTimer(stale.controller);
-	stale.controller.reset();
-	stale.doc.destroy();
-}
-
-console.log("\n--- Test 5f4f6: a real full-reconcile disk seed durably retires its candidate ---");
-{
-	const external = "seeded external disk authority\n";
-	const fix = buildFixture({
-		path: "Notes/intercepted-closed-disk-seed.md",
-		disk: external,
-		editor: "",
-		crdt: "",
-		reconcileSeedDiskToCrdt: true,
-	});
-	fix.clearDiskIndex();
-	fix.setOpen(false);
-	fix.setBound(false);
-	const candidate = makeInterceptedCandidate(fix.path, external, 62);
-	fix.controller.noteInterceptedExternalDiskMutation(candidate);
-	clearMarkdownDrainTimer(fix.controller);
-
-	await fix.controller.runReconciliation("authoritative");
-
-	assertEq(fix.ytext.toString(), external, "disk-only seed creates the exact Y.Text authority");
-	assertEq(
-		fix.getDiskIndexContentHash(),
-		baselineHashSync(external),
-		"disk-only seed reaches the durable full-reconcile baseline",
-	);
-	assertEq(
-		getInterceptedCandidates(fix.controller).size,
-		0,
-		"durably seeded exact candidate retires after index save",
-	);
-
-	const later = "later external after seed\n";
-	fix.setDiskContent(later);
-	fix.controller.noteInterceptedExternalDiskMutation(
-		makeInterceptedCandidate(fix.path, later, 63),
-	);
-	clearMarkdownDrainTimer(fix.controller);
-	await new Promise<void>((resolve) => setTimeout(resolve, 0));
-	assertEq(
-		Array.from(fix.getCreatedFiles().values()).filter((content) => content === external).length,
-		0,
-		"post-seed candidate does not re-emit the seeded revision as superseded",
-	);
-	clearReconcileCooldownTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-}
-
-console.log("\n--- Test 5f4f7: fresh local Attention resolution retires only its exact candidate ---");
-{
-	const base = "attention remote base\n";
-	const external = "attention fresh local\n";
-	const fix = buildFixture({
-		path: "Notes/intercepted-attention-local-resolution.md",
-		disk: external,
-		editor: external,
-		crdt: base,
-		trackPreservedUnresolvedEpisodes: true,
-	});
-	fix.setBaselineContent(base);
-	fix.setOpen(false);
-	fix.setBound(false);
-	fix.setPreservedUnresolvedEpisode(
-		"remote-delete-missing-baseline",
-		"attention-local-resolution-episode",
-	);
-	const candidate = makeInterceptedCandidate(fix.path, external, 64);
-	fix.controller.noteInterceptedExternalDiskMutation(candidate);
-
-	await drainQueuedMarkdown(fix.controller);
-
-	assertEq(fix.ytext.toString(), external, "fresh local Attention resolution reaches Y.Text");
-	assertEq(
-		fix.getDiskIndexContentHash(),
-		baselineHashSync(external),
-		"fresh local Attention resolution reaches the durable baseline",
-	);
-	assertEq(fix.getPreservedUnresolvedEntries().length, 0, "settled local event clears its Attention episode");
-	assertEq(
-		getInterceptedCandidates(fix.controller).size,
-		0,
-		"settled local event retires its exact intercepted candidate",
-	);
-	clearReconcileCooldownTimer(fix.controller);
-	fix.controller.reset();
-	fix.doc.destroy();
-
-	const replacement = buildFixture({
-		path: "Notes/intercepted-attention-candidate-replaced-during-save.md",
-		disk: external,
-		editor: external,
-		crdt: base,
-		trackPreservedUnresolvedEpisodes: true,
-	});
-	replacement.setBaselineContent(base);
-	replacement.setOpen(false);
-	replacement.setBound(false);
-	replacement.setPreservedUnresolvedEpisode(
-		"remote-delete-missing-baseline",
-		"attention-candidate-replacement-episode",
-	);
-	const olderCandidate = makeInterceptedCandidate(replacement.path, external, 65);
-	const newerCandidate = makeInterceptedCandidate(replacement.path, external, 66);
-	replacement.controller.noteInterceptedExternalDiskMutation(olderCandidate);
-	replacement.setDiskIndexSaveHook(() => {
-		replacement.setDiskIndexSaveHook(null);
-		replacement.controller.noteInterceptedExternalDiskMutation(newerCandidate);
-		clearMarkdownDrainTimer(replacement.controller);
-	});
-
-	await drainQueuedMarkdown(replacement.controller);
-
-	assertEq(
-		replacement.getPreservedUnresolvedEntries().length,
-		0,
-		"same-byte replacement candidate does not block a valid Attention resolution",
-	);
-	assert(
-		getInterceptedCandidates(replacement.controller).get(replacement.path) === newerCandidate,
-		"index-save completion cannot retire a newer candidate object",
-	);
-	clearReconcileCooldownTimer(replacement.controller);
-	replacement.controller.reset();
-	replacement.doc.destroy();
-
-	const episodeReplacement = buildFixture({
-		path: "Notes/intercepted-attention-episode-replaced-during-save.md",
-		disk: external,
-		editor: external,
-		crdt: base,
-		trackPreservedUnresolvedEpisodes: true,
-	});
-	episodeReplacement.setBaselineContent(base);
-	episodeReplacement.setOpen(false);
-	episodeReplacement.setBound(false);
-	episodeReplacement.setPreservedUnresolvedEpisode(
-		"remote-delete-missing-baseline",
-		"attention-original-episode",
-	);
-	const episodeCandidate = makeInterceptedCandidate(episodeReplacement.path, external, 67);
-	episodeReplacement.controller.noteInterceptedExternalDiskMutation(episodeCandidate);
-	episodeReplacement.setDiskIndexSaveHook(() => {
-		episodeReplacement.setDiskIndexSaveHook(null);
-		episodeReplacement.setPreservedUnresolvedEpisode(
-			"remote-delete-missing-baseline",
-			"attention-replacement-episode",
-		);
-	});
-
-	await drainQueuedMarkdown(episodeReplacement.controller);
-
-	assert(
-		episodeReplacement.getPreservedUnresolvedEntries().some(
-			(entry) => entry.episodeId === "attention-replacement-episode",
-		),
-		"replacement Attention episode survives the older settlement",
-	);
-	assert(
-		getInterceptedCandidates(episodeReplacement.controller).get(episodeReplacement.path) ===
-			episodeCandidate,
-		"episode replacement prevents exact candidate retirement",
-	);
-	clearReconcileCooldownTimer(episodeReplacement.controller);
-	episodeReplacement.controller.reset();
-	episodeReplacement.doc.destroy();
-}
-
-console.log("\n--- Test 5f4f8: full closed guards retain candidates until the final index is authoritative ---");
-{
-	const safety = buildFixture({
-		path: "Notes/intercepted-closed-safety-brake.md",
-		disk: "safety disk\n",
-		editor: "safety remote\n",
-		crdt: "safety remote\n",
-	});
-	safety.setBaselineContent("safety disk\n");
-	safety.setOpen(false);
-	safety.setBound(false);
-	const safetyCandidate = makeInterceptedCandidate(safety.path, "safety disk\n", 68);
-	safety.controller.noteInterceptedExternalDiskMutation(safetyCandidate);
-	clearMarkdownDrainTimer(safety.controller);
-	const safetyVaultSync = (safety.controller as never as {
-		deps: { getVaultSync(): { reconcileVault: (...args: unknown[]) => Record<string, unknown> } };
-	}).deps.getVaultSync();
-	const originalSafetyReconcile = safetyVaultSync.reconcileVault.bind(safetyVaultSync);
-	safetyVaultSync.reconcileVault = (...args: unknown[]) => ({
-		...originalSafetyReconcile(...args),
-		updatedOnDisk: Array.from({ length: 21 }, () => safety.path),
-	});
-
-	await safety.controller.runReconciliation("authoritative");
-
-	assert(
-		getInterceptedCandidates(safety.controller).get(safety.path) === safetyCandidate,
-		"safety brake retains the exact candidate",
-	);
-	clearReconcileCooldownTimer(safety.controller);
-	safety.controller.reset();
-	safety.doc.destroy();
-
-	const baseline = "## Work\nbase work\n\n## Life\nbase life\n";
-	const external = "## Work\nbase work\n\n## Life\nexternal life\n";
-	const remote = "## Work\nremote work\n\n## Life\nbase life\n";
-	const indexMismatch = buildFixture({
-		path: "Notes/intercepted-closed-final-index-mismatch.md",
-		disk: external,
-		editor: remote,
-		crdt: remote,
-	});
-	indexMismatch.setBaselineContent(baseline);
-	indexMismatch.setOpen(false);
-	indexMismatch.setBound(false);
-	const mismatchCandidate = makeInterceptedCandidate(indexMismatch.path, external, 69);
-	indexMismatch.controller.noteInterceptedExternalDiskMutation(mismatchCandidate);
-	clearMarkdownDrainTimer(indexMismatch.controller);
-	indexMismatch.setFlushWriteBoundaryHook(() => {
-		indexMismatch.advanceOpenExternalAuthority("baseline-hash");
-		indexMismatch.advanceOpenExternalAuthority("baseline-revision");
-	});
-
-	await indexMismatch.controller.runReconciliation("authoritative");
-	indexMismatch.setFlushWriteBoundaryHook(null);
-
-	assertEq(
-		indexMismatch.getDiskIndexContentHash(),
-		baselineHashSync("newer baseline authority"),
-		"newer verified baseline replaces the reconcile-local planned hash",
-	);
-	assert(
-		getInterceptedCandidates(indexMismatch.controller).get(indexMismatch.path) === mismatchCandidate,
-		"final next-index hash mismatch retains the candidate",
-	);
-	clearReconcileCooldownTimer(indexMismatch.controller);
-	indexMismatch.controller.reset();
-	indexMismatch.doc.destroy();
-
-	const candidateReplacement = buildFixture({
-		path: "Notes/intercepted-closed-candidate-replaced-during-save.md",
-		disk: external,
-		editor: remote,
-		crdt: remote,
-	});
-	candidateReplacement.setBaselineContent(baseline);
-	candidateReplacement.setOpen(false);
-	candidateReplacement.setBound(false);
-	const candidateBeforeSave = makeInterceptedCandidate(
-		candidateReplacement.path,
-		external,
-		72,
-	);
-	const candidateDuringSave = makeInterceptedCandidate(
-		candidateReplacement.path,
-		external,
-		73,
-	);
-	candidateReplacement.controller.noteInterceptedExternalDiskMutation(candidateBeforeSave);
-	clearMarkdownDrainTimer(candidateReplacement.controller);
-	candidateReplacement.setDiskIndexSaveHook(() => {
-		candidateReplacement.setDiskIndexSaveHook(null);
-		candidateReplacement.controller.noteInterceptedExternalDiskMutation(candidateDuringSave);
-		clearMarkdownDrainTimer(candidateReplacement.controller);
-	});
-
-	await candidateReplacement.controller.runReconciliation("authoritative");
-
-	assert(
-		getInterceptedCandidates(candidateReplacement.controller).get(candidateReplacement.path) ===
-			candidateDuringSave,
-		"full index-save completion cannot retire a newer candidate object",
-	);
-	clearReconcileCooldownTimer(candidateReplacement.controller);
-	candidateReplacement.controller.reset();
-	candidateReplacement.doc.destroy();
-
-	const artifactFailure = buildFixture({
-		path: "Notes/intercepted-closed-full-artifact-failure.md",
-		disk: "closed artifact external\n",
-		editor: "closed artifact remote\n",
-		crdt: "closed artifact remote\n",
-	});
-	artifactFailure.setBaselineContent("closed artifact base\n");
-	artifactFailure.setOpen(false);
-	artifactFailure.setBound(false);
-	artifactFailure.setArtifactWriteFailure(true);
-	const artifactCandidate = makeInterceptedCandidate(
-		artifactFailure.path,
-		"closed artifact external\n",
-		70,
-	);
-	artifactFailure.controller.noteInterceptedExternalDiskMutation(artifactCandidate);
-	clearMarkdownDrainTimer(artifactFailure.controller);
-
-	await artifactFailure.controller.runReconciliation("authoritative");
-
-	assert(
-		getInterceptedCandidates(artifactFailure.controller).get(artifactFailure.path) ===
-			artifactCandidate,
-		"closed full artifact failure retains the exact candidate",
-	);
-	clearReconcileCooldownTimer(artifactFailure.controller);
-	artifactFailure.controller.reset();
-	artifactFailure.doc.destroy();
-
-	const flushFailure = buildFixture({
-		path: "Notes/intercepted-closed-full-flush-failure.md",
-		disk: "closed flush baseline\n",
-		editor: "closed flush remote\n",
-		crdt: "closed flush remote\n",
-	});
-	flushFailure.setBaselineContent("closed flush baseline\n");
-	flushFailure.setOpen(false);
-	flushFailure.setBound(false);
-	const flushCandidate = makeInterceptedCandidate(
-		flushFailure.path,
-		"closed flush baseline\n",
-		71,
-	);
-	flushFailure.controller.noteInterceptedExternalDiskMutation(flushCandidate);
-	clearMarkdownDrainTimer(flushFailure.controller);
-	flushFailure.setFlushWriteBoundaryHook(() => {
-		flushFailure.setDiskContent("newer disk before closed flush\n");
-	});
-
-	await flushFailure.controller.runReconciliation("authoritative");
-	flushFailure.setFlushWriteBoundaryHook(null);
-
-	assert(
-		getInterceptedCandidates(flushFailure.controller).get(flushFailure.path) === flushCandidate,
-		"closed full flush failure retains the exact candidate",
-	);
-	clearReconcileCooldownTimer(flushFailure.controller);
-	flushFailure.controller.reset();
-	flushFailure.doc.destroy();
 }
 
 console.log("\n--- Test 5f4g: failed artifact and failed flush retain the current candidate ---");
@@ -7956,24 +5641,6 @@ console.log("\n--- Test 8: source-grep regressions on EditorBindingManager emit 
 		new URL("../src/sync/editorBinding.ts", import.meta.url),
 	);
 	const src = readFileSync(bindingSourcePath, "utf8");
-	const sourceFile = ts.createSourceFile(
-		bindingSourcePath,
-		src,
-		ts.ScriptTarget.Latest,
-		true,
-		ts.ScriptKind.TS,
-	);
-	const methodSource = (methodName: string): string => {
-		const editorBindingClass = sourceFile.statements.find((statement) =>
-			ts.isClassDeclaration(statement) && statement.name?.text === "EditorBindingManager"
-		);
-		if (!editorBindingClass || !ts.isClassDeclaration(editorBindingClass)) return "";
-		const method = editorBindingClass.members.find((member) =>
-			ts.isMethodDeclaration(member)
-			&& member.name.getText(sourceFile) === methodName
-		);
-		return method ? method.getText(sourceFile) : "";
-	};
 
 	// Constructor accepts the optional flight callback.
 	assert(
@@ -7986,8 +5653,11 @@ console.log("\n--- Test 8: source-grep regressions on EditorBindingManager emit 
 	);
 
 	// applyBinding emits editor.repair.applied for action==="repair" only.
-	const applyBindingTail = methodSource("applyBinding");
-	assert(applyBindingTail.length > 0, "applyBinding method present");
+	const applyBindingIdx = src.indexOf(
+		"private applyBinding(",
+	);
+	assert(applyBindingIdx > 0, "applyBinding method present");
+	const applyBindingTail = src.slice(applyBindingIdx, applyBindingIdx + 4500);
 	assert(
 		applyBindingTail.includes("PRODUCT_EVENT_KIND.editorRepairApplied"),
 		"applyBinding emits PRODUCT_EVENT_KIND.editorRepairApplied",
@@ -7997,23 +5667,54 @@ console.log("\n--- Test 8: source-grep regressions on EditorBindingManager emit 
 		"applyBinding gates emission on action===\"repair\"",
 	);
 
-	// Path-scoped binding makes heal() attach-only. It may validate the exact
-	// existing target and delegate to repair(), but it must never rewrite Y.Text
-	// from an editor facade or emit the retired mutation-success event.
-	const healBody = methodSource("heal");
-	assert(healBody.length > 0, "heal method present");
+	// heal() emits editor.heal.applied on every successful entry that
+	// resolves a binding target (not gated on the diff branch). Carries
+	// diffApplied: boolean so absence of the event proves heal() was not
+	// invoked.
+	const healIdx = src.indexOf(
+		"heal(view: MarkdownView, deviceName: string, reason: string): boolean {",
+	);
+	assert(healIdx > 0, "heal method present");
+	const healBody = src.slice(healIdx, healIdx + 2500);
+	const applyDiffIdx = healBody.indexOf("applyDiffToYText(target.ytext, crdtContent, currentContent, ORIGIN_EDITOR_HEALTH_HEAL)");
+	const healEmitIdx = healBody.indexOf("PRODUCT_EVENT_KIND.editorHealApplied");
+	assert(applyDiffIdx > 0, "heal() calls applyDiffToYText with ORIGIN_EDITOR_HEALTH_HEAL");
+	assert(healEmitIdx > 0, "heal() emits PRODUCT_EVENT_KIND.editorHealApplied");
 	assert(
-		healBody.includes("return this.repair(view, deviceName, reason)"),
-		"heal() delegates an already-certified existing target to repair()",
+		healEmitIdx > applyDiffIdx,
+		"PRODUCT_EVENT_KIND.editorHealApplied emit follows applyDiffToYText",
+	);
+	// editor.heal.applied is NOT gated on the diff branch — the emit must
+	// be after the if (diffApplied) block, not inside it. We assert this by
+	// checking that the emit index is past the closing brace of the diff
+	// branch. The diff branch is short (just the log + applyDiffToYText) so
+	// we can detect it textually.
+	assert(
+		healBody.includes("const diffApplied = crdtContent !== currentContent"),
+		"heal() computes diffApplied flag",
 	);
 	assert(
-		!healBody.includes("applyDiffToYText")
-			&& !healBody.includes("ORIGIN_EDITOR_HEALTH_HEAL"),
-		"heal() performs no editor-to-Y.Text mutation",
+		healBody.includes("diffApplied,"),
+		"heal() emit data carries diffApplied flag",
 	);
+	const ifBranchIdx = healBody.indexOf("if (diffApplied) {");
+	assert(ifBranchIdx > 0, "heal() has if(diffApplied) block");
+	// The emit must NOT be inside the if(diffApplied) block. Find the
+	// closing brace of that block by walking braces.
+	let depth = 0;
+	let closeIdx = -1;
+	for (let i = ifBranchIdx + "if (diffApplied) {".length - 1; i < healBody.length; i++) {
+		const ch = healBody[i];
+		if (ch === "{") depth++;
+		else if (ch === "}") {
+			depth--;
+			if (depth === 0) { closeIdx = i; break; }
+		}
+	}
+	assert(closeIdx > 0, "heal() if(diffApplied) block closing brace found");
 	assert(
-		!healBody.includes("PRODUCT_EVENT_KIND.editorHealApplied"),
-		"heal() emits no retired editor.heal.applied mutation event",
+		healEmitIdx > closeIdx,
+		"PRODUCT_EVENT_KIND.editorHealApplied emit is OUTSIDE if(diffApplied) block (fires on every successful entry)",
 	);
 }
 
@@ -8038,12 +5739,6 @@ console.log("\n--- Test 8a: main wires monotonic markdown authority generations 
 		"controller receives the live markdown sync-scope generation",
 	);
 	assert(
-		src.includes("persistPreservedUnresolvedStateDurably: async (stateChanged) =>")
-			&& src.includes("if (stateChanged) this.markdownAttentionGeneration++")
-			&& src.includes("await this.persistPreservedUnresolvedStateDurably()"),
-		"controller receives an awaited durable Markdown Attention persistence boundary",
-	);
-	assert(
 		src.includes("() => this.handleMarkdownAttentionStateChanged()"),
 		"DiskMirror Attention changes advance generation through one callback",
 	);
@@ -8058,22 +5753,6 @@ console.log("\n--- Test 8a: main wires monotonic markdown authority generations 
 	assert(
 		/private updateMarkdownSyncScopeGeneration\(runtimeConfig: RuntimeConfig\): void \{[\s\S]{0,500}this\.markdownSyncScopeGeneration\+\+[\s\S]{0,200}this\.markdownSyncScopeFingerprint = nextFingerprint/.test(src),
 		"effective Markdown scope changes increment generation before publishing the fingerprint",
-	);
-	assert(
-		src.includes("this.reconciliationController.beginExternalDiskMutationProbe({") &&
-			src.indexOf("this.reconciliationController.beginExternalDiskMutationProbe({") <
-			src.indexOf("editorBindingsAtEvent.beginExternalDiskMutation(file.path, sequence)"),
-		"main captures exact modify-event authority synchronously before the editor probe",
-	);
-	assert(
-		src.includes("const probe = await dm.probeExactObservedDiskRevision(") &&
-			src.includes('probe.kind === "stale" || probe.kind === "unavailable"'),
-		"both external and recent-KAOS attribution paths retain rich exact-probe disposition",
-	);
-	assert(
-		src.includes("this.reconciliationController.noteExternalDiskMutationProbeDisposition({") &&
-			src.includes('disposition: "unavailable",'),
-		"normal and exceptional probe failures transfer exact event ownership to the controller",
 	);
 }
 
@@ -8145,378 +5824,6 @@ console.log("\n--- Test 10: unstable stable-read does not import partial content
 	assertEq(dirty?.retryCount, 1, "unstable read requeues with retryCount=1");
 	assertEq(Object.keys(fix.diskIndex).length, 0, "unstable read does not advance disk index");
 	clearMarkdownDrainTimer(fix.controller);
-}
-
-console.log("\n--- Test 10b: exhausted stable-read becomes durable Attention and exact settlement clears it ---");
-{
-	const diskDuringWriterChurn = "external writer partial bytes";
-	const settledContent = "unchanged CRDT authority";
-	const fix = buildUnboundIngestFixture({
-		path: "Notes/stable-read-exhausted.md",
-		disk: diskDuringWriterChurn,
-		crdt: settledContent,
-	});
-	let readAttempts = 0;
-	fix.setStableReader(async () => {
-		readAttempts++;
-		return { kind: "unstable" };
-	});
-
-	await exhaustUnstableMarkdownReadRetries(fix);
-
-	assertEq(readAttempts, 4, "initial stable-read plus three retries are attempted exactly once each");
-	assertEq(fix.ytext.toString(), settledContent, "retry exhaustion never mutates CRDT authority");
-	assertEq(Object.keys(fix.diskIndex).length, 0, "retry exhaustion never advances the disk baseline");
-	assertEq(
-		fix.getPreservedEntries()[0]?.reason,
-		"external-disk-read-unavailable",
-		"retry exhaustion publishes an explicit durable Attention reason",
-	);
-	const ownedEpisodeId = fix.getPreservedEntries()[0]?.episodeId;
-	assert(typeof ownedEpisodeId === "string", "retry exhaustion owns one exact Attention episode");
-
-	fix.setDiskContent(settledContent);
-	fix.setStableReader(async () => ({
-		kind: "ready",
-		file: fix.file,
-		content: settledContent,
-		stat: { mtime: 9, size: settledContent.length },
-	}));
-	fix.controller.markMarkdownDirty(fix.file, "modify", "op-stable-after-exhaustion");
-	await drainQueuedMarkdown(fix.controller);
-
-	assertEq(fix.ytext.toString(), settledContent, "stable retry settlement preserves equal CRDT bytes");
-	assertEq(fix.diskIndex[fix.path]?.mtime, 9, "stable retry settlement durably advances the baseline");
-	assertEq(fix.getPreservedClearCount(), 1, "durable settlement clears the owned Attention once");
-	assertEq(fix.getPreservedEntries().length, 0, "owned exhausted-read Attention is retired");
-}
-
-console.log("\n--- Test 10b2: failed Attention persistence retries only terminalization with bounded backoff ---");
-{
-	const settledContent = "durable Attention recovery authority";
-	const fix = buildUnboundIngestFixture({
-		path: "Notes/stable-read-attention-persist-retry.md",
-		disk: "external writer partial bytes",
-		crdt: settledContent,
-	});
-	let stableReadAttempts = 0;
-	fix.setStableReader(async () => {
-		stableReadAttempts++;
-		return { kind: "unstable" };
-	});
-	fix.setAttentionPersistenceFailure(true);
-
-	await exhaustUnstableMarkdownReadRetries(fix);
-
-	const episodeId = fix.getPreservedEntries()[0]?.episodeId;
-	const pendingPersistence = getDirtyMarkdownEntry(fix.controller, fix.path);
-	assert(typeof episodeId === "string", "persistence failure retains the exact in-memory episode");
-	assertEq(fix.getAttentionPersistenceCalls(), 1, "terminalization awaits the first durable save attempt");
-	assertEq(stableReadAttempts, 4, "persistence failure occurs only after the bounded stable-read attempts");
-	assertEq(
-		pendingPersistence?.externalReadAttentionEpisodeIdPendingPersistence,
-		episodeId,
-		"failed durable save queues the exact episode for persistence only",
-	);
-	const firstRetryDelay = (pendingPersistence?.notBeforeMs ?? 0) - Date.now();
-	assert(
-		firstRetryDelay > 0 && firstRetryDelay <= 30_000,
-		"Attention persistence retry uses a positive bounded backoff",
-	);
-
-	// A newer real file event must not erase the pending durable owner. It is
-	// carried as a follow-up ingest and runs only after the Attention save lands.
-	fix.setDiskContent(settledContent);
-	fix.controller.markMarkdownDirty(fix.file, "modify", "op-newer-during-attention-persist");
-	clearMarkdownDrainTimer(fix.controller);
-	const merged = getDirtyMarkdownEntry(fix.controller, fix.path);
-	assertEq(
-		merged?.externalReadAttentionEpisodeIdPendingPersistence,
-		episodeId,
-		"new modify inherits the exact pending persistence episode",
-	);
-	assert(
-		merged?.externalReadAttentionNeedsFollowupIngest === true,
-		"new modify is retained as a post-persistence follow-up ingest",
-	);
-	if (merged) merged.notBeforeMs = 0;
-
-	fix.setAttentionPersistenceFailure(false);
-	fix.setStableReader(async () => {
-		stableReadAttempts++;
-		return {
-			kind: "ready",
-			file: fix.file,
-			content: settledContent,
-			stat: { mtime: 11, size: settledContent.length },
-		};
-	});
-	await drainQueuedMarkdown(fix.controller);
-
-	assertEq(fix.getAttentionPersistenceCalls(), 2, "terminal-only retry awaits the durable save successfully");
-	assertEq(stableReadAttempts, 4, "terminal-only retry does not repeat any file read");
-	const followup = getDirtyMarkdownEntry(fix.controller, fix.path);
-	assert(
-		followup !== undefined
-			&& followup.externalReadAttentionEpisodeIdPendingPersistence === undefined,
-		"successful persistence releases the newer modify into the ordinary ingest lane",
-	);
-
-	await drainQueuedMarkdown(fix.controller);
-	assertEq(stableReadAttempts, 5, "the retained newer modify performs one later stable read");
-	assertEq(fix.diskIndex[fix.path]?.mtime, 11, "follow-up ingest reaches the durable baseline");
-	assertEq(fix.getPreservedEntries().length, 0, "follow-up settlement clears the exact persisted episode");
-}
-
-console.log("\n--- Test 10b2a: modify during failed Attention save retains terminal ownership ---");
-{
-	const settledContent = "in-flight persistence replacement authority";
-	const fix = buildUnboundIngestFixture({
-		path: "Notes/stable-read-attention-inflight-modify.md",
-		disk: "external writer partial bytes",
-		crdt: settledContent,
-	});
-	let stableReadAttempts = 0;
-	fix.setStableReader(async () => {
-		stableReadAttempts++;
-		return { kind: "unstable" };
-	});
-	let markPersistenceStarted!: () => void;
-	const persistenceStarted = new Promise<void>((resolve) => {
-		markPersistenceStarted = resolve;
-	});
-	let releasePersistence!: () => void;
-	const persistenceGate = new Promise<void>((resolve) => {
-		releasePersistence = resolve;
-	});
-	fix.setAttentionPersistenceHook(async () => {
-		markPersistenceStarted();
-		await persistenceGate;
-	});
-	fix.setAttentionPersistenceFailure(true);
-
-	const exhausting = exhaustUnstableMarkdownReadRetries(fix);
-	await persistenceStarted;
-	const episodeId = fix.getPreservedEntries()[0]?.episodeId;
-	fix.setDiskContent(settledContent);
-	fix.controller.markMarkdownDirty(fix.file, "modify", "op-during-attention-save");
-	releasePersistence();
-	await exhausting;
-
-	const pending = getDirtyMarkdownEntry(fix.controller, fix.path);
-	assertEq(stableReadAttempts, 4, "in-flight modify does not restart the exhausted read loop");
-	assertEq(
-		pending?.externalReadAttentionEpisodeIdPendingPersistence,
-		episodeId,
-		"failed in-flight save transfers the exact terminal owner to replacement work",
-	);
-	assert(
-		pending?.externalReadAttentionNeedsFollowupIngest === true,
-		"replacement modify remains queued behind the transferred terminal owner",
-	);
-	clearMarkdownDrainTimer(fix.controller);
-	fix.controller.reset();
-}
-
-console.log("\n--- Test 10b3: pending Attention persistence is CAS-fenced across reset, replacement, and rename ---");
-{
-	async function makePendingPersistenceFixture(label: string): Promise<{
-		fix: UnboundIngestFixture;
-		getStableReadAttempts(): number;
-	}> {
-		const fix = buildUnboundIngestFixture({
-			path: `Notes/stable-read-persist-${label}.md`,
-			disk: `${label} external partial bytes`,
-			crdt: `${label} CRDT authority`,
-		});
-		let stableReadAttempts = 0;
-		fix.setStableReader(async () => {
-			stableReadAttempts++;
-			return { kind: "unstable" };
-		});
-		fix.setAttentionPersistenceFailure(true);
-		await exhaustUnstableMarkdownReadRetries(fix);
-		return { fix, getStableReadAttempts: () => stableReadAttempts };
-	}
-
-	{
-		const { fix, getStableReadAttempts } = await makePendingPersistenceFixture("reset");
-		assert(
-			getDirtyMarkdownEntry(fix.controller, fix.path)
-				?.externalReadAttentionEpisodeIdPendingPersistence !== undefined,
-			"reset case begins with one pending persistence owner",
-		);
-		fix.controller.reset();
-		fix.setAttentionPersistenceFailure(false);
-		await drainQueuedMarkdown(fix.controller);
-		assertEq(fix.getAttentionPersistenceCalls(), 1, "reset retires the stale persistence retry");
-		assertEq(getStableReadAttempts(), 4, "reset cannot revive stale file reads");
-	}
-
-	{
-		const { fix, getStableReadAttempts } = await makePendingPersistenceFixture("replacement");
-		fix.setPreservedUnresolved(true, "path-collision", "manual-newer-persist-episode");
-		const pending = getDirtyMarkdownEntry(fix.controller, fix.path);
-		if (pending) pending.notBeforeMs = 0;
-		fix.setAttentionPersistenceFailure(false);
-		await drainQueuedMarkdown(fix.controller);
-		assertEq(
-			fix.getAttentionPersistenceCalls(),
-			1,
-			"replacement episode invalidates the older persistence call before I/O",
-		);
-		assertEq(fix.getPreservedClearCount(), 0, "stale persistence retry never clears replacement Attention");
-		assertEq(
-			fix.getPreservedEntries()[0]?.episodeId,
-			"manual-newer-persist-episode",
-			"replacement Attention survives pending terminalization",
-		);
-		assertEq(getStableReadAttempts(), 4, "replacement invalidation performs no extra file read");
-	}
-
-	{
-		const { fix, getStableReadAttempts } = await makePendingPersistenceFixture("rename");
-		const renamedPath = "Notes/stable-read-persist-renamed.md";
-		const pendingEpisodeId = fix.getPreservedEntries()[0]?.episodeId;
-		fix.setCrdtPath(renamedPath);
-		fix.setFilePath(renamedPath);
-		fix.controller.redirectPendingDirtyPath(fix.path, renamedPath);
-		const redirectedPending = getDirtyMarkdownEntry(fix.controller, renamedPath);
-		assertEq(
-			redirectedPending?.externalReadAttentionEpisodeIdPendingPersistence,
-			pendingEpisodeId,
-			"rename redirects the exact pending persistence owner",
-		);
-		if (redirectedPending) redirectedPending.notBeforeMs = 0;
-		fix.setAttentionPersistenceFailure(false);
-		await drainQueuedMarkdown(fix.controller);
-		assertEq(fix.getAttentionPersistenceCalls(), 2, "renamed episode reaches durable persistence once");
-		assertEq(getStableReadAttempts(), 4, "rename terminalization performs no repeated file read");
-		assertEq(fix.getPreservedEntries()[0]?.path, renamedPath, "Attention ownership follows the rename");
-		assertEq(fix.getPreservedEntries()[0]?.episodeId, pendingEpisodeId, "rename preserves exact episode identity");
-		fix.controller.reset();
-	}
-}
-
-console.log("\n--- Test 10c: replacement Attention survives an older exhausted-read settlement ---");
-{
-	const settledContent = "stable local authority";
-	const fix = buildUnboundIngestFixture({
-		path: "Notes/stable-read-replacement-attention.md",
-		disk: "external writer still changing",
-		crdt: settledContent,
-	});
-	fix.setStableReader(async () => ({ kind: "unstable" }));
-	await exhaustUnstableMarkdownReadRetries(fix);
-	const exhaustedEpisodeId = fix.getPreservedEntries()[0]?.episodeId;
-	assert(typeof exhaustedEpisodeId === "string", "older exhausted-read episode is established");
-
-	fix.setDiskContent(settledContent);
-	fix.controller.markMarkdownDirty(fix.file, "modify", "op-stable-before-replacement");
-	fix.setStableReader(async () => {
-		fix.setPreservedUnresolved(true, "path-collision", "manual-replacement-episode");
-		return {
-			kind: "ready",
-			file: fix.file,
-			content: settledContent,
-			stat: { mtime: 10, size: settledContent.length },
-		};
-	});
-	await drainQueuedMarkdown(fix.controller);
-
-	assertEq(fix.getPreservedClearCount(), 0, "older stable work cannot clear replacement Attention");
-	assertEq(
-		fix.getPreservedEntries()[0]?.episodeId,
-		"manual-replacement-episode",
-		"replacement Attention episode remains exact",
-	);
-	assertEq(fix.getPreservedEntries()[0]?.reason, "path-collision", "replacement reason is preserved");
-	assertEq(Object.keys(fix.diskIndex).length, 0, "stale settlement cannot advance the baseline");
-	clearMarkdownDrainTimer(fix.controller);
-}
-
-console.log("\n--- Test 10d: invalidated final stable-read cannot publish stale Attention ---");
-{
-	const cases: Array<{
-		label: string;
-		path: string;
-		retryCount?: number;
-		invalidate: (fix: UnboundIngestFixture) => void;
-	}> = [
-		{
-			label: "rename",
-			path: "Notes/stable-read-final-rename.md",
-			invalidate: (fix) => {
-				const renamed = "Notes/stable-read-final-renamed.md";
-				fix.setCrdtPath(renamed);
-				fix.setFilePath(renamed);
-				fix.controller.redirectPendingDirtyPath(fix.path, renamed);
-			},
-		},
-		{
-			label: "delete",
-			path: "Notes/stable-read-final-delete.md",
-			invalidate: (fix) => {
-				fix.controller.noteMarkdownDiskMutation(fix.path);
-				fix.controller.dropDirtyPath(fix.path);
-			},
-		},
-		{
-			label: "reset",
-			path: "Notes/stable-read-final-reset.md",
-			invalidate: (fix) => fix.controller.reset(),
-		},
-		{
-			label: "generation",
-			path: "Notes/stable-read-final-generation.md",
-			invalidate: (fix) => {
-				(fix.controller as never as {
-					bumpMarkdownIngestGeneration(path: string): number;
-				}).bumpMarkdownIngestGeneration(fix.path);
-			},
-		},
-		{
-			label: "lifecycle generation",
-			path: "Notes/stable-read-final-lifecycle-generation.md",
-			retryCount: 0,
-			invalidate: (fix) => fix.controller.revokeAsyncAuthority(),
-		},
-	];
-
-	for (const testCase of cases) {
-		const fix = buildUnboundIngestFixture({
-			path: testCase.path,
-			disk: `${testCase.label} writer bytes`,
-			crdt: `${testCase.label} CRDT authority`,
-		});
-		let releaseRead!: () => void;
-		const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
-		let markReadStarted!: () => void;
-		const readStarted = new Promise<void>((resolve) => { markReadStarted = resolve; });
-		fix.setStableReader(async () => {
-			markReadStarted();
-			await readGate;
-			return { kind: "unstable" };
-		});
-
-		const staleFinalRead = fix.processDirty(
-			fix.path,
-			"modify",
-			testCase.retryCount ?? 3,
-		);
-		await readStarted;
-		testCase.invalidate(fix);
-		releaseRead();
-		await staleFinalRead;
-
-		assertEq(
-			fix.getPreservedEntries().length,
-			0,
-			`${testCase.label}: invalidated final read cannot publish an Attention episode`,
-		);
-		clearMarkdownDrainTimer(fix.controller);
-		fix.controller.reset();
-	}
 }
 
 console.log("\n--- Test 11: delayed stable-read imports final complete content ---");

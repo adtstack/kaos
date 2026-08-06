@@ -573,8 +573,6 @@ export interface BlobQueueSnapshot {
 		status?: "pending" | "processing";
 		readyAt?: number;
 		attentionResolution?: BlobKeepLocalUploadResolution;
-		/** Re-capture the causal base only after the durable settlement stage retires. */
-		deferredUntilSettlement?: true;
 		needsRerun?: boolean;
 		rerunResets?: number;
 	}[];
@@ -606,11 +604,6 @@ export class BlobSyncManager {
 
 	/** Debounce timers for upload scheduling (keyed by path). */
 	private uploadDebounce = new Map<string, ReturnType<typeof setTimeout>>();
-	/** Local modify events observed while download-owned settlement is active. */
-	private deferredUploadsAfterSettlement = new Map<
-		string,
-		{ sizeBytes?: number }
-	>();
 
 	/** Paths currently uploading. */
 	private inflightUploads = new Set<string>();
@@ -869,7 +862,6 @@ export class BlobSyncManager {
 			delete this.settlementStages[normalized];
 			this.recordSettledRef(normalized, ref);
 		}
-		this.flushDeferredUploadAfterSettlement(normalized);
 		const finalRef = cloneBlobRef(this.vaultSync.getBlobRef?.(normalized));
 		const finalSourceVersion = this.vaultSync.getBlobSourceVersion?.(normalized);
 		return sameBlobRef(finalRef, ref)
@@ -905,7 +897,6 @@ export class BlobSyncManager {
 		} else if (this.settlementStages[normalized]?.stageId === stage.stageId) {
 			delete this.settlementStages[normalized];
 		}
-		this.flushDeferredUploadAfterSettlement(normalized);
 	}
 
 	// -------------------------------------------------------------------
@@ -1075,26 +1066,11 @@ export class BlobSyncManager {
 			// commit must survive as a fail-closed rerun. It cannot recapture a
 			// base while the pre-commit stage masks settlement authority.
 			if (
-				(activeStage.kind === "upload" || activeStage.kind === "equality")
+				activeStage.kind === "upload"
 				&& existing?.status === "processing"
 			) {
 				existing.needsRerun = true;
 				if (sizeBytes && sizeBytes > 0) existing.sizeBytes = sizeBytes;
-			} else if (activeStage.kind === "download" || activeStage.kind === "equality") {
-				// This marker supersedes any not-yet-processing upload whose causal base
-				// was captured before the active settlement stage.
-				if (existing) this.uploadQueue.delete(path);
-				const deferred = this.deferredUploadsAfterSettlement.get(normalized);
-				this.deferredUploadsAfterSettlement.set(normalized, {
-					sizeBytes: sizeBytes && sizeBytes > 0
-						? sizeBytes
-						: deferred?.sizeBytes,
-				});
-				this.trace?.("blob", "upload-deferred-settlement", {
-					path: normalized,
-					stageId: activeStage.stageId,
-					sizeBytes: sizeBytes ?? null,
-				});
 			}
 			return;
 		}
@@ -1138,35 +1114,6 @@ export class BlobSyncManager {
 			attentionResolution,
 			rerunResets: 0,
 		});
-	}
-
-	private flushDeferredUploadAfterSettlement(path: string): void {
-		const normalized = normalizePath(path);
-		if (this.settlementStages[normalized]) return;
-		const deferred = this.deferredUploadsAfterSettlement.get(normalized);
-		if (!deferred) return;
-		this.deferredUploadsAfterSettlement.delete(normalized);
-		if (this.destroyed) return;
-
-		const current = this.app.vault.getAbstractFileByPath(normalized);
-		if (!(current instanceof TFile)) {
-			this.trace?.("blob", "deferred-upload-dropped-after-settlement", {
-				path: normalized,
-				reason: "path-no-longer-file",
-			});
-			return;
-		}
-
-		this.trace?.("blob", "deferred-upload-admitted-after-settlement", {
-			path: normalized,
-			sizeBytes: current.stat.size ?? deferred.sizeBytes ?? null,
-		});
-		this.enqueueUpload(
-			normalized,
-			0,
-			current.stat.size ?? deferred.sizeBytes,
-		);
-		this.kickUploadDrain();
 	}
 
 	private enqueueDownload(
@@ -1278,7 +1225,6 @@ export class BlobSyncManager {
 				}
 			}
 		}
-		this.deferredUploadsAfterSettlement?.delete(normalized);
 		if (this.downloadQueue) {
 			for (const queuedPath of this.downloadQueue.keys()) {
 				if (normalizePath(queuedPath) === normalized) {
@@ -6385,9 +6331,7 @@ export class BlobSyncManager {
 	// -------------------------------------------------------------------
 
 	get pendingUploads(): number {
-		return this.uploadQueue.size
-			+ this.uploadDebounce.size
-			+ this.deferredUploadsAfterSettlement.size;
+		return this.uploadQueue.size + this.uploadDebounce.size;
 	}
 
 	get pendingDownloads(): number {
@@ -6404,7 +6348,6 @@ export class BlobSyncManager {
 		const upPending =
 			this.pendingUploadCount() +
 			this.uploadDebounce.size +
-			this.deferredUploadsAfterSettlement.size +
 			this.inflightUploads.size;
 		if (upPending > 0) {
 			parts.push(
@@ -6448,33 +6391,8 @@ export class BlobSyncManager {
 	 * Processing items are restored as pending on load.
 	 */
 	exportQueue(): BlobQueueSnapshot {
-		const deferredUploadsForSnapshot = new Map(
-			this.deferredUploadsAfterSettlement,
-		);
-		// A watcher event can still be waiting in debounce when a remote
-		// download/equality stage starts. If retirement happens before that timer
-		// fires, serialize the event with the same authority-free marker that
-		// enqueueUpload() would have produced behind the stage.
-		for (const [path] of this.uploadDebounce) {
-			const normalized = normalizePath(path);
-			const activeStage = this.settlementStages[normalized];
-			if (activeStage?.kind !== "download" && activeStage?.kind !== "equality") {
-				continue;
-			}
-			const current = this.app.vault.getAbstractFileByPath(normalized);
-			const existing = deferredUploadsForSnapshot.get(normalized);
-			deferredUploadsForSnapshot.set(normalized, {
-				sizeBytes: current instanceof TFile
-					? current.stat.size
-					: existing?.sizeBytes,
-			});
-		}
-
 		const uploads: BlobQueueSnapshot["uploads"] = [];
 		for (const [, item] of this.uploadQueue) {
-			if (deferredUploadsForSnapshot.has(normalizePath(item.path))) {
-				continue;
-			}
 			uploads.push({
 				path: item.path,
 				sizeBytes: item.sizeBytes,
@@ -6492,10 +6410,7 @@ export class BlobSyncManager {
 		}
 		// Also include items in debounce (not yet in queue but pending)
 		for (const [path] of this.uploadDebounce) {
-			if (
-				!this.uploadQueue.has(path)
-				&& !deferredUploadsForSnapshot.has(normalizePath(path))
-			) {
+			if (!this.uploadQueue.has(path)) {
 				const uploadBase = this.captureUploadBase(path);
 				uploads.push({
 					path,
@@ -6509,21 +6424,6 @@ export class BlobSyncManager {
 					rerunResets: 0,
 				});
 			}
-		}
-		// A modify observed while download-owned settlement is active cannot yet
-		// capture a trustworthy causal base. Persist an explicit marker so
-		// stop/refresh/restart transfers the intent without borrowing stale authority.
-		for (const [path, deferred] of deferredUploadsForSnapshot) {
-			uploads.push({
-				path,
-				sizeBytes: deferred.sizeBytes,
-				baseRefKnown: false,
-				retries: 0,
-				status: "pending",
-				readyAt: 0,
-				deferredUntilSettlement: true,
-				rerunResets: 0,
-			});
 		}
 
 		const downloads: BlobQueueSnapshot["downloads"] = [];
@@ -6559,22 +6459,11 @@ export class BlobSyncManager {
 	importQueue(snapshot: BlobQueueSnapshot): void {
 		let restored = 0;
 		let skipped = 0;
-		const importedDeferredPaths = new Set<string>();
 
 		if (snapshot.uploads) {
 			for (const item of snapshot.uploads) {
 				if (!this.isBlobPathSyncable(item.path)) {
 					skipped++;
-					continue;
-				}
-				if (item.deferredUntilSettlement === true) {
-					const normalized = normalizePath(item.path);
-					const existing = this.deferredUploadsAfterSettlement.get(normalized);
-					this.deferredUploadsAfterSettlement.set(normalized, {
-						sizeBytes: item.sizeBytes ?? existing?.sizeBytes,
-					});
-					importedDeferredPaths.add(normalized);
-					restored++;
 					continue;
 				}
 				if (!hasValidUploadBaseSourceVersion(item)) {
@@ -6663,10 +6552,6 @@ export class BlobSyncManager {
 					restored++;
 				}
 			}
-		}
-
-		for (const path of importedDeferredPaths) {
-			this.flushDeferredUploadAfterSettlement(path);
 		}
 
 		if (restored > 0) {
@@ -6765,7 +6650,6 @@ export class BlobSyncManager {
 			clearTimeout(timer);
 		}
 		this.uploadDebounce.clear();
-		this.deferredUploadsAfterSettlement.clear();
 		for (const timer of this.retryTimers.values()) {
 			clearTimeout(timer);
 		}

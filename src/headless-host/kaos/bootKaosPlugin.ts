@@ -7,7 +7,6 @@ import type { Plugin } from "../core/plugin";
 import { bootHeadlessPlugin, type HeadlessPluginConstructor } from "../core/pluginHost";
 import * as codeMirrorStateShim from "../codeMirrorStateShim";
 import * as codeMirrorViewShim from "../codeMirrorViewShim";
-import * as codeMirrorCommandsShim from "../codeMirrorCommandsShim";
 import * as obsidianShim from "../obsidianShim";
 import { installHeadlessHostPolyfills } from "../polyfills";
 
@@ -126,7 +125,6 @@ async function loadPluginMain(pluginMainPath: string): Promise<HeadlessPluginCon
 		if (request === "obsidian") return obsidianShim;
 		if (request === "@codemirror/state") return codeMirrorStateShim;
 		if (request === "@codemirror/view") return codeMirrorViewShim;
-		if (request === "@codemirror/commands") return codeMirrorCommandsShim;
 		if (request === "electron") return electronShim;
 		try {
 			return originalRequire(request);

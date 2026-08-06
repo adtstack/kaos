@@ -19,8 +19,6 @@ const APPROVED_ENSURE_FILE_WRITERS = Object.freeze([
 	["src/runtime/reconciliationController.ts", "syncFileFromDisk", "closed-file-missing-crdt-admission", 1],
 	["src/runtime/reconciliationController.ts", "resolvePreservedUnresolvedFromFreshDiskEvent", "fresh-disk-recovery-admission", 1],
 	["src/runtime/reconciliationController.ts", "handleBoundFileSyncGap", "controller-certified-open-path-admission", 1],
-	["src/runtime/reconciliationController.ts", "commitMissingTargetSeed", "one-shot-open-path-seed-permit", 1],
-	["src/runtime/reconciliationController.ts", "commitSamePathAdoptionSeed", "one-shot-same-path-adoption-seed", 1],
 	["qa/harness/qaDebugApi.ts", "__qaOnlyForceCrdtContentUnsafe", "explicit-qa-force-route", 1],
 ]);
 
@@ -32,8 +30,6 @@ const REQUIRED_SOURCE_MARKERS = Object.freeze(new Map([
 	["closed-file-missing-crdt-admission", "commitClosedFileReconcileMutation"],
 	["fresh-disk-recovery-admission", "episodeIsCurrent"],
 	["controller-certified-open-path-admission", "captureOpenEditorMutationTicket"],
-	["one-shot-open-path-seed-permit", "consumeSeedPermit"],
-	["one-shot-same-path-adoption-seed", "consumeSamePathAdoptionSeedPermit"],
 	["explicit-qa-force-route", "__KAOS_QA_HARNESS_ENABLED__"],
 ]));
 
@@ -45,8 +41,6 @@ const APPROVED_WRITER_OWNER_PATHS = Object.freeze(new Map([
 	["closed-file-missing-crdt-admission", "ReconciliationController.syncFileFromDisk.commit[stage=\"open-unbound-disk-seed\"].withActiveOpId#arg1"],
 	["fresh-disk-recovery-admission", "ReconciliationController.resolvePreservedUnresolvedFromFreshDiskEvent.commit[stage=\"preserved-unresolved-fresh-local-event\"].withActiveOpId#arg1[branch=else]"],
 	["controller-certified-open-path-admission", "ReconciliationController.handleBoundFileSyncGap.commitMutation#arg2[arg0=\"bound-file-local-only-seed\"][branch=else][branch=then]"],
-	["one-shot-open-path-seed-permit", "ReconciliationController.commitMissingTargetSeed"],
-	["one-shot-same-path-adoption-seed", "ReconciliationController.commitSamePathAdoptionSeed"],
 	["explicit-qa-force-route", "buildQaDebugApi.api.__qaOnlyForceCrdtContentUnsafe"],
 ]));
 
@@ -58,8 +52,6 @@ const REQUIRED_MARKER_OWNER_PATHS = Object.freeze(new Map([
 	["closed-file-missing-crdt-admission", "ReconciliationController.syncFileFromDisk"],
 	["fresh-disk-recovery-admission", "ReconciliationController.resolvePreservedUnresolvedFromFreshDiskEvent"],
 	["controller-certified-open-path-admission", "ReconciliationController.handleBoundFileSyncGap"],
-	["one-shot-open-path-seed-permit", "ReconciliationController.commitMissingTargetSeed"],
-	["one-shot-same-path-adoption-seed", "ReconciliationController.commitSamePathAdoptionSeed"],
 	["explicit-qa-force-route", "buildQaDebugApi.api.__qaOnlyForceCrdtContentUnsafe"],
 ]));
 

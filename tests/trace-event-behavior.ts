@@ -69,11 +69,6 @@ function makeMarkdownDeleteEpisode(path: string) {
 	};
 }
 
-const CLOSED_PATH_EDITOR_AUTHORITY = {
-	capturePathEditorAuthority: () => ({ kind: "none" as const }),
-	isPathEditorAuthorityLeaseCurrent: () => false,
-};
-
 const BASE_SCOPE: ScopeKey & ScopeMetadata = {
 	vaultIdHash: "vault-hash",
 	serverHostHash: "host-hash",
@@ -150,7 +145,6 @@ function makeSuppressionMirror(
 		isFileMetaDeleted: () => false,
 	} as any;
 	const editorBindings = {
-		...CLOSED_PATH_EDITOR_AUTHORITY,
 		getLastEditorActivityForPath: () => null,
 	} as any;
 	return new DiskMirror(app, vaultSync, editorBindings, false, captureTrace(events));
@@ -186,45 +180,6 @@ console.log("\n--- Test 4: suppression mismatch trace fires from changed file st
 	assert(!suppressed, "changed observed state does not suppress modify event");
 	assert(!!mismatch, "changed observed state emits suppression-mismatch");
 	assert(mismatch?.details?.reason === "size-mismatch", "suppression mismatch includes reason");
-}
-
-console.log("\n--- Test 4a: same-path adoption holds projection before Y.Text read ---");
-{
-	const mirror = makeSuppressionMirror(() => "disk", []);
-	mirror.setSamePathAdoptionProjectionHoldPredicate(() => true);
-	const held = await mirror.flushWrite("Notes/adoption-held.md", true);
-	assert(
-		held.kind === "deferred" && held.reason === "same-path-adoption-active",
-		"ordinary forced projection is held while adoption is active",
-	);
-	const exactSettlement = await mirror.flushWrite("Notes/adoption-held.md", true, {
-		isSamePathAdoptionSettlementCurrent: () => true,
-	});
-	assert(
-		exactSettlement.kind === "deferred" && exactSettlement.reason === "missing-ytext",
-		"the exact settlement capability crosses only the adoption hold",
-	);
-}
-
-console.log("\n--- Test 4a2: queued projection rechecks the hold under the path lock ---");
-{
-	const mirror = makeSuppressionMirror(() => "disk", []);
-	let held = false;
-	mirror.setSamePathAdoptionProjectionHoldPredicate(() => held);
-	let release!: () => void;
-	const gate = new Promise<void>((resolve) => { release = resolve; });
-	const blocker = (mirror as unknown as {
-		runPathWriteLocked(path: string, work: () => Promise<void>): Promise<void>;
-	}).runPathWriteLocked("Notes/queued-adoption.md", () => gate);
-	const queued = mirror.flushWrite("Notes/queued-adoption.md", true);
-	held = true;
-	release();
-	await blocker;
-	const result = await queued;
-	assert(
-		result.kind === "deferred" && result.reason === "same-path-adoption-active",
-		"work admitted before adoption cannot cross the later under-lock hold",
-	);
 }
 
 console.log("\n--- Test 4b: recent self-write fingerprint probe is exact and non-consuming ---");
@@ -291,7 +246,7 @@ console.log("\n--- Test 4c: fingerprint proof cannot cross a file revision chang
 	releaseRead?.();
 
 	assert(
-		(await probe).kind === "stale",
+		(await probe).kind === "stale-or-unreadable",
 		"later same-size bytes cannot prove that the older modify event was a self-write",
 	);
 	assert(
@@ -372,7 +327,6 @@ console.log("\n--- Test 5: diskMirror remote delete emits trace with deleteMode 
 		...deleteEpisode.vaultSyncFields,
 	} as any;
 	const editorBindings = {
-		...CLOSED_PATH_EDITOR_AUTHORITY,
 		getLastEditorActivityForPath: () => null,
 		isBound: () => false,
 		unbindByPath: () => {},
@@ -434,7 +388,6 @@ console.log("\n--- Test 6: diskMirror remote delete falls back to recoverable va
 		...deleteEpisode.vaultSyncFields,
 	} as any;
 	const editorBindings = {
-		...CLOSED_PATH_EDITOR_AUTHORITY,
 		getLastEditorActivityForPath: () => null,
 		isBound: () => false,
 		unbindByPath: () => {},
@@ -496,7 +449,6 @@ console.log("\n--- Test 7: diskMirror remote delete preserves locally modified m
 		...deleteEpisode.vaultSyncFields,
 	} as any;
 	const editorBindings = {
-		...CLOSED_PATH_EDITOR_AUTHORITY,
 		getLastEditorActivityForPath: () => null,
 		isBound: () => false,
 		unbindByPath: () => {},
@@ -558,7 +510,6 @@ console.log("\n--- Test 8: diskMirror remote delete proceeds when content matche
 		...deleteEpisode.vaultSyncFields,
 	} as any;
 	const editorBindings = {
-		...CLOSED_PATH_EDITOR_AUTHORITY,
 		getLastEditorActivityForPath: () => null,
 		isBound: () => false,
 		unbindByPath: () => {},
@@ -612,7 +563,6 @@ console.log("\n--- Test 9: diskMirror remote delete preserves when CRDT unavaila
 		...deleteEpisode.vaultSyncFields,
 	} as any;
 	const editorBindings = {
-		...CLOSED_PATH_EDITOR_AUTHORITY,
 		getLastEditorActivityForPath: () => null,
 		isBound: () => false,
 		unbindByPath: () => {},
@@ -674,7 +624,6 @@ console.log("\n--- Test 10: diskMirror remote delete suppression fires before de
 		...deleteEpisode.vaultSyncFields,
 	} as any;
 	const editorBindings = {
-		...CLOSED_PATH_EDITOR_AUTHORITY,
 		getLastEditorActivityForPath: () => null,
 		isBound: () => false,
 		unbindByPath: () => {},
@@ -740,7 +689,6 @@ console.log("\n--- Test 11: diskMirror preserves when all recoverable trash mech
 		...deleteEpisode.vaultSyncFields,
 	} as any;
 	const editorBindings = {
-		...CLOSED_PATH_EDITOR_AUTHORITY,
 		getLastEditorActivityForPath: () => null,
 		isBound: () => false,
 		unbindByPath: () => {},
@@ -811,7 +759,6 @@ console.log("\n--- Test 12: known-dirty remote delete revives tombstone (no loop
 		...deleteEpisode.vaultSyncFields,
 	} as any;
 	const editorBindings = {
-		...CLOSED_PATH_EDITOR_AUTHORITY,
 		getLastEditorActivityForPath: () => null,
 		isBound: () => false,
 		unbindByPath: () => {},
@@ -852,7 +799,6 @@ console.log("\n--- Test 12b: remote delete preserves unsaved open editor content
 	const crdtContent = "old baseline";
 	const diskContent = crdtContent;
 	const editorContent = "typed but not autosaved yet";
-	const editorAuthorityLease = { leaseId: "trace-unsaved-open-editor" };
 	let activeContent = crdtContent;
 	const activeText = { toString: () => activeContent, toJSON: () => activeContent };
 	const deleteEpisode = makeMarkdownDeleteEpisode(path);
@@ -896,14 +842,6 @@ console.log("\n--- Test 12b: remote delete preserves unsaved open editor content
 		...deleteEpisode.vaultSyncFields,
 	} as any;
 	const editorBindings = {
-		capturePathEditorAuthority: (candidatePath: string) => candidatePath === path
-			? {
-				kind: "proven-single" as const,
-				content: editorContent,
-				lease: editorAuthorityLease,
-			}
-			: { kind: "none" as const },
-		isPathEditorAuthorityLeaseCurrent: (lease: unknown) => lease === editorAuthorityLease,
 		getLastEditorActivityForPath: () => Date.now(),
 		isBound: () => true,
 		unbindByPath: () => {},
@@ -967,12 +905,11 @@ console.log("\n--- Test 13: unknown-baseline remote delete does NOT revive tombs
 		isFileMetaDeleted: () => false,
 		ensureFile: () => {
 			ensureFileCalled = true;
-			return {};
+			return { kind: "blocked" as const, reason: "tombstone" as const };
 		},
 		...deleteEpisode.vaultSyncFields,
 	} as any;
 	const editorBindings = {
-		...CLOSED_PATH_EDITOR_AUTHORITY,
 		getLastEditorActivityForPath: () => null,
 		isBound: () => false,
 		unbindByPath: () => {},
@@ -1055,7 +992,6 @@ console.log("\n--- Test 5: Multi-pass: unknown-baseline preserved file is NOT re
 	} as any;
 
 	const editorBindings = {
-		...CLOSED_PATH_EDITOR_AUTHORITY,
 		getLastEditorActivityForPath: () => null,
 		isBound: () => false,
 		unbindByPath: () => {},
@@ -1177,11 +1113,10 @@ console.log("\n--- Test 6: Multi-pass: read-failure during remote-delete becomes
 		// CRDT HAS a baseline — but read will fail
 		getTextForPath: () => ytext,
 		isFileMetaDeleted: () => false,
-		ensureFile: () => null,
+		ensureFile: () => ({ kind: "blocked" as const, reason: "policy" as const }),
 		...deleteEpisode.vaultSyncFields,
 	} as any;
 	const editorBindings = {
-		...CLOSED_PATH_EDITOR_AUTHORITY,
 		getLastEditorActivityForPath: () => null,
 		isBound: () => false,
 		unbindByPath: () => {},
@@ -1294,28 +1229,8 @@ function buildOpenExternalTraceFixture(
 	};
 	view.file = file;
 	view.editor = { getValue: () => editorContent } as never;
-	let editorAuthorityLeaseSequence = 0;
-	const editorAuthorityLeases = new Map<
-		object,
-		{ editorRevision: number; editorContent: string }
-	>();
 
 	const editorBindings = {
-		capturePathEditorAuthority: (candidatePath: string) => {
-			if (candidatePath !== path) return { kind: "none" as const };
-			const lease = { leaseId: `trace-open-external-${++editorAuthorityLeaseSequence}` };
-			editorAuthorityLeases.set(lease, { editorRevision, editorContent });
-			return {
-				kind: "proven-single" as const,
-				content: editorContent,
-				lease,
-			};
-		},
-		isPathEditorAuthorityLeaseCurrent: (lease: object) => {
-			const captured = editorAuthorityLeases.get(lease);
-			return captured?.editorRevision === editorRevision
-				&& captured.editorContent === editorContent;
-		},
 		isBound: (candidatePath: string) => candidatePath === path,
 		getBindingDebugInfoForView: () => ({
 			leafId: "trace-leaf",

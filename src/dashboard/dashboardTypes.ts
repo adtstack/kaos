@@ -222,35 +222,6 @@ export interface DashboardActionState {
 	connected: boolean;
 }
 
-export interface DashboardHandoffRecoveryItem {
-	recordId: string;
-	intentId: string;
-	expectedChecksum: string;
-	fromPath: string | null;
-	targetPath: string;
-	originKind: "user" | "ime" | "editor-api";
-	sequenceBegan: "before-handoff" | "after-target-selected";
-	status: "needs-review" | "replayed-awaiting-settlement";
-	capturedAt: number;
-	storedAt: number;
-	startContentHash: string;
-	afterContentHash: string;
-	startLength: number;
-	afterLength: number;
-}
-
-export interface DashboardHandoffRecovery {
-	status: "ready" | "degraded" | "unavailable";
-	activeCount: number;
-	terminalCount: number;
-	totalBytes: number;
-	issues: readonly Readonly<{
-		kind: "corrupt" | "incompatible-schema" | "operational-error";
-		recordId: string | null;
-	}>[];
-	items: readonly DashboardHandoffRecoveryItem[];
-}
-
 export interface KaosDashboardData {
 	generatedAt: string;
 	settings: {
@@ -261,7 +232,6 @@ export interface KaosDashboardData {
 	overview: DashboardMetric[];
 	snapshotStatus: DashboardSnapshotStatus;
 	recoveryStorageStatus: DashboardRecoveryStorageStatus;
-	handoffRecovery: DashboardHandoffRecovery;
 	recentChanges: DashboardRecentChanges;
 	conflicts: DashboardConflictArtifact[];
 	/**
@@ -349,7 +319,6 @@ export interface KaosDashboardCollectorInput {
 	diskIndex: DiskIndex;
 	snapshotStatus: DashboardSnapshotStatus;
 	recoveryStorageStatus: DashboardRecoveryStorageStatus;
-	handoffRecovery: DashboardHandoffRecovery;
 	recentChanges: DashboardRecentChanges;
 	openFileCount: number;
 	snapshotsAvailable: boolean;

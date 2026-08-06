@@ -1,5 +1,5 @@
 import { TFile } from "obsidian";
-import { BlobSyncManager, type BlobQueueSnapshot } from "../src/sync/blobSync";
+import { BlobSyncManager } from "../src/sync/blobSync";
 import { AttachmentOrchestrator } from "../src/runtime/attachmentOrchestrator";
 import {
 	createCausalBlobRef,
@@ -2615,7 +2615,6 @@ console.log("\n--- Test 15d.1: stop retirement blocks refresh until persistence 
 		localDeviceId: "device-a",
 	};
 	let persistedRetirementScope: typeof retiredScope | null = null;
-	let persistedRetirementSnapshot: BlobQueueSnapshot | null = null;
 	let destroyStarted = 0;
 	let replacementStarts = 0;
 	const fakeManager = {
@@ -2623,14 +2622,7 @@ console.log("\n--- Test 15d.1: stop retirement blocks refresh until persistence 
 		get isDownloadGateOpen() { return true; },
 		closeUploadGate: () => undefined,
 		closeDownloadGate: () => undefined,
-		exportQueue: () => ({
-			uploads: [{
-				path: "assets/deferred-at-stop.png",
-				baseRefKnown: false,
-				deferredUntilSettlement: true as const,
-			}],
-			downloads: [],
-		}),
+		exportQueue: () => ({ uploads: [{}], downloads: [] }),
 		destroy: async () => {
 			destroyStarted++;
 			await destroyGate.promise;
@@ -2661,8 +2653,7 @@ console.log("\n--- Test 15d.1: stop retirement blocks refresh until persistence 
 		abortBlobSettlementStage: async () => undefined,
 		getExcludePatterns: () => [],
 		getBlobQueuePersistenceScope: () => ({ ...retiredScope }),
-		persistBlobQueue: async (snapshot: BlobQueueSnapshot, scope: typeof retiredScope) => {
-			persistedRetirementSnapshot = snapshot;
+		persistBlobQueue: async (_snapshot: unknown, scope: typeof retiredScope) => {
 			persistedRetirementScope = { ...scope };
 			await persistGate.promise;
 		},
@@ -2691,10 +2682,6 @@ console.log("\n--- Test 15d.1: stop retirement blocks refresh until persistence 
 	assert(
 		JSON.stringify(persistedRetirementScope) === JSON.stringify(retiredScope),
 		"retirement persists with the manager's captured authority scope",
-	);
-	assert(
-		persistedRetirementSnapshot?.uploads[0]?.deferredUntilSettlement === true,
-		"retirement persists a settlement-deferred local edit before manager destroy",
 	);
 	const refreshing = orchestrator.refresh("capability-race-test");
 	await Promise.resolve();
@@ -3384,9 +3371,6 @@ for (const replacementMode of ["same-file", "tfile-aba"] as const) {
 		upload: async () => { throw new Error("deduplicated upload should not PUT"); },
 	};
 	(manager as any).kickUploadDrain = () => {};
-	// This test manually owns the authoritative recovery attempt below.
-	// Keep the background drain from racing that exact queue item on Node 20 CI.
-	(manager as any).kickDownloadDrain = () => {};
 	(manager as any).enqueueUpload(path, 0, first.byteLength);
 	const item = (manager as any).uploadQueue.get(path);
 	item.status = "processing";
@@ -3728,232 +3712,6 @@ console.log("\n--- Test 30: post-create finalize failure resumes durable settlem
 	assert(!(manager as any).settlementStages[path], "the retried finalization clears its stage");
 	assert(!(manager as any).downloadQueue.has(path), "the settled retry retires its queue item");
 	assert(settledRefs[path]?.hash === hash, "the retried finalization records settlement");
-}
-
-// The downloaded bytes are visible before durable settlement persistence has
-// necessarily returned. A user or headless filesystem watcher may modify that
-// exact path in the meantime. The event is a real local intent and must be
-// admitted once the download stage retires instead of disappearing forever.
-console.log("\n--- Test 31: a local edit during download finalization is admitted afterward ---");
-{
-	const settledRefs: Record<string, BlobRef> = {};
-	const { manager, put } = makeHarness(() => true, settledRefs);
-	const path = "assets/edit-during-download-finalize.png";
-	const remoteData = bytes("remote bytes are already visible");
-	const localData = bytes("local edit while settlement persists");
-	const remoteHash = await sha256Hex(remoteData);
-	(manager as any).__defaultBlobRefs.set(path, {
-		hash: remoteHash,
-		size: remoteData.byteLength,
-	});
-	(manager as any).enqueueDownload(path, remoteHash, remoteData.byteLength);
-	const item = (manager as any).downloadQueue.get(path);
-	item.status = "processing";
-	(manager as any).blobClient = { download: async () => remoteData };
-	(manager as any).kickUploadDrain = () => {};
-
-	const finalizeStarted = deferred<void>();
-	const allowFinalize = deferred<void>();
-	(manager as any).settlementPersistence = {
-		stage: async (candidate: string, stage: unknown) => {
-			(manager as any).settlementStages[candidate] = stage;
-		},
-		finalize: async (
-			candidate: string,
-			_stageId: string,
-			ref: BlobRef,
-			sourceVersion: string,
-		) => {
-			finalizeStarted.resolve();
-			await allowFinalize.promise;
-			settledRefs[candidate] = { ...ref };
-			(manager as any).settledSourceVersions[candidate] = sourceVersion;
-			delete (manager as any).settlementStages[candidate];
-		},
-		retire: async () => {},
-		abort: async (candidate: string) => {
-			delete (manager as any).settlementStages[candidate];
-		},
-	};
-
-	const download = (manager as any).processDownload(item);
-	await finalizeStarted.promise;
-	const edited = put(path, localData);
-	(manager as any).enqueueUpload(path, 0, edited.file.stat.size);
-	assert(
-		!(manager as any).uploadQueue.has(path),
-		"the local edit waits while the exact download stage still owns settlement",
-	);
-	const retirementSnapshot = manager.exportQueue();
-	const deferredMarker = retirementSnapshot.uploads.find(
-		(entry) => entry.path === path,
-	);
-	assert(
-		deferredMarker?.deferredUntilSettlement === true,
-		"manager retirement exports the settlement-deferred local intent",
-	);
-	assert(
-		deferredMarker?.baseRefKnown === false
-			&& deferredMarker.expectedBaseRef === undefined,
-		"the durable marker borrows no causal base before settlement",
-	);
-
-	allowFinalize.resolve();
-	await download;
-	const queued = (manager as any).uploadQueue.get(path);
-	assert(!!queued, "the deferred local edit is admitted after download settlement");
-	assert(
-		queued?.expectedBaseRef?.hash === remoteHash,
-		"the deferred upload uses the finalized remote ref as its causal base",
-	);
-	await manager.destroy();
-}
-
-// Exact-existing downloads use an equality stage rather than a download stage.
-// The same defer-and-recapture contract must survive a manager restart there too.
-console.log("\n--- Test 32: equality-stage local edit survives queue export/import ---");
-{
-	const path = "assets/equality-stage-edit.png";
-	const remoteData = bytes("remote equality base");
-	const localData = bytes("local successor during equality settlement");
-	const remoteHash = await sha256Hex(remoteData);
-	const remoteRef: BlobRef = { hash: remoteHash, size: remoteData.byteLength };
-	const settledRefs: Record<string, BlobRef> = { [path]: remoteRef };
-	const { manager, put } = makeHarness(() => true, settledRefs);
-	put(path, localData);
-	(manager as any).kickUploadDrain = () => {};
-	const sourceVersion = (manager as any).vaultSync.getBlobSourceVersion(path);
-	const equalityStage = {
-		stageId: "equality-stage-before-restart",
-		kind: "equality",
-		ref: { ...remoteRef },
-		sourceVersion,
-		stagedAt: Date.now(),
-	};
-	(manager as any).settlementStages[path] = equalityStage;
-	(manager as any).enqueueUpload(path, 0, localData.byteLength);
-	assert(
-		(manager as any).deferredUploadsAfterSettlement.has(path),
-		"download-owned equality settlement defers the local edit",
-	);
-	const snapshot = manager.exportQueue();
-	assert(
-		snapshot.uploads.some(
-			(entry) => entry.path === path && entry.deferredUntilSettlement === true,
-		),
-		"equality-stage deferred intent is durable in the queue snapshot",
-	);
-
-	const restoredSettledRefs: Record<string, BlobRef> = { [path]: remoteRef };
-	const { manager: restored, put: restoredPut } = makeHarness(
-		() => true,
-		restoredSettledRefs,
-	);
-	restoredPut(path, localData);
-	(restored as any).kickUploadDrain = () => {};
-	const restoredSourceVersion = (restored as any).vaultSync.getBlobSourceVersion(path);
-	const restoredStage = {
-		...equalityStage,
-		sourceVersion: restoredSourceVersion,
-	};
-	(restored as any).settlementStages[path] = restoredStage;
-	restored.importQueue(snapshot);
-	assert(
-		(restored as any).deferredUploadsAfterSettlement.has(path)
-			&& !(restored as any).uploadQueue.has(path),
-		"restart retains the marker without uploading through the unresolved stage",
-	);
-	await (restored as any).finalizeSettlementStage(
-		path,
-		restoredStage,
-		remoteRef,
-		restoredSourceVersion,
-	);
-	const restoredUpload = (restored as any).uploadQueue.get(path);
-	assert(
-		!!restoredUpload,
-		"finalizing the restored equality stage admits the local successor",
-	);
-	assert(
-		restoredUpload?.expectedBaseRef?.hash === remoteHash,
-		"the restored successor captures the finalized equality ref as its base",
-	);
-	await Promise.all([manager.destroy(), restored.destroy()]);
-}
-
-// The public vault-event path waits in uploadDebounce before enqueueUpload(). A
-// retirement snapshot taken in that window must still preserve the edit as a
-// settlement-deferred intent rather than serializing an ordinary unknown-base
-// upload that importQueue will discard behind the active stage.
-console.log("\n--- Test 33: debounced local edit exports as settlement-deferred intent ---");
-{
-	const path = "assets/debounced-edit-during-download.png";
-	const remoteData = bytes("remote base before debounced edit");
-	const localData = bytes("local edit still inside debounce");
-	const remoteHash = await sha256Hex(remoteData);
-	const remoteRef: BlobRef = { hash: remoteHash, size: remoteData.byteLength };
-	const settledRefs: Record<string, BlobRef> = { [path]: remoteRef };
-	const { manager, put } = makeHarness(() => true, settledRefs);
-	const edited = put(path, localData);
-	(manager as any).kickUploadDrain = () => {};
-	const sourceVersion = (manager as any).vaultSync.getBlobSourceVersion(path);
-	const downloadStage = {
-		stageId: "download-stage-before-debounce-fires",
-		kind: "download",
-		ref: { ...remoteRef },
-		sourceVersion,
-		stagedAt: Date.now(),
-	};
-
-	manager.handleFileChange(edited.file);
-	// The remote stage can begin after the watcher scheduled its debounce but
-	// before either the timer or manager-retirement snapshot runs.
-	(manager as any).settlementStages[path] = downloadStage;
-	const snapshot = manager.exportQueue();
-	const pathUploads = snapshot.uploads.filter((entry) => entry.path === path);
-	assert(
-		pathUploads.length === 1
-			&& pathUploads[0]?.deferredUntilSettlement === true,
-		"retirement before debounce fires exports exactly one deferred marker",
-	);
-	assert(
-		pathUploads[0]?.baseRefKnown === false
-			&& pathUploads[0]?.expectedBaseRef === undefined
-			&& pathUploads[0]?.expectedBaseSourceVersion === undefined,
-		"the debounced marker borrows no settlement-owned causal authority",
-	);
-
-	const restoredSettledRefs: Record<string, BlobRef> = { [path]: remoteRef };
-	const { manager: restored, put: restoredPut } = makeHarness(
-		() => true,
-		restoredSettledRefs,
-	);
-	restoredPut(path, localData);
-	(restored as any).kickUploadDrain = () => {};
-	const restoredSourceVersion = (restored as any).vaultSync.getBlobSourceVersion(path);
-	const restoredStage = {
-		...downloadStage,
-		sourceVersion: restoredSourceVersion,
-	};
-	(restored as any).settlementStages[path] = restoredStage;
-	restored.importQueue(snapshot);
-	assert(
-		(restored as any).deferredUploadsAfterSettlement.has(path)
-			&& !(restored as any).uploadQueue.has(path),
-		"restart holds the debounced edit behind the restored download stage",
-	);
-	await (restored as any).finalizeSettlementStage(
-		path,
-		restoredStage,
-		remoteRef,
-		restoredSourceVersion,
-	);
-	const restoredUpload = (restored as any).uploadQueue.get(path);
-	assert(
-		restoredUpload?.expectedBaseRef?.hash === remoteHash,
-		"the resumed debounced edit captures the finalized remote base",
-	);
-	await Promise.all([manager.destroy(), restored.destroy()]);
 }
 
 console.log("\n──────────────────────────────────────────────────");

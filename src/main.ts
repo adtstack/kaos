@@ -19,16 +19,7 @@ import {
 	type ReconcileMode,
 } from "./sync/vaultSync";
 import { SCHEMA_VERSION } from "./sync/vaultSync";
-import {
-	EditorBindingManager,
-	getEditorHandoffQaDebugSnapshot,
-	holdNextEditorHostLoadForQa,
-	holdNextEditorNativeSaveForQa,
-	installEditorHandoffHostQaBarrier,
-	releaseHeldEditorHostLoadForQa,
-	releaseHeldEditorNativeSaveForQa,
-	setEditorHandoffHostApiVersionOverrideForQa,
-} from "./sync/editorBinding";
+import { EditorBindingManager } from "./sync/editorBinding";
 import {
 	DiskMirror,
 	type ObservedDiskMutationRevision,
@@ -202,7 +193,6 @@ import {
 } from "./runtime/reconciliationController";
 import { AttachmentOrchestrator } from "./runtime/attachmentOrchestrator";
 import { EditorWorkspaceOrchestrator } from "./runtime/editorWorkspaceOrchestrator";
-import { isMarkdownEditorView } from "./runtime/markdownEditorView";
 import { SetupLinkController } from "./runtime/setupLinkController";
 import { TraceRuntimeController } from "./runtime/traceRuntimeController";
 import { registerCommands } from "./commands";
@@ -220,7 +210,6 @@ import type {
 	DashboardBlobConflictResolutionChoice,
 	DashboardBlobConflictResolutionResult,
 	DashboardBlobConflictResolutionTarget,
-	DashboardHandoffRecovery,
 	DashboardLegacyMissingBlobResolutionChoice,
 	DashboardLegacyMissingBlobResolutionTarget,
 	DashboardRemoteDeleteResolutionChoice,
@@ -241,24 +230,9 @@ import { randomBase64Url } from "./utils/base64url";
 import { ConfirmModal } from "./ui/ConfirmModal";
 import { runSchemaMigrationToV2 } from "./migrations/schemaV2";
 import type { TelemetryRuntimeHandle } from "./telemetry/installTelemetryRuntime";
-import type {
-	EngineControlPort,
-	DiskIngestPort,
-} from "./runtime/engineControlPort";
+import type { EngineControlPort, DiskIngestPort } from "./runtime/engineControlPort";
 import type { BindingPropagationGate } from "./sync/editorBinding";
 import { getOrCreateLocalDeviceIdentity } from "./sync/indexedDbCandidateStore";
-import { IndexedDbHandoffRecoveryStore } from "./sync/indexedDbHandoffRecoveryStore";
-import {
-	HANDOFF_RECOVERY_SCHEMA_VERSION,
-	buildHandoffRecoveryScopeKey,
-	isActiveHandoffRecoveryRecord,
-	type ActiveHandoffRecoveryRecord,
-	type ClearHandoffRecoveryScopeResult,
-	type HandoffRecoveryHydrationResult,
-} from "./sync/handoffRecoveryStore";
-import { ManualHandoffRecoveryCoordinator } from "./runtime/handoffRecoveryCoordinator";
-import { exportHandoffRecoveryBody } from "./sync/handoffRecoveryExport";
-import { requestHandoffRecoveryExportPath } from "./ui/HandoffRecoveryExportModal";
 
 // Build-time constant injected by esbuild.
 //   production build (main.js):          define __KAOS_QA_HARNESS_ENABLED__ = false
@@ -358,7 +332,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		diskIngestSuspended: boolean;
 		pausedEditorPropagationPaths: Set<string>;
 		bindingReconfigureHook: ((path: string, deviceName: string, action: "pause" | "resume") => void) | null;
-	controlPort: EngineControlPort;
+		controlPort: EngineControlPort;
 	} | null = null;
 	/** Domain-level trace sink. Routes to lab when active, noop otherwise. */
 	private traceSink: TraceSink = new NoopTraceSink();
@@ -437,22 +411,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private readonly blobIntentSessionId = randomBase64Url(16);
 	private blobIntentLocalDeviceId: string | null = null;
 	private blobLocalDeviceIdentityStatus: LocalDeviceIdentityStatus = "unknown";
-	private handoffRecoveryStore: IndexedDbHandoffRecoveryStore | null = null;
-	private handoffRecoveryCoordinator: ManualHandoffRecoveryCoordinator | null = null;
-	private handoffRecoveryScopeKey: string | null = null;
-	private handoffRecoveryActivationEpoch = 0;
-	private handoffRecoveryReady = false;
-	private handoffRecoveryOperationalError:
-		| "identity-unavailable"
-		| "indexeddb-unavailable"
-		| null = null;
-	private handoffRecoveryHydration: HandoffRecoveryHydrationResult = {
-		status: "missing",
-		active: [],
-		terminal: [],
-		issues: [],
-		totalBytes: 0,
-	};
 	private pendingBlobIntentStore: IndexedDbPendingBlobIntentStore | null = null;
 	private pendingBlobIntentStoreKey: string | null = null;
 	private pendingBlobIntentPersistChain: Promise<void> = Promise.resolve();
@@ -519,17 +477,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				const previousHash = this.conflictMergeBases[artifactPath];
 				this.conflictMergeBases[artifactPath] = baseHash;
 				if (previousHash && previousHash !== baseHash) this.baselineTextDeleteCandidates.add(previousHash);
-				this.scheduleDiskIndexSave("conflict-merge-base");
 			},
 			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
 			isRemoteProjectionAllowed: (path) =>
 				this.remoteProjectionPolicyGate.isRemoteProjectionAllowed(path),
 			getMarkdownAttentionGeneration: () => this.markdownAttentionGeneration,
 			getMarkdownSyncScopeGeneration: () => this.markdownSyncScopeGeneration,
-			persistPreservedUnresolvedStateDurably: async (stateChanged) => {
-				if (stateChanged) this.markdownAttentionGeneration++;
-				await this.persistPreservedUnresolvedStateDurably();
-			},
 			shouldTombstoneIntrinsicMarkdownPath: (path) => this.isIntrinsicMarkdownPathExcluded(path),
 			shouldTombstoneIntrinsicBlobPath: (path) => this.isIntrinsicBlobPathExcluded(path),
 			shouldBlockFrontmatterIngest: (path, previousContent, nextContent, reason) =>
@@ -2901,19 +2854,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// BindingPropagationGate hooks can store into _qaState.
 		// In production this block is dead code — esbuild eliminates it entirely.
 		if (__KAOS_QA_HARNESS_ENABLED__) {
-			const contentFreeSnapshot = () => {
-				if (!this.editorBindings) throw new Error("EditorBindingManager not ready");
-				return getEditorHandoffQaDebugSnapshot(this.editorBindings);
-			};
 			this._qaState = {
 				diskIngestPort: null,
-					diskIngestSuspended: false,
-					pausedEditorPropagationPaths: new Set(),
-					bindingReconfigureHook: null,
-					controlPort: {
-					setEditorHandoffHostApiVersionOverride: (version) => {
-						setEditorHandoffHostApiVersionOverrideForQa(version);
-					},
+				diskIngestSuspended: false,
+				pausedEditorPropagationPaths: new Set(),
+				bindingReconfigureHook: null,
+				controlPort: {
 					ingestDiskFileNow: async (path, reason = "modify") => {
 						if (!this._qaState?.diskIngestPort) throw new Error("DiskIngestPort not registered (reconciliation controller not started?)");
 						await this._qaState.diskIngestPort.ingestDiskFileNow(path, reason);
@@ -2938,25 +2884,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						this._qaState.diskIngestSuspended = suspended;
 						return previous;
 					},
-					holdNextHostLoad: (path, stage) => {
-						if (!this.editorBindings) throw new Error("EditorBindingManager not ready");
-						holdNextEditorHostLoadForQa(this.editorBindings, path, stage);
-					},
-					releaseHeldHostLoad: () => {
-						if (!this.editorBindings) throw new Error("EditorBindingManager not ready");
-						releaseHeldEditorHostLoadForQa(this.editorBindings);
-					},
-					holdNextNativeSave: (path) => {
-						if (!this.editorBindings) throw new Error("EditorBindingManager not ready");
-						holdNextEditorNativeSaveForQa(this.editorBindings, path);
-					},
-					releaseHeldNativeSave: () => {
-						if (!this.editorBindings) throw new Error("EditorBindingManager not ready");
-						releaseHeldEditorNativeSaveForQa(this.editorBindings);
-					},
-						getEditorHandoffDebugSnapshot: contentFreeSnapshot,
-						getContentFreeSnapshot: contentFreeSnapshot,
-					},
+				},
 			};
 			// Attach the accessor as an instance property so the method name
 			// never appears on the class prototype in production bundles.
@@ -3033,22 +2961,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.resolveLegacyMissingBlobAttention(target, choice),
 				resolveBlobConflict: (target, choice) =>
 					this.resolveBlobConflict(target, choice),
-				loadHandoffRecovery: (recordId, expectedChecksum) =>
-					this.loadHandoffRecoveryRecord(recordId, expectedChecksum)
-						.then(({ record }) => record),
-				copyHandoffRecovery: (recordId, expectedChecksum) =>
-					this.copyHandoffRecoveryRecord(recordId, expectedChecksum),
-				exportHandoffRecovery: (recordId, expectedChecksum, requestedPath) =>
-					this.exportHandoffRecoveryRecord(
-						recordId,
-						expectedChecksum,
-						requestedPath,
-					),
-				resolveHandoffRecovery: (recordId, expectedChecksum) =>
-					this.resolveHandoffRecoveryRecord(recordId, expectedChecksum),
-				discardHandoffRecovery: (recordId, expectedChecksum) =>
-					this.discardHandoffRecoveryRecord(recordId, expectedChecksum),
-				clearHandoffRecoveryScope: () => this.clearHandoffRecoveryScope(),
 			},
 		}));
 		this.addRibbonIcon("layout-dashboard", "Open dashboard", () => {
@@ -3531,29 +3443,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.reconciliationController.noteInterceptedExternalDiskMutation(candidate);
 				},
 				() => true,
-				(request) => {
-					this.editorWorkspace?.onOpenPathAdmissionWake(request.targetPath);
-				},
-				this.reconciliationController,
 				{
-					chooseVerifiedExporter: async () => {
-						const path = await requestHandoffRecoveryExportPath(
-							this.app,
-							`Handoff Recovery ${new Date().toISOString().replace(/[:.]/g, "-")}.txt`,
-						);
-						if (path === null) return null;
-						return async (content: string) => {
-							await exportHandoffRecoveryBody(this.app, path, content);
-						};
+					settleOpenExternalEdit: (path) =>
+						this.reconciliationController.settleOpenExternalEditBeforeTransition(path),
+					flushOpenPath: async (path, reason) => {
+						await this.diskMirror?.flushOpenPath(path, reason);
 					},
+					admitTargetFromDisk: (file) =>
+						this.reconciliationController.admitEditorTargetFromDisk(file),
 				},
 			);
-			// Settings may have been applied before local identity was ready.
-			// Retry the same manual Recovery scope after editor startup.
-			this.rotateHandoffRecoveryScope("editor-bindings-ready");
-			if (__KAOS_QA_HARNESS_ENABLED__) {
-				installEditorHandoffHostQaBarrier(this.editorBindings);
-			}
 
 			// 3. Global CM6 extension
 			this.registerEditorExtension(
@@ -3584,9 +3483,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.diskMirror.setMarkdownPathSyncabilityPredicate((path) => this.isMarkdownPathSyncable(path));
 			this.diskMirror.setRemoteProjectionAdmissionPredicate(
 				(path) => this.remoteProjectionPolicyGate.isRemoteProjectionAllowed(path),
-			);
-			this.diskMirror.setSamePathAdoptionProjectionHoldPredicate(
-				(path) => this.editorBindings?.isSamePathAdoptionProjectionHeld(path) ?? false,
 			);
 			this.diskMirror.setRemoteProjectionAdmissionProvider((paths) => {
 				const policyLease = this.remoteProjectionPolicyGate.captureLease(paths);
@@ -3626,17 +3522,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// Used by decideClosedFileConflict on startup/re-enable to determine
 			// which side actually changed from the last known stable state.
 			this.diskMirror.setDiskWriteCallback((path, contentHash, content) => {
-				const admission = this.reconciliationController
-					.captureDiskBaselineSettlementAdmission(path, contentHash, content);
-				if (!admission) return false;
+				this.reconciliationController.noteDiskBaselineSettlement(path, content);
 				const existing = this.diskIndex[path];
 				const previousHash = existing?.contentHash;
-				const normalizedContentHash = contentHash.toLowerCase();
-				const previousBaselineText = this.baselineTexts[normalizedContentHash];
-				const baselineTextWasDirty =
-					this.dirtyBaselineTextHashes.has(normalizedContentHash);
-				const previousHashWasDeleteCandidate = previousHash !== undefined
-					&& this.baselineTextDeleteCandidates.has(previousHash);
 				if (existing) {
 					existing.contentHash = contentHash;
 				} else {
@@ -3646,37 +3534,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.baselineTextDeleteCandidates.add(previousHash);
 				}
 				this.recordBaselineText(contentHash, content);
-				if (!this.reconciliationController.commitDiskBaselineSettlementAdmission(admission)) {
-					if (existing) {
-						if (previousHash === undefined) delete existing.contentHash;
-						else existing.contentHash = previousHash;
-					} else {
-						delete this.diskIndex[path];
-					}
-					if (previousHash !== undefined && previousHash !== contentHash) {
-						if (previousHashWasDeleteCandidate) {
-							this.baselineTextDeleteCandidates.add(previousHash);
-						} else {
-							this.baselineTextDeleteCandidates.delete(previousHash);
-						}
-					}
-					if (previousBaselineText === undefined) {
-						delete this.baselineTexts[normalizedContentHash];
-					} else {
-						this.baselineTexts[normalizedContentHash] = previousBaselineText;
-					}
-					if (baselineTextWasDirty) {
-						this.dirtyBaselineTextHashes.add(normalizedContentHash);
-					} else {
-						this.dirtyBaselineTextHashes.delete(normalizedContentHash);
-					}
-					return false;
-				}
 				this.scheduleDiskIndexSave("disk-write-baseline");
 				// Req 17.2: mark dirty after post-readback verification succeeds.
 				// contentHash is baselineHash-domain — NOT published as diskHash.
 				this.lab?.markWitnessDirty(path, "disk-write");
-				return true;
 			});
 
 			// 4b. BlobSyncManager (if attachment sync is enabled)
@@ -3839,8 +3700,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					runReconciliation: (mode) => this.runReconciliation(mode),
 					runSchemaMigrationToV2: () => this.runSchemaMigrationToV2(),
 					importUntrackedFiles: () => this.importUntrackedFiles(),
-					retryBlockedHandoffRecoveryExport: () =>
-						this.editorBindings?.retryPendingStructuralSourceCloseExport() ?? 0,
 					clearLocalServerReceiptState: () => this.clearLocalServerReceiptState(),
 					resetLocalCache: () => this.resetLocalCache(),
 					nuclearReset: () => this.nuclearReset(),
@@ -4153,20 +4012,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						size: typeof file.stat?.size === "number" ? file.stat.size : null,
 					};
 					const editorBindingsAtEvent = this.editorBindings;
-					if (editorBindingsAtEvent?.tracksExternalDiskMutationPath(file.path)) {
+					if (editorBindingsAtEvent?.isBound(file.path)) {
 						const sequence = ++this.externalDiskMutationSequence;
-						const controllerProbeTicket =
-							this.reconciliationController.beginExternalDiskMutationProbe({
-								file,
-								revision: diskMutationRevision,
-								sequence,
-								observedAt,
-							});
 						editorBindingsAtEvent.beginExternalDiskMutation(file.path, sequence);
 						void (async () => {
 							let content: string | null = null;
-							let disposition: "current" | "stale" | "unavailable" =
-								dm ? "current" : "unavailable";
 							if (dm) {
 								if (writerGuess === "kaos-write") {
 									// Timing is diagnostic only. The exact event revision must match
@@ -4175,45 +4025,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 										file,
 										diskMutationRevision,
 									);
-									if (
-										this.diskMirror !== dm ||
-										this.editorBindings !== editorBindingsAtEvent
-									) {
-										return;
-									}
-									if (probe.kind === "self-write") {
-										editorBindingsAtEvent.noteSelfWriteExternalDiskMutation({
-											...diskMutationRevision,
-											sequence,
-											observedAt,
-											content: probe.content,
-										});
-										if (controllerProbeTicket) {
-											void this.reconciliationController
-												.noteSelfWriteExternalDiskMutationProbeOutcome(
-													controllerProbeTicket,
-													probe.content,
-												);
-										}
-										return;
-									}
-									if (
-										probe.kind === "stale" || probe.kind === "unavailable"
-									) {
-										disposition = probe.kind;
-									} else {
+									if (probe.kind === "self-write") return;
+									if (probe.kind !== "stale-or-unreadable") {
 										content = probe.content;
 									}
 								} else {
-									const probe = await dm.probeExactObservedDiskRevision(
+									content = await dm.readExactObservedDiskRevision(
 										file,
 										diskMutationRevision,
 									);
-									if (probe.kind === "current") {
-										content = probe.content;
-									} else {
-										disposition = probe.kind;
-									}
 								}
 							}
 
@@ -4222,45 +4042,16 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 							if (this.diskMirror !== dm || this.editorBindings !== editorBindingsAtEvent) {
 								return;
 							}
-							if (disposition !== "current" && controllerProbeTicket) {
-								this.reconciliationController.noteExternalDiskMutationProbeDisposition({
-									disposition,
-									ticket: controllerProbeTicket,
-								});
-							}
-							const completion = editorBindingsAtEvent.noteExternalDiskMutation({
+							editorBindingsAtEvent.noteExternalDiskMutation({
 								...diskMutationRevision,
 								sequence,
 								observedAt,
 								content,
 							});
-							if (completion === "terminal-no-candidate" && controllerProbeTicket) {
-								void this.reconciliationController.noteExternalDiskMutationProbeSettled(
-									controllerProbeTicket,
-								);
-							}
 						})().catch((err) => {
 							this.trace("editor", "external-disk-reload-guard-probe-failed", {
-								path: diskMutationRevision.path,
+								path: file.path,
 								error: formatUnknown(err),
-							});
-							if (
-								this.diskMirror !== dm ||
-								this.editorBindings !== editorBindingsAtEvent
-							) {
-								return;
-							}
-							if (controllerProbeTicket) {
-								this.reconciliationController.noteExternalDiskMutationProbeDisposition({
-									disposition: "unavailable",
-									ticket: controllerProbeTicket,
-								});
-							}
-							editorBindingsAtEvent.noteExternalDiskMutation({
-								...diskMutationRevision,
-								sequence,
-								observedAt,
-								content: null,
 							});
 						});
 					}
@@ -4720,11 +4511,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * After this, the plugin is in the same state as before initSync().
 	 */
 	private async teardownSync(): Promise<void> {
-		const editorSaveDrain = this.editorBindings?.beginOwnedSaveDrainForTeardown();
 		this.reconciliationController.revokeAsyncAuthority();
-		this.editorBindings?.revokeAsyncAuthority();
 		this.log("teardownSync: tearing down all sync state");
-		await editorSaveDrain;
 
 		// Safe teardown ordering for disk index baseline persistence:
 		//   1. Flush all pending disk writes (callbacks fire, hashes recorded in memory)
@@ -4753,9 +4541,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.vaultSync = null;
 		this.connectionController = null;
 		this.editorBindings = null;
-		this.handoffRecoveryStore = null;
-		this.handoffRecoveryCoordinator = null;
-		this.handoffRecoveryReady = false;
 		this.diskMirror = null;
 		this.externalDiskMutationSequence = 0;
 		this.awaitingFirstProviderSyncAfterStartup = false;
@@ -5111,119 +4896,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		};
 	}
 
-	private unavailableHandoffRecoveryDashboard(): DashboardHandoffRecovery {
-		return {
-			status: "unavailable",
-			activeCount: this.handoffRecoveryHydration.active.length,
-			terminalCount: this.handoffRecoveryHydration.terminal.length,
-			totalBytes: this.handoffRecoveryHydration.totalBytes,
-			issues: [{ kind: "operational-error", recordId: null }],
-			items: [],
-		};
-	}
-
-	private async collectDashboardHandoffRecovery(): Promise<DashboardHandoffRecovery> {
-		const coordinator = this.handoffRecoveryCoordinator;
-		if (!this.handoffRecoveryReady || !coordinator) {
-			return this.unavailableHandoffRecoveryDashboard();
-		}
-		try {
-			const recovery = await coordinator.collectDashboardHandoffRecovery();
-			if (
-				!this.handoffRecoveryReady
-				|| this.handoffRecoveryCoordinator !== coordinator
-			) return this.unavailableHandoffRecoveryDashboard();
-			return recovery;
-		} catch {
-			return this.unavailableHandoffRecoveryDashboard();
-		}
-	}
-
-	private async loadHandoffRecoveryRecord(
-		recordId: string,
-		expectedChecksum: string,
-	): Promise<Readonly<{
-		coordinator: ManualHandoffRecoveryCoordinator;
-		record: ActiveHandoffRecoveryRecord;
-	}>> {
-		const coordinator = this.handoffRecoveryCoordinator;
-		if (!this.handoffRecoveryReady || !coordinator) {
-			throw new Error("Handoff Recovery is unavailable");
-		}
-		const record = await coordinator.getRecord(recordId, expectedChecksum);
-		if (
-			!this.handoffRecoveryReady
-			|| this.handoffRecoveryCoordinator !== coordinator
-			|| !isActiveHandoffRecoveryRecord(record)
-			|| record.recordId !== recordId
-			|| record.checksum !== expectedChecksum
-		) {
-			throw new Error("Handoff Recovery record is missing or stale");
-		}
-		return { coordinator, record };
-	}
-
-	private async copyHandoffRecoveryRecord(
-		recordId: string,
-		expectedChecksum: string,
-	): Promise<void> {
-		const { record } = await this.loadHandoffRecoveryRecord(recordId, expectedChecksum);
-		if (!navigator.clipboard?.writeText) throw new Error("Clipboard is unavailable");
-		await navigator.clipboard.writeText(record.body.afterContent);
-	}
-
-	private async exportHandoffRecoveryRecord(
-		recordId: string,
-		expectedChecksum: string,
-		requestedPath: string,
-	): Promise<{ path: string }> {
-		const { record } = await this.loadHandoffRecoveryRecord(recordId, expectedChecksum);
-		const result = await exportHandoffRecoveryBody(
-			this.app,
-			requestedPath,
-			record.body.afterContent,
-		);
-		return { path: result.path };
-	}
-
-	private async resolveHandoffRecoveryRecord(
-		recordId: string,
-		expectedChecksum: string,
-	): Promise<void> {
-		const { coordinator, record } = await this.loadHandoffRecoveryRecord(
-			recordId,
-			expectedChecksum,
-		);
-		if (record.status !== "needs-review") {
-			throw new Error("Handoff Recovery record is not ready for manual resolution");
-		}
-		await coordinator.resolveManually(record.recordId, record.checksum);
-	}
-
-	private async discardHandoffRecoveryRecord(
-		recordId: string,
-		expectedChecksum: string,
-	): Promise<void> {
-		const { coordinator, record } = await this.loadHandoffRecoveryRecord(
-			recordId,
-			expectedChecksum,
-		);
-		await coordinator.discardRecord(record.recordId, record.checksum);
-	}
-
-	private async clearHandoffRecoveryScope(): Promise<ClearHandoffRecoveryScopeResult> {
-		const coordinator = this.handoffRecoveryCoordinator;
-		if (!this.handoffRecoveryReady || !coordinator) {
-			throw new Error("Handoff Recovery is unavailable");
-		}
-		const result = await coordinator.clearCurrentScope();
-		if (this.handoffRecoveryCoordinator !== coordinator) {
-			throw new Error("Handoff Recovery scope changed during clear");
-		}
-		this.handoffRecoveryHydration = await coordinator.hydrateScope();
-		return result;
-	}
-
 	private async collectDashboardData(): Promise<KaosDashboardData> {
 		const connection = this.getDashboardConnectionSummary();
 		const status = this.getSettingsStatusSummary();
@@ -5240,7 +4912,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const recoveryStorageStatus = this.snapshotService
 			? await this.snapshotService.getDashboardRecoveryStorageStatus()
 			: { status: "unavailable" as const, message: "File history storage service not initialized." };
-		const handoffRecovery = await this.collectDashboardHandoffRecovery();
 		const vaultSync = this.vaultSync;
 		const blobSync = this.getBlobSync();
 		return buildKaosDashboardData({
@@ -5290,7 +4961,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			diskIndex: this.diskIndex,
 			snapshotStatus,
 			recoveryStorageStatus,
-			handoffRecovery,
 			recentChanges,
 			openFileCount: this.editorWorkspace?.openFileCount ?? 0,
 			snapshotsAvailable: this.serverSupportsSnapshots,
@@ -6103,7 +5773,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const probes: Array<Record<string, unknown>> = [];
 		const leaves: MarkdownView[] = [];
 		this.app.workspace.iterateAllLeaves((leaf) => {
-			if (isMarkdownEditorView(leaf.view) && leaf.view.file) {
+			if (leaf.view instanceof MarkdownView && leaf.view.file) {
 				leaves.push(leaf.view);
 			}
 		});
@@ -6188,12 +5858,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	onunload() {
 		this.log("Unloading plugin");
-		const recoveryDrain = this.handoffRecoveryCoordinator?.drain();
-		if (recoveryDrain) {
-			void recoveryDrain.catch(() => {
-				this.log("Handoff Recovery write tail did not drain before unload");
-			});
-		}
 		this.lab?.dispose();   // dispose stops flight trace, witness, and QA API
 		const teardown = this.teardownSync().catch((err) => {
 			console.error("[kaos] Failed to teardown sync runtime during unload:", err);
@@ -6461,110 +6125,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		});
 	}
 
-	private rotateHandoffRecoveryScope(reason: string): void {
-		const vaultId = this.settings.vaultId;
-		const localDeviceId = this.blobIntentLocalDeviceId;
-		const requestedScopeKey = vaultId && localDeviceId
-			? buildHandoffRecoveryScopeKey({
-				schemaVersion: HANDOFF_RECOVERY_SCHEMA_VERSION,
-				vaultId,
-				localDeviceId,
-			})
-			: null;
-		if (
-			requestedScopeKey === this.handoffRecoveryScopeKey
-			&& (
-				(requestedScopeKey !== null
-					&& this.handoffRecoveryCoordinator !== null)
-				|| this.handoffRecoveryOperationalError === "identity-unavailable"
-			)
-		) return;
-		const activationEpoch = ++this.handoffRecoveryActivationEpoch;
-		this.handoffRecoveryReady = false;
-		this.handoffRecoveryScopeKey = requestedScopeKey;
-		void this.initializeHandoffRecovery(activationEpoch, requestedScopeKey, reason);
-	}
-
-	private async initializeHandoffRecovery(
-		activationEpoch: number,
-		requestedScopeKey: string | null,
-		reason: string,
-	): Promise<void> {
-		const vaultId = this.settings.vaultId;
-		const localDeviceId = this.blobIntentLocalDeviceId;
-		if (
-			activationEpoch !== this.handoffRecoveryActivationEpoch
-			|| requestedScopeKey !== this.handoffRecoveryScopeKey
-		) return;
-		const previous = this.handoffRecoveryCoordinator;
-		if (!vaultId || !localDeviceId) {
-			this.handoffRecoveryStore = null;
-			this.handoffRecoveryCoordinator = null;
-			this.handoffRecoveryReady = false;
-			this.handoffRecoveryScopeKey = null;
-			this.handoffRecoveryOperationalError = "identity-unavailable";
-			this.handoffRecoveryHydration = {
-				status: "missing",
-				active: [],
-				terminal: [],
-				issues: [],
-				totalBytes: 0,
-			};
-			void previous?.drain().catch(() => undefined);
-			return;
-		}
-		const scope = {
-			schemaVersion: HANDOFF_RECOVERY_SCHEMA_VERSION,
-			vaultId,
-			localDeviceId,
-		};
-		const scopeKey = buildHandoffRecoveryScopeKey(scope);
-		if (scopeKey !== requestedScopeKey) return;
-		const store = new IndexedDbHandoffRecoveryStore(scope);
-		const coordinator = new ManualHandoffRecoveryCoordinator({
-			store,
-			isScopeCurrent: () =>
-				activationEpoch === this.handoffRecoveryActivationEpoch
-				&& scopeKey === this.handoffRecoveryScopeKey,
-		});
-		this.handoffRecoveryStore = store;
-		this.handoffRecoveryCoordinator = coordinator;
-		try {
-			const hydration = await coordinator.hydrateScope();
-			if (
-				activationEpoch !== this.handoffRecoveryActivationEpoch
-				|| scopeKey !== this.handoffRecoveryScopeKey
-			) return;
-			this.handoffRecoveryHydration = hydration;
-			this.handoffRecoveryOperationalError = null;
-			this.handoffRecoveryReady = true;
-		} catch {
-			if (activationEpoch !== this.handoffRecoveryActivationEpoch) return;
-			this.handoffRecoveryOperationalError = "indexeddb-unavailable";
-			this.handoffRecoveryReady = false;
-			// Recovery remains unavailable rather than applying unverified editor data.
-			this.handoffRecoveryHydration = {
-				status: "missing",
-				active: [],
-				terminal: [],
-				issues: [],
-				totalBytes: 0,
-			};
-		} finally {
-			this.trace("recovery", "handoff-recovery-scope-activation-finished", {
-				reason,
-				activationEpoch,
-				current: activationEpoch === this.handoffRecoveryActivationEpoch,
-			});
-			void previous?.drain().catch(() => undefined);
-		}
-	}
-
 	private applyRuntimeSettings(reason: string): void {
 		this.runtimeConfig = this.buildEffectiveRuntimeConfig();
 		this.updateMarkdownSyncScopeGeneration(this.runtimeConfig);
 		this.activateBlobAuthorityScope(`runtime-settings:${reason}`);
-		this.rotateHandoffRecoveryScope(reason);
 		this.excludePatterns = this.runtimeConfig.excludePatterns;
 		this.maxFileSize = this.runtimeConfig.maxFileSizeBytes;
 		this.applyCursorVisibility();
