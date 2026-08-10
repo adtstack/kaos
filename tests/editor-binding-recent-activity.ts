@@ -3,7 +3,6 @@ import { Annotation, EditorState, Transaction, type TransactionSpec } from "@cod
 import { YSyncConfig, ySyncFacet } from "y-codemirror.next";
 import {
 	EditorBindingManager,
-	type EditorTransitionBoundaryDeps,
 	type InterceptedExternalDiskMutation,
 } from "../src/sync/editorBinding";
 import {
@@ -121,7 +120,6 @@ function recordExpectedEditorYTextPatch(
 function buildManagerFixture(options: {
 	lastEditorChangeAgeMs: number;
 	lastEditorDocChangeAgeMs?: number | null;
-	editorTransitionBoundary?: EditorTransitionBoundaryDeps;
 	externalReloadGuardEnabled?: () => boolean;
 	onExternalDiskReloadIntercepted?: (
 		candidate: InterceptedExternalDiskMutation,
@@ -204,7 +202,6 @@ function buildManagerFixture(options: {
 			options.onExternalDiskReloadIntercepted?.(candidate);
 		},
 		options.externalReloadGuardEnabled,
-		options.editorTransitionBoundary,
 	);
 	const binding = {
 		view,
@@ -4302,6 +4299,35 @@ console.log("\n--- Test 24: pending replacement states resolve to the guarded bi
 	clearPendingHealthChecks(manager);
 }
 
+console.log("\n--- Test 24a: external disk lineage is complete, primitive, and immutable ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	const lineage = manager.captureExternalDiskMutationEditorAuthorityLineage(
+		binding.path,
+		[binding.view as never],
+	);
+	assertEq(lineage !== null, true, "a fully resolved open editor produces lineage proof");
+	assertEq(Object.isFrozen(lineage), true, "lineage envelope is immutable");
+	assertEq(Object.isFrozen(lineage?.views), true, "lineage view list is immutable");
+	assertEq(Object.isFrozen(lineage?.views[0]), true, "lineage view snapshot is immutable");
+	assertEq(lineage?.views[0]?.leafId, "leaf-1", "lineage keeps the exact leaf identity");
+	assertEq(lineage?.views[0]?.cmId, "cm-1", "lineage keeps the exact CodeMirror identity");
+	assertEq(
+		"view" in (lineage?.views[0] ?? {}),
+		false,
+		"lineage contains no live MarkdownView reference",
+	);
+	assertEq(
+		"cm" in (lineage?.views[0] ?? {}),
+		false,
+		"lineage contains no live EditorView reference",
+	);
+	clearPendingHealthChecks(manager);
+}
+
 console.log("\n--- Test 25: stale path bindings detach before user input propagates ---");
 {
 	const { manager, binding } = buildManagerFixture({
@@ -4322,6 +4348,31 @@ console.log("\n--- Test 25: stale path bindings detach before user input propaga
 		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has("leaf-1"),
 		false,
 		"stale path binding is removed before the editor update phase",
+	);
+	await Promise.resolve();
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 25a: stale path bindings block late non-user projections ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	binding.view.file = { path: "Notes/next.md" };
+	const result = (manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch({
+		docChanged: true,
+		startState: binding.cm.state,
+		annotation: () => null,
+		isUserEvent: () => false,
+	});
+	assertEq(result !== null, true, "late non-user projection is replaced by a detach effect");
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has("leaf-1"),
+		false,
+		"stale path binding is removed before a late A projection can reach B",
 	);
 	await Promise.resolve();
 	clearPendingHealthChecks(manager);
@@ -4552,161 +4603,6 @@ console.log("\n--- Test 29: rapid same-leaf switch binds the replacement without
 	assertEq(scrollDOM.scrollTop, 840, "binding reconfigure leaves scrollTop untouched");
 	assertEq(replacementState.facet(ySyncFacet)?.ytext, nextText, "replacement CM receives the new file Y.Text");
 	nextDoc.destroy();
-	clearPendingHealthChecks(manager);
-}
-
-console.log("\n--- Test 30: transition waits for the active IME composition before settling A ---");
-{
-	const order: string[] = [];
-	let inputWasBlockedAtSettlement = false;
-	let fixtureManager: EditorBindingManager | null = null;
-	let fixtureView: unknown = null;
-	const boundary: EditorTransitionBoundaryDeps = {
-		settleOpenExternalEdit: async () => {
-			inputWasBlockedAtSettlement = (
-				fixtureManager as unknown as { transitionBlockedViews: Set<unknown> }
-			).transitionBlockedViews.has(fixtureView);
-			order.push("external-settled");
-			return true;
-		},
-		flushOpenPath: async () => {
-			order.push("source-flushed");
-		},
-		admitTargetFromDisk: async () => true,
-	};
-	const { manager, binding } = buildManagerFixture({
-		lastEditorChangeAgeMs: 0,
-		lastEditorDocChangeAgeMs: 0,
-		editorTransitionBoundary: boundary,
-	});
-	fixtureManager = manager;
-	fixtureView = binding.view;
-	(manager as unknown as { handleCompositionStart: (cm: unknown) => boolean })
-		.handleCompositionStart(binding.cm);
-	const settlement = (manager as unknown as {
-		settleAndDetachTransitionSource: (
-			view: unknown,
-			path: string,
-			generation: number,
-			reason: string,
-		) => Promise<void>;
-	}).settleAndDetachTransitionSource(binding.view, binding.path, 1, "test");
-	await Promise.resolve();
-	assertEq(order.length, 0, "A settlement does not start while its IME composition is active");
-	(manager as unknown as { handleCompositionEnd: (cm: unknown) => boolean })
-		.handleCompositionEnd(binding.cm);
-	await settlement;
-	assertEq(inputWasBlockedAtSettlement, true, "new input is gated before external settlement starts");
-	assertEq(order.join(","), "external-settled,source-flushed", "A settles externally before its final flush");
-	assertEq(
-		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has("leaf-1"),
-		false,
-		"A is detached only after composition, external settlement, and flush complete",
-	);
-	clearPendingHealthChecks(manager);
-}
-
-console.log("\n--- Test 31: transition gate rejects post-click input without replay ---");
-{
-	const { manager, binding } = buildManagerFixture({
-		lastEditorChangeAgeMs: 10_000,
-		lastEditorDocChangeAgeMs: 10_000,
-	});
-	const state = EditorState.create({ doc: "A" });
-	(binding.cm as unknown as { state: EditorState }).state = state;
-	(manager as unknown as { transitionBlockedViews: Set<unknown> })
-		.transitionBlockedViews.add(binding.view);
-	const input = state.update({
-		changes: { from: 1, insert: "post-click" },
-		annotations: Transaction.userEvent.of("input.type"),
-	});
-	const filtered = (manager as unknown as {
-		filterRiskyNonUserPatch: (transaction: Transaction) => unknown;
-	}).filterRiskyNonUserPatch(input);
-	assertEq(Array.isArray(filtered), true, "post-click input is cancelled by the transition gate");
-	assertEq((filtered as unknown[]).length, 0, "cancelled input creates no replay payload");
-
-	const internals = manager as unknown as {
-		transitionBlockedViews: Set<unknown>;
-		transitionGuards: Map<unknown, {
-			snapshot(): { phase: "source-settling" };
-		}>;
-		handleCompositionStart(cm: unknown): boolean;
-		handleCompositionEnd(cm: unknown): boolean;
-		filterRiskyNonUserPatch(transaction: Transaction): unknown;
-	};
-	internals.transitionBlockedViews.clear();
-	internals.transitionGuards.set(binding.view, {
-		snapshot: () => ({ phase: "source-settling" }),
-	});
-	const intentBlocked = internals.filterRiskyNonUserPatch(input);
-	assertEq(
-		Array.isArray(intentBlocked),
-		true,
-		"the synchronous unload intent blocks new input before async settlement starts",
-	);
-	internals.handleCompositionStart(binding.cm);
-	const compositionCommit = state.update({
-		changes: { from: 1, insert: "한" },
-		annotations: Transaction.userEvent.of("input.type.compose"),
-	});
-	const compositionAllowed = internals.filterRiskyNonUserPatch(compositionCommit);
-	assertEq(
-		compositionAllowed,
-		compositionCommit,
-		"the composition that was already active at click time may finish in A",
-	);
-	internals.handleCompositionEnd(binding.cm);
-	await Promise.resolve();
-	internals.transitionGuards.clear();
-	clearPendingHealthChecks(manager);
-}
-
-console.log("\n--- Test 32: retired A projection is blocked while an unrelated B load remains allowed ---");
-{
-	const { manager, binding } = buildManagerFixture({
-		lastEditorChangeAgeMs: 10_000,
-		lastEditorDocChangeAgeMs: 10_000,
-	});
-	const sourceConfig = new YSyncConfig(binding.ytext, {});
-	const sourceState = EditorState.create({
-		doc: "A source",
-		extensions: ySyncFacet.of(sourceConfig),
-	});
-	(binding.cm as unknown as { state: EditorState }).state = sourceState;
-	(manager as unknown as {
-		retireTransitionSyncFacet: (view: unknown, binding: unknown, generation: number) => void;
-	}).retireTransitionSyncFacet(binding.view, binding, 1);
-	const staleSourceProjection = sourceState.update({
-		changes: { from: 0, to: sourceState.doc.length, insert: "late A provider patch" },
-	});
-	const blocked = (manager as unknown as {
-		filterRiskyNonUserPatch: (transaction: Transaction) => unknown;
-	}).filterRiskyNonUserPatch(staleSourceProjection);
-	assertEq(Array.isArray(blocked), true, "late projection carrying A's retired facet is cancelled");
-	assertEq((blocked as unknown[]).length, 0, "late A content cannot become B editor content");
-
-	(manager as unknown as { bindings: Map<string, unknown> }).bindings.clear();
-	const targetDoc = new Y.Doc();
-	const targetText = targetDoc.getText("target");
-	targetText.insert(0, "B disk content");
-	const targetState = EditorState.create({
-		doc: "B before host load",
-		extensions: ySyncFacet.of(new YSyncConfig(targetText, {})),
-	});
-	const hostTargetLoad = targetState.update({
-		changes: {
-			from: 0,
-			to: targetState.doc.length,
-			insert: "B disk content",
-		},
-		annotations: Transaction.userEvent.of("set"),
-	});
-	const allowed = (manager as unknown as {
-		filterRiskyNonUserPatch: (transaction: Transaction) => unknown;
-	}).filterRiskyNonUserPatch(hostTargetLoad);
-	assertEq(allowed, hostTargetLoad, "B host load with a distinct facet remains allowed");
-	targetDoc.destroy();
 	clearPendingHealthChecks(manager);
 }
 

@@ -5,6 +5,7 @@
 
 import { type App } from "obsidian";
 import type { KaosQaDebugApi } from "../../src/qaDebugApi";
+import { isMarkdownConflictArtifactPath } from "../../src/paths/conflictArtifactPath";
 
 export class AssertionError extends Error {
 	constructor(message: string) {
@@ -76,8 +77,9 @@ export async function assertNoConflictCopies(app: App, dir = ""): Promise<void> 
 	const conflicts = allFiles.filter((p) => {
 		if (dir && !p.startsWith(dir)) return false;
 		// Obsidian conflict pattern: "file (device's conflicted copy YYYY-MM-DD).ext"
-		// or KAOS pattern: "file.conflict.md", "file (conflict).md"
+		// plus canonical and legacy KAOS conflict paths.
 		return (
+			isMarkdownConflictArtifactPath(p) ||
 			p.includes(" (conflict") ||
 			p.includes(".conflict.") ||
 			/\s\([^)]+conflicted copy[^)]*\)/.test(p)

@@ -5,16 +5,17 @@
  * Usage:
  *   bun run qa/controllers/open-external-merge.ts \
  *     --port 9222 --vault /path/to/disposable-vault [--out-dir qa-runs] \
- *     [--case clean|same-line|representation|cursor|soak]
+ *     [--case clean|same-line|representation|cursor|quickadd-burst|quickadd-heading|soak]
  */
 
 import { resolve } from "path";
+import { isMarkdownConflictArtifactPath } from "../../src/paths/conflictArtifactPath";
 import { ArtifactCollector } from "./collect-artifacts";
-import { ObsidianClient } from "./obsidian-client";
+import { RawCdpObsidianClient as ObsidianClient } from "./obsidian-client-raw-cdp";
 
 const SCENARIO = "open-external-merge";
 const TARGET = "QA-scratch/open-external-merge.md";
-const ARTIFACT_PREFIX = "QA-scratch/open-external-merge (KAOS conflict - disk";
+const ARTIFACT_PREFIX = "QA-scratch/open-external-merge (KAOS conflict";
 const OBSERVE_TIMEOUT_MS = 30_000;
 
 interface FileState {
@@ -85,7 +86,7 @@ async function waitFor<T>(
 }
 
 async function readState(client: ObsidianClient): Promise<FileState> {
-	return client.evalRaw<FileState>(`
+	const state = await client.evalRaw<FileState>(`
 		(async () => {
 			const app = window.app;
 			const debug = window.__KAOS_DEBUG__;
@@ -122,6 +123,9 @@ async function readState(client: ObsidianClient): Promise<FileState> {
 			};
 		})()
 	`);
+	state.artifacts = state.artifacts.filter((artifact) =>
+		isMarkdownConflictArtifactPath(artifact.path));
+	return state;
 }
 
 function isConverged(state: FileState, expected: string, artifactCount = 0): boolean {
@@ -141,6 +145,28 @@ async function waitForConvergence(
 ): Promise<FileState> {
 	return waitFor(label, () => readState(client), (state) =>
 		isConverged(state, expected, artifactCount));
+}
+
+async function assertConvergenceRemainsStable(
+	client: ObsidianClient,
+	label: string,
+	expected: string,
+	settled: FileState,
+	durationMs = 3_500,
+): Promise<void> {
+	const deadline = Date.now() + durationMs;
+	while (Date.now() < deadline) {
+		const state = await readState(client);
+		if (
+			!isConverged(state, expected) ||
+			state.diskHash !== settled.diskHash ||
+			state.crdtHash !== settled.crdtHash ||
+			state.editorHash !== settled.editorHash
+		) {
+			throw new Error(`${label} rolled back after convergence: ${JSON.stringify(state)}`);
+		}
+		await delay(200);
+	}
 }
 
 async function waitForEditorAuthority(
@@ -394,6 +420,111 @@ async function runCursorScrollUndo(
 	}
 }
 
+async function runQuickAddBurst(client: ObsidianClient): Promise<void> {
+	const baseline = "# QuickAdd burst\n\n## Captures\n";
+	const additions = [
+		"- capture one\n",
+		"- capture two\n",
+		"- capture three\n",
+	];
+	const expected = baseline + additions.join("");
+	await prepareCase(client, baseline);
+
+	const processInputs = await client.evalRaw<string[]>(`
+		(async () => {
+			const app = window.app;
+			if (!app) throw new Error("Obsidian app unavailable");
+			const path = ${JSON.stringify(TARGET)};
+			const additions = ${JSON.stringify(additions)};
+			const inputs = [];
+			for (const addition of additions) {
+				const file = app.vault.getFileByPath(path);
+				if (!file) throw new Error("QuickAdd target disappeared");
+				await app.vault.process(file, (current) => {
+					inputs.push(current);
+					return current + addition;
+				});
+				await new Promise((resolveDelay) => setTimeout(resolveDelay, 75));
+			}
+			return inputs;
+		})()
+	`);
+	let expectedInput = baseline;
+	for (let index = 0; index < additions.length; index += 1) {
+		if (processInputs[index] !== expectedInput) {
+			throw new Error(
+				`QuickAdd burst ${index + 1} observed stale input: ` +
+				JSON.stringify(processInputs[index]),
+			);
+		}
+		expectedInput += additions[index];
+	}
+
+	const settled = await waitForConvergence(client, "QuickAdd burst convergence", expected);
+	await assertConvergenceRemainsStable(
+		client,
+		"QuickAdd burst",
+		expected,
+		settled,
+	);
+}
+
+async function runQuickAddHeadingInsertion(client: ObsidianClient): Promise<void> {
+	const baseline = [
+		"# Daily note",
+		"",
+		"## Captures",
+		"- existing capture",
+		"",
+		"## Completed",
+		"- existing completion",
+		"",
+	].join("\n");
+	const heading = "## Captures\n";
+	const insertion = "- inserted under heading\n";
+	const insertionOffset = baseline.indexOf(heading) + heading.length;
+	const expected = baseline.slice(0, insertionOffset) + insertion + baseline.slice(insertionOffset);
+	await prepareCase(client, baseline);
+
+	const processInput = await client.evalRaw<string>(`
+		(async () => {
+			const app = window.app;
+			if (!app) throw new Error("Obsidian app unavailable");
+			const path = ${JSON.stringify(TARGET)};
+			const file = app.vault.getFileByPath(path);
+			if (!file) throw new Error("QuickAdd target disappeared");
+			const heading = ${JSON.stringify(heading)};
+			const insertion = ${JSON.stringify(insertion)};
+			let input = null;
+			await app.vault.process(file, (current) => {
+				input = current;
+				const first = current.indexOf(heading);
+				if (first < 0 || current.indexOf(heading, first + heading.length) >= 0) {
+					throw new Error("QuickAdd heading must occur exactly once");
+				}
+				const offset = first + heading.length;
+				return current.slice(0, offset) + insertion + current.slice(offset);
+			});
+			return input;
+		})()
+	`);
+	if (processInput !== baseline) {
+		throw new Error(`QuickAdd heading insertion observed stale input: ${JSON.stringify(processInput)}`);
+	}
+
+	const settled = await waitForConvergence(
+		client,
+		"QuickAdd heading insertion convergence",
+		expected,
+	);
+	await assertConvergenceRemainsStable(
+		client,
+		"QuickAdd heading insertion",
+		expected,
+		settled,
+	);
+}
+
 async function runAlternatingSoak(
 	client: ObsidianClient,
 	vaultPath: string,
@@ -476,6 +607,8 @@ async function main(): Promise<number> {
 			["same-line", "same-line conflict", () => runSameLineConflict(client, vaultPath)],
 			["representation", "CRLF/BOM representation", () => runRepresentationOnly(client, vaultPath)],
 			["cursor", "cursor, scroll, and undo", () => runCursorScrollUndo(client, vaultPath)],
+			["quickadd-burst", "QuickAdd three-write burst", () => runQuickAddBurst(client)],
+			["quickadd-heading", "QuickAdd heading insertion", () => runQuickAddHeadingInsertion(client)],
 			["soak", "50-cycle alternating soak", () => runAlternatingSoak(client, vaultPath)],
 		];
 		const requestedCase = args.case;

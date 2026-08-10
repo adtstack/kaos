@@ -1078,7 +1078,11 @@ console.log("\n--- Open reconcile: programmatic editor successor replaces a defe
 			current: unknown,
 			contents: string[],
 			readComplete: boolean,
-		): { kind: string; advancedEditorContents: string[] };
+		): {
+			kind: string;
+			advancedEditorContents: string[];
+			provenNoEditorAuthorityAdvance: boolean;
+		};
 		captureVisibleAuthorityAtDirtyAdmission(
 			path: string,
 			reason: "modify",
@@ -1204,6 +1208,155 @@ console.log("\n--- Open reconcile: programmatic editor successor replaces a defe
 	artifacts.clear();
 	markerRecords.length = 0;
 	activeAttentionReason = null;
+	const providerDiskSuccessorContent = "provider/disk successor document\n";
+	const aliasCapturedTicket = {
+		...capturedTicket,
+		views: [{
+			...capturedTicket.views[0]!,
+			editorContent: crdtContent,
+		}],
+	};
+	currentTicket = aliasCapturedTicket;
+	internals.captureVisibleAuthorityAtDirtyAdmission(path, "modify");
+	const capturedAliasMarker = internals.visibleAuthorityDeferredPaths.get(path);
+	assert(
+		capturedAliasMarker?.readComplete === true &&
+		capturedAliasMarker.editorContents.length === 1 &&
+		capturedAliasMarker.editorContents[0] === crdtContent &&
+		capturedAliasMarker.capturedCrdtContent === crdtContent,
+		"dirty admission retains a CRDT alias long enough to detect a later editor-origin advance",
+	);
+	// This models a same-file Vault write projected through Y.Text into the
+	// already-open CodeMirror document. The provider patch advances the general
+	// editor revision, but it is not a new editor-origin authority revision.
+	liveEditorContent = providerDiskSuccessorContent;
+	currentTicket = {
+		...liveTicket,
+		views: [{
+			...liveTicket.views[0]!,
+			editorRevision: 1,
+			editorAuthorityRevision: 0,
+			editorAuthorityContent: null,
+			editorContent: providerDiskSuccessorContent,
+		}],
+	};
+	ytext.delete(0, ytext.length);
+	ytext.insert(0, providerDiskSuccessorContent);
+	// A second same-path Vault event can be admitted before the first one drains.
+	// Its provider-projected editor document is the new CRDT alias, not a second
+	// independent editor candidate.
+	internals.captureVisibleAuthorityAtDirtyAdmission(path, "modify");
+	const recapturedAliasMarker = internals.visibleAuthorityDeferredPaths.get(path);
+	assert(
+		recapturedAliasMarker?.readComplete === true &&
+		recapturedAliasMarker.editorContents.length === 1 &&
+		recapturedAliasMarker.editorContents[0] === providerDiskSuccessorContent &&
+		recapturedAliasMarker.capturedCrdtContent === providerDiskSuccessorContent,
+		"back-to-back dirty admissions replace an older CRDT alias instead of accumulating candidates",
+	);
+	const aliasOutcome = await internals.handleBoundFileSyncGap(
+		file,
+		providerDiskSuccessorContent,
+		ytext,
+		[view],
+		"modify",
+		{ mtime: 42, size: providerDiskSuccessorContent.length },
+	);
+	assertEqual(aliasOutcome.kind, "handled", "provider/disk successor settles a captured CRDT alias");
+	assertEqual(
+		ytext.toString(),
+		providerDiskSuccessorContent,
+		"provider/disk successor remains the converged CRDT value",
+	);
+	assertEqual(artifacts.size, 0, "captured CRDT alias creates no editor conflict artifact");
+	assertEqual(markerRecords.length, 0, "captured CRDT alias creates no durable quarantine");
+	assert(
+		!internals.visibleAuthorityDeferredPaths.has(path),
+		"provider/disk/editor convergence retires the captured CRDT alias",
+	);
+
+	ytext.delete(0, ytext.length);
+	ytext.insert(0, crdtContent);
+	liveEditorContent = diskContent;
+	currentTicket = aliasCapturedTicket;
+	internals.captureVisibleAuthorityAtDirtyAdmission(path, "modify");
+	const missingEditorSnapshotContent = "provider after an unobserved editor advance\n";
+	const missingEditorSnapshotTicket = {
+		...liveTicket,
+		views: [{
+			...liveTicket.views[0]!,
+			editorRevision: 2,
+			editorAuthorityRevision: 1,
+			editorAuthorityContent: null,
+			editorContent: missingEditorSnapshotContent,
+		}],
+	};
+	const missingSnapshotProgress = internals.classifyVisibleAuthorityTicketProgress(
+		aliasCapturedTicket,
+		missingEditorSnapshotTicket,
+		[missingEditorSnapshotContent],
+		true,
+	);
+	assert(
+		missingSnapshotProgress.kind === "not-successor" &&
+		missingSnapshotProgress.advancedEditorContents.length === 0 &&
+		missingSnapshotProgress.provenNoEditorAuthorityAdvance === false,
+		"an advanced authority revision without exact content cannot prove a provider-only projection",
+	);
+	liveEditorContent = missingEditorSnapshotContent;
+	currentTicket = missingEditorSnapshotTicket;
+	ytext.delete(0, ytext.length);
+	ytext.insert(0, missingEditorSnapshotContent);
+	const missingSnapshotDirectOutcome = await internals.handleBoundFileSyncGap(
+		file,
+		missingEditorSnapshotContent,
+		ytext,
+		[view],
+		"modify",
+		{ mtime: 43, size: missingEditorSnapshotContent.length },
+	);
+	const missingSnapshotDirectMarker = internals.visibleAuthorityDeferredPaths.get(path);
+	assertEqual(
+		missingSnapshotDirectOutcome.kind,
+		"handled",
+		"direct re-plan fails closed when editor-origin provenance is incomplete",
+	);
+	assert(
+		missingSnapshotDirectMarker?.readComplete === false &&
+		missingSnapshotDirectMarker.editorContents.includes(crdtContent) &&
+		missingSnapshotDirectMarker.editorContents.includes(missingEditorSnapshotContent) &&
+		[...artifacts.values()].includes(crdtContent),
+		"direct re-plan preserves the old alias instead of retiring across an unproven authority advance",
+	);
+	internals.visibleAuthorityDeferredPaths.delete(path);
+	artifacts.clear();
+	markerRecords.length = 0;
+	activeAttentionReason = null;
+	ytext.delete(0, ytext.length);
+	ytext.insert(0, crdtContent);
+	liveEditorContent = diskContent;
+	currentTicket = aliasCapturedTicket;
+	internals.captureVisibleAuthorityAtDirtyAdmission(path, "modify");
+	liveEditorContent = missingEditorSnapshotContent;
+	currentTicket = missingEditorSnapshotTicket;
+	ytext.delete(0, ytext.length);
+	ytext.insert(0, missingEditorSnapshotContent);
+	internals.captureVisibleAuthorityAtDirtyAdmission(path, "modify");
+	const missingSnapshotMarker = internals.visibleAuthorityDeferredPaths.get(path);
+	assert(
+		missingSnapshotMarker?.readComplete === false &&
+		missingSnapshotMarker.editorContents.includes(crdtContent) &&
+		missingSnapshotMarker.editorContents.includes(missingEditorSnapshotContent),
+		"missing editor-origin provenance remains fail-closed instead of recapturing a CRDT alias",
+	);
+	internals.visibleAuthorityDeferredPaths.delete(path);
+	ytext.delete(0, ytext.length);
+	ytext.insert(0, crdtContent);
+	liveEditorContent = diskContent;
+
+	artifacts.clear();
+	markerRecords.length = 0;
+	activeAttentionReason = null;
 	const providerVisibleContent = "provider-only visible document\n";
 	liveEditorContent = providerVisibleContent;
 	currentTicket = {
@@ -1226,6 +1379,10 @@ console.log("\n--- Open reconcile: programmatic editor successor replaces a defe
 		capturedEditorTicket: capturedTicket,
 		capturedAt: Date.now() - 1,
 	});
+	assert(
+		capturedEditorContent !== crdtContent,
+		"the provider-only quarantine case starts with a genuine editor-only snapshot",
+	);
 	internals.captureVisibleAuthorityAtDirtyAdmission(path, "modify");
 	const providerAdmissionMarker = internals.visibleAuthorityDeferredPaths.get(path);
 	assert(
@@ -1278,8 +1435,10 @@ console.log("\n--- Open reconcile: programmatic editor successor replaces a defe
 			editorContent: laterProviderContent,
 		}],
 	};
+	ytext.delete(0, ytext.length);
+	ytext.insert(0, laterProviderContent);
 	internals.visibleAuthorityDeferredPaths.set(path, {
-		editorContents: [capturedEditorContent],
+		editorContents: [crdtContent],
 		readComplete: true,
 		capturedDiskContent: diskContent,
 		capturedCrdtContent: crdtContent,
@@ -1292,10 +1451,10 @@ console.log("\n--- Open reconcile: programmatic editor successor replaces a defe
 	const interleavedMarker = internals.visibleAuthorityDeferredPaths.get(path);
 	assert(
 		interleavedMarker?.readComplete === false &&
-		!interleavedMarker.editorContents.includes(capturedEditorContent) &&
+		!interleavedMarker.editorContents.includes(crdtContent) &&
 		interleavedMarker.editorContents.includes(interveningLocalContent) &&
 		interleavedMarker.editorContents.includes(laterProviderContent),
-		"A -> B(local) -> C(provider) replaces superseded A and retains exact B/C candidates",
+		"A(alias) -> B(local) -> C(provider) replaces superseded A and retains exact B/C candidates",
 	);
 	const retainedTicketView = (
 		interleavedMarker?.capturedEditorTicket as { views?: Array<Record<string, unknown>> } | null

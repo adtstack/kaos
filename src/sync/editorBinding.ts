@@ -9,14 +9,9 @@ import {
 import { EditorView, ViewPlugin, type ViewUpdate } from "@codemirror/view";
 import { yCollab, ySyncFacet } from "y-codemirror.next";
 import * as Y from "yjs";
-import { Notice, type MarkdownView, type TFile } from "obsidian";
+import { Notice, type MarkdownView } from "obsidian";
 import type { VaultSync } from "./vaultSync";
 import { applyDiffToYText } from "./diff";
-import {
-	installEditorTransitionGuard,
-	type EditorTransitionGuard,
-	type EditorTransitionPhase,
-} from "./editorTransitionGuard";
 import type { TraceRecord } from "../observability/traceContext";
 import type { ProductFlightPathEventInput } from "../observability/traceSink";
 import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
@@ -150,6 +145,27 @@ export interface ExternalDiskMutationNotice {
 	observedAt: number;
 	/** Exact raw text read while the event's TFile identity/stat remained current. */
 	content: string | null;
+	/**
+	 * Primitive snapshot of every open editor at event admission. Reconciliation
+	 * may use two complete snapshots to prove that a newer disk revision either
+	 * superseded or already adopted an earlier revision. Missing proof preserves.
+	 */
+	editorAuthorityLineage?: ExternalDiskMutationEditorAuthorityLineage | null;
+}
+
+export interface ExternalDiskMutationEditorAuthorityLineageView {
+	readonly viewId: string;
+	readonly leafId: string;
+	readonly cmId: string;
+	readonly bindingEpoch: number;
+	readonly editorRevision: number;
+	readonly editorAuthorityRevision: number;
+	readonly editorContent: string;
+}
+
+export interface ExternalDiskMutationEditorAuthorityLineage {
+	readonly path: string;
+	readonly views: readonly ExternalDiskMutationEditorAuthorityLineageView[];
 }
 
 export type InterceptedExternalDiskMutation = Readonly<
@@ -323,29 +339,9 @@ export interface BindingPropagationGate {
 	): void;
 }
 
-/**
- * Narrow lifecycle boundary used only while a TextFileView changes files.
- *
- * The owner remains responsible for disk/CRDT policy. The binding manager only
- * orders those existing operations around Obsidian's public unload/load hooks;
- * it does not retain a journal, replay input, or recover an older editor state.
- */
-export interface EditorTransitionBoundaryDeps {
-	settleOpenExternalEdit(path: string): Promise<boolean>;
-	flushOpenPath(path: string, reason: string): Promise<void>;
-	admitTargetFromDisk(file: TFile): Promise<boolean>;
-}
-
-interface ActiveEditorComposition {
-	readonly settled: Promise<void>;
-	resolve(): void;
-}
-
 export class EditorBindingManager {
 	/** The CM6 compartment that holds yCollab for each editor. */
 	readonly compartment = new Compartment();
-	/** Temporarily makes a transitioning TextFileView read-only. */
-	private readonly transitionInputCompartment = new Compartment();
 
 	/** Track which views are currently bound. Keyed by MarkdownView leaf id. */
 	private bindings = new Map<string, EditorBinding>();
@@ -382,12 +378,6 @@ export class EditorBindingManager {
 	private recentEditorOriginChanges = new Map<string, RecentEditorOriginChange>();
 	private lastExternalDiskMutationSequenceByPath = new Map<string, number>();
 	private observedExternalDiskMutationSequenceByPath = new Map<string, number>();
-	private readonly transitionGuards = new Map<MarkdownView, EditorTransitionGuard>();
-	private readonly transitionUnsupportedViews = new WeakSet<MarkdownView>();
-	private readonly transitionBlockedViews = new Set<MarkdownView>();
-	private readonly retiredTransitionSyncFacets = new Map<MarkdownView, Map<unknown, string>>();
-	private readonly activeCompositions = new WeakMap<EditorView, ActiveEditorComposition>();
-
 	private readonly debug: boolean;
 
 	constructor(
@@ -402,7 +392,6 @@ export class EditorBindingManager {
 			candidate: InterceptedExternalDiskMutation,
 		) => void,
 		private readonly isExternalDiskReloadGuardEnabled: () => boolean = () => true,
-		private readonly editorTransitionBoundary?: EditorTransitionBoundaryDeps,
 	) {
 		this.debug = debug;
 		// Register the reconfigure hook so the harness can trigger CM extension
@@ -446,11 +435,8 @@ export class EditorBindingManager {
 		const filterRiskyNonUserPatch = this.filterRiskyNonUserPatch.bind(this);
 		const annotateEditorDocumentOrigin = this.annotateEditorDocumentOrigin.bind(this);
 		const fenceStaleUserBinding = this.fenceStaleUserBinding.bind(this);
-		const handleCompositionStart = this.handleCompositionStart.bind(this);
-		const handleCompositionEnd = this.handleCompositionEnd.bind(this);
 		return [
 			this.compartment.of([]),
-			this.transitionInputCompartment.of([]),
 			// Guard y-codemirror document patches that would replay a local repair
 			// over an actively edited note. The actual local-edit tracking lives
 			// in the ViewPlugin below; this filter runs before the patch reaches
@@ -460,10 +446,6 @@ export class EditorBindingManager {
 			// `filter: false`, so provenance attached here reaches the final update.
 			EditorState.transactionExtender.of(annotateEditorDocumentOrigin),
 			EditorState.transactionExtender.of(fenceStaleUserBinding),
-			EditorView.domEventHandlers({
-				compositionstart: (_event, view) => handleCompositionStart(view),
-				compositionend: (_event, view) => handleCompositionEnd(view),
-			}),
 			ViewPlugin.fromClass(
 				class {
 					constructor(readonly view: EditorView) {
@@ -711,16 +693,6 @@ export class EditorBindingManager {
 		if (!file) return;
 
 		if (!this.canBindPath(view, "bind")) return;
-		if (!this.ensureEditorTransitionGuard(view)) return;
-		const transition = this.transitionGuards.get(view)?.snapshot();
-		if (transition && transition.phase !== "idle" && transition.phase !== "inert") {
-			this.trace?.("editor", "binding-deferred-for-editor-transition", {
-				path: file.path,
-				phase: transition.phase,
-				generation: transition.generation,
-			});
-			return;
-		}
 
 		const leafId = (view.leaf as unknown as { id: string }).id ?? file.path;
 		const existing = this.bindings.get(leafId);
@@ -810,14 +782,9 @@ export class EditorBindingManager {
 			deviceName,
 			"bind",
 		);
-		if (!target) {
-			if (this.transitionBlockedViews.has(view)) {
-				this.scheduleCmResolveRetry(view, deviceName, leafId, "transition-target-not-ready");
-			}
-			return;
-		}
+		if (!target) return;
 
-		const applied = this.applyBinding({
+		this.applyBinding({
 			action: "bind",
 			deviceName,
 			view,
@@ -829,11 +796,6 @@ export class EditorBindingManager {
 			fileId: target.fileId,
 			rapidSwitch,
 		});
-		if (applied && this.transitionBlockedViews.has(view)) {
-			this.setTransitionInputBlocked(view, false, "target-bound");
-		} else if (this.transitionBlockedViews.has(view)) {
-			this.scheduleCmResolveRetry(view, deviceName, leafId, "transition-bind-apply");
-		}
 	}
 
 	repair(view: MarkdownView, deviceName: string, reason: string): boolean {
@@ -1040,40 +1002,7 @@ export class EditorBindingManager {
 		this.recentEditorOriginChanges.clear();
 		this.lastExternalDiskMutationSequenceByPath.clear();
 		this.observedExternalDiskMutationSequenceByPath.clear();
-		for (const guard of this.transitionGuards.values()) {
-			guard.restore();
-		}
-		this.transitionGuards.clear();
-		this.transitionBlockedViews.clear();
-		this.retiredTransitionSyncFacets.clear();
-		for (const cm of this.knownCmViews) {
-			const composition = this.activeCompositions.get(cm);
-			if (composition) {
-				this.activeCompositions.delete(cm);
-				composition.resolve();
-			}
-			try {
-				cm.dispatch({ effects: this.transitionInputCompartment.reconfigure([]) });
-			} catch {
-				// View may already be destroyed.
-			}
-		}
 		this.clearLocalPresence("unbind-all");
-	}
-
-	/** Release instance-level lifecycle wrappers after a MarkdownView leaves the workspace. */
-	pruneTransitionViews(liveViews: ReadonlySet<MarkdownView>): number {
-		let pruned = 0;
-		for (const [view, guard] of this.transitionGuards) {
-			if (liveViews.has(view)) continue;
-			guard.restore();
-			this.transitionGuards.delete(view);
-			this.transitionBlockedViews.delete(view);
-			this.retiredTransitionSyncFacets.delete(view);
-			this.transitionUnsupportedViews.delete(view);
-			pruned += 1;
-		}
-		return pruned;
 	}
 
 	/**
@@ -1232,6 +1161,47 @@ export class EditorBindingManager {
 			}
 		}
 		return latest;
+	}
+
+	/**
+	 * Capture only immutable editor lineage. Live MarkdownView/EditorView objects
+	 * must never escape into an asynchronous disk candidate.
+	 */
+	captureExternalDiskMutationEditorAuthorityLineage(
+		path: string,
+		views: readonly MarkdownView[],
+	): ExternalDiskMutationEditorAuthorityLineage | null {
+		if (views.length === 0) return null;
+		const ticket = this.captureOpenEditorMutationTicket(path, views);
+		const seenLeafIds = new Set<string>();
+		const snapshots: ExternalDiskMutationEditorAuthorityLineageView[] = [];
+		for (const snapshot of ticket.views) {
+			if (
+				snapshot.view.file?.path !== path ||
+				snapshot.cm === null ||
+				snapshot.cmId === null ||
+				snapshot.editorContent === null ||
+				seenLeafIds.has(snapshot.leafId)
+			) {
+				return null;
+			}
+			seenLeafIds.add(snapshot.leafId);
+			snapshots.push(Object.freeze({
+				viewId: snapshot.viewId,
+				leafId: snapshot.leafId,
+				cmId: snapshot.cmId,
+				bindingEpoch: snapshot.bindingEpoch,
+				editorRevision: snapshot.editorRevision,
+				editorAuthorityRevision: snapshot.editorAuthorityRevision,
+				editorContent: snapshot.editorContent,
+			}));
+		}
+		if (snapshots.length !== views.length) return null;
+		snapshots.sort((left, right) => left.leafId.localeCompare(right.leafId));
+		return Object.freeze({
+			path,
+			views: Object.freeze(snapshots),
+		});
 	}
 
 	/**
@@ -1652,314 +1622,11 @@ export class EditorBindingManager {
 		return viewId;
 	}
 
-	private ensureEditorTransitionGuard(view: MarkdownView): boolean {
-		if (!this.editorTransitionBoundary) return true;
-		if (this.transitionUnsupportedViews.has(view)) return false;
-		if (this.transitionGuards.has(view)) return true;
-
-		const installed = installEditorTransitionGuard(view, {
-			beforeSourceUnload: async ({ sourceFile, generation }) => {
-				await this.settleAndDetachTransitionSource(
-					view,
-					sourceFile.path,
-					generation,
-					"source-unload",
-				);
-			},
-			afterSourceUnload: ({ sourceFile, generation }) => {
-				this.trace?.("editor", "editor-transition-source-unloaded", {
-					path: sourceFile.path,
-					generation,
-				});
-			},
-			beforeTargetLoad: async ({ targetFile, generation }) => {
-				const existing = this.getBindingForView(view);
-				if (existing) {
-					await this.settleAndDetachTransitionSource(
-						view,
-						existing.path,
-						generation,
-						"target-load-with-live-source",
-					);
-				} else {
-					this.setTransitionInputBlocked(view, true, "target-load");
-				}
-				if (!this.isMarkdownPathSyncable(targetFile.path)) return;
-				const admitted = await this.editorTransitionBoundary!.admitTargetFromDisk(targetFile);
-				if (!admitted) {
-					throw new Error(`target admission did not settle for ${targetFile.path}`);
-				}
-			},
-			afterTargetLoad: async ({ targetFile, generation }) => {
-				this.trace?.("editor", "editor-transition-target-loaded", {
-					path: targetFile.path,
-					generation,
-				});
-				if (!this.isMarkdownPathSyncable(targetFile.path)) {
-					this.setTransitionInputBlocked(view, false, "target-excluded");
-					return;
-				}
-				// The guard becomes idle after this callback resolves. A macrotask keeps
-				// input gated until bind() has attached the exact B document.
-				setTimeout(() => this.bind(view, this.lastDeviceName), 0);
-			},
-			onSaveSuppressed: ({ phase, file, clear }) => {
-				this.trace?.("editor", "editor-transition-save-suppressed", {
-					path: file?.path ?? null,
-					phase,
-					clear,
-				});
-			},
-			onFailure: ({ phase, generation, error }) => {
-				this.handleEditorTransitionFailure(view, phase, generation, error);
-			},
-		});
-		if (installed.kind === "unsupported") {
-			this.transitionUnsupportedViews.add(view);
-			this.unbind(view);
-			this.trace?.("editor", "editor-transition-guard-unsupported", {
-				path: view.file?.path ?? null,
-				reason: installed.reason,
-			});
-			new Notice(
-				"KAOS: this editor cannot provide a safe note-switch boundary. " +
-				"Live collaboration is disabled for this pane; background sync continues.",
-				10000,
-			);
-			return false;
-		}
-
-		this.transitionGuards.set(view, installed.guard);
-		return true;
-	}
-
-	private getBindingForView(view: MarkdownView): EditorBinding | null {
-		const leafId =
-			(view.leaf as unknown as { id?: string }).id ?? view.file?.path ?? null;
-		if (leafId) {
-			const exact = this.bindings.get(leafId);
-			if (exact?.view === view) return exact;
-		}
-		for (const binding of this.bindings.values()) {
-			if (binding.view === view) return binding;
-		}
-		return null;
-	}
-
-	private async settleAndDetachTransitionSource(
-		view: MarkdownView,
-		sourcePath: string,
-		generation: number,
-		reason: string,
-	): Promise<void> {
-		const binding = this.getBindingForView(view);
-		if (binding && binding.path !== sourcePath) {
-			throw new Error(
-				`source binding changed before transition settlement (${binding.path} != ${sourcePath})`,
-			);
-		}
-		const sourceCm = binding?.cm ?? this.getCmView(view);
-		if (sourceCm) await this.finishActiveComposition(sourceCm, sourcePath);
-		this.setTransitionInputBlocked(view, true, reason);
-		if (!this.isMarkdownPathSyncable(sourcePath)) {
-			if (binding) this.unbind(view);
-			return;
-		}
-
-		const externalSettled =
-			await this.editorTransitionBoundary!.settleOpenExternalEdit(sourcePath);
-		if (!externalSettled) {
-			throw new Error(`external edit did not settle for ${sourcePath}`);
-		}
-		await this.editorTransitionBoundary!.flushOpenPath(
-			sourcePath,
-			`editor-transition:${reason}`,
-		);
-
-		const current = this.getBindingForView(view);
-		if (current) {
-			if (current.path !== sourcePath || current !== binding) {
-				throw new Error(`source binding advanced during transition settlement for ${sourcePath}`);
-			}
-			this.retireTransitionSyncFacet(view, current, generation);
-			this.unbind(view);
-		}
-		this.trace?.("editor", "editor-transition-source-settled", {
-			path: sourcePath,
-			generation,
-			reason,
-		});
-	}
-
-	private finishActiveComposition(cm: EditorView, path: string): Promise<void> {
-		const active = this.activeCompositions.get(cm);
-		if (!active) return Promise.resolve();
-
-		try {
-			cm.contentDOM.blur();
-		} catch {
-			// The click may already have blurred the editor. compositionend remains
-			// the only success signal; a timeout below aborts the switch fail-closed.
-		}
-
-		let reminder: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-			new Notice(
-				"Finish or cancel the current text composition before switching notes.",
-				5000,
-			);
-		}, 1000);
-		let deadline: ReturnType<typeof setTimeout> | null = null;
-		const timeout = new Promise<void>((_resolve, reject) => {
-			deadline = setTimeout(
-				() => reject(new Error(`IME composition did not finish for ${path}`)),
-				5000,
-			);
-		});
-		return Promise.race([active.settled, timeout]).finally(() => {
-			if (reminder) clearTimeout(reminder);
-			if (deadline) clearTimeout(deadline);
-			reminder = null;
-			deadline = null;
-		});
-	}
-
-	private setTransitionInputBlocked(
-		view: MarkdownView,
-		blocked: boolean,
-		reason: string,
-	): void {
-		if (blocked) {
-			this.transitionBlockedViews.add(view);
-		} else {
-			this.transitionBlockedViews.delete(view);
-		}
-		for (const cm of this.knownCmViews) {
-			if (!view.containerEl.contains(cm.dom)) continue;
-			try {
-				cm.dispatch({
-					effects: this.transitionInputCompartment.reconfigure(
-						blocked ? EditorView.editable.of(false) : [],
-					),
-				});
-			} catch {
-				// A switching view can dispose either CM between containment and dispatch.
-			}
-		}
-		this.trace?.("editor", blocked
-			? "editor-transition-input-blocked"
-			: "editor-transition-input-released", {
-			path: view.file?.path ?? null,
-			reason,
-		});
-	}
-
-	private handleCompositionStart(cm: EditorView): boolean {
-		if (this.activeCompositions.has(cm)) return false;
-		let resolve!: () => void;
-		const settled = new Promise<void>((finish) => {
-			resolve = finish;
-		});
-		this.activeCompositions.set(cm, { settled, resolve });
-		return false;
-	}
-
-	private handleCompositionEnd(cm: EditorView): boolean {
-		const active = this.activeCompositions.get(cm);
-		if (!active) return false;
-		// Let CodeMirror commit the composition transaction before the awaiting
-		// unload boundary closes input and snapshots A.
-		queueMicrotask(() => {
-			if (this.activeCompositions.get(cm) !== active) return;
-			this.activeCompositions.delete(cm);
-			active.resolve();
-		});
-		return false;
-	}
-
-	private retireTransitionSyncFacet(
-		view: MarkdownView,
-		binding: EditorBinding,
-		generation: number,
-	): void {
-		let facet: unknown;
-		try {
-			facet = binding.cm.state.facet(ySyncFacet);
-		} catch {
-			facet = undefined;
-		}
-		if (!facet) return;
-		const retired = this.retiredTransitionSyncFacets.get(view) ?? new Map<unknown, string>();
-		retired.set(facet, binding.path);
-		this.retiredTransitionSyncFacets.set(view, retired);
-		const retireTimer = setTimeout(() => {
-			const current = this.retiredTransitionSyncFacets.get(view);
-			if (!current || current.get(facet) !== binding.path) return;
-			current.delete(facet);
-			if (current.size === 0) this.retiredTransitionSyncFacets.delete(view);
-		}, 5000);
-		(retireTimer as unknown as { unref?: () => void }).unref?.();
-		this.trace?.("editor", "editor-transition-source-facet-retired", {
-			path: binding.path,
-			generation,
-		});
-	}
-
-	private handleEditorTransitionFailure(
-		view: MarkdownView,
-		phase: EditorTransitionPhase,
-		generation: number,
-		error: unknown,
-	): void {
-		this.setTransitionInputBlocked(view, false, "transition-failed");
-		this.trace?.("editor", "editor-transition-failed", {
-			path: view.file?.path ?? null,
-			phase,
-			generation,
-			error: error instanceof Error ? error.message : String(error),
-		});
-		new Notice(
-			"Note switching stopped because the current note could not be settled safely.",
-			10000,
-		);
-		setTimeout(() => {
-			const guard = this.transitionGuards.get(view);
-			if (guard) guard.restore();
-			this.transitionGuards.delete(view);
-			if (view.file && this.isMarkdownPathSyncable(view.file.path)) {
-				this.bind(view, this.lastDeviceName);
-			}
-		}, 0);
-	}
-
 	private registerKnownCmView(cm: EditorView): void {
 		this.knownCmViews.add(cm);
-		for (const view of this.transitionBlockedViews) {
-			if (!view.containerEl.contains(cm.dom)) continue;
-			queueMicrotask(() => {
-				if (!this.transitionBlockedViews.has(view) || !this.knownCmViews.has(cm)) return;
-				try {
-					cm.dispatch({
-						effects: this.transitionInputCompartment.reconfigure(
-							EditorView.editable.of(false),
-						),
-					});
-				} catch {
-					// The transient target CM may already have been replaced.
-				}
-			});
-			break;
-		}
 	}
 
 	private unregisterKnownCmView(cm: EditorView): void {
-		const active = this.activeCompositions.get(cm);
-		if (active) {
-			this.activeCompositions.delete(cm);
-			active.resolve();
-			this.trace?.("editor", "editor-transition-composition-view-destroyed", {
-				cmId: this.getCmId(cm),
-			});
-		}
 		this.knownCmViews.delete(cm);
 		this.cmToLeafId.delete(cm);
 		this.pendingReplacementCmToLeafId.delete(cm);
@@ -2023,23 +1690,8 @@ export class EditorBindingManager {
 		if (!transaction.docChanged) {
 			return transaction;
 		}
-		const retiredProjection = this.getRetiredTransitionProjection(transaction.startState);
-		if (retiredProjection) {
-			this.trace?.("editor", "editor-transition-retired-source-projection-blocked", {
-				path: retiredProjection.path,
-				currentPath: retiredProjection.view.file?.path ?? null,
-			});
-			return [];
-		}
 
 		if (this.isUserTransaction(transaction)) {
-			const blockedView = this.getTransitionBlockedViewForTransaction(transaction);
-			if (blockedView) {
-				this.trace?.("editor", "editor-transition-user-input-blocked", {
-					path: blockedView.file?.path ?? null,
-				});
-				return [];
-			}
 			const match = this.findBindingForState(transaction.startState);
 			if (!match) return transaction;
 			if (match.binding.view.file?.path !== match.binding.path) {
@@ -2062,6 +1714,17 @@ export class EditorBindingManager {
 		const match = this.findBindingForState(transaction.startState);
 		if (!match) return transaction;
 		const { leafId, binding } = match;
+		if (binding.view.file?.path !== binding.path) {
+			// A late Yjs/provider projection can be built from A's yCollab state after
+			// the host has already reused the MarkdownView for B. Cancel that document
+			// change and remove the stale compartment in the same transaction. A fresh
+			// bind is attempted only after the host callback has settled.
+			return this.detachStaleBinding(
+				leafId,
+				binding,
+				"non-user-projection",
+			);
+		}
 		if (this.editorAuthorityShieldLeafIds.has(leafId)) {
 			return { effects: this.compartment.reconfigure([]) };
 		}
@@ -2231,63 +1894,6 @@ export class EditorBindingManager {
 			validPendingPatch?.origin ?? null,
 		);
 		return { effects: this.compartment.reconfigure([]) };
-	}
-
-	private getTransitionBlockedViewForTransaction(transaction: Transaction): MarkdownView | null {
-		const binding = this.findBindingForState(transaction.startState);
-		let cm = binding?.binding.cm ?? null;
-		if (!cm) {
-			for (const candidate of this.knownCmViews) {
-				if (candidate.state === transaction.startState) {
-					cm = candidate;
-					break;
-				}
-			}
-		}
-		if (!cm) return null;
-
-		for (const [view, guard] of this.transitionGuards) {
-			if (!view.containerEl.contains(cm.dom)) continue;
-			if (this.transitionBlockedViews.has(view)) return view;
-			const phase = guard.snapshot().phase;
-			const transitionStarted =
-				phase === "source-settling" ||
-				phase === "source-settled" ||
-				phase === "target-loading";
-			if (!transitionStarted) return null;
-			if (
-				this.activeCompositions.has(cm) &&
-				transaction.isUserEvent("input.type.compose")
-			) {
-				return null;
-			}
-			return view;
-		}
-
-		if (binding && this.transitionBlockedViews.has(binding.binding.view)) {
-			return binding.binding.view;
-		}
-		for (const view of this.transitionBlockedViews) {
-			if (view.containerEl.contains(cm.dom)) return view;
-		}
-		return null;
-	}
-
-	private getRetiredTransitionProjection(
-		state: EditorState,
-	): { view: MarkdownView; path: string } | null {
-		let facet: unknown;
-		try {
-			facet = state.facet(ySyncFacet);
-		} catch {
-			facet = undefined;
-		}
-		if (!facet) return null;
-		for (const [view, retired] of this.retiredTransitionSyncFacets) {
-			const path = retired.get(facet);
-			if (path !== undefined) return { view, path };
-		}
-		return null;
 	}
 
 	private prepareExternalDiskHostProjection(input: {
@@ -2997,6 +2603,7 @@ export class EditorBindingManager {
 			sequence: notice.sequence,
 			observedAt: notice.observedAt,
 			content: notice.content,
+			editorAuthorityLineage: notice.editorAuthorityLineage ?? null,
 		});
 		try {
 			this.onExternalDiskReloadIntercepted?.(candidate);
@@ -3025,7 +2632,14 @@ export class EditorBindingManager {
 		const { leafId, binding } = match;
 		const currentPath = binding.view.file?.path ?? null;
 		if (currentPath === binding.path) return null;
+		return this.detachStaleBinding(leafId, binding, "user-input");
+	}
 
+	private detachStaleBinding(
+		leafId: string,
+		binding: EditorBinding,
+		source: "user-input" | "non-user-projection",
+	): TransactionSpec {
 		this.clearScheduledHealthCheck(leafId);
 		this.clearCmResolveRetry(leafId);
 		this.healthWorkInFlight.delete(leafId);
@@ -3033,11 +2647,12 @@ export class EditorBindingManager {
 		this.cmToLeafId.delete(binding.cm);
 		this.pendingReplacementCmToLeafId.delete(binding.cm);
 		this.bumpBindingEpoch(leafId);
-		this.trace?.("editor", "stale-binding-detached-before-user-input", {
+		this.trace?.("editor", "stale-binding-detached-before-editor-transaction", {
 			leafId,
 			boundPath: binding.path,
-			currentPath,
+			currentPath: binding.view.file?.path ?? null,
 			cmId: binding.cmId,
+			source,
 		});
 
 		queueMicrotask(() => {
