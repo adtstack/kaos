@@ -30,7 +30,10 @@ import {
 	type StableMarkdownReadResult,
 } from "../src/runtime/reconciliationController";
 import type { DiskIngestPort } from "../src/runtime/engineControlPort";
-import type { InterceptedExternalDiskMutation } from "../src/sync/editorBinding";
+import type {
+	ExternalDiskMutationEditorAuthorityLineage,
+	InterceptedExternalDiskMutation,
+} from "../src/sync/editorBinding";
 import type { EnsureFileResult } from "../src/sync/vaultSync";
 import { contentBaselineHash } from "../src/sync/diskIndex";
 import type {
@@ -180,6 +183,8 @@ interface Fixture {
 	setEqualitySettlementReadHook(hook: (() => Promise<void>) | null): void;
 	setFlushWriteBoundaryHook(hook: (() => void | Promise<void>) | null): void;
 	setSelfWriteModifyHook(hook: (() => void | Promise<void>) | null): void;
+	setRecentWriteFingerprintMatches(value: boolean): void;
+	setRecentWriteFingerprintHook(hook: (() => void | Promise<void>) | null): void;
 	advanceOpenExternalAuthority(advance: OpenExternalAuthorityAdvance): void;
 	setArtifactWriteFailure(value: boolean, message?: string): void;
 	pauseArtifactPreservation(): void;
@@ -246,6 +251,8 @@ function buildFixture(initial: {
 	let equalitySettlementReadHook: (() => Promise<void>) | null = null;
 	let flushWriteBoundaryHook: (() => void | Promise<void>) | null = null;
 	let selfWriteModifyHook: (() => void | Promise<void>) | null = null;
+	let recentWriteFingerprintMatches = false;
+	let recentWriteFingerprintHook: (() => void | Promise<void>) | null = null;
 	const selfWriteMarkerObservations: Array<{
 		activeLeaseCount: number;
 		markerPreserved: boolean;
@@ -410,6 +417,35 @@ function buildFixture(initial: {
 				};
 			}),
 		}),
+		captureExternalDiskMutationEditorAuthorityLineage: (
+			lineagePath: string,
+			lineageViews: readonly MarkdownView[],
+		) => {
+			if (lineageViews.length === 0) return null;
+			const snapshots: ExternalDiskMutationEditorAuthorityLineage["views"][number][] = [];
+			for (const [index, lineageView] of lineageViews.entries()) {
+				if (lineageView.file?.path !== lineagePath) return null;
+				let lineageEditorContent: string;
+				try {
+					lineageEditorContent = lineageView.editor.getValue();
+				} catch {
+					return null;
+				}
+				snapshots.push(Object.freeze({
+					viewId: `stub-view-${index + 1}`,
+					leafId: `stub-leaf-${index + 1}`,
+					cmId: `stub-cm-${index + 1}`,
+					bindingEpoch,
+					editorRevision: ticketRevision,
+					editorAuthorityRevision: ticketRevision,
+					editorContent: lineageEditorContent,
+				}));
+			}
+			return Object.freeze({
+				path: lineagePath,
+				views: Object.freeze(snapshots),
+			});
+		},
 		validateOpenEditorMutationTicket: (
 			ticket: {
 				path: string;
@@ -540,6 +576,10 @@ function buildFixture(initial: {
 		getDiskMirror: () => ({
 			shouldSuppressCreate: async () => false,
 			shouldSuppressModify: async () => false,
+			matchesRecentWriteFingerprint: async () => {
+				await recentWriteFingerprintHook?.();
+				return recentWriteFingerprintMatches;
+			},
 			suppressLocalCreate: async (_artifactPath: string, content: string) => {
 				artifactPreservationStarts.push(content);
 				markArtifactPreservationStarted?.();
@@ -783,6 +823,12 @@ function buildFixture(initial: {
 		setEqualitySettlementReadHook: (hook) => { equalitySettlementReadHook = hook; },
 		setFlushWriteBoundaryHook: (hook) => { flushWriteBoundaryHook = hook; },
 		setSelfWriteModifyHook: (hook) => { selfWriteModifyHook = hook; },
+		setRecentWriteFingerprintMatches: (value) => {
+			recentWriteFingerprintMatches = value;
+		},
+		setRecentWriteFingerprintHook: (hook) => {
+			recentWriteFingerprintHook = hook;
+		},
 		advanceOpenExternalAuthority: (advance) => {
 			if (advance === "editor-revision") {
 				ticketRevision++;
@@ -1189,16 +1235,61 @@ function makeInterceptedCandidate(
 	path: string,
 	content: string,
 	sequence: number,
+	options: {
+		editorAuthorityLineage?: ExternalDiskMutationEditorAuthorityLineage;
+		observedAt?: number;
+	} = {},
 ): InterceptedExternalDiskMutation {
 	return Object.freeze({
 		path,
 		content,
 		sequence,
-		observedAt: sequence,
+		observedAt: options.observedAt ?? sequence,
 		ctime: sequence,
 		mtime: sequence,
 		size: content.length,
+		editorAuthorityLineage: options.editorAuthorityLineage,
 	});
+}
+
+function makeExternalEditorLineage(
+	path: string,
+	editorAuthorityRevision: number,
+	editorRevision = editorAuthorityRevision,
+): ExternalDiskMutationEditorAuthorityLineage {
+	return Object.freeze({
+		path,
+		views: Object.freeze([Object.freeze({
+			viewId: "view-1",
+			leafId: "leaf-1",
+			cmId: "cm-1",
+			bindingEpoch: 4,
+			editorRevision,
+			editorAuthorityRevision,
+			editorContent: "visible editor authority\n",
+		})]),
+	});
+}
+
+function captureFixtureExternalEditorLineage(
+	fix: Fixture,
+): ExternalDiskMutationEditorAuthorityLineage {
+	const bindings = (fix.controller as never as {
+		deps: {
+			getEditorBindings(): {
+				captureExternalDiskMutationEditorAuthorityLineage(
+					path: string,
+					views: readonly MarkdownView[],
+				): ExternalDiskMutationEditorAuthorityLineage | null;
+			};
+		};
+	}).deps.getEditorBindings();
+	const lineage = bindings.captureExternalDiskMutationEditorAuthorityLineage(
+		fix.path,
+		fix.views,
+	);
+	if (!lineage) throw new Error("fixture failed to capture external editor lineage");
+	return lineage;
 }
 
 function getInterceptedCandidates(
@@ -1894,6 +1985,335 @@ console.log("\n--- Test 5c: known-baseline external-only edit imports and settle
 		"external-only import is one targeted open-external transaction",
 	);
 	assertSettledSelfWriteLease(fix, "external-only merge");
+}
+
+// -------------------------------------------------------------------
+// Test 5c1a — delayed event with a stale baseline still accepts an exact append
+// -------------------------------------------------------------------
+
+console.log("\n--- Test 5c1a: stale baseline accepts an insertion-only external append successor ---");
+{
+	const staleBaseline = "# log\neditor-01\n";
+	const current = `${staleBaseline}filesystem-02\neditor-03\n`;
+	const external = `${current}filesystem-04\n`;
+	const fix = buildFixture({
+		path: "Notes/open-external-delayed-append.md",
+		disk: external,
+		editor: current,
+		crdt: current,
+	});
+	fix.setBaselineContent(staleBaseline);
+
+	await fix.ingestDiskFileNow("modify");
+
+	assertEq(fix.ytext.toString(), external, "delayed append becomes Y.Text authority");
+	assertEq(fix.getCurrentDiskContent(), external, "delayed append remains settled on disk");
+	assertEq(fix.getCreatedFiles().size, 0, "delayed append creates no conflict artifact");
+	assertEq(
+		fix.transactionOrigins.filter((origin) => origin === ORIGIN_OPEN_EXTERNAL_EDIT_MERGE).length,
+		1,
+		"delayed append applies in one targeted external transaction",
+	);
+	assertSettledSelfWriteLease(fix, "delayed append successor");
+}
+
+console.log("\n--- Test 5c1a1: authoritative scan ignores a lagging Vault.read projection ---");
+{
+	const staleBaseline = "# log\neditor-01\n";
+	const staleHostProjection = `${staleBaseline}filesystem-02\n`;
+	const current = `${staleHostProjection}editor-03\n`;
+	const external = `${current}filesystem-04\n`;
+	const fix = buildFixture({
+		path: "Notes/open-external-lagging-vault-read.md",
+		disk: external,
+		editor: current,
+		crdt: current,
+	});
+	fix.setBaselineContent(staleBaseline);
+	const candidate = makeInterceptedCandidate(fix.path, external, 44);
+	fix.controller.noteInterceptedExternalDiskMutation(candidate);
+	clearMarkdownDrainTimer(fix.controller);
+
+	let staleVaultReadCount = 0;
+	let freshDiskReadCount = 0;
+	const internals = fix.controller as never as {
+		deps: {
+			app: { vault: { read(file: TFile): Promise<string> } };
+			readFreshMarkdownFile?: (file: TFile) => Promise<string>;
+		};
+	};
+	internals.deps.app.vault.read = async () => {
+		staleVaultReadCount++;
+		return staleHostProjection;
+	};
+	internals.deps.readFreshMarkdownFile = async (file) => {
+		assert(file === fix.file, "fresh reader keeps the exact TFile identity");
+		freshDiskReadCount++;
+		return fix.getCurrentDiskContent();
+	};
+
+	await fix.controller.runReconciliation("authoritative");
+
+	assert(freshDiskReadCount > 0, "authoritative reconcile uses the physical disk reader");
+	assertEq(staleVaultReadCount, 0, "lagging Vault.read projection is never an authority fence");
+	assertEq(fix.ytext.toString(), external, "physical external successor becomes Y.Text authority");
+	assertEq(fix.getCurrentDiskContent(), external, "physical external successor is never overwritten");
+	assertEq(fix.getCreatedFiles().size, 0, "cache lag creates no false conflict artifact");
+	assert(
+		getInterceptedCandidates(fix.controller).get(fix.path) !== candidate,
+		"the exact external candidate clears only after physical disk settlement",
+	);
+	clearMarkdownDrainTimer(fix.controller);
+	fix.controller.reset();
+	fix.doc.destroy();
+}
+
+console.log("\n--- Test 5c1a2: exact QuickAdd append survives a delayed open-editor rewrite ---");
+{
+	const physicalSelfWrite = "# log\neditor-01\neditor-02\n";
+	const externalAppend = `${physicalSelfWrite}quickadd-03\n`;
+	const fix = buildFixture({
+		path: "Notes/open-external-over-delayed-self-write.md",
+		disk: physicalSelfWrite,
+		editor: physicalSelfWrite,
+		crdt: physicalSelfWrite,
+	});
+	fix.setBaselineContent(physicalSelfWrite);
+	fix.setRecentWriteFingerprintMatches(true);
+
+	const candidate = makeInterceptedCandidate(fix.path, externalAppend, 45, {
+		editorAuthorityLineage: captureFixtureExternalEditorLineage(fix),
+		observedAt: 45_000,
+	});
+	fix.controller.noteInterceptedExternalDiskMutation(candidate);
+	clearMarkdownDrainTimer(fix.controller);
+
+	await fix.ingestDiskFileNow("modify");
+
+	assertEq(
+		fix.ytext.toString(),
+		externalAppend,
+		"the exact intercepted append becomes Y.Text authority",
+	);
+	assertEq(
+		fix.getCurrentDiskContent(),
+		externalAppend,
+		"the recovered append is restored to physical disk",
+	);
+	assertEq(
+		fix.getCreatedFiles().size,
+		0,
+		"the delayed self-write race creates no false conflict artifact",
+	);
+	assertEq(
+		fix.getFlushWriteCalls()[0]?.expectedDiskContent,
+		physicalSelfWrite,
+		"the write CAS fences against physical bytes, not the replayed candidate",
+	);
+	assertEq(
+		fix.transactionOrigins.filter((origin) => origin === ORIGIN_OPEN_EXTERNAL_EDIT_MERGE).length,
+		1,
+		"the recovered append applies in one targeted external transaction",
+	);
+	assert(
+		fix.traces.some((trace) =>
+			trace.msg === "open-external-append-recovered-over-self-write" &&
+			trace.details?.sequence === candidate.sequence
+		),
+		"the narrow recovery decision is traceable",
+	);
+	assert(
+		!getInterceptedCandidates(fix.controller).has(fix.path),
+		"the exact external candidate retires only after settlement",
+	);
+	clearMarkdownDrainTimer(fix.controller);
+	fix.controller.reset();
+	fix.doc.destroy();
+}
+
+console.log("\n--- Test 5c1a2a: a newer QuickAdd revision replaces a candidate during async proof ---");
+{
+	const physicalSelfWrite = "# log\neditor-current\n";
+	const intermediateAppend = `${physicalSelfWrite}quickadd-intermediate\n`;
+	const finalAppend = `${physicalSelfWrite}quickadd-final\n`;
+	const fix = buildFixture({
+		path: "Notes/open-external-candidate-proof-race.md",
+		disk: physicalSelfWrite,
+		editor: physicalSelfWrite,
+		crdt: physicalSelfWrite,
+	});
+	fix.setBaselineContent(physicalSelfWrite);
+	fix.setRecentWriteFingerprintMatches(true);
+	const unchangedLineage = captureFixtureExternalEditorLineage(fix);
+	const intermediate = makeInterceptedCandidate(fix.path, intermediateAppend, 46, {
+		editorAuthorityLineage: unchangedLineage,
+		observedAt: 46_000,
+	});
+	const final = makeInterceptedCandidate(fix.path, finalAppend, 47, {
+		editorAuthorityLineage: unchangedLineage,
+		observedAt: 46_100,
+	});
+	fix.controller.noteInterceptedExternalDiskMutation(intermediate);
+	clearMarkdownDrainTimer(fix.controller);
+
+	let fingerprintCallCount = 0;
+	let markFirstProofStarted!: () => void;
+	const firstProofStarted = new Promise<void>((resolve) => {
+		markFirstProofStarted = resolve;
+	});
+	let releaseFirstProof!: () => void;
+	const firstProofGate = new Promise<void>((resolve) => {
+		releaseFirstProof = resolve;
+	});
+	fix.setRecentWriteFingerprintHook(async () => {
+		fingerprintCallCount++;
+		if (fingerprintCallCount !== 1) return;
+		markFirstProofStarted();
+		await firstProofGate;
+	});
+
+	const ingest = fix.ingestDiskFileNow("modify");
+	await firstProofStarted;
+	fix.controller.noteInterceptedExternalDiskMutation(final);
+	clearMarkdownDrainTimer(fix.controller);
+	releaseFirstProof();
+	await ingest;
+
+	assertEq(fingerprintCallCount, 2, "candidate replacement restarts the exact self-write proof");
+	assertEq(fix.ytext.toString(), finalAppend, "only the newest QuickAdd revision reaches Y.Text");
+	assertEq(fix.getCurrentDiskContent(), finalAppend, "only the newest QuickAdd revision reaches disk");
+	assertEq(fix.getCreatedFiles().size, 0, "a proven same-lineage replacement creates no artifact");
+	assert(
+		!getInterceptedCandidates(fix.controller).has(fix.path),
+		"the newest candidate retires after its own settlement",
+	);
+	clearMarkdownDrainTimer(fix.controller);
+	fix.controller.reset();
+	fix.doc.destroy();
+}
+
+console.log("\n--- Test 5c1a2b: full reconcile cannot preempt queued append recovery ---");
+{
+	const physicalSelfWrite = "# log\neditor-before-full-scan\n";
+	const externalAppend = `${physicalSelfWrite}quickadd-before-full-scan\n`;
+	const fix = buildFixture({
+		path: "Notes/open-external-full-reconcile-preemption.md",
+		disk: physicalSelfWrite,
+		editor: physicalSelfWrite,
+		crdt: physicalSelfWrite,
+	});
+	fix.setBaselineContent(physicalSelfWrite);
+	fix.setRecentWriteFingerprintMatches(true);
+	const candidate = makeInterceptedCandidate(fix.path, externalAppend, 45, {
+		editorAuthorityLineage: captureFixtureExternalEditorLineage(fix),
+		observedAt: 45_000,
+	});
+	fix.controller.noteInterceptedExternalDiskMutation(candidate);
+	clearMarkdownDrainTimer(fix.controller);
+
+	await fix.controller.runReconciliation("authoritative");
+	clearMarkdownDrainTimer(fix.controller);
+
+	assertEq(
+		fix.getCreatedFiles().size,
+		0,
+		"full reconcile does not preserve the recoverable append as superseded",
+	);
+	assert(
+		getInterceptedCandidates(fix.controller).get(fix.path) === candidate,
+		"full reconcile retains the exact append for the path-scoped dirty lane",
+	);
+	assertEq(
+		fix.ytext.toString(),
+		physicalSelfWrite,
+		"full reconcile performs no speculative append replay",
+	);
+	assert(
+		fix.traces.some((trace) =>
+			trace.msg === "open-external-append-recovery-deferred-to-dirty-ingest" &&
+			trace.details?.sequence === candidate.sequence
+		),
+		"full reconcile records the bounded handoff to existing dirty ingest",
+	);
+
+	await fix.ingestDiskFileNow("modify");
+
+	assertEq(
+		fix.ytext.toString(),
+		externalAppend,
+		"the canonical dirty lane revalidates and applies the retained append",
+	);
+	assertEq(
+		fix.getCurrentDiskContent(),
+		externalAppend,
+		"the canonical dirty lane settles the append to physical disk",
+	);
+	assertEq(
+		fix.getCreatedFiles().size,
+		0,
+		"full-scan preemption fix creates no conflict artifact after settlement",
+	);
+	clearMarkdownDrainTimer(fix.controller);
+	fix.controller.reset();
+	fix.doc.destroy();
+}
+
+for (const failClosedCase of [
+	"missing-self-write-proof",
+	"editor-authority-advanced",
+] as const) {
+	console.log(
+		`\n--- Test 5c1a3 (${failClosedCase}): delayed rewrite recovery fails closed ---`,
+	);
+	const physicalSelfWrite = "# log\neditor-current\n";
+	const externalAppend = `${physicalSelfWrite}quickadd-external\n`;
+	const fix = buildFixture({
+		path: `Notes/open-external-recovery-${failClosedCase}.md`,
+		disk: physicalSelfWrite,
+		editor: physicalSelfWrite,
+		crdt: physicalSelfWrite,
+	});
+	fix.setBaselineContent(physicalSelfWrite);
+	fix.setRecentWriteFingerprintMatches(failClosedCase !== "missing-self-write-proof");
+	const candidate = makeInterceptedCandidate(fix.path, externalAppend, 46, {
+		editorAuthorityLineage: captureFixtureExternalEditorLineage(fix),
+		observedAt: 46_000,
+	});
+	fix.controller.noteInterceptedExternalDiskMutation(candidate);
+	clearMarkdownDrainTimer(fix.controller);
+	if (failClosedCase === "editor-authority-advanced") {
+		// Preserve the same visible bytes while advancing the user-authority
+		// revision. Content equality alone must never authorize replay.
+		fix.setEditorContent(physicalSelfWrite);
+	}
+
+	await fix.ingestDiskFileNow("modify");
+
+	assertEq(
+		fix.ytext.toString(),
+		physicalSelfWrite,
+		`${failClosedCase}: unproven replay never mutates Y.Text`,
+	);
+	assertEq(
+		fix.getCurrentDiskContent(),
+		physicalSelfWrite,
+		`${failClosedCase}: unproven replay never overwrites physical disk`,
+	);
+	assertEq(
+		Array.from(fix.getCreatedFiles().values())
+			.filter((content) => content === externalAppend).length,
+		1,
+		`${failClosedCase}: exact external bytes remain recoverable as one artifact`,
+	);
+	assert(
+		!fix.traces.some((trace) =>
+			trace.msg === "open-external-append-recovered-over-self-write"
+		),
+		`${failClosedCase}: recovery trace is absent without every proof`,
+	);
+	clearMarkdownDrainTimer(fix.controller);
+	fix.controller.reset();
+	fix.doc.destroy();
 }
 
 // -------------------------------------------------------------------
@@ -4250,6 +4670,177 @@ console.log("\n--- Test 5f4b: newer same-content revision replaces metadata with
 	);
 	fix.controller.reset();
 	fix.doc.destroy();
+}
+
+console.log("\n--- Test 5f4b1: consecutive revisions coalesce only with unchanged editor lineage ---");
+{
+	const olderRaw = "quickadd intermediate\n";
+	const newerRaw = "quickadd final\n";
+	const fix = buildFixture({
+		path: "Notes/intercepted-proven-transient.md",
+		disk: newerRaw,
+		editor: "visible editor authority\n",
+		crdt: "visible editor authority\n",
+	});
+	const unchangedLineage = makeExternalEditorLineage(fix.path, 7, 11);
+	const older = makeInterceptedCandidate(fix.path, olderRaw, 9, {
+		editorAuthorityLineage: unchangedLineage,
+		observedAt: 10_000,
+	});
+	const newer = makeInterceptedCandidate(fix.path, newerRaw, 10, {
+		editorAuthorityLineage: unchangedLineage,
+		observedAt: 10_120,
+	});
+	fix.controller.noteInterceptedExternalDiskMutation(older);
+	fix.controller.noteInterceptedExternalDiskMutation(newer);
+	clearMarkdownDrainTimer(fix.controller);
+	await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+	assertEq(
+		fix.getCreatedFiles().size,
+		0,
+		"proven transient QuickAdd revision creates no conflict artifact",
+	);
+	assertEq(
+		getPendingSupersededCandidates(fix.controller).length,
+		0,
+		"proven transient revision never enters the preservation queue",
+	);
+	assert(
+		getInterceptedCandidates(fix.controller).get(fix.path) === newer,
+		"the newest exact disk revision remains authoritative for reconciliation",
+	);
+	fix.controller.reset();
+	fix.doc.destroy();
+}
+
+console.log("\n--- Test 5f4b2: out-of-order reads coalesce with the same complete proof ---");
+{
+	const olderRaw = "delayed intermediate\n";
+	const newerRaw = "already completed final\n";
+	const fix = buildFixture({
+		path: "Notes/intercepted-proven-out-of-order.md",
+		disk: newerRaw,
+		editor: "visible editor authority\n",
+		crdt: "visible editor authority\n",
+	});
+	const unchangedLineage = makeExternalEditorLineage(fix.path, 13, 19);
+	const older = makeInterceptedCandidate(fix.path, olderRaw, 20, {
+		editorAuthorityLineage: unchangedLineage,
+		observedAt: 20_000,
+	});
+	const newer = makeInterceptedCandidate(fix.path, newerRaw, 21, {
+		editorAuthorityLineage: unchangedLineage,
+		observedAt: 20_090,
+	});
+	fix.controller.noteInterceptedExternalDiskMutation(newer);
+	fix.controller.noteInterceptedExternalDiskMutation(older);
+	clearMarkdownDrainTimer(fix.controller);
+	await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+	assertEq(fix.getCreatedFiles().size, 0, "delayed intermediate read creates no artifact");
+	assert(
+		getInterceptedCandidates(fix.controller).get(fix.path) === newer,
+		"out-of-order completion cannot replace the newest exact revision",
+	);
+	fix.controller.reset();
+	fix.doc.destroy();
+}
+
+console.log("\n--- Test 5f4b3: an editor-authority advance vetoes revision coalescing ---");
+{
+	const olderRaw = "external before editor change\n";
+	const newerRaw = "external after editor change\n";
+	const fix = buildFixture({
+		path: "Notes/intercepted-editor-advance.md",
+		disk: newerRaw,
+		editor: "visible editor authority\n",
+		crdt: "visible editor authority\n",
+	});
+	const older = makeInterceptedCandidate(fix.path, olderRaw, 30, {
+		editorAuthorityLineage: makeExternalEditorLineage(fix.path, 3, 8),
+		observedAt: 30_000,
+	});
+	const newer = makeInterceptedCandidate(fix.path, newerRaw, 31, {
+		editorAuthorityLineage: makeExternalEditorLineage(fix.path, 4, 9),
+		observedAt: 30_080,
+	});
+	fix.controller.noteInterceptedExternalDiskMutation(older);
+	fix.controller.noteInterceptedExternalDiskMutation(newer);
+	clearMarkdownDrainTimer(fix.controller);
+	await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+	assert(
+		Array.from(fix.getCreatedFiles().values()).includes(olderRaw),
+		"intervening editor authority preserves the older exact disk revision",
+	);
+	fix.controller.reset();
+	fix.doc.destroy();
+}
+
+console.log("\n--- Test 5f4b4: incomplete, changed-pane, and old proofs fail closed ---");
+{
+	const cases = [
+		{
+			label: "missing lineage",
+			olderLineage: undefined,
+			newerLineage: makeExternalEditorLineage("Notes/fail-closed-missing.md", 2, 5),
+			path: "Notes/fail-closed-missing.md",
+			olderObservedAt: 40_000,
+			newerObservedAt: 40_050,
+		},
+		{
+			label: "changed pane lineage",
+			olderLineage: makeExternalEditorLineage("Notes/fail-closed-pane.md", 2, 5),
+			newerLineage: Object.freeze({
+				path: "Notes/fail-closed-pane.md",
+				views: Object.freeze([Object.freeze({
+					...makeExternalEditorLineage("Notes/fail-closed-pane.md", 2, 5).views[0]!,
+					viewId: "replacement-view",
+				})]),
+			}),
+			path: "Notes/fail-closed-pane.md",
+			olderObservedAt: 50_000,
+			newerObservedAt: 50_050,
+		},
+		{
+			label: "expired proof window",
+			olderLineage: makeExternalEditorLineage("Notes/fail-closed-window.md", 2, 5),
+			newerLineage: makeExternalEditorLineage("Notes/fail-closed-window.md", 2, 5),
+			path: "Notes/fail-closed-window.md",
+			olderObservedAt: 60_000,
+			newerObservedAt: 63_001,
+		},
+	] as const;
+
+	for (const scenario of cases) {
+		const olderRaw = `${scenario.label} older\n`;
+		const newerRaw = `${scenario.label} newer\n`;
+		const fix = buildFixture({
+			path: scenario.path,
+			disk: newerRaw,
+			editor: "visible editor authority\n",
+			crdt: "visible editor authority\n",
+		});
+		const older = makeInterceptedCandidate(fix.path, olderRaw, 40, {
+			editorAuthorityLineage: scenario.olderLineage,
+			observedAt: scenario.olderObservedAt,
+		});
+		const newer = makeInterceptedCandidate(fix.path, newerRaw, 41, {
+			editorAuthorityLineage: scenario.newerLineage,
+			observedAt: scenario.newerObservedAt,
+		});
+		fix.controller.noteInterceptedExternalDiskMutation(older);
+		fix.controller.noteInterceptedExternalDiskMutation(newer);
+		clearMarkdownDrainTimer(fix.controller);
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		assert(
+			Array.from(fix.getCreatedFiles().values()).includes(olderRaw),
+			`${scenario.label} preserves the older exact disk revision`,
+		);
+		fix.controller.reset();
+		fix.doc.destroy();
+	}
 }
 
 console.log("\n--- Test 5f4c: newer revision durably preserves the superseded current candidate ---");

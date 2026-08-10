@@ -77,6 +77,8 @@ function makeHarness(options: {
 	openEditorContent?: string | (() => string);
 	initialDiskContent?: string;
 	onRead?: () => void | Promise<void>;
+	/** Optional lagging host projection; adapter reads still expose diskFiles. */
+	vaultReadContent?: string | (() => string);
 	onGetAbstractFile?: (path: string, file: TFile | null, callCount: number) => void;
 	onBeforeProcess?: () => void | Promise<void>;
 	onAfterProcess?: () => void | Promise<void>;
@@ -233,7 +235,10 @@ function makeHarness(options: {
 				return file;
 			},
 			read: async (file: { path: string }) => {
-				const content = diskFiles.get(file.path) ?? "";
+				const projected = options.vaultReadContent;
+				const content = projected === undefined
+					? diskFiles.get(file.path) ?? ""
+					: typeof projected === "function" ? projected() : projected;
 				await options.onRead?.();
 				return options.stripBomOnVaultRead && content.charCodeAt(0) === 0xfeff
 					? content.slice(1)
@@ -1701,6 +1706,40 @@ console.log("\n--- Test 14: durable baseline preserves a disk edit made before f
 	);
 	assert(fixture.getProcessCalls() === 0, "dirty durable-baseline mismatch never reaches atomic commit");
 	assert(fixture.getModifyCalls() === 0, "dirty durable-baseline mismatch never reaches fallback modify");
+
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Test 14a: physical disk CAS ignores a lagging Vault.read projection ---");
+{
+	const staleProjection = "DISK_BEFORE_EXTERNAL_WRITE\n";
+	const externalLatest = `${staleProjection}EXTERNAL_APPEND\n`;
+	const fixture = makeHarness({
+		initialDiskContent: externalLatest,
+		vaultReadContent: staleProjection,
+	});
+	fixture.ytext.insert(0, `${staleProjection}REMOTE_CRDT_APPEND\n`);
+	let freshReadCount = 0;
+	fixture.mirror.setFreshMarkdownFileReader(async (file) => {
+		freshReadCount++;
+		return fixture.diskFiles.get(file.path) ?? "";
+	});
+
+	const result = await fixture.mirror.flushWrite(FILE_PATH, true, {
+		expectedDiskContent: staleProjection,
+	});
+
+	assert(freshReadCount > 0, "flush compare-and-swap reads the physical disk boundary");
+	assert(
+		result.kind === "deferred" && result.reason === "disk-changed-during-write",
+		"physical external bytes invalidate a plan based on the lagging host projection",
+	);
+	assert(
+		fixture.diskFiles.get(FILE_PATH) === externalLatest,
+		"late host projection can never overwrite the physical external append",
+	);
+	assert(fixture.getProcessCalls() === 0, "stale host projection never reaches atomic commit");
+	assert(fixture.getModifyCalls() === 0, "stale host projection never reaches fallback modify");
 
 	fixture.doc.destroy();
 }

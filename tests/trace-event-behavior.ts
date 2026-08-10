@@ -213,6 +213,59 @@ console.log("\n--- Test 4b: recent self-write fingerprint probe is exact and non
 	);
 }
 
+console.log("\n--- Test 4b2: recovery proof outlives event attribution without hiding events ---");
+{
+	const diskContent = "expected";
+	const events: CapturedTrace[] = [];
+	const mirror = makeSuppressionMirror(() => diskContent, events);
+	await (mirror as any).suppressWrite("Notes/recovery-proof.md", diskContent);
+	const file = new TFile() as TFile & {
+		path: string;
+		stat: { ctime: number; mtime: number; size: number };
+	};
+	file.path = "Notes/recovery-proof.md";
+	file.stat = {
+		ctime: 1,
+		mtime: 10,
+		size: new TextEncoder().encode(diskContent).length,
+	};
+	const fingerprints = (mirror as unknown as {
+		recentWriteFingerprints: Map<string, { recordedAt: number }>;
+	}).recentWriteFingerprints;
+	const fingerprint = fingerprints.get(file.path);
+	if (!fingerprint) throw new Error("recovery proof fixture fingerprint missing");
+	fingerprint.recordedAt = Date.now() - 6_000;
+
+	const eventProbe = await mirror.probeRecentWriteFingerprint(file, {
+		path: file.path,
+		ctime: file.stat.ctime,
+		mtime: file.stat.mtime,
+		size: file.stat.size,
+	});
+	assert(
+		eventProbe.kind === "unproven",
+		"a six-second fingerprint cannot suppress a later modify event",
+	);
+	assert(
+		fingerprints.has(file.path),
+		"event expiry retains the exact fingerprint for bounded recovery proof",
+	);
+	assert(
+		await mirror.matchesRecentWriteFingerprint(file) === true,
+		"strict recovery can still prove the exact six-second physical bytes",
+	);
+
+	fingerprint.recordedAt = Date.now() - 11_000;
+	assert(
+		await mirror.matchesRecentWriteFingerprint(file) === null,
+		"recovery proof expires after its independent bounded window",
+	);
+	assert(
+		!fingerprints.has(file.path),
+		"expired recovery proof is retired from the bounded cache",
+	);
+}
+
 console.log("\n--- Test 4c: fingerprint proof cannot cross a file revision change ---");
 {
 	let releaseRead: (() => void) | null = null;

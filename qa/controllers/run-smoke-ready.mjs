@@ -73,9 +73,11 @@ class CdpClient {
 		// Pick main Obsidian renderer page (not DevTools, not blob workers)
 		let target =
 			targets.find(
+				(t) => t.type === "page" && t.url?.includes("obsidian.md/index.html"),
+			) ??
+			targets.find(
 				(t) => t.type === "page" && t.title.includes("Obsidian") && !t.title.includes("DevTools"),
 			) ??
-			targets.find((t) => t.url?.includes("obsidian.md/index.html")) ??
 			targets.find(
 				(t) =>
 					t.type === "page" &&

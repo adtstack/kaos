@@ -207,16 +207,15 @@ console.log("\n--- Test 9a: remote typing awareness is advisory only ---");
 		section?.includes("this.warnConcurrentTyping(match.binding.path, remoteTypers)"),
 		"active remote typing emits an advisory warning",
 	);
+	const userBranchIndex = section?.indexOf("if (this.isUserTransaction(transaction))") ?? -1;
 	const nonUserBranchIndex = section?.indexOf("const { leafId, binding } = match;") ?? -1;
-	const transitionGateIndex = section?.indexOf("this.getTransitionBlockedViewForTransaction(transaction)") ?? -1;
-	const transitionCancellationIndex = section?.indexOf("return [];", transitionGateIndex) ?? -1;
 	const warningIndex = section?.indexOf("this.warnConcurrentTyping(match.binding.path, remoteTypers)") ?? -1;
 	assert(
-		transitionGateIndex >= 0 &&
-		transitionCancellationIndex > transitionGateIndex &&
-		transitionCancellationIndex < warningIndex &&
-		!section?.slice(warningIndex, nonUserBranchIndex).includes("return [];"),
-		"only an explicit note-transition gate may cancel user input; remote typing stays advisory",
+		userBranchIndex >= 0 &&
+		warningIndex > userBranchIndex &&
+		nonUserBranchIndex > warningIndex &&
+		!section?.slice(userBranchIndex, nonUserBranchIndex).includes("return [];"),
+		"user input is never cancelled; remote typing stays advisory",
 	);
 	assert(
 		warningSection?.includes('"concurrent-typing-warning"'),

@@ -115,7 +115,7 @@ export class RawCdpObsidianClient {
 	}
 
 	/** Evaluate an expression string in the Obsidian renderer process. */
-	async evalRaw<T = unknown>(expression: string): Promise<T> {
+	async evalRaw<T = unknown>(expression: string, timeoutMs = 60_000): Promise<T> {
 		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
 			throw new Error("Not connected — call connect() first");
 		}
@@ -125,8 +125,8 @@ export class RawCdpObsidianClient {
 		return new Promise<T>((resolve, reject) => {
 			const timeout = setTimeout(() => {
 				this.pending.delete(id);
-				reject(new Error(`CDP eval timeout (60s) on port ${this.port}`));
-			}, 60_000);
+				reject(new Error(`CDP eval timeout (${timeoutMs}ms) on port ${this.port}`));
+			}, timeoutMs);
 
 			this.pending.set(id, (msg: unknown) => {
 				clearTimeout(timeout);
@@ -160,6 +160,42 @@ export class RawCdpObsidianClient {
 					},
 				}),
 			);
+		});
+	}
+
+	private async sendCommand<T = unknown>(
+		method: string,
+		params: Record<string, unknown>,
+		timeoutMs = 15_000,
+	): Promise<T> {
+		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+			throw new Error("Not connected — call connect() first");
+		}
+
+		const id = ++this.msgId;
+		return new Promise<T>((resolve, reject) => {
+			const timeout = setTimeout(() => {
+				this.pending.delete(id);
+				reject(new Error(`CDP command timeout (${timeoutMs}ms): ${method}`));
+			}, timeoutMs);
+
+			this.pending.set(id, (msg: unknown) => {
+				clearTimeout(timeout);
+				const response = msg as {
+					result?: T;
+					error?: { message?: string; data?: string };
+				};
+				if (response.error) {
+					reject(new Error(
+						`${method}: ${response.error.message ?? "CDP command failed"}` +
+						(response.error.data ? ` (${response.error.data})` : ""),
+					));
+					return;
+				}
+				resolve(response.result as T);
+			});
+
+			this.ws!.send(JSON.stringify({ id, method, params }));
 		});
 	}
 
@@ -209,7 +245,52 @@ export class RawCdpObsidianClient {
 				if (!qa) throw new Error('__KAOS_QA__ not found');
 				return qa.run(${JSON.stringify(id)}, ${JSON.stringify({ timeoutMs })});
 			})()
+		`, timeoutMs + 5_000);
+	}
+
+	/** Refuse filesystem-mutating QA when CDP is attached to a different vault. */
+	async assertVaultBasePath(expectedVaultPath: string): Promise<string> {
+		const connectedBasePath = await this.evalRaw<string | null>(`
+			(() => {
+				const adapter = window.app?.vault?.adapter;
+				return typeof adapter?.getBasePath === "function" ? adapter.getBasePath() : null;
+			})()
 		`);
+		if (!connectedBasePath) {
+			throw new Error("Connected Obsidian vault does not expose a filesystem base path");
+		}
+		const { realpath } = await import("fs/promises");
+		const { resolve } = await import("path");
+		const expected = await realpath(resolve(expectedVaultPath));
+		const connected = await realpath(resolve(connectedBasePath));
+		if (connected !== expected) {
+			throw new Error(
+				`Refusing to mutate the wrong vault: requested ${expected}, connected ${connected}`,
+			);
+		}
+		return connected;
+	}
+
+	/** Write through Node's filesystem so Obsidian observes a real external edit. */
+	async writeNodeFile(vaultAbsPath: string, relPath: string, content: string): Promise<void> {
+		const { mkdir, writeFile } = await import("fs/promises");
+		const { dirname, join } = await import("path");
+		const fullPath = join(vaultAbsPath, relPath);
+		await mkdir(dirname(fullPath), { recursive: true });
+		await writeFile(fullPath, content, "utf-8");
+	}
+
+	/** Start or update a real Chromium IME composition in the focused editor. */
+	async imeSetComposition(
+		text: string,
+		selectionStart = text.length,
+		selectionEnd = text.length,
+	): Promise<void> {
+		await this.sendCommand("Input.imeSetComposition", {
+			text,
+			selectionStart,
+			selectionEnd,
+		});
 	}
 
 	/** Snapshot the vault manifest. */
