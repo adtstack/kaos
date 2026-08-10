@@ -5,6 +5,7 @@
  *   S07a  create-empty-then-fill
  *   S07b  async delayed template writes
  *   S07c  open-editor template mutation (confirms #25 coverage)
+ *   S07d  QuickAdd modify/process appends on one open file
  *   S07e  frontmatter race
  *   S07f  invalid intermediate → valid final
  *   S07h  multi-file burst (25 files)
@@ -17,12 +18,66 @@
  */
 
 import { MarkdownView } from "obsidian";
-import type { QaScenario } from "../types";
+import type { QaContext, QaScenario } from "../types";
 
 const FOLDER = "QA-s07";
 
 function p(name: string): string {
 	return `${FOLDER}/${name}-${Date.now().toString(36)}.md`;
+}
+
+interface OpenFileConvergenceState {
+	diskContent: string | null;
+	editorContent: string | null;
+	diskHash: string | null;
+	crdtHash: string | null;
+	editorHash: string | null;
+}
+
+async function waitForOpenFileConvergence(
+	ctx: QaContext,
+	path: string,
+	expectedContent: string,
+	label: string,
+	timeoutMs = 15_000,
+): Promise<OpenFileConvergenceState> {
+	const deadline = Date.now() + timeoutMs;
+	let lastState: OpenFileConvergenceState = {
+		diskContent: null,
+		editorContent: null,
+		diskHash: null,
+		crdtHash: null,
+		editorHash: null,
+	};
+	while (Date.now() < deadline) {
+		const file = ctx.app.vault.getFileByPath(path);
+		const view = ctx.app.workspace.getActiveViewOfType(MarkdownView);
+		const [diskHash, crdtHash, editorHash] = await Promise.all([
+			ctx.kaos.getDiskHash(path),
+			ctx.kaos.getCrdtHash(path),
+			ctx.kaos.getEditorHash(path),
+		]);
+		lastState = {
+			diskContent: file ? await ctx.app.vault.read(file) : null,
+			editorContent: view?.file?.path === path ? view.editor.getValue() : null,
+			diskHash,
+			crdtHash,
+			editorHash,
+		};
+		if (
+			lastState.diskContent === expectedContent &&
+			lastState.editorContent === expectedContent &&
+			diskHash !== null &&
+			diskHash === crdtHash &&
+			diskHash === editorHash
+		) {
+			return lastState;
+		}
+		await ctx.sleep(50);
+	}
+	throw new Error(
+		`${label}: disk/CRDT/editor did not converge for ${path}: ${JSON.stringify(lastState)}`,
+	);
 }
 
 // -----------------------------------------------------------------------
@@ -365,6 +420,127 @@ export const s07cOpenEditorTemplateMutation: QaScenario = {
 };
 
 // -----------------------------------------------------------------------
+// S07d — QuickAdd append through Vault.modify and Vault.process
+//
+// QuickAdd-class plugins update the same note through Obsidian's Vault API
+// while that note remains open. Neither host-driven editor refresh may be
+// mistaken for an independent workspace authority and preserved as a KAOS
+// editor conflict artifact.
+// -----------------------------------------------------------------------
+
+let s07dPathForCleanup: string | null = null;
+
+export const s07dQuickAddOpenFileAppends: QaScenario = {
+	id: "s07d-quickadd-open-file-appends",
+	title: "S07d: QuickAdd appends through Vault.modify/process while file stays open",
+	tags: ["s07d", "plugin-writes", "quickadd-class", "editor-bound", "regression"],
+	traceRecordingMode: "qa-safe",
+	traceExportPrivacy: "safe",
+
+	async setup(ctx): Promise<void> {
+		await ctx.waitForIdle(8000);
+	},
+
+	async run(ctx): Promise<void> {
+		const path = p("s07d-quickadd-open");
+		s07dPathForCleanup = path;
+		const initial = [
+			"# QuickAdd daily note",
+			"",
+			"## Captures",
+			"",
+		].join("\n");
+		const modifyAppend = "- Vault.modify capture\n";
+		const processAppend = "- Vault.process capture\n";
+		const afterModify = initial + modifyAppend;
+		const expectedFinal = afterModify + processAppend;
+
+		await ctx.createFile(path, initial);
+		await ctx.waitForCrdtFile(path, 15_000);
+		await ctx.waitForDiskCrdtConverge(path, 15_000);
+		await ctx.openFile(path);
+		await ctx.waitForCrdtBinding(path, 15_000);
+		await ctx.waitForIdle(15_000);
+		await waitForOpenFileConvergence(ctx, path, initial, "S07d baseline");
+
+		// QuickAdd implementations commonly read and replace the full file via
+		// Vault.modify. Keep the editor open throughout the host refresh and issue
+		// the next Vault write before KAOS is allowed to drain the first event.
+		await ctx.modifyFile(path, afterModify);
+
+		// Exercise Obsidian's atomic read-modify-write API back-to-back on that
+		// same open file. This catches alias-marker accumulation across consecutive
+		// modify events, the failure shape that produced numbered editor artifacts.
+		const file = ctx.app.vault.getFileByPath(path);
+		if (!file) throw new Error(`S07d: missing ${path} before Vault.process`);
+		let processInput: string | null = null;
+		await ctx.app.vault.process(file, (current) => {
+			processInput = current;
+			return current + processAppend;
+		});
+		if (processInput !== afterModify) {
+			throw new Error(
+				`S07d: Vault.process observed an unexpected preimage: ${JSON.stringify(processInput)}`,
+			);
+		}
+
+		await ctx.waitForIdle(15_000);
+		const settled = await waitForOpenFileConvergence(
+			ctx,
+			path,
+			expectedFinal,
+			"S07d Vault.process append",
+		);
+		await ctx.assert.noConflictCopies(FOLDER);
+
+		// The reported failure can arrive after an apparently successful refresh.
+		// Hold an explicit 3.5-second observation window and verify no rollback,
+		// hash change, or delayed editor conflict artifact appears.
+		await ctx.sleep(3500);
+		await ctx.waitForIdle(15_000);
+		const stable = await waitForOpenFileConvergence(
+			ctx,
+			path,
+			expectedFinal,
+			"S07d delayed stability",
+		);
+		if (
+			stable.diskHash !== settled.diskHash ||
+			stable.crdtHash !== settled.crdtHash ||
+			stable.editorHash !== settled.editorHash
+		) {
+			throw new Error(
+				`S07d: hashes changed during stability window` +
+				`\n  settled: ${JSON.stringify(settled)}` +
+				`\n  stable: ${JSON.stringify(stable)}`,
+			);
+		}
+		await ctx.assert.noConflictCopies(FOLDER);
+
+		await ctx.closeFile(path);
+		await ctx.deleteFile(path);
+		s07dPathForCleanup = null;
+	},
+
+	async assert(ctx): Promise<void> {
+		await ctx.assert.noConflictCopies(FOLDER);
+	},
+
+	async cleanup(ctx): Promise<void> {
+		const path = s07dPathForCleanup;
+		s07dPathForCleanup = null;
+		if (path) {
+			try {
+				await ctx.closeFile(path);
+			} finally {
+				await ctx.deleteFile(path);
+			}
+		}
+		await ctx.waitForIdle(5000);
+	},
+};
+
+// -----------------------------------------------------------------------
 // S07e — frontmatter race
 //
 // Template writes YAML; then a second programmatic write modifies the
@@ -462,11 +638,16 @@ export const s07eFrontmatterRace: QaScenario = {
 		const editorFinal = await ctx.kaos.getEditorHash(path);
 		console.log("[S07e] final state", { diskFinal, crdtFinal, editorFinal });
 
-		if (!diskFinal || !crdtFinal) {
+		if (!diskFinal || !crdtFinal || !editorFinal) {
 			throw new Error("S07e: could not read final hashes");
 		}
-		if (diskFinal !== crdtFinal) {
-			throw new Error(`S07e: disk != CRDT after frontmatter race\n  disk: ${diskFinal}\n  crdt: ${crdtFinal}`);
+		if (diskFinal !== crdtFinal || diskFinal !== editorFinal) {
+			throw new Error(
+				`S07e: disk/CRDT/editor diverged after frontmatter race` +
+				`\n  disk: ${diskFinal}` +
+				`\n  crdt: ${crdtFinal}` +
+				`\n  editor: ${editorFinal}`,
+			);
 		}
 		if (diskFinal === hashBefore) {
 			throw new Error("S07e: disk/CRDT did not update — still shows initial content");
@@ -476,6 +657,16 @@ export const s07eFrontmatterRace: QaScenario = {
 		const finalFile = ctx.app.vault.getFileByPath(path);
 		if (!finalFile) throw new Error("S07e: file not found on disk");
 		const finalContent = await ctx.app.vault.read(finalFile);
+		const finalView = ctx.app.workspace.getActiveViewOfType(MarkdownView);
+		if (finalContent !== FM_SECOND_WRITE) {
+			throw new Error(`S07e: disk is not the final programmatic write: ${JSON.stringify(finalContent)}`);
+		}
+		if (finalView?.file?.path !== path || finalView.editor.getValue() !== FM_SECOND_WRITE) {
+			throw new Error(
+				`S07e: editor is not the final programmatic write: ` +
+				`${JSON.stringify(finalView?.editor.getValue() ?? null)}`,
+			);
+		}
 		// Quick sanity: must start with --- and have a matching close ---
 		const fences = (finalContent.match(/^---\s*$/mg) ?? []).length;
 		if (fences < 2) {

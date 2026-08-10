@@ -14,7 +14,7 @@
 
 import { resolve, join } from "path";
 import { readFileSync } from "fs";
-import { ObsidianClient } from "./obsidian-client";
+import { RawCdpObsidianClient as ObsidianClient } from "./obsidian-client-raw-cdp";
 import { ArtifactCollector } from "./collect-artifacts";
 import { analyzeTrace } from "../analyzers/analyzer";
 import { formatReport } from "../analyzers/report";
@@ -101,7 +101,9 @@ async function main(): Promise<void> {
 		if (tracePath && vaultPath) {
 			const fullTracePath = tracePath.startsWith("/")
 				? tracePath
-				: join(vaultPath, ".obsidian", tracePath);
+				: tracePath.startsWith(".obsidian/")
+					? join(vaultPath, tracePath)
+					: join(vaultPath, ".obsidian", tracePath);
 			await collector.collectTrace(fullTracePath).catch((e) =>
 				log(`Warning: could not collect trace: ${e}`),
 			);

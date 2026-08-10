@@ -195,7 +195,16 @@ const DEBOUNCE_BURST_MS = 1000;
 const OPEN_FILE_IDLE_MS = 1500;
 const OPEN_FILE_ACTIVE_GRACE_MS = 1200;
 const SUPPRESS_MS = 500;
-const RECENT_WRITE_FINGERPRINT_MS = 5000;
+/** Event attribution stays short so later external revisions are never hidden. */
+const RECENT_WRITE_EVENT_FINGERPRINT_MS = 5000;
+/**
+ * A stricter controller recovery runs after the 3s editor-idle fence and can
+ * land on the next 5s host reconciliation tick. Retain the exact fingerprint
+ * long enough for that proof without extending event-level self-write
+ * suppression. Recovery additionally requires unchanged editor authority,
+ * editor=CRDT=physical bytes, and a strict external append successor.
+ */
+const RECENT_WRITE_RECOVERY_PROOF_MS = 10_000;
 const RECENT_WRITE_FINGERPRINT_MAX_ENTRIES = 200;
 const MAX_CONCURRENT_WRITES = 5;
 const BURST_THRESHOLD = 20;
@@ -384,6 +393,8 @@ export class DiskMirror {
 	private diskBaselineTextProvider:
 		| ((path: string) => Promise<string | null> | string | null)
 		| null = null;
+	/** Production adapter-backed reader used for every destructive text fence. */
+	private freshMarkdownFileReader: ((file: TFile) => Promise<string>) | null = null;
 
 	/**
 	 * Per-path timestamp of the most recent successful `flushWrite`. Updated
@@ -463,6 +474,14 @@ export class DiskMirror {
 		provider: (path: string) => Promise<string | null> | string | null,
 	): void {
 		this.diskBaselineTextProvider = provider;
+	}
+
+	setFreshMarkdownFileReader(reader: (file: TFile) => Promise<string>): void {
+		this.freshMarkdownFileReader = reader;
+	}
+
+	private readFreshMarkdownFile(file: TFile): Promise<string> {
+		return this.freshMarkdownFileReader?.(file) ?? this.app.vault.read(file);
 	}
 
 	setMarkdownPathSyncabilityPredicate(predicate: (path: string) => boolean): void {
@@ -963,7 +982,7 @@ export class DiskMirror {
 					return this.deferDiskChangedWrite(path, "expected-missing-now-existing");
 				}
 				if (existing instanceof TFile) {
-					const currentContent = await this.app.vault.read(existing);
+					const currentContent = await this.readFreshMarkdownFile(existing);
 					if (!this.isCallerAuthorityCurrent(path, options, "before-commit", "post-read")) {
 						return this.deferCallerAuthorityStale(path, "post-read", options);
 					}
@@ -1382,7 +1401,7 @@ export class DiskMirror {
 								return this.deferDiskChangedWrite(path, "expected-missing-create-race");
 							}
 							try {
-								const appearedContent = await this.app.vault.read(appeared);
+								const appearedContent = await this.readFreshMarkdownFile(appeared);
 								if (
 									appearedContent === content &&
 									this.vaultSync.getTextForPath(path)?.toJSON() === content
@@ -1594,7 +1613,7 @@ export class DiskMirror {
 
 		let actualContent: string;
 		try {
-			actualContent = await this.app.vault.read(expectedFile);
+			actualContent = await this.readFreshMarkdownFile(expectedFile);
 		} catch {
 			return reject("readback-failed");
 		}
@@ -2050,7 +2069,7 @@ export class DiskMirror {
 							);
 						} else {
 							try {
-								const diskContent = await this.app.vault.read(file);
+								const diskContent = await this.readFreshMarkdownFile(file);
 								if (diskContent !== lastKnownContent) {
 									// Known baseline exists, local file differs → known dirty.
 									// Preserve and revive: local dirty work wins over remote delete.
@@ -2131,7 +2150,7 @@ export class DiskMirror {
 							});
 						} else {
 							try {
-								const latestDiskContent = await this.app.vault.read(latestFile);
+								const latestDiskContent = await this.readFreshMarkdownFile(latestFile);
 								if (!this.isExactDiskFileCurrent(normalized, latestFile)) {
 									decision = { kind: "preserve-unresolved" };
 									unresolvedReason = "remote-delete-read-failed";
@@ -2363,7 +2382,7 @@ export class DiskMirror {
 									throw new Error("editor authority changed before dirty revival");
 								}
 							} else {
-								const latestDiskContent = await this.app.vault.read(file);
+								const latestDiskContent = await this.readFreshMarkdownFile(file);
 								if (
 									!this.isExactDiskFileCurrent(normalized, file)
 									|| latestDiskContent !== decision.diskContent
@@ -2601,7 +2620,7 @@ export class DiskMirror {
 				const expectedContent = yTextToString(expectedYText);
 				let targetContent: string;
 				try {
-					targetContent = await this.app.vault.read(target);
+					targetContent = await this.readFreshMarkdownFile(target);
 				} catch {
 					preserveCollision("target-read-failed");
 					return;
@@ -2625,7 +2644,7 @@ export class DiskMirror {
 
 			if (oldFile instanceof TFile) {
 				try {
-					const plannedSourceContent = await this.app.vault.read(oldFile);
+					const plannedSourceContent = await this.readFreshMarkdownFile(oldFile);
 					if (!isIntentCurrent()) return;
 					const dir = newNormalized.substring(0, newNormalized.lastIndexOf("/"));
 					if (dir && !this.app.vault.getAbstractFileByPath(normalizePath(dir))) {
@@ -2645,7 +2664,7 @@ export class DiskMirror {
 						preserveCollision("path-changed-before-rename-commit");
 						return;
 					}
-					const finalSourceContent = await this.app.vault.read(finalSource);
+					const finalSourceContent = await this.readFreshMarkdownFile(finalSource);
 					if (!isIntentCurrent()) return;
 					if (
 						this.app.vault.getAbstractFileByPath(oldNormalized) !== finalSource ||
@@ -2933,10 +2952,16 @@ export class DiskMirror {
 	): Promise<RecentWriteFingerprintProbe> {
 		const path = normalizePath(revision.path);
 		const expected = this.recentWriteFingerprints.get(path);
+		const age = expected === undefined ? null : Date.now() - expected.recordedAt;
 		const expectedIsFresh =
 			expected !== undefined &&
-			Date.now() - expected.recordedAt <= RECENT_WRITE_FINGERPRINT_MS;
-		if (expected && !expectedIsFresh) {
+			age !== null &&
+			age <= RECENT_WRITE_EVENT_FINGERPRINT_MS;
+		if (
+			expected &&
+			age !== null &&
+			age > RECENT_WRITE_RECOVERY_PROOF_MS
+		) {
 			this.recentWriteFingerprints.delete(path);
 		}
 
@@ -2945,7 +2970,10 @@ export class DiskMirror {
 		if (!expectedIsFresh || !expected) return { kind: "unproven", content };
 
 		const observed = await this.fingerprintContent(content);
-		if (!this.isObservedDiskRevisionCurrent(file, revision)) {
+		if (
+			!this.isObservedDiskRevisionCurrent(file, revision) ||
+			this.recentWriteFingerprints.get(path) !== expected
+		) {
 			return { kind: "stale-or-unreadable" };
 		}
 		return observed.bytes === expected.expectedBytes &&
@@ -2954,13 +2982,30 @@ export class DiskMirror {
 			: { kind: "not-self-write", content };
 	}
 
-	/** Backward-compatible boolean probe used by suppression diagnostics/tests. */
+	/**
+	 * Exact, non-consuming proof for the controller's narrowly fenced recovery.
+	 * This deliberately has a longer retention window than event attribution.
+	 */
 	async matchesRecentWriteFingerprint(file: TFile): Promise<boolean | null> {
+		const path = normalizePath(file.path);
+		const expected = this.recentWriteFingerprints.get(path);
+		if (!expected) return null;
+		if (Date.now() - expected.recordedAt > RECENT_WRITE_RECOVERY_PROOF_MS) {
+			this.recentWriteFingerprints.delete(path);
+			return null;
+		}
 		const revision = this.captureObservedDiskMutationRevision(file);
-		const result = await this.probeRecentWriteFingerprint(file, revision);
-		if (result.kind === "self-write") return true;
-		if (result.kind === "not-self-write") return false;
-		return null;
+		const content = await this.readExactObservedDiskRevision(file, revision);
+		if (content === null) return null;
+		const observed = await this.fingerprintContent(content);
+		if (
+			!this.isObservedDiskRevisionCurrent(file, revision) ||
+			this.recentWriteFingerprints.get(path) !== expected
+		) {
+			return null;
+		}
+		return observed.bytes === expected.expectedBytes &&
+			observed.hash === expected.expectedHash;
 	}
 
 	async shouldSuppressModify(file: TFile): Promise<boolean> {

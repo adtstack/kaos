@@ -376,11 +376,15 @@ npm run qa:open-external-merge -- \
   --out-dir qa-runs
 ```
 
-기본 실행은 `clean`, `same-line`, `representation`, `cursor`, `soak`을 모두
-검증한다. 한 case만 재현할 때는 `--case clean` 또는 `--case same-line`처럼
-지정한다. PASS 기준은 화면이 잠시 맞는 것이 아니라 disk/CRDT/editor hash,
-artifact 수, cursor/scroll/undo assertion이 모두 맞는 것이다. controller는 CDP로
-연결된 실제 vault 경로가 `--vault`와 다르면 파일을 만들거나 지우지 않고 중단한다.
+기본 실행은 `clean`, `same-line`, `representation`, `cursor`, `quickadd-burst`,
+`quickadd-heading`, `soak`을 모두 검증한다. `quickadd-burst`는 열린 note에
+`Vault.process()`를 75ms 간격으로 세 번 실행하고, `quickadd-heading`은 문서 중간의
+특정 제목 바로 아래에 문구를 삽입한다. 두 case 모두 최초 수렴 후 3.5초 동안
+200ms 간격으로 계속 관찰하여 rollback이나 지연 conflict artifact도 실패로 본다.
+한 case만 재현할 때는 `--case quickadd-burst`처럼 지정한다. PASS 기준은 화면이
+잠시 맞는 것이 아니라 disk/CRDT/editor hash, artifact 수, cursor/scroll/undo
+assertion이 모두 맞는 것이다. controller는 CDP로 연결된 실제 vault 경로가
+`--vault`와 다르면 파일을 만들거나 지우지 않고 중단한다.
 
 ### 12.5 재시작 데이터 유실 회귀
 

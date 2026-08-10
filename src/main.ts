@@ -526,6 +526,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			recordFlightEvent: (event) => this.recordFlightEvent(event as import("./telemetry/debug/flightEvents").FlightEventInput),
 			recordFlightPathEvent: (event) => this.recordFlightPathEvent(event),
 			readStableMarkdownFile: (path, reason) => this.readStableMarkdownFile(path, reason),
+			readFreshMarkdownFile: (file) => this.readFreshMarkdownFile(file),
 			computeRecoveryStateHash: async (_path, content) => {
 				return this.lab?.computeWitnessStateHash(content) ?? null;
 			},
@@ -3443,15 +3444,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.reconciliationController.noteInterceptedExternalDiskMutation(candidate);
 				},
 				() => true,
-				{
-					settleOpenExternalEdit: (path) =>
-						this.reconciliationController.settleOpenExternalEditBeforeTransition(path),
-					flushOpenPath: async (path, reason) => {
-						await this.diskMirror?.flushOpenPath(path, reason);
-					},
-					admitTargetFromDisk: (file) =>
-						this.reconciliationController.admitEditorTargetFromDisk(file),
-				},
 			);
 
 			// 3. Global CM6 extension
@@ -3481,6 +3473,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				() => this.handleMarkdownAttentionStateChanged(),
 			);
 			this.diskMirror.setMarkdownPathSyncabilityPredicate((path) => this.isMarkdownPathSyncable(path));
+			this.diskMirror.setFreshMarkdownFileReader((file) => this.readFreshMarkdownFile(file));
 			this.diskMirror.setRemoteProjectionAdmissionPredicate(
 				(path) => this.remoteProjectionPolicyGate.isRemoteProjectionAllowed(path),
 			);
@@ -3663,10 +3656,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.refreshStatusBar();
 				this.schedulePendingBlobIntentReplay("status-tick");
 				if (this.reconciliationController.isReconciled && this.editorBindings) {
-					const touched = this.editorWorkspace?.auditBindings("status-tick") ?? 0;
-					if (touched > 0) {
-						this.log(`Binding health audit (status-tick) — touched ${touched}`);
-					}
+					this.editorWorkspace?.validateOpenBindings("status-tick");
 				}
 				// Periodically persist blob queue if transfers are active,
 				// or clear persisted queue if transfers completed
@@ -3895,7 +3885,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		path: string,
 		reason: MarkdownDirtyReason,
 	): Promise<StableMarkdownReadResult> {
-		return readStableMarkdownSnapshot<TFile>({
+		const snapshot = await readStableMarkdownSnapshot<TFile>({
 			stat: async (candidate) => {
 				const stat = await this.app.vault.adapter.stat(candidate);
 				return stat ? { mtime: stat.mtime, size: stat.size } : null;
@@ -3904,9 +3894,39 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				const file = this.app.vault.getAbstractFileByPath(candidate);
 				return file instanceof TFile ? file : null;
 			},
-			read: (file) => this.app.vault.read(file),
+			// Vault.read can lag a real filesystem writer until Obsidian publishes
+			// the corresponding modify event. Stable stat fencing therefore has to
+			// read through the adapter as well; mixing current stat with a stale host
+			// projection can otherwise turn the exact external revision into a
+			// conflict artifact and then overwrite the primary file.
+			read: (file) => this.app.vault.adapter.read(file.path),
 			trace: (message, details) => this.trace("reconcile", message, details),
 		}, path, reason);
+		if (snapshot.kind !== "ready") return snapshot;
+		const rawByteLength = new TextEncoder().encode(snapshot.content).byteLength;
+		if (rawByteLength !== snapshot.stat.size) {
+			this.trace("reconcile", "markdown-stable-read-byte-size-mismatch", {
+				path,
+				reason,
+				expectedBytes: snapshot.stat.size,
+				actualBytes: rawByteLength,
+			});
+			return { kind: "unstable" };
+		}
+		return {
+			...snapshot,
+			content: this.toVaultLogicalText(snapshot.content),
+		};
+	}
+
+	/** Adapter-backed equivalent of Vault.read's leading-BOM text semantics. */
+	private async readFreshMarkdownFile(file: TFile): Promise<string> {
+		const raw = await this.app.vault.adapter.read(file.path);
+		return this.toVaultLogicalText(raw);
+	}
+
+	private toVaultLogicalText(raw: string): string {
+		return raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
 	}
 
 	private async importUntrackedFiles(): Promise<void> {
@@ -4014,26 +4034,36 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					const editorBindingsAtEvent = this.editorBindings;
 					if (editorBindingsAtEvent?.isBound(file.path)) {
 						const sequence = ++this.externalDiskMutationSequence;
+						const openViews: MarkdownView[] = [];
+						this.app.workspace.iterateAllLeaves((leaf) => {
+							if (
+								leaf.view instanceof MarkdownView &&
+								leaf.view.file?.path === file.path
+							) {
+								openViews.push(leaf.view);
+							}
+						});
+						const editorAuthorityLineage =
+							editorBindingsAtEvent
+								.captureExternalDiskMutationEditorAuthorityLineage(
+									file.path,
+									openViews,
+								);
 						editorBindingsAtEvent.beginExternalDiskMutation(file.path, sequence);
 						void (async () => {
 							let content: string | null = null;
 							if (dm) {
-								if (writerGuess === "kaos-write") {
-									// Timing is diagnostic only. The exact event revision must match
-									// the intended bytes before this event may bypass the guard.
-									const probe = await dm.probeRecentWriteFingerprint(
-										file,
-										diskMutationRevision,
-									);
-									if (probe.kind === "self-write") return;
-									if (probe.kind !== "stale-or-unreadable") {
-										content = probe.content;
-									}
-								} else {
-									content = await dm.readExactObservedDiskRevision(
-										file,
-										diskMutationRevision,
-									);
+								// writerGuess is intentionally diagnostic only. Obsidian can emit
+								// our exact write event several seconds after suppression expires,
+								// so every event must use the content fingerprint before it may be
+								// admitted as a distinct external revision.
+								const probe = await dm.probeRecentWriteFingerprint(
+									file,
+									diskMutationRevision,
+								);
+								if (probe.kind === "self-write") return;
+								if (probe.kind !== "stale-or-unreadable") {
+									content = probe.content;
 								}
 							}
 
@@ -4047,6 +4077,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 								sequence,
 								observedAt,
 								content,
+								editorAuthorityLineage,
 							});
 						})().catch((err) => {
 							this.trace("editor", "external-disk-reload-guard-probe-failed", {

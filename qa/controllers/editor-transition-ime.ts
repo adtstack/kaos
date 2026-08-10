@@ -7,7 +7,7 @@
  */
 
 import { resolve } from "path";
-import { ObsidianClient } from "./obsidian-client";
+import { RawCdpObsidianClient as ObsidianClient } from "./obsidian-client-raw-cdp";
 
 const SOURCE_PATH = "QA-scratch/transition-ime-a.md";
 const TARGET_PATH = "QA-scratch/transition-ime-b.md";

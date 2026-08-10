@@ -110,6 +110,20 @@ assert.deepEqual(planOpenExternalEdit({
 	currentText: appendSubset,
 	externalText: appendSuperset,
 }), { kind: "apply-external", targetText: appendSuperset });
+
+const staleAppendBaseline = `${appendBase}editor-01\n`;
+const currentAfterManyAppends = `${staleAppendBaseline}filesystem-02\neditor-03\n`;
+const externalAppendSuccessor = `${currentAfterManyAppends}filesystem-04\n`;
+assert.deepEqual(planOpenExternalEdit({
+	baselineText: staleAppendBaseline,
+	currentText: currentAfterManyAppends,
+	externalText: externalAppendSuccessor,
+}), { kind: "apply-external", targetText: externalAppendSuccessor });
+assert.deepEqual(planOpenExternalEdit({
+	baselineText: null,
+	currentText: currentAfterManyAppends,
+	externalText: externalAppendSuccessor,
+}), { kind: "apply-external", targetText: externalAppendSuccessor });
 assert.deepEqual(planOpenExternalEdit({
 	baselineText: appendBase,
 	currentText: appendSuperset,

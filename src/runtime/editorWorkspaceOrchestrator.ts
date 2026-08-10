@@ -39,11 +39,7 @@ export class EditorWorkspaceOrchestrator {
 			this.getActiveMarkdownPath(),
 			"layout-change-active-blur",
 		);
-		const touched = this.auditBindings("layout-change");
-		if (touched > 0) {
-			this.deps.log(`Binding health audit (layout-change) — touched ${touched}`);
-			this.deps.scheduleTraceStateSnapshot("binding-audit:layout-change");
-		}
+		this.validateOpenBindings("layout-change");
 	}
 
 	onActiveLeafChange(leaf: WorkspaceLeaf | null): void {
@@ -69,6 +65,10 @@ export class EditorWorkspaceOrchestrator {
 		if (view && view.file?.path === filePath) {
 			this.bindView(view);
 		}
+		// Obsidian can emit file-open before the MarkdownView has adopted its new
+		// TFile. Re-scan after the current host callback settles instead of relying
+		// on a private save boundary to keep the binding alive.
+		queueMicrotask(() => this.validateOpenBindings("file-open-settled"));
 	}
 
 	onMarkdownDeleted(path: string): void {
@@ -117,7 +117,7 @@ export class EditorWorkspaceOrchestrator {
 
 			if (!binding || !health?.bound) {
 				touched += 1;
-				editorBindings.bind(leaf.view, this.deps.getSettings().deviceName);
+				this.bindView(leaf.view);
 				return;
 			}
 
@@ -174,11 +174,7 @@ export class EditorWorkspaceOrchestrator {
 
 	private reconcileTrackedOpenFiles(reason: string): void {
 		const currentlyOpen = new Set<string>();
-		const liveMarkdownViews = new Set<MarkdownView>();
 		this.deps.app.workspace.iterateAllLeaves((leaf) => {
-			if (leaf.view instanceof MarkdownView) {
-				liveMarkdownViews.add(leaf.view);
-			}
 			if (
 				leaf.view instanceof MarkdownView
 				&& leaf.view.file
@@ -187,7 +183,6 @@ export class EditorWorkspaceOrchestrator {
 				currentlyOpen.add(leaf.view.file.path);
 			}
 		});
-		this.deps.getEditorBindings()?.pruneTransitionViews(liveMarkdownViews);
 
 		for (const tracked of this.openFilePaths) {
 			if (!currentlyOpen.has(tracked)) {
@@ -213,10 +208,5 @@ export class EditorWorkspaceOrchestrator {
 		}
 
 		this.deps.getEditorBindings()?.clearLocalCursor(reason);
-		// A same-view file change is flushed by EditorBindingManager's awaited
-		// TextFileView unload boundary after any active IME composition settles.
-		// A plain focus change leaves the previous editor open, so its normal
-		// DiskMirror schedule remains authoritative. Fire-and-forget flushing here
-		// would race both cases and could publish a pre-composition snapshot.
 	}
 }
