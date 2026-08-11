@@ -19,7 +19,7 @@ async function buildBundleFromSegments(
 	const deviceId = await client.evalRaw<string>(`window.__KAOS_DEBUG__?.getDeviceId()`);
 	const secretHash = await client.evalRaw<string>(`window.__KAOS_DEBUG__?.getActiveTraceInfo()?.qaTraceSecretHash ?? ""`);
 	const segs = await client.evalRaw<string | null>(`window.__KAOS_DEBUG__?.exportWitnessSegments?.(${JSON.stringify(traceId)}) ?? null`);
-	const pathIdRaw = await client.evalRaw<string | null>(`(async () => { const ftc = app.plugins.plugins.kaos?.flightTrace; if (!ftc) return null; const p = await ftc.getPathId(${JSON.stringify(scratch)}); return p?.pathId ?? null; })()`);
+	const pathIdRaw = await client.evalRaw<string | null>(`(async () => { const ftc = app.plugins.plugins.kaos?.lab?.getFlightTraceController?.(); if (!ftc) return null; const p = await ftc.getPathId(${JSON.stringify(scratch)}); return p?.pathId ?? null; })()`);
 
 	const lines = (segs || "").split("\n").filter((l) => l.trim());
 	const filtered = lines.filter((l) => {

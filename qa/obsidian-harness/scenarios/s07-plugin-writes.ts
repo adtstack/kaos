@@ -423,9 +423,8 @@ export const s07cOpenEditorTemplateMutation: QaScenario = {
 // S07d — QuickAdd append through Vault.modify and Vault.process
 //
 // QuickAdd-class plugins update the same note through Obsidian's Vault API
-// while that note remains open. Neither host-driven editor refresh may be
-// mistaken for an independent workspace authority and preserved as a KAOS
-// editor conflict artifact.
+// while that note remains open. Each write is allowed to settle before the
+// next begins so this scenario proves the serialized plugin-write contract.
 // -----------------------------------------------------------------------
 
 let s07dPathForCleanup: string | null = null;
@@ -464,13 +463,31 @@ export const s07dQuickAddOpenFileAppends: QaScenario = {
 		await waitForOpenFileConvergence(ctx, path, initial, "S07d baseline");
 
 		// QuickAdd implementations commonly read and replace the full file via
-		// Vault.modify. Keep the editor open throughout the host refresh and issue
-		// the next Vault write before KAOS is allowed to drain the first event.
+		// Vault.modify. Keep the editor open, then prove this revision is fully
+		// settled before a second plugin write begins.
 		await ctx.modifyFile(path, afterModify);
+		await waitForOpenFileConvergence(ctx, path, afterModify, "S07d Vault.modify append");
+		await ctx.waitForIdle(15_000);
+		const modifySettled = await waitForOpenFileConvergence(ctx, path, afterModify, "S07d Vault.modify baseline");
+		await ctx.sleep(3500);
+		await ctx.waitForIdle(15_000);
+		const modifyStable = await waitForOpenFileConvergence(ctx, path, afterModify, "S07d Vault.modify stability");
+		if (
+			modifyStable.diskHash !== modifySettled.diskHash ||
+			modifyStable.crdtHash !== modifySettled.crdtHash ||
+			modifyStable.editorHash !== modifySettled.editorHash
+		) {
+			throw new Error(
+				`S07d: Vault.modify hashes changed before Vault.process` +
+				`\n  settled: ${JSON.stringify(modifySettled)}` +
+				`\n  stable: ${JSON.stringify(modifyStable)}`,
+			);
+		}
+		await ctx.assert.noConflictCopies(FOLDER);
 
-		// Exercise Obsidian's atomic read-modify-write API back-to-back on that
-		// same open file. This catches alias-marker accumulation across consecutive
-		// modify events, the failure shape that produced numbered editor artifacts.
+		// Exercise Obsidian's atomic read-modify-write API against that settled
+		// preimage. A true overlapping burst has no causal adoption receipt and is
+		// intentionally covered by the fail-closed external-revision policy instead.
 		const file = ctx.app.vault.getFileByPath(path);
 		if (!file) throw new Error(`S07d: missing ${path} before Vault.process`);
 		let processInput: string | null = null;

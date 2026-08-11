@@ -5,7 +5,7 @@
  * Usage:
  *   bun run qa/controllers/open-external-merge.ts \
  *     --port 9222 --vault /path/to/disposable-vault [--out-dir qa-runs] \
- *     [--case clean|same-line|representation|cursor|quickadd-burst|quickadd-heading|soak]
+ *     [--case clean|same-line|representation|cursor|quickadd-burst|quickadd-heading|korean-prefix|move-delete|soak]
  */
 
 import { resolve } from "path";
@@ -147,6 +147,16 @@ async function waitForConvergence(
 		isConverged(state, expected, artifactCount));
 }
 
+async function waitForQaIdle(client: ObsidianClient, timeoutMs = 15_000): Promise<void> {
+	await client.evalRaw(`
+		(async () => {
+			const qa = window.__KAOS_QA__;
+			if (!qa) throw new Error("__KAOS_QA__ unavailable");
+			await qa.waitForIdle(${timeoutMs});
+		})()
+	`);
+}
+
 async function assertConvergenceRemainsStable(
 	client: ObsidianClient,
 	label: string,
@@ -154,14 +164,17 @@ async function assertConvergenceRemainsStable(
 	settled: FileState,
 	durationMs = 3_500,
 ): Promise<void> {
+	const artifactCount = settled.artifacts.length;
+	const artifactSnapshot = JSON.stringify(settled.artifacts);
 	const deadline = Date.now() + durationMs;
 	while (Date.now() < deadline) {
 		const state = await readState(client);
 		if (
-			!isConverged(state, expected) ||
+			!isConverged(state, expected, artifactCount) ||
 			state.diskHash !== settled.diskHash ||
 			state.crdtHash !== settled.crdtHash ||
-			state.editorHash !== settled.editorHash
+			state.editorHash !== settled.editorHash ||
+			JSON.stringify(state.artifacts) !== artifactSnapshot
 		) {
 			throw new Error(`${label} rolled back after convergence: ${JSON.stringify(state)}`);
 		}
@@ -420,8 +433,8 @@ async function runCursorScrollUndo(
 	}
 }
 
-async function runQuickAddBurst(client: ObsidianClient): Promise<void> {
-	const baseline = "# QuickAdd burst\n\n## Captures\n";
+async function runQuickAddSerialized(client: ObsidianClient): Promise<void> {
+	const baseline = "# QuickAdd serialized writes\n\n## Captures\n";
 	const additions = [
 		"- capture one\n",
 		"- capture two\n",
@@ -430,43 +443,98 @@ async function runQuickAddBurst(client: ObsidianClient): Promise<void> {
 	const expected = baseline + additions.join("");
 	await prepareCase(client, baseline);
 
-	const processInputs = await client.evalRaw<string[]>(`
-		(async () => {
-			const app = window.app;
-			if (!app) throw new Error("Obsidian app unavailable");
-			const path = ${JSON.stringify(TARGET)};
-			const additions = ${JSON.stringify(additions)};
-			const inputs = [];
-			for (const addition of additions) {
-				const file = app.vault.getFileByPath(path);
-				if (!file) throw new Error("QuickAdd target disappeared");
-				await app.vault.process(file, (current) => {
-					inputs.push(current);
-					return current + addition;
-				});
-				await new Promise((resolveDelay) => setTimeout(resolveDelay, 75));
-			}
-			return inputs;
-		})()
-	`);
 	let expectedInput = baseline;
 	for (let index = 0; index < additions.length; index += 1) {
-		if (processInputs[index] !== expectedInput) {
+		const addition = additions[index];
+		const processInput = await client.evalRaw<string>(`
+			(async () => {
+				const app = window.app;
+				if (!app) throw new Error("Obsidian app unavailable");
+				const file = app.vault.getFileByPath(${JSON.stringify(TARGET)});
+				if (!file) throw new Error("QuickAdd target disappeared");
+				let input = "";
+				await app.vault.process(file, (current) => {
+					input = current;
+					return current + ${JSON.stringify(addition)};
+				});
+				return input;
+			})()
+		`);
+		if (processInput !== expectedInput) {
 			throw new Error(
-				`QuickAdd burst ${index + 1} observed stale input: ` +
-				JSON.stringify(processInputs[index]),
+				`QuickAdd serialized write ${index + 1} observed stale input: ` +
+				JSON.stringify(processInput),
 			);
 		}
-		expectedInput += additions[index];
+		expectedInput += addition;
+		await waitForConvergence(client, `QuickAdd serialized write ${index + 1}`, expectedInput);
+		await waitForQaIdle(client);
+		const stable = await waitForConvergence(client, `QuickAdd serialized write ${index + 1} baseline`, expectedInput);
+		await assertConvergenceRemainsStable(
+			client,
+			`QuickAdd serialized write ${index + 1}`,
+			expectedInput,
+			stable,
+		);
 	}
 
-	const settled = await waitForConvergence(client, "QuickAdd burst convergence", expected);
+	const settled = await waitForConvergence(client, "QuickAdd serialized convergence", expected);
 	await assertConvergenceRemainsStable(
 		client,
-		"QuickAdd burst",
+		"QuickAdd serialized writes",
 		expected,
 		settled,
 	);
+}
+
+async function runKoreanPrefixConflict(
+	client: ObsidianClient,
+	vaultPath: string,
+): Promise<void> {
+	const baseline = [
+		"---",
+		"date: 2026-08-08",
+		"---",
+		"",
+		"## 일상",
+		"오늘은 하루종일 ",
+	].join("\n");
+	const local = `${baseline}고미`;
+	const rawExternal = `${baseline}고민하고 `;
+	if (rawExternal.startsWith(local) || !rawExternal.normalize("NFD").startsWith(local.normalize("NFD"))) {
+		throw new Error("Korean prefix fixture no longer exercises the Unicode normalization-prefix boundary");
+	}
+	await prepareCase(client, baseline);
+	const edited = await appendEditorText(client, "고미");
+	if (edited !== local) throw new Error(`Korean prefix local body mismatch: ${JSON.stringify(edited)}`);
+	await waitForEditorAuthority(client, "Korean prefix local authority", local);
+	await client.writeNodeFile(vaultPath, TARGET, rawExternal);
+	const state = await waitForConvergence(client, "Korean prefix conflict settlement", local, 1);
+	if (state.artifacts[0]?.content !== rawExternal) {
+		throw new Error(`Korean prefix artifact is not byte-exact: ${JSON.stringify(state.artifacts)}`);
+	}
+	if (state.diskContent?.includes("<<<<<<<")) throw new Error("Korean prefix primary contains conflict markers");
+	await assertConvergenceRemainsStable(client, "Korean prefix conflict", local, state);
+}
+
+async function runMoveDeleteConflict(
+	client: ObsidianClient,
+	vaultPath: string,
+): Promise<void> {
+	const baseline = "A\nB\nC\n";
+	const local = "A\nC\n";
+	const rawExternal = "A\nC\nB\n";
+	await prepareCase(client, baseline);
+	const edited = await replaceEditorText(client, "B\n", "");
+	if (edited !== local) throw new Error(`move/delete local body mismatch: ${JSON.stringify(edited)}`);
+	await waitForEditorAuthority(client, "move/delete local authority", local);
+	await client.writeNodeFile(vaultPath, TARGET, rawExternal);
+	const state = await waitForConvergence(client, "move/delete conflict settlement", local, 1);
+	if (state.artifacts[0]?.content !== rawExternal) {
+		throw new Error(`move/delete artifact is not byte-exact: ${JSON.stringify(state.artifacts)}`);
+	}
+	if (state.diskContent?.includes("<<<<<<<")) throw new Error("move/delete primary contains conflict markers");
+	await assertConvergenceRemainsStable(client, "move/delete conflict", local, state);
 }
 
 async function runQuickAddHeadingInsertion(client: ObsidianClient): Promise<void> {
@@ -544,10 +612,13 @@ async function runAlternatingSoak(
 		} else {
 			await client.writeNodeFile(vaultPath, TARGET, expected);
 		}
-		const state = await waitForConvergence(client, `soak cycle ${cycle}`, expected);
+		await waitForConvergence(client, `soak cycle ${cycle}`, expected);
+		await waitForQaIdle(client);
+		const state = await waitForConvergence(client, `soak cycle ${cycle} post-idle`, expected);
 		if (state.size !== byteLength(expected)) {
 			throw new Error(`soak cycle ${cycle}: size ${state.size} != ${byteLength(expected)}`);
 		}
+		await assertConvergenceRemainsStable(client, `soak cycle ${cycle}`, expected, state);
 	}
 
 	const final = await waitForConvergence(client, "soak final convergence", expected);
@@ -607,8 +678,10 @@ async function main(): Promise<number> {
 			["same-line", "same-line conflict", () => runSameLineConflict(client, vaultPath)],
 			["representation", "CRLF/BOM representation", () => runRepresentationOnly(client, vaultPath)],
 			["cursor", "cursor, scroll, and undo", () => runCursorScrollUndo(client, vaultPath)],
-			["quickadd-burst", "QuickAdd three-write burst", () => runQuickAddBurst(client)],
+			["quickadd-burst", "QuickAdd serialized three-write sequence", () => runQuickAddSerialized(client)],
 			["quickadd-heading", "QuickAdd heading insertion", () => runQuickAddHeadingInsertion(client)],
+			["korean-prefix", "Korean normalization-prefix conflict", () => runKoreanPrefixConflict(client, vaultPath)],
+			["move-delete", "move versus delete conflict", () => runMoveDeleteConflict(client, vaultPath)],
 			["soak", "50-cycle alternating soak", () => runAlternatingSoak(client, vaultPath)],
 		];
 		const requestedCase = args.case;

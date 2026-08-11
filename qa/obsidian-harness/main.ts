@@ -312,6 +312,8 @@ export default class KaosQaHarnessPlugin extends Plugin {
 
 		const debugApi = buildQaDebugApi({
 			app: this.app,
+			settings: (product as any).settings,
+			saveSettings: (reason?: string) => (product as any).saveSettings(reason),
 			getVaultSync: () => (product as any).vaultSync ?? null,
 			getReconciliationController: () => (product as any).reconciliationController,
 			getConnectionController: () => (product as any).connectionController ?? null,

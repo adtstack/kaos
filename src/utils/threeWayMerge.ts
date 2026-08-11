@@ -61,6 +61,11 @@ export function mergeTexts3(
 
 	const conflictRanges = mergeBaseRanges([
 		...collectConflictRanges(leftChanges, rightChanges),
+		...collectAmbiguousSharedRemovalReintroductionRanges(
+			baseLines,
+			leftChanges,
+			rightChanges,
+		),
 		...collectAmbiguousRepeatedLineAlignmentRanges(
 			baseLines,
 			leftChanges,
@@ -168,11 +173,11 @@ function collectConflictRanges(
 	const ranges: BaseRange[] = [];
 	for (const left of leftChanges) {
 		for (const right of rightChanges) {
-			// Both variants may already contain the same delta, or one replacement
-			// may structurally subsume the other at the exact same base range. Keep
-			// only the complete textual superset. Empty replacements are excluded
-			// so delete-vs-modify remains a conflict.
-			if (lineChangesCompatible(left, right)) continue;
+			// The same delta can be applied once. Distinct replacements at the same
+			// base range remain a conflict even when one happens to contain all lines
+			// from the other: containment does not prove that an omitted line was not
+			// intentionally deleted.
+			if (lineChangesEqual(left, right)) continue;
 			if (!rangesTouch(left, right)) continue;
 			ranges.push({
 				start: Math.min(left.baseStart, right.baseStart),
@@ -190,27 +195,6 @@ function lineChangesEqual(left: LineChange, right: LineChange): boolean {
 		left.lines.every((line, index) => line === right.lines[index]);
 }
 
-function lineChangesCompatible(left: LineChange, right: LineChange): boolean {
-	return lineChangesEqual(left, right) ||
-		lineChangeStrictlySubsumes(left, right) ||
-		lineChangeStrictlySubsumes(right, left);
-}
-
-function lineChangeStrictlySubsumes(
-	container: LineChange,
-	candidate: LineChange,
-): boolean {
-	if (
-		container.baseStart !== candidate.baseStart ||
-		container.baseEnd !== candidate.baseEnd ||
-		candidate.lines.length === 0 ||
-		container.lines.length <= candidate.lines.length
-	) {
-		return false;
-	}
-	return containsLineSubsequence(container.lines, candidate.lines);
-}
-
 function containsLineSubsequence(container: string[], candidate: string[]): boolean {
 	if (candidate.length === 0) return true;
 	let candidateIndex = 0;
@@ -222,6 +206,88 @@ function containsLineSubsequence(container: string[], candidate: string[]): bool
 	return false;
 }
 
+/**
+ * A move can look like one exact shared removal plus a non-overlapping insertion
+ * on only one side. Treating those deltas as independent would silently revive
+ * text that the other side intentionally removed. Conflict only when a
+ * unilateral change reintroduces an exact line removed by the shared change;
+ * unrelated insertions remain mergeable.
+ */
+function collectAmbiguousSharedRemovalReintroductionRanges(
+	baseLines: string[],
+	leftChanges: LineChange[],
+	rightChanges: LineChange[],
+): BaseRange[] {
+	const ranges: BaseRange[] = [];
+	const sharedChanges = leftChanges.filter((left) =>
+		rightChanges.some((right) => lineChangesEqual(left, right)));
+	const sharedRemovals = sharedChanges.filter((change) =>
+		change.baseStart < change.baseEnd);
+	const commonCounts = countLinesAfterChanges(baseLines, sharedChanges);
+	const leftCounts = countLinesAfterChanges(baseLines, leftChanges);
+	const rightCounts = countLinesAfterChanges(baseLines, rightChanges);
+
+	for (const shared of sharedRemovals) {
+		const retainedCounts = new Map<string, number>();
+		for (const line of shared.lines) {
+			retainedCounts.set(line, (retainedCounts.get(line) ?? 0) + 1);
+		}
+		const removedLines = new Set<string>();
+		for (const line of baseLines.slice(shared.baseStart, shared.baseEnd)) {
+			const retained = retainedCounts.get(line) ?? 0;
+			if (retained > 0) {
+				retainedCounts.set(line, retained - 1);
+			} else {
+				removedLines.add(line);
+			}
+		}
+		if (removedLines.size === 0) continue;
+
+		const collectUnilateralReintroductions = (
+			changes: LineChange[],
+			otherChanges: LineChange[],
+			sideCounts: Map<string, number>,
+		) => {
+			for (const candidate of changes) {
+				if (lineChangesEqual(candidate, shared)) continue;
+				if (otherChanges.some((other) => lineChangesEqual(candidate, other))) continue;
+				if (!candidate.lines.some((line) =>
+					removedLines.has(line) &&
+					(sideCounts.get(line) ?? 0) > (commonCounts.get(line) ?? 0))) continue;
+				ranges.push({
+					start: Math.min(shared.baseStart, candidate.baseStart),
+					end: Math.max(shared.baseEnd, candidate.baseEnd),
+				});
+			}
+		};
+
+		collectUnilateralReintroductions(leftChanges, rightChanges, leftCounts);
+		collectUnilateralReintroductions(rightChanges, leftChanges, rightCounts);
+	}
+
+	return mergeBaseRanges(ranges);
+}
+
+function countLinesAfterChanges(
+	baseLines: string[],
+	changes: LineChange[],
+): Map<string, number> {
+	const counts = new Map<string, number>();
+	const adjust = (line: string, delta: number) => {
+		const next = (counts.get(line) ?? 0) + delta;
+		if (next === 0) counts.delete(line);
+		else counts.set(line, next);
+	};
+
+	for (const line of baseLines) adjust(line, 1);
+	for (const change of changes) {
+		for (const line of baseLines.slice(change.baseStart, change.baseEnd)) {
+			adjust(line, -1);
+		}
+		for (const line of change.lines) adjust(line, 1);
+	}
+	return counts;
+}
 function collectAmbiguousRepeatedLineAlignmentRanges(
 	baseLines: string[],
 	leftChanges: LineChange[],
@@ -282,9 +348,6 @@ function combineDistinctChanges(
 ): LineChange[] {
 	const candidates = [...leftChanges, ...rightChanges];
 	return candidates.filter((candidate, index) => {
-		if (candidates.some((other) => lineChangeStrictlySubsumes(other, candidate))) {
-			return false;
-		}
 		return candidates.findIndex((other) => lineChangesEqual(other, candidate)) === index;
 	});
 }

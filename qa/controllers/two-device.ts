@@ -3336,7 +3336,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		}
 
 		// Get pathId for the s13 file to filter bundle events to only this file
-		const pathIdA = await a.evalRaw<string | null>(`(async () => { const r = await window.__KAOS_DEBUG__?.getActiveTraceInfo?.(); const ftc = app.plugins.plugins.kaos?.flightTrace; if (!ftc) return null; const p = await ftc.getPathId(${JSON.stringify(scratch)}); return p?.pathId ?? null; })()`);
+		const pathIdA = await a.evalRaw<string | null>(`(async () => { const r = await window.__KAOS_DEBUG__?.getActiveTraceInfo?.(); const ftc = app.plugins.plugins.kaos?.lab?.getFlightTraceController?.(); if (!ftc) return null; const p = await ftc.getPathId(${JSON.stringify(scratch)}); return p?.pathId ?? null; })()`);
 		log(`s13: pathId for s13 file: ${pathIdA}`);
 
 		// Export bundles and run offline analyzer -- filter to s13 file events only
@@ -3513,8 +3513,9 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			const traceId = await client.evalRaw<string>(`window.__KAOS_DEBUG__?.getActiveTraceInfo()?.localTraceId ?? ""`);
 			const deviceId = await client.evalRaw<string>(`window.__KAOS_DEBUG__?.getDeviceId()`);
 			const secretHash = await client.evalRaw<string>(`window.__KAOS_DEBUG__?.getActiveTraceInfo()?.qaTraceSecretHash ?? ""`);
+			const pluginVersion = await client.evalRaw<string>(`app.plugins.plugins.kaos?.manifest?.version ?? "unknown"`);
 			const segs = await client.evalRaw<string | null>(`window.__KAOS_DEBUG__?.exportWitnessSegments?.(${JSON.stringify(traceId)}) ?? null`);
-			const pathIdRaw = await client.evalRaw<string | null>(`(async()=>{const ftc=app.plugins.plugins.kaos?.flightTrace;if(!ftc)return null;const p=await ftc.getPathId(${JSON.stringify(scratch)});return p?.pathId??null;})()`);
+			const pathIdRaw = await client.evalRaw<string | null>(`(async()=>{const ftc=app.plugins.plugins.kaos?.lab?.getFlightTraceController?.();if(!ftc)return null;const p=await ftc.getPathId(${JSON.stringify(scratch)});return p?.pathId??null;})()`);
 			const lines = (segs || "").split("\n").filter((l) => l.trim());
 			const filtered = lines.filter((l) => {
 				try {
@@ -3525,7 +3526,7 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 				} catch { return false; }
 			});
 			const eventCount = filtered.filter((l) => { try { return (JSON.parse(l) as Record<string, unknown>).kind !== "checkpoint.segment.header"; } catch { return false; } }).length;
-			const header = { kind: "bundle.header", bundleSchemaVersion: 1, createdAt: new Date().toISOString(), pluginVersion: "1.6.1", deviceId, deviceLabel: label, platform, runtimeState: "foreground", localTraceId: traceId, scenarioRunId: RUN_ID, scenarioId: SCENARIO_ID, qaTraceSecretHash: secretHash, flightMode: "qa-safe", eventCount, containsRawPaths: false, hashDomain: "witness-state-v1", privacyMode: "safe" };
+			const header = { kind: "bundle.header", bundleSchemaVersion: 1, createdAt: new Date().toISOString(), pluginVersion, deviceId, deviceLabel: label, platform, runtimeState: "foreground", localTraceId: traceId, scenarioRunId: RUN_ID, scenarioId: SCENARIO_ID, qaTraceSecretHash: secretHash, flightMode: "qa-safe", eventCount, containsRawPaths: false, hashDomain: "witness-state-v1", privacyMode: "safe" };
 			return [JSON.stringify(header), ...filtered].join("\n") + "\n";
 		};
 
@@ -3632,6 +3633,16 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		const bReady = await b.evalRaw<boolean>(`!!app.plugins.plugins.kaos`);
 		if (!bReady) errors.push("s12c: B KAOS did not re-enable");
 		log(`s12c: B KAOS re-enabled: ${bReady}`);
+		if (bReady) {
+			// Product unload deliberately removes window.__KAOS_DEBUG__. The already-loaded
+			// harness only mounts that bridge during its own onload, so rebind it to the
+			// new product instance before collecting post-reload evidence.
+			await b.evalRaw(`(async()=>{await app.plugins.disablePlugin("kaos-qa-harness");await app.plugins.enablePlugin("kaos-qa-harness");})()`);
+			await b.waitForQaReady(30000);
+			await b.evalRaw(`window.__KAOS_DEBUG__.waitForLocalReady(30000)`);
+			await b.evalRaw(`window.__KAOS_DEBUG__.waitForReconciled(30000)`);
+			log("s12c: B QA harness rebound to reloaded KAOS");
+		}
 
 		await b.evalRaw(`window.__KAOS_DEBUG__?.waitForIdle(30000)`).catch(() => {});
 		await new Promise((r) => setTimeout(r, 5000));
@@ -3664,9 +3675,12 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		if (artifactOnA) errors.push(`s12c: Conflict artifact(s) exist on A (should be local-only on B): ${JSON.stringify(artifactsOnA)}`);
 		log(`s12c: artifact on A: ${artifactOnA} (expected: false)`);
 
-		await b.evalRaw(`window.__KAOS_DEBUG__?.startFlightTrace("qa-safe", ${JSON.stringify(QA_SECRET)})`).catch(() => {});
+		await b.evalRaw(`window.__KAOS_DEBUG__.startFlightTrace("qa-safe", ${JSON.stringify(QA_SECRET)})`);
 		await new Promise((r) => setTimeout(r, 1000));
-		await b.evalRaw(`window.__KAOS_DEBUG__?.__qaOnlySetScenarioRunIdUnsafe?.(${JSON.stringify(RUN_ID)}, ${JSON.stringify(SCENARIO_ID)})`).catch(() => {});
+		await b.evalRaw(`window.__KAOS_DEBUG__.__qaOnlySetScenarioRunIdUnsafe(${JSON.stringify(RUN_ID)}, ${JSON.stringify(SCENARIO_ID)})`);
+		const postResyncSeqAnchors = await Promise.all([a, b].map((client) =>
+			client.evalRaw<number>(`window.__KAOS_DEBUG__.currentWitnessSeq()`),
+		));
 		for (const [client] of [[a], [b]] as const) {
 			await client.evalRaw(`window.__KAOS_DEBUG__?.__qaOnlyAdvanceScenarioStepUnsafe?.(3, "post-resync-convergence")`).catch(() => {});
 		}
@@ -3677,31 +3691,76 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		}
 		await new Promise((r) => setTimeout(r, 6000));
 
-		const { mkdirSync, writeFileSync } = await import("node:fs");
+		const { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
 		const { spawnSync } = await import("node:child_process");
-		const outDir = errors.length === 0 ? "qa-runs/s12c-conflict-pass" : "qa-runs/s12c-conflict-fail";
-		mkdirSync(outDir, { recursive: true });
 
 		const buildBundle = async (client: typeof a, label: string) => {
 			const traceId = await client.evalRaw<string>(`window.__KAOS_DEBUG__?.getActiveTraceInfo()?.localTraceId ?? ""`);
 			const deviceId = await client.evalRaw<string>(`window.__KAOS_DEBUG__?.getDeviceId()`);
 			const secretHash = await client.evalRaw<string>(`window.__KAOS_DEBUG__?.getActiveTraceInfo()?.qaTraceSecretHash ?? ""`);
+			const pluginVersion = await client.evalRaw<string>(`app.plugins.plugins.kaos?.manifest?.version ?? "unknown"`);
 			const segs = await client.evalRaw<string | null>(`window.__KAOS_DEBUG__?.exportWitnessSegments?.(${JSON.stringify(traceId)}) ?? null`);
-			const pathIdRaw = await client.evalRaw<string | null>(`(async()=>{const ftc=app.plugins.plugins.kaos?.flightTrace;if(!ftc)return null;const p=await ftc.getPathId(${JSON.stringify(scratch)});return p?.pathId??null;})()`);
+			const pathIdRaw = await client.evalRaw<string | null>(`(async()=>{const ftc=app.plugins.plugins.kaos?.lab?.getFlightTraceController?.();if(!ftc)return null;const p=await ftc.getPathId(${JSON.stringify(scratch)});return p?.pathId??null;})()`);
 			const lines = (segs || "").split("\n").filter((l) => l.trim());
 			const filtered = lines.filter((l) => { try { const obj = JSON.parse(l) as Record<string, unknown>; if (obj.kind === "checkpoint.segment.header") return true; if (obj.kind !== "device.witness.settled" && obj.kind !== "device.witness.diverged") return true; return obj.pathId === pathIdRaw; } catch { return false; } });
 			const eventCount = filtered.filter((l) => { try { return (JSON.parse(l) as Record<string, unknown>).kind !== "checkpoint.segment.header"; } catch { return false; } }).length;
-			const header = { kind: "bundle.header", bundleSchemaVersion: 1, createdAt: new Date().toISOString(), pluginVersion: "1.6.1", deviceId, deviceLabel: label, platform: "desktop", runtimeState: "foreground", localTraceId: traceId, scenarioRunId: RUN_ID, scenarioId: SCENARIO_ID, qaTraceSecretHash: secretHash, flightMode: "qa-safe", eventCount, containsRawPaths: false, hashDomain: "witness-state-v1", privacyMode: "safe" };
+			const header = { kind: "bundle.header", bundleSchemaVersion: 1, createdAt: new Date().toISOString(), pluginVersion, deviceId, deviceLabel: label, platform: "desktop", runtimeState: "foreground", localTraceId: traceId, scenarioRunId: RUN_ID, scenarioId: SCENARIO_ID, qaTraceSecretHash: secretHash, flightMode: "qa-safe", eventCount, containsRawPaths: false, hashDomain: "witness-state-v1", privacyMode: "safe" };
 			return [JSON.stringify(header), ...filtered].join("\n") + "\n";
 		};
 
 		const bundleA = await buildBundle(a, "device-a");
 		const bundleB = await buildBundle(b, "device-b");
+		const bundleHeaders = [bundleA, bundleB].map((bundle) => JSON.parse(bundle.split("\n", 1)[0]) as Record<string, unknown>);
+		for (const [index, header] of bundleHeaders.entries()) {
+			const label = index === 0 ? "A" : "B";
+			if (typeof header.localTraceId !== "string" || header.localTraceId.length === 0) errors.push(`s12c: ${label} bundle has no trace id`);
+			if (typeof header.qaTraceSecretHash !== "string" || !header.qaTraceSecretHash.startsWith("sha256:")) errors.push(`s12c: ${label} bundle has no trace secret hash`);
+			if (typeof header.deviceId !== "string" || header.deviceId.length === 0 || header.deviceId === "unknown") errors.push(`s12c: ${label} bundle has no device id`);
+			if (typeof header.eventCount !== "number" || header.eventCount <= 0) errors.push(`s12c: ${label} bundle has no witness events`);
+			if (typeof header.pluginVersion !== "string" || header.pluginVersion.length === 0 || header.pluginVersion === "unknown") errors.push(`s12c: ${label} bundle has no plugin version`);
+			const events = (index === 0 ? bundleA : bundleB).split("\n").slice(1).filter(Boolean).flatMap((line) => {
+				try { return [JSON.parse(line) as Record<string, unknown>]; } catch { return []; }
+			});
+			const hasSettledWitness = events.some((event) => {
+				if (event.kind !== "device.witness.settled" || typeof event.pathId !== "string") return false;
+				const data = event.data as Record<string, unknown> | undefined;
+				return typeof event.seq === "number" && event.seq > postResyncSeqAnchors[index] &&
+					data?.stateKind === "present" && data?.diskMatchesCrdt === true;
+			});
+			if (!hasSettledWitness) errors.push(`s12c: ${label} bundle has no post-resync settled witness for the conflict path`);
+		}
+		if (bundleHeaders[0]?.qaTraceSecretHash !== bundleHeaders[1]?.qaTraceSecretHash) errors.push("s12c: bundle trace secret hashes do not match");
+		if (bundleHeaders[0]?.pluginVersion !== bundleHeaders[1]?.pluginVersion) errors.push("s12c: bundle plugin versions do not match");
+
+		const analysisDir = mkdtempSync(join(tmpdir(), "kaos-s12c-analysis-"));
+		const analysisBundleA = join(analysisDir, "device-a.ndjson");
+		const analysisBundleB = join(analysisDir, "device-b.ndjson");
+		const analysisReport = join(analysisDir, "report.json");
+		writeFileSync(analysisBundleA, bundleA);
+		writeFileSync(analysisBundleB, bundleB);
+		const analyzerResult = spawnSync("bun", ["run", "qa:analyze-bundles", "--", analysisBundleA, analysisBundleB, "--out", analysisReport], { encoding: "utf-8" });
+		log(`s12c: analyzer: ${analyzerResult.stdout?.trim()}`);
+		let analyzerReportText: string | null = null;
+		try {
+			analyzerReportText = readFileSync(analysisReport, "utf-8");
+			const report = JSON.parse(analyzerReportText) as {
+				summary?: { ok?: boolean };
+				bundle_validation?: { rejectionReason?: string };
+			};
+			if (analyzerResult.status !== 0 || report.summary?.ok !== true || report.bundle_validation?.rejectionReason) {
+				errors.push(`s12c: offline analyzer failed${report.bundle_validation?.rejectionReason ? `: ${report.bundle_validation.rejectionReason}` : ""}`);
+			}
+		} catch (error) {
+			errors.push(`s12c: offline analyzer report unreadable: ${String(error)}`);
+		}
+		rmSync(analysisDir, { recursive: true, force: true });
+
+		const outDir = errors.length === 0 ? "qa-runs/s12c-conflict-pass" : "qa-runs/s12c-conflict-fail";
+		mkdirSync(outDir, { recursive: true });
 		writeFileSync(`${outDir}/device-a.ndjson`, bundleA);
 		writeFileSync(`${outDir}/device-b.ndjson`, bundleB);
-
-		const analyzerResult = spawnSync("bun", ["run", "qa:analyze-bundles", "--", `${outDir}/device-a.ndjson`, `${outDir}/device-b.ndjson`, "--out", `${outDir}/report.json`], { encoding: "utf-8" });
-		log(`s12c: analyzer: ${analyzerResult.stdout?.trim()}`);
+		if (analyzerReportText !== null) writeFileSync(`${outDir}/report.json`, analyzerReportText);
 
 		const summary = [`# s12c-conflict`, `**Date**: ${new Date().toISOString()}`, `**scenarioRunId**: ${RUN_ID}`, `**deviceA**: ${deviceIdA}`, `**deviceB**: ${deviceIdB}`, `**result**: ${errors.length === 0 ? "PASS" : "FAIL"}`, `**B survivor content**: ${JSON.stringify(survivorContent?.slice(0, 200))}`, `**B artifact path**: ${artifactPath}`, `**B artifact content**: ${JSON.stringify(artifactContent?.slice(0, 200))}`, `**artifact on A**: ${artifactOnA}`, errors.length > 0 ? `\n**errors**:\n${errors.map((e) => `- ${e}`).join("\n")}` : ""].join("\n");
 		writeFileSync(`${outDir}/summary.md`, summary);

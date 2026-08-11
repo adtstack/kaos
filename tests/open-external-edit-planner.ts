@@ -109,7 +109,11 @@ assert.deepEqual(planOpenExternalEdit({
 	baselineText: appendBase,
 	currentText: appendSubset,
 	externalText: appendSuperset,
-}), { kind: "apply-external", targetText: appendSuperset });
+}), {
+	kind: "preserve-conflict",
+	reason: "overlapping-hunks",
+	hunkCount: 1,
+});
 
 const staleAppendBaseline = `${appendBase}editor-01\n`;
 const currentAfterManyAppends = `${staleAppendBaseline}filesystem-02\neditor-03\n`;
@@ -118,17 +122,107 @@ assert.deepEqual(planOpenExternalEdit({
 	baselineText: staleAppendBaseline,
 	currentText: currentAfterManyAppends,
 	externalText: externalAppendSuccessor,
-}), { kind: "apply-external", targetText: externalAppendSuccessor });
+}), {
+	kind: "preserve-conflict",
+	reason: "overlapping-hunks",
+	hunkCount: 1,
+});
 assert.deepEqual(planOpenExternalEdit({
 	baselineText: null,
 	currentText: currentAfterManyAppends,
 	externalText: externalAppendSuccessor,
-}), { kind: "apply-external", targetText: externalAppendSuccessor });
+}), {
+	kind: "preserve-conflict",
+	reason: "missing-baseline",
+	hunkCount: 0,
+});
+
+assert.deepEqual(planOpenExternalEdit({
+	baselineText: "abc",
+	currentText: "a",
+	externalText: "abcd",
+}), {
+	kind: "preserve-conflict",
+	reason: "overlapping-hunks",
+	hunkCount: 1,
+});
+assert.deepEqual(planOpenExternalEdit({
+	baselineText: "a",
+	currentText: "ab",
+	externalText: "abcd",
+}), {
+	kind: "preserve-conflict",
+	reason: "overlapping-hunks",
+	hunkCount: 1,
+});
+assert.deepEqual(planOpenExternalEdit({
+	baselineText: "A\nB\nC\n",
+	currentText: "A\nC\n",
+	externalText: "A\nC\nB\n",
+}), {
+	kind: "preserve-conflict",
+	reason: "overlapping-hunks",
+	hunkCount: 1,
+});
 assert.deepEqual(planOpenExternalEdit({
 	baselineText: appendBase,
 	currentText: appendSuperset,
 	externalText: appendSubset,
-}), { kind: "keep-current", targetText: appendSuperset });
+}), {
+	kind: "preserve-conflict",
+	reason: "overlapping-hunks",
+	hunkCount: 1,
+});
+
+const koreanDocumentPrefix = [
+	"---",
+	"date: 2026-08-08",
+	"---",
+	"",
+	"## 일상",
+	"오늘은 하루종일 ",
+].join("\n");
+const koreanImeCurrent = `${koreanDocumentPrefix}고미`;
+const koreanImeSuccessor = `${koreanDocumentPrefix}고민하고 `;
+assert.deepEqual(planOpenExternalEdit({
+	baselineText: koreanDocumentPrefix,
+	currentText: koreanImeCurrent,
+	externalText: koreanImeSuccessor,
+}), {
+	kind: "preserve-conflict",
+	reason: "overlapping-hunks",
+	hunkCount: 1,
+});
+
+assert.deepEqual(planOpenExternalEdit({
+	baselineText: `${koreanDocumentPrefix}고민`,
+	currentText: `${koreanDocumentPrefix}고`,
+	externalText: `${koreanDocumentPrefix}고민하고 `,
+}), {
+	kind: "preserve-conflict",
+	reason: "overlapping-hunks",
+	hunkCount: 1,
+});
+
+assert.deepEqual(planOpenExternalEdit({
+	baselineText: null,
+	currentText: koreanImeSuccessor,
+	externalText: koreanImeCurrent,
+}), {
+	kind: "preserve-conflict",
+	reason: "missing-baseline",
+	hunkCount: 0,
+});
+
+assert.deepEqual(planOpenExternalEdit({
+	baselineText: null,
+	currentText: koreanImeCurrent,
+	externalText: `${koreanDocumentPrefix}고마`,
+}), {
+	kind: "preserve-conflict",
+	reason: "missing-baseline",
+	hunkCount: 0,
+});
 
 const siblingAppend = planOpenExternalEdit({
 	baselineText: appendBase,

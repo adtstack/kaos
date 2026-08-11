@@ -164,7 +164,9 @@ console.log("\n--- Test 5: product policy is absent and QA suspension is build-g
 	const reconciliationControllerSource = read("src/runtime/reconciliationController.ts");
 	const unsafePortSource = read("qa/harness/ports/kaosUnsafeQaPort.ts");
 	const qaApiSource = read("qa/harness/qaDebugApi.ts");
+	const harnessMainSource = read("qa/obsidian-harness/main.ts");
 	const twoDeviceSource = read("qa/controllers/two-device.ts");
+	const scenarioHelpersSource = read("qa/controllers/_scenario-helpers.ts");
 	const s05Source = read("qa/obsidian-harness/scenarios/s05-frontmatter-safety-loop.ts");
 	const s06aSource = read("qa/obsidian-harness/scenarios/s06a-issue-25-forced-recovery.ts");
 	const s10dSource = read("qa/obsidian-harness/scenarios/s10d-recovery-amplifier-orchestration.ts");
@@ -200,6 +202,32 @@ console.log("\n--- Test 5: product policy is absent and QA suspension is build-g
 			qaApiSource.includes("setDiskIngestSuspended") &&
 			twoDeviceSource.includes("setDiskIngestSuspended"),
 		"QA ports and CDP bridge expose the suspension seam",
+	);
+	assert(
+		harnessMainSource.includes("settings: (product as any).settings") &&
+			harnessMainSource.includes("saveSettings: (reason?: string)"),
+		"Obsidian harness supplies the settings port required by shared QA traces",
+	);
+	assert(
+		!`${twoDeviceSource}\n${scenarioHelpersSource}`.includes("plugins.kaos?.flightTrace") &&
+			`${twoDeviceSource}\n${scenarioHelpersSource}`.includes(
+				"plugins.kaos?.lab?.getFlightTraceController?.()",
+			),
+		"QA evidence resolves path IDs through the mounted telemetry runtime",
+	);
+	assert(
+		twoDeviceSource.includes('disablePlugin("kaos-qa-harness")') &&
+			twoDeviceSource.includes("await b.waitForQaReady(30000)") &&
+			twoDeviceSource.includes("B QA harness rebound to reloaded KAOS"),
+		"disable/re-enable evidence rebinds the QA harness to the new product instance",
+	);
+	assert(
+		twoDeviceSource.includes("bundle trace secret hashes do not match") &&
+			twoDeviceSource.includes("bundle has no post-resync settled witness for the conflict path") &&
+			twoDeviceSource.includes("event.seq > postResyncSeqAnchors[index]") &&
+			twoDeviceSource.includes('mkdtempSync(join(tmpdir(), "kaos-s12c-analysis-")') &&
+			twoDeviceSource.includes("offline analyzer report unreadable"),
+		"s12c fails closed on incomplete or rejected evidence bundles",
 	);
 	assert(
 		(reconciliationControllerSource.match(/isDiskIngestSuspendedForQa\?\.\(\)/g) ?? []).length >= 2,

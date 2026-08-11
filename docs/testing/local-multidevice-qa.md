@@ -377,10 +377,23 @@ npm run qa:open-external-merge -- \
 ```
 
 기본 실행은 `clean`, `same-line`, `representation`, `cursor`, `quickadd-burst`,
-`quickadd-heading`, `soak`을 모두 검증한다. `quickadd-burst`는 열린 note에
-`Vault.process()`를 75ms 간격으로 세 번 실행하고, `quickadd-heading`은 문서 중간의
-특정 제목 바로 아래에 문구를 삽입한다. 두 case 모두 최초 수렴 후 3.5초 동안
-200ms 간격으로 계속 관찰하여 rollback이나 지연 conflict artifact도 실패로 본다.
+`quickadd-heading`, `korean-prefix`, `move-delete`, `soak`을 모두 검증한다.
+`quickadd-burst`라는 기존 case ID는 호환성을 위해 유지하지만, 각 `Vault.process()`
+쓰기 뒤 disk/CRDT/editor 수렴과 idle baseline 정착을 확인한 다음 다음 쓰기를 시작하는
+직렬 3회 시나리오다. 각 단계는 추가 3.5초 안정성 관찰로 hash와 artifact 불변까지
+확인한다. 원인 영수증이 없는 실제 중첩 burst의 서로 다른 중간 후보는
+artifact 없이 자동 소거하지 않는다. `quickadd-heading`은 문서 중간의 특정 제목 바로
+아래에 문구를 삽입한다. 두 case 모두 최초 수렴 후 3.5초 동안 200ms 간격으로 계속
+관찰하여 rollback이나 지연 conflict artifact도 실패로 본다.
+
+`korean-prefix`는 실제 사고 형태인 editor `고미` 대 disk `고민하고 `를 검증하고,
+`move-delete`는 같은 줄의 이동 대 삭제를 검증한다. 두 case 모두 열린 editor 내용을
+primary로 유지하고 외부 원문 전체를 byte-exact local conflict artifact 한 개로 보존해야
+한다. 자동으로 긴 문자열이나 이동 쪽을 선택하면 실패다. `soak`도 각 cycle마다
+수렴 상태를 idle 뒤 다시 확인하고 3.5초 동안 hash와 artifact가 불변인지 검증한 다음
+다음 변경으로 넘어간다.
+artifact가 다른 장치로 전파되지 않는 local-only 성질은 12.3과 `s12c-conflict`에서
+별도로 검증한다.
 한 case만 재현할 때는 `--case quickadd-burst`처럼 지정한다. PASS 기준은 화면이
 잠시 맞는 것이 아니라 disk/CRDT/editor hash, artifact 수, cursor/scroll/undo
 assertion이 모두 맞는 것이다. controller는 CDP로 연결된 실제 vault 경로가

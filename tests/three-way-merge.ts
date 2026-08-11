@@ -147,7 +147,7 @@ console.log("\n--- Test 14: shared text inside a genuinely different hunk remain
 	}
 }
 
-console.log("\n--- Test 15: an insertion superset subsumes its complete subset ---");
+console.log("\n--- Test 15: a distinct insertion superset conflicts with its subset ---");
 {
 	const base = "# Alternating soak\n";
 	const predecessor = `${base}editor-01\n`;
@@ -156,25 +156,20 @@ console.log("\n--- Test 15: an insertion superset subsumes its complete subset -
 		[predecessor, successor],
 		[successor, predecessor],
 	] as const) {
-		const result = mergeTexts3(base, left, right);
-		assert.equal(result.kind, "clean-merge");
-		assert.equal(result.kind === "clean-merge" ? result.mergedText : "", successor);
+		assert.equal(mergeTexts3(base, left, right).kind, "conflict");
 	}
 }
 
-console.log("\n--- Test 16: a subsumed insertion still merges independent changes ---");
+console.log("\n--- Test 16: an ambiguous insertion superset blocks the whole automatic merge ---");
 {
 	const base = "a\nb\nc\ntail\n";
 	const left = "left a\nb\nc\ntail\nshared\n";
 	const right = "a\nb\nright c\ntail\nshared\nexternal\n";
-	const expected = "left a\nb\nright c\ntail\nshared\nexternal\n";
 	for (const [first, second] of [
 		[left, right],
 		[right, left],
 	] as const) {
-		const result = mergeTexts3(base, first, second);
-		assert.equal(result.kind, "clean-merge");
-		assert.equal(result.kind === "clean-merge" ? result.mergedText : "", expected);
+		assert.equal(mergeTexts3(base, first, second).kind, "conflict");
 	}
 }
 
@@ -187,7 +182,7 @@ console.log("\n--- Test 17: partial overlap at one insertion point remains a con
 	assert.equal(mergeTexts3(base, right, left).kind, "conflict");
 }
 
-console.log("\n--- Test 18: a same-range replacement superset subsumes its complete subset ---");
+console.log("\n--- Test 18: a same-range replacement superset conflicts with its subset ---");
 {
 	const base = "a\n";
 	const subset = "A\n";
@@ -196,9 +191,7 @@ console.log("\n--- Test 18: a same-range replacement superset subsumes its compl
 		[subset, superset],
 		[superset, subset],
 	] as const) {
-		const result = mergeTexts3(base, left, right);
-		assert.equal(result.kind, "clean-merge");
-		assert.equal(result.kind === "clean-merge" ? result.mergedText : "", superset);
+		assert.equal(mergeTexts3(base, left, right).kind, "conflict");
 	}
 }
 
@@ -220,7 +213,7 @@ console.log("\n--- Test 20: a wider replacement without boundary containment rem
 	assert.equal(mergeTexts3(base, widerSibling, narrow).kind, "conflict");
 }
 
-console.log("\n--- Test 21: an ordered same-range superset may interleave additional lines ---");
+console.log("\n--- Test 21: an ordered same-range superset remains ambiguous ---");
 {
 	const base = "anchor\n";
 	const subset = `${base}A\nC\n`;
@@ -229,9 +222,7 @@ console.log("\n--- Test 21: an ordered same-range superset may interleave additi
 		[subset, superset],
 		[superset, subset],
 	] as const) {
-		const result = mergeTexts3(base, left, right);
-		assert.equal(result.kind, "clean-merge");
-		assert.equal(result.kind === "clean-merge" ? result.mergedText : "", superset);
+		assert.equal(mergeTexts3(base, left, right).kind, "conflict");
 	}
 }
 
@@ -249,7 +240,7 @@ console.log("\n--- Test 22: structural subsumption preserves order and multiplic
 	assert.equal(mergeTexts3(base, insufficient, duplicate).kind, "conflict");
 }
 
-console.log("\n--- Test 23: generated ordered supersets merge symmetrically and near-misses conflict ---");
+console.log("\n--- Test 23: generated ordered supersets and near-misses conflict symmetrically ---");
 {
 	const base = "anchor\n";
 	for (let seed = 0; seed < 24; seed++) {
@@ -267,9 +258,7 @@ console.log("\n--- Test 23: generated ordered supersets merge symmetrically and 
 			[subset, superset],
 			[superset, subset],
 		] as const) {
-			const result = mergeTexts3(base, left, right);
-			assert.equal(result.kind, "clean-merge");
-			assert.equal(result.kind === "clean-merge" ? result.mergedText : "", superset);
+			assert.equal(mergeTexts3(base, left, right).kind, "conflict");
 		}
 
 		const nearMissLines = supersetLines.slice();
@@ -362,5 +351,219 @@ console.log("\n--- Test 28: ambiguous repeated alignment keeps an independent pr
 			{ kind: "text", text: "left top\nhead\n" },
 			{ kind: "conflict", hunkIndex: 0 },
 		]);
+	}
+}
+
+console.log("\n--- Test 29: moving a line conflicts with deleting that line ---");
+{
+	const base = "A\nB\nC\n";
+	const deleted = "A\nC\n";
+	const moved = "A\nC\nB\n";
+	assert.equal(mergeTexts3(base, deleted, moved).kind, "conflict");
+	assert.equal(mergeTexts3(base, moved, deleted).kind, "conflict");
+}
+
+console.log("\n--- Test 30: moving a whitespace-only line conflicts with deleting it ---");
+{
+	const base = "A\n\nB\n";
+	const deleted = "A\nB\n";
+	const moved = "A\nB\n\n";
+	assert.equal(mergeTexts3(base, deleted, moved).kind, "conflict");
+	assert.equal(mergeTexts3(base, moved, deleted).kind, "conflict");
+}
+
+console.log("\n--- Test 31: moving the same line to different destinations conflicts ---");
+{
+	const base = "A\nB\nC\nD\n";
+	const movedAfterC = "A\nC\nB\nD\n";
+	const movedAfterD = "A\nC\nD\nB\n";
+	assert.equal(mergeTexts3(base, movedAfterC, movedAfterD).kind, "conflict");
+	assert.equal(mergeTexts3(base, movedAfterD, movedAfterC).kind, "conflict");
+}
+
+console.log("\n--- Test 32: a shared deletion still merges an unrelated insertion ---");
+{
+	const base = "A\nB\nC\n";
+	const deleted = "A\nC\n";
+	const deletedWithUnrelatedInsertion = "X\nA\nC\n";
+	const expected = deletedWithUnrelatedInsertion;
+	for (const [left, right] of [
+		[deleted, deletedWithUnrelatedInsertion],
+		[deletedWithUnrelatedInsertion, deleted],
+	] as const) {
+		const result = mergeTexts3(base, left, right);
+		assert.equal(result.kind, "clean-merge");
+		assert.equal(result.kind === "clean-merge" ? result.mergedText : "", expected);
+	}
+}
+
+console.log("\n--- Test 33: reintroducing a commonly replaced line elsewhere conflicts ---");
+{
+	const base = "A\nB\nC\n";
+	const replaced = "A\nX\nC\n";
+	const replacedAndReintroduced = "B\nA\nX\nC\n";
+	assert.equal(mergeTexts3(base, replaced, replacedAndReintroduced).kind, "conflict");
+	assert.equal(mergeTexts3(base, replacedAndReintroduced, replaced).kind, "conflict");
+}
+
+console.log("\n--- Test 34: repeated-line removal and reinsertion is count-aware ---");
+{
+	const base = "A\nA\nB\n";
+	const deleted = "A\nB\n";
+	const moved = "A\nB\nA\n";
+	assert.equal(mergeTexts3(base, deleted, moved).kind, "conflict");
+	assert.equal(mergeTexts3(base, moved, deleted).kind, "conflict");
+}
+
+console.log("\n--- Test 35: a reordered subset of a shared deleted block conflicts ---");
+{
+	const base = "A\nB\nC\nD\nE\n";
+	const deleted = "A\nD\nE\n";
+	const reorderedMove = "A\nD\nC\nB\nE\n";
+	assert.equal(mergeTexts3(base, deleted, reorderedMove).kind, "conflict");
+	assert.equal(mergeTexts3(base, reorderedMove, deleted).kind, "conflict");
+}
+
+console.log("\n--- Test 36: a shared replacement still merges an unrelated insertion ---");
+{
+	const base = "A\nB\nC\n";
+	const replaced = "A\nX\nC\n";
+	const replacedWithUnrelatedInsertion = "Z\nA\nX\nC\n";
+	for (const [left, right] of [
+		[replaced, replacedWithUnrelatedInsertion],
+		[replacedWithUnrelatedInsertion, replaced],
+	] as const) {
+		const result = mergeTexts3(base, left, right);
+		assert.equal(result.kind, "clean-merge");
+		assert.equal(
+			result.kind === "clean-merge" ? result.mergedText : "",
+			replacedWithUnrelatedInsertion,
+		);
+	}
+}
+
+console.log("\n--- Test 37: an agreed move still merges distant independent edits ---");
+{
+	const base = "p\nq\nA\nB\nC\nD\nE\nr\ns\n";
+	const left = "left p\nq\nA\nB\nD\nE\nC\nr\ns\n";
+	const right = "p\nq\nA\nB\nD\nE\nC\nr\nright s\n";
+	const expected = "left p\nq\nA\nB\nD\nE\nC\nr\nright s\n";
+	for (const [first, second] of [
+		[left, right],
+		[right, left],
+	] as const) {
+		const result = mergeTexts3(base, first, second);
+		assert.equal(result.kind, "clean-merge");
+		assert.equal(result.kind === "clean-merge" ? result.mergedText : "", expected);
+	}
+}
+
+console.log("\n--- Test 38: generated exact moves never revive deletion-only lines ---");
+{
+	const permutations = (values: string[]): string[][] => {
+		if (values.length < 2) return [values];
+		const result: string[][] = [];
+		for (let index = 0; index < values.length; index++) {
+			for (const tail of permutations([
+				...values.slice(0, index),
+				...values.slice(index + 1),
+			])) {
+				result.push([values[index]!, ...tail]);
+			}
+		}
+		return result;
+	};
+	const baseLines = ["A", "B", "C", "D", "E"];
+	const base = baseLines.map((line) => `${line}\n`).join("");
+	let cleanMergeCount = 0;
+	for (const movedLines of permutations(baseLines)) {
+		const moved = movedLines.map((line) => `${line}\n`).join("");
+		for (let mask = 0; mask < (1 << baseLines.length); mask++) {
+			const keptLines = baseLines.filter((_, index) => (mask & (1 << index)) !== 0);
+			if (keptLines.length === baseLines.length) continue;
+			const deletedLines = baseLines.filter((line) => !keptLines.includes(line));
+			const deleted = keptLines.map((line) => `${line}\n`).join("");
+			for (const [left, right] of [
+				[deleted, moved],
+				[moved, deleted],
+			] as const) {
+				const result = mergeTexts3(base, left, right);
+				if (result.kind !== "clean-merge") continue;
+				cleanMergeCount++;
+				const mergedLines = result.mergedText.split("\n").filter(Boolean);
+				for (const deletedLine of deletedLines) {
+					assert.equal(
+						mergedLines.includes(deletedLine),
+						false,
+						`clean merge revived ${deletedLine}: ${JSON.stringify({
+							keptLines,
+							movedLines,
+							mergedLines,
+						})}`,
+					);
+				}
+			}
+		}
+	}
+	assert(cleanMergeCount > 0, "generated matrix retains valid clean deletion merges");
+}
+
+console.log("\n--- Test 39: different repeated-line occurrences can be edited independently ---");
+{
+	const base = "start\nX\nmid\nX\nend\n";
+	const left = "start\nL\nmid\nX\nend\n";
+	const right = "start\nX\nmid\nR\nend\n";
+	const expected = "start\nL\nmid\nR\nend\n";
+	for (const [first, second] of [[left, right], [right, left]] as const) {
+		const result = mergeTexts3(base, first, second);
+		assert.equal(result.kind, "clean-merge");
+		assert.equal(result.kind === "clean-merge" ? result.mergedText : "", expected);
+	}
+}
+
+console.log("\n--- Test 40: different repeated-line occurrences can be deleted independently ---");
+{
+	const base = "start\nX\nmid\nX\nend\n";
+	const left = "start\nmid\nX\nend\n";
+	const right = "start\nX\nmid\nend\n";
+	const expected = "start\nmid\nend\n";
+	for (const [first, second] of [[left, right], [right, left]] as const) {
+		const result = mergeTexts3(base, first, second);
+		assert.equal(result.kind, "clean-merge");
+		assert.equal(result.kind === "clean-merge" ? result.mergedText : "", expected);
+	}
+}
+
+console.log("\n--- Test 41: independent removals of different unique lines still merge ---");
+{
+	const base = "A\nkeep\nB\n";
+	const left = "keep\nB\n";
+	const right = "A\nkeep\n";
+	const expected = "keep\n";
+	for (const [first, second] of [
+		[left, right],
+		[right, left],
+	] as const) {
+		const result = mergeTexts3(base, first, second);
+		assert.equal(result.kind, "clean-merge");
+		assert.equal(result.kind === "clean-merge" ? result.mergedText : "", expected);
+	}
+}
+
+console.log("\n--- Test 42: moving a surviving repeated line does not revive the shared deletion ---");
+{
+	const base = "A\nX\nB\nY\nX\nZ\n";
+	const sharedDeletion = "A\nB\nY\nX\nZ\n";
+	const deletionWithSurvivingMove = "A\nB\nX\nY\nZ\n";
+	for (const [left, right] of [
+		[sharedDeletion, deletionWithSurvivingMove],
+		[deletionWithSurvivingMove, sharedDeletion],
+	] as const) {
+		const result = mergeTexts3(base, left, right);
+		assert.equal(result.kind, "clean-merge");
+		assert.equal(
+			result.kind === "clean-merge" ? result.mergedText : "",
+			deletionWithSurvivingMove,
+		);
 	}
 }
