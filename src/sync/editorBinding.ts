@@ -146,9 +146,10 @@ export interface ExternalDiskMutationNotice {
 	/** Exact raw text read while the event's TFile identity/stat remained current. */
 	content: string | null;
 	/**
-	 * Primitive snapshot of every open editor at event admission. Reconciliation
-	 * may use two complete snapshots to prove that a newer disk revision either
-	 * superseded or already adopted an earlier revision. Missing proof preserves.
+	 * Primitive snapshot of every open editor at event admission. It is retained
+	 * as immutable event metadata, but never proves that one distinct disk
+	 * revision supersedes or was adopted by another. Distinct raw candidates are
+	 * preserved independently unless a candidate-specific durable receipt exists.
 	 */
 	editorAuthorityLineage?: ExternalDiskMutationEditorAuthorityLineage | null;
 }

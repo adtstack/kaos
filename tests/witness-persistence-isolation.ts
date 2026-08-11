@@ -10,8 +10,10 @@
  */
 
 import assert from "node:assert/strict";
+import { TFile } from "obsidian";
 import { DeviceWitnessTracker } from "../src/telemetry/diagnostics/deviceWitnessTracker";
 import type { WitnessTrackerConfig } from "../src/telemetry/diagnostics/deviceWitnessTracker";
+import { readWitnessDiskContent } from "../src/telemetry/installTelemetryRuntime";
 
 let passed = 0;
 let failed = 0;
@@ -143,6 +145,63 @@ test("bundle export uses console/modal only — no vault.adapter.write (telemetr
 	assert.ok(!exportFnBody.includes("vault.adapter.mkdir"), "Bundle export must not mkdir via vault adapter");
 	// Verify the unsafe-local mode is NOT available in telemetry (it's Puppeteer-only)
 	assert.ok(!exportFnBody.includes("unsafe-local"), "Telemetry bundle export must not support unsafe-local privacy mode");
+});
+
+test("telemetry disk witness reads through the Obsidian 1.5 legacy lookup", async () => {
+	const legacyFile = new TFile();
+	const lookups: string[] = [];
+	const reads: TFile[] = [];
+	const content = await readWitnessDiskContent({
+		getAbstractFileByPath: (path: string) => {
+			lookups.push(path);
+			return legacyFile;
+		},
+		read: async (file: TFile) => {
+			reads.push(file);
+			return "legacy witness content";
+		},
+	}, "Legacy/witness.md");
+
+	assert.equal(content, "legacy witness content");
+	assert.deepEqual(lookups, ["Legacy/witness.md"]);
+	assert.deepEqual(reads, [legacyFile]);
+});
+
+test("telemetry disk witness rejects missing and non-file legacy entries without reading", async () => {
+	for (const entry of [null, {}]) {
+		let readCount = 0;
+		const content = await readWitnessDiskContent({
+			getAbstractFileByPath: () => entry as never,
+			read: async () => {
+				readCount++;
+				return "must not be read";
+			},
+		}, "Legacy/not-a-file.md");
+
+		assert.equal(content, null);
+		assert.equal(readCount, 0);
+	}
+});
+
+test("telemetry disk witness keeps a host-safe lookup without dynamic imports", async () => {
+	const { readFileSync } = await import("node:fs");
+	const src = readFileSync("src/telemetry/installTelemetryRuntime.ts", "utf-8");
+	const helperStart = src.indexOf("export async function readWitnessDiskContent");
+	assert.ok(helperStart >= 0, "Must find the telemetry disk witness reader");
+	const readBody = src.slice(helperStart, helperStart + 700);
+	assert.ok(
+		readBody.includes("vault.getAbstractFileByPath(path)"),
+		"Disk witness must use the lookup available throughout Obsidian 1.5",
+	);
+	assert.ok(!readBody.includes("vault.getFileByPath"), "Disk witness must not require the Obsidian 1.5.7 lookup");
+	assert.ok(
+		readBody.includes("file instanceof TFile"),
+		"Legacy lookup must reject non-file vault entries",
+	);
+	assert.ok(
+		!readBody.includes('import("obsidian")'),
+		"Disk witness must not use a renderer-unresolvable dynamic Obsidian import",
+	);
 });
 
 // -----------------------------------------------------------------------

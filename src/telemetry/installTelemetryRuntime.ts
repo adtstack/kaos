@@ -20,7 +20,7 @@
  */
 
 import type { App, MarkdownView, Plugin } from "obsidian";
-import { Notice } from "obsidian";
+import { Notice, TFile } from "obsidian";
 import type { TelemetryRuntimeHost } from "./telemetryRuntimeHost";
 import { FlightTraceController } from "./debug/flightTraceController";
 import { FlightTraceSink } from "./debug/flightTraceSink";
@@ -31,6 +31,22 @@ import type { ProductFlightPathEventInput } from "../observability/traceSink";
 import { isCrdtDocumentPath } from "../paths/crdtDocumentPath";
 import { PersistentTraceLogger } from "./debug/trace";
 import type { TraceLoggerPort, TraceLoggerConfig } from "../observability/traceLogger";
+
+type WitnessReadableVault = Pick<App["vault"], "getAbstractFileByPath" | "read">;
+
+/**
+ * Read witness content through the host Vault API across supported Obsidian
+ * versions. Vault.getAbstractFileByPath is available throughout the declared
+ * support range; the TFile check rejects folders before Vault.read.
+ */
+export async function readWitnessDiskContent(
+	vault: WitnessReadableVault,
+	path: string,
+): Promise<string | null> {
+	const file = vault.getAbstractFileByPath(path);
+	if (!(file instanceof TFile)) return null;
+	return await vault.read(file);
+}
 
 /**
  * Handle returned to main.ts after telemetry runtime is installed.
@@ -229,11 +245,7 @@ export async function installTelemetryRuntime(host: TelemetryRuntimeHost): Promi
 			},
 			readDiskContent: async (path: string) => {
 				try {
-					const file = host.app.vault.getAbstractFileByPath(path);
-					if (!file) return null;
-					const { TFile } = await import("obsidian");
-					if (!(file instanceof TFile)) return null;
-					return await host.app.vault.read(file);
+					return await readWitnessDiskContent(host.app.vault, path);
 				} catch {
 					return null;
 				}
