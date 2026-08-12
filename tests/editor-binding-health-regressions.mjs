@@ -79,7 +79,10 @@ console.log("\n--- Test 4: direct rebind is guarded by recent editor activity --
 	);
 	assert(section !== null, "rebind section found");
 	assert(section?.includes("this.deferRepairForRecentEditorActivity("), "rebind defers during recent editor activity");
-	assert(section?.indexOf("this.deferRepairForRecentEditorActivity(") < section?.indexOf("this.unbind(view)"), "rebind checks defer before unbind");
+	assert(
+		section?.indexOf("this.deferRepairForRecentEditorActivity(") < section?.indexOf("this.unbind(view"),
+		"rebind checks defer before unbind",
+	);
 }
 
 console.log("\n--- Test 5: bind cm-change path is guarded before unbind ---");
@@ -92,7 +95,10 @@ console.log("\n--- Test 5: bind cm-change path is guarded before unbind ---");
 	assert(section !== null, "bind section found");
 	assert(section?.includes("\"bind-target-changed:cm-changed\""), "bind cm-change path has recent activity guard");
 	assert(section?.includes("this.pendingReplacementCmToLeafId.set(cm, leafId)"), "deferred bind cm-change tracks the replacement editor");
-	assert(section?.indexOf("\"bind-target-changed:cm-changed\"") < section?.lastIndexOf("this.unbind(view)"), "bind cm-change guard runs before replacement unbind");
+	assert(
+		section?.indexOf("\"bind-target-changed:cm-changed\"") < section?.lastIndexOf("this.unbind(view"),
+		"bind cm-change guard runs before replacement unbind",
+	);
 }
 
 console.log("\n--- Test 6: pending replacement cm updates still map to the binding ---");

@@ -121,6 +121,8 @@ function buildManagerFixture(options: {
 	lastEditorChangeAgeMs: number;
 	lastEditorDocChangeAgeMs?: number | null;
 	externalReloadGuardEnabled?: () => boolean;
+	isMarkdownPathSyncable?: (path: string) => boolean;
+	pendingRenameOldPathForTarget?: (path: string) => string | undefined;
 	onExternalDiskReloadIntercepted?: (
 		candidate: InterceptedExternalDiskMutation,
 	) => void;
@@ -157,7 +159,10 @@ function buildManagerFixture(options: {
 		getTextForPath: (p: string) => (p === path ? expectedText : null),
 		getFileId: () => "file-1",
 		getFileIdForText: (text: Y.Text) => (text === expectedText ? "file-1" : "other-file"),
-		isPendingRenameTarget: () => false,
+		isPendingRenameTarget: (p: string) =>
+			options.pendingRenameOldPathForTarget?.(p) !== undefined,
+		getPendingRenameOldPathForTarget: (p: string) =>
+			options.pendingRenameOldPathForTarget?.(p),
 		isMarkdownTombstoned: () => false,
 		ensureFile: () => null,
 	};
@@ -190,7 +195,7 @@ function buildManagerFixture(options: {
 	const manager = new EditorBindingManager(
 		vaultSync as never,
 		false,
-		(p) => p.endsWith(".md"),
+		options.isMarkdownPathSyncable ?? ((p) => p.endsWith(".md")),
 		(source, msg, details) => traceRecords.push({ source, msg, details }),
 		(event) => {
 			flightEvents.push({ kind: event.kind, data: event.data });
@@ -4335,15 +4340,16 @@ console.log("\n--- Test 25: stale path bindings detach before user input propaga
 		lastEditorDocChangeAgeMs: 100,
 	});
 	binding.view.file = { path: "Notes/next.md" };
-	const result = (manager as unknown as {
-		fenceStaleUserBinding: (transaction: unknown) => unknown;
-	}).fenceStaleUserBinding({
+	const transaction = {
 		docChanged: true,
 		startState: binding.cm.state,
 		annotation: () => "input",
 		isUserEvent: (name: string) => name === "input",
-	});
-	assertEq(result !== null, true, "stale binding adds a same-transaction detach effect");
+	};
+	const result = (manager as unknown as {
+		fenceStaleUserBinding: (transaction: unknown) => unknown;
+	}).fenceStaleUserBinding(transaction);
+	assertEq(result !== transaction, true, "stale input is replaced by a detach-only transaction");
 	assertEq(
 		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has("leaf-1"),
 		false,
@@ -4353,7 +4359,245 @@ console.log("\n--- Test 25: stale path bindings detach before user input propaga
 	clearPendingHealthChecks(manager);
 }
 
-console.log("\n--- Test 25a: stale path bindings block late non-user projections ---");
+console.log("\n--- Test 25a-local: an excluded target preserves its first local edit ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+		isMarkdownPathSyncable: (path) => path.startsWith("Notes/"),
+	});
+	const syncConfig = new YSyncConfig(binding.ytext, {});
+	let state = EditorState.create({
+		doc: binding.cm.state.doc.toString(),
+		extensions: manager.getBaseExtension(),
+	});
+	state = state.update({
+		effects: manager.compartment.reconfigure(ySyncFacet.of(syncConfig)),
+		filter: false,
+	}).state;
+	(binding.cm as unknown as { state: EditorState }).state = state;
+	binding.view.file = { path: "Local/excluded.md" };
+
+	const transaction = state.update({
+		changes: { from: state.doc.length, insert: " local edit" },
+		annotations: Transaction.userEvent.of("input.type"),
+	});
+	assertEq(transaction.docChanged, true, "the first local-only edit is not cancelled");
+	assertEq(
+		transaction.newDoc.toString(),
+		`${state.doc.toString()} local edit`,
+		"the excluded note keeps the exact local edit",
+	);
+	assertEq(
+		transaction.state.facet(ySyncFacet),
+		undefined,
+		"stale A yCollab is detached in the preserved edit transaction",
+	);
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has("leaf-1"),
+		false,
+		"the stale A binding is retired before the local-only update phase",
+	);
+	await Promise.resolve();
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 25a-rename: a pending rename preserves same-file input and binding ---");
+{
+	const renamedPath = "Notes/renamed.md";
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+		pendingRenameOldPathForTarget: (path) =>
+			path === renamedPath ? "Notes/typing.md" : undefined,
+	});
+	const syncConfig = new YSyncConfig(binding.ytext, {});
+	let state = EditorState.create({
+		doc: binding.cm.state.doc.toString(),
+		extensions: manager.getBaseExtension(),
+	});
+	state = state.update({
+		effects: manager.compartment.reconfigure(ySyncFacet.of(syncConfig)),
+		filter: false,
+	}).state;
+	(binding.cm as unknown as { state: EditorState }).state = state;
+	binding.view.file = { path: renamedPath };
+
+	const transaction = state.update({
+		changes: { from: state.doc.length, insert: " rename edit" },
+		annotations: Transaction.userEvent.of("input.type"),
+	});
+	assertEq(transaction.docChanged, true, "pending rename input is not cancelled");
+	assertEq(
+		transaction.newDoc.toString(),
+		`${state.doc.toString()} rename edit`,
+		"the rename gap keeps the exact edit",
+	);
+	assertEq(
+		transaction.state.facet(ySyncFacet),
+		syncConfig,
+		"same-file rename keeps yCollab attached until metadata catches up",
+	);
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has("leaf-1"),
+		true,
+		"the stable Y.Text binding survives the rename debounce window",
+	);
+	const renameGapDebug = manager.getCollabDebugInfoForView(binding.view as never);
+	assertEq(
+		renameGapDebug?.yTextMatchesExpected,
+		true,
+		"health resolves the expected Y.Text through the exact pending rename source",
+	);
+	assertEq(
+		manager.getBindingHealthForView(binding.view as never).issues.includes("ytext-mismatch"),
+		false,
+		"rename-gap validation cannot detach the binding for a false Y.Text mismatch",
+	);
+	manager.updatePathsAfterRename(new Map([["Notes/typing.md", renamedPath]]));
+	assertEq(binding.path, renamedPath, "rename metadata catches up to the preserved binding");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 25a0: filter:false stale input detaches yCollab in the same transaction ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	const syncConfig = new YSyncConfig(binding.ytext, {});
+	let state = EditorState.create({
+		doc: binding.cm.state.doc.toString(),
+		extensions: manager.getBaseExtension(),
+	});
+	state = state.update({
+		effects: manager.compartment.reconfigure(ySyncFacet.of(syncConfig)),
+		filter: false,
+	}).state;
+	(binding.cm as unknown as { state: EditorState }).state = state;
+	binding.view.file = { path: "Notes/next.md" };
+
+	const transaction = state.update({
+		changes: { from: state.doc.length, insert: "B edit" },
+		annotations: Transaction.userEvent.of("input.type"),
+		filter: false,
+	});
+	assertEq(transaction.docChanged, true, "filter:false still applies the editor change");
+	assertEq(
+		transaction.state.facet(ySyncFacet),
+		undefined,
+		"the extender removes stale yCollab from the same bypass transaction",
+	);
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has("leaf-1"),
+		false,
+		"the stale A binding is retired before the bypass update phase",
+	);
+	await Promise.resolve();
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 25a: announced target fences input before MarkdownView path adoption ---");
+{
+	const { manager, binding, setLiveEditorContent } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	const targetPath = "Notes/next.md";
+	const sourceState = EditorState.create({
+		doc: binding.cm.state.doc.toString(),
+		extensions: manager.getBaseExtension(),
+	});
+	(binding.cm as unknown as { state: EditorState }).state = sourceState;
+	manager.beginFileTransition(binding.view as never, targetPath);
+	assertEq(
+		(manager as unknown as { bindings: Map<string, unknown> }).bindings.has("leaf-1"),
+		false,
+		"the A binding is detached synchronously when B is announced",
+	);
+	const blocked = sourceState.update({
+		changes: { from: sourceState.doc.length, insert: "!" },
+		annotations: Transaction.userEvent.of("input.type"),
+	});
+	assertEq(
+		blocked.docChanged,
+		false,
+		"user input is cancelled throughout the unbound A-to-B gap",
+	);
+	assertEq(
+		(manager as unknown as { fileTransitionFences: Map<unknown, unknown> })
+			.fileTransitionFences.size,
+		1,
+		"the fence remains active before B is bound",
+	);
+
+	binding.view.file = { path: targetPath };
+	setLiveEditorContent(binding.ytext.toString());
+	(binding.cm as unknown as { state: EditorState }).state = EditorState.create({
+		doc: binding.ytext.toString(),
+		extensions: manager.getBaseExtension(),
+	});
+	const applied = (manager as unknown as {
+		applyBinding: (options: Record<string, unknown>) => boolean;
+	}).applyBinding({
+		action: "bind",
+		deviceName: "test-device",
+		view: binding.view,
+		cm: binding.cm,
+		cmId: "cm-target",
+		leafId: "leaf-1",
+		filePath: targetPath,
+		ytext: binding.ytext,
+		fileId: "file-target",
+		rapidSwitch: true,
+	});
+	assertEq(applied, true, "the exact B editor can be bound while the fence is active");
+	assertEq(
+		(manager as unknown as { fileTransitionFences: Map<unknown, unknown> })
+			.fileTransitionFences.size,
+		0,
+		"the fence releases only after the B binding succeeds",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 25b: an in-flight source IME commit is admitted only while A remains authoritative ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	(manager as unknown as { activeCompositions: WeakSet<object> })
+		.activeCompositions.add(binding.cm);
+	const sourceState = EditorState.create({
+		doc: binding.cm.state.doc.toString(),
+		extensions: manager.getBaseExtension(),
+	});
+	(binding.cm as unknown as { state: EditorState }).state = sourceState;
+	manager.beginFileTransition(binding.view as never, "Notes/next.md");
+	const compositionSpec = {
+		changes: { from: sourceState.doc.length, insert: "한" },
+		annotations: Transaction.userEvent.of("input.type.compose"),
+	};
+	const admitted = sourceState.update(compositionSpec);
+	assertEq(
+		admitted.docChanged,
+		true,
+		"the last composition commit can still reach A while A's path and binding agree",
+	);
+
+	binding.view.file = { path: "Notes/next.md" };
+	const blockedAfterAdoption = sourceState.update(compositionSpec);
+	assertEq(
+		blockedAfterAdoption.docChanged,
+		false,
+		"the same composition transaction is blocked after the view adopts B",
+	);
+	manager.cancelFileTransition(binding.view as never, "Notes/next.md", "test-cleanup");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 25c: stale path bindings block late non-user projections ---");
 {
 	const { manager, binding } = buildManagerFixture({
 		lastEditorChangeAgeMs: 10_000,
@@ -4375,6 +4619,94 @@ console.log("\n--- Test 25a: stale path bindings block late non-user projections
 		"stale path binding is removed before a late A projection can reach B",
 	);
 	await Promise.resolve();
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 25d: an abandoned source transition releases its input fence ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	manager.beginFileTransition(binding.view as never, "Notes/next.md");
+	const pruned = manager.pruneFileTransitionFences(
+		new Set([binding.view as never]),
+		Number.MAX_SAFE_INTEGER,
+	);
+	assertEq(pruned, 1, "a live view that never leaves A is pruned after the adoption deadline");
+	assertEq(
+		(manager as unknown as { fileTransitionFences: Map<unknown, unknown> })
+			.fileTransitionFences.size,
+		0,
+		"the abandoned transition cannot leave A permanently read-only",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 25e: an adopted target that never binds releases its input fence ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	const targetPath = "Notes/next.md";
+	manager.beginFileTransition(binding.view as never, targetPath);
+	binding.view.file = { path: targetPath };
+	const pruned = manager.pruneFileTransitionFences(
+		new Set([binding.view as never]),
+		Number.MAX_SAFE_INTEGER,
+	);
+	assertEq(pruned, 1, "a target adoption without a successful binding expires after the deadline");
+	assertEq(
+		(manager as unknown as {
+			fileTransitionFences: Map<unknown, { inputBlocked: boolean }>;
+		}).fileTransitionFences.get(binding.view)?.inputBlocked,
+		false,
+		"a failed target bind cannot leave B permanently read-only",
+	);
+	assertEq(
+		(manager as unknown as { fileTransitionFences: Map<unknown, unknown> })
+			.fileTransitionFences.size,
+		1,
+		"the unblocked transition remains tracked until the exact target can bind",
+	);
+	manager.bind(binding.view as never, "test-device");
+	assertEq(
+		(manager as unknown as { pendingCmResolveRetries: Map<string, unknown> })
+			.pendingCmResolveRetries.has("leaf-1"),
+		true,
+		"the adopted target keeps a non-blocking binding retry after fence expiry",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 25f: an expired source transition rebinds before bind() returns ---");
+{
+	const { manager, binding } = buildManagerFixture({
+		lastEditorChangeAgeMs: 100,
+		lastEditorDocChangeAgeMs: 100,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, binding.cm.state.doc.toString());
+	manager.beginFileTransition(binding.view as never, "Notes/next.md");
+	const fence = (manager as unknown as {
+		fileTransitionFences: Map<unknown, { startedAtMs: number }>;
+	}).fileTransitionFences.get(binding.view);
+	if (fence) fence.startedAtMs = 0;
+
+	manager.bind(binding.view as never, "test-device");
+	assertEq(
+		(manager as unknown as { fileTransitionFences: Map<unknown, unknown> })
+			.fileTransitionFences.size,
+		0,
+		"the expired fence is released inside the retry bind",
+	);
+	assertEq(
+		(manager as unknown as { bindings: Map<string, { path: string }> })
+			.bindings.get("leaf-1")?.path,
+		binding.path,
+		"the still-current source path is rebound in the same synchronous call",
+	);
 	clearPendingHealthChecks(manager);
 }
 
