@@ -195,6 +195,7 @@ import { AttachmentOrchestrator } from "./runtime/attachmentOrchestrator";
 import { EditorWorkspaceOrchestrator } from "./runtime/editorWorkspaceOrchestrator";
 import { SetupLinkController } from "./runtime/setupLinkController";
 import { TraceRuntimeController } from "./runtime/traceRuntimeController";
+import { applyLocalTextMutation, type LocalTextMutationResult } from "./runtime/localTextMutation";
 import { registerCommands } from "./commands";
 import {
 	buildKaosDashboardData,
@@ -3931,6 +3932,43 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private async importUntrackedFiles(): Promise<void> {
 		await this.reconciliationController.importUntrackedFiles();
+	}
+
+	/**
+	 * Apply a text mutation to a tracked file's CRDT (Y.Text) via a targeted
+	 * diff, then schedule a debounced disk flush. Because the write flows
+	 * through the CRDT and is flushed by DiskMirror (which registers a
+	 * self-write fingerprint), the resulting disk modify is recognized as
+	 * KAOS-originated and does NOT produce a superseded-candidate conflict
+	 * artifact — even when called in rapid succession (D1 → D2 → D3 coalesce
+	 * into one forward flush).
+	 *
+	 * The mutator is synchronous and receives the current CRDT text; it must
+	 * return the desired next text. A targeted diff is applied (not a whole-
+	 * document replace), so concurrent editor typing in unaffected regions is
+	 * preserved by the CRDT merge.
+	 *
+	 * External tools reach this via `app.plugins.plugins["kaos"].applyTextMutation`.
+	 *
+	 * @throws if KAOS is not initialized or the path is not yet tracked.
+	 */
+	public applyTextMutation(
+		path: string,
+		mutator: (current: string) => string,
+	): LocalTextMutationResult {
+		const vaultSync = this.vaultSync;
+		const diskMirror = this.diskMirror;
+		if (!vaultSync || !diskMirror) {
+			throw new Error("applyTextMutation: KAOS not initialized");
+		}
+		return applyLocalTextMutation(
+			{
+				getTextForPath: (p) => vaultSync.getTextForPath(p),
+				scheduleWrite: (p) => diskMirror.scheduleWrite(p),
+			},
+			path,
+			mutator,
+		);
 	}
 
 	private async clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined> {

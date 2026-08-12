@@ -56,12 +56,33 @@ export class EditorWorkspaceOrchestrator {
 	}
 
 	onFileOpen(filePath: string | null): void {
+		const syncablePath =
+			filePath && this.deps.isMarkdownPathSyncable(filePath) ? filePath : null;
+		const view = this.deps.app.workspace.getActiveViewOfType(MarkdownView);
+		const leafStatePath = view ? this.getLeafStateFilePath(view) : null;
+		const activeViewOwnsEvent =
+			!!view
+			&& !!filePath
+			&& (view.file?.path === filePath || leafStatePath === filePath);
 		this.updateActiveMarkdownPath(
-			filePath && this.deps.isMarkdownPathSyncable(filePath) ? filePath : null,
+			filePath === null
+				? null
+				: activeViewOwnsEvent
+					? syncablePath
+					: this.getActiveMarkdownPath(),
 			"file-open-active-change",
 		);
+		const editorBindings = this.deps.getEditorBindings();
+		if (view && syncablePath && activeViewOwnsEvent) {
+			// Fence synchronously: file-open can precede the reused MarkdownView's
+			// TFile/CodeMirror adoption, so waiting for the settled validation leaves
+			// a real input window between A and B. The leaf view-state ownership check
+			// excludes file-open events emitted for embeds or another leaf.
+			editorBindings?.beginFileTransition(view, syncablePath);
+		} else if (view && activeViewOwnsEvent) {
+			editorBindings?.cancelFileTransition(view, undefined, "file-open-unsyncable");
+		}
 		if (!filePath) return;
-		const view = this.deps.app.workspace.getActiveViewOfType(MarkdownView);
 		if (view && view.file?.path === filePath) {
 			this.bindView(view);
 		}
@@ -96,33 +117,44 @@ export class EditorWorkspaceOrchestrator {
 	validateOpenBindings(reason: string): void {
 		let touched = 0;
 		let auditNeeded = false;
+		const liveMarkdownViews = new Set<MarkdownView>();
 		const editorBindings = this.deps.getEditorBindings();
 		if (!editorBindings) return;
 
 		this.deps.app.workspace.iterateAllLeaves((leaf) => {
-			if (!(leaf.view instanceof MarkdownView) || !leaf.view.file) {
-				return;
+			if (leaf.view instanceof MarkdownView) {
+				liveMarkdownViews.add(leaf.view);
 			}
-			if (!this.deps.isMarkdownPathSyncable(leaf.view.file.path)) {
-				editorBindings.unbind(leaf.view);
-				return;
+		});
+		// Expired input fences must be released or retired before the current-path
+		// bind attempt. Both operations run in this callback, so user input cannot
+		// enter the newly editable editor between release and reattachment.
+		editorBindings.pruneFileTransitionFences(liveMarkdownViews);
+
+		for (const view of liveMarkdownViews) {
+			if (!view.file) continue;
+			if (!this.deps.isMarkdownPathSyncable(view.file.path)) {
+				// This can still be the briefly visible excluded source A while a
+				// syncable target B owns an active same-view transition fence.
+				editorBindings.unbind(view, true);
+				continue;
 			}
 
-			const binding = editorBindings.getBindingDebugInfoForView(leaf.view) ?? null;
-			const health = editorBindings.getBindingHealthForView(leaf.view) ?? null;
+			const binding = editorBindings.getBindingDebugInfoForView(view) ?? null;
+			const health = editorBindings.getBindingHealthForView(view) ?? null;
 
 			if (health?.bound && (health.healthy || health.settling)) {
-				return;
+				continue;
 			}
 
 			if (!binding || !health?.bound) {
 				touched += 1;
-				this.bindView(leaf.view);
-				return;
+				this.bindView(view);
+				continue;
 			}
 
 			auditNeeded = true;
-		});
+		}
 
 		if (auditNeeded) {
 			touched += editorBindings.auditBindings(`validate:${reason}`);
@@ -155,7 +187,9 @@ export class EditorWorkspaceOrchestrator {
 		const bindings = this.deps.getEditorBindings();
 		const path = view.file?.path;
 		if (!path || !this.deps.isMarkdownPathSyncable(path)) {
-			bindings?.unbind(view);
+			// An excluded source can remain visible until the target TFile is adopted.
+			// Preserve any syncable target fence announced by file-open.
+			bindings?.unbind(view, true);
 			return;
 		}
 		bindings?.bind(view, this.deps.getSettings().deviceName);
@@ -197,6 +231,15 @@ export class EditorWorkspaceOrchestrator {
 		const activeView = this.deps.app.workspace.getActiveViewOfType(MarkdownView);
 		const path = activeView?.file?.path;
 		return path && this.deps.isMarkdownPathSyncable(path) ? path : null;
+	}
+
+	private getLeafStateFilePath(view: MarkdownView): string | null {
+		try {
+			const state = view.leaf.getViewState().state as { file?: unknown };
+			return typeof state.file === "string" ? state.file : null;
+		} catch {
+			return null;
+		}
 	}
 
 	private updateActiveMarkdownPath(nextPath: string | null, reason: string): void {

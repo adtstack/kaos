@@ -1,6 +1,6 @@
 {
 	"name": "kaos",
-	"version": "1.11.2",
+	"version": "1.11.3",
 	"releaseVersions": {
 		"server": "0.7.2",
 		"headlessHost": "0.2.5"

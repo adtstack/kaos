@@ -66,6 +66,7 @@ const EDITOR_AUTHORITY_SHIELD_ORIGINS = new Set<string>([
 const CM_RESOLVE_RETRY_DELAYS_MS = [80, 160, 320, 640, 1000, 1500, 2000] as const;
 const CM_RESOLVE_DELAYED_ATTEMPT = 5;
 const CM_RESOLVE_IDLE_RETRY_DELAY_MS = 5000;
+const STALE_FILE_TRANSITION_FENCE_MS = 5000;
 
 /** Map from MarkdownView instance id to its binding state. */
 interface EditorBinding {
@@ -81,6 +82,15 @@ interface EditorBinding {
 	lastEditorChangeAtMs: number;
 	lastEditorDocChangeAtMs: number | null;
 	settleWindowMs: number;
+}
+
+interface EditorFileTransitionFence {
+	view: MarkdownView;
+	leafId: string;
+	sourcePath: string | null;
+	targetPath: string;
+	startedAtMs: number;
+	inputBlocked: boolean;
 }
 
 export interface BindingDebugInfo {
@@ -147,9 +157,11 @@ export interface ExternalDiskMutationNotice {
 	content: string | null;
 	/**
 	 * Primitive snapshot of every open editor at event admission. It is retained
-	 * as immutable event metadata, but never proves that one distinct disk
-	 * revision supersedes or was adopted by another. Distinct raw candidates are
-	 * preserved independently unless a candidate-specific durable receipt exists.
+	 * as immutable event metadata and used as one fence in the strict
+	 * recent-self-write append recovery proof. It never proves that one distinct
+	 * disk revision supersedes or was adopted by another; distinct raw candidates
+	 * are preserved independently unless a candidate-specific durable receipt
+	 * exists.
 	 */
 	editorAuthorityLineage?: ExternalDiskMutationEditorAuthorityLineage | null;
 }
@@ -343,6 +355,8 @@ export interface BindingPropagationGate {
 export class EditorBindingManager {
 	/** The CM6 compartment that holds yCollab for each editor. */
 	readonly compartment = new Compartment();
+	/** Makes only the short same-view A -> B adoption window read-only. */
+	private readonly transitionInputCompartment = new Compartment();
 
 	/** Track which views are currently bound. Keyed by MarkdownView leaf id. */
 	private bindings = new Map<string, EditorBinding>();
@@ -379,6 +393,8 @@ export class EditorBindingManager {
 	private recentEditorOriginChanges = new Map<string, RecentEditorOriginChange>();
 	private lastExternalDiskMutationSequenceByPath = new Map<string, number>();
 	private observedExternalDiskMutationSequenceByPath = new Map<string, number>();
+	private readonly fileTransitionFences = new Map<MarkdownView, EditorFileTransitionFence>();
+	private readonly activeCompositions = new WeakSet<EditorView>();
 	private readonly debug: boolean;
 
 	constructor(
@@ -436,17 +452,34 @@ export class EditorBindingManager {
 		const filterRiskyNonUserPatch = this.filterRiskyNonUserPatch.bind(this);
 		const annotateEditorDocumentOrigin = this.annotateEditorDocumentOrigin.bind(this);
 		const fenceStaleUserBinding = this.fenceStaleUserBinding.bind(this);
+		const detachStaleUserBindingAfterFilterBypass =
+			this.detachStaleUserBindingAfterFilterBypass.bind(this);
+		const handleCompositionStart = this.handleCompositionStart.bind(this);
+		const handleCompositionEnd = this.handleCompositionEnd.bind(this);
 		return [
 			this.compartment.of([]),
+			this.transitionInputCompartment.of([]),
+			// Syncable note transitions must replace a fenced user transaction, not
+			// merely extend it: an extender would let the original document change
+			// continue in a transient editor after stale yCollab is removed. A switch
+			// to an excluded/local-only note is handled by the detach-only extender so
+			// its first local edit remains intact.
+			EditorState.transactionFilter.of(fenceStaleUserBinding),
 			// Guard y-codemirror document patches that would replay a local repair
 			// over an actively edited note. The actual local-edit tracking lives
 			// in the ViewPlugin below; this filter runs before the patch reaches
 			// the editor document.
 			EditorState.transactionFilter.of(filterRiskyNonUserPatch),
 			// Extenders run after every transaction filter and even when a caller uses
-			// `filter: false`, so provenance attached here reaches the final update.
+			// `filter: false`. Keep a detach-only fallback in that path so a stale
+			// yCollab compartment cannot carry B's edit into A's Y.Text.
+			EditorState.transactionExtender.of(detachStaleUserBindingAfterFilterBypass),
+			// Provenance attached here reaches the final update after the fallback.
 			EditorState.transactionExtender.of(annotateEditorDocumentOrigin),
-			EditorState.transactionExtender.of(fenceStaleUserBinding),
+			EditorView.domEventHandlers({
+				compositionstart: (_event, view) => handleCompositionStart(view),
+				compositionend: (_event, view) => handleCompositionEnd(view),
+			}),
 			ViewPlugin.fromClass(
 				class {
 					constructor(readonly view: EditorView) {
@@ -685,6 +718,147 @@ export class EditorBindingManager {
 	}
 
 	/**
+	 * Fence the short interval in which Obsidian has announced B but a reused
+	 * MarkdownView/CodeMirror may still expose A. No journal, replay, lease, or
+	 * private TextFileView lifecycle hook is involved: input is simply disabled
+	 * until the exact target binding has been installed.
+	 */
+	beginFileTransition(view: MarkdownView, targetPath: string): boolean {
+		if (!this.isMarkdownPathSyncable(targetPath)) {
+			this.cancelFileTransition(view, undefined, "target-not-syncable");
+			return false;
+		}
+
+		const leafId =
+			(view.leaf as unknown as { id?: string }).id ?? view.file?.path ?? targetPath;
+		const existing = this.bindings.get(leafId);
+		const liveCm = this.getCmView(view);
+		const compositionActive = liveCm ? this.isCompositionActive(liveCm) : false;
+		if (liveCm && compositionActive) {
+			this.activeCompositions.add(liveCm);
+		}
+		if (
+			existing?.view === view
+			&& existing.path === targetPath
+			&& view.file?.path === targetPath
+			&& liveCm === existing.cm
+		) {
+			this.cancelFileTransition(view, targetPath, "target-already-bound");
+			return false;
+		}
+
+		const current = this.fileTransitionFences.get(view);
+		if (current?.targetPath === targetPath) {
+			// Once the safety timeout has released input, a duplicate file-open for
+			// the same unresolved target must not make the editor read-only again.
+			if (current.inputBlocked) {
+				this.setFileTransitionInputBlocked(current, true, "transition-reaffirmed");
+			}
+			return true;
+		}
+
+		for (const [candidateView, candidate] of this.fileTransitionFences) {
+			if (candidateView !== view && candidate.leafId === leafId) {
+				this.cancelFileTransition(
+					candidateView,
+					candidate.targetPath,
+					"leaf-view-replaced",
+				);
+			}
+		}
+		if (current) {
+			this.cancelFileTransition(view, current.targetPath, "target-replaced");
+		}
+
+		const fence: EditorFileTransitionFence = {
+			view,
+			leafId,
+			sourcePath: existing?.path ?? view.file?.path ?? null,
+			targetPath,
+			startedAtMs: Date.now(),
+			inputBlocked: true,
+		};
+		this.fileTransitionFences.set(view, fence);
+		this.setFileTransitionInputBlocked(fence, true, "file-open");
+		this.trace?.("editor", "file-transition-fence-started", {
+			leafId,
+			sourcePath: fence.sourcePath,
+			targetPath,
+			cmId: liveCm ? this.getCmId(liveCm) : null,
+			compositionActive,
+		});
+
+		if (liveCm && compositionActive) {
+			// Blurring asks the host IME to commit A before the queued compositionend
+			// cleanup detaches A. The transaction filter admits that one commit only
+			// while the source binding and MarkdownView path still agree.
+			try {
+				liveCm.contentDOM.blur();
+			} catch {
+				// A click may already have blurred or disposed the source editor.
+			}
+		} else if (existing) {
+			this.unbind(view, true);
+		}
+
+		return true;
+	}
+
+	cancelFileTransition(
+		view: MarkdownView,
+		expectedTargetPath?: string,
+		reason = "cancelled",
+	): boolean {
+		const fence = this.fileTransitionFences.get(view);
+		if (!fence || (expectedTargetPath && fence.targetPath !== expectedTargetPath)) {
+			return false;
+		}
+		this.fileTransitionFences.delete(view);
+		this.setFileTransitionInputBlocked(fence, false, reason);
+		this.clearCmResolveRetry(fence.leafId);
+		this.trace?.("editor", "file-transition-fence-cancelled", {
+			leafId: fence.leafId,
+			sourcePath: fence.sourcePath,
+			targetPath: fence.targetPath,
+			reason,
+		});
+		return true;
+	}
+
+	pruneFileTransitionFences(
+		liveViews: ReadonlySet<MarkdownView>,
+		now = Date.now(),
+	): number {
+		let pruned = 0;
+		for (const [view, fence] of this.fileTransitionFences) {
+			const live = liveViews.has(view);
+			const expired =
+				now - fence.startedAtMs >= STALE_FILE_TRANSITION_FENCE_MS;
+			if (live && (!expired || !fence.inputBlocked)) continue;
+			const currentPath = view.file?.path ?? null;
+			if (live && currentPath === fence.targetPath) {
+				this.setFileTransitionInputBlocked(
+					fence,
+					false,
+					"target-binding-timeout",
+				);
+				pruned += 1;
+				continue;
+			}
+			if (this.cancelFileTransition(
+				view,
+				fence.targetPath,
+				!live
+					? "view-closed"
+					: "target-not-adopted",
+			)) {
+				pruned += 1;
+			}
+		}
+		return pruned;
+	}
+
+	/**
 	 * Bind a MarkdownView's editor to the correct Y.Text.
 	 * Call this when a leaf becomes active or a file is opened.
 	 */
@@ -693,9 +867,41 @@ export class EditorBindingManager {
 		const file = view.file;
 		if (!file) return;
 
+		const leafId = (view.leaf as unknown as { id: string }).id ?? file.path;
+		let transition = this.fileTransitionFences.get(view);
+		if (
+			transition
+			&& Date.now() - transition.startedAtMs >= STALE_FILE_TRANSITION_FENCE_MS
+		) {
+			if (file.path === transition.targetPath) {
+				if (transition.inputBlocked) {
+					this.setFileTransitionInputBlocked(
+						transition,
+						false,
+						"target-binding-timeout",
+					);
+				}
+			} else {
+				this.cancelFileTransition(
+					view,
+					transition.targetPath,
+					"target-not-adopted",
+				);
+				transition = undefined;
+			}
+		}
+		if (transition && file.path !== transition.targetPath) {
+			this.scheduleCmResolveRetry(
+				view,
+				deviceName,
+				leafId,
+				"transition-view-not-ready",
+			);
+			return;
+		}
+
 		if (!this.canBindPath(view, "bind")) return;
 
-		const leafId = (view.leaf as unknown as { id: string }).id ?? file.path;
 		const existing = this.bindings.get(leafId);
 		const cm = this.getCmView(view);
 		if (!cm) {
@@ -703,14 +909,16 @@ export class EditorBindingManager {
 			// still mounting. Detach the old yCollab immediately; retry will bind the
 			// new editor once its document agrees with the MarkdownView facade.
 			if (existing && existing.path !== file.path) {
-				this.unbind(view);
+				this.unbind(view, transition?.targetPath === file.path);
 			}
 			this.log(`bind: waiting for Obsidian editor view for "${file.path}"`);
 			this.scheduleCmResolveRetry(view, deviceName, leafId, "bind");
 			return;
 		}
-		this.clearCmResolveRetry(leafId);
-		this.cmDegradedWarned = false;
+		if (!transition) {
+			this.clearCmResolveRetry(leafId);
+			this.cmDegradedWarned = false;
+		}
 		const cmId = this.getCmId(cm);
 		this.carryCmActivityToPath(cm, file.path);
 		const rapidSwitch =
@@ -730,6 +938,7 @@ export class EditorBindingManager {
 					return;
 				}
 
+				this.finishFileTransition(view, file.path, "target-already-bound");
 				this.log(`bind: already bound "${file.path}" (leaf=${leafId}, cm=${cmId})`);
 				return;
 			}
@@ -775,7 +984,7 @@ export class EditorBindingManager {
 
 		// Unbind previous if switching files in the same leaf
 		if (existing) {
-			this.unbind(view);
+			this.unbind(view, transition?.targetPath === file.path);
 		}
 
 		const target = this.resolveBindingTarget(
@@ -783,9 +992,19 @@ export class EditorBindingManager {
 			deviceName,
 			"bind",
 		);
-		if (!target) return;
+		if (!target) {
+			if (transition?.targetPath === file.path) {
+				this.scheduleCmResolveRetry(
+					view,
+					deviceName,
+					leafId,
+					"transition-target-not-ready",
+				);
+			}
+			return;
+		}
 
-		this.applyBinding({
+		const applied = this.applyBinding({
 			action: "bind",
 			deviceName,
 			view,
@@ -797,6 +1016,14 @@ export class EditorBindingManager {
 			fileId: target.fileId,
 			rapidSwitch,
 		});
+		if (!applied && transition?.targetPath === file.path) {
+			this.scheduleCmResolveRetry(
+				view,
+				deviceName,
+				leafId,
+				"transition-bind-apply",
+			);
+		}
 	}
 
 	repair(view: MarkdownView, deviceName: string, reason: string): boolean {
@@ -944,17 +1171,20 @@ export class EditorBindingManager {
 			return;
 		}
 		this.log(`rebind: forcing "${file.path}" (leaf=${leafId}, reason=${reason})`);
-		this.unbind(view);
+		this.unbind(view, this.fileTransitionFences.get(view)?.targetPath === file.path);
 		this.bind(view, deviceName);
 	}
 
 	/**
 	 * Unbind a MarkdownView's editor (clear yCollab extension).
 	 */
-	unbind(view: MarkdownView): void {
+	unbind(view: MarkdownView, preserveFileTransitionFence = false): void {
 		const file = view.file;
 		const leafId =
 			(view.leaf as unknown as { id: string }).id ?? file?.path ?? "unknown";
+		if (!preserveFileTransitionFence) {
+			this.cancelFileTransition(view, undefined, "unbind");
+		}
 
 		const binding = this.bindings.get(leafId);
 		if (!binding) return;
@@ -988,6 +1218,9 @@ export class EditorBindingManager {
 	 * Unbind all editors. Called on plugin unload.
 	 */
 	unbindAll(): void {
+		for (const [view, fence] of this.fileTransitionFences) {
+			this.cancelFileTransition(view, fence.targetPath, "unbind-all");
+		}
 		for (const [leafId, binding] of this.bindings) {
 			this.clearScheduledHealthCheck(leafId);
 			this.clearCmResolveRetry(leafId);
@@ -1011,6 +1244,11 @@ export class EditorBindingManager {
 	 * Called when a file is deleted (locally or remotely).
 	 */
 	unbindByPath(path: string): void {
+		for (const [view, fence] of this.fileTransitionFences) {
+			if (fence.targetPath === path) {
+				this.cancelFileTransition(view, path, "target-removed");
+			}
+		}
 		for (const [leafId, binding] of this.bindings) {
 			if (binding.path === path) {
 				this.clearScheduledHealthCheck(leafId);
@@ -1052,6 +1290,13 @@ export class EditorBindingManager {
 	 * itself doesn't need to change (stable file IDs), but our bookkeeping does.
 	 */
 	updatePathsAfterRename(renames: Map<string, string>): void {
+		for (const fence of this.fileTransitionFences.values()) {
+			const renamedTarget = renames.get(fence.targetPath);
+			if (renamedTarget) fence.targetPath = renamedTarget;
+			if (fence.sourcePath) {
+				fence.sourcePath = renames.get(fence.sourcePath) ?? fence.sourcePath;
+			}
+		}
 		for (const [leafId, binding] of this.bindings) {
 			const newPath = renames.get(binding.path);
 			if (newPath) {
@@ -1329,6 +1574,11 @@ export class EditorBindingManager {
 
 		const leafId =
 			(view.leaf as unknown as { id: string }).id ?? file.path;
+		const binding = this.bindings.get(leafId);
+		const expectedPath =
+			binding?.view === view && this.bindingMatchesCurrentViewPath(binding)
+				? binding.path
+				: file.path;
 		const cm = this.getCmView(view);
 		if (!cm) {
 			return {
@@ -1340,7 +1590,7 @@ export class EditorBindingManager {
 				yTextMatchesExpected: null,
 				undoManagerMatchesFacet: null,
 				facetFileId: null,
-				expectedFileId: this.vaultSync.getFileId(file.path) ?? null,
+				expectedFileId: this.vaultSync.getFileId(expectedPath) ?? null,
 				facetTextLength: null,
 				cmDocLength: null,
 			};
@@ -1359,10 +1609,9 @@ export class EditorBindingManager {
 			syncFacet = undefined;
 		}
 
-		const binding = this.bindings.get(leafId);
-		const expectedText = this.vaultSync.getTextForPath(file.path);
+		const expectedText = this.vaultSync.getTextForPath(expectedPath);
 		const expectedFileId =
-			this.vaultSync.getFileId(file.path)
+			this.vaultSync.getFileId(expectedPath)
 			?? (expectedText ? this.vaultSync.getFileIdForText(expectedText) : undefined)
 			?? null;
 		const facetText = syncFacet?.ytext ?? null;
@@ -1625,12 +1874,57 @@ export class EditorBindingManager {
 
 	private registerKnownCmView(cm: EditorView): void {
 		this.knownCmViews.add(cm);
+		const fence = this.findFileTransitionForCm(cm);
+		if (!fence) return;
+		queueMicrotask(() => {
+			if (
+				this.fileTransitionFences.get(fence.view) !== fence
+				|| !this.knownCmViews.has(cm)
+			) {
+				return;
+			}
+			try {
+				cm.dispatch({
+					effects: this.transitionInputCompartment.reconfigure(
+						EditorView.editable.of(false),
+					),
+				});
+			} catch {
+				// The transient target CM may already have been replaced.
+			}
+		});
 	}
 
 	private unregisterKnownCmView(cm: EditorView): void {
+		this.activeCompositions.delete(cm);
 		this.knownCmViews.delete(cm);
 		this.cmToLeafId.delete(cm);
 		this.pendingReplacementCmToLeafId.delete(cm);
+	}
+
+	private handleCompositionStart(cm: EditorView): boolean {
+		this.activeCompositions.add(cm);
+		return false;
+	}
+
+	private handleCompositionEnd(cm: EditorView): boolean {
+		queueMicrotask(() => {
+			this.activeCompositions.delete(cm);
+			const fence = this.findFileTransitionForCm(cm);
+			if (!fence || this.fileTransitionFences.get(fence.view) !== fence) return;
+			const binding = this.bindings.get(fence.leafId);
+			if (binding?.view === fence.view && binding.path !== fence.targetPath) {
+				this.unbind(fence.view, true);
+			}
+			if (fence.view.file?.path === fence.targetPath) {
+				this.bind(fence.view, this.lastDeviceName);
+			}
+		});
+		return false;
+	}
+
+	private isCompositionActive(cm: EditorView): boolean {
+		return this.activeCompositions.has(cm) || cm.composing;
 	}
 
 	private inspectBindingHealth(
@@ -1651,7 +1945,7 @@ export class EditorBindingManager {
 
 		if (!file) {
 			issues.push("missing-file");
-		} else if (binding.path !== file.path) {
+		} else if (!this.bindingMatchesCurrentViewPath(binding)) {
 			issues.push("path-changed");
 		}
 
@@ -1695,10 +1989,10 @@ export class EditorBindingManager {
 		if (this.isUserTransaction(transaction)) {
 			const match = this.findBindingForState(transaction.startState);
 			if (!match) return transaction;
-			if (match.binding.view.file?.path !== match.binding.path) {
-				// The transaction extender below detaches the stale yCollab
-				// compartment in the same transaction. Do not evaluate remote
-				// typing awareness against the previous file.
+			if (!this.bindingMatchesCurrentViewPath(match.binding)) {
+				// The stale-binding guard either cancels a syncable transition edit or
+				// preserves an excluded note's edit while the extender detaches yCollab.
+				// In either case, do not evaluate awareness against the previous file.
 				return transaction;
 			}
 
@@ -1715,7 +2009,7 @@ export class EditorBindingManager {
 		const match = this.findBindingForState(transaction.startState);
 		if (!match) return transaction;
 		const { leafId, binding } = match;
-		if (binding.view.file?.path !== binding.path) {
+		if (!this.bindingMatchesCurrentViewPath(binding)) {
 			// A late Yjs/provider projection can be built from A's yCollab state after
 			// the host has already reused the MarkdownView for B. Cancel that document
 			// change and remove the stale compartment in the same transaction. A fresh
@@ -2624,22 +2918,204 @@ export class EditorBindingManager {
 		this.notifyExternalDiskReloadIntercepted(marker);
 	}
 
-	private fenceStaleUserBinding(transaction: Transaction): TransactionSpec | null {
+	private fenceStaleUserBinding(
+		transaction: Transaction,
+	): Transaction | TransactionSpec | readonly TransactionSpec[] {
+		if (!transaction.docChanged || !this.isUserTransaction(transaction)) {
+			return transaction;
+		}
+
+		const transition = this.findFileTransitionForState(transaction.startState);
+		if (transition) {
+			const match = this.findBindingForState(transaction.startState);
+			const sourceCompositionCanFinish =
+				transaction.isUserEvent("input.type.compose")
+				&& this.isCompositionActive(transition.cm)
+				&& match?.binding.cm === transition.cm
+				&& match.binding.view === transition.fence.view
+				&& match.binding.path === transition.fence.sourcePath
+				&& match.binding.path !== transition.fence.targetPath
+				&& match.binding.view.file?.path === match.binding.path;
+			if (sourceCompositionCanFinish) {
+				this.trace?.("editor", "file-transition-source-composition-admitted", {
+					leafId: transition.fence.leafId,
+					sourcePath: transition.fence.sourcePath,
+					targetPath: transition.fence.targetPath,
+					cmId: this.getCmId(transition.cm),
+				});
+				return transaction;
+			}
+
+			this.trace?.("editor", "file-transition-user-input-blocked", {
+				leafId: transition.fence.leafId,
+				sourcePath: transition.fence.sourcePath,
+				targetPath: transition.fence.targetPath,
+				currentPath: transition.fence.view.file?.path ?? null,
+				cmId: this.getCmId(transition.cm),
+				userEvent: transaction.annotation(Transaction.userEvent) ?? null,
+			});
+			return [];
+		}
+
+		const match = this.findBindingForState(transaction.startState);
+		if (!match) return transaction;
+		const { leafId, binding } = match;
+		const currentPath = binding.view.file?.path ?? null;
+		if (this.bindingMatchesCurrentViewPath(binding)) return transaction;
+		if (currentPath && !this.isMarkdownPathSyncable(currentPath)) {
+			// No collaborative target will adopt this local-only document. Preserve
+			// its first edit and let the extender below detach stale A yCollab in the
+			// same transaction before the editor update phase can propagate it.
+			return transaction;
+		}
+		return this.detachStaleBinding(leafId, binding, "user-input");
+	}
+
+	/**
+	 * `EditorState.update({ filter: false })` skips transaction filters but still
+	 * runs extenders. It cannot be cancelled here, so detach yCollab in the same
+	 * transaction before a reused B surface can propagate its change into A.
+	 */
+	private detachStaleUserBindingAfterFilterBypass(
+		transaction: Transaction,
+	): TransactionSpec | null {
 		if (!transaction.docChanged || !this.isUserTransaction(transaction)) {
 			return null;
 		}
+
+		const transition = this.findFileTransitionForState(transaction.startState);
+		if (transition) {
+			const match = this.findBindingForState(transaction.startState);
+			const sourceCompositionCanFinish =
+				transaction.isUserEvent("input.type.compose")
+					&& this.isCompositionActive(transition.cm)
+					&& match?.binding.cm === transition.cm
+					&& match.binding.view === transition.fence.view
+					&& match.binding.path === transition.fence.sourcePath
+					&& match.binding.path !== transition.fence.targetPath
+					&& match.binding.view.file?.path === match.binding.path;
+			if (sourceCompositionCanFinish || !match) return null;
+
+			this.trace?.("editor", "file-transition-filter-bypass-detached", {
+				leafId: transition.fence.leafId,
+				sourcePath: transition.fence.sourcePath,
+				targetPath: transition.fence.targetPath,
+				currentPath: transition.fence.view.file?.path ?? null,
+				cmId: this.getCmId(transition.cm),
+				userEvent: transaction.annotation(Transaction.userEvent) ?? null,
+			});
+			return this.detachStaleBinding(
+				match.leafId,
+				match.binding,
+				"filter-bypass-user-input",
+			);
+		}
+
 		const match = this.findBindingForState(transaction.startState);
+		if (!match || this.bindingMatchesCurrentViewPath(match.binding)) return null;
+		return this.detachStaleBinding(
+			match.leafId,
+			match.binding,
+			"filter-bypass-user-input",
+		);
+	}
+
+	private bindingMatchesCurrentViewPath(binding: EditorBinding): boolean {
+		const currentPath = binding.view.file?.path;
+		if (!currentPath) return false;
+		if (currentPath === binding.path) return true;
+		// VaultSync records the exact old->new identity while rename metadata is
+		// debounced. Keep the existing Y.Text binding alive only when this target
+		// belongs to this binding's old path; an unrelated pending target must not
+		// be allowed to carry edits into the wrong document.
+		return (
+			this.vaultSync.getPendingRenameOldPathForTarget(currentPath)
+			=== binding.path
+		);
+	}
+
+	private findFileTransitionForState(
+		state: EditorState,
+	): { fence: EditorFileTransitionFence; cm: EditorView } | null {
+		for (const cm of this.knownCmViews) {
+			if (cm.state !== state) continue;
+			const fence = this.findFileTransitionForCm(cm);
+			if (fence) return { fence, cm };
+		}
+
+		const match = this.findBindingForState(state);
 		if (!match) return null;
-		const { leafId, binding } = match;
-		const currentPath = binding.view.file?.path ?? null;
-		if (currentPath === binding.path) return null;
-		return this.detachStaleBinding(leafId, binding, "user-input");
+		const fence = this.fileTransitionFences.get(match.binding.view);
+		return fence?.inputBlocked ? { fence, cm: match.binding.cm } : null;
+	}
+
+	private findFileTransitionForCm(cm: EditorView): EditorFileTransitionFence | null {
+		for (const fence of this.fileTransitionFences.values()) {
+			if (!fence.inputBlocked) continue;
+			try {
+				if (fence.view.containerEl.contains(cm.dom)) return fence;
+			} catch {
+				// A disposed MarkdownView cannot own a live transition CM.
+			}
+		}
+		return null;
+	}
+
+	private finishFileTransition(
+		view: MarkdownView,
+		targetPath: string,
+		reason: string,
+	): boolean {
+		const fence = this.fileTransitionFences.get(view);
+		if (!fence || fence.targetPath !== targetPath) return false;
+		this.fileTransitionFences.delete(view);
+		this.setFileTransitionInputBlocked(fence, false, reason);
+		this.clearCmResolveRetry(fence.leafId);
+		this.trace?.("editor", "file-transition-fence-completed", {
+			leafId: fence.leafId,
+			sourcePath: fence.sourcePath,
+			targetPath,
+			reason,
+			durationMs: Date.now() - fence.startedAtMs,
+		});
+		return true;
+	}
+
+	private setFileTransitionInputBlocked(
+		fence: EditorFileTransitionFence,
+		blocked: boolean,
+		reason: string,
+	): void {
+		fence.inputBlocked = blocked;
+		for (const cm of this.knownCmViews) {
+			try {
+				if (!fence.view.containerEl.contains(cm.dom)) continue;
+				if (!blocked) this.activeCompositions.delete(cm);
+				cm.dispatch({
+					effects: this.transitionInputCompartment.reconfigure(
+						blocked ? EditorView.editable.of(false) : [],
+					),
+				});
+			} catch {
+				// Either CM can disappear while Obsidian replaces the editor surface.
+			}
+		}
+		this.trace?.(
+			"editor",
+			blocked ? "file-transition-input-blocked" : "file-transition-input-released",
+			{
+				leafId: fence.leafId,
+				sourcePath: fence.sourcePath,
+				targetPath: fence.targetPath,
+				reason,
+			},
+		);
 	}
 
 	private detachStaleBinding(
 		leafId: string,
 		binding: EditorBinding,
-		source: "user-input" | "non-user-projection",
+		source: "user-input" | "filter-bypass-user-input" | "non-user-projection",
 	): TransactionSpec {
 		this.clearScheduledHealthCheck(leafId);
 		this.clearCmResolveRetry(leafId);
@@ -3436,6 +3912,7 @@ export class EditorBindingManager {
 			this.publishLocalActiveFile(binding);
 		}
 		this.cmToLeafId.set(cm, leafId);
+		this.finishFileTransition(view, filePath, "target-bound");
 		this.schedulePostBindHealthCheck(leafId, settleWindowMs);
 		this.trace?.("editor", "binding-applied", {
 			action,

@@ -2187,7 +2187,142 @@ console.log("\n--- Test 5c1a2: a delayed external append over a newer self-write
 	);
 	assert(
 		!getInterceptedCandidates(fix.controller).has(fix.path),
-		"the external candidate retires only after durable preservation",
+		"the exact external candidate retires only after settlement",
+	);
+	clearMarkdownDrainTimer(fix.controller);
+	fix.controller.reset();
+	fix.doc.destroy();
+}
+
+console.log("\n--- Test 5c1a2a: distinct QuickAdd revisions fail closed during async proof ---");
+{
+	const physicalSelfWrite = "# log\neditor-current\n";
+	const intermediateAppend = `${physicalSelfWrite}quickadd-intermediate\n`;
+	const finalAppend = `${physicalSelfWrite}quickadd-final\n`;
+	const fix = buildFixture({
+		path: "Notes/open-external-candidate-proof-race.md",
+		disk: physicalSelfWrite,
+		editor: physicalSelfWrite,
+		crdt: physicalSelfWrite,
+	});
+	fix.setBaselineContent(physicalSelfWrite);
+	fix.setRecentWriteFingerprintMatches(true);
+	const unchangedLineage = captureFixtureExternalEditorLineage(fix);
+	const intermediate = makeInterceptedCandidate(fix.path, intermediateAppend, 46, {
+		editorAuthorityLineage: unchangedLineage,
+		observedAt: 46_000,
+	});
+	const final = makeInterceptedCandidate(fix.path, finalAppend, 47, {
+		editorAuthorityLineage: unchangedLineage,
+		observedAt: 46_100,
+	});
+	fix.controller.noteInterceptedExternalDiskMutation(intermediate);
+	clearMarkdownDrainTimer(fix.controller);
+
+	let fingerprintCallCount = 0;
+	let markFirstProofStarted!: () => void;
+	const firstProofStarted = new Promise<void>((resolve) => {
+		markFirstProofStarted = resolve;
+	});
+	let releaseFirstProof!: () => void;
+	const firstProofGate = new Promise<void>((resolve) => {
+		releaseFirstProof = resolve;
+	});
+	fix.setRecentWriteFingerprintHook(async () => {
+		fingerprintCallCount++;
+		if (fingerprintCallCount !== 1) return;
+		markFirstProofStarted();
+		await firstProofGate;
+	});
+
+	const ingest = fix.ingestDiskFileNow("modify");
+	await firstProofStarted;
+	fix.controller.noteInterceptedExternalDiskMutation(final);
+	clearMarkdownDrainTimer(fix.controller);
+	releaseFirstProof();
+	await ingest;
+
+	assertEq(fingerprintCallCount, 1, "a pending distinct revision cancels speculative append replay");
+	assertEq(fix.ytext.toString(), physicalSelfWrite, "unproven revisions never reach Y.Text");
+	assertEq(fix.getCurrentDiskContent(), physicalSelfWrite, "unproven revisions never overwrite disk");
+	assert(
+		Array.from(fix.getCreatedFiles().values()).includes(intermediateAppend),
+		"the superseded intermediate revision is preserved",
+	);
+	assert(
+		Array.from(fix.getCreatedFiles().values()).includes(finalAppend),
+		"the final revision is also preserved instead of borrowing the older proof",
+	);
+	assertEq(fix.getCreatedFiles().size, 2, "each distinct raw revision has one safety copy");
+	assert(
+		!getInterceptedCandidates(fix.controller).has(fix.path),
+		"the newest candidate retires only after durable preservation",
+	);
+	clearMarkdownDrainTimer(fix.controller);
+	fix.controller.reset();
+	fix.doc.destroy();
+}
+
+console.log("\n--- Test 5c1a2b: full reconcile cannot preempt queued append recovery ---");
+{
+	const physicalSelfWrite = "# log\neditor-before-full-scan\n";
+	const externalAppend = `${physicalSelfWrite}quickadd-before-full-scan\n`;
+	const fix = buildFixture({
+		path: "Notes/open-external-full-reconcile-preemption.md",
+		disk: physicalSelfWrite,
+		editor: physicalSelfWrite,
+		crdt: physicalSelfWrite,
+	});
+	fix.setBaselineContent(physicalSelfWrite);
+	fix.setRecentWriteFingerprintMatches(true);
+	const candidate = makeInterceptedCandidate(fix.path, externalAppend, 45, {
+		editorAuthorityLineage: captureFixtureExternalEditorLineage(fix),
+		observedAt: 45_000,
+	});
+	fix.controller.noteInterceptedExternalDiskMutation(candidate);
+	clearMarkdownDrainTimer(fix.controller);
+
+	await fix.controller.runReconciliation("authoritative");
+	clearMarkdownDrainTimer(fix.controller);
+
+	assertEq(
+		fix.getCreatedFiles().size,
+		0,
+		"full reconcile does not preserve the recoverable append as superseded",
+	);
+	assert(
+		getInterceptedCandidates(fix.controller).get(fix.path) === candidate,
+		"full reconcile retains the exact append for the path-scoped dirty lane",
+	);
+	assertEq(
+		fix.ytext.toString(),
+		physicalSelfWrite,
+		"full reconcile performs no speculative append replay",
+	);
+	assert(
+		fix.traces.some((trace) =>
+			trace.msg === "open-external-append-recovery-deferred-to-dirty-ingest" &&
+			trace.details?.sequence === candidate.sequence
+		),
+		"full reconcile records the bounded handoff to existing dirty ingest",
+	);
+
+	await fix.ingestDiskFileNow("modify");
+
+	assertEq(
+		fix.ytext.toString(),
+		externalAppend,
+		"the canonical dirty lane revalidates and applies the retained append",
+	);
+	assertEq(
+		fix.getCurrentDiskContent(),
+		externalAppend,
+		"the canonical dirty lane settles the append to physical disk",
+	);
+	assertEq(
+		fix.getCreatedFiles().size,
+		0,
+		"full-scan preemption fix creates no conflict artifact after settlement",
 	);
 	clearMarkdownDrainTimer(fix.controller);
 	fix.controller.reset();

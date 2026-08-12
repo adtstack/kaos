@@ -228,6 +228,8 @@ const suites = [
 	[JITI, "tests/fingerprint-quarantine-policy.ts"],
 	// Autophagy: Amplification quarantine policy
 	[JITI, "tests/amplification-quarantine-policy.ts"],
+	// Public local text-mutation API (CRDT-routed writes)
+	[JITI, "tests/local-text-mutation.ts"],
 ];
 
 let totalPassed = 0;
