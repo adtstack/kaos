@@ -5335,6 +5335,146 @@ console.log("\n--- Test 5f4d: delayed older revision is preserved without changi
 	fix.doc.destroy();
 }
 
+console.log("\n--- Test 5f4d1: superseded revision equal to the durable baseline is skipped without an artifact ---");
+{
+	// Regression for the 2026-08-13 checkbox incident: a stale out-of-order disk
+	// read carrying the pre-edit bytes (v0) was preserved as a `(KAOS conflict -
+	// disk ...)` artifact even though those exact bytes were already the durable
+	// baseline. Preservation must skip revisions that hash to the disk-index
+	// contentHash — an artifact for them adds zero recoverable information.
+	const baseline = "base\n";
+	const latest = "latest external\n";
+	const fix = buildFixture({
+		path: "Notes/intercepted-superseded-baseline-skip.md",
+		disk: latest,
+		editor: baseline,
+		crdt: baseline,
+	});
+	fix.setBaselineContent(baseline);
+	const baselineBefore = fix.getDiskIndexContentHash();
+	fix.controller.noteInterceptedExternalDiskMutation(
+		makeInterceptedCandidate(fix.path, latest, 12),
+	);
+	clearMarkdownDrainTimer(fix.controller);
+	fix.controller.noteInterceptedExternalDiskMutation(
+		makeInterceptedCandidate(fix.path, baseline, 11),
+	);
+	await waitForAsyncCondition(
+		() => getPendingSupersededCandidates(fix.controller).length === 0,
+		"baseline-equal superseded candidate to retire without preservation",
+	);
+
+	assertEq(fix.getCreatedFiles().size, 0, "baseline-equal revision creates no conflict artifact");
+	assert(
+		fix.traces.some(
+			(trace) =>
+				trace.msg === "superseded-external-revision-baseline-skipped" &&
+				trace.details?.path === fix.path &&
+				trace.details?.sequence === 11,
+		),
+		"baseline skip is traced with the exact candidate sequence",
+	);
+	assertEq(fix.ytext.toString(), baseline, "baseline skip never mutates Y.Text");
+	assertEq(fix.getCurrentDiskContent(), latest, "baseline skip never mutates primary disk");
+	assertEq(fix.getDiskIndexContentHash(), baselineBefore, "baseline skip never advances baseline");
+	assertEq(
+		getInterceptedCandidates(fix.controller).get(fix.path)?.sequence,
+		12,
+		"newer candidate remains retained for reconciliation",
+	);
+	fix.controller.reset();
+	fix.doc.destroy();
+}
+
+console.log("\n--- Test 5f4d2: superseded revision differing from the baseline is still preserved ---");
+{
+	// Fail-closed contrast for 5f4d1: only the exact durable-baseline bytes are
+	// skippable. Any other distinct superseded revision must still become a
+	// conflict artifact, and the skip trace must not fire.
+	const baseline = "base\n";
+	const latest = "latest external\n";
+	const older = "older external\r\n";
+	const fix = buildFixture({
+		path: "Notes/intercepted-superseded-baseline-preserve.md",
+		disk: latest,
+		editor: baseline,
+		crdt: baseline,
+	});
+	fix.setBaselineContent(baseline);
+	const baselineBefore = fix.getDiskIndexContentHash();
+	fix.controller.noteInterceptedExternalDiskMutation(
+		makeInterceptedCandidate(fix.path, latest, 12),
+	);
+	clearMarkdownDrainTimer(fix.controller);
+	fix.controller.noteInterceptedExternalDiskMutation(
+		makeInterceptedCandidate(fix.path, older, 11),
+	);
+	await waitForAsyncCondition(
+		() => getPendingSupersededCandidates(fix.controller).length === 0,
+		"non-baseline superseded candidate to be durably preserved",
+	);
+
+	assertEq(fix.getCreatedFiles().size, 1, "non-baseline revision is still preserved exactly once");
+	assert(
+		Array.from(fix.getCreatedFiles().values()).includes(older),
+		"the preserved artifact holds the exact non-baseline bytes",
+	);
+	assertEq(
+		fix.traces.some((trace) => trace.msg === "superseded-external-revision-baseline-skipped"),
+		false,
+		"non-baseline revision never emits the baseline-skip trace",
+	);
+	assertEq(fix.ytext.toString(), baseline, "preservation never mutates Y.Text");
+	assertEq(fix.getCurrentDiskContent(), latest, "preservation never mutates primary disk");
+	assertEq(fix.getDiskIndexContentHash(), baselineBefore, "preservation never advances baseline");
+	assertEq(
+		getInterceptedCandidates(fix.controller).get(fix.path)?.sequence,
+		12,
+		"newer candidate remains retained for reconciliation",
+	);
+	fix.controller.reset();
+	fix.doc.destroy();
+}
+
+console.log("\n--- Test 5f4d3: missing baseline hash keeps fail-closed preservation ---");
+{
+	// The skip guard must be inert when the disk index has no hash for the path:
+	// inability to prove redundancy is not proof of cleanliness.
+	const latest = "latest external\n";
+	const older = "older external\r\n";
+	const fix = buildFixture({
+		path: "Notes/intercepted-superseded-no-baseline.md",
+		disk: latest,
+		editor: "base\n",
+		crdt: "base\n",
+	});
+	fix.clearDiskIndex();
+	fix.controller.noteInterceptedExternalDiskMutation(
+		makeInterceptedCandidate(fix.path, latest, 12),
+	);
+	clearMarkdownDrainTimer(fix.controller);
+	fix.controller.noteInterceptedExternalDiskMutation(
+		makeInterceptedCandidate(fix.path, older, 11),
+	);
+	await waitForAsyncCondition(
+		() => getPendingSupersededCandidates(fix.controller).length === 0,
+		"superseded candidate with missing baseline to be preserved",
+	);
+
+	assertEq(fix.getCreatedFiles().size, 1, "missing baseline keeps fail-closed preservation");
+	assert(
+		Array.from(fix.getCreatedFiles().values()).includes(older),
+		"the preserved artifact holds the exact distinct bytes",
+	);
+	assertEq(
+		fix.traces.some((trace) => trace.msg === "superseded-external-revision-baseline-skipped"),
+		false,
+		"missing baseline never emits the baseline-skip trace",
+	);
+	fix.controller.reset();
+	fix.doc.destroy();
+}
+
 console.log("\n--- Test 5f4e: reset, rename, and delete invalidation clear candidates ---");
 {
 	const fix = buildFixture({
