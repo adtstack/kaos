@@ -15,8 +15,10 @@ conflict handling, attachment transfer, or the mobile lifecycle:
       real-device topology (three devices when multi-device behavior changed).
 - [ ] I linked evidence that background/foreground or network restoration
       reconnects without a plugin reload when reconnect or lifecycle code changed.
-- [ ] I linked real-device evidence that the competing version is preserved and
-      conflict artifacts remain local-only when conflict handling changed.
+- [ ] I linked real-device evidence that competing versions survive conflict
+      handling changes (CRDT merge / server journal+snapshots / disk-index
+      baseline / git recovery layer; discarded revisions reach the server
+      audit log; no editor rollback occurs).
 - [ ] I linked bounded soak or stress evidence when retry, timer, queue, or
       backoff behavior changed.
 - [ ] The Verification section records device/OS, Obsidian, plugin, and server

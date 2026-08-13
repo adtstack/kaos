@@ -22,7 +22,7 @@ import { handleSnapshotRoute } from "./routes/snapshots";
 import { handleRecoveryContentRoute, handleRecoverySnapshotRoute } from "./routes/recoverySnapshots";
 import { handleSyncSocketRoute, parseSyncPath } from "./routes/syncSocket";
 import { handleTicketRoute } from "./routes/ticket";
-import { fetchVaultDebug, fetchVaultDocument, recordVaultTrace } from "./routes/trace";
+import { fetchVaultDebug, fetchVaultDocument, handleVaultTraceRoute, recordVaultTrace } from "./routes/trace";
 import type { AuthState, AuthStateCached, Env } from "./routes/types";
 
 const LOG_PREFIX = "[kaos-sync:worker]";
@@ -56,7 +56,7 @@ type WorkerRoute =
  * The complete set of vault sub-resources the server actually handles.
  * Anything outside this set returns not-found before auth — zero DO access.
  */
-const VALID_VAULT_RESOURCES = new Set(["auth", "debug", "blobs", "snapshots", "recovery-snapshots", "recovery-content"]);
+const VALID_VAULT_RESOURCES = new Set(["auth", "debug", "trace", "blobs", "snapshots", "recovery-snapshots", "recovery-content"]);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SECURITY / BILLING INVARIANT — route classifier duplication is intentional
@@ -135,6 +135,7 @@ function isKnownRecoverySnapshotRouteShape(method: string, rest: string[]): bool
  * Valid shapes are derived directly from the route handlers in routes/:
  *   auth:      POST /auth/ticket
  *   debug:     GET  /debug/recent
+ *   trace:     POST /trace
  *   blobs:     GET|PUT /blobs/:hash,  POST /blobs/exists
  *              (GET|PUT /blobs/exists are structurally valid — the blob handler
  *               treats "exists" as a hash and rejects/misses it after auth,
@@ -150,6 +151,9 @@ function isKnownVaultRouteShape(method: string, resource: string, rest: string[]
 
 		case "debug":
 			return method === "GET" && rest.length === 1 && rest[0] === "recent";
+
+		case "trace":
+			return method === "POST" && rest.length === 0;
 
 		case "blobs": {
 			if (rest.length !== 1) return false;
@@ -473,6 +477,8 @@ const worker = {
 				response = withCors(authFailure);
 			} else if (resource === "debug" && req.method === "GET" && rest[0] === "recent") {
 				response = withCors(await fetchVaultDebug(env, vaultId));
+			} else if (resource === "trace" && req.method === "POST" && rest.length === 0) {
+				response = withCors(await handleVaultTraceRoute(env, vaultId, req, json));
 			} else if (resource === "auth" && rest[0] === "ticket" && req.method === "POST") {
 				response = withCors(await handleTicketRoute(req, authState, vaultId, json, env));
 			} else if (resource === "blobs") {

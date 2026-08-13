@@ -1,6 +1,9 @@
 import {
+	appendAuditTraceEntry,
 	appendTraceEntry,
+	DEFAULT_AUDIT_MAX_ENTRIES,
 	DEFAULT_TRACE_RATE_LIMIT_PER_WINDOW,
+	listAuditTraceEntries,
 	listRecentTraceEntries,
 	MAX_TRACE_ENTRY_BYTES,
 	prepareTraceEntryForStorage,
@@ -187,6 +190,48 @@ console.log("\n--- Test 7: default budget is the documented per-room rate ---");
 		DEFAULT_TRACE_RATE_LIMIT_PER_WINDOW === 600,
 		"default per-window cap matches sync-invariants.md draft target (600 events / 60s)",
 	);
+}
+
+console.log("\n--- Test 9: audit list persists discards beyond the debug ring bound ---");
+{
+	const storage = new FakeStorage();
+	const auditEntries = new Map<number, TraceEntry>();
+	for (let i = 0; i < DEFAULT_AUDIT_MAX_ENTRIES + 50; i++) {
+		const entry = makeEntry(i);
+		await appendAuditTraceEntry(storage, entry);
+		auditEntries.set(i, entry);
+	}
+
+	const auditKeys = [...storage.data.keys()].filter((key) => key.startsWith("audit:"));
+	assert(
+		auditKeys.length === DEFAULT_AUDIT_MAX_ENTRIES,
+		"audit list retains exactly the newest bounded entries",
+	);
+	assert(
+		auditKeys.every((key) => key.startsWith("audit:")),
+		"audit entries use the audit: key prefix, separate from the debug ring",
+	);
+
+	const listed = await listAuditTraceEntries(storage, DEFAULT_AUDIT_MAX_ENTRIES);
+	assert(listed.length === DEFAULT_AUDIT_MAX_ENTRIES, "listAuditTraceEntries returns the bounded list");
+	assert((listed[0] as { seq?: unknown }).seq === DEFAULT_AUDIT_MAX_ENTRIES + 49, "newest audit entry is first");
+	assert(
+		(listed.at(-1) as { seq?: unknown })?.seq === 50,
+		"oldest retained audit entry is the newest-bounded one (50th of 1050)",
+	);
+}
+
+console.log("\n--- Test 10: audit list does not evict the debug ring and vice versa ---");
+{
+	const storage = new FakeStorage();
+	await appendTraceEntry(storage, makeEntry(1), 100);
+	await appendAuditTraceEntry(storage, makeEntry(2));
+	await appendTraceEntry(storage, makeEntry(3), 100);
+
+	const traceKeys = [...storage.data.keys()].filter((key) => key.startsWith("trace:"));
+	const auditKeys = [...storage.data.keys()].filter((key) => key.startsWith("audit:"));
+	assert(traceKeys.length === 2, "debug ring keeps its entries when audit entries are appended");
+	assert(auditKeys.length === 1, "audit list keeps its entries when debug ring entries are appended");
 }
 
 console.log("\n--- Test 8: throttle-summary bypasses the limiter and does not recurse ---");

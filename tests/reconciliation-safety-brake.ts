@@ -30,10 +30,10 @@ function makeTFile(path: string): TFile {
 	return file;
 }
 
-console.log("\n--- Test 1: updateIndex removes blocked paths from the index ---");
+console.log("\n--- Test 1: updateIndex carries excluded paths forward unchanged ---");
 {
 	const index: DiskIndex = {
-		"blocked.md": { mtime: 1, size: 1 },
+		"blocked.md": { mtime: 1, size: 1, contentHash: "hash-blocked" },
 		"clean.md": { mtime: 1, size: 1 },
 	};
 	const stats = new Map<string, { mtime: number; size: number }>([
@@ -43,22 +43,28 @@ console.log("\n--- Test 1: updateIndex removes blocked paths from the index ---"
 	]);
 
 	const next = updateIndex(index, stats, { excludePaths: ["blocked.md"] });
-	assert(!("blocked.md" in next), "blocked path is unindexed, not preserved");
+	// "Excluded from advancement" preserves the durable baseline entry — dropping
+	// it would erase the baseline for an open-editor/preserved path and amplify
+	// conservative behavior on the next reconcile.
+	assert("blocked.md" in next, "blocked path is carried forward, not dropped");
+	assert(next["blocked.md"].mtime === 1 && next["blocked.md"].contentHash === "hash-blocked", "blocked path keeps its previous entry unchanged");
 	assert(next["clean.md"].mtime === 2, "unblocked path advances mtime");
 	assert(next["new.md"].mtime === 2, "new unblocked path is indexed");
 }
 
-console.log("\n--- Test 2: same-stat excluded paths are still unindexed ---");
+console.log("\n--- Test 2: excluded paths with no previous entry stay unindexed ---");
 {
 	const index: DiskIndex = {
-		"blocked.md": { mtime: 1, size: 1 },
+		"blocked.md": { mtime: 1, size: 1, contentHash: "hash-blocked" },
 	};
 	const stats = new Map<string, { mtime: number; size: number }>([
 		["blocked.md", { mtime: 1, size: 1 }],
+		["never-indexed.md", { mtime: 1, size: 1 }],
 	]);
 
-	const next = updateIndex(index, stats, { excludePaths: ["blocked.md"] });
-	assert(!("blocked.md" in next), "same-stat blocked path is removed from index");
+	const next = updateIndex(index, stats, { excludePaths: ["blocked.md", "never-indexed.md"] });
+	assert(next["blocked.md"]?.mtime === 1, "same-stat blocked path is carried forward");
+	assert(!("never-indexed.md" in next), "excluded path without a previous entry stays unindexed");
 }
 
 console.log("\n--- Test 2b: clean equal disk/CRDT paths get a settled baseline ---");
@@ -539,8 +545,7 @@ console.log("\n--- Test 2c: fenced disk conflict winner settles its baseline imm
 	await controller.runReconciliation("authoritative");
 
 	assert(ytext.toString() === diskContent, "first pass applies disk winner to CRDT");
-	assert(createdFiles.size === 1, "first pass preserves the losing CRDT side");
-	assert(Array.from(createdFiles.values())[0] === crdtContent, "conflict artifact contains the losing CRDT content");
+	assert(createdFiles.size === 0, "first pass creates no conflict artifact");
 	const expectedDiskHash = await contentBaselineHash(diskContent);
 	const baselineHash = diskIndex[path]?.contentHash;
 	assert(
@@ -571,8 +576,9 @@ console.log("\n--- Test 2c1: closed-file stale decision cannot overwrite a newer
 		[path, { mtime: 2, size: diskContent.length }],
 	]);
 	const createdFiles = new Map<string, string>();
+	const discarded: string[] = [];
 	const traces: Array<{ msg: string; details?: Record<string, unknown> }> = [];
-	let providerAdvancedDuringArtifactWrite = false;
+	let providerAdvancedDuringDiscardRecord = false;
 
 	const app = {
 		vault: {
@@ -587,13 +593,6 @@ console.log("\n--- Test 2c1: closed-file stale decision cannot overwrite a newer
 			create: async (createdPath: string, content: string) => {
 				if (createdFiles.has(createdPath)) throw new Error("exists");
 				createdFiles.set(createdPath, content);
-				if (!providerAdvancedDuringArtifactWrite && content === capturedCrdtContent) {
-					providerAdvancedDuringArtifactWrite = true;
-					doc.transact(() => {
-						ytext.delete(0, ytext.length);
-						ytext.insert(0, newestCrdtContent);
-					}, providerOrigin);
-				}
 			},
 			adapter: {
 				stat: async (candidate: string) => stats.get(candidate) ?? null,
@@ -642,6 +641,18 @@ console.log("\n--- Test 2c1: closed-file stale decision cannot overwrite a newer
 		getDiskIndex: () => diskIndex,
 		setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
 		getBaselineText: async (hash: string) => hash === baselineHash ? baselineContent : null,
+		recordDiscardedRevision: (_path, _contentHash, _reason) => {
+			discarded.push(_contentHash);
+			// The provider advances inside the async discard-record seam; the
+			// following compare-and-commit must see the newer CRDT and abort.
+			if (!providerAdvancedDuringDiscardRecord) {
+				providerAdvancedDuringDiscardRecord = true;
+				doc.transact(() => {
+					ytext.delete(0, ytext.length);
+					ytext.insert(0, newestCrdtContent);
+				}, providerOrigin);
+			}
+		},
 		isMarkdownPathSyncable: () => true,
 		shouldBlockFrontmatterIngest: () => false,
 		refreshServerCapabilities: async () => {},
@@ -660,17 +671,17 @@ console.log("\n--- Test 2c1: closed-file stale decision cannot overwrite a newer
 
 	await controller.runReconciliation("authoritative");
 
-	assert(providerAdvancedDuringArtifactWrite, "provider update lands inside the async decision window");
+	assert(providerAdvancedDuringDiscardRecord, "provider update lands inside the async discard-record window");
 	assert(ytext.toString() === newestCrdtContent, "newest provider content survives the stale disk decision");
+	assert(createdFiles.size === 0, "the stale decision creates no conflict artifacts");
 	assert(
-		Array.from(createdFiles.values()).includes(capturedCrdtContent),
-		"captured CRDT side is preserved before the race",
+		discarded.length >= 2,
+		"captured CRDT side and the disk snapshot are both recorded as discarded revisions",
 	);
 	assert(
-		Array.from(createdFiles.values()).includes(diskContent),
-		"disk snapshot is preserved after the stale decision is rejected",
+		path in diskIndex && diskIndex[path]?.contentHash === baselineHash,
+		"stale decision path carries its previous durable baseline entry forward",
 	);
-	assert(!(path in diskIndex), "stale decision path is excluded from the settled disk index");
 	assert(
 		traces.some((trace) =>
 			trace.msg === "closed-file-mutation-ticket-stale" &&
@@ -785,10 +796,9 @@ console.log("\n--- Test 2c2: pending local create wins missing-baseline reconcil
 
 	await controller.runReconciliation("authoritative");
 
-	const artifactContent = Array.from(createdFiles.values())[0];
 	assert(ytext.toString() === diskContent, "pending create imports disk content to CRDT");
 	assert(flushed.length === 0, "pending create does not flush stale CRDT to disk");
-	assert(artifactContent === crdtContent, "stale CRDT side is preserved as a conflict artifact");
+	assert(createdFiles.size === 0, "pending create records the stale CRDT side without a conflict artifact");
 	assert(
 		decisions.some((decision) =>
 			decision.reason === "missing-baseline" &&
@@ -915,13 +925,8 @@ console.log("\n--- Test 2d: startup open editor content wins before binding can 
 
 	await controller.runReconciliation("authoritative");
 
-	const artifactPath = Array.from(createdFiles.keys()).find((candidate) =>
-		candidate.startsWith("open-reenable (KAOS conflict - crdt from Device ") &&
-		candidate.endsWith(".md")
-	);
 	assert(ytext.toString() === editorContent, "open editor content is applied to CRDT before binding");
-	assert(!!artifactPath, "remote CRDT content is preserved as a conflict artifact");
-	assert(artifactPath ? createdFiles.get(artifactPath) === crdtContent : false, "conflict artifact contains remote CRDT content");
+	assert(createdFiles.size === 0, "startup editor-wins creates no conflict artifact");
 	assert(flushed.length === 0, "open editor reconcile does not write remote CRDT over disk");
 	assert(
 		transactionOrigins.includes(ORIGIN_DISK_SYNC_RECOVER_BOUND),
@@ -1272,12 +1277,9 @@ console.log("\n--- Test 2e: recent startup typing defers open editor conflict cr
 	internals.lastReconcileTime = 0;
 	await controller.runReconciliation("authoritative");
 
-	const crdtArtifact = Array.from(createdFiles.entries()).find(([candidate]) =>
-		candidate.includes("KAOS conflict - crdt")
-	);
 	assert(ytext.toString() === editorContent, "close/autosave converges CRDT to captured editor E");
 	assert(diskContent === editorContent, "close/autosave leaves captured editor E on the original disk path");
-	assert(crdtArtifact?.[1] === crdtContent, "competing CRDT C is preserved as an artifact");
+	assert(createdFiles.size === 0, "competing CRDT C creates no conflict artifact");
 	assert(
 		diskIndex[path]?.contentHash === await contentBaselineHash(editorContent),
 		"E becomes the durable settled baseline after close",
@@ -1433,11 +1435,8 @@ console.log("\n--- Test 2f: startup editor ahead of disk and CRDT defers without
 	internals.lastReconcileTime = 0;
 	await controller.runReconciliation("authoritative");
 
-	const crdtArtifact = Array.from(createdFiles.entries()).find(([candidate]) =>
-		candidate.includes("KAOS conflict - crdt")
-	);
 	assert(ytext.toString() === editorContent, "no-timestamp close/autosave keeps captured editor E");
-	assert(crdtArtifact?.[1] === crdtContent, "no-timestamp close preserves competing CRDT C");
+	assert(createdFiles.size === 0, "no-timestamp close creates no conflict artifact");
 	assert(
 		!internals.visibleAuthorityDeferredPaths.has(path),
 		"no-timestamp marker clears after exact E convergence",
@@ -1532,7 +1531,10 @@ console.log("\n--- Test 3: reconciliation safety brake leaves blocked overwrites
 	assert(flushed.length === 0, "safety brake blocks destructive update flushes");
 	assert(saveDiskIndexCalls === 1, "disk index save is still attempted");
 	for (const path of paths) {
-		assert(!(path in diskIndex), `blocked path is unindexed: ${path}`);
+		assert(
+			path in diskIndex && diskIndex[path]?.mtime === 1,
+			`blocked path keeps its previous durable baseline entry: ${path}`,
+		);
 	}
 	assert(
 		traces.some((event) =>
@@ -1869,25 +1871,17 @@ console.log("\n--- Test 6: bound ambiguous divergence creates a conflict artifac
 
 	await (controller as any).syncFileFromDisk(file, "modify");
 
-	const createdPath = Array.from(createdFiles.keys()).find((candidate) =>
-		candidate.startsWith("ambiguous (KAOS conflict - crdt from Test Device ") &&
-		candidate.endsWith(".md")
-	);
-	const diskCreatedPath = Array.from(createdFiles.keys()).find((candidate) =>
-		candidate.startsWith("ambiguous (KAOS conflict - disk from Test Device ") &&
-		candidate.endsWith(".md")
-	);
-	const neededTrace = traces.find((event) => event.msg === "conflict-artifact-needed");
-	assert(ytext.toString() === editorContent, "ambiguous path converges CRDT to visible editor content after artifact creation");
-	assert(!!createdPath, "ambiguous divergence creates a CRDT conflict note");
-	assert(createdPath ? createdFiles.get(createdPath) === crdtContent : false, "conflict note preserves competing CRDT content");
-	assert(!!diskCreatedPath, "true three-way divergence creates a disk conflict note");
-	assert(diskCreatedPath ? createdFiles.get(diskCreatedPath) === diskContent : false, "disk conflict note preserves disk content");
-	assert(neededTrace?.details?.conflictArtifactCreated === true, "conflict-needed trace reports artifact creation");
-	assert(neededTrace?.details?.convergenceApplied === true, "conflict-needed trace reports convergence applied");
+	assert(ytext.toString() === editorContent, "ambiguous path converges CRDT to visible editor content");
+	assert(createdFiles.size === 0, "ambiguous divergence creates no conflict artifact");
+	const discardTrace = traces.find((event) => event.msg === "conflict-revision-discarded");
 	assert(
-		traces.some((event) => event.msg === "conflict-artifact-created"),
-		"conflict artifact creation is traced",
+		discardTrace?.details?.reason === "bound-file-ambiguous-divergence",
+		"ambiguous divergence records the competing sides as discarded revisions",
+	);
+	assert(
+		discardTrace?.details?.chosenSource === "editor" &&
+		discardTrace.details?.convergenceApplied === true,
+		"conflict-revision-discarded trace reports editor authority and convergence",
 	);
 	doc.destroy();
 }
@@ -2227,78 +2221,22 @@ console.log("\n--- Test 9: convergence failure does not create infinite conflict
 		log: () => {},
 	});
 
-	// First call: creates artifact, convergence fails because getTextForPath returns null
+	// First call: convergence fails because getTextForPath returns null on the
+	// convergence re-lookup. No artifact is ever written.
 	await (controller as any).syncFileFromDisk(file, "modify");
-	assert(createdFiles.size === 2, "first pass creates CRDT and disk conflict artifacts");
+	assert(createdFiles.size === 0, "first pass creates no conflict artifacts");
 
-	const firstTraces = traces.filter((t) => t.msg === "conflict-artifact-needed");
-	assert(firstTraces.length === 1, "first pass traces conflict-artifact-needed");
-	assert(firstTraces[0]?.details?.conflictArtifactCreated === true, "first pass artifact was created");
-	// convergenceApplied is false because getTextForPath returned null for the convergence call
-	assert(firstTraces[0]?.details?.convergenceApplied === false, "first pass convergence was not applied");
+	const firstTraces = traces.filter((t) => t.msg === "conflict-revision-discarded");
+	assert(firstTraces.length >= 1, "first pass records the discarded revisions");
 
-	// Second call with same divergence: dedupe prevents second artifact
+	// Second call with the same divergence: still no artifacts — the infinite
+	// artifact loop is structurally impossible without artifact creation.
 	await (controller as any).syncFileFromDisk(file, "modify");
-	assert(createdFiles.size === 2, "second pass does NOT create more conflict artifacts (dedupe)");
+	assert(createdFiles.size === 0, "repeated pass still creates no conflict artifacts");
 
-	const secondTraces = traces.filter((t) => t.msg === "conflict-artifact-needed");
-	assert(secondTraces.length === 2, "second pass still traces conflict-artifact-needed");
-	assert(secondTraces[1]?.details?.conflictSkippedDedupe === true, "second pass reports dedupe skip");
-
-	let restartGetTextForPathCallCount = 0;
-	const restartVaultSync = {
-		getTextForPath: () => {
-			restartGetTextForPathCallCount++;
-			if (restartGetTextForPathCallCount % 2 === 1) return ytext;
-			return null;
-		},
-	};
-	const restartedController = new ReconciliationController({
-		app: app as any,
-		getSettings: () => ({ deviceName: "Test Device" }) as any,
-		getRuntimeConfig: () => ({
-			maxFileSizeBytes: 0,
-			maxFileSizeKB: 0,
-			excludePatterns: [],
-		}) as any,
-		getVaultSync: () => restartVaultSync as any,
-		getDiskMirror: () => null,
-		getBlobSync: () => null,
-		getEditorBindings: () => editorBindings as any,
-		getDiskIndex: () => diskIndex,
-		setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
-		isMarkdownPathSyncable: () => true,
-		shouldBlockFrontmatterIngest: () => false,
-		refreshServerCapabilities: async () => {},
-		validateOpenEditorBindings: () => {},
-		onReconciled: () => {},
-		getAwaitingFirstProviderSyncAfterStartup: () => false,
-		setAwaitingFirstProviderSyncAfterStartup: () => {},
-		saveDiskIndex: async () => {},
-		refreshStatusBar: () => {},
-		trace: (source: string, msg: string, details?: Record<string, unknown>) => {
-			traces.push({ source, msg, details });
-		},
-		scheduleTraceStateSnapshot: () => {},
-		log: () => {},
-	});
-
-	await (restartedController as any).syncFileFromDisk(file, "modify");
-	assert(createdFiles.size === 2, "restart pass reuses existing conflict artifacts");
-
-	const restartTrace = traces.filter((t) => t.msg === "conflict-artifact-needed").at(-1);
-	assert(restartTrace?.details?.conflictSkippedDedupe === true, "restart pass reports durable artifact dedupe");
-	assert(restartTrace?.details?.conflictDedupeScope === "artifact", "restart dedupe scope is artifact");
-	assert(restartTrace?.details?.conflictArtifactCreated === false, "restart pass does not report a fresh artifact");
-
-	// The deliberately stale convergence requeues a deferred dirty entry on both
-	// controllers. Dispose their markdown-drain timers so this isolated suite
-	// proves the retry behavior without retaining a live Node handle.
 	controller.reset();
-	restartedController.reset();
 	doc.destroy();
 }
-
 console.log("\n--- Test 10: second reconcile after successful convergence does not create duplicate artifact ---");
 {
 	const path = "already-converged.md";
@@ -2387,21 +2325,18 @@ console.log("\n--- Test 10: second reconcile after successful convergence does n
 		log: () => {},
 	});
 
-	// First call: artifact created, convergence succeeds
+	// First call: ambiguous divergence converges CRDT to the editor winner
 	await (controller as any).syncFileFromDisk(file, "modify");
-	assert(createdFiles.size === 2, "first pass creates CRDT and disk conflict artifacts");
+	assert(createdFiles.size === 0, "first pass creates no conflict artifacts");
 	assert(ytext.toString() === editorContent, "first pass converges CRDT to editor");
 
-	// Second call: CRDT already matches disk, so it exits early via the
-	// crdtContent === content check in syncFileFromDisk. No second artifact.
-	// Reset CRDT to create ambiguity again and verify dedupe is cleared after convergence
+	// Second call: CRDT already matches the editor, so it exits early via the
+	// crdtContent === content check in syncFileFromDisk. Reset CRDT to create
+	// ambiguity again; a genuinely new divergence still creates no artifacts.
 	ytext.delete(0, ytext.length);
 	ytext.insert(0, "new-crdt-version");
 	await (controller as any).syncFileFromDisk(file, "modify");
-
-	// This is a genuinely new divergence (different CRDT content), so a
-	// new artifact should be created.
-	assert(createdFiles.size === 4, "genuinely new divergence creates new CRDT and disk conflict artifacts");
+	assert(createdFiles.size === 0, "genuinely new divergence creates no conflict artifacts");
 
 	doc.destroy();
 }
@@ -2490,14 +2425,16 @@ console.log("\n--- Test 11: artifact creation failure does NOT trigger convergen
 
 	await (controller as any).syncFileFromDisk(file, "modify");
 
-	// CRDT must be UNTOUCHED — still contains original content
-	assert(ytext.toString() === crdtContent, "CRDT is untouched after artifact creation failure");
+	// With artifact preservation abolished there is no artifact I/O to fail:
+	// the ambiguous divergence converges CRDT to the visible editor content.
+	assert(ytext.toString() === editorContent, "ambiguous divergence converges CRDT to the editor winner");
 
-	const conflictTraces = traces.filter((t) => t.msg === "conflict-artifact-needed");
-	assert(conflictTraces.length === 1, "traces conflict-artifact-needed");
-	assert(conflictTraces[0]?.details?.conflictArtifactCreated === false, "conflictArtifactCreated is false");
-	assert(conflictTraces[0]?.details?.convergenceApplied === false, "convergenceApplied is false");
-	assert(conflictTraces[0]?.details?.error === "disk full", "error message is captured");
+	const discardTraces = traces.filter((t) => t.msg === "conflict-revision-discarded");
+	assert(discardTraces.length === 1, "traces conflict-revision-discarded");
+	assert(
+		discardTraces[0]?.details?.convergenceApplied === true,
+		"conflict-revision-discarded reports convergence applied",
+	);
 
 	doc.destroy();
 }

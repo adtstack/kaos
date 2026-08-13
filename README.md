@@ -75,7 +75,10 @@ After pairing, Markdown and `.base` files begin syncing through the shared vault
 8. Daily and on-demand snapshots provide a recovery path outside the live CRDT.
 
 External changes to open notes merge automatically when edits do not overlap.
-Overlapping edits are preserved as a local conflict note for review.
+Overlapping or ambiguous edits never clobber the open editor: the editor
+stays authoritative, the losing revision is recorded to the server audit log
+(hashed path + content hash + reason), and the CRDT journal/snapshots, the
+durable disk-index baseline, and git remain the recovery layer.
 
 ## Attachments and Snapshots
 

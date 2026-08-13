@@ -327,10 +327,10 @@ async function runSameLineConflict(
 	if (edited !== local) throw new Error(`same-line local body mismatch: ${JSON.stringify(edited)}`);
 	await waitForEditorAuthority(client, "same-line local authority", local);
 	await client.writeNodeFile(vaultPath, TARGET, rawExternal);
-	const state = await waitForConvergence(client, "same-line conflict settlement", local, 1);
-	if (state.artifacts[0]?.content !== rawExternal) {
+	const state = await waitForConvergence(client, "same-line conflict settlement", local);
+	if (state.artifacts.length !== 0) {
 		throw new Error(
-			`same-line artifact did not preserve raw disk text: ${JSON.stringify(state.artifacts)}`,
+			`same-line conflict created unexpected artifacts (abolished in 1.12.0): ${JSON.stringify(state.artifacts)}`,
 		);
 	}
 	if (state.diskContent?.includes("<<<<<<<")) {
@@ -509,9 +509,9 @@ async function runKoreanPrefixConflict(
 	if (edited !== local) throw new Error(`Korean prefix local body mismatch: ${JSON.stringify(edited)}`);
 	await waitForEditorAuthority(client, "Korean prefix local authority", local);
 	await client.writeNodeFile(vaultPath, TARGET, rawExternal);
-	const state = await waitForConvergence(client, "Korean prefix conflict settlement", local, 1);
-	if (state.artifacts[0]?.content !== rawExternal) {
-		throw new Error(`Korean prefix artifact is not byte-exact: ${JSON.stringify(state.artifacts)}`);
+	const state = await waitForConvergence(client, "Korean prefix conflict settlement", local);
+	if (state.artifacts.length !== 0) {
+		throw new Error(`Korean prefix conflict created unexpected artifacts (abolished in 1.12.0): ${JSON.stringify(state.artifacts)}`);
 	}
 	if (state.diskContent?.includes("<<<<<<<")) throw new Error("Korean prefix primary contains conflict markers");
 	await assertConvergenceRemainsStable(client, "Korean prefix conflict", local, state);
@@ -529,9 +529,9 @@ async function runMoveDeleteConflict(
 	if (edited !== local) throw new Error(`move/delete local body mismatch: ${JSON.stringify(edited)}`);
 	await waitForEditorAuthority(client, "move/delete local authority", local);
 	await client.writeNodeFile(vaultPath, TARGET, rawExternal);
-	const state = await waitForConvergence(client, "move/delete conflict settlement", local, 1);
-	if (state.artifacts[0]?.content !== rawExternal) {
-		throw new Error(`move/delete artifact is not byte-exact: ${JSON.stringify(state.artifacts)}`);
+	const state = await waitForConvergence(client, "move/delete conflict settlement", local);
+	if (state.artifacts.length !== 0) {
+		throw new Error(`move/delete conflict created unexpected artifacts (abolished in 1.12.0): ${JSON.stringify(state.artifacts)}`);
 	}
 	if (state.diskContent?.includes("<<<<<<<")) throw new Error("move/delete primary contains conflict markers");
 	await assertConvergenceRemainsStable(client, "move/delete conflict", local, state);

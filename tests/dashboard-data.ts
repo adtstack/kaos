@@ -191,14 +191,14 @@ const baseInput: KaosDashboardCollectorInput = {
 		count: 2,
 	}],
 	diskIndex: {
-		"notes/a (KAOS conflict - disk from device-a 2026-06-23T14-20-40Z).md": {
-			mtime: 20,
-			size: 13,
+		"assets/img (KAOS remote conflict 2026-06-23T15-00-00Z).png": {
+			mtime: 21,
+			size: 101,
 			contentHash: "h1",
 		},
-		"notes/a.md": {
-			mtime: 10,
-			size: 12,
+		"assets/img.png": {
+			mtime: 11,
+			size: 100,
 			contentHash: "h2",
 		},
 	},
@@ -256,9 +256,11 @@ console.log("\n--- Test 1: true conflicts and attachment safety copies are separ
 {
 	const conflicts = collectDashboardConflictArtifacts(baseInput);
 	const safetyCopies = collectDashboardBlobSafetyCopies(baseInput);
-	assert(conflicts.length === 3, "three true conflict artifacts collected");
-	assert(conflicts[0]?.artifactPath.includes("2026-06-24T09-00-00Z") ?? false, "newest conflict first");
+	// Markdown conflict-artifact preservation is abolished; only blob conflicts
+	// (binary, no CRDT history) are collected.
+	assert(conflicts.length === 1, "one true blob conflict artifact collected");
 	assert(conflicts.some((item) => item.kind === "blob" && item.source === "remote"), "blob conflict included");
+	assert(!conflicts.some((item) => item.kind === "markdown"), "legacy markdown conflict artifacts are not collected");
 	assert(!conflicts.some((item) => item.source === "local"), "clean local backup is not counted as a conflict");
 	assert(safetyCopies.length === 2 && safetyCopies.every((item) => item.source === "local"), "local blob backups are collected separately");
 	assert(
@@ -375,12 +377,11 @@ console.log("\n--- Test 1e: only the exact active remote copy is actionable ---"
 console.log("\n--- Test 2: original existence and disk index flags are computed ---");
 {
 	const conflicts = collectDashboardConflictArtifacts(baseInput);
-	const a = conflicts.find((item) => item.artifactPath.includes("device-a"));
-	const b = conflicts.find((item) => item.artifactPath.includes("device-b"));
-	assert(a?.originalExists === true, "existing original detected");
-	assert(a?.artifactIndexed === true, "artifact disk index flag true");
-	assert(a?.originalIndexed === true, "original disk index flag true");
-	assert(b?.originalExists === false, "missing original detected");
+	const blob = conflicts.find((item) => item.artifactPath.includes(activeBlobArtifactPath));
+	assert(blob?.originalExists === true, "existing original detected");
+	assert(blob?.artifactIndexed === true, "artifact disk index flag true");
+	assert(blob?.originalIndexed === true, "original disk index flag true");
+	assert(blob?.blobResolution?.canKeepLocal === true, "active blob conflict exposes keep-local");
 }
 
 console.log("\n--- Test 3: attention aggregation includes all local attention types ---");

@@ -195,6 +195,8 @@ import { AttachmentOrchestrator } from "./runtime/attachmentOrchestrator";
 import { EditorWorkspaceOrchestrator } from "./runtime/editorWorkspaceOrchestrator";
 import { SetupLinkController } from "./runtime/setupLinkController";
 import { TraceRuntimeController } from "./runtime/traceRuntimeController";
+import { DiscardedRevisionAudit } from "./runtime/discardedRevisionAudit";
+import { obsidianRequest } from "./utils/http";
 import { applyLocalTextMutation, type LocalTextMutationResult } from "./runtime/localTextMutation";
 import { registerCommands } from "./commands";
 import {
@@ -312,6 +314,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private reconciliationController!: ReconciliationController;
 	private setupLinkController: SetupLinkController | null = null;
 	private traceRuntime: TraceRuntimeController | null = null;
+	/** Durable audit sink for discarded markdown revisions (server trace POST). */
+	private discardedRevisionAudit: DiscardedRevisionAudit | null = null;
 	/** Telemetry runtime handle — null until dynamically loaded. */
 	private lab: TelemetryRuntimeHandle | null = null;
 
@@ -462,6 +466,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private blobLocalPersistenceReady = false;
 	private blobProviderReady = false;
 	private createReconciliationController(): ReconciliationController {
+		this.discardedRevisionAudit = new DiscardedRevisionAudit({
+			getSettings: () => this.settings,
+			postJson: async (url, body) => {
+				try {
+					const res = await obsidianRequest({
+						url,
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+							Authorization: `Bearer ${this.settings.token}`,
+						},
+						body: JSON.stringify(body),
+					});
+					return { ok: res.status === 200 };
+				} catch {
+					return { ok: false };
+				}
+			},
+		});
 		this.reconciliationController = new ReconciliationController({
 			app: this.app,
 			getSettings: () => this.settings,
@@ -474,11 +497,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			setDiskIndex: (index) => this.replaceDiskIndex(index),
 			getBaselineText: (contentHash) => this.getBaselineText(contentHash),
 			recordBaselineText: (contentHash, text) => this.recordBaselineText(contentHash, text),
-			recordConflictMergeBase: (artifactPath, baseHash) => {
-				const previousHash = this.conflictMergeBases[artifactPath];
-				this.conflictMergeBases[artifactPath] = baseHash;
-				if (previousHash && previousHash !== baseHash) this.baselineTextDeleteCandidates.add(previousHash);
-			},
+			recordDiscardedRevision: (path, contentHash, reason) =>
+				this.discardedRevisionAudit?.record(path, contentHash, reason),
 			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
 			isRemoteProjectionAllowed: (path) =>
 				this.remoteProjectionPolicyGate.isRemoteProjectionAllowed(path),
@@ -5939,6 +5959,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.log(`trace runtime shutdown failed during unload: ${formatUnknown(err)}`);
 			});
 		}
+		const auditFlush = this.discardedRevisionAudit?.flushNow();
+		if (auditFlush) {
+			void auditFlush.catch((err) => {
+				console.error("[kaos] Failed to flush discarded-revision audit during unload:", err);
+			});
+		}
 		document.body.removeClass("vault-crdt-show-cursors");
 		// Remove plugin-owned debug global to prevent stale API references
 		// from confusing test harnesses after plugin reload.
@@ -6143,11 +6169,24 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				(entry): entry is PreservedUnresolvedEntry => {
 					if (typeof entry !== "object" || entry === null) return false;
 					const candidate = entry as unknown as Record<string, unknown>;
-					return typeof candidate.path === "string" &&
-						(candidate.kind === "markdown" || candidate.kind === "blob") &&
-						typeof candidate.reason === "string" &&
-						typeof candidate.firstSeenAt === "number" &&
-						typeof candidate.lastSeenAt === "number";
+					if (typeof candidate.path !== "string" ||
+						(candidate.kind !== "markdown" && candidate.kind !== "blob") ||
+						typeof candidate.reason !== "string" ||
+						typeof candidate.firstSeenAt !== "number" ||
+						typeof candidate.lastSeenAt !== "number") {
+						return false;
+					}
+					// Migration: markdown conflict-artifact preservation is abolished.
+					// Legacy limbo episodes that only existed to retry artifact I/O are
+					// dropped; every other reason (flush deferral, targeted-diff failure,
+					// path collision, remote-delete limbo, restore failure) stays.
+					if (candidate.kind === "markdown" && (
+						candidate.reason === "conflict-artifact-write-failed" ||
+						candidate.reason === "multiple-editor-authorities"
+					)) {
+						return false;
+					}
+					return true;
 				},
 			);
 		}

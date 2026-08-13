@@ -1,7 +1,10 @@
 const TRACE_KEY_PREFIX = "trace:";
+const AUDIT_KEY_PREFIX = "audit:";
 const TRACE_ELLIPSIS = "...";
 
 export const MAX_TRACE_ENTRY_BYTES = 16 * 1024;
+/** Cap for the durable revision-discard audit list (per vault room). */
+export const DEFAULT_AUDIT_MAX_ENTRIES = 1000;
 const MAX_TRACE_STRING_BYTES = 2048;
 const MAX_TRACE_ARRAY_ITEMS = 20;
 const MAX_TRACE_OBJECT_KEYS = 20;
@@ -233,17 +236,19 @@ export function createTraceKey(ts = Date.now()): string {
 	return `${TRACE_KEY_PREFIX}${paddedTimestamp(ts)}:${randomSuffix()}`;
 }
 
-export async function appendTraceEntry(
+/**
+ * Trim a bounded prefixed list down to its newest `maxEntries`. Used by both
+ * the debug ring (`trace:`) and the durable audit list (`audit:`).
+ */
+async function trimPrefixedEntries(
 	storage: TraceStorageLike,
-	entry: TraceEntry,
+	prefix: string,
 	maxEntries: number,
 ): Promise<void> {
-	const traceTs = Date.parse(entry.ts);
-	await storage.put(createTraceKey(Number.isFinite(traceTs) ? traceTs : Date.now()), entry);
 	if (maxEntries <= 0) return;
 
 	const recent = await storage.list<TraceEntry>({
-		prefix: TRACE_KEY_PREFIX,
+		prefix,
 		reverse: true,
 		limit: maxEntries + 1,
 	});
@@ -254,13 +259,56 @@ export async function appendTraceEntry(
 	if (!cutoffKey) return;
 
 	const older = await storage.list<TraceEntry>({
-		prefix: TRACE_KEY_PREFIX,
+		prefix,
 		end: cutoffKey,
 	});
 	const deleteKeys = [...older.keys(), cutoffKey];
 	if (deleteKeys.length > 0) {
 		await storage.delete(deleteKeys);
 	}
+}
+
+export async function appendTraceEntry(
+	storage: TraceStorageLike,
+	entry: TraceEntry,
+	maxEntries: number,
+): Promise<void> {
+	const traceTs = Date.parse(entry.ts);
+	await storage.put(createTraceKey(Number.isFinite(traceTs) ? traceTs : Date.now()), entry);
+	await trimPrefixedEntries(storage, TRACE_KEY_PREFIX, maxEntries);
+}
+
+export function createAuditKey(ts = Date.now()): string {
+	return `${AUDIT_KEY_PREFIX}${paddedTimestamp(ts)}:${randomSuffix()}`;
+}
+
+/**
+ * Append an entry to the durable revision-discard audit list. Unlike the
+ * debug ring this list is not rate-limited (discard records are rare and
+ * must not be silently dropped) — it is only bounded by
+ * {@link DEFAULT_AUDIT_MAX_ENTRIES} with oldest-first eviction.
+ */
+export async function appendAuditTraceEntry(
+	storage: TraceStorageLike,
+	entry: TraceEntry,
+	maxEntries: number = DEFAULT_AUDIT_MAX_ENTRIES,
+): Promise<void> {
+	const auditTs = Date.parse(entry.ts);
+	await storage.put(createAuditKey(Number.isFinite(auditTs) ? auditTs : Date.now()), entry);
+	await trimPrefixedEntries(storage, AUDIT_KEY_PREFIX, maxEntries);
+}
+
+export async function listAuditTraceEntries(
+	storage: TraceStorageLike,
+	limit: number,
+): Promise<TraceEntry[]> {
+	if (limit <= 0) return [];
+	const recent = await storage.list<TraceEntry>({
+		prefix: AUDIT_KEY_PREFIX,
+		reverse: true,
+		limit,
+	});
+	return Array.from(recent.values());
 }
 
 export async function listRecentTraceEntries(

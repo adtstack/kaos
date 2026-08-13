@@ -263,6 +263,7 @@ function makeDirtyFixture(options: DirtyFixtureOptions = {}) {
 	let diskIndex: DiskIndex = {};
 	let clearCalls = 0;
 	const artifacts = new Map<string, string>();
+	const discarded: Array<{ contentHash: string; reason: string }> = [];
 	const operationOrder: string[] = [];
 
 	const controller = new ReconciliationController({
@@ -321,7 +322,10 @@ function makeDirtyFixture(options: DirtyFixtureOptions = {}) {
 		}) as never,
 		getBlobSync: () => null,
 		getEditorBindings: () => null,
-		getDiskIndex: () => diskIndex,
+				recordDiscardedRevision: (_path, contentHash, reason) => {
+			discarded.push({ contentHash, reason });
+		},
+getDiskIndex: () => diskIndex,
 		setDiskIndex: (next) => {
 			operationOrder.push("index-set");
 			diskIndex = next;
@@ -355,6 +359,7 @@ function makeDirtyFixture(options: DirtyFixtureOptions = {}) {
 		setEntry(next: PreservedUnresolvedEntry | null) { entry = next; },
 		get clearCalls() { return clearCalls; },
 		artifacts,
+		discarded,
 		operationOrder,
 	};
 }
@@ -439,21 +444,22 @@ console.log("\n--- Controller quarantine: exact fresh local event clears only af
 	assertEqual(fixture.clearCalls, 1, "exact-episode event clears Attention once");
 	assert(fixture.entry === null, "resolved episode is absent only after successful settlement");
 	assert(
-		[...fixture.artifacts.values()].includes(fixture.initialCrdtContent),
-		"losing CRDT candidate is preserved before convergence",
+		fixture.discarded.some((record) =>
+			record.reason === "preserved-unresolved-fresh-local-event"
+		),
+		"losing CRDT candidate is recorded as discarded before convergence",
 	);
 	assertEqual(
 		fixture.diskIndex[fixture.path]?.contentHash,
 		await contentBaselineHash(fixture.diskContent),
 		"exact local bytes become the durable baseline",
 	);
-	const artifactAt = fixture.operationOrder.indexOf("artifact-create");
 	const baselineAt = fixture.operationOrder.indexOf("baseline-record");
 	const saveAt = fixture.operationOrder.indexOf("index-save");
 	const clearAt = fixture.operationOrder.indexOf("marker-clear");
 	assert(
-		artifactAt >= 0 && artifactAt < baselineAt && baselineAt < saveAt && saveAt < clearAt,
-		"artifact -> baseline -> durable save -> marker clear order is exact",
+		baselineAt >= 0 && baselineAt < saveAt && saveAt < clearAt,
+		"baseline -> durable save -> marker clear order is exact",
 	);
 	fixture.controller.reset();
 	fixture.doc.destroy();
@@ -706,7 +712,10 @@ console.log("\n--- Closed reconcile: same-bytes TFile delete/recreate ABA fails 
 	assertEqual(ytext.toString(), crdtContent, "same bytes under a replacement TFile cannot mutate CRDT");
 	assertEqual(flushWrites.length, 0, "same-bytes TFile ABA cannot reach a disk flush");
 	assertEqual(baselinePublishes.length, 0, "same-bytes TFile ABA cannot publish a baseline");
-	assert(!(path in diskIndex), "same-bytes TFile ABA leaves the path unindexed for re-evaluation");
+	assert(
+		path in diskIndex,
+		"same-bytes TFile ABA carries the previous durable baseline entry forward (deferred, not dropped)",
+	);
 	assert(
 		traces.some((trace) =>
 			trace.msg === "closed-file-mutation-ticket-stale" &&
@@ -1325,8 +1334,8 @@ console.log("\n--- Open reconcile: programmatic editor successor replaces a defe
 		missingSnapshotDirectMarker?.readComplete === false &&
 		missingSnapshotDirectMarker.editorContents.includes(crdtContent) &&
 		missingSnapshotDirectMarker.editorContents.includes(missingEditorSnapshotContent) &&
-		[...artifacts.values()].includes(crdtContent),
-		"direct re-plan preserves the old alias instead of retiring across an unproven authority advance",
+		artifacts.size === 0,
+		"direct re-plan retains the old alias marker without creating conflict artifacts",
 	);
 	internals.visibleAuthorityDeferredPaths.delete(path);
 	artifacts.clear();
@@ -1407,16 +1416,11 @@ console.log("\n--- Open reconcile: programmatic editor successor replaces a defe
 		providerMarker.editorContents.includes(providerVisibleContent),
 		"provider-only replacement cannot erase the captured editor candidate",
 	);
-	assert(
-		[...artifacts.values()].includes(capturedEditorContent) &&
-		[...artifacts.values()].includes(providerVisibleContent),
-		"provider-only replacement preserves both visible candidates as artifacts",
-	);
-	assert(
-		markerRecords.some((record) =>
-			record.path === path && record.reason === "conflict-winner-flush-deferred"
-		),
-		"provider-only replacement still records durable quarantine",
+	assertEqual(artifacts.size, 0, "provider-only replacement creates no conflict artifacts");
+	assertEqual(
+		markerRecords.filter((record) => record.path === path).length,
+		0,
+		"provider-only replacement records no preserved-unresolved episode (states stay alive in the panes)",
 	);
 
 	artifacts.clear();
@@ -1475,10 +1479,7 @@ console.log("\n--- Open reconcile: programmatic editor successor replaces a defe
 		{ mtime: 41, size: diskContent.length },
 	);
 	assertEqual(interleavedOutcome.kind, "handled", "interleaved authority remains fail-closed");
-	assert(
-		[...artifacts.values()].includes(interveningLocalContent),
-		"the exact intervening local document is preserved as a conflict artifact",
-	);
+	assertEqual(artifacts.size, 0, "the exact intervening local document creates no conflict artifact");
 	controller.reset();
 	doc.destroy();
 }

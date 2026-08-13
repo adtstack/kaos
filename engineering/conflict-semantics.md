@@ -13,39 +13,39 @@ local typing, never merely because a file is open, and never by performing a
 string-level merge inside the editor binding. Open-file three-way planning is
 owned by reconciliation and accepted targets enter through Y.Text.
 
-## 1. Markdown ambiguous divergence
+## 1. Markdown divergence (no artifact preservation)
 
-**Trigger:** Open file in editor where disk, CRDT, and editor all disagree
-and no single authority can be chosen (the "ambiguous divergence" path in
-`ReconciliationController.handleBoundFileSyncGap`).
+**Policy (1.12.0+):** KAOS does **not** write `(KAOS conflict ...)` files for
+markdown and never rewinds an open editor from a disk snapshot. Every losing
+revision is recorded through `recordDiscardedRevision` — a local trace
+(`revision-discarded` / `conflict-revision-discarded`) and a durable server
+audit record (`POST /vault/:id/trace`, event `revision.discarded`) that
+carries a hashed path, the sha256 content hash, and the policy reason.
 
-**Policy:**
+**Recovery layer (what replaces artifacts):**
 
-1. Preserve the competing version as a sibling conflict note:
-   `<base> (KAOS conflict - <source> from <device> <timestamp>).md`
-2. Force-replace the original path's CRDT to match the disk/editor content
-   using `ORIGIN_DISK_SYNC_RECOVER_BOUND`.
-3. Trace `conflict-artifact-needed` with `convergenceApplied: true/false`.
+- **CRDT merge** — real two-device concurrent edits merge at the character
+  level in Yjs; the server persists the update journal and snapshots.
+- **Disk-index baseline** — the last clean-settlement content hash per path
+  (carried forward unchanged for deferred paths, never dropped).
+- **git / server snapshots** — durable history outside the plugin.
+- **Blob conflict artifacts** — unchanged (see §2); binaries have no CRDT
+  history, so files remain the only recovery surface there.
 
-**Who wins:** The version currently visible in the local editor/disk wins
-the original path. The remote/CRDT version is preserved as a separate file.
+**Who wins:** the single provable authority — the visible editor (converged
+into CRDT via `ORIGIN_DISK_SYNC_RECOVER_BOUND`), or the disk/CRDT winner of a
+closed-file three-way decision. No authority is selected when the editor
+authority is unresolvable (multiple panes, a read failure, or no readable
+pane): every replica is left untouched and the next vault event re-evaluates
+(trace `visible-authority-unresolved-deferred`).
 
-**Deduplication:** `lastConflictFingerprints` tracks
-`(crdtHash, diskHash, editorHash)` per path. Same fingerprint skips
-artifact creation. Fingerprint cleared after successful convergence so
-genuinely new divergences create fresh artifacts.
-
-**Failure paths:**
-- Artifact creation fails (disk full, permissions): convergence does NOT
-  proceed. CRDT remains untouched. Retried on next reconcile.
-- Artifact succeeds, convergence fails (getTextForPath returns null):
-  dedupe prevents infinite artifacts. Convergence retried on subsequent
-  passes.
-
-**Sync behavior:** Markdown conflict artifacts are **local-only** safety
-copies. The create event is suppressed when the artifact is written, and the
-durable `"(KAOS conflict ...)"` filename marker is excluded from markdown sync
-classification so restart reconciliation does not seed it into CRDT.
+**Editor rollback is abolished:** the editor document is never rewritten
+backward — not by an external-reload revert
+(`ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT` is gone), not by the open-file idle
+disk recovery (`ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER` application is gone), and
+not by a filter-bypass Y.Text projection. A disk change on an open note is
+ingested only by the open-external-edit merge lane (editor idle >= 3s, editor
+== CRDT, baseline-based 3-way merge) or after the note closes.
 
 ### Open external-edit reconciliation
 
@@ -59,41 +59,23 @@ correlated whole-document reload and hands the exact candidate to
   Y.Text;
 - `D`: the stable external disk candidate.
 
-If only one side changed, or both sides changed in non-overlapping hunks, the
-selected target is applied in one targeted Y.Text transaction. Same or adjacent
+The selected target is applied in one targeted Y.Text transaction when only
+one side changed or both changed in non-overlapping hunks. Same or adjacent
 hunks, a missing baseline, multiple pane authorities, editor read failure, or
-frontmatter rejection cause no partial primary-file mutation. The current
-Y.Text remains primary and the complete raw external candidate is preserved as
-a local-only conflict artifact. Stale calculations replan without creating an
-artifact merely because authority advanced.
+frontmatter rejection cause no partial primary-file mutation — the current
+Y.Text remains primary and the external candidate is recorded as a discarded
+revision. Stale calculations replan without recording anything merely because
+authority advanced.
 
-### Superseded external revision preservation (fail-closed)
+### Superseded external revisions (audit instead of preserve)
 
 Distinct raw disk revisions that an async read proves were superseded by a
-newer event are preserved as `<base> (KAOS conflict - disk ...)` artifacts
-until a candidate-specific durable adoption receipt exists. Two provably
-redundant classes are skipped without weakening the fail-closed contract:
-
-1. **Durable-baseline skip.** A superseded revision whose exact bytes hash to
-   the durable disk-index `contentHash` is already recorded as the last
-   clean-settlement baseline, so an artifact adds zero recoverable information.
-   The drain retires it without writing a file and traces
-   `superseded-external-revision-baseline-skipped`. A missing index entry or
-   hash disables the skip — inability to prove redundancy is not proof of
-   cleanliness.
-2. **Stale own-origin drop.** A stale out-of-order disk read whose exact
-   normalized bytes equal the before/after snapshot of a fresh recent
-   editor-origin change (the editor's own state, captured by the binding's
-   bounded FIFO journal) cannot be unique external work. The editor binding
-   drops it before interception and traces
-   `external-disk-reload-guard-stale-own-origin-dropped`. All other stale
-   bytes keep the artifact path.
-
-Rationale: a multi-step own edit (checkbox toggle followed by a tasks-plugin
-completion-date append) produces several disk revisions whose reads can
-complete out of order; both skips prevent those intermediate own-device states
-from becoming false-positive conflict artifacts while preserving every
-revision that cannot be proven redundant.
+newer event are recorded as discarded revisions (trace + server audit), never
+written to files. One provably redundant class is not even audited: bytes
+that hash to the durable disk-index `contentHash` are the baseline itself
+(trace `superseded-external-revision-baseline-skipped`). The candidate
+tracking/FIFO remains — it gates dirty-path admission and open-flush leases —
+but the drain only records and retires.
 
 ## 2. Blob download conflict
 
@@ -301,17 +283,24 @@ resets to 0. UI/status must treat count as current and timestamp as
 
 ## Naming conventions
 
-Both Markdown and blob conflict artifacts cap component lengths to prevent
-filesystem path length issues (255-byte component limit):
+Blob conflict artifacts cap component lengths to prevent filesystem path
+length issues (255-byte component limit):
 - Device name: max 50 characters
 - Base name: max 100 characters (further reduced if suffix is long)
 - Illegal filesystem characters are replaced with `-`
+
+Legacy markdown `(KAOS conflict ...)` files from releases before 1.12.0 are
+still recognized and excluded from markdown sync classification (they never
+seed CRDT), but no new markdown artifacts are created.
 
 ## Recovery quarantine
 
 Not a conflict policy per se, but related: if the same recovery
 fingerprint (reason + content hashes) recurs 3 times within a 10-minute
-window, the path is quarantined to prevent infinite recovery loops.
+window, the path is quarantined to prevent infinite recovery loops. The
+guard applies to the remaining disk→CRDT recovery lane (bound-file
+local-only divergence, editor == disk ≠ CRDT alignment), which is the only
+open-editor recovery that cannot jump the editor backward.
 
 - Same fingerprint within TTL: count increments
 - Same fingerprint beyond TTL: count resets to 1

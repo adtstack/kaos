@@ -247,6 +247,9 @@ console.log("\n--- Test 5: valid resource + invalid shape returns 404 without KA
 		["POST", "/vault/foo/blobs/not-real"],      // blobs POST only handles /exists
 		["DELETE", "/vault/foo/blobs/somehash"],    // blobs doesn't handle DELETE
 		["POST", "/vault/foo/auth/ticket/extra"],   // extra path segments
+		["GET",  "/vault/foo/trace"],               // trace is POST-only
+		["POST", "/vault/foo/trace/extra"],         // trace has no subpaths
+		["DELETE", "/vault/foo/trace"],             // trace doesn't handle DELETE
 		["PUT", "/vault/foo/recovery-snapshots/maybe"],
 		["GET", "/vault/foo/recovery-snapshots/abc123"],
 		["POST", "/vault/foo/recovery-snapshots/abc123/manifest"],

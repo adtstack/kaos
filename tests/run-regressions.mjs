@@ -111,6 +111,8 @@ const suites = [
 	[JITI, "tests/folder-rename.ts"],
 	[JITI, "tests/chunked-doc-store.ts"],
 	[JITI, "tests/trace-store.ts"],
+	[JITI, "tests/vault-trace-route.ts"],
+	[JITI, "tests/discarded-revision-audit.ts"],
 	[JITI, "tests/server-hardening.ts"],
 	[JITI, "tests/server-claim-security.ts"],
 	[JITI, "tests/settings-hardening.ts"],

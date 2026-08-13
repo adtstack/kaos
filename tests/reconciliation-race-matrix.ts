@@ -224,10 +224,6 @@ console.log("\n--- Race 2: opening/binding during artifact I/O aborts closed mut
 				: (artifacts.get(candidate.path) ?? ""),
 			create: async (artifactPath: string, content: string) => {
 				artifacts.set(artifactPath, content);
-				// The note transitions from closed to live while conflict preservation
-				// is yielding. The following compare-and-commit must see this.
-				isOpen = true;
-				isBound = true;
 				return makeTFile(artifactPath);
 			},
 			adapter: { stat: async () => ({ mtime: 2, size: diskContent.length }) },
@@ -283,16 +279,20 @@ console.log("\n--- Race 2: opening/binding during artifact I/O aborts closed mut
 			setDiskIndex: (next) => { diskIndex = next; },
 		}),
 		getEditorBindings: () => ({ isBound: () => isBound }) as never,
+		recordDiscardedRevision: (_path, _hash, _reason) => {
+			// The note transitions from closed to live while the discard record
+			// is yielding (the async content-hash await). The following
+			// compare-and-commit must see this and abort.
+			isOpen = true;
+			isBound = true;
+		},
 	});
 
 	await controller.runReconciliation("authoritative");
-	assert(isOpen && isBound, "fixture transitions the path to live authority during artifact creation");
+	assert(isOpen && isBound, "fixture transitions the path to live authority during discard recording");
 	assert(ytext.toString() === crdtContent, "stale closed disk winner cannot replace live CRDT/editor content");
 	assert(flushCount === 0, "stale closed decision performs no CRDT-to-disk mutation either");
-	assert(
-		Array.from(artifacts.values()).includes(crdtContent),
-		"the competing CRDT version is preserved before the decision is abandoned",
-	);
+	assert(artifacts.size === 0, "no conflict artifact file is created");
 	assert(controller.pending, "the stale closed decision requests a fresh open-aware follow-up");
 	controller.reset();
 	doc.destroy();

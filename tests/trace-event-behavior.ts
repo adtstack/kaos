@@ -1511,7 +1511,7 @@ console.log("\n--- Test 14: open external edit traces are complete and privacy-s
 		"open-external-candidate-captured",
 		"open-external-recent-typing-deferred",
 		"open-external-clean-merge-applied",
-		"open-external-overlapping-hunk-preserved",
+		"open-external-overlapping-hunk-discarded",
 		"open-external-stale-replan",
 		"open-external-frontmatter-blocked",
 		"open-external-disk-settled",
@@ -1627,9 +1627,9 @@ console.log("\n--- Test 14: open external edit traces are complete and privacy-s
 	);
 	assert(
 		scenarioEvents.conflict.some((event) =>
-			event.msg === "open-external-overlapping-hunk-preserved"
+			event.msg === "open-external-overlapping-hunk-discarded"
 		),
-		"overlapping-hunk scenario emits preserved trace",
+		"overlapping-hunk scenario emits discarded trace",
 	);
 	assert(
 		scenarioEvents.guarded.some((event) => event.msg === "open-external-frontmatter-blocked"),
@@ -1666,14 +1666,13 @@ console.log("\n--- Test 14: open external edit traces are complete and privacy-s
 			keys: ["path", "reason", "diskLength", "currentLength", "targetLength"],
 			reasons: ["apply-external", "apply-clean-merge"],
 		},
-		"open-external-overlapping-hunk-preserved": {
+		"open-external-overlapping-hunk-discarded": {
 			keys: [
 				"path",
 				"reason",
 				"diskLength",
 				"currentLength",
 				"hunkCount",
-				"artifactCreated",
 			],
 			reasons: ["overlapping-hunks"],
 		},

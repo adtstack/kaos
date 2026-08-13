@@ -45,7 +45,8 @@ const EXPECTATIONS: Expectation[] = [
 		],
 		forbiddenKinds: ["recovery.postcondition.failed", "recovery.quarantined"],
 		allowedReasons: [
-			"bound-file-open-idle-disk-recovery",
+			// bound-file-open-idle-disk-recovery is abolished (1.12.0): an open
+			// editor agreeing with CRDT is never rewritten from disk.
 			"bound-file-local-only-divergence",
 		],
 	},

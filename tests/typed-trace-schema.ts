@@ -36,7 +36,7 @@ console.log("\n--- Test 1: dangerous transitions have typed trace events ---");
 	assert(reconciliation.includes('"recovery-force-replace-applied"'), "recovery force-replace fallback is traced");
 	assert(reconciliation.includes('"recovery-postcondition-failed"'), "recovery postcondition failure is traced");
 	assert(reconciliation.includes('"recovery-postcondition-skipped"'), "recovery lock skips are traced");
-	assert(reconciliation.includes('"conflict-artifact-needed"'), "ambiguous divergence conflict need is traced");
+	assert(reconciliation.includes('"revision-discarded"'), "ambiguous divergence discard is traced");
 	assert(fmCoordinator.includes('"frontmatter-quarantined"'), "frontmatter quarantine uses quarantine trace source");
 	assert(fmCoordinator.includes('"frontmatter-quarantine-cleared"'), "frontmatter quarantine clear uses quarantine trace source");
 	assert(blobSync.includes('"download-overwrite-decision"'), "attachment download overwrite decisions are traced");
@@ -49,7 +49,7 @@ console.log("\n--- Test 1: dangerous transitions have typed trace events ---");
 	assert(diskMirror.includes('"remote-delete-applied"'), "remote delete completions are traced in diskMirror");
 	assert(blobSync.includes('"remote-delete-applied"'), "remote delete completions are traced in blobSync");
 	assert(reconciliation.includes('"recovery-quarantined"'), "recovery loop quarantine is traced");
-	assert(reconciliation.includes('"conflict-artifact-created"'), "conflict artifact creation is traced");
+	assert(reconciliation.includes('"superseded-external-revision-baseline-skipped"'), "superseded baseline skip is traced");
 	assert(reconciliation.includes('convergenceApplied'), "conflict convergence decision is traced");
 }
 

@@ -2718,52 +2718,38 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 		await b.evalRaw(`window.__KAOS_DEBUG__?.startFlightTrace("qa-safe", ${JSON.stringify(QA_SECRET)})`);
 		await new Promise((r) => setTimeout(r, 1000));
 
-		// ── Phase 3: Wait for conflict artifact ───────────────────────────
+		// ── Phase 3: no conflict artifact, survivor converges (1.12.0) ────
 
-		log("s11b: Phase 3 -- waiting for conflict artifact...");
+		log("s11b: Phase 3 -- asserting no conflict artifact and survivor convergence...");
 		const scratchBase = scratch.split("/").pop()?.replace(".md", "") ?? "";
-		let conflictArtifactPath = "";
-		for (let i = 0; i < 20; i++) {
-			await new Promise((r) => setTimeout(r, 1000));
-			const artifact = await b.evalRaw<string | null>(`
-				(function() {
-					const base = ${JSON.stringify(scratchBase)};
-					return app.vault.getFiles().map(f => f.path).find(p =>
-						p.includes(base) && (p.includes("conflict") || p.includes("KAOS")) && p !== ${JSON.stringify(scratch)}
-					) ?? null;
-				})()
-			`);
-			if (artifact) { conflictArtifactPath = artifact; log(`s11b: conflict artifact: ${artifact}`); break; }
-		}
-		if (!conflictArtifactPath) {
-			log("s11b: WARNING -- no conflict artifact found after 20s");
-			errors.push("s11b: no conflict artifact created -- conflict preservation may have failed");
+		await new Promise((r) => setTimeout(r, 2000));
+		const conflictArtifactPath = await b.evalRaw<string | null>(`
+			(function() {
+				const base = ${JSON.stringify(scratchBase)};
+				return app.vault.getFiles().map(f => f.path).find(p =>
+					p.includes(base) && (p.includes("conflict") || p.includes("KAOS")) && p !== ${JSON.stringify(scratch)}
+				) ?? null;
+			})()
+		`);
+		if (conflictArtifactPath) {
+			errors.push(`s11b: FAIL -- markdown conflict artifacts are abolished (1.12.0) but ${conflictArtifactPath} exists`);
+			log(`s11b: FAIL -- unexpected conflict artifact: ${conflictArtifactPath}`);
+		} else {
+			log("s11b: no conflict artifact created ✓");
 		}
 
 		// Compute actual hashes from disk content (the semantic proof targets)
-		const artifactContent = conflictArtifactPath ? await b.evalRaw<string | null>(`
-			(async () => { const f = app.vault.getAbstractFileByPath(${JSON.stringify(conflictArtifactPath)}); return f ? await app.vault.read(f) : null; })()
-		`) : null;
 		const survivorContent = await b.evalRaw<string | null>(`
 			(async () => { const f = app.vault.getAbstractFileByPath(${JSON.stringify(scratch)}); return f ? await app.vault.read(f) : null; })()
 		`);
 
-		// ── Semantic content assertions (Fix 1) ──────────────────────────
+		// ── Semantic content assertions (1.12.0) ─────────────────────────
 		// KAOS conflict policy for this scenario (both-changed/winner=disk):
 		//   - Disk wins main file → original path has S11B-LOCAL (B's local edit)
-		//   - CRDT edit goes to artifact → artifact has S11B-REMOTE (A's remote edit)
-		// These assertions prove semantic preservation, not just hash persistence.
+		//   - No markdown conflict artifact; A's remote edit merges into the
+		//     CRDT and survives in the server journal/audit log.
 		const LOCAL_MARKER = "S11B-LOCAL";
-		const REMOTE_MARKER = "S11B-REMOTE";
 
-		if (artifactContent !== null) {
-			if (!artifactContent.includes(REMOTE_MARKER)) {
-				errors.push(`s11b: SEMANTIC FAIL -- conflict artifact does not contain A's remote edit marker (${REMOTE_MARKER}). Content: ${artifactContent.slice(0, 100)}`);
-				log(`s11b: SEMANTIC FAIL -- artifact missing ${REMOTE_MARKER}`);
-			} else {
-				log(`s11b: artifact contains ${REMOTE_MARKER} ✓`);
-			}
-		}
 		if (survivorContent !== null) {
 			if (!survivorContent.includes(LOCAL_MARKER)) {
 				errors.push(`s11b: SEMANTIC FAIL -- original path does not contain B's local edit marker (${LOCAL_MARKER}). Content: ${survivorContent.slice(0, 100)}`);
@@ -2773,9 +2759,8 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			}
 		}
 
-		const actualConflictHash = artifactContent ? await b.evalRaw<string>(`window.__KAOS_DEBUG__?.computeWitnessStateHash(${JSON.stringify(artifactContent)})`) : "";
 		const actualSurvivorHash = survivorContent ? await b.evalRaw<string>(`window.__KAOS_DEBUG__?.computeWitnessStateHash(${JSON.stringify(survivorContent)})`) : "";
-		log(`s11b: actualConflictHash=${actualConflictHash.slice(0, 12)}, actualSurvivorHash=${actualSurvivorHash.slice(0, 12)}`);
+		log(`s11b: actualSurvivorHash=${actualSurvivorHash.slice(0, 12)}`);
 
 		// ── Phase 4+5: Quorum + negative-window checks (inline, no runS11b) ─
 
@@ -2800,27 +2785,13 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 			noRecovery(handleB, scratch, { windowMs: 10_000 }),
 		]);
 
-		// Quorum: conflict artifact exists on Device B with expected content
-		// Note: conflict artifact is a local-only file on B (not synced to A in current KAOS)
+		// Quorum (1.12.0): no markdown conflict artifact may exist on either device
+		// (preservation is abolished; the losing revision goes to the audit log).
 		let conflictArtifactLocalCheck: { ok: boolean; reason?: string; evidence: unknown[]; intermediateHashes: Record<string, unknown[]>; summary: string };
-		if (conflictArtifactPath && actualConflictHash) {
-			const hashB = await b.evalRaw<string | null>(`
-				(async () => {
-					const f = app.vault.getAbstractFileByPath(${JSON.stringify(conflictArtifactPath)});
-					if (!f) return null;
-					const content = await app.vault.read(f);
-					return window.__KAOS_DEBUG__?.computeWitnessStateHash(content);
-				})()
-			`);
-			log(`s11b: conflict artifact hash B=${hashB?.slice(0, 12)} expected=${actualConflictHash.slice(0, 12)}`);
-			if (hashB === actualConflictHash) {
-				conflictArtifactLocalCheck = { ok: true, evidence: [{ kind: "disk_hash_match_on_b", hashB, expected: actualConflictHash }], intermediateHashes: {}, summary: `Device B has conflict artifact with expected hash ${actualConflictHash}` };
-				log("s11b: conflict artifact content verified on B ✓");
-			} else {
-				conflictArtifactLocalCheck = { ok: false, reason: "conflict_artifact_hash_mismatch", evidence: [{ hashB, expected: actualConflictHash }], intermediateHashes: {}, summary: `Conflict artifact hash mismatch on B: got ${hashB} expected ${actualConflictHash}` };
-			}
+		if (conflictArtifactPath) {
+			conflictArtifactLocalCheck = { ok: false, reason: "unexpected_conflict_artifact", evidence: [{ path: conflictArtifactPath }], intermediateHashes: {}, summary: `unexpected conflict artifact: ${conflictArtifactPath}` };
 		} else {
-			conflictArtifactLocalCheck = { ok: false, reason: "no_conflict_artifact", evidence: [], intermediateHashes: {}, summary: "no conflict artifact" };
+			conflictArtifactLocalCheck = { ok: true, evidence: [{ kind: "no_conflict_artifact" }], intermediateHashes: {}, summary: "no markdown conflict artifact on either device" };
 		}
 
 		// Quorum: both devices witness original path with expected survivor hash
@@ -2837,17 +2808,16 @@ const TWO_DEVICE_SCENARIOS: Record<string, TwoDeviceScenarioFn> = {
 
 		const phaseOk = noStaleOnA.ok && noStaleOnB.ok && noRecoveryOnA.ok && noRecoveryOnB.ok
 			&& conflictArtifactLocalCheck.ok && originalPathQuorum.ok
-			&& (artifactContent?.includes(REMOTE_MARKER) ?? false)
 			&& (survivorContent?.includes(LOCAL_MARKER) ?? false);
 
 		const resultSummary = phaseOk
-			? `s11b PASSED: conflict artifact preserved (${actualConflictHash.slice(0, 12)}), survivor hash (${actualSurvivorHash.slice(0, 12)}), no stale/recovery divergences`
+			? `s11b PASSED: no conflict artifact, survivor hash (${actualSurvivorHash.slice(0, 12)}), no stale/recovery divergences`
 			: `s11b FAILED: ${[
 				!noStaleOnA.ok && `stale on A: ${noStaleOnA.reason}`,
 				!noStaleOnB.ok && `stale on B: ${noStaleOnB.reason}`,
 				!noRecoveryOnA.ok && `recovery on A: ${noRecoveryOnA.reason}`,
 				!noRecoveryOnB.ok && `recovery on B: ${noRecoveryOnB.reason}`,
-				!conflictArtifactLocalCheck.ok && `conflict artifact quorum: ${conflictArtifactLocalCheck.reason}`,
+				!conflictArtifactLocalCheck.ok && `conflict artifact check: ${conflictArtifactLocalCheck.reason}`,
 				!originalPathQuorum.ok && `original path quorum: ${originalPathQuorum.reason}`,
 			].filter(Boolean).join("; ")}`;
 

@@ -654,33 +654,23 @@ export class EditorBindingManager {
 		if (candidate && diskMutationPredatesEditorChange) {
 			this.recentEditorOriginChanges.delete(notice.path);
 			this.notifyExternalDiskReloadIntercepted(notice);
-			if (this.isRecentEditorOriginChangeCurrent(candidate)) {
-				applyDiffToYText(
-					candidate.ytext,
-					candidate.afterContent,
-					candidate.beforeContent,
-					ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT,
-				);
-				this.trace?.("editor", "external-disk-editor-reload-reverted", {
-					path: notice.path,
-					leafId: candidate.leafId,
-					cmId: candidate.binding.cmId,
-					beforeLength: candidate.beforeContent.length,
-					externalLength: candidate.afterContent.length,
-					eventObservedAt: notice.observedAt,
-					diskMtime: notice.mtime,
-					diskSize: notice.size,
-					editorChangeAt: candidate.at,
-				});
-			} else {
-				this.trace?.("editor", "external-disk-editor-reload-revert-skipped", {
-					path: notice.path,
-					reason: "exact-state-changed",
-					externalCandidatePreserved: true,
-					diskMtime: notice.mtime,
-					editorChangeAt: candidate.at,
-				});
-			}
+			// Editor rollback is abolished: the editor document is never
+			// rewritten backward from a disk snapshot. The external bytes are
+			// handed to reconciliation as an intercepted candidate; the
+			// open-external-edit merge lane (idle) or the editor's own next
+			// save settles them. Leaving the editor untouched means a stale
+			// disk revision can never yank the user's document back in time.
+			this.trace?.("editor", "external-disk-editor-reload-intercepted-no-revert", {
+				path: notice.path,
+				leafId: candidate.leafId,
+				cmId: candidate.binding.cmId,
+				beforeLength: candidate.beforeContent.length,
+				externalLength: candidate.afterContent.length,
+				eventObservedAt: notice.observedAt,
+				diskMtime: notice.mtime,
+				diskSize: notice.size,
+				editorChangeAt: candidate.at,
+			});
 			return;
 		} else if (candidate && candidateContentMatches && exactDiskRevisionMatches) {
 			// Exact bytes/revision are known, but a coarse or non-monotonic clock
@@ -3520,6 +3510,12 @@ export class EditorBindingManager {
 		cm: EditorView,
 		bypass: ExternalReloadFilterBypass,
 	): void {
+		// Editor rollback is abolished: a filter-bypassed external reload is
+		// never projected back from Y.Text into the CodeMirror document — that
+		// CRDT→editor restore is exactly the "text jumped back a few seconds"
+		// symptom. The bypass already detached y-codemirror; schedule the
+		// guarded health path to re-evaluate the current editor/CRDT state
+		// from scratch instead of rewriting the visible document.
 		queueMicrotask(() => {
 			const match = this.findBindingForCm(cm);
 			if (
@@ -3529,74 +3525,19 @@ export class EditorBindingManager {
 				match.binding.view.file?.path !== bypass.path ||
 				(this.bindingEpochByLeafId.get(match.leafId) ?? 0) !== bypass.bindingEpoch
 			) {
-				this.trace?.("editor", "external-disk-editor-reload-bypass-revert-skipped", {
+				this.trace?.("editor", "external-disk-editor-reload-bypass-no-rollback", {
 					path: bypass.path,
 					reason: "binding-lineage-changed",
 				});
 				return;
 			}
 
-			const { binding } = match;
-			const currentYText = this.vaultSync.getTextForPath(bypass.path);
-			let currentEditorContent: string | null = null;
-			try {
-				currentEditorContent = binding.view.editor.getValue();
-			} catch {
-				// An unreadable or replaced editor is newer uncertainty; leave it alone.
-			}
-			if (currentYText !== binding.ytext) {
-				this.trace?.("editor", "external-disk-editor-reload-bypass-revert-skipped", {
-					path: bypass.path,
-					reason: "crdt-identity-changed",
-				});
-				return;
-			}
-			if (
-				currentEditorContent !== bypass.externalContent ||
-				cm.state.doc.toString() !== bypass.externalContent
-			) {
-				// A newer editor state won the CAS. It may now differ from Y.Text, so
-				// direct reattachment would bypass canApplyBindingToEditor's equality
-				// invariant. Keep both authorities untouched and detached; the guarded
-				// health path will re-evaluate the current state from scratch.
-				this.scheduleHealthCheck(
-					match.leafId,
-					LIVE_UPDATE_HEALTH_RETRY_DELAY_MS,
-					"external-reload-bypass-divergent",
-				);
-				this.trace?.("editor", "external-disk-editor-reload-bypass-revert-skipped", {
-					path: bypass.path,
-					reason: "exact-editor-state-changed",
-					bindingRestored: false,
-					recoveryScheduled: true,
-				});
-				return;
-			}
-
-			// Detaching y-codemirror in the bypass transaction is the CRDT mutation
-			// fence. Never roll Y.Text back to a captured snapshot here: a provider may
-			// have legitimately advanced it, including to the same bytes as the disk
-			// candidate. Project only the current Y.Text value into CM.
-			const authoritativeContent = currentYText.toJSON();
-			cm.dispatch({
-				changes: {
-					from: 0,
-					to: cm.state.doc.length,
-					insert: authoritativeContent,
-				},
-				annotations: [
-					EDITOR_AUTHORITY_TRANSACTION.of({
-						content: authoritativeContent,
-						source: "external-reload-correction",
-					}),
-					Transaction.addToHistory.of(false),
-				],
-				effects: this.compartment.reconfigure(
-					this.buildGuardedCollabExtension(match.leafId, binding),
-				),
-			});
-
-			this.trace?.("editor", "external-disk-editor-reload-bypass-reverted", {
+			this.scheduleHealthCheck(
+				match.leafId,
+				LIVE_UPDATE_HEALTH_RETRY_DELAY_MS,
+				"external-reload-bypass-no-rollback",
+			);
+			this.trace?.("editor", "external-disk-editor-reload-bypass-no-rollback", {
 				path: bypass.path,
 				leafId: bypass.leafId,
 				beforeLength: bypass.beforeContent.length,

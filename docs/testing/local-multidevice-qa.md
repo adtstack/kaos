@@ -354,9 +354,9 @@ diff로 적용한다. 그래서 커서·선택·undo를 불필요한 전체 repl
 1. 같은 baseline에서 B editor의 `work` 줄을 `work: local`로 바꾼다.
 2. 다른 프로그램은 B disk의 같은 줄을 `work: external`로 바꾼다.
 3. B의 원래 note가 `work: local`을 유지하는지 확인한다.
-4. B에 생성된 disk-sourced conflict artifact가 외부 파일 원문 전체를 정확히
-   포함하는지 확인한다. marker 한 줄만 발췌한 파일이면 실패다.
-5. conflict artifact가 A로 동기화되지 않는지 확인한다.
+4. (1.12.0+ 기준) disk-sourced conflict artifact 파일이 생성되지 않고, 외부
+   원문 전체가 서버 감사 로그(`revision.discarded`)에 기록되는지 확인한다.
+5. 감사 기록이 A로 동기화되지 않는지 확인한다.
 6. 최종 원래 note의 editor, Y.Text, disk가 다시 같은 local-primary 내용인지
    확인한다.
 
@@ -388,10 +388,10 @@ artifact 없이 자동 소거하지 않는다. `quickadd-heading`은 문서 중�
 
 `korean-prefix`는 실제 사고 형태인 editor `고미` 대 disk `고민하고 `를 검증하고,
 `move-delete`는 같은 줄의 이동 대 삭제를 검증한다. 두 case 모두 열린 editor 내용을
-primary로 유지하고 외부 원문 전체를 byte-exact local conflict artifact 한 개로 보존해야
-한다. 자동으로 긴 문자열이나 이동 쪽을 선택하면 실패다. `soak`도 각 cycle마다
-수렴 상태를 idle 뒤 다시 확인하고 3.5초 동안 hash와 artifact가 불변인지 검증한 다음
-다음 변경으로 넘어간다.
+primary로 유지하고 (1.12.0+ 기준) 외부 원문 전체를 byte-exact로 서버 감사 로그에
+기록해야 한다. 자동으로 긴 문자열이나 이동 쪽을 선택하면 실패다. `soak`도 각
+cycle마다 수렴 상태를 idle 뒤 다시 확인하고 3.5초 동안 hash와 감사 기록이
+불변인지 검증한 다음 다음 변경으로 넘어간다.
 artifact가 다른 장치로 전파되지 않는 local-only 성질은 12.3과 `s12c-conflict`에서
 별도로 검증한다.
 한 case만 재현할 때는 `--case quickadd-burst`처럼 지정한다. PASS 기준은 화면이
@@ -423,7 +423,8 @@ BUG CONFIRMED: ISSUE #22-B open-file path — local edit silently lost
 수정 후의 acceptance 기준:
 
 - B의 main file에 `LOCAL_ON_B`가 남는다.
-- `REMOTE_FROM_A`는 B의 로컬 conflict artifact에 보존된다.
+- (1.12.0+ 기준) `REMOTE_FROM_A`는 conflict artifact 파일이 아니라 CRDT
+  병합/서버 감사 로그로 보존된다.
 - 사용자 편집이 조용히 사라지지 않는다.
 
 [`qa/scripts/repro-cold-relaunch-external-edit.ts`](../../qa/scripts/repro-cold-relaunch-external-edit.ts)는
