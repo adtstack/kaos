@@ -3298,6 +3298,40 @@ export class ReconciliationController {
 			const pending = this.pendingSupersededExternalDiskMutations.get(path);
 			const candidate = pending?.[0];
 			if (!pending || !candidate) return { kind: "preserved" };
+
+			// Fail-closed preservation admits one provably redundant class: a
+			// superseded disk revision whose exact bytes hash to the durable
+			// disk-index contentHash. Those bytes are already durably recorded
+			// as the last clean-settlement baseline, so an artifact for them
+			// adds zero recoverable information. A missing index entry or hash
+			// disables the skip and preserves as before — inability to prove
+			// redundancy is not proof of cleanliness.
+			const durableBaselineHash =
+				this.deps.getDiskIndex()[candidate.path]?.contentHash ?? null;
+			if (durableBaselineHash !== null) {
+				const candidateHash = await contentBaselineHash(candidate.content);
+				if (!isCurrent()) return { kind: "invalidated" };
+				if (candidateHash === durableBaselineHash) {
+					this.deps.trace(
+						"conflict",
+						"superseded-external-revision-baseline-skipped",
+						{
+							path: candidate.path,
+							sequence: candidate.sequence,
+							contentLength: candidate.content.length,
+							baselineHashPrefix: durableBaselineHash.slice(0, 12),
+						},
+					);
+					if (
+						this.retirePendingSupersededCandidate(path, pending, candidate) ===
+						"invalidated"
+					) {
+						return { kind: "invalidated" };
+					}
+					continue;
+				}
+			}
+
 			try {
 				await this.createMarkdownConflictArtifact(
 					candidate.path,
@@ -3346,18 +3380,38 @@ export class ReconciliationController {
 				}
 				this.supersededExternalPreservationFailures.delete(path);
 			}
-			if (this.pendingSupersededExternalDiskMutations.get(path) !== pending) {
+			if (
+				this.retirePendingSupersededCandidate(path, pending, candidate) ===
+				"invalidated"
+			) {
 				return { kind: "invalidated" };
-			}
-			const currentIndex = pending.findIndex((queued) =>
-				this.isSameExternalCandidate(queued, candidate)
-			);
-			if (currentIndex >= 0) pending.splice(currentIndex, 1);
-			if (pending.length === 0) {
-				this.pendingSupersededExternalDiskMutations.delete(path);
 			}
 		}
 		return { kind: "invalidated" };
+	}
+
+	/**
+	 * Remove one exact pending superseded candidate from its per-path FIFO,
+	 * deleting the FIFO entry once it is empty. Returns "invalidated" when a
+	 * concurrent drain replaced the FIFO identity and the caller must abandon
+	 * this pass.
+	 */
+	private retirePendingSupersededCandidate(
+		path: string,
+		pending: InterceptedExternalDiskMutation[],
+		candidate: InterceptedExternalDiskMutation,
+	): "retired" | "invalidated" {
+		if (this.pendingSupersededExternalDiskMutations.get(path) !== pending) {
+			return "invalidated";
+		}
+		const currentIndex = pending.findIndex((queued) =>
+			this.isSameExternalCandidate(queued, candidate)
+		);
+		if (currentIndex >= 0) pending.splice(currentIndex, 1);
+		if (pending.length === 0) {
+			this.pendingSupersededExternalDiskMutations.delete(path);
+		}
+		return "retired";
 	}
 
 	private hasPendingSupersededExternalDiskMutation(

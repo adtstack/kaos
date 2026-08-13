@@ -67,6 +67,34 @@ Y.Text remains primary and the complete raw external candidate is preserved as
 a local-only conflict artifact. Stale calculations replan without creating an
 artifact merely because authority advanced.
 
+### Superseded external revision preservation (fail-closed)
+
+Distinct raw disk revisions that an async read proves were superseded by a
+newer event are preserved as `<base> (KAOS conflict - disk ...)` artifacts
+until a candidate-specific durable adoption receipt exists. Two provably
+redundant classes are skipped without weakening the fail-closed contract:
+
+1. **Durable-baseline skip.** A superseded revision whose exact bytes hash to
+   the durable disk-index `contentHash` is already recorded as the last
+   clean-settlement baseline, so an artifact adds zero recoverable information.
+   The drain retires it without writing a file and traces
+   `superseded-external-revision-baseline-skipped`. A missing index entry or
+   hash disables the skip — inability to prove redundancy is not proof of
+   cleanliness.
+2. **Stale own-origin drop.** A stale out-of-order disk read whose exact
+   normalized bytes equal the before/after snapshot of a fresh recent
+   editor-origin change (the editor's own state, captured by the binding's
+   bounded FIFO journal) cannot be unique external work. The editor binding
+   drops it before interception and traces
+   `external-disk-reload-guard-stale-own-origin-dropped`. All other stale
+   bytes keep the artifact path.
+
+Rationale: a multi-step own edit (checkbox toggle followed by a tasks-plugin
+completion-date append) produces several disk revisions whose reads can
+complete out of order; both skips prevent those intermediate own-device states
+from becoming false-positive conflict artifacts while preserving every
+revision that cannot be proven redundant.
+
 ## 2. Blob download conflict
 
 **Trigger:** During blob download, either:

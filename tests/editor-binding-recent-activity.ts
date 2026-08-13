@@ -93,12 +93,13 @@ function recordExpectedEditorYTextPatch(
 	manager: unknown,
 	binding: { path: string; ytext: Y.Text },
 ): void {
-	const candidate = (manager as {
-		recentEditorOriginChanges: Map<string, {
+	const candidates = (manager as {
+		recentEditorOriginChanges: Map<string, Array<{
 			leafId: string;
 			expectedYTextOrigin: unknown;
-		}>;
+		}>>;
 	}).recentEditorOriginChanges.get(binding.path);
+	const candidate = candidates?.[candidates.length - 1];
 	if (!candidate) {
 		throw new Error(`Missing recent editor-origin candidate for ${binding.path}`);
 	}
@@ -3827,6 +3828,169 @@ console.log("\n--- Test 19a9: out-of-order exact reads cannot replace a newer ma
 		older,
 		"out-of-order stale completion interception",
 	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a9a: stale read matching a fresh own-origin snapshot is dropped, not preserved ---");
+{
+	// Regression for the 2026-08-13 checkbox incident (Layer 2): a stale
+	// out-of-order disk read whose bytes exactly equal a kaos-captured recent
+	// editor-origin snapshot (the editor's own pre-edit state) must not be
+	// intercepted as an external disk mutation. The journal survives here
+	// because the newer event's content matches no origin snapshot.
+	const {
+		manager,
+		binding,
+		traceRecords,
+		setLiveEditorContent,
+		interceptedExternalReloads,
+	} = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	// Own edit step 1: v0 -> v1 (checkbox toggle).
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "pre-edit baseline");
+	setLiveEditorContent("pre-edit baseline");
+	(manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch({
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "checked checkbox" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	});
+	// Own edit step 2: v1 -> v2 (tasks plugin completion-date append).
+	setLiveEditorContent("checked checkbox");
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "checked checkbox");
+	(manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch({
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "checked checkbox \u2705 2026-08-13" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	});
+
+	const stale = externalDiskMutationNotice(
+		binding.path,
+		"pre-edit baseline",
+		1788.5,
+		{ ctime: 1788.25, sequence: 1788, observedAt: 1788.75 },
+	);
+	const newer = externalDiskMutationNotice(
+		binding.path,
+		"newer external",
+		1789.5,
+		{ ctime: 1789.25, sequence: 1789, observedAt: 1789.75 },
+	);
+	manager.beginExternalDiskMutation(binding.path, stale.sequence);
+	manager.beginExternalDiskMutation(binding.path, newer.sequence);
+	manager.noteExternalDiskMutation(newer);
+	manager.noteExternalDiskMutation(stale);
+
+	assertEq(interceptedExternalReloads.length, 0, "own-origin stale bytes are never intercepted");
+	assertEq(
+		traceRecords.some(
+			(record) =>
+				record.msg === "external-disk-reload-guard-stale-own-origin-dropped" &&
+				record.details?.sequence === stale.sequence,
+		),
+		true,
+		"the own-origin drop is traced with the stale sequence",
+	);
+	const pending = (manager as unknown as {
+		pendingExternalDiskMutations: Map<string, { content: string | null }>;
+	}).pendingExternalDiskMutations.get(binding.path);
+	assertEq(pending?.content, "newer external", "newer marker is untouched by the dropped stale read");
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a9b: stale read with foreign bytes is still intercepted alongside a fresh journal ---");
+{
+	// Fail-closed contrast for 19a9a: a fresh own-origin journal does not
+	// authorize dropping stale bytes that match no snapshot.
+	const {
+		manager,
+		binding,
+		setLiveEditorContent,
+		interceptedExternalReloads,
+	} = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "pre-edit baseline");
+	setLiveEditorContent("pre-edit baseline");
+	(manager as unknown as {
+		filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+	}).filterRiskyNonUserPatch({
+		docChanged: true,
+		startState: binding.cm.state,
+		newDoc: { toString: () => "own edit" },
+		annotation: () => undefined,
+		isUserEvent: () => false,
+	});
+
+	const stale = externalDiskMutationNotice(
+		binding.path,
+		"foreign external",
+		1798.5,
+		{ ctime: 1798.25, sequence: 1798, observedAt: 1798.75 },
+	);
+	const newer = externalDiskMutationNotice(
+		binding.path,
+		"newer external",
+		1799.5,
+		{ ctime: 1799.25, sequence: 1799, observedAt: 1799.75 },
+	);
+	manager.beginExternalDiskMutation(binding.path, stale.sequence);
+	manager.beginExternalDiskMutation(binding.path, newer.sequence);
+	manager.noteExternalDiskMutation(newer);
+	manager.noteExternalDiskMutation(stale);
+
+	assertEq(interceptedExternalReloads.length, 1, "foreign stale bytes are still preserved");
+	assertCandidateMatchesNotice(
+		interceptedExternalReloads[0],
+		stale,
+		"foreign stale completion interception",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 19a9c: the own-origin journal retains a bounded FIFO of fresh snapshots ---");
+{
+	const {
+		manager,
+		binding,
+		setLiveEditorContent,
+	} = buildManagerFixture({
+		lastEditorChangeAgeMs: 10_000,
+		lastEditorDocChangeAgeMs: 10_000,
+	});
+	for (const step of ["edit one", "edit two", "edit three", "edit four", "edit five"]) {
+		binding.ytext.delete(0, binding.ytext.length);
+		binding.ytext.insert(0, binding.cm.state.doc.toString());
+		(manager as unknown as {
+			filterRiskyNonUserPatch: (transaction: unknown) => unknown;
+		}).filterRiskyNonUserPatch({
+			docChanged: true,
+			startState: binding.cm.state,
+			newDoc: { toString: () => step },
+			annotation: () => undefined,
+			isUserEvent: () => false,
+		});
+		setLiveEditorContent(step);
+	}
+	const journal = (manager as unknown as {
+		recentEditorOriginChanges: Map<string, Array<{ afterContent: string }>>;
+	}).recentEditorOriginChanges.get(binding.path) ?? [];
+	assertEq(journal.length, 4, "journal caps at the FIFO limit");
+	assertEq(journal[0]?.afterContent, "edit two", "oldest snapshot beyond the cap is pruned first");
+	assertEq(journal[3]?.afterContent, "edit five", "newest snapshot stays at the tail");
 	clearPendingHealthChecks(manager);
 }
 

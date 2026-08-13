@@ -56,6 +56,13 @@ const LIVE_UPDATE_HEALTH_RETRY_DELAY_MS = 120;
 const RECENT_EDITOR_REPAIR_DEFER_MS = 1200;
 const RECENT_EDITOR_PATCH_SHIELD_MS = 5000;
 const EXTERNAL_DISK_RELOAD_CORRELATION_MS = 5000;
+/**
+ * Maximum fresh own-origin snapshots retained per path for disk-write
+ * correlation. A multi-step own edit (e.g. checkbox toggle followed by a
+ * tasks-plugin completion-date append) journals several snapshots, and an
+ * autosave or stale read of an earlier step must still correlate.
+ */
+const RECENT_EDITOR_ORIGIN_CHANGE_LIMIT = 4;
 const TYPING_AWARENESS_MIN_INTERVAL_MS = 750;
 const CONCURRENT_TYPING_NOTICE_COOLDOWN_MS = 8_000;
 const EDITOR_AUTHORITY_SHIELD_ORIGINS = new Set<string>([
@@ -390,7 +397,7 @@ export class EditorBindingManager {
 	private pendingExternalDiskMutationStarts = new Map<string, PendingExternalDiskMutationStart>();
 	private pendingExternalDiskHostProjectionFences =
 		new WeakMap<EditorState, PendingExternalDiskHostProjectionFence>();
-	private recentEditorOriginChanges = new Map<string, RecentEditorOriginChange>();
+	private recentEditorOriginChanges = new Map<string, RecentEditorOriginChange[]>();
 	private lastExternalDiskMutationSequenceByPath = new Map<string, number>();
 	private observedExternalDiskMutationSequenceByPath = new Map<string, number>();
 	private readonly fileTransitionFences = new Map<MarkdownView, EditorFileTransitionFence>();
@@ -574,6 +581,18 @@ export class EditorBindingManager {
 		if (notice.sequence <= previousSequence) {
 			// Async reads may finish out of order. Never replace a newer exact
 			// marker with an older revision; preserve the older proven bytes instead.
+			// One provable exception: bytes that exactly match a kaos-captured
+			// recent editor-origin snapshot (the editor's own before/after state)
+			// cannot be unique external work, so they are dropped instead of
+			// preserved. Everything else keeps the fail-closed artifact path.
+			if (notice.content !== null && this.isStaleNoticeOwnOrigin(notice)) {
+				this.trace?.("editor", "external-disk-reload-guard-stale-own-origin-dropped", {
+					path: notice.path,
+					sequence: notice.sequence,
+					currentSequence: previousSequence,
+				});
+				return;
+			}
 			if (notice.content !== null) {
 				this.notifyExternalDiskReloadIntercepted(notice);
 			}
@@ -587,17 +606,23 @@ export class EditorBindingManager {
 		}
 		this.lastExternalDiskMutationSequenceByPath.set(notice.path, notice.sequence);
 		const now = Date.now();
-		const candidate = this.getFreshRecentEditorOriginChange(notice.path, now);
 		const normalizedDiskContent = notice.content === null
 			? null
 			: normalizeEditorText(notice.content);
 		if (this.promoteHeldExternalDiskHostProjection(notice, normalizedDiskContent, now)) {
 			return;
 		}
-		const candidateContentMatches =
-			candidate !== null &&
-			normalizedDiskContent !== null &&
-			candidate.afterContent === normalizedDiskContent;
+		// A multi-step own edit journals several snapshots; correlate against
+		// the freshest snapshot whose exact post-change bytes equal the disk
+		// content, not only against the latest snapshot.
+		const candidate = normalizedDiskContent === null
+			? null
+			: this.getFreshRecentEditorOriginChangeMatchingContent(
+				notice.path,
+				now,
+				normalizedDiskContent,
+			);
+		const candidateContentMatches = candidate !== null;
 		const exactDiskRevisionMatches =
 			candidate !== null &&
 			candidate.observedDiskMtime !== null &&
@@ -715,6 +740,21 @@ export class EditorBindingManager {
 			retireScheduled: false,
 			candidateDeliveredFromEarlyHostProjection: false,
 		});
+	}
+
+	/**
+	 * A stale out-of-order disk read is own-origin when its exact normalized
+	 * bytes equal the before or after snapshot of a fresh recent editor-origin
+	 * change. Those bytes are a state the bound editor itself passed through,
+	 * so preserving them as a conflict artifact adds no recoverable information.
+	 */
+	private isStaleNoticeOwnOrigin(notice: ExternalDiskMutationNotice): boolean {
+		if (notice.content === null) return false;
+		const normalized = normalizeEditorText(notice.content);
+		return this.getFreshRecentEditorOriginChanges(notice.path, Date.now())
+			.some((entry) =>
+				entry.beforeContent === normalized || entry.afterContent === normalized
+			);
 	}
 
 	/**
@@ -2815,24 +2855,69 @@ export class EditorBindingManager {
 	}
 
 	private rememberRecentEditorOriginChange(candidate: RecentEditorOriginChange): void {
-		this.recentEditorOriginChanges.set(candidate.path, candidate);
+		const now = Date.now();
+		const entries = this.pruneRecentEditorOriginChanges(candidate.path, now);
+		entries.push(candidate);
+		while (entries.length > RECENT_EDITOR_ORIGIN_CHANGE_LIMIT) {
+			entries.shift();
+		}
+		this.recentEditorOriginChanges.set(candidate.path, entries);
 		setTimeout(() => {
-			if (this.recentEditorOriginChanges.get(candidate.path) === candidate) {
-				this.recentEditorOriginChanges.delete(candidate.path);
-			}
+			this.pruneRecentEditorOriginChanges(candidate.path, Date.now());
 		}, EXTERNAL_DISK_RELOAD_CORRELATION_MS);
+	}
+
+	private pruneRecentEditorOriginChanges(
+		path: string,
+		now: number,
+	): RecentEditorOriginChange[] {
+		const entries = this.recentEditorOriginChanges.get(path) ?? [];
+		const fresh = entries.filter(
+			(entry) => now - entry.at <= EXTERNAL_DISK_RELOAD_CORRELATION_MS,
+		);
+		if (fresh.length === 0) {
+			this.recentEditorOriginChanges.delete(path);
+			return [];
+		}
+		if (fresh.length !== entries.length) {
+			this.recentEditorOriginChanges.set(path, fresh);
+		}
+		return fresh;
 	}
 
 	private getFreshRecentEditorOriginChange(
 		path: string,
 		now: number,
 	): RecentEditorOriginChange | null {
-		const candidate = this.recentEditorOriginChanges.get(path);
-		if (!candidate) return null;
-		if (now - candidate.at <= EXTERNAL_DISK_RELOAD_CORRELATION_MS) {
-			return candidate;
+		const entries = this.pruneRecentEditorOriginChanges(path, now);
+		return entries.length > 0 ? entries[entries.length - 1]! : null;
+	}
+
+	/** Fresh own-origin snapshots for a path, oldest first. */
+	private getFreshRecentEditorOriginChanges(
+		path: string,
+		now: number,
+	): RecentEditorOriginChange[] {
+		return this.pruneRecentEditorOriginChanges(path, now);
+	}
+
+	/**
+	 * The freshest own-origin snapshot whose exact post-change bytes equal the
+	 * normalized disk content, or null. A multi-step edit journals several
+	 * snapshots; an autosave of an earlier step must still correlate instead
+	 * of being misread as an external write.
+	 */
+	private getFreshRecentEditorOriginChangeMatchingContent(
+		path: string,
+		now: number,
+		normalizedContent: string,
+	): RecentEditorOriginChange | null {
+		const entries = this.pruneRecentEditorOriginChanges(path, now);
+		for (let index = entries.length - 1; index >= 0; index--) {
+			if (entries[index]!.afterContent === normalizedContent) {
+				return entries[index]!;
+			}
 		}
-		this.recentEditorOriginChanges.delete(path);
 		return null;
 	}
 

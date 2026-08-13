@@ -1,7 +1,7 @@
 {
 	"id": "kaos",
 	"name": "KAOS",
-	"version": "1.11.3",
+	"version": "1.11.4",
 	"minAppVersion": "1.5.0",
 	"description": "A zero-terminal, real-time sync engine powered by your own Cloudflare Worker.",
 	"author": "adtstack",
