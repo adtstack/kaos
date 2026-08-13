@@ -55,7 +55,9 @@ export function collectDashboardConflictArtifacts(
 	const artifacts: DashboardConflictArtifact[] = [];
 	for (const file of files) {
 		const parsed = parseConflictArtifactPath(file.path);
-		if (!parsed || parsed.source === "local") continue;
+		// Markdown conflict-artifact preservation is abolished; only blob
+		// conflicts (binary, no CRDT history) remain in the Conflicts tab.
+		if (!parsed || parsed.kind !== "blob" || parsed.source === "local") continue;
 		artifacts.push(buildConflictArtifact(input, file, parsed));
 	}
 	return sortDashboardArtifacts(artifacts);

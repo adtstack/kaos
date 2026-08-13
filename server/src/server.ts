@@ -24,6 +24,7 @@ import {
 	type RecoverySnapshotResult,
 } from "./recoverySnapshot";
 import {
+	appendAuditTraceEntry,
 	appendTraceEntry,
 	listRecentTraceEntries,
 	prepareTraceEntryForStorage,
@@ -375,6 +376,22 @@ export class VaultSyncServer extends YServer {
 			}
 
 			await this.recordTrace(body.event, body.data ?? {});
+			// Durable audit channel: the public /vault/:id/trace endpoint is the
+			// plugin's revision-discard audit. Persist beyond the bounded debug
+			// ring so a discarded revision stays observable after ring eviction.
+			try {
+				await appendAuditTraceEntry(
+					this.ctx.storage,
+					prepareTraceEntryForStorage({
+						...body.data,
+						ts: new Date().toISOString(),
+						event: body.event,
+						roomId: this.getRoomId(),
+					}),
+				);
+			} catch (err) {
+				console.error(`${LOG_PREFIX} audit persist failed:`, err);
+			}
 			return json({ ok: true });
 		}
 

@@ -2639,8 +2639,8 @@ console.log("\n--- Test 19a3c2b: filter:false host merge cannot cross a provider
 	);
 	assertEq(
 		rollbackProjection,
-		providerContent,
-		"post-update CAS projects the provider authority back into CM",
+		null,
+		"editor rollback is abolished: no post-update CAS projects Y.Text back into CM",
 	);
 	assertEq(
 		interceptedExternalReloads.length,
@@ -2840,14 +2840,9 @@ console.log("\n--- Test 19a3c2d: rollback projects a provider advance whose byte
 		"provider same-bytes authority is not replaced by captured old CRDT bytes",
 	);
 	assertEq(
-		correctedState?.doc.toString() ?? null,
-		externalContent,
-		"latest Y.Text bytes are projected into CodeMirror",
-	);
-	assertEq(
-		correctedState?.facet(ySyncFacet)?.ytext === binding.ytext,
-		true,
-		"equal CM and Y.Text state safely reattaches collaboration",
+		correctedState,
+		null,
+		"editor rollback is abolished: Y.Text bytes are never projected into CodeMirror",
 	);
 	assertEq(interceptedExternalReloads.length, 1, "same-bytes provider race preserves one disk candidate");
 	assertCandidateMatchesNotice(
@@ -3256,7 +3251,11 @@ console.log("\n--- Test 19a3d: event order survives delayed exact-content proof 
 	recordExpectedEditorYTextPatch(manager, binding);
 	manager.noteExternalDiskMutation(notice);
 
-	assertEq(binding.ytext.toString(), "typing now", "synchronous event sequence restores editor authority");
+	assertEq(
+		binding.ytext.toString(),
+		externalContent,
+		"editor rollback is abolished: Y.Text keeps the editor's own bytes, never rewound",
+	);
 	assertEq(interceptedExternalReloads.length, 1, "delayed proof still preserves the exact external version");
 	assertCandidateMatchesNotice(
 		interceptedExternalReloads[0],
@@ -3379,12 +3378,16 @@ console.log("\n--- Test 19a5: late external event uses exact CAS rollback ---");
 	recordExpectedEditorYTextPatch(manager, binding);
 	manager.noteExternalDiskMutation(notice);
 
-	assertEq(binding.ytext.toString(), "typing now", "exact unchanged Y.Text is restored to editor authority");
+	assertEq(
+		binding.ytext.toString(),
+		"late external replacement",
+		"editor rollback is abolished: Y.Text is never rewound to the pre-reload state",
+	);
 	assertEq(interceptedExternalReloads.length, 1, "late external candidate is preserved exactly once");
 	assertCandidateMatchesNotice(
 		interceptedExternalReloads[0],
 		notice,
-		"late editor-first rollback interception",
+		"late editor-first interception",
 	);
 	clearPendingHealthChecks(manager);
 }

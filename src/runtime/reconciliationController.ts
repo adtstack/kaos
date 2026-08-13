@@ -47,7 +47,6 @@ import { mergeTexts3 } from "../utils/threeWayMerge";
 import {
 	ORIGIN_DISK_SYNC,
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
-	ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
 	ORIGIN_OPEN_EXTERNAL_EDIT_MERGE,
 } from "../sync/origins";
 import { planClosedFileReconcile } from "./reconcile/closedFilePlanner";
@@ -77,11 +76,6 @@ import {
 	type UnresolvedStructuralChange,
 } from "./reconcile/noEventStructuralPlanner";
 import { evaluatePathBindingIntegrity } from "../sync/pathBindingIntegrity";
-import {
-	buildMarkdownConflictArtifactCopyPath,
-	buildMarkdownConflictArtifactPath,
-	isMarkdownConflictArtifactForOriginalPath,
-} from "../paths/conflictArtifactPath";
 import { isCrdtDocumentPath } from "../paths/crdtDocumentPath";
 import { getOpenFileViewsForPath } from "../utils/openFileViews";
 import {
@@ -156,7 +150,6 @@ export type StableMarkdownReadResult =
 
 type ExternalCandidatePreservationResult =
 	| { kind: "preserved" }
-	| { kind: "failed-retained" }
 	| { kind: "invalidated" };
 
 interface ActiveMarkdownIngest {
@@ -335,7 +328,7 @@ type OpenExternalTraceMessage =
 	| "open-external-candidate-captured"
 	| "open-external-recent-typing-deferred"
 	| "open-external-clean-merge-applied"
-	| "open-external-overlapping-hunk-preserved"
+	| "open-external-overlapping-hunk-discarded"
 	| "open-external-frontmatter-blocked"
 	| "open-external-disk-settled"
 	| "open-external-baseline-advanced";
@@ -376,11 +369,6 @@ type ClosedFileReconcileMutationCommit<T> =
 	| { kind: "committed"; value: T }
 	| { kind: "stale" };
 
-interface MarkdownConflictArtifactResult {
-	path: string;
-	created: boolean;
-}
-
 interface ReconciliationControllerDeps {
 	app: App;
 	getSettings(): VaultSyncSettings;
@@ -393,7 +381,6 @@ interface ReconciliationControllerDeps {
 	setDiskIndex(index: DiskIndex): void;
 	getBaselineText?(contentHash: string): Promise<string | null> | string | null;
 	recordBaselineText?(contentHash: string, text: string): void;
-	recordConflictMergeBase?(artifactPath: string, baseHash: string): void;
 	isMarkdownPathSyncable(path: string): boolean;
 	/** Provider-generation admission for CRDT-to-disk projection only. */
 	isRemoteProjectionAllowed?(path: string): boolean;
@@ -457,6 +444,14 @@ interface ReconciliationControllerDeps {
 	 * Must not be wired in production main.ts.
 	 */
 	registerDiskIngestPort?(port: DiskIngestPort): void;
+	/**
+	 * Optional: durable audit sink for discarded markdown revisions. With
+	 * conflict-artifact preservation abolished, every losing revision is
+	 * reported here (path identity already hashed) instead of being written
+	 * to a `(KAOS conflict ...)` file. Absent in tests unless a capture stub
+	 * is wired.
+	 */
+	recordDiscardedRevision?(path: string, contentHash: string, reason: string): void;
 }
 
 const RECONCILE_COOLDOWN_MS = 10_000;
@@ -631,17 +626,12 @@ export class ReconciliationController {
 		new Map<string, Set<OpenFlushAuthorityLease>>();
 	/** Exact raw intercepted disk revisions awaiting safe open-file reconciliation. */
 	private interceptedExternalDiskMutations = new Map<string, InterceptedExternalDiskMutation>();
-	/** FIFO revisions that must reach a durable artifact before retirement. */
+	/** FIFO revisions that must reach the discard audit before retirement. */
 	private pendingSupersededExternalDiskMutations =
 		new Map<string, InterceptedExternalDiskMutation[]>();
-	/** At most one superseded-candidate artifact drain may write for a path. */
+	/** At most one superseded-candidate drain may run for a path. */
 	private supersededExternalPreservationByPath =
 		new Map<string, Promise<ExternalCandidatePreservationResult>>();
-	/** Exact Attention episode owned by a failed superseded-candidate write. */
-	private supersededExternalPreservationFailures = new Map<string, {
-		candidate: InterceptedExternalDiskMutation;
-		episodeId: string;
-	}>();
 	/** Monotonic path-identity fence for intercepted external disk candidates. */
 	private externalCandidateIdentityEpochs = new Map<string, number>();
 	/** Invalidates fire-and-forget preservation work across reset/reinitialization. */
@@ -659,18 +649,13 @@ export class ReconciliationController {
 	 * "same diff repeating," this catches "growing diff repeating."
 	 */
 	private amplificationHistory = new Map<string, AmplificationEntry[]>();
-	private lastConflictFingerprints = new Map<string, string>();
 	private blockedDivergenceCount = 0;
 	private lastBlockedDivergenceAt: string | null = null;
 	private blockedDivergenceSample: Array<{ ext: string; hash: string }> = [];
 	private unresolvedStructuralChanges: UnresolvedStructuralChange[] = [];
 	private readonly diagnosticPathSalt =
 		Math.random().toString(36).slice(2) + Date.now().toString(36);
-	/** Conflict notice throttle: suppress repeat notices within window. */
-	private lastConflictNoticeAt = 0;
-	private conflictNoticeSuppressionCount = 0;
-	private static readonly CONFLICT_NOTICE_COOLDOWN_MS = 30_000;
-	/** Amplification-quarantine notice throttle. Independent from conflict notices. */
+	/** Amplification-quarantine notice throttle. */
 	private lastAmplificationNoticeAt = 0;
 	private amplificationNoticeSuppressionCount = 0;
 	private static readonly AMPLIFICATION_NOTICE_COOLDOWN_MS = 60_000;
@@ -808,7 +793,6 @@ export class ReconciliationController {
 		this.interceptedExternalDiskMutations.clear();
 		this.pendingSupersededExternalDiskMutations.clear();
 		this.supersededExternalPreservationByPath.clear();
-		this.supersededExternalPreservationFailures.clear();
 		// lifecycleGeneration advances before epochs reset, so old async work cannot
 		// become current again when a cleared path starts at epoch zero.
 		this.externalCandidateIdentityEpochs.clear();
@@ -816,13 +800,10 @@ export class ReconciliationController {
 		this.lastMarkdownDirtyAt = 0;
 		this.recoveryFingerprints.clear();
 		this.amplificationHistory.clear();
-		this.lastConflictFingerprints.clear();
 		this.blockedDivergenceCount = 0;
 		this.lastBlockedDivergenceAt = null;
 		this.blockedDivergenceSample = [];
 		this.unresolvedStructuralChanges = [];
-		this.lastConflictNoticeAt = 0;
-		this.conflictNoticeSuppressionCount = 0;
 		this.lastAmplificationNoticeAt = 0;
 		this.amplificationNoticeSuppressionCount = 0;
 		this.boundRecoveryLocks.clear();
@@ -1066,36 +1047,63 @@ export class ReconciliationController {
 		return { kind: "stale" };
 	}
 
+	/**
+	 * Record a discarded markdown revision without creating a conflict
+	 * artifact file. With preservation abolished, the losing revision is
+	 * reported through the local trace and the durable server audit sink;
+	 * recovery is left to the CRDT journal/snapshots, the disk-index
+	 * baseline, and git. `contentHash` may be supplied when the caller
+	 * already computed it (avoids a redundant sha256).
+	 */
+	private async recordDiscardedRevision(
+		path: string,
+		content: string,
+		reason: string,
+		contentHash?: string,
+	): Promise<void> {
+		let resolvedHash = contentHash ?? null;
+		if (resolvedHash === null) {
+			try {
+				resolvedHash = await contentBaselineHash(content);
+			} catch {
+				resolvedHash = null;
+			}
+		}
+		this.deps.trace("conflict", "revision-discarded", {
+			path,
+			reason,
+			contentLength: content.length,
+			contentHash: resolvedHash?.slice(0, 16) ?? null,
+			contentFingerprint: contentFingerprint(content),
+		});
+		this.deps.recordDiscardedRevision?.(
+			path,
+			resolvedHash ?? contentFingerprint(content),
+			reason,
+		);
+	}
+
+	/**
+	 * Record that a stale closed-file decision superseded a disk snapshot.
+	 * The stale CAS means the decision is retried with a fresh read, so the
+	 * bytes are still on disk; the trace/audit record keeps the event
+	 * observable without an artifact file.
+	 */
 	private async preserveStaleClosedFileDiskSnapshot(
 		path: string,
 		diskContent: string,
 		stage: string,
 	): Promise<void> {
-		try {
-			const artifact = await this.createMarkdownConflictArtifact(
-				path,
-				diskContent,
-				`stale-${stage}`,
-				"disk",
-			);
-			this.deps.trace("conflict", "closed-file-stale-decision-preserved", {
-				path,
-				stage,
-				conflictPath: artifact.path,
-				conflictArtifactCreated: artifact.created,
-				diskLength: diskContent.length,
-			});
-		} catch (err) {
-			this.deps.getDiskMirror()?.recordPreservedUnresolved?.(
-				path,
-				"conflict-artifact-write-failed",
-			);
-			this.deps.trace("conflict", "closed-file-stale-decision-preserve-failed", {
-				path,
-				stage,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		}
+		await this.recordDiscardedRevision(
+			path,
+			diskContent,
+			`stale-${stage}`,
+		);
+		this.deps.trace("conflict", "closed-file-stale-decision-recorded", {
+			path,
+			stage,
+			diskLength: diskContent.length,
+		});
 	}
 
 	private async applyNoEventStructuralPrepass(input: {
@@ -1463,14 +1471,11 @@ export class ReconciliationController {
 
 				diskFiles.delete(path);
 				diskSnapshotRevisions.delete(path);
-				const reason = candidateAdmission.kind === "failed-retained"
-					? "external-candidate-preservation-failed"
-					: "external-candidate-admission-invalidated";
-				this.requestReconciliationFollowup(path, reason);
+				this.requestReconciliationFollowup(path, "external-candidate-admission-invalidated");
 				this.deps.trace("reconcile", "external-candidate-admission-deferred", {
 					path,
 					stage: "full-reconcile-open-file",
-					reason,
+					reason: "external-candidate-admission-invalidated",
 				});
 			}
 
@@ -2378,99 +2383,78 @@ export class ReconciliationController {
 									});
 								}
 							}
-							try {
-								const preservedContent = action.preserveSide === "disk" ? diskContent : crdtContent;
-								const conflictArtifact = await this.createMarkdownConflictArtifact(
+							const preservedContent = action.preserveSide === "disk" ? diskContent : crdtContent;
+							await this.recordDiscardedRevision(
+								path,
+								preservedContent,
+								`closed-file-${action.reason}`,
+								action.preserveSide === "disk" ? diskHash : crdtHash,
+							);
+							if (action.winner === "disk") {
+								const diskWinnerCommit = await this.commitClosedFileReconcileMutation({
 									path,
-									preservedContent,
-									`closed-file-${action.reason}`,
-									action.preserveSide,
-								);
-								const conflictPath = conflictArtifact.path;
-								if (baselineHash !== null) {
-									this.deps.recordConflictMergeBase?.(conflictPath, baselineHash);
-								}
-								if (action.winner === "disk") {
-									const diskWinnerCommit = await this.commitClosedFileReconcileMutation({
+									file: eligibleFileByPath.get(path) ?? null,
+									expectedYText: ytext,
+									expectedDiskContent: diskContent,
+									expectedCrdtContent: crdtContent,
+									expectedDiskRevision: diskSnapshotRevisions.get(path) ?? -1,
+									stage: "closed-file-conflict-disk-wins",
+									commit: () => {
+										applyDiffToYTextWithPostcondition(
+											ytext,
+											crdtContent,
+											diskContent,
+											ORIGIN_DISK_SYNC_RECOVER_BOUND,
+										);
+										recordSettledBaseline(path, diskHash, diskContent);
+									},
+								});
+								if (diskWinnerCommit.kind === "stale") {
+									staleClosedDecisionIndexPaths.add(path);
+									this.requestReconciliationFollowup(
 										path,
-										file: eligibleFileByPath.get(path) ?? null,
-										expectedYText: ytext,
-										expectedDiskContent: diskContent,
-										expectedCrdtContent: crdtContent,
-										expectedDiskRevision: diskSnapshotRevisions.get(path) ?? -1,
-										stage: "closed-file-conflict-disk-wins",
-										commit: () => {
-											applyDiffToYTextWithPostcondition(
-												ytext,
-												crdtContent,
-												diskContent,
-												ORIGIN_DISK_SYNC_RECOVER_BOUND,
-											);
-											recordSettledBaseline(path, diskHash, diskContent);
-										},
-									});
-									if (diskWinnerCommit.kind === "stale") {
+										"closed-file-conflict-disk-wins-stale",
+									);
+									await this.preserveStaleClosedFileDiskSnapshot(
+										path,
+										diskContent,
+										"closed-file-conflict-disk-wins",
+									);
+									continue;
+								}
+								} else {
+									const remoteProjectionAdmission =
+										this.captureRemoteProjectionAdmission(
+											diskMirror,
+											[path],
+										);
+									if (remoteProjectionAdmission) {
+										updatesToFlush.push({
+											path,
+											baselineActionKind: "conflict-crdt-wins",
+											expectedDiskContent: diskContent,
+											remoteProjectionAdmission,
+										});
+									} else {
 										staleClosedDecisionIndexPaths.add(path);
 										this.requestReconciliationFollowup(
 											path,
-											"closed-file-conflict-disk-wins-stale",
+											"closed-file-conflict-crdt-wins-policy-held",
 										);
-										await this.preserveStaleClosedFileDiskSnapshot(
-											path,
-											diskContent,
-											"closed-file-conflict-disk-wins",
-										);
-										continue;
 									}
-									} else {
-										const remoteProjectionAdmission =
-											this.captureRemoteProjectionAdmission(
-												diskMirror,
-												[path],
-											);
-										if (remoteProjectionAdmission) {
-											updatesToFlush.push({
-												path,
-												baselineActionKind: "conflict-crdt-wins",
-												expectedDiskContent: diskContent,
-												remoteProjectionAdmission,
-											});
-										} else {
-											staleClosedDecisionIndexPaths.add(path);
-											this.requestReconciliationFollowup(
-												path,
-												"closed-file-conflict-crdt-wins-policy-held",
-											);
-										}
-									}
-								this.deps.trace("conflict", "closed-file-conflict-preserved", {
-									path,
-									conflictPath,
-									reason: action.reason,
-									winner: action.winner,
-									preservedSide: action.preserveSide,
-									diskLength: diskContent.length,
-									crdtLength: crdtContent.length,
-								});
-								if (action.winner === "disk") {
-									flushedUpdates++;
 								}
-								continue;
-							} catch (err) {
-								diskMirror.recordPreservedUnresolved(
-									path,
-									"conflict-artifact-write-failed",
-								);
-								this.deps.trace("conflict", "closed-file-conflict-preserve-failed", {
-									path,
-									reason: action.reason,
-									error: err instanceof Error ? err.message : String(err),
-								});
-								// Baseline advancement: defer on artifact creation failure
-								// (planBaselineAdvancement would return defer, but we skip calling it
-								// since we're not setting any hash anyway - the path is dropped)
-								continue;
+							this.deps.trace("conflict", "closed-file-conflict-discarded", {
+								path,
+								reason: action.reason,
+								winner: action.winner,
+								preservedSide: action.preserveSide,
+								diskLength: diskContent.length,
+								crdtLength: crdtContent.length,
+							});
+							if (action.winner === "disk") {
+								flushedUpdates++;
 							}
+							continue;
 						}
 						if (action.kind === "import-disk-to-crdt") {
 							const importCommit = await this.commitClosedFileReconcileMutation({
@@ -3299,92 +3283,43 @@ export class ReconciliationController {
 			const candidate = pending?.[0];
 			if (!pending || !candidate) return { kind: "preserved" };
 
-			// Fail-closed preservation admits one provably redundant class: a
-			// superseded disk revision whose exact bytes hash to the durable
-			// disk-index contentHash. Those bytes are already durably recorded
-			// as the last clean-settlement baseline, so an artifact for them
-			// adds zero recoverable information. A missing index entry or hash
-			// disables the skip and preserves as before — inability to prove
-			// redundancy is not proof of cleanliness.
-			const durableBaselineHash =
-				this.deps.getDiskIndex()[candidate.path]?.contentHash ?? null;
-			if (durableBaselineHash !== null) {
-				const candidateHash = await contentBaselineHash(candidate.content);
-				if (!isCurrent()) return { kind: "invalidated" };
-				if (candidateHash === durableBaselineHash) {
-					this.deps.trace(
-						"conflict",
-						"superseded-external-revision-baseline-skipped",
-						{
-							path: candidate.path,
-							sequence: candidate.sequence,
-							contentLength: candidate.content.length,
-							baselineHashPrefix: durableBaselineHash.slice(0, 12),
-						},
-					);
-					if (
-						this.retirePendingSupersededCandidate(path, pending, candidate) ===
-						"invalidated"
-					) {
-						return { kind: "invalidated" };
-					}
-					continue;
-				}
-			}
-
-			try {
-				await this.createMarkdownConflictArtifact(
-					candidate.path,
-					candidate.content,
-					"superseded-external-revision",
-					"disk",
-					isCurrent,
-				);
-			} catch (error) {
-				if (!isCurrent()) return { kind: "invalidated" };
-				this.deps.getDiskMirror()?.recordPreservedUnresolved?.(
-					candidate.path,
-					"conflict-artifact-write-failed",
-				);
-				this.deps.trace("conflict", "superseded-external-revision-preserve-failed", {
-					path: candidate.path,
-					sequence: candidate.sequence,
-					errorCategory: error instanceof Error ? "exception" : "non-error-throw",
-				});
-				const failureEntry = this.getPreservedUnresolvedMarkdownEntries()
-					.find((entry) =>
-						entry.path === path && entry.reason === "conflict-artifact-write-failed"
-					);
-				if (failureEntry) {
-					this.supersededExternalPreservationFailures.set(path, {
-						candidate,
-						episodeId: getPreservedUnresolvedEpisodeId(failureEntry),
-					});
-				}
-				return { kind: "failed-retained" };
-			}
-
+			// With conflict-artifact preservation abolished, every distinct
+			// superseded disk revision is recorded (trace + durable server
+			// audit) instead of written to a `(KAOS conflict ...)` file. The
+			// bytes may be genuinely unrecoverable elsewhere (already
+			// overwritten on disk, never ingested into CRDT), so the audit
+			// record is the only trace of what was lost.
+			const candidateHash = await contentBaselineHash(candidate.content);
 			if (!isCurrent()) return { kind: "invalidated" };
-			const ownedFailure = this.supersededExternalPreservationFailures.get(path);
-			if (
-				ownedFailure &&
-				this.isSameExternalCandidate(ownedFailure.candidate, candidate)
-			) {
-				const currentEntry = this.getPreservedUnresolvedMarkdownEntries()
-					.find((entry) => entry.path === path);
-				if (
-					currentEntry?.reason === "conflict-artifact-write-failed" &&
-					getPreservedUnresolvedEpisodeId(currentEntry) === ownedFailure.episodeId
-				) {
-					this.deps.getDiskMirror()?.clearPreservedUnresolved?.(path);
-				}
-				this.supersededExternalPreservationFailures.delete(path);
-			}
 			if (
 				this.retirePendingSupersededCandidate(path, pending, candidate) ===
 				"invalidated"
 			) {
 				return { kind: "invalidated" };
+			}
+			// One provably redundant class is not even audited: bytes that
+			// hash to the durable disk-index contentHash are the baseline and
+			// nothing was lost.
+			const durableBaselineHash =
+				this.deps.getDiskIndex()[candidate.path]?.contentHash ?? null;
+			if (durableBaselineHash === null || candidateHash !== durableBaselineHash) {
+				await this.recordDiscardedRevision(
+					candidate.path,
+					candidate.content,
+					"superseded-external-revision",
+					candidateHash,
+				);
+			} else {
+				this.deps.trace(
+					"conflict",
+					"superseded-external-revision-baseline-skipped",
+					{
+						path: candidate.path,
+						sequence: candidate.sequence,
+						contentLength: candidate.content.length,
+						baselineHashPrefix: durableBaselineHash.slice(0, 12),
+					},
+				);
 			}
 		}
 		return { kind: "invalidated" };
@@ -3482,30 +3417,15 @@ export class ReconciliationController {
 		return this.externalCandidateIdentityEpochs.get(path) ?? 0;
 	}
 
-	private clearInvalidatedExternalCandidateAttention(path: string): void {
-		const ownedFailure = this.supersededExternalPreservationFailures.get(path);
-		if (!ownedFailure) return;
-		const currentEntry = this.getPreservedUnresolvedMarkdownEntries()
-			.find((entry) => entry.path === path);
-		if (
-			currentEntry?.reason === "conflict-artifact-write-failed" &&
-			getPreservedUnresolvedEpisodeId(currentEntry) === ownedFailure.episodeId
-		) {
-			this.deps.getDiskMirror()?.clearPreservedUnresolved?.(path);
-		}
-	}
-
 	private invalidateExternalCandidateIdentity(path: string): void {
-		// Fence in-flight artifact work before inspecting or clearing its Attention
-		// ownership, so a stale catch cannot publish a replacement episode afterward.
+		// Fence in-flight candidate work before clearing its state, so a stale
+		// pass cannot republish a superseded candidate after invalidation.
 		this.externalCandidateIdentityEpochs.set(
 			path,
 			this.getExternalCandidateIdentityEpoch(path) + 1,
 		);
-		this.clearInvalidatedExternalCandidateAttention(path);
 		this.interceptedExternalDiskMutations.delete(path);
 		this.pendingSupersededExternalDiskMutations.delete(path);
-		this.supersededExternalPreservationFailures.delete(path);
 	}
 
 	private getMatchingInterceptedExternalDiskMutation(
@@ -4570,19 +4490,6 @@ export class ReconciliationController {
 				});
 				return;
 			}
-			if (externalCandidateAdmission.kind === "failed-retained") {
-				const notBeforeMs = Date.now() + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS;
-				this.mergeDirtyEntryIntoPath(path, {
-					...entry,
-					notBeforeMs: Math.max(entry.notBeforeMs ?? 0, notBeforeMs),
-				});
-				this.deps.trace("reconcile", "external-candidate-admission-deferred", {
-					path,
-					stage: "dirty-ingest",
-					notBeforeMs,
-				});
-				return;
-			}
 
 			const diskMirror = this.deps.getDiskMirror();
 			const preservedEntry = this.getPreservedUnresolvedMarkdownEntries()
@@ -4821,20 +4728,11 @@ export class ReconciliationController {
 					return;
 				}
 				if (visibleDecision.kind === "disk-wins") {
-					try {
-						await this.createMarkdownConflictArtifact(
-							path,
-							crdtContent,
-							"closed-dirty-visible-authority-disk-wins",
-							"crdt",
-						);
-					} catch {
-						diskMirror?.recordPreservedUnresolved(
-							path,
-							"conflict-artifact-write-failed",
-						);
-						return;
-					}
+					await this.recordDiscardedRevision(
+						path,
+						crdtContent,
+						"closed-dirty-visible-authority-disk-wins",
+					);
 					const diskWinnerCommit = await this.commitClosedFileReconcileMutation({
 						path,
 						file,
@@ -4873,20 +4771,11 @@ export class ReconciliationController {
 					return;
 				}
 				if (visibleDecision.kind === "crdt-wins") {
-					try {
-						await this.createMarkdownConflictArtifact(
-							path,
-							content,
-							"closed-dirty-visible-authority-crdt-wins",
-							"disk",
-						);
-					} catch {
-						diskMirror?.recordPreservedUnresolved(
-							path,
-							"conflict-artifact-write-failed",
-						);
-						return;
-					}
+					await this.recordDiscardedRevision(
+						path,
+						content,
+						"closed-dirty-visible-authority-crdt-wins",
+					);
 					const crdtWinnerAdmission = await this.commitClosedFileReconcileMutation({
 						path,
 						file,
@@ -5223,17 +5112,11 @@ export class ReconciliationController {
 		}
 
 		if (existingText && existingCrdtContent !== content) {
-			try {
-				await this.createMarkdownConflictArtifact(
-					path,
-					existingCrdtContent ?? "",
-					"preserved-unresolved-fresh-local-event",
-					"crdt",
-				);
-			} catch {
-				diskMirror.recordPreservedUnresolved(path, "conflict-artifact-write-failed");
-				return;
-			}
+			await this.recordDiscardedRevision(
+				path,
+				existingCrdtContent ?? "",
+				"preserved-unresolved-fresh-local-event",
+			);
 		}
 
 		if (!episodeIsCurrent() || this.shouldAbortActiveMarkdownIngest(active)) return;
@@ -5646,99 +5529,6 @@ export class ReconciliationController {
 		return false;
 	}
 
-	private getStartupOpenFileAuthorityStaleReason(
-		snapshot: StartupOpenFileAuthoritySnapshot,
-	): string | null {
-		const expectedFile = snapshot.file;
-		if (
-			!expectedFile ||
-			expectedFile.path !== snapshot.path ||
-			this.deps.app.vault.getAbstractFileByPath(snapshot.path) !== expectedFile
-		) {
-			return "disk-file-identity-changed";
-		}
-		if (snapshot.diskStat !== null) {
-			const currentStat = {
-				ctime: typeof expectedFile.stat?.ctime === "number" ? expectedFile.stat.ctime : null,
-				mtime: typeof expectedFile.stat?.mtime === "number" ? expectedFile.stat.mtime : null,
-				size: typeof expectedFile.stat?.size === "number" ? expectedFile.stat.size : null,
-			};
-			if (
-				currentStat.ctime !== snapshot.diskStat.ctime ||
-				currentStat.mtime !== snapshot.diskStat.mtime ||
-				currentStat.size !== snapshot.diskStat.size
-			) {
-				return "disk-stat-changed";
-			}
-		}
-		if (
-			(this.deps.getDiskIndex()[snapshot.path]?.contentHash ?? null) !==
-			snapshot.baselineHash
-		) {
-			return "baseline-hash-changed";
-		}
-		if (
-			(this.diskBaselineRevisions.get(snapshot.path) ?? 0) !==
-			snapshot.baselineRevision
-		) {
-			return "baseline-revision-changed";
-		}
-		if (this.lifecycleGeneration !== snapshot.lifecycleGeneration) {
-			return "lifecycle-generation-changed";
-		}
-		if (this.getMarkdownDiskRevision(snapshot.path) !== snapshot.diskRevision) {
-			return "disk-event-generation-changed";
-		}
-		if (
-			(this.visibleAuthorityDeferredPaths.get(snapshot.path) ?? null) !==
-			snapshot.visibleAuthorityMarker
-		) {
-			return "visible-authority-marker-changed";
-		}
-		if (
-			(this.interceptedExternalDiskMutations.get(snapshot.path) ?? null) !==
-			snapshot.interceptedCandidate
-		) {
-			return "external-candidate-changed";
-		}
-		if (
-			this.getExternalCandidateIdentityEpoch(snapshot.path) !==
-			snapshot.candidateIdentityEpoch
-		) {
-			return "external-candidate-identity-changed";
-		}
-		if (
-			(this.deps.getMarkdownAttentionGeneration?.() ?? 0) !== snapshot.attentionGeneration
-		) return "attention-generation-changed";
-		if (
-			(this.deps.getMarkdownSyncScopeGeneration?.() ?? 0) !== snapshot.syncScopeGeneration
-		) return "sync-scope-generation-changed";
-		if (this.isMarkdownPreservedUnresolved(snapshot.path)) {
-			return "preserved-unresolved";
-		}
-		if (!this.deps.isMarkdownPathSyncable(snapshot.path)) {
-			return "path-not-syncable";
-		}
-
-		const currentViews = this.getOpenMarkdownViewsForPath(snapshot.path);
-		const validation = snapshot.editorTicket
-			? this.deps.getEditorBindings()?.validateOpenEditorMutationTicket?.(
-				snapshot.editorTicket,
-				currentViews,
-			) ?? {
-				current: false as const,
-				reason: "binding-manager-unavailable",
-			}
-			: { current: true as const, reason: "no-ticket" };
-		const currentYText = this.deps.getVaultSync()?.getTextForPath(snapshot.path) ?? null;
-		if (currentYText !== snapshot.expectedYText) return "crdt-text-replaced";
-		if (yTextToString(currentYText) !== snapshot.expectedCrdtContent) {
-			return "crdt-content-changed";
-		}
-		if (!validation.current) return validation.reason;
-		return null;
-	}
-
 	/**
 	 * Startup authorities not already covered by commitOpenEditorDiskMutation's
 	 * exact file/disk/baseline/lifecycle/candidate/Y.Text/editor checks. The
@@ -5756,25 +5546,6 @@ export class ReconciliationController {
 		) return "sync-scope-generation-changed";
 		if (!this.deps.isMarkdownPathSyncable(snapshot.path)) return "path-not-syncable";
 		return null;
-	}
-
-	private traceStartupOpenFileAuthorityStale(
-		snapshot: StartupOpenFileAuthoritySnapshot,
-		reason: string,
-		stage: string,
-	): void {
-		this.deps.trace("recovery", "open-editor-mutation-ticket-stale", {
-			path: snapshot.path,
-			stage,
-			reason,
-			expectedDiskRevision: snapshot.diskRevision,
-			currentDiskRevision: this.getMarkdownDiskRevision(snapshot.path),
-			expectedCrdtLength: snapshot.expectedCrdtContent.length,
-			currentCrdtLength:
-				yTextToString(this.deps.getVaultSync()?.getTextForPath(snapshot.path) ?? null)
-					?.length ?? null,
-			openViewCount: this.getOpenMarkdownViewsForPath(snapshot.path).length,
-		});
 	}
 
 	/**
@@ -6336,6 +6107,16 @@ export class ReconciliationController {
 		});
 	}
 
+	/**
+	 * Handle an unresolved visible-editor authority (multiple panes, an
+	 * editor read failure, or no readable pane) without preserving anything.
+	 *
+	 * With conflict-artifact preservation abolished, no file is written and
+	 * no limbo episode is recorded: every competing state is still alive in
+	 * the editor(s), the CRDT, or on disk, so the correct action is to do
+	 * nothing and let the next vault event re-evaluate. The trace keeps the
+	 * deferral observable.
+	 */
 	private async preserveUnresolvedVisibleAuthority(
 		path: string,
 		marker: DeferredVisibleEditorAuthority,
@@ -6343,59 +6124,13 @@ export class ReconciliationController {
 		crdtContent: string,
 		stage: string,
 	): Promise<void> {
-		// Quarantine synchronously, before the first artifact I/O await. A provider
-		// write may already be queued from before this conflict was classified; if
-		// the marker were published only after artifact creation, that writer could
-		// overwrite the original disk candidate while preservation is in flight.
-		const diskMirror = this.deps.getDiskMirror();
-		diskMirror?.recordPreservedUnresolved?.(
-			path,
-			"conflict-winner-flush-deferred",
-		);
-		const preserved: Array<{ source: "editor" | "crdt"; content: string }> = [];
-		for (const editorContent of new Set(marker.editorContents)) {
-			if (editorContent !== diskContent) {
-				preserved.push({ source: "editor", content: editorContent });
-			}
-		}
-		if (
-			crdtContent !== diskContent &&
-			!preserved.some((candidate) => candidate.content === crdtContent)
-		) {
-			preserved.push({ source: "crdt", content: crdtContent });
-		}
-
-		let preserveFailed = false;
-		const conflictPaths: string[] = [];
-		for (const candidate of preserved) {
-			try {
-				const artifact = await this.createMarkdownConflictArtifact(
-					path,
-					candidate.content,
-					`visible-authority-${stage}`,
-					candidate.source,
-				);
-				conflictPaths.push(artifact.path);
-			} catch {
-				preserveFailed = true;
-			}
-		}
-
-		if (preserveFailed) {
-			diskMirror?.recordPreservedUnresolved?.(
-				path,
-				"conflict-artifact-write-failed",
-			);
-		}
-		this.deps.trace("conflict", "visible-authority-unresolved-preserved", {
+		this.deps.trace("conflict", "visible-authority-unresolved-deferred", {
 			path,
 			stage,
 			readComplete: marker.readComplete,
 			editorCandidateCount: marker.editorContents.length,
 			capturedDiskRevision: marker.capturedDiskRevision,
 			currentDiskRevision: this.getMarkdownDiskRevision(path),
-			conflictPaths,
-			preserveFailed,
 			diskLength: diskContent.length,
 			crdtLength: crdtContent.length,
 		});
@@ -6792,19 +6527,8 @@ export class ReconciliationController {
 			attentionGeneration,
 			syncScopeGeneration,
 		});
-		const getStartupAuthorityStaleReason = () =>
-			this.getStartupOpenFileAuthorityStaleReason(startupAuthoritySnapshot);
 		const getStartupSupplementalStaleReason = () =>
 			this.getStartupOpenFileSupplementalStaleReason(startupAuthoritySnapshot);
-		let artifactAuthorityStaleReason: string | null = null;
-		let artifactAdmissionRejected = false;
-		const startupAuthorityCurrent = () => {
-			const reason = getStartupAuthorityStaleReason();
-			if (reason !== null && artifactAuthorityStaleReason === null) {
-				artifactAuthorityStaleReason = reason;
-			}
-			return reason === null;
-		};
 		const queueStartupReplan = () => {
 			this.mergeDirtyEntryIntoPath(path, {
 				reason: "modify",
@@ -6813,35 +6537,6 @@ export class ReconciliationController {
 				retryCount: 0,
 				notBeforeMs: Date.now() + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS,
 			});
-		};
-		const createStartupArtifactWithinAdmission = async (
-			startCreate: () => Promise<TFile>,
-		): Promise<boolean> => {
-			const admission = await this.commitOpenEditorDiskMutation({
-				path,
-				file,
-				expectedDiskContent: diskContent,
-				expectedDiskStat: diskFileStat,
-				expectedBaselineHash: baselineAuthority.hash,
-				expectedBaselineRevision: baselineAuthority.revision,
-				expectedLifecycleGeneration: lifecycleGeneration,
-				ticket: mutationTicket,
-				expectedYText: ytext,
-				expectedCrdtContent: crdtContent,
-				expectedDiskRevision: diskMutationRevision,
-				expectedVisibleAuthorityMarker: visibleAuthorityMarker,
-				expectedInterceptedCandidate: interceptedCandidate,
-				expectedCandidateIdentityEpoch: candidateIdentityEpoch,
-				additionalAuthorityStaleReason: getStartupSupplementalStaleReason,
-				stage: "startup-open-editor-artifact-admission",
-				commit: startCreate,
-			});
-			if (admission.kind === "stale") {
-				artifactAdmissionRejected = true;
-				return false;
-			}
-			await admission.value;
-			return true;
 		};
 
 		// Do not let this legacy startup shortcut pre-empt the three-way open-file
@@ -6917,52 +6612,17 @@ export class ReconciliationController {
 			},
 		});
 
-		let crdtConflictPath: string | null = null;
-		let diskConflictPath: string | null = null;
-		let conflictArtifactCreated = false;
-		try {
-			const crdtConflict = await this.createMarkdownConflictArtifact(
+		await this.recordDiscardedRevision(
+			path,
+			crdtContent,
+			"open-file-reconcile-editor-wins",
+		);
+		if (diskContent !== editorAuthority && diskContent !== crdtContent) {
+			await this.recordDiscardedRevision(
 				path,
-				crdtContent,
-				"open-file-reconcile-editor-wins",
-				"crdt",
-				startupAuthorityCurrent,
-				createStartupArtifactWithinAdmission,
+				diskContent,
+				"open-file-reconcile-editor-wins-disk",
 			);
-			crdtConflictPath = crdtConflict.path;
-			conflictArtifactCreated ||= crdtConflict.created;
-			if (diskContent !== editorAuthority && diskContent !== crdtContent) {
-				const diskConflict = await this.createMarkdownConflictArtifact(
-					path,
-					diskContent,
-					"open-file-reconcile-editor-wins",
-					"disk",
-					startupAuthorityCurrent,
-					createStartupArtifactWithinAdmission,
-				);
-				diskConflictPath = diskConflict.path;
-				conflictArtifactCreated ||= diskConflict.created;
-			}
-		} catch (err) {
-			if (artifactAdmissionRejected) {
-				queueStartupReplan();
-				return true;
-			}
-			const staleReason = artifactAuthorityStaleReason ?? getStartupAuthorityStaleReason();
-			if (staleReason !== null) {
-				this.traceStartupOpenFileAuthorityStale(
-					startupAuthoritySnapshot,
-					staleReason,
-					"startup-open-editor-artifact",
-				);
-				queueStartupReplan();
-				return true;
-			}
-			this.deps.trace("conflict", "open-file-reconcile-preserve-failed", {
-				path,
-				errorCategory: err instanceof Error ? "exception" : "non-error-throw",
-			});
-			return true;
 		}
 
 		const convergenceAttempt = await this.commitOpenEditorDiskMutation({
@@ -7000,147 +6660,97 @@ export class ReconciliationController {
 		this.deps.trace("conflict", "open-file-reconcile-editor-wins", {
 			path,
 			filePath: file?.path ?? null,
-			crdtConflictPath,
-			diskConflictPath,
 			editorViewCount: openViews.length,
 			editorLength: editorAuthority.length,
 			diskLength: diskContent.length,
 			crdtLength: crdtContent.length,
 			convergenceApplied,
-			conflictArtifactCreated,
 		});
-		if (conflictArtifactCreated) {
-			this.showConflictNotice(
-				`Conflict detected for "${path.split("/").pop()}" — ` +
-				`competing version preserved as conflict note.`,
-			);
-		}
 		return true;
 	}
 
-	private async preserveOpenBoundPlannerConflict(input: {
-		file: TFile;
-		diskContent: string;
-		crdtContent: string;
-		expectedYText: NonNullable<ReturnType<VaultSync["getTextForPath"]>>;
-		targetContent?: string;
-		commitTarget?: (
-			commit: () => boolean,
-		) => Promise<OpenEditorDiskMutationCommit<boolean>>;
-		reason: string;
-		preserveDisk: boolean;
-		preserveCrdt: boolean;
-		editorViewCount: number;
-		distinctEditorContentCount: number;
-		chosenSource: "disk" | "crdt" | "editor";
-	}): Promise<boolean> {
-		const {
-			file,
-			diskContent,
-			crdtContent,
-			expectedYText,
-			targetContent,
-			commitTarget,
-			reason,
-			preserveDisk,
-			preserveCrdt,
-			editorViewCount,
-			distinctEditorContentCount,
-			chosenSource,
-		} = input;
-		let crdtConflictPath: string | null = null;
-		let diskConflictPath: string | null = null;
-		let conflictError: string | null = null;
-		let convergenceApplied = false;
-		let conflictArtifactCreated = false;
+		private async preserveOpenBoundPlannerConflict(input: {
+			file: TFile;
+			diskContent: string;
+			crdtContent: string;
+			expectedYText: NonNullable<ReturnType<VaultSync["getTextForPath"]>>;
+			targetContent?: string;
+			commitTarget?: (
+				commit: () => boolean,
+			) => Promise<OpenEditorDiskMutationCommit<boolean>>;
+			reason: string;
+			preserveDisk: boolean;
+			preserveCrdt: boolean;
+			editorViewCount: number;
+			distinctEditorContentCount: number;
+			chosenSource: "disk" | "crdt" | "editor";
+		}): Promise<boolean> {
+			const {
+				file,
+				diskContent,
+				crdtContent,
+				expectedYText,
+				targetContent,
+				commitTarget,
+				reason,
+				preserveDisk,
+				preserveCrdt,
+				editorViewCount,
+				distinctEditorContentCount,
+				chosenSource,
+			} = input;
+			let convergenceApplied = false;
 
-		try {
+			// With preservation abolished, the losing sides are recorded
+			// (trace + durable server audit) instead of written as artifacts.
 			if (preserveCrdt && crdtContent !== targetContent) {
-				const crdtConflict = await this.createMarkdownConflictArtifact(
+				await this.recordDiscardedRevision(
 					file.path,
 					crdtContent,
 					reason,
-					"crdt",
 				);
-				crdtConflictPath = crdtConflict.path;
-				conflictArtifactCreated ||= crdtConflict.created;
 			}
 			if (
 				preserveDisk &&
 				diskContent !== targetContent &&
 				diskContent !== crdtContent
 			) {
-				const diskConflict = await this.createMarkdownConflictArtifact(
+				await this.recordDiscardedRevision(
 					file.path,
 					diskContent,
-					reason,
-					"disk",
+					`${reason}-disk`,
 				);
-				diskConflictPath = diskConflict.path;
-				conflictArtifactCreated ||= diskConflict.created;
 			}
-		} catch (err) {
-			conflictError = err instanceof Error ? err.message : String(err);
-			this.deps.getDiskMirror()?.recordPreservedUnresolved?.(
-				file.path,
-				"conflict-artifact-write-failed",
-			);
-			this.deps.trace("conflict", "conflict-artifact-needed", {
+
+			if (targetContent !== undefined) {
+				if (!commitTarget) {
+					return false;
+				}
+				const convergenceAttempt = await commitTarget(() => {
+					const result = applyDiffToYTextWithPostcondition(
+						expectedYText,
+						crdtContent,
+						targetContent,
+						ORIGIN_DISK_SYNC_RECOVER_BOUND,
+					);
+					return result.finalMatchesExpected;
+				});
+				if (convergenceAttempt.kind === "stale") return false;
+				convergenceApplied = convergenceAttempt.value;
+			}
+
+			this.deps.trace("conflict", "conflict-revision-discarded", {
 				path: file.path,
-				conflictPath: crdtConflictPath,
-				diskConflictPath,
 				reason,
 				diskLength: diskContent.length,
 				crdtLength: crdtContent.length,
 				editorViewCount,
 				distinctEditorContentCount,
 				chosenSource,
-				conflictArtifactCreated,
-				convergenceApplied: false,
-				error: conflictError,
+				convergenceApplied,
 			});
-			return false;
+			return true;
 		}
-
-		if (targetContent !== undefined) {
-			if (!commitTarget) {
-				return false;
-			}
-			const convergenceAttempt = await commitTarget(() => {
-				const result = applyDiffToYTextWithPostcondition(
-					expectedYText,
-					crdtContent,
-					targetContent,
-					ORIGIN_DISK_SYNC_RECOVER_BOUND,
-				);
-				return result.finalMatchesExpected;
-			});
-			if (convergenceAttempt.kind === "stale") return false;
-			convergenceApplied = convergenceAttempt.value;
-		}
-
-		this.deps.trace("conflict", "conflict-artifact-needed", {
-			path: file.path,
-			conflictPath: crdtConflictPath,
-			diskConflictPath,
-			reason,
-			diskLength: diskContent.length,
-			crdtLength: crdtContent.length,
-			editorViewCount,
-			distinctEditorContentCount,
-			chosenSource,
-			conflictArtifactCreated,
-			convergenceApplied,
-			error: conflictError,
-		});
-		if (conflictArtifactCreated) {
-			this.showConflictNotice(
-				`Conflict detected for "${file.path.split("/").pop()}" — ` +
-				`competing version preserved as conflict note.`,
-			);
-		}
-		return true;
-	}
 
 	private async handleBoundFileSyncGap(
 		file: TFile,
@@ -7738,37 +7348,19 @@ export class ReconciliationController {
 					throw new Error("unreachable open-external exact diff result");
 				}
 				case "preserve-conflict": {
-					let artifact: MarkdownConflictArtifactResult;
-					try {
-						const artifactContent =
-							interceptedCandidate &&
-							this.externalCandidateMatchesStableDisk(
-								interceptedCandidate.content,
-								content,
-							)
-								? interceptedCandidate.content
-								: content;
-						artifact = await this.createMarkdownConflictArtifact(
-							file.path,
-							artifactContent,
-							`open-external-${externalPlan.reason}`,
-							"disk",
-						);
-						if (baselineHash !== null) {
-							this.deps.recordConflictMergeBase?.(artifact.path, baselineHash);
-						}
-					} catch (error) {
-						this.deps.getDiskMirror()?.recordPreservedUnresolved?.(
-							file.path,
-							"conflict-artifact-write-failed",
-						);
-						this.deps.trace("conflict", "open-external-conflict-preserve-failed", {
-							path: file.path,
-							reason: externalPlan.reason,
-							errorCategory: error instanceof Error ? "exception" : "non-error-throw",
-						});
-						return { kind: "handled" };
-					}
+					const artifactContent =
+						interceptedCandidate &&
+						this.externalCandidateMatchesStableDisk(
+							interceptedCandidate.content,
+							content,
+						)
+							? interceptedCandidate.content
+							: content;
+					await this.recordDiscardedRevision(
+						file.path,
+						artifactContent,
+						`open-external-${externalPlan.reason}`,
+					);
 					const conflictAdmission = await commitMutation(
 						"open-external-conflict-settlement",
 						crdtContent,
@@ -7781,13 +7373,12 @@ export class ReconciliationController {
 						);
 					}
 					if (externalPlan.reason === "overlapping-hunks") {
-						this.traceOpenExternalEvent("open-external-overlapping-hunk-preserved", {
+						this.traceOpenExternalEvent("open-external-overlapping-hunk-discarded", {
 							path: file.path,
 							reason: "overlapping-hunks",
 							diskLength: content.length,
 							currentLength: crdtContent.length,
 							hunkCount: externalPlan.hunkCount,
-							artifactCreated: artifact.created,
 						});
 					}
 					return admitOpenFlush({
@@ -8555,121 +8146,26 @@ export class ReconciliationController {
 					};
 				}
 
-			if (existingText) {
-				if (this.deps.shouldBlockFrontmatterIngest(
-					file.path,
-					crdtContent ?? "",
-					content,
-					"bound-file-open-idle-disk-recovery",
-					)) {
-						this.recordFrontmatterIngestBlocked(file.path, true, "bound-file-open-idle-disk-recovery");
-						this.deps.scheduleTraceStateSnapshot("frontmatter-ingest-blocked");
-						return { kind: "handled" };
-					}
-				this.deps.log(
-					`syncFileFromDisk: recovering "${file.path}" ` +
-					`(editor-bound external disk edit while idle: ${crdtContent?.length ?? 0} -> ${content.length} chars)`,
-				);
-			const _rsh3 = await this.deps.computeRecoveryStateHash?.(file.path, content) ?? undefined;
-			this.deps.recordFlightPathEvent?.({
-				priority: "important",
-				kind: PRODUCT_EVENT_KIND.recoveryDecision,
-				severity: "info",
-				scope: "file",
-				source: "reconciliationController",
-				layer: "recovery",
+			// bound-file-open-idle-disk-recovery is abolished: an open editor
+			// that agrees with CRDT is never rewritten from a disk snapshot —
+			// that application is exactly the "text jumped back a few seconds"
+			// symptom. The disk change stays in the dirty lane and is ingested
+			// by the open-external-edit merge lane once the editor has been
+			// idle long enough (>= 3s), or by the closed-dirty lane after the
+			// note closes.
+			this.deps.trace("reconcile", "open-file-disk-change-deferred", {
 				path: file.path,
-				data: {
-					reason: "bound-file-open-idle-disk-recovery",
-					signature: computeRecoveryFingerprint("bound-file-open-idle-disk-recovery", crdtContent ?? "", content),
-					action: "apply-diff",
-					diskLength: content.length,
-					crdtLength: crdtContent?.length ?? null,
-					// Branch predicates
-					editorEqualsDisk: false,
-					editorEqualsCrdt: crdtOnlyViews.length > 0,
-					diskFingerprintPrefix: contentFingerprint(content).slice(0, 8),
-					crdtFingerprintPrefix: crdtContent ? contentFingerprint(crdtContent).slice(0, 8) : null,
-					...(_rsh3 ? { recoveryStateHash: _rsh3 } : {}),
-				},
+				reason: "open-editor-authority-preserved",
+				diskLength: content.length,
+				crdtLength: crdtContent?.length ?? null,
+				idleMs: lastEditorActivity === null
+					? null
+					: Math.max(0, Date.now() - lastEditorActivity),
 			});
-				if (this.shouldQuarantineRepeatedRecovery(
-					file.path,
-					"bound-file-open-idle-disk-recovery",
-					crdtContent ?? "",
-					content,
-				)) {
-					return { kind: "handled" };
-				}
-				if (shouldAbort()) return { kind: "handled" };
-				this.deps.recordFlightPathEvent?.({
-					priority: "important",
-					kind: PRODUCT_EVENT_KIND.recoveryApplyStart,
-					severity: "info",
-					scope: "file",
-					source: "reconciliationController",
-					layer: "recovery",
-					path: file.path,
-					data: {
-						reason: "bound-file-open-idle-disk-recovery",
-						origin: ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
-						diskLength: content.length,
-						crdtLength: crdtContent?.length ?? null,
-					},
-				});
-				const recoveryAttempt = await commitMutation(
-					"bound-file-open-idle-disk-recovery",
-					crdtContent,
-					() => applyDiffToYTextWithPostcondition(
-						existingText,
-						crdtContent ?? "",
-						content,
-						ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
-					),
-				);
-				if (recoveryAttempt.kind === "stale") {
-					return this.deferStaleOpenEditorMutation("bound-file-open-idle-disk-recovery");
-				}
-				const recoveryResult = recoveryAttempt.value;
-			traceRecoveryPostcondition(
-				(source, msg, details) => this.deps.trace(source, msg, details),
-				(event) => this.deps.recordFlightPathEvent?.(event),
-				file.path,
-				"bound-file-open-idle-disk-recovery",
-				ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
-				content.length,
-				recoveryResult,
-			);
-				this.deps.recordFlightPathEvent?.({
-					priority: recoveryResult.forceReplaceApplied ? "critical" : "important",
-					kind: PRODUCT_EVENT_KIND.recoveryApplyDone,
-					severity: recoveryResult.finalMatchesExpected ? "info" : "warn",
-					scope: "file",
-					source: "reconciliationController",
-					layer: "recovery",
-					path: file.path,
-					data: {
-						reason: "bound-file-open-idle-disk-recovery",
-						origin: ORIGIN_DISK_SYNC_OPEN_IDLE_RECOVER,
-						expectedLength: content.length,
-						actualLength: recoveryResult.finalLength,
-						matchesExpected: recoveryResult.finalMatchesExpected,
-						forceReplaceApplied: recoveryResult.forceReplaceApplied,
-					},
-				});
-			}
-			this.boundRecoveryLocks.set(file.path, Date.now() + BOUND_RECOVERY_LOCK_MS);
-			this.deps.scheduleTraceStateSnapshot("bound-file-open-idle-disk-recovery");
 			return {
-				kind: "handled",
-				settlement: !plannerConflictPreserved
-					? this.captureBoundFileSettlement(
-						file.path,
-						content,
-						existingText,
-						openViews,
-					)
-					: undefined,
+				kind: "deferred",
+				deferUntil: Date.now() + OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS,
+				reason: "open-editor-authority-preserved",
 			};
 		}
 
@@ -8696,163 +8192,65 @@ export class ReconciliationController {
 		const editorAuthority: string | null = distinctEditorContents.length === 1
 			? distinctEditorContents[0]!
 			: null;
-		if (editorAuthority === null) {
-			this.deps.getDiskMirror()?.recordPreservedUnresolved(
-				file.path,
-				"multiple-editor-authorities",
-			);
-		}
-		let conflictPath: string | null = null;
-		let diskConflictPath: string | null = null;
-		let conflictError: string | null = null;
-		let conflictSkippedDedupe = false;
-		let conflictDedupeScope: "session" | "artifact" | null = null;
-		let conflictArtifactCreated = false;
+
+		// With conflict-artifact preservation abolished, the losing sides of an
+		// ambiguous divergence are recorded (trace + durable server audit)
+		// instead of written as artifacts. crdtContent remains recoverable from
+		// the CRDT journal/snapshots; diskContent stays on disk until the
+		// convergence flush below.
 		if (crdtContent != null) {
-			// Dedupe: if the same ambiguous fingerprint was already turned into
-			// a conflict artifact, do not create another one. This prevents
-			// infinite conflict artifact spam when convergence fails.
-			// Include editor hash to catch cases where editor content differs
-			// from disk between attempts (editor is the local authority being
-			// applied during convergence). Use sorted distinct hashes of ALL
-			// open views, not just the first — multiple panes may have different
-			// unsaved content.
-			const editorHashes = [...new Set(
-				viewStates.flatMap((state) =>
-					state.editorContent === null
-						? []
-						: [contentFingerprint(state.editorContent)]
-				),
-			)].sort();
-			const editorFp = editorHashes.length > 0
-				? editorHashes.join("+")
-				: "no-editor";
-			const conflictFingerprint = `${contentFingerprint(crdtContent)}\x00${contentFingerprint(content)}\x00${editorFp}`;
-			const previousConflictFingerprint = this.lastConflictFingerprints.get(file.path);
-			if (previousConflictFingerprint === conflictFingerprint) {
-				conflictSkippedDedupe = true;
-				conflictDedupeScope = "session";
-			} else {
-				try {
-					const needsDiskConflictArtifact =
-						editorAuthority !== null &&
-						content !== editorAuthority &&
-						content !== crdtContent;
-					const existingCrdtConflictPath = await this.findExistingMarkdownConflictArtifact(
-						file.path,
-						crdtContent,
-						"crdt",
-					);
-					const existingDiskConflictPath = needsDiskConflictArtifact
-						? await this.findExistingMarkdownConflictArtifact(file.path, content, "disk")
-						: null;
-					if (
-						existingCrdtConflictPath !== null &&
-						(!needsDiskConflictArtifact || existingDiskConflictPath !== null)
-					) {
-						conflictPath = existingCrdtConflictPath;
-						diskConflictPath = existingDiskConflictPath;
-						conflictSkippedDedupe = true;
-						conflictDedupeScope = "artifact";
-					} else {
-						if (existingCrdtConflictPath !== null) {
-							conflictPath = existingCrdtConflictPath;
-						} else {
-							const crdtConflict = await this.createMarkdownConflictArtifact(
-								file.path,
-								crdtContent,
-								"bound-file-ambiguous-divergence",
-								"crdt",
-							);
-							conflictPath = crdtConflict.path;
-							conflictArtifactCreated ||= crdtConflict.created;
-						}
-						if (needsDiskConflictArtifact) {
-							if (existingDiskConflictPath !== null) {
-								diskConflictPath = existingDiskConflictPath;
-							} else {
-								const diskConflict = await this.createMarkdownConflictArtifact(
-									file.path,
-									content,
-									"bound-file-ambiguous-divergence",
-									"disk",
-								);
-								diskConflictPath = diskConflict.path;
-								conflictArtifactCreated ||= diskConflict.created;
-							}
-						}
-					}
-					if (conflictArtifactCreated) {
-						// Notify the user only when this pass creates a new
-						// preserved artifact. Existing artifacts are durable
-						// duplicate markers across restart and should not
-						// re-notify as a fresh conflict.
-						this.showConflictNotice(
-							`Conflict detected for "${file.path.split("/").pop()}" — ` +
-							`competing version preserved as conflict note.`,
-						);
-					}
-					this.lastConflictFingerprints.set(file.path, conflictFingerprint);
-				} catch (err) {
-					conflictError = err instanceof Error ? err.message : String(err);
-				}
+			await this.recordDiscardedRevision(
+				file.path,
+				crdtContent,
+				"bound-file-ambiguous-divergence",
+			);
+			if (
+				editorAuthority !== null &&
+				content !== editorAuthority &&
+				content !== crdtContent
+			) {
+				await this.recordDiscardedRevision(
+					file.path,
+					content,
+					"bound-file-ambiguous-divergence-disk",
+				);
 			}
 		}
 
-		// After preserving competing versions as conflict artifacts, converge
-		// the original path's CRDT to the visible editor content. This
-		// prevents the same ambiguity from re-triggering on the next reconcile
-		// and creating infinite conflict copies.
-		//
-		// Also attempt convergence when dedupe skipped artifact creation —
-		// the earlier artifact already preserved the losing side; retry
-		// convergence so the path can become stable.
+		// Converge the original path's CRDT to the visible editor content so
+		// the same ambiguity does not re-trigger on the next reconcile.
 		let convergenceApplied = false;
 		let convergenceStale = false;
-		if ((conflictPath !== null || conflictSkippedDedupe) && editorAuthority !== null) {
-			if (existingText) {
-				const convergenceAttempt = await commitMutation(
-					"bound-file-ambiguous-convergence",
-					crdtContent,
-					() => {
-						const result = applyDiffToYTextWithPostcondition(
-							existingText,
-							crdtContent ?? "",
-							editorAuthority,
-							ORIGIN_DISK_SYNC_RECOVER_BOUND,
-						);
-						return result.finalMatchesExpected;
-					},
-				);
-				if (convergenceAttempt.kind === "stale") {
-					convergenceStale = true;
-				} else {
-					convergenceApplied = convergenceAttempt.value;
-				}
-				if (!convergenceStale && convergenceApplied) {
-					// Convergence succeeded — the original path now matches disk.
-					// Clear the conflict fingerprint so a genuinely new divergence
-					// (different content) can still create a fresh artifact.
-					this.lastConflictFingerprints.delete(file.path);
-				}
+		if (editorAuthority !== null && existingText) {
+			const convergenceAttempt = await commitMutation(
+				"bound-file-ambiguous-convergence",
+				crdtContent,
+				() => {
+					const result = applyDiffToYTextWithPostcondition(
+						existingText,
+						crdtContent ?? "",
+						editorAuthority,
+						ORIGIN_DISK_SYNC_RECOVER_BOUND,
+					);
+					return result.finalMatchesExpected;
+				},
+			);
+			if (convergenceAttempt.kind === "stale") {
+				convergenceStale = true;
+			} else {
+				convergenceApplied = convergenceAttempt.value;
 			}
 		}
 
-		this.deps.trace("conflict", "conflict-artifact-needed", {
+		this.deps.trace("conflict", "conflict-revision-discarded", {
 			path: file.path,
-			conflictPath,
-			diskConflictPath,
 			reason: "bound-file-ambiguous-divergence",
 			diskLength: content.length,
 			crdtLength: crdtContent?.length ?? null,
 			editorViewCount: viewStates.length,
 			distinctEditorContentCount: distinctEditorContents.length,
 			chosenSource: editorAuthority === null ? "none-multiple-editor-contents" : "editor",
-			conflictArtifactCreated,
-			conflictSkippedDedupe,
-			conflictDedupeScope,
 			convergenceApplied,
-			error: conflictError,
 		});
 		this.deps.log(`syncFileFromDisk: skipping "${file.path}" (editor-bound, ambiguous divergence)`);
 		this.deps.scheduleTraceStateSnapshot("bound-file-ambiguous");
@@ -9087,101 +8485,6 @@ export class ReconciliationController {
 		return true;
 	}
 
-	private async createMarkdownConflictArtifact(
-		path: string,
-		content: string,
-		reason: string,
-		source?: "crdt" | "disk" | "editor",
-		isCurrent: () => boolean = () => true,
-		postSuppressCreate?: (
-			startCreate: () => Promise<TFile>,
-		) => Promise<boolean>,
-	): Promise<MarkdownConflictArtifactResult> {
-		if (!isCurrent()) throw new Error("stale reconciliation work");
-		const existing = await this.findExistingMarkdownConflictArtifact(path, content, source);
-		if (!isCurrent()) throw new Error("stale reconciliation work");
-		if (existing !== null) {
-			this.deps.trace("conflict", "conflict-artifact-deduped", {
-				path,
-				conflictPath: existing,
-				reason,
-				source: source ?? null,
-				contentFingerprint: contentFingerprint(content),
-			});
-			return { path: existing, created: false };
-		}
-
-		const basePath = buildMarkdownConflictArtifactPath(path, {
-			deviceName: this.deps.getSettings().deviceName,
-			source,
-		});
-		for (let i = 0; i < 100; i++) {
-			if (!isCurrent()) throw new Error("stale reconciliation work");
-			const candidate = buildMarkdownConflictArtifactCopyPath(basePath, i + 1);
-			if (this.deps.app.vault.getAbstractFileByPath(candidate)) continue;
-			const diskMirror = this.deps.getDiskMirror();
-			const suppressionHandle = await diskMirror?.suppressLocalCreate(candidate, content);
-			try {
-				if (postSuppressCreate) {
-					const created = await postSuppressCreate(() => {
-						if (!isCurrent()) throw new Error("stale reconciliation work");
-						return this.deps.app.vault.create(candidate, content);
-					});
-					if (!created) throw new Error("stale reconciliation work");
-				} else {
-					if (!isCurrent()) throw new Error("stale reconciliation work");
-					await this.deps.app.vault.create(candidate, content);
-				}
-			} catch (error) {
-				if (suppressionHandle) {
-					diskMirror?.rollbackLocalCreateSuppression(suppressionHandle);
-				}
-				throw error;
-			}
-			this.deps.trace("conflict", "conflict-artifact-created", {
-				path,
-				conflictPath: candidate,
-				reason,
-				source: source ?? null,
-				contentLength: content.length,
-			});
-			return { path: candidate, created: true };
-		}
-		throw new Error(`could not create conflict artifact for ${path}`);
-	}
-
-	private async findExistingMarkdownConflictArtifact(
-		path: string,
-		content: string,
-		source?: "crdt" | "disk" | "editor",
-	): Promise<string | null> {
-		const vault = this.deps.app.vault;
-		const candidates = typeof vault.getFiles === "function"
-			? vault.getFiles()
-			: (typeof vault.getMarkdownFiles === "function" ? vault.getMarkdownFiles() : null);
-		if (candidates === null) return null;
-
-		const targetFingerprint = contentFingerprint(content);
-		for (const file of candidates) {
-			if (!isMarkdownConflictArtifactForOriginalPath(file.path, path, source)) continue;
-			try {
-				// Conflict artifacts preserve the exact competing disk representation.
-				// Vault.read strips a leading UTF-8 BOM, so replay dedupe must inspect
-				// adapter text or it will create a duplicate for the same raw artifact.
-				const existingContent = typeof this.deps.app.vault.adapter.read === "function"
-					? await this.deps.app.vault.adapter.read(file.path)
-					: await this.readFreshMarkdownFile(file);
-				if (contentFingerprint(existingContent) === targetFingerprint && existingContent === content) {
-					return file.path;
-				}
-			} catch {
-				// If an existing candidate cannot be read, keep looking. The
-				// create path below still preserves the competing version.
-			}
-		}
-		return null;
-	}
-
 	private async updateDiskIndexForPath(
 		path: string,
 		settledContent?: string,
@@ -9323,29 +8626,8 @@ export class ReconciliationController {
 	}
 
 	/**
-	 * Show a conflict notice with rate-limiting. Only one notice per
-	 * CONFLICT_NOTICE_COOLDOWN_MS window; suppressed conflicts are
-	 * counted and mentioned in the next notice.
-	 */
-	private showConflictNotice(message: string): void {
-		const now = Date.now();
-		if (now - this.lastConflictNoticeAt < ReconciliationController.CONFLICT_NOTICE_COOLDOWN_MS) {
-			this.conflictNoticeSuppressionCount++;
-			return;
-		}
-		const suppressed = this.conflictNoticeSuppressionCount;
-		this.conflictNoticeSuppressionCount = 0;
-		this.lastConflictNoticeAt = now;
-		const suffix = suppressed > 0
-			? ` (and ${suppressed} other conflict${suppressed > 1 ? "s" : ""} in the last 30s)`
-			: "";
-		new Notice(`KAOS: ${message}${suffix}`, 10000);
-	}
-
-	/**
 	 * Show an amplification-quarantine notice with rate-limiting. Independent
-	 * from showConflictNotice — these two surfaces are different: a conflict
-	 * preserved a competing version, an amplification quarantine paused
+	 * from any conflict surface — an amplification quarantine paused
 	 * content recovery on a file that looked like it was looping.
 	 *
 	 * One notice per AMPLIFICATION_NOTICE_COOLDOWN_MS window; suppressed

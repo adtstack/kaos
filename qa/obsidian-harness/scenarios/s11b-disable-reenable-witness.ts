@@ -4,24 +4,24 @@
  * Replicates Issue #22-B: disable/re-enable on Device B with concurrent
  * local-disk and remote edits.
  *
- * ACCEPTANCE VERSION: s11b-local-artifact-v2 (2026-05-17)
+ * ACCEPTANCE VERSION: s11b-no-artifact-v3 (2026-08-13)
  *
- * Current KAOS conflict policy (both-changed/winner=disk):
+ * Current KAOS conflict policy (1.12.0+, both-changed/winner=disk):
  *   - Disk wins main file → original path has B's local edit (S11B-LOCAL)
- *   - CRDT edit goes to local conflict artifact on B → artifact has A's remote edit (S11B-REMOTE)
- *   - Conflict artifact is LOCAL-ONLY on B (not synced to A)
+ *   - No markdown conflict artifact is created; the displaced CRDT state
+ *     (S11B-REMOTE) survives in the CRDT merge / server journal and is
+ *     recorded in the server audit log (revision.discarded).
+ *   - A's remote edit merges into the CRDT; neither device rolls back.
  *
- * SUPERSEDED assumption: conflict artifact syncs to A via CRDT.
- * That assumption was wrong for current KAOS semantics. The artifact is a
- * local preservation mechanism on B, not a CRDT-synced file.
+ * SUPERSEDED (pre-1.12.0): s11b-local-artifact-v2 expected B to create a
+ * local conflict artifact holding A's remote edit.
  *
- * Acceptance criteria (s11b-local-artifact-v2):
- *   1. Device B creates a local conflict artifact.
- *   2. Artifact content contains A's remote edit (S11B-REMOTE) — displaced CRDT state.
- *   3. Original path on B contains B's local edit (S11B-LOCAL) — disk wins.
- *   4. Original path converges across A/B to B's local edit (survivor).
- *   5. No stale_hash_after_newer_witness or recovery_emitted_old_hash appears.
- *   6. Conflict artifact is NOT required to sync to A.
+ * Acceptance criteria (s11b-no-artifact-v3):
+ *   1. Original path on B contains B's local edit (S11B-LOCAL) — disk wins.
+ *   2. Original path converges across A/B to B's local edit (survivor).
+ *   3. No markdown conflict artifact file appears on either device.
+ *   4. No stale_hash_after_newer_witness or recovery_emitted_old_hash appears.
+ *   5. Discarded revisions reach the server audit log (checked by the caller).
  *
  * Device identity (Requirement 2): all primitives key on deviceId, never deviceName.
  * Clock discipline (Requirement 3): no wall-clock for correctness.
@@ -46,11 +46,11 @@ export interface S11bConfig {
 	/** Content Device A writes remotely while B is disabled. */
 	remoteEditContent: string;
 	/**
-	 * B12: Expected hash of the conflict artifact content.
-	 * Must be computed by the caller from the actual expected artifact content.
-	 * The scenario fails if the artifact hash doesn't match this.
+	 * B12 (pre-1.12.0): Expected hash of the conflict artifact content.
+	 * Since 1.12.0 no markdown conflict artifact is created; pass null and
+	 * the scenario asserts the artifact path stays ABSENT on both devices.
 	 */
-	expectedConflictArtifactHash: string;
+	expectedConflictArtifactHash: string | null;
 	/**
 	 * B12: Expected hash of the original path's surviving content after re-sync.
 	 * Must be computed by the caller from the expected surviving content.
@@ -146,16 +146,23 @@ export async function runS11b(config: S11bConfig): Promise<S11bResult> {
 		noRecoveryEmittedOldHash(deviceB, path, { windowMs: resyncWindowMs }),
 	]);
 
-	// 6. B12: Assert conflict artifact with EXPECTED hash (semantic preservation proof)
-	// witnessQuorum proves both devices agree on the specific expected content,
-	// not just that they agree on something.
-	const conflictArtifactQuorum = await witnessQuorum([deviceA, deviceB], conflictArtifactPath, {
-		pathId: conflictArtifactPath,
-		stateKind: "present",
-		expectedStateHash: config.expectedConflictArtifactHash,
-		timeoutMs: quorumTimeoutMs,
-		minStableAfterMs,
-	});
+	// 6. B12: markdown conflict artifacts are abolished (1.12.0) — assert the
+	// artifact path stays ABSENT on both devices (or, for legacy runs that
+	// still pass an expected hash, assert the exact artifact content).
+	const conflictArtifactQuorum = config.expectedConflictArtifactHash === null
+		? await witnessQuorum([deviceA, deviceB], conflictArtifactPath, {
+			pathId: conflictArtifactPath,
+			stateKind: "deleted",
+			timeoutMs: quorumTimeoutMs,
+			minStableAfterMs,
+		})
+		: await witnessQuorum([deviceA, deviceB], conflictArtifactPath, {
+			pathId: conflictArtifactPath,
+			stateKind: "present",
+			expectedStateHash: config.expectedConflictArtifactHash,
+			timeoutMs: quorumTimeoutMs,
+			minStableAfterMs,
+		});
 
 	// 7. B12: Assert original path with EXPECTED survivor hash
 	const originalPathQuorum = await witnessQuorum([deviceA, deviceB], path, {

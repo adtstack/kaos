@@ -103,3 +103,43 @@ export async function fetchVaultSchemaVersion(env: Env, vaultId: string): Promis
 export async function fetchVaultDebug(env: Env, vaultId: string): Promise<Response> {
 	return await fetchVaultRoomCheap(env, vaultId, "/__kaos/debug");
 }
+
+/**
+ * Public audit endpoint: forwards an authenticated POST body to the room's
+ * durable trace/audit store (the DO persists it beyond the bounded debug
+ * ring). The plugin posts discarded-revision records here — path identity is
+ * already hashed client-side, so no raw vault path crosses this route.
+ */
+export async function handleVaultTraceRoute(
+	env: Env,
+	vaultId: string,
+	req: Request,
+	json: (body: unknown, status?: number) => Response,
+): Promise<Response> {
+	let body: { event?: unknown; data?: unknown } = {};
+	try {
+		body = await req.json();
+	} catch {
+		return json({ error: "invalid json" }, 400);
+	}
+	if (typeof body.event !== "string" || body.event.length === 0) {
+		return json({ error: "missing event" }, 400);
+	}
+	const data =
+		typeof body.data === "object" && body.data !== null
+			? (body.data as Record<string, unknown>)
+			: {};
+	try {
+		const res = await fetchVaultRoomCheap(env, vaultId, "/__kaos/trace", {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ event: body.event, data }),
+		});
+		return json({ ok: res.ok });
+	} catch (err) {
+		console.warn(`${LOG_PREFIX} vault trace write failed:`, err);
+		return json({ ok: false }, 500);
+	}
+}

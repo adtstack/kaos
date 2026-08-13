@@ -146,7 +146,7 @@ async function main() {
 		await waitForFileContent(vaultA, "notes/restart.md", "after restart\n", e2eTimeout(30_000));
 		console.log("  PASS  restarted hosts continue syncing Markdown");
 
-		console.log("\n--- headless host worker e2e: offline divergence creates conflict artifact ---");
+		console.log("\n--- headless host worker e2e: offline divergence converges without a conflict artifact ---");
 		await writeVaultFile(vaultA, "notes/conflict.md", "conflict base\n");
 		await waitForFileContent(vaultB, "notes/conflict.md", "conflict base\n", e2eTimeout(30_000));
 		await sleep(2_000);
@@ -157,9 +157,13 @@ async function main() {
 		hostB = startHeadlessHost(vaultB, dataB);
 		children.push(hostB.child);
 		await hostB.waitFor('"kind":"poller-started"', e2eTimeout(25_000));
-		const conflictArtifact = await waitForConflictArtifact(vaultB, "notes/conflict.md", ["remote side\n", "local side\n"], e2eTimeout(45_000));
-		assert.match(conflictArtifact.path, /notes\/conflict \(KAOS conflict/);
-		console.log(`  PASS  conflict artifact created at ${conflictArtifact.path}`);
+		// Markdown conflict artifacts are abolished (1.12.0): the survivor
+		// (winner selection) converges and no `(KAOS conflict ...)` file appears.
+		await waitForFileContent(vaultA, "notes/conflict.md", "local side\n", e2eTimeout(45_000));
+		await waitForFileContent(vaultB, "notes/conflict.md", "local side\n", e2eTimeout(45_000));
+		const conflictArtifacts = await findConflictArtifacts(vaultB, "notes/conflict.md");
+		assert.equal(conflictArtifacts.length, 0, "no markdown conflict artifact is created");
+		console.log("  PASS  offline divergence converges with no conflict artifact");
 
 		console.log("\n--- headless host worker e2e: A attachment uploads to R2 and downloads on B ---");
 		const aBytes = Buffer.from([0, 1, 2, 3, 250, 251, 252, 253]);
@@ -599,19 +603,6 @@ async function waitForMissing(vaultRoot, path, timeoutMs) {
 	await waitUntil(async () => !existsSync(abs), timeoutMs);
 }
 
-async function waitForConflictArtifact(vaultRoot, originalPath, allowedContents, timeoutMs) {
-	let latest = [];
-	await waitUntil(async () => {
-		latest = await findConflictArtifacts(vaultRoot, originalPath);
-		for (const artifact of latest) {
-			if (allowedContents.includes(artifact.content)) return true;
-		}
-		return false;
-	}, timeoutMs);
-	const match = latest.find((artifact) => allowedContents.includes(artifact.content));
-	if (!match) throw new Error(`conflict artifact existed but content did not match expected variants: ${JSON.stringify(latest)}`);
-	return match;
-}
 
 async function findConflictArtifacts(vaultRoot, originalPath) {
 	const normalizedOriginal = originalPath.replace(/\\/g, "/");

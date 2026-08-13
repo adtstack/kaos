@@ -212,6 +212,16 @@ export function updateIndex(
 
 	for (const [path, stat] of allStats) {
 		if (excluded.has(path)) {
+			// "Excluded from advancement" means the OLD entry is carried forward
+			// unchanged — never dropped. Dropping the entry erases the durable
+			// baseline for an open-editor or preserved-unresolved path, which
+			// makes the next reconcile treat the path as missing-baseline and
+			// amplifies conservative behavior (more deferrals, no redundancy
+			// proof for discard auditing).
+			const previousEntry = index[path];
+			if (previousEntry !== undefined) {
+				newIndex[path] = previousEntry;
+			}
 			continue;
 		}
 		const oldEntry = index[path];
