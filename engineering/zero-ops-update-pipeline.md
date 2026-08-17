@@ -36,7 +36,7 @@ Because workflows are stripped during deploy clone, KAOS bootstraps them using a
 
 - Plugin collects the generated repo URL.
 - Plugin opens a pre-filled GitHub file creation URL for
-  `.github/workflows/kaos-ops-v2.yml`.
+  `.github/workflows/kaos-ops-v3.yml`.
 - User clicks **Commit changes** once.
 
 The versioned filename also gives existing deployments a collision-free path
@@ -47,7 +47,7 @@ This gives the repo an update entrypoint without terminal or PAT setup.
 
 ### Phase 3: repo-local execution
 
-`kaos-ops-v2.yml` is generated as a self-contained dispatch workflow inside the
+`kaos-ops-v3.yml` is generated as a self-contained dispatch workflow inside the
 deployment repo:
 
 - update action: pull release artifact and apply
@@ -55,7 +55,21 @@ deployment repo:
 
 Keeping execution repo-local avoids an extra private-repo workflow-sharing step.
 The updater logic still ships in the server artifact itself, so normal updates
-can replace the local updater script when needed.
+can replace the local updater script when needed. For deployment repositories
+that predate that script, v3 refreshes the updater from the selected release ZIP
+before each update run.
+
+### Control-plane ownership
+
+`kaos-ops-v3.yml` is the one managed control-plane file. Every server artifact
+contains its current template, and the updater replaces that exact file in the
+same commit as the server code. The workflow run that makes the commit continues
+with its prior definition; the refreshed definition applies on the next run.
+
+All other `.github/**` paths are user-owned and are always protected. `wrangler.toml`
+is user-owned as well. Normal releases must keep the v3 filename; a new vN file
+is allowed only when the existing workflow cannot recover or execute the required
+bootstrap path.
 
 ## Update mechanism
 
@@ -113,6 +127,6 @@ Deploy is an install primitive, not an in-place update primitive. Re-deploy can 
 - Normal update: click **Update server** in KAOS settings, run the opened workflow with `update`, then let KAOS watch the Worker version.
 - Rollback: run workflow with `revert`.
 - Migration-required release: update the plugin first (sync pauses), review the
-  release notes and take a current snapshot, create and commit updater v2, then
+  release notes and take a current snapshot, create and commit updater v3, then
   explicitly enable `allow_migration_update` for that workflow run. Without the
   opt-in, the workflow fails safely before changing files.

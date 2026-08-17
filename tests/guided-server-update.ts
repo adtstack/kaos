@@ -18,7 +18,7 @@ const pending = {
 	status: "waiting-for-user" as const,
 	targetVersion: "0.5.0",
 	startedAt,
-	updateActionUrl: "https://github.com/example/kaos/actions/workflows/kaos-ops-v2.yml",
+	updateActionUrl: "https://github.com/example/kaos/actions/workflows/kaos-ops-v3.yml",
 };
 
 assert.deepEqual(readPersistedGuidedServerUpdateState(pending), pending, "valid state is accepted");
@@ -70,8 +70,8 @@ const workflowCases = [
 		envExpression: "${{ github.event.inputs.allow_migration_update }}",
 	},
 	{
-		label: "versioned migration server template",
-		source: readFileSync("server/.github/workflows/kaos-ops-v2.yml", "utf8"),
+		label: "legacy-safe versioned server template",
+		source: readFileSync("server/.github/workflows/kaos-ops-v3.yml", "utf8"),
 		envExpression: "${{ github.event.inputs.allow_migration_update }}",
 	},
 	{
@@ -104,7 +104,7 @@ const updateService = new CapabilityUpdateService({
 assert.equal(
 	updateService.buildServerUpdateUrl(),
 	`https://github.com/example/deployment/actions/workflows/${GITHUB_OPS_WORKFLOW_FILENAME}`,
-	"GitHub update action targets the collision-free v2 workflow",
+	"GitHub update action targets the collision-free v3 workflow",
 );
 const bootstrapUrl = updateService.buildGithubUpdaterBootstrapUrl();
 assert.ok(bootstrapUrl, "GitHub updater bootstrap URL is available");
@@ -116,8 +116,13 @@ assert.equal(
 );
 assert.match(
 	parsedBootstrapUrl.searchParams.get("value") ?? "",
-	/^name: KAOS Server Ops v2/m,
-	"bootstrap content is the migration-capable v2 workflow",
+/^name: KAOS Server Ops v3/m,
+	"bootstrap content is the legacy-safe v3 workflow",
+);
+assert.match(
+	parsedBootstrapUrl.searchParams.get("value") ?? "",
+/Refresh updater from release[\s\S]*?KAOS_RELEASE_VERSION[\s\S]*?kaos-server-bootstrap\.zip[\s\S]*?BOOTSTRAP_URL[\s\S]*?unzip -p/,
+	"bootstrap workflow refreshes the updater from the selected release before every update run",
 );
 
 const settingsSource = readFileSync("src/settings/settingsTab.ts", "utf8");
@@ -130,14 +135,14 @@ const migrationUiEnd = settingsSource.indexOf(
 );
 const migrationUi = settingsSource.slice(migrationUiStart, migrationUiEnd);
 assert.ok(
-	migrationUi.indexOf("1. Create updater v2") >= 0
-		&& migrationUi.indexOf("1. Create updater v2")
+	migrationUi.indexOf("1. Create updater v3") >= 0
+		&& migrationUi.indexOf("1. Create updater v3")
 			< migrationUi.indexOf("2. After commit, run migration"),
 	"migration settings present workflow creation before execution",
 );
 assert.match(
 	settingsSource,
-	/Plugin-first migration: sync pauses until you create and commit updater v2/,
+	/Plugin-first migration: sync pauses until you create and commit updater v3/,
 	"migration settings explain the intentional compatibility pause",
 );
 

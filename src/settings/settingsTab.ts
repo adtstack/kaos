@@ -287,7 +287,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						? "Waiting for the GitHub update workflow and Cloudflare redeploy to finish."
 						: updateState.serverUpdateAvailable
 							? updateState.migrationRequired
-								? "Plugin-first migration: sync pauses until you create and commit updater v2, then explicitly allow the server migration."
+								? "Plugin-first migration: sync pauses until you create and commit updater v3, then explicitly allow the server migration."
 								: updateState.updateRepoUrl
 									? "A guided server update is available."
 									: "A server update is available. Add your deployment repo URL to enable guided updates."
@@ -378,7 +378,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					});
 				}
 				if (bootstrapUrl) {
-					updateActions.createEl("button", { text: "1. Create updater v2" }).addEventListener("click", () => {
+					updateActions.createEl("button", { text: "1. Create updater v3" }).addEventListener("click", () => {
 						window.open(bootstrapUrl, "_blank", "noopener");
 					});
 				}

@@ -58,12 +58,15 @@ const UPDATE_MANIFEST_URLS = [
 ] as const;
 const UPDATE_MANIFEST_CACHE_MS = 24 * 60 * 60 * 1000;
 export const CAPABILITY_REFRESH_INTERVAL_MS = 30_000;
-export const GITHUB_OPS_WORKFLOW_FILENAME = "kaos-ops-v2.yml";
+// Deployment repositories are detached copies, so an already-committed workflow
+// cannot be upgraded remotely. Keep this versioned whenever its bootstrap
+// contract changes; v3 can recover deployments that predate the updater script.
+export const GITHUB_OPS_WORKFLOW_FILENAME = "kaos-ops-v3.yml";
 export const GITHUB_OPS_WORKFLOW_PATH = `.github/workflows/${GITHUB_OPS_WORKFLOW_FILENAME}`;
 
 export function buildGithubOpsBootstrapWorkflowYaml(): string {
 	return [
-		"name: KAOS Server Ops v2",
+		"name: KAOS Server Ops v3",
 		"on:",
 		"  workflow_dispatch:",
 		"    inputs:",
@@ -91,6 +94,24 @@ export function buildGithubOpsBootstrapWorkflowYaml(): string {
 		"        run: |",
 		"          git config user.name \"GitHub Actions\"",
 		"          git config user.email \"actions@github.com\"",
+		"      - name: Refresh updater from release",
+		"        if: ${{ github.event.inputs.action == 'update' }}",
+		"        env:",
+		"          KAOS_RELEASE_REPO: ${{ vars.KAOS_RELEASE_REPO != '' && vars.KAOS_RELEASE_REPO || github.event.inputs.release_repo }}",
+		"          KAOS_RELEASE_VERSION: ${{ github.event.inputs.version }}",
+		"        run: |",
+		"          mkdir -p scripts",
+		"          BOOTSTRAP_ARCHIVE=\"$RUNNER_TEMP/kaos-server-bootstrap.zip\"",
+		"          if [ -n \"$KAOS_RELEASE_VERSION\" ]; then",
+		"            BOOTSTRAP_URL=\"https://github.com/${KAOS_RELEASE_REPO}/releases/download/${KAOS_RELEASE_VERSION}/kaos-server.zip\"",
+		"          else",
+		"            BOOTSTRAP_URL=\"https://github.com/${KAOS_RELEASE_REPO}/releases/latest/download/kaos-server.zip\"",
+		"          fi",
+		"          curl --fail --location --silent --show-error \\",
+		"            \"$BOOTSTRAP_URL\" \\",
+		"            --output \"$BOOTSTRAP_ARCHIVE\"",
+		"          unzip -p \"$BOOTSTRAP_ARCHIVE\" scripts/update-from-release.mjs > scripts/update-from-release.mjs",
+		"          test -s scripts/update-from-release.mjs",
 		"      - name: Apply KAOS server artifact",
 		"        if: ${{ github.event.inputs.action == 'update' }}",
 		"        env:",
