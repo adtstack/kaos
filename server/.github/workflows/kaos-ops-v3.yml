@@ -1,0 +1,106 @@
+name: KAOS Server Ops v3
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Choose update or revert"
+        required: true
+        default: "update"
+        type: choice
+        options:
+          - update
+          - revert
+      version:
+        description: "Optional KAOS release tag to install (defaults to latest)"
+        required: false
+        type: string
+      release_repo:
+        description: "Optional owner/repo to pull releases from"
+        required: false
+        default: "adtstack/kaos"
+        type: string
+      allow_migration_update:
+        description: "Explicitly allow a release marked migration-required"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 20
+
+      - name: Configure git identity
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+      # Deploy-to-Cloudflare repositories created before the update pipeline do
+      # not yet contain this script. Refreshing it from the release archive
+      # also lets future releases update this workflow in the same Git commit.
+      - name: Refresh updater from release
+        if: ${{ github.event.inputs.action == 'update' }}
+        env:
+          KAOS_RELEASE_REPO: ${{ vars.KAOS_RELEASE_REPO != '' && vars.KAOS_RELEASE_REPO || github.event.inputs.release_repo }}
+          KAOS_RELEASE_VERSION: ${{ github.event.inputs.version }}
+          KAOS_RELEASE_TOKEN: ${{ secrets.KAOS_RELEASE_TOKEN }}
+        run: |
+          mkdir -p scripts
+          BOOTSTRAP_ARCHIVE="$RUNNER_TEMP/kaos-server-bootstrap.zip"
+          if [ -n "$KAOS_RELEASE_VERSION" ]; then
+            BOOTSTRAP_URL="https://github.com/${KAOS_RELEASE_REPO}/releases/download/${KAOS_RELEASE_VERSION}/kaos-server.zip"
+          else
+            BOOTSTRAP_URL="https://github.com/${KAOS_RELEASE_REPO}/releases/latest/download/kaos-server.zip"
+          fi
+          if [ -n "$KAOS_RELEASE_TOKEN" ]; then
+            curl --fail --location --silent --show-error \
+              --header "Authorization: Bearer ${KAOS_RELEASE_TOKEN}" \
+              "$BOOTSTRAP_URL" \
+              --output "$BOOTSTRAP_ARCHIVE"
+          else
+            curl --fail --location --silent --show-error \
+              "$BOOTSTRAP_URL" \
+              --output "$BOOTSTRAP_ARCHIVE"
+          fi
+          unzip -p "$BOOTSTRAP_ARCHIVE" scripts/update-from-release.mjs > scripts/update-from-release.mjs
+          test -s scripts/update-from-release.mjs
+
+      - name: Apply KAOS server artifact
+        if: ${{ github.event.inputs.action == 'update' }}
+        env:
+          KAOS_RELEASE_REPO: ${{ vars.KAOS_RELEASE_REPO != '' && vars.KAOS_RELEASE_REPO || github.event.inputs.release_repo }}
+          KAOS_RELEASE_VERSION: ${{ github.event.inputs.version }}
+          KAOS_RELEASE_TOKEN: ${{ secrets.KAOS_RELEASE_TOKEN }}
+          KAOS_ALLOW_MIGRATION_UPDATE: ${{ github.event.inputs.allow_migration_update }}
+        run: node scripts/update-from-release.mjs
+
+      - name: Revert last KAOS update commit
+        if: ${{ github.event.inputs.action == 'revert' }}
+        run: node scripts/revert-last-update.mjs
+
+      - name: Commit and push update if changed
+        if: ${{ github.event.inputs.action == 'update' }}
+        run: |
+          git add -A -- ':!.github/workflows/kaos-ops-v3.yml'
+          if git diff --cached --quiet; then
+            echo "No KAOS server changes to commit."
+            exit 0
+          fi
+          VERSION="$(node -p "require('./package.json').version")"
+          git commit -m "kaos(server): update to ${VERSION}"
+          git push
+
+      - name: Push revert commit
+        if: ${{ github.event.inputs.action == 'revert' }}
+        run: git push
