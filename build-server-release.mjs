@@ -1,12 +1,13 @@
 import { execFileSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const rootDir = resolve(".");
 const outputDir = resolve(rootDir, "dist/release-assets");
 const tempDir = mkdtempSync(join(tmpdir(), "kaos-server-release-"));
 const serverTempDir = join(tempDir, "server");
+const managedWorkflowPath = ".github/workflows/kaos-ops-v3.yml";
 
 const rootPackage = JSON.parse(readFileSync(resolve(rootDir, "package.json"), "utf8"));
 const pluginManifest = JSON.parse(readFileSync(resolve(rootDir, "manifest.json"), "utf8"));
@@ -123,7 +124,9 @@ const serverZipManifest = {
 	serverMinSchemaVersion,
 	serverMaxSchemaVersion,
 	protectedFiles: ["wrangler.toml"],
+	managedWorkflowPath,
 	updateOwnedPaths: [
+		managedWorkflowPath,
 		".gitlab-ci.yml",
 		"package.json",
 		"package-lock.json",
@@ -138,6 +141,7 @@ mkdirSync(outputDir, { recursive: true });
 mkdirSync(serverTempDir, { recursive: true });
 
 for (const relativePath of [
+	managedWorkflowPath,
 	"package.json",
 	"package-lock.json",
 	".gitlab-ci.yml",
@@ -146,7 +150,9 @@ for (const relativePath of [
 	"wrangler.toml",
 	"src",
 ]) {
-	cpSync(resolve(rootDir, "server", relativePath), join(serverTempDir, relativePath), {
+	const targetPath = join(serverTempDir, relativePath);
+	mkdirSync(dirname(targetPath), { recursive: true });
+	cpSync(resolve(rootDir, "server", relativePath), targetPath, {
 		recursive: true,
 	});
 }
