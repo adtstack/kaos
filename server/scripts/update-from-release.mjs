@@ -55,6 +55,7 @@ const tempDir = mkdtempSync(join(tmpdir(), "kaos-server-update-"));
 const zipPath = join(tempDir, "kaos-server.zip");
 const extractDir = join(tempDir, "extract");
 const protectedPrefixes = [".github", ".github/"];
+const managedWorkflowPath = ".github/workflows/kaos-ops-v3.yml";
 const allowMigrationUpdate =
 	process.env.KAOS_ALLOW_MIGRATION_UPDATE?.trim().toLowerCase() === "true";
 const allowSchemaRangeUpdate =
@@ -73,24 +74,23 @@ function assertSafeServerUpdateTarget() {
 	}
 
 	const packagePath = join(repoRoot, "package.json");
-	const versionPath = join(repoRoot, "src/version.ts");
 	const wranglerPath = join(repoRoot, "wrangler.toml");
-	if (!existsSync(packagePath) || !existsSync(versionPath) || !existsSync(wranglerPath)) {
+	if (!existsSync(packagePath) || !existsSync(wranglerPath)) {
 		throw new Error(
 			[
 				"Refusing to apply a KAOS server update outside a KAOS server repository.",
 				`Current directory: ${repoRoot}`,
-				"Expected package.json, src/version.ts, and wrangler.toml.",
+				"Expected package.json and wrangler.toml.",
 				"Run this updater from the generated Cloudflare Worker/server repository.",
 			].join(" "),
 		);
 	}
 
 	const packageJson = JSON.parse(readFileSync(packagePath, "utf8"));
-	if (packageJson?.name !== "kaos-server") {
+	if (packageJson?.name !== "kaos-server" && packageJson?.name !== "yaos-server") {
 		throw new Error(
 			[
-				"Refusing to apply a KAOS server update because package.json is not the KAOS server package.",
+				"Refusing to apply a KAOS server update because package.json is not the KAOS or legacy YAOS server package.",
 				`Current directory: ${repoRoot}`,
 				`Found package name: ${String(packageJson?.name ?? "missing")}`,
 			].join(" "),
@@ -407,6 +407,14 @@ async function main() {
 	if (!Array.isArray(rawManifest.updateOwnedPaths)) {
 		throw new Error("Artifact manifest is missing updateOwnedPaths");
 	}
+	if (
+		rawManifest.managedWorkflowPath !== undefined &&
+		rawManifest.managedWorkflowPath !== managedWorkflowPath
+	) {
+		throw new Error(
+			`Artifact manifest declares an unsupported managed workflow path: ${String(rawManifest.managedWorkflowPath)}`,
+		);
+	}
 	if (rawManifest.migrationRequired === true && !allowMigrationUpdate) {
 		throw new Error(
 			[
@@ -434,12 +442,18 @@ async function main() {
 		if (typeof relativePath !== "string" || !relativePath) {
 			throw new Error(`Invalid update-owned path in artifact: ${String(relativePath)}`);
 		}
-		if (protectedPrefixes.some((prefix) => relativePath === prefix || relativePath.startsWith(prefix))) {
+		const isManagedWorkflow = rawManifest.managedWorkflowPath === managedWorkflowPath &&
+			relativePath === managedWorkflowPath;
+		if (!isManagedWorkflow && protectedPrefixes.some((prefix) => relativePath === prefix || relativePath.startsWith(prefix))) {
 			console.log(`Skipping protected path ${relativePath}`);
 			continue;
 		}
 		const sourcePath = join(extractDir, relativePath);
 		const targetPath = join(repoRoot, relativePath);
+		if (isManagedWorkflow && existsSync(targetPath)) {
+			console.log(`Keeping immutable managed bootstrap ${relativePath}; workflow control-plane upgrades use a new versioned filename.`);
+			continue;
+		}
 		rmSync(targetPath, { recursive: true, force: true });
 		const sourceStats = statSync(sourcePath);
 		if (sourceStats.isDirectory()) {
