@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -186,6 +186,12 @@ try {
 
 	const baselineVersion = read("src/version.ts");
 	const baselineWrangler = read("wrangler.toml");
+	const managedWorkflowPath = ".github/workflows/kaos-ops-v3.yml";
+	const baselineManagedWorkflow = read(managedWorkflowPath);
+	const customWorkflowPath = ".github/workflows/local-user-workflow.yml";
+	const customWorkflow = "name: Local user workflow\n";
+	writeFileSync(join(repoDir, managedWorkflowPath), `${baselineManagedWorkflow}\n# stale local copy\n`);
+	writeFileSync(join(repoDir, customWorkflowPath), customWorkflow);
 	const currentServerVersionMatch = baselineVersion.match(/SERVER_VERSION = "([^"]+)"/);
 	if (!currentServerVersionMatch) {
 		throw new Error("Unable to read current server version from src/version.ts");
@@ -241,6 +247,12 @@ try {
 	if (!updatedWrangler.includes("# local-test-preserved")) {
 		throw new Error("Update test failed: protected wrangler.toml changes were overwritten");
 	}
+	if (read(managedWorkflowPath) !== `${baselineManagedWorkflow}\n# stale local copy\n`) {
+		throw new Error("Update test failed: the immutable versioned bootstrap workflow was unexpectedly overwritten");
+	}
+	if (read(customWorkflowPath) !== customWorkflow) {
+		throw new Error("Update test failed: a user-owned workflow was overwritten");
+	}
 
 	run("git", ["add", "-A"]);
 	run("git", ["commit", "-qm", `kaos(server): update to ${currentServerVersion}`]);
@@ -269,6 +281,39 @@ try {
 	const afterBadUpdateVersion = read("src/version.ts");
 	if (!afterBadUpdateVersion.includes('SERVER_VERSION = "0.1.9"')) {
 		throw new Error("Schema gap test failed: rejected update still modified src/version.ts");
+	}
+
+	// The v3 workflow extracts this updater from the release archive when a
+	// detached deployment predates scripts/update-from-release.mjs. Such a
+	// deployment can also predate src/version.ts, so the updater must still be
+	// able to install its first versioned release after explicit migration consent.
+	const legacyRepoDir = join(tempDir, "legacy-repo");
+	mkdirSync(join(legacyRepoDir, "src"), { recursive: true });
+	writeFileSync(
+		join(legacyRepoDir, "package.json"),
+		`${JSON.stringify({ name: "yaos-server", version: "0.1.0" }, null, 2)}\n`,
+	);
+	writeFileSync(
+		join(legacyRepoDir, "wrangler.toml"),
+		'name = "legacy-kaos"\nmain = "src/index.ts"\n',
+	);
+	writeFileSync(join(legacyRepoDir, "src/index.ts"), "export default {};\n");
+	execFileSync("node", [resolve(rootDir, "server/scripts/update-from-release.mjs")], {
+		cwd: legacyRepoDir,
+		stdio: "inherit",
+		env: {
+			...process.env,
+			KAOS_RELEASE_FILE: artifactPath,
+			KAOS_ALLOW_MIGRATION_UPDATE: "true",
+		},
+	});
+	const bootstrappedVersion = readFileSync(join(legacyRepoDir, "src/version.ts"), "utf8");
+	if (bootstrappedVersion !== baselineVersion) {
+		throw new Error("Legacy bootstrap update failed to install src/version.ts from the artifact");
+	}
+	const bootstrappedWorkflowPath = join(legacyRepoDir, managedWorkflowPath);
+	if (!existsSync(bootstrappedWorkflowPath) || readFileSync(bootstrappedWorkflowPath, "utf8") !== baselineManagedWorkflow) {
+		throw new Error("Legacy bootstrap update failed to install the managed updater workflow");
 	}
 
 	const vaultDir = join(tempDir, "vault");

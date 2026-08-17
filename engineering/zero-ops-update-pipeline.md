@@ -36,7 +36,7 @@ Because workflows are stripped during deploy clone, KAOS bootstraps them using a
 
 - Plugin collects the generated repo URL.
 - Plugin opens a pre-filled GitHub file creation URL for
-  `.github/workflows/kaos-ops-v2.yml`.
+  `.github/workflows/kaos-ops-v3.yml`.
 - User clicks **Commit changes** once.
 
 The versioned filename also gives existing deployments a collision-free path
@@ -47,15 +47,35 @@ This gives the repo an update entrypoint without terminal or PAT setup.
 
 ### Phase 3: repo-local execution
 
-`kaos-ops-v2.yml` is generated as a self-contained dispatch workflow inside the
-deployment repo:
+`kaos-ops-v3.yml` is generated as a self-contained, versioned dispatch workflow
+inside the deployment repo:
 
 - update action: pull release artifact and apply
 - revert action: revert last update commit
 
 Keeping execution repo-local avoids an extra private-repo workflow-sharing step.
 The updater logic still ships in the server artifact itself, so normal updates
-can replace the local updater script when needed.
+replace the local updater script when needed. For deployment repositories that
+predate that script, v3 refreshes the updater from the selected release ZIP
+before each update run.
+
+### Control-plane ownership
+
+`kaos-ops-v3.yml` is an immutable, versioned control-plane bootstrap. Every
+server artifact contains its template so it can be installed when missing, but a
+run never overwrites an existing bootstrap. GitHub requires a workflow-scoped
+credential to modify `.github/workflows/**`; the generated workflow intentionally
+uses only the repository `GITHUB_TOKEN`, so ordinary server updates cannot safely
+self-mutate the workflow that runs them. The updater script is release-owned and
+is refreshed before every update, which keeps normal server-update behavior
+current without extra setup.
+
+All other `.github/**` paths are user-owned and are always protected. `wrangler.toml`
+is user-owned as well. Normal releases keep the v3 filename and refresh only the
+release-owned updater. When the bootstrap contract itself must change, KAOS ships
+a new `kaos-ops-vN.yml` template; the plugin creates the pre-filled GitHub link,
+so the user never has to invent a filename or edit YAML. The user commits that
+new file once, and it takes over future dispatches.
 
 ## Update mechanism
 
@@ -113,6 +133,6 @@ Deploy is an install primitive, not an in-place update primitive. Re-deploy can 
 - Normal update: click **Update server** in KAOS settings, run the opened workflow with `update`, then let KAOS watch the Worker version.
 - Rollback: run workflow with `revert`.
 - Migration-required release: update the plugin first (sync pauses), review the
-  release notes and take a current snapshot, create and commit updater v2, then
+  release notes and take a current snapshot, create and commit updater v3, then
   explicitly enable `allow_migration_update` for that workflow run. Without the
   opt-in, the workflow fails safely before changing files.

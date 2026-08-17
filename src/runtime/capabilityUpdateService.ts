@@ -58,12 +58,16 @@ const UPDATE_MANIFEST_URLS = [
 ] as const;
 const UPDATE_MANIFEST_CACHE_MS = 24 * 60 * 60 * 1000;
 export const CAPABILITY_REFRESH_INTERVAL_MS = 30_000;
-export const GITHUB_OPS_WORKFLOW_FILENAME = "kaos-ops-v2.yml";
+// GitHub requires a workflow-scoped credential to rewrite an existing workflow
+// from Actions. Deployment repositories instead keep this bootstrap immutable;
+// when its contract changes, publish a new versioned filename. The current
+// bootstrap refreshes the release-owned updater script on every normal update.
+export const GITHUB_OPS_WORKFLOW_FILENAME = "kaos-ops-v3.yml";
 export const GITHUB_OPS_WORKFLOW_PATH = `.github/workflows/${GITHUB_OPS_WORKFLOW_FILENAME}`;
 
 export function buildGithubOpsBootstrapWorkflowYaml(): string {
 	return [
-		"name: KAOS Server Ops v2",
+		"name: KAOS Server Ops v3",
 		"on:",
 		"  workflow_dispatch:",
 		"    inputs:",
@@ -91,6 +95,33 @@ export function buildGithubOpsBootstrapWorkflowYaml(): string {
 		"        run: |",
 		"          git config user.name \"GitHub Actions\"",
 		"          git config user.email \"actions@github.com\"",
+		"      # The versioned workflow is an immutable bootstrap. Refresh the release-owned updater before every update.",
+		"      - name: Refresh updater from release",
+		"        if: ${{ github.event.inputs.action == 'update' }}",
+		"        env:",
+		"          KAOS_RELEASE_REPO: ${{ vars.KAOS_RELEASE_REPO != '' && vars.KAOS_RELEASE_REPO || github.event.inputs.release_repo }}",
+		"          KAOS_RELEASE_VERSION: ${{ github.event.inputs.version }}",
+		"          KAOS_RELEASE_TOKEN: ${{ secrets.KAOS_RELEASE_TOKEN }}",
+		"        run: |",
+		"          mkdir -p scripts",
+		"          BOOTSTRAP_ARCHIVE=\"$RUNNER_TEMP/kaos-server-bootstrap.zip\"",
+		"          if [ -n \"$KAOS_RELEASE_VERSION\" ]; then",
+		"            BOOTSTRAP_URL=\"https://github.com/${KAOS_RELEASE_REPO}/releases/download/${KAOS_RELEASE_VERSION}/kaos-server.zip\"",
+		"          else",
+		"            BOOTSTRAP_URL=\"https://github.com/${KAOS_RELEASE_REPO}/releases/latest/download/kaos-server.zip\"",
+		"          fi",
+		"          if [ -n \"$KAOS_RELEASE_TOKEN\" ]; then",
+		"            curl --fail --location --silent --show-error \\",
+		"              --header \"Authorization: Bearer ${KAOS_RELEASE_TOKEN}\" \\",
+		"              \"$BOOTSTRAP_URL\" \\",
+		"              --output \"$BOOTSTRAP_ARCHIVE\"",
+		"          else",
+		"            curl --fail --location --silent --show-error \\",
+		"              \"$BOOTSTRAP_URL\" \\",
+		"              --output \"$BOOTSTRAP_ARCHIVE\"",
+		"          fi",
+		"          unzip -p \"$BOOTSTRAP_ARCHIVE\" scripts/update-from-release.mjs > scripts/update-from-release.mjs",
+		"          test -s scripts/update-from-release.mjs",
 		"      - name: Apply KAOS server artifact",
 		"        if: ${{ github.event.inputs.action == 'update' }}",
 		"        env:",
@@ -105,7 +136,8 @@ export function buildGithubOpsBootstrapWorkflowYaml(): string {
 		"      - name: Commit and push update if changed",
 		"        if: ${{ github.event.inputs.action == 'update' }}",
 		"        run: |",
-		"          git add -A",
+		"          # GITHUB_TOKEN cannot rewrite an existing workflow; keep this versioned bootstrap immutable.",
+		"          git add -A -- ':!.github/workflows/kaos-ops-v3.yml'",
 		"          if git diff --cached --quiet; then",
 		"            echo \"No KAOS server changes to commit.\"",
 		"            exit 0",
