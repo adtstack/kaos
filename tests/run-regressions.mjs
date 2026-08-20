@@ -72,6 +72,7 @@ const suites = [
 	[JITI, "tests/indexed-db-pending-blob-intent-store.ts"],
 	[JITI, "tests/pending-blob-intent-write-ahead.ts"],
 	[JITI, "tests/pending-blob-intent-commit.ts"],
+	[JITI, "tests/stuck-blob-intent-retirement.ts"],
 	[JITI, "tests/indexed-db-blob-settled-ref-store.ts"],
 	[JITI, "tests/blob-settled-ref-migration.ts"],
 	[JITI, "tests/blob-legacy-upgrade-quarantine.ts"],

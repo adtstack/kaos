@@ -18,6 +18,9 @@ import type {
 	DashboardRemoteDeleteResolutionTarget,
 	DashboardRecoveryHistoryTarget,
 	DashboardRecoveryStorageStatus,
+	DashboardStuckLocalMutationResolution,
+	DashboardStuckLocalMutationResolutionResult,
+	DashboardStuckLocalMutationResolutionTarget,
 	DashboardTone,
 	KaosDashboardData,
 } from "./dashboardTypes";
@@ -64,6 +67,9 @@ export interface KaosDashboardActions {
 		target: DashboardLegacyMissingBlobResolutionTarget,
 		choice: DashboardLegacyMissingBlobResolutionChoice,
 	): Promise<DashboardRemoteDeleteResolutionResult>;
+	dismissStuckLocalMutationAttention(
+		target: DashboardStuckLocalMutationResolutionTarget,
+	): Promise<DashboardStuckLocalMutationResolutionResult>;
 	resolveBlobConflict(
 		target: DashboardBlobConflictResolutionTarget,
 		choice: DashboardBlobConflictResolutionChoice,
@@ -702,6 +708,18 @@ export class KaosDashboardView extends ItemView {
 						resolution.unavailableReason ?? undefined,
 					);
 					keepAbsentButton.classList.add("mod-warning");
+				} else if (resolution?.kind === "stuck-local-mutation") {
+					const pending = this.pendingAttentionEpisodes.has(
+						attentionEpisodeKey(path, resolution),
+					);
+					const dismissButton = this.button(
+						actions,
+						pending ? "Dismissing…" : "Dismiss (trace-only)",
+						() => this.confirmStuckLocalMutationDismiss(path, resolution),
+						pending || !resolution.canDismiss,
+						resolution.unavailableReason ?? undefined,
+					);
+					dismissButton.classList.add("mod-warning");
 				} else {
 					this.button(
 						actions,
@@ -868,6 +886,71 @@ export class KaosDashboardView extends ItemView {
 		if (!this.data) return;
 		const nextAttention = this.data.attention.filter((item) => {
 			if (item.path !== path || item.resolution?.kind !== "legacy-missing-blob") {
+				return true;
+			}
+			return item.resolution.episodeId !== resolution.episodeId;
+		});
+		if (nextAttention.length === this.data.attention.length) return;
+		this.data = {
+			...this.data,
+			attention: nextAttention,
+			attentionTotalCount: Math.max(0, this.data.attentionTotalCount - 1),
+		};
+	}
+
+	private confirmStuckLocalMutationDismiss(
+		path: string,
+		resolution: DashboardStuckLocalMutationResolution,
+	): Promise<void> {
+		const episodeKey = attentionEpisodeKey(path, resolution);
+		if (this.pendingAttentionEpisodes.has(episodeKey)) {
+			return Promise.reject(new Error(`A resolution is already pending for "${path}".`));
+		}
+		this.pendingAttentionEpisodes.add(episodeKey);
+		this.render();
+		return new Promise((resolve, reject) => {
+			new ConfirmModal(
+				this.app,
+				"Dismiss this conflict episode?",
+				`Retire the stuck local-mutation conflict for "${path}"? The quarantined journal intent is removed and the dismissal is recorded as a trace. If the remote still holds a live version of this path, the standard download-or-keep-absence choice appears instead of deleting anything.`,
+				async () => {
+					try {
+						const result = await this.deps.actions.dismissStuckLocalMutationAttention(
+							{ path, ...resolution },
+						);
+						new Notice(result.status === "pending"
+							? result.message
+							: `Conflict episode dismissed: ${path}`, 7_000);
+						if (result.status === "completed") {
+							this.removeResolvedStuckLocalMutationEpisode(path, resolution);
+						}
+						resolve();
+					} catch (err) {
+						reject(err instanceof Error ? err : new Error(String(err)));
+					} finally {
+						this.pendingAttentionEpisodes.delete(episodeKey);
+						this.render();
+					}
+				},
+				"Dismiss (trace-only)",
+				"Cancel",
+				() => {
+					this.pendingAttentionEpisodes.delete(episodeKey);
+					this.render();
+					resolve();
+				},
+				"mod-warning",
+			).open();
+		});
+	}
+
+	private removeResolvedStuckLocalMutationEpisode(
+		path: string,
+		resolution: DashboardStuckLocalMutationResolution,
+	): void {
+		if (!this.data) return;
+		const nextAttention = this.data.attention.filter((item) => {
+			if (item.path !== path || item.resolution?.kind !== "stuck-local-mutation") {
 				return true;
 			}
 			return item.resolution.episodeId !== resolution.episodeId;
