@@ -143,7 +143,8 @@ export interface DashboardLegacyMissingBlobResolution {
 
 export type DashboardAttentionResolution =
 	| DashboardRemoteDeleteResolution
-	| DashboardLegacyMissingBlobResolution;
+	| DashboardLegacyMissingBlobResolution
+	| DashboardStuckLocalMutationResolution;
 
 export interface DashboardRemoteDeleteResolutionTarget
 	extends DashboardRemoteDeleteResolution {
@@ -166,6 +167,25 @@ export interface DashboardLegacyMissingBlobResolutionTarget
 export type DashboardLegacyMissingBlobResolutionChoice =
 	| "download-remote"
 	| "keep-local-absent";
+
+export interface DashboardStuckLocalMutationResolution {
+	kind: "stuck-local-mutation";
+	fileKind: "blob";
+	reason: "local-blob-mutation-remote-conflict";
+	episodeId: string;
+	localFile: DashboardLocalFileIdentity;
+	canDismiss: boolean;
+	unavailableReason: string | null;
+}
+
+export interface DashboardStuckLocalMutationResolutionTarget
+	extends DashboardStuckLocalMutationResolution {
+	path: string;
+}
+
+export type DashboardStuckLocalMutationResolutionResult =
+	| { status: "completed" }
+	| { status: "pending"; message: string };
 
 export type DashboardSnapshotStatus =
 	| { status: "ready"; summary: DashboardSnapshotStatusSummary }

@@ -120,6 +120,11 @@ import {
 	type PendingBlobMutationBase,
 } from "./sync/pendingBlobIntentJournal";
 import {
+	decidePendingBlobIntentRetirement,
+	type PendingBlobIntentGroundTruth,
+	type PendingBlobIntentRetirementDisposition,
+} from "./sync/pendingBlobIntentRetirement";
+import {
 	commitPendingBlobIntentWithWriteAhead,
 	type PendingBlobIntentCommitOutcome,
 } from "./sync/pendingBlobIntentCommit";
@@ -218,6 +223,8 @@ import type {
 	DashboardRemoteDeleteResolutionChoice,
 	DashboardRemoteDeleteResolutionResult,
 	DashboardRemoteDeleteResolutionTarget,
+	DashboardStuckLocalMutationResolutionTarget,
+	DashboardStuckLocalMutationResolutionResult,
 	DashboardLocalFileIdentity,
 	KaosDashboardData,
 	DashboardTone,
@@ -265,6 +272,21 @@ type PendingBlobReplayMutation = {
 type PendingBlobReplayApplyResult =
 	| PendingBlobReplayPrecondition
 	| PendingBlobReplayMutation;
+
+/**
+ * Preserved-unresolved reasons owned by one pending-intent episode. When the
+ * episode resolves or retires, its attention entries must not linger.
+ */
+const INTENT_EPISODE_CONFLICT_REASONS: readonly PreservedUnresolvedReason[] = [
+	"local-blob-mutation-remote-conflict",
+	"remote-delete-local-conflict",
+];
+
+function isIntentEpisodeConflictReason(
+	reason: PreservedUnresolvedReason,
+): boolean {
+	return INTENT_EPISODE_CONFLICT_REASONS.includes(reason);
+}
 
 type PersistedPluginState = Partial<VaultSyncSettings> & ExternalEditPolicyCompatibilityFields & {
 	_diskIndex?: DiskIndex;
@@ -1974,8 +1996,24 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			: "local-blob-mutation-remote-conflict";
 		const blobSync = this.getBlobSync();
 		if (blobSync) {
+			// The replay loop re-evaluates the same fenced intent every status
+			// tick. One record per episode is sufficient; re-recording would keep
+			// refreshing lastSeenAt and re-fencing transfers for a path whose
+			// quarantine state has not changed.
+			const alreadyRecorded = blobSync.getPreservedUnresolvedEntries().some((entry) =>
+				entry.kind === "blob"
+				&& normalizePath(entry.path) === normalizePath(path)
+				&& entry.reason === reason
+			);
+			if (alreadyRecorded) return;
 			blobSync.recordPreservedUnresolved(path, reason);
 		} else {
+			const alreadyRecorded = this.preservedUnresolvedEntries.some((entry) =>
+				entry.kind === "blob"
+				&& normalizePath(entry.path) === normalizePath(path)
+				&& entry.reason === reason
+			);
+			if (alreadyRecorded) return;
 			this.recordPersistedBlobUnresolved(path, reason);
 		}
 	}
@@ -1990,18 +2028,136 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			const liveEntry = blobSync?.getPreservedUnresolvedEntries().find((entry) =>
 				entry.kind === "blob"
 				&& normalizePath(entry.path) === normalized
-				&& entry.reason === "local-blob-mutation-remote-conflict"
+				&& isIntentEpisodeConflictReason(entry.reason)
 			);
 			if (liveEntry) blobSync?.clearPreservedUnresolved(normalized);
 		}
 		const before = this.preservedUnresolvedEntries.length;
 		this.preservedUnresolvedEntries = this.preservedUnresolvedEntries.filter((entry) =>
 			entry.kind !== "blob"
-			|| entry.reason !== "local-blob-mutation-remote-conflict"
+			|| !isIntentEpisodeConflictReason(entry.reason)
 			|| !paths.some((path) => normalizePath(path) === normalizePath(entry.path))
 		);
 		if (this.preservedUnresolvedEntries.length !== before) {
 			this.persistPreservedUnresolvedState();
+		}
+	}
+
+	private pendingBlobIntentGroundTruth(
+		intent: PendingBlobIntent,
+		vaultSync: VaultSync,
+	): PendingBlobIntentGroundTruth {
+		const sourcePath = intent.kind === "delete" ? intent.path : intent.oldPath;
+		return {
+			diskOccupied: this.app.vault.getAbstractFileByPath(sourcePath) !== null,
+			liveRef: !!vaultSync.getBlobRef(sourcePath),
+		};
+	}
+
+	/**
+	 * Retire one quarantined intent permanently, or re-record its quarantine if
+	 * the ground truth still warrants keeping it fenced. Only reachable from
+	 * replay sites that already record a committed-intent conflict; normal
+	 * ready/CAS/receipt-wait lanes never pass through here.
+	 */
+	private async retireOrQuarantinePendingBlobIntent(
+		intent: PendingBlobIntent,
+		scopeToken: BlobAuthorityScopeToken,
+		vaultSync: VaultSync,
+		preferRemoteDeleteResolution = false,
+	): Promise<"retired" | "quarantined" | "stop"> {
+		const groundTruth = this.pendingBlobIntentGroundTruth(intent, vaultSync);
+		const disposition = decidePendingBlobIntentRetirement(intent, groundTruth);
+		if (disposition.kind === "retain") {
+			this.recordCommittedBlobIntentConflict(intent, preferRemoteDeleteResolution);
+			return "quarantined";
+		}
+		await this.retireStuckBlobEpisode(intent, disposition, groundTruth, "auto");
+		if (!this.isCurrentBlobReplayAuthority(scopeToken, vaultSync)) return "stop";
+		return "retired";
+	}
+
+	private async retireStuckBlobEpisode(
+		intent: PendingBlobIntent,
+		disposition: PendingBlobIntentRetirementDisposition,
+		groundTruth: PendingBlobIntentGroundTruth,
+		origin: "auto" | "operator",
+	): Promise<void> {
+		const sourcePath = intent.kind === "delete" ? intent.path : intent.oldPath;
+		this.pendingBlobIntents.remove(intent.id);
+		// Settlement stages installed by this intent's own removal prep follow it
+		// into retirement. Random-id retire stages are compact absence
+		// provenance and must survive.
+		let settlementChanged = false;
+		let legacyQuarantineChanged = false;
+		for (const rawPath of Object.keys(this.blobSettlementStages)) {
+			const stageId = this.blobSettlementStages[rawPath]?.stageId;
+			if (
+				stageId === `committed:${intent.id}`
+				|| stageId === `rename:${intent.id}`
+			) {
+				delete this.blobSettlementStages[rawPath];
+				settlementChanged = true;
+			}
+		}
+		this.clearResolvedLocalBlobMutationConflict(intent);
+		if (disposition.kind === "retire-authority-moved") {
+			// A live CRDT ref owns the path while the disk file is gone. Surface
+			// the standard download-or-keep-absence attention instead of letting
+			// an ungated reconcile resurrect the deleted file. Membership in the
+			// legacy quarantine registry is what makes that attention resolvable
+			// and self-healing; recording the entry alone would strand it.
+			const normalizedSource = normalizePath(sourcePath);
+			if (!this.legacyMissingBlobPaths.has(normalizedSource)) {
+				this.legacyMissingBlobPaths.add(normalizedSource);
+				legacyQuarantineChanged = true;
+			}
+			const blobSync = this.getBlobSync();
+			if (blobSync) {
+				blobSync.recordPreservedUnresolved(
+					sourcePath,
+					LEGACY_MISSING_BLOB_ATTENTION_REASON,
+				);
+			} else {
+				this.recordPersistedBlobUnresolved(
+					sourcePath,
+					LEGACY_MISSING_BLOB_ATTENTION_REASON,
+				);
+			}
+		}
+		this.trace("blob", "pending-blob-intent-retired", {
+			path: sourcePath,
+			disposition: disposition.kind,
+			origin,
+			intentKind: intent.kind,
+			attempted: intent.commitAttemptId !== undefined,
+			committed: intent.committedAt !== undefined,
+			diskOccupied: groundTruth.diskOccupied,
+			liveRef: groundTruth.liveRef,
+		});
+		if (settlementChanged || legacyQuarantineChanged) {
+			// The settled-ref snapshot carries the authority-moved download
+			// gate. It must reach storage before the journal fence removal: a
+			// crash between the two writes may only resurrect the intent,
+			// which re-derives this retirement, never durably drop the last
+			// fence over a live remote ref.
+			try {
+				await this.enqueueBlobSettledRefPersistence();
+			} catch {
+				if (legacyQuarantineChanged) {
+					// Persisting the journal removal now would durably remove
+					// the fence while the gate is still volatile. Leave the
+					// stale journal entry; a crash resurrects the intent and
+					// the next replay tick converges.
+					return;
+				}
+			}
+		}
+		try {
+			await this.enqueuePendingBlobIntentPersistence();
+		} catch {
+			// The in-memory journal removal stands; a persistence failure only
+			// means a crash could resurrect the intent, which fails closed.
 		}
 	}
 
@@ -2633,14 +2789,26 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// point immediately before process death. Fence it before *any* occupant,
 			// receipt, removal, or CAS logic so an H1 revival cannot borrow its base.
 			if (intent.commitAttemptId !== undefined) {
-				this.recordCommittedBlobIntentConflict(intent, false);
+				const conflictOutcome = await this.retireOrQuarantinePendingBlobIntent(
+					intent,
+					scopeToken,
+					vaultSync,
+				);
+				if (conflictOutcome === "stop") return;
+				if (conflictOutcome === "retired") changed = true;
 				continue;
 			}
 			if (
 				intent.committedAt === undefined
 				&& this.pendingBlobIntentHasSettlementStage(intent)
 			) {
-				this.recordCommittedBlobIntentConflict(intent, false);
+				const conflictOutcome = await this.retireOrQuarantinePendingBlobIntent(
+					intent,
+					scopeToken,
+					vaultSync,
+				);
+				if (conflictOutcome === "stop") return;
+				if (conflictOutcome === "retired") changed = true;
 				continue;
 			}
 			if (
@@ -2649,22 +2817,38 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			) {
 				// A later same-path event cannot bypass an older operation whose CAS
 				// outcome is still unconfirmed. Rename episodes own both namespaces.
-				this.recordCommittedBlobIntentConflict(intent, false);
+				const conflictOutcome = await this.retireOrQuarantinePendingBlobIntent(
+					intent,
+					scopeToken,
+					vaultSync,
+				);
+				if (conflictOutcome === "stop") return;
+				if (conflictOutcome === "retired") changed = true;
 				continue;
 			}
 
 			if (intent.kind === "delete") {
 				const occupant = this.app.vault.getAbstractFileByPath(intent.path);
 				if (occupant !== null && intent.committedAt !== undefined) {
-					this.recordCommittedBlobIntentConflict(
+					const conflictOutcome = await this.retireOrQuarantinePendingBlobIntent(
 						intent,
+						scopeToken,
+						vaultSync,
 						this.hasPendingBlobIntentCommitPostcondition(intent, vaultSync),
 					);
+					if (conflictOutcome === "stop") return;
+					if (conflictOutcome === "retired") changed = true;
 					continue;
 				}
 				if (this.isPendingBlobIntentReceiptConfirmed(intent, vaultSync)) {
 					if (!await this.prepareCommittedBlobIntentForRemoval(intent, vaultSync)) {
-						this.recordCommittedBlobIntentConflict(intent, false);
+						const conflictOutcome = await this.retireOrQuarantinePendingBlobIntent(
+							intent,
+							scopeToken,
+							vaultSync,
+						);
+						if (conflictOutcome === "stop") return;
+						if (conflictOutcome === "retired") changed = true;
 						continue;
 					}
 					this.clearResolvedLocalBlobMutationConflict(intent);
@@ -2675,7 +2859,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					if (this.hasPendingBlobIntentCommitPostcondition(intent, vaultSync)) {
 						this.replayedCommittedBlobIntentIds.add(intent.id);
 					} else {
-						this.recordCommittedBlobIntentConflict(intent, false);
+						const conflictOutcome = await this.retireOrQuarantinePendingBlobIntent(
+							intent,
+							scopeToken,
+							vaultSync,
+						);
+						if (conflictOutcome === "stop") return;
+						if (conflictOutcome === "retired") changed = true;
 					}
 					continue;
 				}
@@ -2736,15 +2926,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 			const oldOccupant = this.app.vault.getAbstractFileByPath(intent.oldPath);
 			if (oldOccupant !== null && intent.committedAt !== undefined) {
-				this.recordCommittedBlobIntentConflict(
+				const conflictOutcome = await this.retireOrQuarantinePendingBlobIntent(
 					intent,
+					scopeToken,
+					vaultSync,
 					this.hasPendingBlobIntentCommitPostcondition(intent, vaultSync),
 				);
+				if (conflictOutcome === "stop") return;
+				if (conflictOutcome === "retired") changed = true;
 				continue;
 			}
 			if (this.isPendingBlobIntentReceiptConfirmed(intent, vaultSync)) {
 				if (!await this.prepareCommittedBlobIntentForRemoval(intent, vaultSync)) {
-					this.recordCommittedBlobIntentConflict(intent, false);
+					const conflictOutcome = await this.retireOrQuarantinePendingBlobIntent(
+						intent,
+						scopeToken,
+						vaultSync,
+					);
+					if (conflictOutcome === "stop") return;
+					if (conflictOutcome === "retired") changed = true;
 					continue;
 				}
 				this.clearResolvedLocalBlobMutationConflict(intent);
@@ -2756,7 +2956,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (this.hasPendingBlobIntentCommitPostcondition(intent, vaultSync)) {
 					this.replayedCommittedBlobIntentIds.add(intent.id);
 				} else {
-					this.recordCommittedBlobIntentConflict(intent, false);
+					const conflictOutcome = await this.retireOrQuarantinePendingBlobIntent(
+						intent,
+						scopeToken,
+						vaultSync,
+					);
+					if (conflictOutcome === "stop") return;
+					if (conflictOutcome === "retired") changed = true;
 				}
 				continue;
 			}
@@ -2981,6 +3187,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.resolveRemoteDeleteAttention(target, choice),
 				resolveLegacyMissingBlobAttention: (target, choice) =>
 					this.resolveLegacyMissingBlobAttention(target, choice),
+				dismissStuckLocalMutationAttention: (target) =>
+					this.dismissStuckLocalMutationAttention(target),
 				resolveBlobConflict: (target, choice) =>
 					this.resolveBlobConflict(target, choice),
 			},
@@ -5289,6 +5497,80 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		);
 	}
 
+	private async dismissStuckLocalMutationAttention(
+		target: DashboardStuckLocalMutationResolutionTarget,
+	): Promise<DashboardStuckLocalMutationResolutionResult> {
+		const normalizedPath = normalizePath(target.path);
+		return withAttentionResolutionLock(
+			this.attentionResolutionInFlight,
+			`blob:${normalizedPath}`,
+			normalizedPath,
+			async () => {
+				const current = this.collectPreservedUnresolvedEntries().find((entry) =>
+					entry.kind === "blob" && normalizePath(entry.path) === normalizedPath
+				);
+				if (
+					!current
+					|| current.reason !== "local-blob-mutation-remote-conflict"
+					|| getPreservedUnresolvedEpisodeId(current) !== target.episodeId
+				) {
+					throw new Error(`Attention state changed for "${normalizedPath}". Refresh the dashboard.`);
+				}
+				const vaultSync = this.vaultSync;
+				if (!vaultSync) {
+					throw new Error("Attachment sync is not initialized.");
+				}
+				const scope = this.getBlobIntentScope();
+				const intentPaths = (intent: PendingBlobIntent) => intent.kind === "delete"
+					? [intent.path]
+					: [intent.oldPath, intent.newPath];
+				let retiredCount = 0;
+				for (const intent of this.pendingBlobIntents.getEntries(scope)) {
+					if (
+						!intentPaths(intent).some((path) => normalizePath(path) === normalizedPath)
+					) continue;
+					// Only an intent that entered a commit attempt can own the
+					// stuck episode behind this attention; a later ready intent
+					// on the same path may still commit and earn its receipt,
+					// so operator dismissal must not discard it.
+					if (
+						intent.commitAttemptId === undefined
+						&& intent.committedAt === undefined
+					) continue;
+					// The operator's dismissal is the authority; ground truth only
+					// decides whether the path needs the download-gated handoff so
+					// a live remote ref cannot silently resurrect the file.
+					const groundTruth = this.pendingBlobIntentGroundTruth(intent, vaultSync);
+					const disposition: PendingBlobIntentRetirementDisposition =
+						!groundTruth.diskOccupied && groundTruth.liveRef
+							? { kind: "retire-authority-moved" }
+							: { kind: "retire-operator-dismissed" };
+					await this.retireStuckBlobEpisode(intent, disposition, groundTruth, "operator");
+					retiredCount++;
+				}
+				if (retiredCount === 0) {
+					// Orphaned attention with no backing journal intent.
+					this.getBlobSync()?.clearPreservedUnresolved(normalizedPath);
+					const before = this.preservedUnresolvedEntries.length;
+					this.preservedUnresolvedEntries = this.preservedUnresolvedEntries.filter((entry) =>
+						entry.kind !== "blob"
+						|| normalizePath(entry.path) !== normalizedPath
+						|| entry.reason !== "local-blob-mutation-remote-conflict"
+					);
+					if (this.preservedUnresolvedEntries.length !== before) {
+						this.persistPreservedUnresolvedState();
+					}
+				}
+				this.trace("blob", "preserved-unresolved-operator-dismissed", {
+					path: normalizedPath,
+					episodeId: target.episodeId,
+					retiredIntentCount: retiredCount,
+				});
+				return { status: "completed" };
+			},
+		);
+	}
+
 	private getCurrentLegacyMissingBlobAttention(
 		target: DashboardLegacyMissingBlobResolutionTarget,
 	): PreservedUnresolvedEntry {
@@ -6148,6 +6430,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// queue created by this exact host/vault/local-device authority scope.
 		this.savedBlobQueue = null;
 		let scrubbedBlobQueue = false;
+		let droppedPreservedUnresolved = false;
 		if (data?._blobQueue !== undefined) {
 			const queue = readPersistedBlobQueueSnapshot(
 				data._blobQueue,
@@ -6184,6 +6467,20 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						candidate.reason === "conflict-artifact-write-failed" ||
 						candidate.reason === "multiple-editor-authorities"
 					)) {
+						droppedPreservedUnresolved = true;
+						return false;
+					}
+					// Migration: structurally unresolvable local-mutation conflict
+					// episodes are abolished. A still-stuck pending blob intent
+					// re-derives this attention on its next replay (where the
+					// retirement check now settles it); orphaned entries were
+					// perpetual status-tick noise. Remote-delete limbo reasons are
+					// operator-resolvable and stay.
+					if (
+						candidate.kind === "blob"
+						&& candidate.reason === "local-blob-mutation-remote-conflict"
+					) {
+						droppedPreservedUnresolved = true;
 						return false;
 					}
 					return true;
@@ -6200,7 +6497,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		);
 		this.frontmatterQuarantineEntries = readPersistedFrontmatterQuarantine(data?._frontmatterQuarantine);
 		this.refreshPersistedState();
-		if (migrated || scrubbedBlobQueue) {
+		if (migrated || scrubbedBlobQueue || droppedPreservedUnresolved) {
 			await this.persistPluginState();
 		}
 	}

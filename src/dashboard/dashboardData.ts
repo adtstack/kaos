@@ -14,6 +14,7 @@ import type {
 	DashboardConflictArtifact,
 	DashboardLocalFileIdentity,
 	DashboardMetric,
+	DashboardStuckLocalMutationResolution,
 	DashboardVaultSyncDebug,
 	KaosDashboardCollectorInput,
 	KaosDashboardData,
@@ -161,6 +162,22 @@ export function collectDashboardAttention(
 				: localFile.kind === "file"
 					? "A local file now exists. Run reconcile to settle it first."
 					: null;
+		const stuckLocalMutation = entry.kind === "blob"
+			&& entry.reason === "local-blob-mutation-remote-conflict";
+		const stuckUnavailableReason = !engineAvailable
+			? "Attachment sync is not initialized."
+			: null;
+		const stuckLocalMutationResolution: DashboardStuckLocalMutationResolution | null = stuckLocalMutation
+			? {
+				kind: "stuck-local-mutation",
+				fileKind: "blob",
+				reason: "local-blob-mutation-remote-conflict",
+				episodeId,
+				localFile,
+				canDismiss: stuckUnavailableReason === null,
+				unavailableReason: stuckUnavailableReason,
+			}
+			: null;
 		const downloadConflictArtifactAvailable = entry.reason === "remote-download-local-conflict"
 			&& typeof entry.artifactPath === "string"
 			&& input.app.vault.getAbstractFileByPath(normalizePath(entry.artifactPath)) instanceof TFile;
@@ -207,7 +224,7 @@ export function collectDashboardAttention(
 					&& legacyRemoteRef !== null,
 				canKeepLocalAbsent: legacyUnavailableReason === null,
 				unavailableReason: legacyUnavailableReason,
-			} : null,
+			} : stuckLocalMutationResolution,
 		});
 	}
 
