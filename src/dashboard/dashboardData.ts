@@ -13,6 +13,7 @@ import type {
 	DashboardBlobConflictResolution,
 	DashboardConflictArtifact,
 	DashboardLocalFileIdentity,
+	DashboardMarkdownConflictResolution,
 	DashboardMetric,
 	DashboardStuckLocalMutationResolution,
 	DashboardVaultSyncDebug,
@@ -23,6 +24,15 @@ import { blobRefFingerprint, cloneBlobRef } from "../types";
 
 const ATTENTION_SAMPLE_LIMIT = 20;
 type DashboardServerReceipt = DashboardVaultSyncDebug["serverReceipt"];
+
+const MARKDOWN_CONFLICT_PRESERVED_REASONS = new Set<string>([
+	"conflict-winner-flush-deferred",
+	"conflict-artifact-write-failed",
+	"three-way-preserve-failed",
+	"open-external-targeted-diff-failed",
+	"restore-disk-settlement-failed",
+	"multiple-editor-authorities",
+]);
 
 export function buildKaosDashboardData(input: KaosDashboardCollectorInput): KaosDashboardData {
 	const connected = input.vaultSync?.connected ?? false;
@@ -178,6 +188,29 @@ export function collectDashboardAttention(
 				unavailableReason: stuckUnavailableReason,
 			}
 			: null;
+		const isMarkdownConflict = entry.kind === "markdown" && MARKDOWN_CONFLICT_PRESERVED_REASONS.has(entry.reason);
+		const markdownConflictResolution: DashboardMarkdownConflictResolution | null = isMarkdownConflict
+			? {
+				kind: "markdown-conflict",
+				fileKind: "markdown",
+				reason: entry.reason,
+				episodeId,
+				localFile,
+				canKeepLocal: engineAvailable && localFile.kind === "file",
+				canUseRemote: engineAvailable,
+				keepLocalUnavailableReason: !engineAvailable
+					? "Sync engine is not initialized."
+					: localFile.kind !== "file"
+						? "Local file does not exist."
+						: null,
+				useRemoteUnavailableReason: !engineAvailable
+					? "Sync engine is not initialized."
+					: null,
+				unavailableReason: !engineAvailable
+					? "Sync engine is not initialized."
+					: null,
+			}
+			: null;
 		const downloadConflictArtifactAvailable = entry.reason === "remote-download-local-conflict"
 			&& typeof entry.artifactPath === "string"
 			&& input.app.vault.getAbstractFileByPath(normalizePath(entry.artifactPath)) instanceof TFile;
@@ -224,7 +257,7 @@ export function collectDashboardAttention(
 					&& legacyRemoteRef !== null,
 				canKeepLocalAbsent: legacyUnavailableReason === null,
 				unavailableReason: legacyUnavailableReason,
-			} : stuckLocalMutationResolution,
+			} : (stuckLocalMutationResolution ?? markdownConflictResolution),
 		});
 	}
 

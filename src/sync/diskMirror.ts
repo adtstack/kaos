@@ -156,6 +156,15 @@ export interface DiskWriteOptions {
 	 * caused by DiskMirror's own atomic write while retaining every other fence.
 	 */
 	isAuthorityCurrent?: (phase: DiskWriteAuthorityPhase) => boolean;
+	/**
+	 * Exact preserved-unresolved episode ID under which this write is permitted to
+	 * proceed. Used for conflict-heal and manual resolution flows where the write
+	 * itself is resolving the active episode.
+	 *
+	 * When supplied, `flushWrite` verifies that any active preserved-unresolved entry
+	 * matches this exact episode ID rather than unconditionally blocking.
+	 */
+	expectedPreservedUnresolvedEpisodeId?: string;
 }
 
 type ExistingFileWriteAbortReason =
@@ -917,7 +926,7 @@ export class DiskMirror {
 		options: DiskWriteOptions,
 	): Promise<DiskWriteResult> {
 		const normalized = normalizePath(path);
-		if (this.isPreservedUnresolved(normalized)) {
+		if (this.isPreservedUnresolvedWriteBlocked(normalized, options)) {
 			return this.blockPreservedUnresolvedWrite(normalized, "preflight");
 		}
 		if (!this.isCallerAuthorityCurrent(path, options, "before-commit", "preflight")) {
@@ -929,7 +938,7 @@ export class DiskMirror {
 		let expectedDiskSnapshot = options.expectedDiskContent;
 
 		for (let attempt = 0; attempt < 3; attempt++) {
-			if (this.isPreservedUnresolved(normalized)) {
+			if (this.isPreservedUnresolvedWriteBlocked(normalized, options)) {
 				return this.blockPreservedUnresolvedWrite(normalized, `attempt-${attempt}`);
 			}
 			if (this.isAuthoritativeMarkdownDeleteActiveForWrite(normalized)) {
@@ -986,7 +995,7 @@ export class DiskMirror {
 					if (!this.isCallerAuthorityCurrent(path, options, "before-commit", "post-read")) {
 						return this.deferCallerAuthorityStale(path, "post-read", options);
 					}
-					if (this.isPreservedUnresolved(normalized)) {
+					if (this.isPreservedUnresolvedWriteBlocked(normalized, options)) {
 						return this.blockPreservedUnresolvedWrite(normalized, "post-read");
 					}
 					if (!this.isExactDiskFileCurrent(normalized, existing)) {
@@ -1101,7 +1110,7 @@ export class DiskMirror {
 						let committedDiskRevision: DiskFileRevision | undefined;
 						try {
 							await atomicProcess.call(this.app.vault, existing, (latestDiskContent) => {
-								if (this.isPreservedUnresolved(normalized)) {
+								if (this.isPreservedUnresolvedWriteBlocked(normalized, options)) {
 									throw new ExistingFileWriteAborted("preserved-unresolved");
 								}
 								if (!this.isExactDiskFileCurrent(normalized, existing)) {
@@ -1177,7 +1186,7 @@ export class DiskMirror {
 							this.suppressedPaths.delete(normalized);
 							return this.deferDiskChangedWrite(path, "post-atomic-process-file-identity");
 						}
-						if (this.isPreservedUnresolved(normalized)) {
+						if (this.isPreservedUnresolvedWriteBlocked(normalized, options)) {
 							this.suppressedPaths.delete(normalized);
 							return this.blockPreservedUnresolvedWrite(normalized, "post-atomic-process");
 						}
@@ -1192,7 +1201,7 @@ export class DiskMirror {
 							this.suppressedPaths.delete(normalized);
 							return this.deferCallerAuthorityStale(path, "post-write-hash", options);
 						}
-						if (this.isPreservedUnresolved(normalized)) {
+						if (this.isPreservedUnresolvedWriteBlocked(normalized, options)) {
 							this.suppressedPaths.delete(normalized);
 							return this.blockPreservedUnresolvedWrite(normalized, "post-write-hash");
 						}
@@ -1207,6 +1216,7 @@ export class DiskMirror {
 							ytext,
 							"post-write-hash",
 							committedDiskRevision,
+							options,
 						))) {
 							this.suppressedPaths.delete(normalized);
 							return this.deferDiskChangedWrite(path, "post-write-readback");
@@ -1313,7 +1323,7 @@ export class DiskMirror {
 						return this.deferDiskChangedWrite(path, "create-target-appeared");
 					}
 					if (this.didCrdtChangeDuringWrite(path, content, "create-folder")) continue;
-					if (this.isPreservedUnresolved(normalized)) {
+					if (this.isPreservedUnresolvedWriteBlocked(normalized, options)) {
 						return this.blockPreservedUnresolvedWrite(normalized, "post-create-folder");
 					}
 					const preCreateDefer = this.getOpenWriteDeferral(
@@ -1331,7 +1341,7 @@ export class DiskMirror {
 						this.suppressedPaths.delete(normalized);
 						return this.deferCallerAuthorityStale(path, "post-suppress-create", options);
 					}
-					if (this.isPreservedUnresolved(normalized)) {
+					if (this.isPreservedUnresolvedWriteBlocked(normalized, options)) {
 						this.suppressedPaths.delete(normalized);
 						return this.blockPreservedUnresolvedWrite(normalized, "post-suppress-create");
 					}
@@ -1356,7 +1366,7 @@ export class DiskMirror {
 					}
 					let createdFile: TFile;
 					try {
-						if (this.isPreservedUnresolved(normalized)) {
+						if (this.isPreservedUnresolvedWriteBlocked(normalized, options)) {
 							this.suppressedPaths.delete(normalized);
 							return this.blockPreservedUnresolvedWrite(normalized, "pre-create-commit");
 						}
@@ -1437,7 +1447,7 @@ export class DiskMirror {
 						this.suppressedPaths.delete(normalized);
 						return this.deferCallerAuthorityStale(path, "post-create-hash", options);
 					}
-					if (this.isPreservedUnresolved(normalized)) {
+					if (this.isPreservedUnresolvedWriteBlocked(normalized, options)) {
 						this.suppressedPaths.delete(normalized);
 						return this.blockPreservedUnresolvedWrite(normalized, "post-create-hash");
 					}
@@ -1448,6 +1458,7 @@ export class DiskMirror {
 						ytext,
 						"post-create-hash",
 						committedDiskRevision,
+						options,
 					))) {
 						this.suppressedPaths.delete(normalized);
 						return this.deferDiskChangedWrite(path, "post-create-readback");
@@ -1516,7 +1527,7 @@ export class DiskMirror {
 		expectedYText: Y.Text,
 	): Promise<DiskWriteResult> {
 		const normalized = normalizePath(path);
-		if (this.isPreservedUnresolved(normalized)) {
+		if (this.isPreservedUnresolvedWriteBlocked(normalized, options)) {
 			return this.blockPreservedUnresolvedWrite(normalized, "unchanged-pre-hash");
 		}
 		if (!this.isCallerAuthorityCurrent(path, options, "before-commit", "unchanged-pre-hash")) {
@@ -1532,7 +1543,7 @@ export class DiskMirror {
 		if (!this.isCallerAuthorityCurrent(path, options, "before-commit", "unchanged-post-hash")) {
 			return this.deferCallerAuthorityStale(path, "unchanged-post-hash", options);
 		}
-		if (this.isPreservedUnresolved(normalized)) {
+		if (this.isPreservedUnresolvedWriteBlocked(normalized, options)) {
 			return this.blockPreservedUnresolvedWrite(normalized, "unchanged-post-hash");
 		}
 		if (!this.isExactDiskFileCurrent(normalized, expectedFile)) {
@@ -1548,6 +1559,7 @@ export class DiskMirror {
 			expectedYText,
 			"post-unchanged-hash",
 			options.expectedDiskRevision,
+			options,
 		);
 		if (!settled) {
 			return this.deferDiskChangedWrite(path, "post-unchanged-readback");
@@ -1590,6 +1602,7 @@ export class DiskMirror {
 		expectedYText: Y.Text,
 		phase: string,
 		expectedRevision?: DiskFileRevision,
+		options?: DiskWriteOptions,
 	): Promise<boolean> {
 		const normalized = normalizePath(path);
 		const reject = (reason: string, actualLength?: number): false => {
@@ -1603,7 +1616,7 @@ export class DiskMirror {
 			return false;
 		};
 
-		if (this.isPreservedUnresolved(normalized)) return reject("preserved-unresolved");
+		if (this.isPreservedUnresolvedWriteBlocked(normalized, options)) return reject("preserved-unresolved");
 		if (!this.isExactDiskFileCurrent(normalized, expectedFile)) {
 			return reject("file-identity-changed-before-readback");
 		}
@@ -1631,7 +1644,7 @@ export class DiskMirror {
 		if (currentYText.toJSON() !== expectedContent) {
 			return reject("crdt-content-changed", actualContent.length);
 		}
-		if (this.isPreservedUnresolved(normalized)) return reject("preserved-unresolved");
+		if (this.isPreservedUnresolvedWriteBlocked(normalized, options)) return reject("preserved-unresolved");
 		if (!this.isDiskRevisionCurrent(expectedFile, expectedRevision)) {
 			return reject("file-revision-changed-before-settlement", actualContent.length);
 		}
@@ -3055,6 +3068,29 @@ export class DiskMirror {
 	 */
 	isPreservedUnresolved(path: string): boolean {
 		return this.preservedUnresolvedPaths.has(normalizePath(path));
+	}
+
+	/**
+	 * Returns true if a write to this path must be blocked because of an active
+	 * preserved-unresolved episode. If the caller holds explicit authority for the
+	 * exact episode currently active, the write is permitted to proceed.
+	 */
+	isPreservedUnresolvedWriteBlocked(
+		path: string,
+		options?: DiskWriteOptions,
+	): boolean {
+		const normalized = normalizePath(path);
+		const entry = this.preservedUnresolved.get(normalized);
+		if (!entry) {
+			return options?.expectedPreservedUnresolvedEpisodeId !== undefined;
+		}
+		if (
+			options?.expectedPreservedUnresolvedEpisodeId !== undefined
+			&& getPreservedUnresolvedEpisodeId(entry) === options.expectedPreservedUnresolvedEpisodeId
+		) {
+			return false;
+		}
+		return true;
 	}
 
 	/**

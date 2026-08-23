@@ -1,4 +1,4 @@
-import { App, MarkdownView, Notice, TFile } from "obsidian";
+import { App, MarkdownView, Notice, TFile, normalizePath } from "obsidian";
 import type { BlobSyncManager } from "../sync/blobSync";
 import type {
 	DiskMirror,
@@ -82,6 +82,7 @@ import {
 	getPreservedUnresolvedEpisodeId,
 	isRemoteDeletePreservedUnresolvedEntry,
 	type PreservedUnresolvedEntry,
+	type PreservedUnresolvedReason,
 	type RemoteDeletePreservedUnresolvedReason,
 } from "../sync/preservedUnresolved";
 import { normalizeEditorText } from "../utils/editorTextNormalization";
@@ -175,6 +176,16 @@ export interface MarkdownRemoteDeleteEntryIdentity {
 	reason: RemoteDeletePreservedUnresolvedReason;
 	episodeId: string;
 	remoteDeleteFingerprint?: string;
+	localFile?: {
+		kind: "file" | "missing" | "other";
+		mtime: number | null;
+		size: number | null;
+	};
+}
+
+export interface MarkdownConflictEntryIdentity {
+	reason: PreservedUnresolvedReason;
+	episodeId: string;
 	localFile?: {
 		kind: "file" | "missing" | "other";
 		mtime: number | null;
@@ -1844,6 +1855,9 @@ export class ReconciliationController {
 				}
 				for (const [path, diskContent] of diskFiles) {
 					if (this.isMarkdownPreservedUnresolved(path)) {
+						if (await this.tryHealFencedConflictWinnerFlush(path, diskContent)) {
+							continue;
+						}
 						deferredOpenEditorIndexPaths.add(path);
 						this.deps.trace("reconcile", "reconcile-skipped-preserved-unresolved", {
 							path,
@@ -1895,6 +1909,13 @@ export class ReconciliationController {
 				}
 				for (const path of result.updatedOnDisk) {
 					if (this.isMarkdownPreservedUnresolved(path)) {
+						const healDiskContent = diskFiles.get(path);
+						if (
+							healDiskContent !== undefined &&
+							await this.tryHealFencedConflictWinnerFlush(path, healDiskContent)
+						) {
+							continue;
+						}
 						deferredOpenEditorIndexPaths.add(path);
 						this.deps.trace("reconcile", "reconcile-skipped-preserved-unresolved", {
 							path,
@@ -4018,6 +4039,232 @@ export class ReconciliationController {
 		}
 	}
 
+	async resolveMarkdownConflictAttention(
+		path: string,
+		choice: "keep-local" | "use-remote",
+		expectedEpisode?: MarkdownConflictEntryIdentity,
+	): Promise<void> {
+		const normalizedPath = normalizePath(path);
+		const vaultSync = this.deps.getVaultSync();
+		const diskMirror = this.deps.getDiskMirror();
+		if (!vaultSync || !diskMirror) {
+			throw new Error("Sync is not initialized.");
+		}
+		if (!this.deps.isMarkdownPathSyncable(normalizedPath)) {
+			throw new Error(`File is no longer in sync scope: ${normalizedPath}`);
+		}
+
+		const entry = this.getPreservedUnresolvedMarkdownEntries()
+			.find((candidate) => normalizePath(candidate.path) === normalizedPath);
+		if (
+			!entry
+			|| (expectedEpisode?.episodeId !== undefined && getPreservedUnresolvedEpisodeId(entry) !== expectedEpisode.episodeId)
+			|| (expectedEpisode?.reason !== undefined && entry.reason !== expectedEpisode.reason)
+		) {
+			throw new Error(`Attention state changed for "${normalizedPath}". Refresh the dashboard.`);
+		}
+
+		const expectedEpisodeId = getPreservedUnresolvedEpisodeId(entry);
+		const episodeIsCurrent = (): boolean => {
+			const current = this.getPreservedUnresolvedMarkdownEntries()
+				.find((candidate) => normalizePath(candidate.path) === normalizedPath);
+			return !!current && getPreservedUnresolvedEpisodeId(current) === expectedEpisodeId;
+		};
+
+		if (choice === "keep-local") {
+			const abstractFile = this.deps.app.vault.getAbstractFileByPath(normalizedPath);
+			if (!(abstractFile instanceof TFile)) {
+				throw new Error(`Local file not found: ${normalizedPath}`);
+			}
+			const stableRead = await this.readStableMarkdownFile(normalizedPath, "modify", abstractFile);
+			if (stableRead.kind === "missing") {
+				throw new Error(`Local file not found: ${normalizedPath}`);
+			}
+			if (stableRead.kind === "unstable") {
+				throw new Error(`Local file is still changing: ${normalizedPath}. Wait a moment and try again.`);
+			}
+			if (stableRead.file.path !== normalizedPath) {
+				throw new Error(`Local file changed path while resolving Attention: ${normalizedPath}`);
+			}
+
+			const runtimeConfig = this.deps.getRuntimeConfig();
+			if (
+				runtimeConfig.maxFileSizeBytes > 0
+				&& stableRead.content.length > runtimeConfig.maxFileSizeBytes
+			) {
+				throw new Error(`File exceeds the configured size limit: ${normalizedPath}`);
+			}
+
+			this.assertEditorMatchesStableMarkdown(normalizedPath, stableRead.content);
+
+			const previousText = vaultSync.getTextForPath(normalizedPath);
+			const previousContent = previousText ? yTextToString(previousText) ?? "" : null;
+			if (this.deps.shouldBlockFrontmatterIngest(
+				normalizedPath,
+				previousContent,
+				stableRead.content,
+				"dashboard-conflict-keep-local",
+			)) {
+				throw new Error(`Local properties are quarantined for "${normalizedPath}". Review them before keeping this file.`);
+			}
+
+			if (!episodeIsCurrent()) {
+				throw new Error(`Attention state changed for "${normalizedPath}". Refresh the dashboard.`);
+			}
+
+			const opId = `op-conflict-keep-local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+			let resolvedText: ReturnType<VaultSync["getTextForPath"]> = null;
+			const result = vaultSync.serverAckTracker.withActiveOpId(opId, () => {
+				const ensureResult = vaultSync.ensureFile(
+					normalizedPath,
+					stableRead.content,
+					this.deps.getSettings().deviceName,
+					{
+						reviveTombstone: true,
+						reviveReason: "dashboard-conflict-keep-local",
+						opId,
+					},
+				);
+				switch (ensureResult.kind) {
+					case "created":
+					case "existing":
+						resolvedText = ensureResult.ytext;
+						return applyDiffToYTextWithPostcondition(
+							ensureResult.ytext,
+							yTextToString(ensureResult.ytext) ?? "",
+							stableRead.content,
+							ORIGIN_DISK_SYNC,
+						);
+					case "replan":
+					case "blocked":
+						return null;
+					default:
+						return null;
+				}
+			});
+			if (!result?.finalMatchesExpected || !resolvedText) {
+				throw new Error(`Failed to publish the local content for "${normalizedPath}".`);
+			}
+
+			if (previousContent && previousContent !== stableRead.content) {
+				await this.recordDiscardedRevision(
+					normalizedPath,
+					previousContent,
+					"manual-conflict-keep-local",
+				);
+			}
+
+			const baselineSettled = await this.updateDiskIndexForPath(
+				normalizedPath,
+				stableRead.content,
+				stableRead.stat,
+				{
+					expectedPreservedUnresolvedEpisodeId: expectedEpisodeId,
+					expectedDiskFile: stableRead.file,
+					expectedYText: resolvedText,
+					expectedCrdtContent: stableRead.content,
+				},
+			);
+			if (!baselineSettled) {
+				throw new Error(`Local state changed before the baseline settled for "${normalizedPath}".`);
+			}
+
+			let finalDiskContent: string;
+			try {
+				finalDiskContent = await this.readFreshMarkdownFile(stableRead.file);
+			} catch {
+				throw new Error(`Local file changed before Attention could be cleared: ${normalizedPath}`);
+			}
+			if (
+				!episodeIsCurrent()
+				|| stableRead.file.path !== normalizedPath
+				|| this.deps.app.vault.getAbstractFileByPath(normalizedPath) !== stableRead.file
+				|| finalDiskContent !== stableRead.content
+				|| vaultSync.getTextForPath(normalizedPath) !== resolvedText
+				|| yTextToString(resolvedText) !== stableRead.content
+			) {
+				throw new Error(`Local state changed before Attention could be cleared: ${normalizedPath}`);
+			}
+
+			diskMirror.clearPreservedUnresolved(normalizedPath);
+			this.deps.onReconciled("dashboard-conflict-keep-local");
+			this.deps.trace("reconcile", "markdown-conflict-resolved-manual-keep-local", {
+				path: normalizedPath,
+				reason: entry.reason,
+				episodeId: expectedEpisodeId,
+				opId,
+			});
+			this.deps.refreshStatusBar();
+		} else if (choice === "use-remote") {
+			const existingText = vaultSync.getTextForPath(normalizedPath);
+			if (!existingText) {
+				throw new Error(`Remote content does not exist for "${normalizedPath}".`);
+			}
+			const crdtContent = yTextToString(existingText);
+			if (crdtContent === null) {
+				throw new Error(`Remote content is empty or tombstoned for "${normalizedPath}".`);
+			}
+
+			const file = this.deps.app.vault.getAbstractFileByPath(normalizedPath);
+			const diskContent = file instanceof TFile
+				? await this.readFreshMarkdownFile(file)
+				: "";
+
+			if (diskContent && diskContent !== crdtContent) {
+				await this.recordDiscardedRevision(
+					normalizedPath,
+					diskContent,
+					"manual-conflict-use-remote",
+				);
+			}
+
+			const admission = this.captureRemoteProjectionAdmission(diskMirror, [normalizedPath]);
+			if (!admission) {
+				throw new Error(`Cannot project remote content for "${normalizedPath}": projection paused.`);
+			}
+
+			const writeResult = await diskMirror.flushWrite(normalizedPath, false, {
+				requireRemoteProjectionAdmission: true,
+				remoteProjectionAdmission: admission,
+				recordBaseline: true,
+				...(file instanceof TFile
+					? { expectedDiskContent: diskContent }
+					: { allowCreateIfMissing: true }),
+				expectedPreservedUnresolvedEpisodeId: expectedEpisodeId,
+			});
+			if (!this.isDiskWriteSettled(writeResult)) {
+				this.traceDiskWriteNotSettled(normalizedPath, writeResult, "manual-conflict-use-remote");
+				throw new Error(`Failed to write remote content to disk for "${normalizedPath}".`);
+			}
+
+			const currentFile = this.deps.app.vault.getAbstractFileByPath(normalizedPath);
+			if (currentFile instanceof TFile) {
+				const baselineSettled = await this.updateDiskIndexForPath(
+					normalizedPath,
+					writeResult.content,
+					currentFile.stat,
+					{
+						expectedPreservedUnresolvedEpisodeId: expectedEpisodeId,
+						expectedDiskFile: currentFile,
+					},
+				);
+				if (!baselineSettled || !episodeIsCurrent()) {
+					throw new Error(`Local state changed before Attention could be cleared: ${normalizedPath}`);
+				}
+			}
+
+			diskMirror.clearPreservedUnresolved(normalizedPath);
+			this.deps.onReconciled("dashboard-conflict-use-remote");
+			this.deps.trace("reconcile", "markdown-conflict-resolved-manual-use-remote", {
+				path: normalizedPath,
+				reason: entry.reason,
+				episodeId: expectedEpisodeId,
+				contentLength: writeResult.content.length,
+			});
+			this.deps.refreshStatusBar();
+		}
+	}
+
 	private hasPendingLocalCreate(path: string): boolean {
 		if (this.dirtyMarkdownPaths.get(path)?.reason === "create") {
 			return true;
@@ -5112,6 +5359,29 @@ export class ReconciliationController {
 		}
 
 		if (existingText && existingCrdtContent !== content) {
+			// A fresh disk event is evidence of local intent for the disk side,
+			// not proof that the CRDT side is stale. When a durable baseline
+			// exists, a CRDT side that diverged from it can carry edits that
+			// were never flushed to disk (the path is fenced, so reconcile
+			// skips it) — remote-device typing or pre-close local work.
+			// Silently discarding that side is the open-editor data-loss shape,
+			// so such an episode stays fenced for the operator instead.
+			// With no baseline there is no divergence evidence to protect and
+			// the fresh disk event remains the newest known intent.
+			const baselineHash = this.deps.getDiskIndex()[path]?.contentHash ?? null;
+			const crdtHash = existingCrdtContent === null
+				? null
+				: await contentBaselineHash(existingCrdtContent);
+			if (baselineHash !== null && crdtHash !== baselineHash) {
+				this.deps.trace("reconcile", "preserved-unresolved-local-resolution-crdt-diverged", {
+					path,
+					reason: entry.reason,
+					episodeId: expectedEpisodeId,
+					baselineHashPrefix: baselineHash.slice(0, 12),
+					crdtHashPrefix: crdtHash?.slice(0, 12) ?? null,
+				});
+				return;
+			}
 			await this.recordDiscardedRevision(
 				path,
 				existingCrdtContent ?? "",
@@ -5233,6 +5503,163 @@ export class ReconciliationController {
 			episodeId: expectedEpisodeId,
 			contentLength: content.length,
 		});
+	}
+
+	/**
+	 * Reconcile-time heal pass for fenced conflict-winner-flush-deferred
+	 * episodes on closed files.
+	 *
+	 * Such an episode records that a conflict winner was chosen but its commit
+	 * never settled (typically an open editor or a CAS race at decision time).
+	 * Reconcile otherwise skips the path forever, so later disk writes never
+	 * reach the CRDT and later CRDT edits never reach disk — the frozen
+	 * divergence shows up on other devices as missing or stubbed-out content.
+	 *
+	 * Only provably lossless cases heal here, each requiring one side to still
+	 * match the durable baseline exactly:
+	 *  - both sides now equal → divergence vanished: settle and clear.
+	 *  - CRDT still at baseline → the disk side is newer: route through the
+	 *    guarded fresh-event resolver (its own CAS chain commits).
+	 *  - disk still at baseline → the deferred CRDT-wins winner flush can be
+	 *    completed without losing anything.
+	 * Anything else (both sides moved, missing baseline, tombstoned CRDT,
+	 * open editor) keeps the episode fenced for the operator.
+	 *
+	 * Returns true only when the episode was actually cleared.
+	 */
+	private async tryHealFencedConflictWinnerFlush(
+		path: string,
+		diskContent: string,
+	): Promise<boolean> {
+		const diskMirror = this.deps.getDiskMirror();
+		const vaultSync = this.deps.getVaultSync();
+		if (!diskMirror || !vaultSync) return false;
+		const entry = this.getPreservedUnresolvedMarkdownEntries()
+			.find((candidate) => candidate.path === path);
+		if (!entry || entry.reason !== "conflict-winner-flush-deferred") return false;
+
+		if (this.getOpenMarkdownViewsForPath(path).length > 0) return false;
+		if (this.deps.getEditorBindings()?.isBound(path) ?? false) return false;
+
+		const runtimeConfig = this.deps.getRuntimeConfig();
+		if (
+			runtimeConfig.maxFileSizeBytes > 0 &&
+			diskContent.length > runtimeConfig.maxFileSizeBytes
+		) {
+			return false;
+		}
+
+		const file = this.deps.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) return false;
+
+		const expectedEpisodeId = getPreservedUnresolvedEpisodeId(entry);
+		const episodeIsCurrent = (): boolean => {
+			const current = this.getPreservedUnresolvedMarkdownEntries()
+				.find((candidate) => candidate.path === path);
+			return !!current && getPreservedUnresolvedEpisodeId(current) === expectedEpisodeId;
+		};
+
+		const existingText = vaultSync.getTextForPath(path);
+		if (!existingText) return false;
+		const existingCrdtContent = yTextToString(existingText);
+
+		if (existingCrdtContent === diskContent) {
+			const baselineSettled = await this.updateDiskIndexForPath(
+				path,
+				diskContent,
+				file.stat,
+				{
+					expectedPreservedUnresolvedEpisodeId: expectedEpisodeId,
+					expectedDiskFile: file,
+					expectedYText: existingText,
+					expectedCrdtContent: diskContent,
+				},
+			);
+			if (!baselineSettled || !episodeIsCurrent()) return false;
+			diskMirror.clearPreservedUnresolved(path);
+			this.deps.trace("reconcile", "fenced-conflict-winner-healed-equal", {
+				path,
+				episodeId: expectedEpisodeId,
+				contentLength: diskContent.length,
+			});
+			return true;
+		}
+
+		const baselineHash = this.deps.getDiskIndex()[path]?.contentHash ?? null;
+		const crdtHash = existingCrdtContent === null
+			? null
+			: await contentBaselineHash(existingCrdtContent);
+		const diskHash = await contentBaselineHash(diskContent);
+
+		if (baselineHash !== null && crdtHash === baselineHash) {
+			await this.resolvePreservedUnresolvedFromFreshDiskEvent({
+				file,
+				path,
+				content: diskContent,
+				stat: file.stat,
+				diskRevision: this.getMarkdownDiskRevision(path),
+				entry,
+				sourceReason: "modify",
+				opId: undefined,
+				coalescedOpIds: [],
+			});
+			return !this.isMarkdownPreservedUnresolved(path);
+		}
+
+		if (baselineHash !== null && diskHash === baselineHash) {
+			const admission = this.captureRemoteProjectionAdmission(diskMirror, [path]);
+			if (!admission) {
+				this.deps.trace("reconcile", "fenced-conflict-winner-heal-held", {
+					path,
+					stage: "projection-admission",
+				});
+				return false;
+			}
+			const writeResult = await diskMirror.flushWrite(path, false, {
+				requireRemoteProjectionAdmission: true,
+				remoteProjectionAdmission: admission,
+				recordBaseline: true,
+				expectedDiskContent: diskContent,
+				expectedPreservedUnresolvedEpisodeId: expectedEpisodeId,
+			});
+			if (!this.isDiskWriteSettled(writeResult)) {
+				this.traceDiskWriteNotSettled(path, writeResult, "fenced-conflict-winner-heal");
+				this.requestFollowupForUnsettledDiskWrite(path, writeResult, "fenced-conflict-winner-heal");
+				return false;
+			}
+			// The settled write result is the ground truth even when live
+			// Y.Text advanced during the write (the closed-file flush loop
+			// records the committed snapshot, never the later live text). A
+			// racing CRDT advance then flows through the normal lane next
+			// pass instead of being re-fenced here.
+			const baselineSettled = await this.updateDiskIndexForPath(
+				path,
+				writeResult.content,
+				file.stat,
+				{
+					expectedPreservedUnresolvedEpisodeId: expectedEpisodeId,
+					expectedDiskFile: file,
+				},
+			);
+			if (!baselineSettled || !episodeIsCurrent()) return false;
+			diskMirror.clearPreservedUnresolved(path);
+			this.deps.trace("reconcile", "fenced-conflict-winner-healed-flush", {
+				path,
+				episodeId: expectedEpisodeId,
+				contentLength: writeResult.content.length,
+				contentHashPrefix: writeResult.contentHash.slice(0, 12),
+			});
+			return true;
+		}
+
+		this.deps.trace("reconcile", "fenced-conflict-winner-kept-ambiguous", {
+			path,
+			episodeId: expectedEpisodeId,
+			baselineHashPrefix: baselineHash?.slice(0, 12) ?? null,
+			crdtHashPrefix: crdtHash?.slice(0, 12) ?? null,
+			diskHashPrefix: diskHash.slice(0, 12),
+		});
+		return false;
 	}
 
 	private getOpenMarkdownViewsForPath(path: string): MarkdownView[] {
