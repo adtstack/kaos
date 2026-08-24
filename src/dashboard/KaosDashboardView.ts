@@ -12,6 +12,10 @@ import type {
 	DashboardLegacyMissingBlobResolution,
 	DashboardLegacyMissingBlobResolutionChoice,
 	DashboardLegacyMissingBlobResolutionTarget,
+	DashboardMarkdownConflictResolution,
+	DashboardMarkdownConflictResolutionChoice,
+	DashboardMarkdownConflictResolutionResult,
+	DashboardMarkdownConflictResolutionTarget,
 	DashboardRemoteDeleteResolution,
 	DashboardRemoteDeleteResolutionChoice,
 	DashboardRemoteDeleteResolutionResult,
@@ -63,6 +67,10 @@ export interface KaosDashboardActions {
 		target: DashboardRemoteDeleteResolutionTarget,
 		choice: DashboardRemoteDeleteResolutionChoice,
 	): Promise<DashboardRemoteDeleteResolutionResult>;
+	resolveMarkdownConflictAttention(
+		target: DashboardMarkdownConflictResolutionTarget,
+		choice: DashboardMarkdownConflictResolutionChoice,
+	): Promise<DashboardMarkdownConflictResolutionResult>;
 	resolveLegacyMissingBlobAttention(
 		target: DashboardLegacyMissingBlobResolutionTarget,
 		choice: DashboardLegacyMissingBlobResolutionChoice,
@@ -720,6 +728,33 @@ export class KaosDashboardView extends ItemView {
 						resolution.unavailableReason ?? undefined,
 					);
 					dismissButton.classList.add("mod-warning");
+				} else if (resolution?.kind === "markdown-conflict") {
+					const pending = this.pendingAttentionEpisodes.has(
+						attentionEpisodeKey(path, resolution),
+					);
+					this.button(
+						actions,
+						pending ? "Resolving…" : "Keep local version",
+						() => this.confirmMarkdownConflictResolution(
+							path,
+							resolution,
+							"keep-local",
+						),
+						pending || !resolution.canKeepLocal,
+						resolution.keepLocalUnavailableReason ?? undefined,
+					);
+					const useRemoteButton = this.button(
+						actions,
+						pending ? "Resolving…" : "Use remote copy",
+						() => this.confirmMarkdownConflictResolution(
+							path,
+							resolution,
+							"use-remote",
+						),
+						pending || !resolution.canUseRemote,
+						resolution.useRemoteUnavailableReason ?? undefined,
+					);
+					useRemoteButton.classList.add("mod-warning");
 				} else {
 					this.button(
 						actions,
@@ -942,6 +977,76 @@ export class KaosDashboardView extends ItemView {
 				"mod-warning",
 			).open();
 		});
+	}
+
+	private confirmMarkdownConflictResolution(
+		path: string,
+		resolution: DashboardMarkdownConflictResolution,
+		choice: DashboardMarkdownConflictResolutionChoice,
+	): Promise<void> {
+		const episodeKey = attentionEpisodeKey(path, resolution);
+		if (this.pendingAttentionEpisodes.has(episodeKey)) {
+			return Promise.reject(new Error(`A resolution is already pending for "${path}".`));
+		}
+		this.pendingAttentionEpisodes.add(episodeKey);
+		this.render();
+		const keepingLocal = choice === "keep-local";
+		return new Promise((resolve, reject) => {
+			new ConfirmModal(
+				this.app,
+				keepingLocal ? "Keep local note version?" : "Use remote note copy?",
+				keepingLocal
+					? `Promote the local disk content of "${path}" as the authoritative version? Remote changes will be overwritten in the CRDT (an audit copy will be preserved).`
+					: `Overwrite the local disk file "${path}" with the remote CRDT version? Local uncommitted disk changes will be replaced.`,
+				async () => {
+					try {
+						await this.deps.actions.resolveMarkdownConflictAttention(
+							{ path, ...resolution },
+							choice,
+						);
+						new Notice(
+							keepingLocal
+								? `Local version kept for: ${path}`
+								: `Remote copy applied for: ${path}`,
+						);
+						this.removeResolvedMarkdownConflictEpisode(path, resolution);
+						resolve();
+					} catch (err) {
+						reject(err instanceof Error ? err : new Error(String(err)));
+					} finally {
+						this.pendingAttentionEpisodes.delete(episodeKey);
+						this.render();
+					}
+				},
+				keepingLocal ? "Keep local version" : "Use remote copy",
+				"Cancel",
+				() => {
+					this.pendingAttentionEpisodes.delete(episodeKey);
+					this.render();
+					resolve();
+				},
+				keepingLocal ? "mod-cta" : "mod-warning",
+			).open();
+		});
+	}
+
+	private removeResolvedMarkdownConflictEpisode(
+		path: string,
+		resolution: DashboardMarkdownConflictResolution,
+	): void {
+		if (!this.data) return;
+		const nextAttention = this.data.attention.filter((item) => {
+			if (item.path !== path || item.resolution?.kind !== "markdown-conflict") {
+				return true;
+			}
+			return item.resolution.episodeId !== resolution.episodeId;
+		});
+		if (nextAttention.length === this.data.attention.length) return;
+		this.data = {
+			...this.data,
+			attention: nextAttention,
+			attentionTotalCount: Math.max(0, this.data.attentionTotalCount - 1),
+		};
 	}
 
 	private removeResolvedStuckLocalMutationEpisode(

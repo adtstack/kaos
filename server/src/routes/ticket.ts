@@ -40,7 +40,7 @@ const TICKET_VERSION = 1;
 const TICKET_AUD = "kaos-ws";
 /** Default TTL.  Long enough for slow mobile reconnects; short enough to
  *  limit the damage from a logged value. */
-export const TICKET_TTL_MS = 5 * 60 * 1_000; // 5 minutes
+export const TICKET_TTL_MS = 60 * 60 * 1_000; // 1 hour
 const MAX_REASONABLE_TICKET_TTL_MS = 24 * 60 * 60 * 1_000; // 24 hours
 
 function readTicketTtlMs(raw: string | undefined): number {

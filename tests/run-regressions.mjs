@@ -87,6 +87,8 @@ const suites = [
 	[JITI, "tests/reconciliation-safety-brake.ts"],
 	[JITI, "tests/reconciliation-race-matrix.ts"],
 	[JITI, "tests/controller-authority-quarantine.ts"],
+	[JITI, "tests/fenced-conflict-winner-heal.ts"],
+	[JITI, "tests/markdown-conflict-dashboard-resolution.ts"],
 	[JITI, "tests/no-event-reconcile-admission.ts"],
 	[NODE, "tests/ensure-file-writer-alias-regressions.mjs"],
 	[NODE, "tests/ensure-file-writer-allowlist.mjs"],

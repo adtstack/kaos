@@ -205,7 +205,8 @@ export async function getStoredServerConfig(env: Env): Promise<StoredServerConfi
 // The cache is invalidated after /claim and /api/update-metadata writes so that
 // the operator sees the new state immediately on the next request.
 
-const AUTH_CONFIG_CACHE_TTL_MS = 60_000;
+const AUTH_CONFIG_CACHE_TTL_MS = 60 * 60_000; // 1 hour
+const UNCLAIMED_CONFIG_CACHE_TTL_MS = 5_000; // 5 seconds (allows post-claim discovery across warm isolates)
 
 let cachedConfig: { value: StoredServerConfig; expiresAt: number } | null = null;
 let configInflight: Promise<StoredServerConfig> | null = null;
@@ -225,7 +226,8 @@ export async function getStoredServerConfigCached(env: Env): Promise<StoredServe
 	}
 	configInflight = getStoredServerConfig(env)
 		.then((config) => {
-			cachedConfig = { value: config, expiresAt: Date.now() + AUTH_CONFIG_CACHE_TTL_MS };
+			const ttl = config.claimed ? AUTH_CONFIG_CACHE_TTL_MS : UNCLAIMED_CONFIG_CACHE_TTL_MS;
+			cachedConfig = { value: config, expiresAt: Date.now() + ttl };
 			return config;
 		})
 		.finally(() => {
