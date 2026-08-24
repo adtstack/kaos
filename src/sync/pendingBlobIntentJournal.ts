@@ -522,6 +522,11 @@ export class PendingBlobIntentJournal {
 		return true;
 	}
 
+	restore(intent: PendingBlobIntent): void {
+		if (this.entries.some((entry) => entry.id === intent.id)) return;
+		this.push(cloneIntent(intent));
+	}
+
 	markCommitted(
 		id: string,
 		committedAt: number,

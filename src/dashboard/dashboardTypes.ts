@@ -5,6 +5,7 @@ import type { FrontmatterQuarantineEntry } from "../sync/frontmatterQuarantine";
 import type {
 	PreservedUnresolvedEntry,
 	PreservedUnresolvedKind,
+	PreservedUnresolvedReason,
 	RemoteDeletePreservedUnresolvedReason,
 } from "../sync/preservedUnresolved";
 import type { BlobRef } from "../types";
@@ -141,10 +142,24 @@ export interface DashboardLegacyMissingBlobResolution {
 	unavailableReason: string | null;
 }
 
+export interface DashboardMarkdownConflictResolution {
+	kind: "markdown-conflict";
+	fileKind: "markdown";
+	reason: PreservedUnresolvedReason;
+	episodeId: string;
+	localFile: DashboardLocalFileIdentity;
+	canKeepLocal: boolean;
+	canUseRemote: boolean;
+	keepLocalUnavailableReason: string | null;
+	useRemoteUnavailableReason: string | null;
+	unavailableReason: string | null;
+}
+
 export type DashboardAttentionResolution =
 	| DashboardRemoteDeleteResolution
 	| DashboardLegacyMissingBlobResolution
-	| DashboardStuckLocalMutationResolution;
+	| DashboardStuckLocalMutationResolution
+	| DashboardMarkdownConflictResolution;
 
 export interface DashboardRemoteDeleteResolutionTarget
 	extends DashboardRemoteDeleteResolution {
@@ -156,6 +171,19 @@ export type DashboardRemoteDeleteResolutionChoice =
 	| "accept-remote-delete";
 
 export type DashboardRemoteDeleteResolutionResult =
+	| { status: "completed" }
+	| { status: "pending"; message: string };
+
+export interface DashboardMarkdownConflictResolutionTarget
+	extends DashboardMarkdownConflictResolution {
+	path: string;
+}
+
+export type DashboardMarkdownConflictResolutionChoice =
+	| "keep-local"
+	| "use-remote";
+
+export type DashboardMarkdownConflictResolutionResult =
 	| { status: "completed" }
 	| { status: "pending"; message: string };
 

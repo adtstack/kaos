@@ -220,6 +220,9 @@ import type {
 	DashboardBlobConflictResolutionTarget,
 	DashboardLegacyMissingBlobResolutionChoice,
 	DashboardLegacyMissingBlobResolutionTarget,
+	DashboardMarkdownConflictResolutionChoice,
+	DashboardMarkdownConflictResolutionResult,
+	DashboardMarkdownConflictResolutionTarget,
 	DashboardRemoteDeleteResolutionChoice,
 	DashboardRemoteDeleteResolutionResult,
 	DashboardRemoteDeleteResolutionTarget,
@@ -2149,6 +2152,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					// the fence while the gate is still volatile. Leave the
 					// stale journal entry; a crash resurrects the intent and
 					// the next replay tick converges.
+					this.pendingBlobIntents.restore(intent);
 					return;
 				}
 			}
@@ -3185,6 +3189,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				},
 				resolveRemoteDeleteAttention: (target, choice) =>
 					this.resolveRemoteDeleteAttention(target, choice),
+				resolveMarkdownConflictAttention: (target, choice) =>
+					this.resolveMarkdownConflictAttention(target, choice),
 				resolveLegacyMissingBlobAttention: (target, choice) =>
 					this.resolveLegacyMissingBlobAttention(target, choice),
 				dismissStuckLocalMutationAttention: (target) =>
@@ -5566,6 +5572,35 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					episodeId: target.episodeId,
 					retiredIntentCount: retiredCount,
 				});
+				return { status: "completed" };
+			},
+		);
+	}
+
+	private async resolveMarkdownConflictAttention(
+		target: DashboardMarkdownConflictResolutionTarget,
+		choice: DashboardMarkdownConflictResolutionChoice,
+	): Promise<DashboardMarkdownConflictResolutionResult> {
+		const normalizedTarget: DashboardMarkdownConflictResolutionTarget = {
+			...target,
+			path: normalizePath(target.path),
+		};
+		const lockKey = `${normalizedTarget.fileKind}:${normalizedTarget.path}`;
+		return withAttentionResolutionLock(
+			this.attentionResolutionInFlight,
+			lockKey,
+			normalizedTarget.path,
+			async () => {
+				await this.reconciliationController.resolveMarkdownConflictAttention(
+					normalizedTarget.path,
+					choice,
+					{
+						reason: normalizedTarget.reason,
+						episodeId: normalizedTarget.episodeId,
+						localFile: normalizedTarget.localFile,
+					},
+				);
+				await this.persistPluginState();
 				return { status: "completed" };
 			},
 		);
