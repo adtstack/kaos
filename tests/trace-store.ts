@@ -3,10 +3,13 @@ import {
 	appendTraceEntry,
 	DEFAULT_AUDIT_MAX_ENTRIES,
 	DEFAULT_TRACE_RATE_LIMIT_PER_WINDOW,
+	DEFAULT_TRACE_TRIM_INTERVAL,
 	listAuditTraceEntries,
 	listRecentTraceEntries,
 	MAX_TRACE_ENTRY_BYTES,
 	prepareTraceEntryForStorage,
+	resetTraceCountersForTest,
+	trimTraceEntries,
 	TraceRateLimiter,
 	type TraceEntry,
 } from "../server/src/traceStore";
@@ -94,32 +97,41 @@ function jsonBytes(value: unknown): number {
 	return new TextEncoder().encode(JSON.stringify(value)).byteLength;
 }
 
-console.log("\n--- Test 1: trace store keeps only the newest bounded entries ---");
+console.log("\n--- Test 1: trace store keeps bounded entries with periodic trimming ---");
 {
+	resetTraceCountersForTest();
 	const storage = new FakeStorage();
 	for (let i = 0; i < 250; i++) {
 		await appendTraceEntry(storage, makeEntry(i), 100);
 	}
 
 	const allKeys = [...storage.data.keys()];
-	assert(allKeys.length === 100, "trace store retains exactly the newest 100 entries");
+	assert(
+		allKeys.length <= 100 + DEFAULT_TRACE_TRIM_INTERVAL,
+		"trace store retains bounded entries within trim interval budget",
+	);
 	assert(allKeys.every((key) => key.startsWith("trace:")), "trace store writes per-entry prefixed keys");
 
 	const recent = await listRecentTraceEntries(storage, 100);
 	assert(recent.length === 100, "debug read returns bounded recent trace entries");
 	assert((recent[0] as { seq?: unknown }).seq === 249, "most recent trace entry is returned first");
 	assert((recent.at(-1) as { seq?: unknown })?.seq === 150, "oldest retained trace entry is the 100th newest");
+
+	// Explicit trim brings it strictly to 100
+	await trimTraceEntries(storage, 100);
+	assert([...storage.data.keys()].length === 100, "trace store retains exactly the newest 100 entries after trim");
 }
 
 console.log("\n--- Test 2: trace store cleanup removes old backlog in one pass ---");
 {
+	resetTraceCountersForTest();
 	const storage = new FakeStorage();
 	for (let i = 0; i < 1000; i++) {
 		const key = `trace:${String(i).padStart(13, "0")}:manual`;
 		await storage.put(key, makeEntry(i));
 	}
 
-	await appendTraceEntry(storage, makeEntry(1001), 100);
+	await appendTraceEntry(storage, makeEntry(1001), 100, { forceTrim: true });
 
 	const allKeys = [...storage.data.keys()].sort((a, b) => a.localeCompare(b));
 	assert(allKeys.length === 100, "cleanup collapses oversized historical backlog down to the bound");

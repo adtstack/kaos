@@ -102,14 +102,17 @@ export class ServerConfig {
 			}
 
 			return await this.state.storage.transaction(async (txn) => {
-				const claimed = await txn.get<boolean>(CLAIMED_KEY);
-				const existingHash = await txn.get<string>(TOKEN_HASH_KEY);
+				const map = await txn.get<unknown>([CLAIMED_KEY, TOKEN_HASH_KEY]);
+				const claimed = map.get(CLAIMED_KEY) as boolean | undefined;
+				const existingHash = map.get(TOKEN_HASH_KEY) as string | undefined;
 				if (claimed === true && typeof existingHash === "string" && existingHash.length > 0) {
 					return json({ error: "already_claimed" }, 403);
 				}
 
-				await txn.put(CLAIMED_KEY, true);
-				await txn.put(TOKEN_HASH_KEY, body.tokenHash);
+				await txn.put({
+					[CLAIMED_KEY]: true,
+					[TOKEN_HASH_KEY]: body.tokenHash,
+				});
 				return json({ ok: true });
 			});
 		}
@@ -137,17 +140,19 @@ export class ServerConfig {
 				return json({ error: err instanceof Error ? err.message : "invalid metadata" }, 400);
 			}
 
-				await this.state.storage.transaction(async (txn) => {
-					if (updateProvider !== null) {
-						await txn.put(UPDATE_PROVIDER_KEY, updateProvider);
-					}
-					if (updateRepoUrl !== null) {
-						await txn.put(UPDATE_REPO_URL_KEY, updateRepoUrl);
-					}
-					if (updateRepoBranch !== null) {
-						await txn.put(UPDATE_REPO_BRANCH_KEY, updateRepoBranch);
-					}
-				});
+			const entries: Record<string, unknown> = {};
+			if (updateProvider !== null) {
+				entries[UPDATE_PROVIDER_KEY] = updateProvider;
+			}
+			if (updateRepoUrl !== null) {
+				entries[UPDATE_REPO_URL_KEY] = updateRepoUrl;
+			}
+			if (updateRepoBranch !== null) {
+				entries[UPDATE_REPO_BRANCH_KEY] = updateRepoBranch;
+			}
+			if (Object.keys(entries).length > 0) {
+				await this.state.storage.put(entries);
+			}
 
 			return json({ ok: true, config: await this.readConfig() });
 		}
@@ -156,11 +161,18 @@ export class ServerConfig {
 	}
 
 	private async readConfig(): Promise<StoredServerConfig> {
-		const claimed = await this.state.storage.get<boolean>(CLAIMED_KEY);
-		const tokenHash = await this.state.storage.get<string>(TOKEN_HASH_KEY);
-		const updateProvider = await this.state.storage.get<UpdateProvider>(UPDATE_PROVIDER_KEY);
-		const updateRepoUrl = await this.state.storage.get<string>(UPDATE_REPO_URL_KEY);
-		const updateRepoBranch = await this.state.storage.get<string>(UPDATE_REPO_BRANCH_KEY);
+		const map = await this.state.storage.get<unknown>([
+			CLAIMED_KEY,
+			TOKEN_HASH_KEY,
+			UPDATE_PROVIDER_KEY,
+			UPDATE_REPO_URL_KEY,
+			UPDATE_REPO_BRANCH_KEY,
+		]);
+		const claimed = map.get(CLAIMED_KEY) as boolean | undefined;
+		const tokenHash = map.get(TOKEN_HASH_KEY) as string | undefined;
+		const updateProvider = map.get(UPDATE_PROVIDER_KEY) as UpdateProvider | undefined;
+		const updateRepoUrl = map.get(UPDATE_REPO_URL_KEY) as string | undefined;
+		const updateRepoBranch = map.get(UPDATE_REPO_BRANCH_KEY) as string | undefined;
 		return {
 			claimed: claimed === true && typeof tokenHash === "string" && tokenHash.length > 0,
 			tokenHash: typeof tokenHash === "string" && tokenHash.length > 0 ? tokenHash : null,

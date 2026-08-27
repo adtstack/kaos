@@ -2,7 +2,7 @@ import * as Y from "yjs";
 import { YServer } from "y-partyserver";
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { runSerialized, runSingleFlight } from "./asyncConcurrency";
-import { ChunkedDocStore } from "./chunkedDocStore";
+import { ChunkedDocStore, journalStatsFromMeta } from "./chunkedDocStore";
 import { readRoomMeta, type RoomMeta, writeRoomMeta } from "./roomMeta";
 import {
 	createSnapshot,
@@ -33,17 +33,13 @@ import {
 	type TraceEntry as StoredTraceEntry,
 } from "./traceStore";
 import { trySendSvEchoStateVector, type SvEchoSendResult } from "./svEcho";
-import { isUpdateBearingSyncMessage } from "./syncMessageClassifier";
 import { bytesToHex } from "./hex";
 import { sha256Hex } from "./hex";
 import {
 	PersistenceCoordinator,
 	type PersistenceHealth,
 } from "./persistenceCoordinator";
-import {
-	attachConnectionClientKind,
-	buildUpdateObservedTraceData,
-} from "./connectionMetadata";
+import { attachConnectionClientKind } from "./connectionMetadata";
 
 const MAX_DEBUG_TRACE_EVENTS = 200;
 const JOURNAL_COMPACT_MAX_ENTRIES = 50;
@@ -226,10 +222,6 @@ export class VaultSyncServer extends YServer {
 	private recoveryDirtyFlushTimer: ReturnType<typeof setTimeout> | null = null;
 	private recoveryDirtyFlushPromise: Promise<void> | null = null;
 	private recoveryIndexObserversAttached = false;
-	private recoveryTextObservers = new Map<string, {
-		ytext: Y.Text;
-		handler: (event: unknown, transaction: Y.Transaction) => void;
-	}>();
 	private recoveryLastFullScanReason: string | null = null;
 	private recoveryLastIncrementalChangedCount: number | null = null;
 	private recoveryLastBuildMs: number | null = null;
@@ -305,18 +297,7 @@ export class VaultSyncServer extends YServer {
 	}
 
 	handleMessage(connection: Connection, message: WSMessage): void {
-		const shouldTraceUpdate = isUpdateBearingSyncMessage(message);
-		const svBefore = shouldTraceUpdate ? Y.encodeStateVector(this.document) : null;
 		super.handleMessage(connection, message);
-		if (shouldTraceUpdate) {
-			const svAfter = Y.encodeStateVector(this.document);
-			const docChanged = svBefore !== null && !equalBytes(svBefore, svAfter);
-			// Fire-and-forget trace: do not block message processing.
-			void this.recordTrace(
-				"server.ydoc.update_observed",
-				buildUpdateObservedTraceData(connection, message, docChanged),
-			);
-		}
 	}
 
 	async fetch(request: Request): Promise<Response> {
@@ -561,26 +542,6 @@ export class VaultSyncServer extends YServer {
 		await this.flushRecoveryDirtyMarks();
 	}
 
-	private observeRecoveryText(fileId: string, ytext: Y.Text): void {
-		const existing = this.recoveryTextObservers.get(fileId);
-		if (existing?.ytext === ytext) return;
-		if (existing) {
-			existing.ytext.unobserve(existing.handler);
-		}
-		const handler = (): void => {
-			this.markRecoveryDirtyFileIds([fileId]);
-		};
-		ytext.observe(handler);
-		this.recoveryTextObservers.set(fileId, { ytext, handler });
-	}
-
-	private unobserveRecoveryText(fileId: string): void {
-		const existing = this.recoveryTextObservers.get(fileId);
-		if (!existing) return;
-		existing.ytext.unobserve(existing.handler);
-		this.recoveryTextObservers.delete(fileId);
-	}
-
 	private async attachRecoveryIndexObservers(): Promise<void> {
 		if (this.recoveryIndexObserversAttached) return;
 		await this.ensureRecoveryDirtyLoaded();
@@ -603,16 +564,17 @@ export class VaultSyncServer extends YServer {
 			this.markRecoveryDirtyFileIds(affected);
 		});
 
-		idToText.observe((event) => {
+		idToText.observeDeep((events) => {
 			const affected = new Set<string>();
-			for (const [fileId, change] of event.changes.keys) {
-				affected.add(fileId);
-				if (change.action === "delete") {
-					this.unobserveRecoveryText(fileId);
-					continue;
+			for (const event of events) {
+				if (event.target === idToText) {
+					for (const [fileId] of (event as Y.YMapEvent<unknown>).changes.keys) {
+						affected.add(fileId);
+					}
+				} else {
+					const key = event.path[0];
+					if (typeof key === "string") affected.add(key);
 				}
-				const ytext = idToText.get(fileId);
-				if (ytext) this.observeRecoveryText(fileId, ytext);
 			}
 			this.markRecoveryDirtyFileIds(affected);
 		});
@@ -625,10 +587,6 @@ export class VaultSyncServer extends YServer {
 				if (typeof change.oldValue === "string") affected.add(change.oldValue);
 			}
 			this.markRecoveryDirtyFileIds(affected);
-		});
-
-		idToText.forEach((ytext, fileId) => {
-			this.observeRecoveryText(fileId, ytext);
 		});
 
 		this.recoveryIndexObserversAttached = true;
@@ -685,24 +643,13 @@ export class VaultSyncServer extends YServer {
 			if (this.documentLoaded) return;
 
 			const store = this.getChunkedDocStore();
-			const state = await store.loadState();
+			const hasChunked = await store.hasCheckpoint();
 
-			// First, load chunked state into a temporary doc to assess its richness
-			const chunkedDoc = new Y.Doc();
-			if (state.checkpoint) {
-				Y.applyUpdate(chunkedDoc, state.checkpoint);
-			}
-			for (const update of state.journalUpdates) {
-				Y.applyUpdate(chunkedDoc, update);
-			}
-			const chunkedPathCount = this.countActivePathsInDoc(chunkedDoc);
-
-			// Legacy migration: check for pre-ChunkedDocStore "document" key.
-			// Migrate if legacy has real content but chunked only has sentinel state.
-			// The reporter's pathological shape was: legacy=full vault, chunked=2 tiny
-			// sys/init entries. We must not let tiny chunked writes block migration.
-			const legacyRaw = await this.ctx.storage.get<unknown>(LEGACY_DOCUMENT_KEY);
+			// Legacy migration guard: only inspect legacy "document" key if NO chunked checkpoint exists yet.
+			// This completely protects against stale legacy keys left behind by failed deletions.
 			let legacyBytes: Uint8Array | null = null;
+			if (!hasChunked) {
+				const legacyRaw = await this.ctx.storage.get<unknown>(LEGACY_DOCUMENT_KEY);
 				if (legacyRaw !== undefined) {
 					if (legacyRaw instanceof Uint8Array) {
 						legacyBytes = legacyRaw;
@@ -717,35 +664,50 @@ export class VaultSyncServer extends YServer {
 						);
 					}
 				}
+			}
 
+			// Sequential, low-peak streaming load:
+			// 1. Load and apply checkpoint first
+			const checkpoint = await store.loadCheckpoint();
+			let loadedSV: Uint8Array | null = null;
+			let checkpointBytes = 0;
+			if (checkpoint?.update) {
+				checkpointBytes = checkpoint.update.byteLength;
+				Y.applyUpdate(this.document, checkpoint.update);
+				if (checkpoint.stateVector) {
+					loadedSV = checkpoint.stateVector.slice();
+				}
+				// Dereference checkpoint update buffer immediately
+				(checkpoint as { update?: unknown }).update = null;
+			}
+
+			// 2. Load and apply journal updates one by one, immediately releasing buffers
+			const journal = await store.loadJournal();
+			const journalStats = journalStatsFromMeta(journal.meta);
+			for (let i = 0; i < journal.entries.length; i++) {
+				const update = journal.entries[i];
+				if (update && update.byteLength > 0) {
+					Y.applyUpdate(this.document, update);
+					(journal.entries as unknown[])[i] = null;
+				}
+			}
+
+			// 3. Handle rare legacy migration if legacy bytes exist and chunked has no real files
 			if (legacyBytes && legacyBytes.byteLength > 0) {
+				const chunkedPathCount = this.countActivePathsInDoc(this.document);
+				const chunkedHasFileState = this.hasAnyFileStateInDoc(this.document);
+
 				const legacyDoc = new Y.Doc();
 				Y.applyUpdate(legacyDoc, legacyBytes);
 				const legacyPathCount = this.countActivePathsInDoc(legacyDoc);
-				const chunkedHasFileState = this.hasAnyFileStateInDoc(chunkedDoc);
 
-				// Migrate if:
-				// - legacy has real files
-				// - chunked has no active paths
-				// - chunked has no semantic file state (tombstones, pathToId, meta)
-				// This prevents resurrecting deleted files if chunked has tombstones.
 				if (legacyPathCount > 0 && chunkedPathCount === 0 && !chunkedHasFileState) {
-					// Merge: apply legacy first, then chunked on top (to preserve any
-					// sys/schema updates that may have happened in chunked)
+					// Apply legacy bytes into this.document (merged with chunked sentinels)
 					Y.applyUpdate(this.document, legacyBytes);
-					if (state.checkpoint) {
-						Y.applyUpdate(this.document, state.checkpoint);
-					}
-					for (const update of state.journalUpdates) {
-						Y.applyUpdate(this.document, update);
-					}
-					// Persist merged state into chunked format
 					const checkpointUpdate = Y.encodeStateAsUpdate(this.document);
 					const checkpointSV = Y.encodeStateVector(this.document);
 					await store.rewriteCheckpoint(checkpointUpdate, checkpointSV);
 
-					// Delete legacy key after successful migration — best-effort
-					// If deletion fails, the room should still load from chunked checkpoint.
 					try {
 						await this.ctx.storage.delete([LEGACY_DOCUMENT_KEY]);
 					} catch (deleteErr) {
@@ -769,50 +731,38 @@ export class VaultSyncServer extends YServer {
 						legacyPathCount,
 						chunkedPathCount,
 						chunkedHasFileState,
-						chunkedJournalEntries: state.journalStats.entryCount,
+						chunkedJournalEntries: journalStats.entryCount,
 						checkpointBytes: checkpointUpdate.byteLength,
 					});
 					legacyDoc.destroy();
-					chunkedDoc.destroy();
 					return;
 				}
 				legacyDoc.destroy();
 			}
 
-			// Normal path: use chunked state
-			// (chunkedDoc already has the state, just copy to this.document)
-			if (state.checkpoint) {
-				Y.applyUpdate(this.document, state.checkpoint);
+			if (!loadedSV || journalStats.entryCount > 0) {
+				loadedSV = Y.encodeStateVector(this.document);
 			}
-			for (const update of state.journalUpdates) {
-				Y.applyUpdate(this.document, update);
-			}
-			chunkedDoc.destroy();
 
-			const loadedSV = (
-				state.checkpointStateVector && state.journalUpdates.length === 0
-			)
-				? state.checkpointStateVector.slice()
-				: Y.encodeStateVector(this.document);
 			this.getPersistenceCoordinator().setInitialStateVector(loadedSV);
 			this.loadedStateVectorHash = bytesToHex(loadedSV.slice(0, 16));
-			this.getPersistenceCoordinator().health.journalEntryCount = state.journalStats.entryCount;
-			this.getPersistenceCoordinator().health.journalBytes = state.journalStats.totalBytes;
+			this.getPersistenceCoordinator().health.journalEntryCount = journalStats.entryCount;
+			this.getPersistenceCoordinator().health.journalBytes = journalStats.totalBytes;
 			this.documentLoaded = true;
 			this.attachDocumentUpdateListener();
 			await this.attachRecoveryIndexObservers();
 			await this.syncRoomMetaFromDocument();
 			await this.recordTrace("checkpoint-load", {
-				hasCheckpoint: state.checkpoint !== null,
-				checkpointStateVectorBytes: state.checkpointStateVector?.byteLength ?? 0,
-				journalEntryCount: state.journalStats.entryCount,
-				journalBytes: state.journalStats.totalBytes,
+				hasCheckpoint: checkpointBytes > 0,
+				checkpointStateVectorBytes: checkpoint?.stateVector?.byteLength ?? 0,
+				journalEntryCount: journalStats.entryCount,
+				journalBytes: journalStats.totalBytes,
 				replayMode:
-					state.checkpoint !== null && state.journalUpdates.length > 0
+					checkpointBytes > 0 && journalStats.entryCount > 0
 						? "checkpoint+journal"
-						: state.checkpoint !== null
+						: checkpointBytes > 0
 							? "checkpoint-only"
-							: state.journalUpdates.length > 0
+							: journalStats.entryCount > 0
 								? "journal-only"
 								: "empty",
 			});
@@ -884,6 +834,15 @@ export class VaultSyncServer extends YServer {
 				this.document,
 				this.getChunkedDocStore(),
 				(event, data) => {
+					// Filter out routine save events to save storage I/O
+					if (
+						event === "save.skipped_equal_sv" ||
+						event === "save.skipped_empty_delta" ||
+						event === "save.delta_computed" ||
+						event === "save.append_succeeded"
+					) {
+						return;
+					}
 					void this.recordTrace(`server.${event}`, data);
 				},
 				{
@@ -1160,8 +1119,10 @@ export class VaultSyncServer extends YServer {
 				}
 
 				const vaultId = this.getRoomId();
-				await this.ensureRecoveryIndexLoaded();
-				await this.ensureRecoveryDirtyLoaded();
+				await Promise.all([
+					this.ensureRecoveryIndexLoaded(),
+					this.ensureRecoveryDirtyLoaded(),
+				]);
 
 				const pendingRaw = await this.ctx.storage.get<unknown>(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY);
 				const pendingUpload = isPreparedFileHistoryPendingUpload(pendingRaw) ? pendingRaw : null;

@@ -3473,7 +3473,10 @@ console.log("\n--- Test 5f4a: only an exact duplicate sequence is idempotent ---
 		makeInterceptedCandidate(fix.path, "different bytes must be ignored\n", 7),
 	);
 	clearMarkdownDrainTimer(fix.controller);
-	await new Promise<void>((resolve) => setTimeout(resolve, 0));
+	await waitForAsyncCondition(
+		() => fix.getDiscardedRevisions().some((record) => record.reason === "superseded-external-revision"),
+		"same-sequence discarded revision",
+	);
 
 	const retained = getInterceptedCandidates(fix.controller);
 	assertEq(retained.size, 1, "duplicate sequence retains one candidate");

@@ -1,6 +1,39 @@
 import esbuild from "esbuild";
 import process from "process";
 import { builtinModules } from 'node:module';
+import fs from "node:fs";
+import path from "node:path";
+
+function loadEnvFileSafe(filePath) {
+	if (!fs.existsSync(filePath)) return;
+	try {
+		if (typeof process.loadEnvFile === "function") {
+			process.loadEnvFile(filePath);
+			return;
+		}
+	} catch {}
+
+	try {
+		const content = fs.readFileSync(filePath, "utf8");
+		for (const line of content.split("\n")) {
+			const trimmed = line.trim();
+			if (!trimmed || trimmed.startsWith("#")) continue;
+			const eqIdx = trimmed.indexOf("=");
+			if (eqIdx <= 0) continue;
+			const key = trimmed.slice(0, eqIdx).trim();
+			let val = trimmed.slice(eqIdx + 1).trim();
+			if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+				val = val.slice(1, -1);
+			}
+			if (key && !(key in process.env)) {
+				process.env[key] = val;
+			}
+		}
+	} catch {}
+}
+
+loadEnvFileSafe(".env");
+loadEnvFileSafe(".env.local");
 
 const banner =
 `/*
@@ -11,6 +44,37 @@ if you want to view the source, please visit the github repository of this plugi
 
 const prod = (process.argv[2] === "production");
 const qaProduct = (process.argv[2] === "qa-product");
+
+const vaultPath = process.env.OBSIDIAN_VAULT_PATH || process.env.OBSIDIAN_VAULT;
+const configDirName = process.env.OBSIDIAN_CONFIG_DIR || ".obsidian";
+const pluginName = process.env.PLUGIN_NAME || "kaos";
+
+function copyToVault() {
+	if (!vaultPath || !fs.existsSync(vaultPath)) return;
+	try {
+		const targetDir = path.join(vaultPath, configDirName, "plugins", pluginName);
+		fs.mkdirSync(targetDir, { recursive: true });
+		for (const file of ["manifest.json", "main.js", "telemetry.js", "styles.css"]) {
+			if (fs.existsSync(file)) {
+				fs.copyFileSync(file, path.join(targetDir, file));
+			}
+		}
+		console.log(`[vault-sync] Synced plugin files to ${targetDir}`);
+	} catch (err) {
+		console.warn(`[vault-sync] Failed to sync to vault: ${err.message}`);
+	}
+}
+
+const vaultSyncPlugin = {
+	name: "vault-sync",
+	setup(build) {
+		build.onEnd((result) => {
+			if (result.errors.length === 0) {
+				copyToVault();
+			}
+		});
+	},
+};
 
 const sharedConfig = {
 	banner: { js: banner },
@@ -39,6 +103,7 @@ const sharedConfig = {
 	sourcemap: (prod || qaProduct) ? false : "inline",
 	treeShaking: true,
 	minify: (prod || qaProduct),
+	plugins: vaultPath ? [vaultSyncPlugin] : [],
 };
 
 // ---------------------------------------------------------------------------
@@ -97,6 +162,9 @@ if (prod) {
 	]);
 	process.exit(0);
 } else {
+	if (vaultPath) {
+		console.log(`[vault-sync] Auto-sync active for vault: ${vaultPath}`);
+	}
 	await Promise.all([
 		mainContext.watch(),
 		telemetryContext.watch(),

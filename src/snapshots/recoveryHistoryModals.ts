@@ -85,6 +85,7 @@ export class RecoveryHistoryModal extends Modal {
 	private diffKey: string | null = null;
 	private diffLines: RenderedDiffLine[] | null = null;
 	private diffError: string | null = null;
+	private diffNotice: string | null = null;
 	private diffLoadSeq = 0;
 	private readonly contentCache = new Map<string, Promise<string>>();
 	private railEl: HTMLElement | null = null;
@@ -421,6 +422,7 @@ export class RecoveryHistoryModal extends Modal {
 		this.diffKey = key;
 		this.diffLines = null;
 		this.diffError = null;
+		this.diffNotice = null;
 		this.renderPreviewOnly();
 
 		if (!hasTextVersions(item)) {
@@ -433,19 +435,61 @@ export class RecoveryHistoryModal extends Modal {
 		try {
 			const previousHash = item.entry.previousContentHash;
 			const currentHash = item.entry.contentHash;
-			const previous = previousHash ? await this.downloadCached(previousHash) : "";
-			const current = currentHash ? await this.downloadCached(currentHash) : "";
+
+			let previous = "";
+			let previousUnavailable = false;
+			if (previousHash) {
+				try {
+					previous = await this.downloadCached(previousHash);
+				} catch {
+					previous = "";
+					previousUnavailable = true;
+				}
+			}
+
+			let current = "";
+			let currentUnavailable = false;
+			if (currentHash) {
+				try {
+					current = await this.downloadCached(currentHash);
+				} catch {
+					current = "";
+					currentUnavailable = true;
+				}
+			}
+
 			if (seq !== this.diffLoadSeq || this.selectedChangeKey !== key) return;
-			this.diffLines = renderDiffLines(previous, current, {
-				contextLines: 0,
-				maxSegments: 80,
-				maxLinesPerSegment: 12,
-			});
-			this.diffError = null;
+
+			if (currentHash && currentUnavailable && previousHash && previousUnavailable) {
+				this.diffLines = null;
+				this.diffError = "Content for this history point is no longer available in remote storage.";
+				this.diffNotice = null;
+			} else if (currentHash && currentUnavailable) {
+				this.diffLines = renderDiffLines(previous, "", {
+					contextLines: 0,
+					maxSegments: 80,
+					maxLinesPerSegment: 12,
+				});
+				this.diffError = null;
+				this.diffNotice = "Current version content was not found in remote storage; showing previous version removals only.";
+			} else {
+				this.diffLines = renderDiffLines(previous, current, {
+					contextLines: 0,
+					maxSegments: 80,
+					maxLinesPerSegment: 12,
+				});
+				this.diffError = null;
+				if (previousHash && previousUnavailable) {
+					this.diffNotice = "Previous version content was not found in remote storage; showing current version as full addition.";
+				} else {
+					this.diffNotice = null;
+				}
+			}
 		} catch (err) {
 			if (seq !== this.diffLoadSeq || this.selectedChangeKey !== key) return;
 			this.diffLines = null;
 			this.diffError = `Diff failed: ${err instanceof Error ? err.message : String(err)}`;
+			this.diffNotice = null;
 		}
 		this.renderPreviewOnly();
 	}
@@ -463,7 +507,7 @@ export class RecoveryHistoryModal extends Modal {
 
 	private renderDiff(parent: HTMLElement, item: RecoveryHistoryChangeItem, lines: RenderedDiffLine[]): void {
 		const root = parent.createDiv({ cls: "recovery-history-diff" });
-		const status = diffStatusMessage(item);
+		const status = diffStatusMessage(item, this.diffNotice);
 		if (status) {
 			root.createDiv({
 				text: status,
@@ -526,6 +570,7 @@ export class RecoveryHistoryModal extends Modal {
 		this.diffKey = null;
 		this.diffLines = null;
 		this.diffError = null;
+		this.diffNotice = null;
 		this.diffLoadSeq++;
 	}
 
@@ -599,7 +644,10 @@ function textUnavailableMessage(item: RecoveryHistoryChangeItem): string {
 	return "No text content was captured for this history entry.";
 }
 
-function diffStatusMessage(item: RecoveryHistoryChangeItem): string | null {
+function diffStatusMessage(item: RecoveryHistoryChangeItem, overrideStatus?: string | null): string | null {
+	if (overrideStatus) {
+		return overrideStatus;
+	}
 	if (!item.entry.previousContentHash && item.entry.contentHash) {
 		return "Created content. The file version appears as additions.";
 	}

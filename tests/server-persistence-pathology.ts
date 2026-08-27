@@ -1299,6 +1299,110 @@ console.log("\n--- Test 19: PersistenceCoordinator — compaction failure stays 
 	assert(coordinator.health.pendingPersistence === false, "pendingPersistence remains false after durable append");
 }
 
+// ── Test 20: Stale legacy document key guard (failed deletion simulation) ──────────
+
+console.log("\n--- Test 20: Stale legacy key guard — hasCheckpoint prevents redundant legacy check ---");
+{
+	const storage = new FakeStorage();
+	const store = new ChunkedDocStore(storage as unknown as DurableObjectStorage);
+
+	// 1. Initially no checkpoint
+	assert((await store.hasCheckpoint()) === false, "fresh store has no checkpoint");
+
+	// 2. Write a real chunked checkpoint
+	const chunkedDoc = new Y.Doc();
+	chunkedDoc.getMap("sys").set("schemaVersion", 8);
+	const pathToId = chunkedDoc.getMap<string>("pathToId");
+	const idToText = chunkedDoc.getMap<Y.Text>("idToText");
+	const meta = chunkedDoc.getMap("meta");
+	for (let i = 0; i < 10; i++) {
+		const path = `note-${i}.md`;
+		const fileId = `file-${i}`;
+		chunkedDoc.transact(() => {
+			pathToId.set(path, fileId);
+			const text = new Y.Text();
+			text.insert(0, `Chunked note ${i}`);
+			idToText.set(fileId, text);
+			meta.set(fileId, { path, deleted: false });
+		});
+	}
+	await store.rewriteCheckpoint(
+		Y.encodeStateAsUpdate(chunkedDoc),
+		Y.encodeStateVector(chunkedDoc),
+	);
+
+	assert((await store.hasCheckpoint()) === true, "store now has checkpoint");
+
+	// 3. Plant a stale legacy "document" key with old/diverged data
+	const staleLegacyDoc = new Y.Doc();
+	staleLegacyDoc.getMap("sys").set("schemaVersion", 6);
+	const staleMeta = staleLegacyDoc.getMap("meta");
+	staleMeta.set("stale-file", { path: "stale.md", deleted: false });
+	storage.data.set("document", Y.encodeStateAsUpdate(staleLegacyDoc));
+
+	// 4. Verify that with hasCheckpoint guard, we skip the legacy check entirely
+	const hasCheckpoint = await store.hasCheckpoint();
+	assert(hasCheckpoint === true, "hasCheckpoint guard identifies existing checkpoint");
+
+	// If hasCheckpoint is true, server does not inspect storage.data.get("document")
+	const loadedDoc = new Y.Doc();
+	const checkpoint = await store.loadCheckpoint();
+	assert(checkpoint !== null, "loaded checkpoint is non-null");
+	if (checkpoint?.update) {
+		Y.applyUpdate(loadedDoc, checkpoint.update);
+	}
+	const journal = await store.loadJournal();
+	for (const update of journal.entries) {
+		Y.applyUpdate(loadedDoc, update);
+	}
+
+	assert(loadedDoc.getMap("meta").has("file-0"), "loaded doc has chunked files");
+	assert(!loadedDoc.getMap("meta").has("stale-file"), "loaded doc ignored stale legacy key");
+	assert(loadedDoc.getMap("sys").get("schemaVersion") === 8, "schemaVersion remains 8");
+}
+
+// ── Test 21: Sequential streaming doc load memory safety ─────────────────────────
+
+console.log("\n--- Test 21: Sequential streaming load — checkpoint & journal apply correctly ---");
+{
+	const storage = new FakeStorage();
+	const store = new ChunkedDocStore(storage as unknown as DurableObjectStorage);
+
+	// Setup checkpoint + 3 journals
+	const doc = new Y.Doc();
+	doc.getText("t").insert(0, "hello");
+	await store.rewriteCheckpoint(Y.encodeStateAsUpdate(doc), Y.encodeStateVector(doc));
+
+	const sv0 = Y.encodeStateVector(doc);
+	doc.getText("t").insert(5, " world");
+	await store.appendUpdate(Y.encodeStateAsUpdate(doc, sv0));
+
+	const sv1 = Y.encodeStateVector(doc);
+	doc.getText("t").insert(11, " from");
+	await store.appendUpdate(Y.encodeStateAsUpdate(doc, sv1));
+
+	const sv2 = Y.encodeStateVector(doc);
+	doc.getText("t").insert(16, " streaming");
+	await store.appendUpdate(Y.encodeStateAsUpdate(doc, sv2));
+
+	// Streaming load sequence matching server.ts ensureDocumentLoaded
+	const liveDoc = new Y.Doc();
+	const checkpoint = await store.loadCheckpoint();
+	assert(checkpoint !== null, "checkpoint loaded");
+	if (checkpoint?.update) {
+		Y.applyUpdate(liveDoc, checkpoint.update);
+	}
+
+	const journal = await store.loadJournal();
+	assert(journal.entries.length === 3, "journal has 3 entries");
+	for (let i = 0; i < journal.entries.length; i++) {
+		const update = journal.entries[i];
+		Y.applyUpdate(liveDoc, update);
+	}
+
+	assert(liveDoc.getText("t").toString() === "hello world from streaming", "final content matches exactly");
+}
+
 // ── Summary ──────────────────────────────────────────────────────────────────
 
 console.log(`\n${"─".repeat(55)}`);
