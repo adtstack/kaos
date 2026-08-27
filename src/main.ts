@@ -3178,6 +3178,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				createFileHistoryPoint: async () => {
 					await this.snapshotService?.createFileHistoryPoint();
 				},
+				resetFileHistoryBaseline: async () => {
+					await this.snapshotService?.resetFileHistoryBaseline();
+				},
 				showRecoveryHistory: async (target) => {
 					await this.snapshotService?.showRecoveryHistory(target);
 				},
@@ -4265,6 +4268,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (!(file instanceof TFile)) return;
 
 				if (this.isMarkdownPathSyncable(file.path)) {
+					this.snapshotService?.noteLocalModification();
 					const opId = this.newOpId();
 					// Writer attribution for the disk modify event.
 					// suppressWindowActive: did KAOS issue a write whose
@@ -5045,6 +5049,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			clearInterval(this.crdtSnapshotInterval);
 			this.crdtSnapshotInterval = null;
 		}
+		this.snapshotService?.destroy();
 	}
 
 	/**

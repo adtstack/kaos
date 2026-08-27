@@ -340,7 +340,7 @@ function emptyJournalMeta(now = new Date().toISOString()): JournalMeta {
 	};
 }
 
-function journalStatsFromMeta(meta: JournalMeta): JournalStats {
+export function journalStatsFromMeta(meta: JournalMeta): JournalStats {
 	return {
 		entryCount: meta.entryCount,
 		totalBytes: meta.totalBytes,
@@ -472,6 +472,11 @@ export class ChunkedDocStore {
 
 	getLastWriteStats(): ChunkWriteStats | null {
 		return this.lastWriteStats;
+	}
+
+	async hasCheckpoint(): Promise<boolean> {
+		const rawPointer = await this.storage.get<unknown>(CHECKPOINT_POINTER_KEY);
+		return rawPointer !== undefined && isManifestPointer(rawPointer);
 	}
 
 	async loadState(): Promise<LoadedDocState> {
@@ -712,7 +717,7 @@ export class ChunkedDocStore {
 		};
 	}
 
-	private async loadCheckpoint(): Promise<{
+	async loadCheckpoint(): Promise<{
 		update: Uint8Array;
 		stateVector: Uint8Array;
 	} | null> {
@@ -785,7 +790,7 @@ export class ChunkedDocStore {
 		return { update, stateVector };
 	}
 
-	private async loadJournal(): Promise<{
+	async loadJournal(): Promise<{
 		meta: JournalMeta;
 		entries: Uint8Array[];
 	}> {

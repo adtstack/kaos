@@ -497,6 +497,46 @@ console.log("\n--- Test 11: fail closed when journal chunk bytes are tampered --
 	);
 }
 
+// Test 12: hasCheckpoint returns true only when valid checkpoint pointer exists
+console.log("\n--- Test 12: hasCheckpoint accurately reflects checkpoint pointer existence ---");
+{
+	const storage = new FakeStorage();
+	const store = new ChunkedDocStore(storage);
+
+	assert((await store.hasCheckpoint()) === false, "fresh store hasCheckpoint is false");
+
+	const doc = new Y.Doc();
+	doc.getText("t").insert(0, "checkpoint test");
+	await store.rewriteCheckpoint(Y.encodeStateAsUpdate(doc), Y.encodeStateVector(doc));
+
+	assert((await store.hasCheckpoint()) === true, "store with checkpoint hasCheckpoint is true");
+}
+
+// Test 13: loadCheckpoint and loadJournal work independently
+console.log("\n--- Test 13: loadCheckpoint and loadJournal execute cleanly in sequence ---");
+{
+	const storage = new FakeStorage();
+	const store = new ChunkedDocStore(storage);
+
+	const doc = new Y.Doc();
+	doc.getText("t").insert(0, "init");
+	await store.rewriteCheckpoint(Y.encodeStateAsUpdate(doc), Y.encodeStateVector(doc));
+
+	const sv0 = Y.encodeStateVector(doc);
+	doc.getText("t").insert(4, " delta");
+	await store.appendUpdate(Y.encodeStateAsUpdate(doc, sv0));
+
+	const cp = await store.loadCheckpoint();
+	assert(cp !== null, "loadCheckpoint returns checkpoint");
+	assert(cp?.update instanceof Uint8Array, "checkpoint update is Uint8Array");
+	assert(cp?.stateVector instanceof Uint8Array, "checkpoint stateVector is Uint8Array");
+
+	const j = await store.loadJournal();
+	assert(j.meta.entryCount === 1, "loadJournal returns correct entryCount");
+	assert(j.entries.length === 1, "loadJournal returns entry array");
+	assert(j.entries[0] instanceof Uint8Array, "journal entry is Uint8Array");
+}
+
 console.log("\n──────────────────────────────────────────────────");
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log("──────────────────────────────────────────────────");

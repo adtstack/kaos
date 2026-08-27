@@ -268,14 +268,41 @@ async function trimPrefixedEntries(
 	}
 }
 
+export const DEFAULT_TRACE_TRIM_INTERVAL = 20;
+
+let traceWriteCounter = 0;
+
+export function resetTraceCountersForTest(): void {
+	traceWriteCounter = 0;
+}
+
+export async function trimTraceEntries(
+	storage: TraceStorageLike,
+	maxEntries: number,
+): Promise<void> {
+	await trimPrefixedEntries(storage, TRACE_KEY_PREFIX, maxEntries);
+}
+
+export async function trimAuditTraceEntries(
+	storage: TraceStorageLike,
+	maxEntries: number = DEFAULT_AUDIT_MAX_ENTRIES,
+): Promise<void> {
+	await trimPrefixedEntries(storage, AUDIT_KEY_PREFIX, maxEntries);
+}
+
 export async function appendTraceEntry(
 	storage: TraceStorageLike,
 	entry: TraceEntry,
 	maxEntries: number,
+	options?: { forceTrim?: boolean; trimInterval?: number },
 ): Promise<void> {
 	const traceTs = Date.parse(entry.ts);
 	await storage.put(createTraceKey(Number.isFinite(traceTs) ? traceTs : Date.now()), entry);
-	await trimPrefixedEntries(storage, TRACE_KEY_PREFIX, maxEntries);
+	traceWriteCounter++;
+	const interval = options?.trimInterval ?? DEFAULT_TRACE_TRIM_INTERVAL;
+	if (options?.forceTrim || (interval > 0 && traceWriteCounter % interval === 0)) {
+		await trimPrefixedEntries(storage, TRACE_KEY_PREFIX, maxEntries);
+	}
 }
 
 export function createAuditKey(ts = Date.now()): string {

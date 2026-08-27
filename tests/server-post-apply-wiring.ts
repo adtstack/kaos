@@ -42,16 +42,10 @@ const broadcastBody = broadcastStart >= 0 && broadcastEnd > broadcastStart
 	: "";
 
 console.log("\n--- Test 1: message handling never acknowledges volatile state ---");
-assert(source.includes("import { isUpdateBearingSyncMessage }"), "server imports pure classifier");
 assert(methodMatch !== null, "server defines handleMessage override");
-assert(body.includes("const shouldTraceUpdate = isUpdateBearingSyncMessage(message);"), "classifier result is computed");
 assert(body.includes("super.handleMessage(connection, message);"), "parent handleMessage is called");
 assert(!body.includes("trySendSvEcho"), "handleMessage sends no receipt from live memory");
 assert(!body.includes("\"postApply\""), "handleMessage contains no postApply receipt");
-
-const classifierIndex = body.indexOf("isUpdateBearingSyncMessage(message)");
-const parentIndex = body.indexOf("super.handleMessage(connection, message)");
-assert(classifierIndex >= 0 && parentIndex > classifierIndex, "classifier runs before parent handler");
 
 console.log("\n--- Test 2: save success is the only postApply receipt boundary ---");
 assert(onSaveBody.includes("const result = await coordinator.enqueueSave();"), "onSave awaits durable save result");

@@ -60,6 +60,7 @@ export interface KaosDashboardActions {
 	takeSnapshotNow(): Promise<void>;
 	showSnapshotList(): Promise<void>;
 	createFileHistoryPoint(): Promise<void>;
+	resetFileHistoryBaseline(): Promise<void>;
 	showRecoveryHistory(target?: DashboardRecoveryHistoryTarget): Promise<void>;
 	exportDiagnostics(): void;
 	exportDiagnosticsWithFilenames(): void;
@@ -290,6 +291,7 @@ export class KaosDashboardView extends ItemView {
 		this.button(recoveryActions, "Take vault snapshot", () => this.deps.actions.takeSnapshotNow(), recoveryDisabled);
 		this.button(recoveryActions, "Browse vault snapshots", () => this.deps.actions.showSnapshotList(), recoveryDisabled);
 		this.button(recoveryActions, "Create file history point", () => this.deps.actions.createFileHistoryPoint(), recoveryDisabled);
+		this.button(recoveryActions, "Reset file history baseline", () => this.deps.actions.resetFileHistoryBaseline(), recoveryDisabled);
 		this.button(recoveryActions, "Review file history", () => this.deps.actions.showRecoveryHistory(), recoveryDisabled);
 	}
 

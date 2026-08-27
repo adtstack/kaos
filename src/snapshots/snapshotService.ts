@@ -58,6 +58,8 @@ import {
 
 const RECOVERY_SNAPSHOT_PENDING_RETRY_MS = 5 * 60 * 1000;
 const RECOVERY_HISTORY_RECENT_POINT_LIMIT = 10;
+const RECOVERY_SNAPSHOT_IDLE_DEBOUNCE_MS = 2 * 60 * 1000;
+const RECOVERY_SNAPSHOT_MIN_INTERVAL_MS = 10 * 60 * 1000;
 
 interface SnapshotServiceDeps {
 	app: App;
@@ -79,7 +81,10 @@ interface RestoreEditorAuthorityEntry {
 
 export class SnapshotService {
 	private recoverySnapshotRetryTimer: ReturnType<typeof setTimeout> | null = null;
+	private debouncedRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
 	private recoverySnapshotInFlight = false;
+	private lastAutoSnapshotAt = 0;
+	private pendingLocalEdits = false;
 	private readonly dashboardSnapshotCache = new DashboardSnapshotCache();
 	private lastFileHistoryAttempt: DashboardFileHistoryAttempt | null = null;
 
@@ -242,6 +247,38 @@ export class SnapshotService {
 	}
 
 	/**
+	 * Record a local modification to schedule an idle auto-snapshot with cooldown.
+	 */
+	noteLocalModification(): void {
+		this.pendingLocalEdits = true;
+		this.scheduleDebouncedRecoverySnapshot();
+	}
+
+	scheduleDebouncedRecoverySnapshot(): void {
+		if (this.debouncedRecoveryTimer) {
+			clearTimeout(this.debouncedRecoveryTimer);
+			this.debouncedRecoveryTimer = null;
+		}
+
+		if (!this.deps.getServerSupportsSnapshots()) return;
+		const vaultSync = this.deps.getVaultSync();
+		if (!vaultSync?.connected || !vaultSync.providerSynced) return;
+
+		const now = Date.now();
+		const elapsedSinceLast = now - this.lastAutoSnapshotAt;
+		const remainingCooldown = Math.max(0, RECOVERY_SNAPSHOT_MIN_INTERVAL_MS - elapsedSinceLast);
+		const delay = Math.max(RECOVERY_SNAPSHOT_IDLE_DEBOUNCE_MS, remainingCooldown);
+
+		this.debouncedRecoveryTimer = setTimeout(() => {
+			this.debouncedRecoveryTimer = null;
+			if (!this.pendingLocalEdits) return;
+			this.pendingLocalEdits = false;
+			this.lastAutoSnapshotAt = Date.now();
+			void this.triggerRecoverySnapshot(false);
+		}, delay);
+	}
+
+	/**
 	 * Request a file history point. Silent noop when unavailable or unchanged.
 	 */
 	async triggerRecoverySnapshot(forceFull = false): Promise<void> {
@@ -259,6 +296,8 @@ export class SnapshotService {
 		this.recoverySnapshotInFlight = true;
 		try {
 			const result = await this.requestFileHistoryPoint(forceFull);
+			this.lastAutoSnapshotAt = Date.now();
+			this.pendingLocalEdits = false;
 			if (result.status === "created") {
 				this.invalidateDashboardSnapshotCache();
 				const changed = typeof result.index?.changedCount === "number"
@@ -300,6 +339,8 @@ export class SnapshotService {
 		new Notice("Creating file history point...");
 		try {
 			const result = await this.requestFileHistoryPoint(true);
+			this.lastAutoSnapshotAt = Date.now();
+			this.pendingLocalEdits = false;
 			if (result.status === "created") {
 				this.invalidateDashboardSnapshotCache();
 				const changed = typeof result.index?.changedCount === "number"
@@ -316,6 +357,56 @@ export class SnapshotService {
 			}
 		} catch (err) {
 			this.showSnapshotFailure("File history point failed", "File history", err);
+		}
+	}
+
+	async resetFileHistoryBaseline(): Promise<void> {
+		const vaultSync = this.deps.getVaultSync();
+		if (!vaultSync) {
+			new Notice("Sync not initialized");
+			return;
+		}
+		if (!this.deps.getServerSupportsSnapshots()) {
+			this.notifySnapshotStorageUnavailable("File history");
+			return;
+		}
+		if (!vaultSync.connected) {
+			new Notice("Not connected to server — cannot reset file history baseline.");
+			return;
+		}
+
+		new Notice("Resetting file history baseline...");
+		try {
+			const result = await this.requestFileHistoryPoint(true);
+			this.lastAutoSnapshotAt = Date.now();
+			this.pendingLocalEdits = false;
+			if (result.status === "created") {
+				this.invalidateDashboardSnapshotCache();
+				const changed = typeof result.index?.changedCount === "number"
+					? `${result.index.changedCount} changed file(s)`
+					: "changes recorded";
+				new Notice(`File history baseline reset successfully: ${changed}.`);
+			} else if (result.status === "noop") {
+				new Notice(result.reason ?? "File history baseline is already up to date.");
+			} else if (result.status === "pending") {
+				new Notice(this.formatPendingFileHistoryPoint(result));
+				this.scheduleRecoverySnapshotRetry(false);
+			} else {
+				new Notice(`File history unavailable: ${result.reason ?? "server storage unavailable"}`);
+			}
+		} catch (err) {
+			this.showSnapshotFailure("File history baseline reset failed", "File history", err);
+		}
+	}
+
+	destroy(): void {
+		if (this.debouncedRecoveryTimer) {
+			clearTimeout(this.debouncedRecoveryTimer);
+			this.debouncedRecoveryTimer = null;
+		}
+		if (this.recoverySnapshotRetryTimer) {
+			clearTimeout(this.recoverySnapshotRetryTimer);
+			this.recoverySnapshotRetryTimer = null;
 		}
 	}
 

@@ -212,6 +212,14 @@ export function registerCommands(
 	});
 
 	registrar.addCommand({
+		id: "reset-file-history-baseline",
+		name: "Reset file history baseline",
+		callback: async () => {
+			await host.getSnapshotService()?.resetFileHistoryBaseline();
+		},
+	});
+
+	registrar.addCommand({
 		id: "snapshot-prune",
 		name: "Cleanup old vault snapshots",
 		callback: async () => {
