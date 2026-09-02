@@ -7,9 +7,11 @@ const REQUIRED_FILES = [
 	"01-zip-sha256.txt",
 	"02-bundle-verify.json",
 	"03-bootstrap.json",
-	"04-secret-permissions.txt",
-	"05-install-postflight.json",
-	"06-install-metadata.json",
+	"04-configuration-permissions.txt",
+	"05-install-files.json",
+	"07-device-enrollment-request.json",
+	"08-install-metadata.json",
+	"08-activate-approved-device.json",
 	"07-post-reboot-verify-running.json",
 	"08-operational-smoke.json",
 	"09-systemctl-status.txt",
@@ -20,16 +22,17 @@ const INSTALL_REQUIRED_FILES = [
 	"01-zip-sha256.txt",
 	"02-bundle-verify.json",
 	"03-bootstrap.json",
-	"04-secret-permissions.txt",
-	"05-install-postflight.json",
-	"06-install-metadata.json",
+	"04-configuration-permissions.txt",
+	"05-install-files.json",
+	"07-device-enrollment-request.json",
+	"08-install-metadata.json",
 ];
 const UPDATE_REQUIRED_FILES = [
 	"01-zip-sha256.txt",
 	"02-bundle-verify.json",
-	"04-secret-permissions.txt",
-	"05-install-postflight.json",
-	"06-install-metadata.json",
+	"04-configuration-permissions.txt",
+	"05-install-files.json",
+	"08-install-metadata.json",
 ];
 const RELEASE_ASSETS = [
 	"kaos-headless-host.mjs",
@@ -77,7 +80,6 @@ async function main() {
 			? INSTALL_REQUIRED_FILES
 			: REQUIRED_FILES;
 	const requiredFiles = requireRebootRequest ? [...baseRequiredFiles, REBOOT_REQUEST_FILE] : baseRequiredFiles;
-	const secret = await readSecret(raw);
 	const checks = [];
 	const texts = {};
 
@@ -92,9 +94,11 @@ async function main() {
 	if (mode !== "update") {
 		checkBootstrap(parseJson(texts["03-bootstrap.json"], "03-bootstrap.json", checks), checks);
 	}
-	checkSecretPermissions(texts["04-secret-permissions.txt"], checks);
-	checkInstallPostflight(parseJson(texts["05-install-postflight.json"], "05-install-postflight.json", checks), checks);
-	checkInstallMetadata(parseJson(texts["06-install-metadata.json"], "06-install-metadata.json", checks), checks);
+	checkConfigurationPermissions(texts["04-configuration-permissions.txt"], checks);
+	checkInstallFiles(parseJson(texts["05-install-files.json"], "05-install-files.json", checks), checks);
+	if (mode !== "update") checkEnrollmentRequest(parseJson(texts["07-device-enrollment-request.json"], "07-device-enrollment-request.json", checks), checks);
+	checkInstallMetadata(parseJson(texts["08-install-metadata.json"], "08-install-metadata.json", checks), checks);
+	if (mode === "full") checkActivation(parseJson(texts["08-activate-approved-device.json"], "08-activate-approved-device.json", checks), checks);
 	if (mode === "full") {
 		const postRebootPayload = parseJson(texts["07-post-reboot-verify-running.json"], "07-post-reboot-verify-running.json", checks);
 		checkPostReboot(postRebootPayload, checks);
@@ -105,7 +109,7 @@ async function main() {
 		}
 	}
 
-	const secretLeakCheck = await checkSecretLeak(logDir, secret, checks);
+	const legacyCredentialCheck = await checkNoLegacyCredential(logDir, checks);
 	const failedChecks = checks.filter((check) => !check.ok);
 	const payload = {
 		kind: "headless-host-oracle-rehearsal-verify",
@@ -115,7 +119,7 @@ async function main() {
 		logDir,
 		requiredFiles,
 		checks,
-		secretLeakCheck,
+		legacyCredentialCheck,
 		failedChecks,
 	};
 	if (payload.ok) {
@@ -157,13 +161,6 @@ function parseArgs(argv) {
 	return out;
 }
 
-async function readSecret(raw) {
-	if (raw.secret !== undefined) return raw.secret;
-	if (raw["secret-file"]) {
-		return (await readFile(resolve(raw["secret-file"]), "utf8")).trim();
-	}
-	return null;
-}
 
 async function readText(path, file, checks) {
 	try {
@@ -233,50 +230,50 @@ function checkBootstrap(payload, checks) {
 	});
 }
 
-function checkSecretPermissions(text, checks) {
+function checkConfigurationPermissions(text, checks) {
 	if (text === undefined) return;
 	const hasEnv = text.includes("/etc/kaos/headless.env");
-	const hasToken = text.includes("/etc/kaos/sync-token");
-	const strictRootGroup = /root:kaos\s+0?640\s+\/etc\/kaos\/headless\.env/.test(text)
-		&& /root:kaos\s+0?640\s+\/etc\/kaos\/sync-token/.test(text);
-	addCheck(checks, "secret-permissions", hasEnv && hasToken && strictRootGroup, {
-		file: "04-secret-permissions.txt",
-		error: "expected root:kaos 0640 for env and token files",
+	const hasDataDir = text.includes("/var/lib/kaos-headless");
+	const strictModes = /root:kaos\s+0?640\s+\/etc\/kaos\/headless\.env/.test(text)
+		&& /kaos:kaos\s+0?700\s+\/var\/lib\/kaos-headless/.test(text);
+	addCheck(checks, "configuration-permissions", hasEnv && hasDataDir && strictModes, {
+		file: "04-configuration-permissions.txt",
+		error: "expected root:kaos 0640 env file and kaos:kaos 0700 state directory",
 		hasEnv,
-		hasToken,
+		hasDataDir,
 	});
 }
 
-function checkInstallPostflight(payload, checks) {
+function checkInstallFiles(payload, checks) {
 	if (!payload) return;
-	addCheck(checks, "install-postflight:shape", payload.kind === "headless-host-release-update" && payload.ok === true, {
-		file: "05-install-postflight.json",
+	addCheck(checks, "install-files:shape", payload.kind === "headless-host-release-update" && payload.ok === true, {
+		file: "05-install-files.json",
 		kind: payload.kind ?? null,
 		ok: payload.ok ?? null,
 	});
-	addCheck(checks, "install-postflight:bundle", payload.bundleVerification?.ok === true, {
-		file: "05-install-postflight.json",
+	addCheck(checks, "install-files:bundle", payload.bundleVerification?.ok === true, {
+		file: "05-install-files.json",
 		error: "bundleVerification.ok must be true",
 	});
-	addCheck(checks, "install-postflight:install", payload.install?.ok === true, {
-		file: "05-install-postflight.json",
+	addCheck(checks, "install-files:install", payload.install?.ok === true, {
+		file: "05-install-files.json",
 		error: "install.ok must be true",
 	});
-	addCheck(checks, "install-postflight:postflight", payload.postflight?.ok === true, {
-		file: "05-install-postflight.json",
-		error: "postflight.ok must be true",
+}
+
+function checkEnrollmentRequest(payload, checks) {
+	if (!payload) return;
+	addCheck(checks, "device-enrollment-request", payload.kind === "device-enrollment" && payload.status === "pending", {
+		file: "07-device-enrollment-request.json",
+		error: "first install must create a pending device request",
 	});
-	addCheck(checks, "install-postflight:readiness", payload.postflight?.readiness?.mode === "full", {
-		file: "05-install-postflight.json",
-		mode: payload.postflight?.readiness?.mode ?? null,
-	});
-	addCheck(checks, "install-postflight:smoke", payload.postflight?.smoke?.ok === true, {
-		file: "05-install-postflight.json",
-		error: "postflight.smoke.ok must be true",
-	});
-	addCheck(checks, "install-postflight:service-enable", payload.serviceEnable?.ok === true, {
-		file: "05-install-postflight.json",
-		error: "serviceEnable.ok must be true",
+}
+
+function checkActivation(payload, checks) {
+	if (!payload) return;
+	addCheck(checks, "approved-device-activation", payload.kind === "headless-host-release-update" && payload.ok === true && payload.postflight?.ok === true, {
+		file: "08-activate-approved-device.json",
+		error: "activation postflight must succeed after Owner approval",
 	});
 }
 
@@ -289,41 +286,41 @@ function checkInstallMetadata(payload, checks) {
 		: {};
 	const downloadedByAsset = new Map(downloaded.map((item) => [item?.asset, item]));
 	addCheck(checks, "install-metadata:shape", payload.kind === "headless-host-release-install", {
-		file: "06-install-metadata.json",
+		file: "08-install-metadata.json",
 		kind: payload.kind ?? null,
 	});
 	addCheck(checks, "install-metadata:release-manifest", payload.manifest?.kind === "kaos-headless-host-release-manifest" && payload.manifest?.schemaVersion === 1, {
-		file: "06-install-metadata.json",
+		file: "08-install-metadata.json",
 		kind: payload.manifest?.kind ?? null,
 		schemaVersion: payload.manifest?.schemaVersion ?? null,
 	});
 	addCheck(checks, "install-metadata:downloaded-assets", DOWNLOADED_ASSETS.every((asset) => isSha256(downloadedByAsset.get(asset)?.sha256)), {
-		file: "06-install-metadata.json",
+		file: "08-install-metadata.json",
 		downloadedCount: downloaded.length,
 		requiredAssets: DOWNLOADED_ASSETS,
 		error: "downloaded must include every required release asset with sha256",
 	});
 	addCheck(checks, "install-metadata:manifest-assets", RELEASE_ASSETS.every((asset) => isSha256(manifestAssets[asset]?.sha256)), {
-		file: "06-install-metadata.json",
+		file: "08-install-metadata.json",
 		requiredAssets: RELEASE_ASSETS,
 		error: "release manifest must include every installed asset sha256",
 	});
 	addCheck(checks, "install-metadata:bundle", payload.bundleVerification?.ok === true, {
-		file: "06-install-metadata.json",
+		file: "08-install-metadata.json",
 		error: "bundleVerification.ok must be true",
 	});
 	addCheck(checks, "install-metadata:install", payload.install?.ok === true, {
-		file: "06-install-metadata.json",
+		file: "08-install-metadata.json",
 		error: "install.ok must be true",
 	});
 	addCheck(checks, "install-metadata:binary-sha256", isSha256(payload.install?.sha256) && payload.install.sha256 === manifestAssets["kaos-headless-host.mjs"]?.sha256, {
-		file: "06-install-metadata.json",
+		file: "08-install-metadata.json",
 		installSha256: payload.install?.sha256 ?? null,
 		manifestSha256: manifestAssets["kaos-headless-host.mjs"]?.sha256 ?? null,
 		error: "installed binary sha256 must match release manifest",
 	});
 	addCheck(checks, "install-metadata:helpers", helpers.length > 0 && helpers.every((helper) => typeof helper.installedSha256 === "string"), {
-		file: "06-install-metadata.json",
+		file: "08-install-metadata.json",
 		helperCount: helpers.length,
 		error: "helpers must include installed sha256 values",
 	});
@@ -332,7 +329,7 @@ function checkInstallMetadata(payload, checks) {
 		const expected = manifestAssets[asset]?.sha256;
 		return isSha256(expected) && helper.sourceSha256 === expected && helper.installedSha256 === expected;
 	}), {
-		file: "06-install-metadata.json",
+		file: "08-install-metadata.json",
 		helperCount: helpers.length,
 		error: "helper source and installed sha256 values must match the release manifest",
 	});
@@ -364,18 +361,15 @@ function checkPostReboot(payload, checks) {
 
 function checkOperationalSmoke(payload, checks) {
 	if (!payload) return;
-	const stages = Array.isArray(payload.completedStages) ? payload.completedStages : [];
-	addCheck(checks, "operational-smoke:shape", payload.kind === "headless-host-sync-smoke" && payload.ok === true, {
+	addCheck(checks, "operational-smoke:shape", payload.kind === "headless-host-device-auth-smoke" && payload.ok === true, {
 		file: "08-operational-smoke.json",
 		kind: payload.kind ?? null,
 		ok: payload.ok ?? null,
 	});
-	for (const stage of ["oracle-to-peer:wait-peer", "peer-to-oracle:wait-primary"]) {
-		addCheck(checks, `operational-smoke:${stage}`, stages.includes(stage), {
-			file: "08-operational-smoke.json",
-			error: `completedStages must include ${stage}`,
-		});
-	}
+	addCheck(checks, "operational-smoke:device", typeof payload.deviceId === "string" && (payload.role === "owner" || payload.role === "member"), {
+		file: "08-operational-smoke.json",
+		error: "device authentication smoke must report an approved device role without a session value",
+	});
 }
 
 function checkSystemdEvidence(statusText, journalText, checks) {
@@ -431,38 +425,27 @@ function checkRebootRequest(payload, postRebootPayload, checks) {
 	});
 }
 
-async function checkSecretLeak(logDir, secret, checks) {
-	if (!secret) {
-		const result = { ok: true, skipped: true, reason: "no secret supplied" };
-		addCheck(checks, "secret-leak", true, result);
-		return result;
-	}
-	if (secret.length < 8) {
-		const result = { ok: false, skipped: false, reason: "secret is too short to check safely" };
-		addCheck(checks, "secret-leak", false, result);
-		return result;
-	}
+async function checkNoLegacyCredential(logDir, checks) {
 	const files = await listFiles(logDir);
-	const leakedFiles = [];
+	const legacyFiles = [];
 	for (const file of files) {
 		const path = join(logDir, file);
 		try {
 			const text = await readFile(path, "utf8");
-			if (text.includes(secret)) leakedFiles.push(file);
+			if (/KAOS_SYNC_TOKEN|SYNC_TOKEN|sync-token|--token(?:\s|=|-)/.test(text)) legacyFiles.push(file);
 		} catch {
 			continue;
 		}
 	}
 	const result = {
-		ok: leakedFiles.length === 0,
-		skipped: false,
+		ok: legacyFiles.length === 0,
 		checkedFiles: files.length,
-		leakedFiles,
+		legacyFiles,
 	};
-	addCheck(checks, "secret-leak", result.ok, {
+	addCheck(checks, "legacy-credential-absent", result.ok, {
 		checkedFiles: result.checkedFiles,
-		leakedFiles,
-		error: "secret material must not appear in rehearsal logs",
+		legacyFiles,
+		error: "legacy shared credential configuration must not appear in rehearsal logs",
 	});
 	return result;
 }
@@ -507,9 +490,6 @@ Options:
   --require-reboot-request
                        With --mode full, require and validate
                        11-reboot-request.json from the remote reboot phase.
-  --secret-file <path>  Optional sync token file. When supplied, every evidence
-                       file is scanned to ensure the token text was not logged.
-  --secret <value>      Optional sync token value. Prefer --secret-file.
   --help, -h            Print this help.
 `);
 }

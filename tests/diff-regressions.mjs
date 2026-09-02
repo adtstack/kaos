@@ -149,7 +149,7 @@ console.log("\n--- Test 6: stale-base disk patch does not duplicate task icons o
 	doc.destroy();
 }
 
-console.log("\n--- Test 7: recovery postcondition rebases stale-base mismatch without whole replacement ---");
+console.log("\n--- Test 7: recovery postcondition preserves concurrent typing on stale base ---");
 {
 	const doc = new Y.Doc();
 	const ytext = doc.getText("content");
@@ -157,10 +157,6 @@ console.log("\n--- Test 7: recovery postcondition rebases stale-base mismatch wi
 	const current = "prefix\nabcX\nsuffix\n";
 	const expected = "prefix\nabcY\nsuffix\n";
 	ytext.insert(0, current);
-	let delta = null;
-	ytext.observe((event) => {
-		delta = event.delta;
-	});
 
 	const result = applyDiffToYTextWithPostcondition(
 		ytext,
@@ -169,20 +165,42 @@ console.log("\n--- Test 7: recovery postcondition rebases stale-base mismatch wi
 		"disk-sync-recover-bound",
 	);
 
-	assert(ytext.toString() === expected, "postcondition helper lands exact expected content");
-	assert(result.diffSkippedDueToStaleBase, "stale caller base is detected");
-	assert(result.matchesAfterDiff, "current Y.Text is used as the rebased diff source");
-	assert(!result.forceReplaceApplied, "stale base does not force a whole-document replacement");
-	assert(result.finalMatchesExpected, "rebased diff satisfies the postcondition");
 	assert(
-		delta?.some((part) => typeof part.retain === "number" && part.retain >= "prefix\nabc".length),
-		"rebased recovery retains the stable prefix",
+		ytext.toString() === "prefix\nabcXY\nsuffix\n",
+		"same-point insertions from typing and recovery are both preserved (no loss)",
 	);
-	const deleted = (delta ?? []).reduce(
-		(sum, part) => sum + (typeof part.delete === "number" ? part.delete : 0),
-		0,
+	assert(result.diffSkippedDueToStaleBase, "stale caller base is detected");
+	assert(!result.forceReplaceApplied, "stale base does not force a whole-document replacement");
+	assert(
+		!result.finalMatchesExpected,
+		"overlapping recovery target reports a failed postcondition so callers re-plan",
 	);
-	assert(deleted < current.length, "rebased recovery does not delete the whole document");
+	doc.destroy();
+}
+
+console.log("\n--- Test 7b: stale-base recovery merges disjoint concurrent edits ---");
+{
+	const doc = new Y.Doc();
+	const ytext = doc.getText("content");
+	const staleBase = "alpha\nbeta\n";
+	const current = "alpha typed\nbeta\n";
+	const expected = "alpha\nbeta\ngamma\n";
+	ytext.insert(0, current);
+
+	const result = applyDiffToYTextWithPostcondition(
+		ytext,
+		staleBase,
+		expected,
+		"disk-sync-recover-bound",
+	);
+
+	assert(
+		ytext.toString() === "alpha typed\nbeta\ngamma\n",
+		"disjoint typing and recovery changes are both preserved",
+	);
+	assert(result.diffSkippedDueToStaleBase, "stale caller base is detected");
+	assert(!result.forceReplaceApplied, "no whole-document replacement for disjoint changes");
+	assert(!result.finalMatchesExpected, "merged result differs from the stale target by design");
 	doc.destroy();
 }
 

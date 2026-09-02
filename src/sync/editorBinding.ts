@@ -33,6 +33,7 @@ import {
 	type RemoteTypingPeer,
 } from "./remoteTypingGuard";
 import { normalizeEditorText } from "../utils/editorTextNormalization";
+import diff from "fast-diff";
 
 /**
  * Manages per-editor CM6 bindings via yCollab.
@@ -3296,14 +3297,27 @@ export class EditorBindingManager {
 		incomingContent: string,
 	): boolean {
 		if (editorContent.length > incomingContent.length) return false;
-		let editorIndex = 0;
-		for (let incomingIndex = 0; incomingIndex < incomingContent.length; incomingIndex++) {
-			if (incomingContent[incomingIndex] === editorContent[editorIndex]) {
-				editorIndex++;
-				if (editorIndex === editorContent.length) return true;
+		// The editor's characters must survive verbatim AND the incoming patch
+		// may only add text at line boundaries (or as whole inserted lines).
+		// A mere character-subsequence check accepts patches that interleave
+		// remote text between the user's characters mid-word, which lands in a
+		// live editor as "content merged together".
+		let editorPos = 0;
+		for (const [op, text] of diff(editorContent, incomingContent)) {
+			if (op === 0) {
+				editorPos += text.length;
+				continue;
 			}
+			if (op === -1) return false;
+			const atLineBoundary =
+				editorPos === 0 ||
+				editorPos === editorContent.length ||
+				editorContent[editorPos - 1] === "\n" ||
+				editorContent[editorPos] === "\n" ||
+				text.includes("\n");
+			if (!atLineBoundary) return false;
 		}
-		return editorIndex === editorContent.length;
+		return true;
 	}
 
 	private isUserTransaction(transaction: Transaction): boolean {
@@ -3503,7 +3517,100 @@ export class EditorBindingManager {
 		for (const bypass of externalReloadBypasses) {
 			this.deferExternalReloadFilterBypassRollback(update.view, bypass);
 		}
+		this.resyncDroppedBatchEdits(update, match.leafId, match.binding);
 		this.maybeHealBinding(match.leafId, match.binding, "live-update");
+	}
+
+	/**
+	 * Compensate for y-codemirror.next's batched-update guard.
+	 *
+	 * ySyncPluginValue.update() skips the ENTIRE ViewUpdate — including the
+	 * CM→Y.Text push — whenever update.transactions[0] carries its ySync
+	 * annotation. When a remote projection and local typing coalesce into one
+	 * multi-transaction update (bursty delivery on slow networks, IME/DOM
+	 * observer flushes), the transactions after the projection are never
+	 * written to Y.Text: the editor and the CRDT silently diverge, and the
+	 * next projection lands at offsets computed against the stale Y.Text —
+	 * text visually shifts together and recent typing disappears. The mirror
+	 * order ([typing, projection]) is equally broken: y-sync pushes the
+	 * composed changes — including the projection delta Y.Text already has —
+	 * duplicating the remote content.
+	 *
+	 * This runs in the same dispatch cycle (after y-sync's own update) and
+	 * re-pushes the final editor document into Y.Text whenever such a batch
+	 * left the two out of sync. The push uses the ySyncConfig instance as the
+	 * transaction origin — the exact convention of y-codemirror's own CM→Y
+	 * push — so y-sync's Y.Text observer treats it as self-originated and
+	 * never re-projects it into the editor document.
+	 */
+	private resyncDroppedBatchEdits(
+		update: ViewUpdate,
+		leafId: string,
+		binding: EditorBinding,
+	): void {
+		if (update.transactions.length < 2 || !update.docChanged) return;
+		if (this.editorAuthorityShieldLeafIds.has(leafId)) return;
+		let docChangedCount = 0;
+		let nonUserDocChanged = false;
+		for (const transaction of update.transactions) {
+			if (!transaction.docChanged) continue;
+			docChangedCount += 1;
+			if (
+				!nonUserDocChanged &&
+				!this.isUserTransaction(transaction) &&
+				this.getExternalReloadFilterBypass(transaction) === null
+			) {
+				nonUserDocChanged = true;
+			}
+		}
+		// Only batches mixing a non-user document transaction (a Yjs/provider
+		// projection) with at least one other document transaction can hit the
+		// y-sync guard: either the later edits are never pushed ([projection,
+		// typing] — typing vanishes from Y.Text) or the projection's delta is
+		// pushed back onto a Y.Text that already has it ([typing, projection] —
+		// duplicated content). The divergence check below is the final arbiter
+		// for both orders.
+		if (docChangedCount < 2 || !nonUserDocChanged) return;
+		const state = update.view.state;
+		const conf = state.facet(ySyncFacet);
+		if (!conf || conf.ytext !== binding.ytext) return;
+		if (this.bindingPropagationGate?.isPaused(binding.path)) return;
+
+		let editorContent: string;
+		let crdtContent: string;
+		try {
+			editorContent = state.doc.toString();
+			crdtContent = binding.ytext.toJSON();
+		} catch {
+			return;
+		}
+		if (editorContent === crdtContent) return;
+
+		applyDiffToYText(binding.ytext, crdtContent, editorContent, conf);
+		this.trace?.("editor", "y-sync-batched-transaction-resynced", {
+			leafId,
+			path: binding.path,
+			cmId: binding.cmId,
+			transactionCount: update.transactions.length,
+			crdtLength: crdtContent.length,
+			editorLength: editorContent.length,
+		});
+		this.recordFlightPathEvent?.({
+			priority: "important",
+			kind: PRODUCT_EVENT_KIND.editorHealApplied,
+			severity: "info",
+			scope: "file",
+			source: "editorBinding",
+			layer: "editor",
+			path: binding.path,
+			data: {
+				reason: "y-sync-batched-transaction-resync",
+				crdtLength: crdtContent.length,
+				editorLength: editorContent.length,
+				crdtMatchesEditorBefore: false,
+				diffApplied: true,
+			},
+		});
 	}
 
 	private deferExternalReloadFilterBypassRollback(

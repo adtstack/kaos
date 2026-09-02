@@ -2,7 +2,7 @@
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { access, chmod, mkdir, readFile, stat } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,13 +14,17 @@ async function main() {
 		printUsage();
 		return;
 	}
+	for (const legacy of ["token", "token-file", "token-stdin"]) {
+		if (raw[legacy] !== undefined) throw new Error(`--${legacy} is no longer supported; use --identity-file and an approved device.`);
+	}
 
 	const binary = resolve(raw.binary ?? "/opt/kaos/kaos-headless-host.mjs");
 	const vault = resolve(raw.vault ?? "/srv/kaos/vault");
 	const dataFile = resolve(raw["data-file"] ?? "/var/lib/kaos-headless/data.json");
 	const lockFile = resolve(raw["lock-file"] ?? "/run/kaos-headless/kaos.lock");
 	const envFile = resolve(raw["env-file"] ?? "/etc/kaos/headless.env");
-	const tokenFile = resolve(raw["token-file"] ?? "/etc/kaos/sync-token");
+	const initialEnv = await readEnvFile(envFile).catch(() => ({}));
+	const identityFile = resolve(raw["identity-file"] ?? initialEnv.KAOS_IDENTITY_FILE ?? "/var/lib/kaos-headless/device-identity.json");
 	const smokeScript = resolve(raw["smoke-script"] ?? defaultSmokeScriptPath());
 	const smokeWorkDir = raw["smoke-work-dir"] ? resolve(raw["smoke-work-dir"]) : undefined;
 	const serviceFile = raw["service-file"]
@@ -79,7 +83,7 @@ async function main() {
 		nodeVersion: null,
 		minNodeMajor,
 		nodeVersionCheck: null,
-		tokenConfigured: true,
+		identityFile,
 		smokeUser: smokeUser ?? null,
 		smokeGroup: smokeGroup ?? null,
 		smokeWorkDir: smokeWorkDir ?? null,
@@ -87,7 +91,7 @@ async function main() {
 		serviceIdentityChecks: null,
 		serviceAccessChecks: null,
 		managedDirectoryPreparation: null,
-		secretFileChecks: null,
+		authFileChecks: null,
 		metadataChecks: null,
 		serviceFileChecks: null,
 		doctor: null,
@@ -116,9 +120,9 @@ async function main() {
 		await assertPath(dirname(dataFile), "data directory");
 		await assertPath(dirname(lockFile), "lock directory");
 		await assertPath(envFile, "env file");
-		await assertPath(tokenFile, "token file");
+		await assertPath(identityFile, "device identity file");
 		if (!skipSmoke) await assertPath(smokeScript, "smoke script");
-		result.secretFileChecks = await checkSecretFiles({ envFile, tokenFile });
+		result.authFileChecks = await checkAuthFiles({ envFile, identityFile });
 		result.serviceAccessChecks = skipServiceAccessCheck
 			? null
 			: checkServiceAccess({
@@ -133,7 +137,7 @@ async function main() {
 				dataFile,
 				lockFile,
 				envFile,
-				tokenFile,
+				identityFile,
 				smokeScript,
 				smokeWorkDir,
 				skipSmoke,
@@ -148,15 +152,17 @@ async function main() {
 			});
 
 		const envConfig = await readEnvFile(envFile);
+		const persistedConfig = await readJsonIfExists(dataFile);
 		const childEnv = {
 			...process.env,
 			...envConfig,
 		};
-		redactor = createRedactor([
-			await readTokenForRedaction(tokenFile),
-			childEnv.KAOS_SYNC_TOKEN,
-			childEnv.SYNC_TOKEN,
-		]);
+		if (hasConfiguredValue(childEnv.KAOS_SYNC_TOKEN) || hasConfiguredValue(childEnv.SYNC_TOKEN)) {
+			throw new PostflightStepError("preflight:legacy-credential", "Legacy shared credential environment variables are not permitted.", {});
+		}
+		if (hasConfiguredValue(persistedConfig.token)) {
+			throw new PostflightStepError("preflight:legacy-credential", "A legacy shared credential remains in data.json. Remove it before deploying.", {});
+		}
 		const nodeVersion = runCommand(nodeBin, ["--version"], { env: childEnv, timeout: timeoutMs, label: "node version" });
 		result.nodeVersion = nodeVersion.stdout;
 		result.nodeVersionCheck = checkNodeVersion(nodeVersion.stdout, minNodeMajor);
@@ -173,7 +179,7 @@ async function main() {
 				dataFile,
 				lockFile,
 				envFile,
-				tokenFile,
+				identityFile,
 			});
 
 		result.doctor = runJson(nodeBin, [
@@ -188,8 +194,8 @@ async function main() {
 			dataFile,
 			"--lock-file",
 			lockFile,
-			"--token-file",
-			tokenFile,
+			"--identity-file",
+			identityFile,
 		], {
 			env: childEnv,
 			timeout: timeoutMs,
@@ -216,7 +222,7 @@ async function main() {
 				dataFile,
 				lockFile,
 				envFile,
-				tokenFile,
+				identityFile,
 				timeoutMs,
 				smokeUser,
 				smokeGroup,
@@ -320,7 +326,7 @@ function parseArgs(argv) {
 	return out;
 }
 
-function buildSmokeCommand({ nodeBin, smokeScript, binary, vault, dataFile, lockFile, envFile, tokenFile, timeoutMs, smokeUser, smokeGroup, runuser, smokeWorkDir }) {
+function buildSmokeCommand({ nodeBin, smokeScript, binary, vault, dataFile, lockFile, envFile, identityFile, timeoutMs, smokeUser, smokeGroup, runuser }) {
 	const smokeArgs = [
 		"--",
 		smokeScript,
@@ -334,15 +340,12 @@ function buildSmokeCommand({ nodeBin, smokeScript, binary, vault, dataFile, lock
 		lockFile,
 		"--env-file",
 		envFile,
-		"--token-file",
-		tokenFile,
+		"--identity-file",
+		identityFile,
 		"--require-lock",
 		"--timeout-ms",
 		String(timeoutMs),
 	];
-	if (smokeWorkDir) {
-		smokeArgs.push("--work-dir", smokeWorkDir);
-	}
 	if (!smokeUser) return [nodeBin, smokeArgs];
 	return [runuser, [...runuserIdentityArgs(smokeUser, smokeGroup), "--", nodeBin, ...smokeArgs]];
 }
@@ -365,15 +368,16 @@ async function readEnvFile(path) {
 	return out;
 }
 
-async function readTokenForRedaction(path) {
+async function readJsonIfExists(path) {
 	try {
-		return (await readFile(path, "utf8")).trim();
+		const value = JSON.parse(await readFile(path, "utf8"));
+		return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 	} catch {
-		return "";
+		return {};
 	}
 }
 
-async function checkSecretFiles({ envFile, tokenFile }) {
+async function checkAuthFiles({ envFile, identityFile }) {
 	const envStat = await stat(envFile);
 	const envMode = envStat.mode & 0o777;
 	const envConfig = await readEnvFile(envFile);
@@ -398,52 +402,46 @@ async function checkSecretFiles({ envFile, tokenFile }) {
 			ok: (envMode & 0o111) === 0,
 		},
 		{
-			name: "env-file-token-not-world-accessible",
+			name: "env-file-no-legacy-credential",
 			expected: true,
-			actual: !envContainsToken || (envMode & 0o007) === 0,
-			ok: !envContainsToken || (envMode & 0o007) === 0,
+			actual: !envContainsToken,
+			ok: !envContainsToken,
 		},
 	];
-	const tokenStat = await stat(tokenFile);
-	const tokenMode = tokenStat.mode & 0o777;
-	const tokenChecks = [
+	const identityStat = await lstat(identityFile);
+	const identityMode = identityStat.mode & 0o777;
+	const identityChecks = [
 		{
-			name: "token-file-not-world-accessible",
+			name: "identity-file-regular",
 			expected: true,
-			actual: (tokenMode & 0o007) === 0,
-			ok: (tokenMode & 0o007) === 0,
+			actual: identityStat.isFile() && !identityStat.isSymbolicLink(),
+			ok: identityStat.isFile() && !identityStat.isSymbolicLink(),
 		},
 		{
-			name: "token-file-not-group-writable",
+			name: "identity-file-mode-0600",
 			expected: true,
-			actual: (tokenMode & 0o020) === 0,
-			ok: (tokenMode & 0o020) === 0,
-		},
-		{
-			name: "token-file-not-executable",
-			expected: true,
-			actual: (tokenMode & 0o111) === 0,
-			ok: (tokenMode & 0o111) === 0,
+			actual: (identityMode & 0o077) === 0,
+			ok: (identityMode & 0o077) === 0,
 		},
 	];
 	const payload = {
-		ok: envChecks.every((check) => check.ok) && tokenChecks.every((check) => check.ok),
+		ok: envChecks.every((check) => check.ok) && identityChecks.every((check) => check.ok),
 		envFile: {
 			path: envFile,
 			mode: `0${envMode.toString(8).padStart(3, "0")}`,
-			containsToken: envContainsToken,
+			containsLegacyCredential: envContainsToken,
 		},
-		tokenFile: {
-			path: tokenFile,
-			mode: `0${tokenMode.toString(8).padStart(3, "0")}`,
+		identityFile: {
+			path: identityFile,
+			mode: `0${identityMode.toString(8).padStart(3, "0")}`,
 		},
-		checks: [...envChecks, ...tokenChecks],
+		checks: [...envChecks, ...identityChecks],
 	};
 	if (!payload.ok) {
-		const tokenFailed = tokenChecks.some((check) => !check.ok);
-		const stage = tokenFailed ? "preflight:token-file-permissions" : "preflight:env-file-permissions";
-		const path = tokenFailed ? tokenFile : envFile;
-		throw new PostflightStepError(stage, `secret file permissions are too broad: ${path}`, payload);
+		const identityFailed = identityChecks.some((check) => !check.ok);
+		const stage = identityFailed ? "preflight:identity-file-permissions" : "preflight:env-file";
+		const path = identityFailed ? identityFile : envFile;
+		throw new PostflightStepError(stage, `authentication file checks failed: ${path}`, payload);
 	}
 	return payload;
 }
@@ -503,7 +501,7 @@ function runIdentityCheck(name, command, args, expected) {
 	};
 }
 
-function checkServiceAccess({ serviceUser, serviceGroup, required, runuser, timeoutMs, nodeBin, binary, vault, dataFile, lockFile, envFile, tokenFile, smokeScript, smokeWorkDir, skipSmoke }) {
+function checkServiceAccess({ serviceUser, serviceGroup, required, runuser, timeoutMs, nodeBin, binary, vault, dataFile, lockFile, envFile, identityFile, smokeScript, smokeWorkDir, skipSmoke }) {
 	if (!required) {
 		return {
 			ok: true,
@@ -545,7 +543,7 @@ function checkServiceAccess({ serviceUser, serviceGroup, required, runuser, time
 			["service-lock-dir-writable", "-w", dirname(lockFile)],
 			["service-lock-dir-searchable", "-x", dirname(lockFile)],
 			["service-env-readable", "-r", envFile],
-			["service-token-readable", "-r", tokenFile],
+			["service-identity-readable", "-r", identityFile],
 			...(!skipSmoke ? [
 				["service-smoke-script-readable", "-r", smokeScript],
 				...smokeWorkspaceAccessChecks(smokeWorkDir),
@@ -821,7 +819,7 @@ async function sha256File(path) {
 	return createHash("sha256").update(bytes).digest("hex");
 }
 
-async function checkServiceFile({ serviceFile, nodeBin, binary, vault, dataFile, lockFile, envFile, tokenFile }) {
+async function checkServiceFile({ serviceFile, nodeBin, binary, vault, dataFile, lockFile, envFile }) {
 	if (!serviceFile) return null;
 	let logicalLines;
 	try {
@@ -912,7 +910,6 @@ async function checkServiceFile({ serviceFile, nodeBin, binary, vault, dataFile,
 			vault,
 			dataFile,
 			lockFile,
-			tokenFile,
 			requireDoctor: false,
 		}),
 		...checkCommand("exec-start-pre", execStartPre, {
@@ -921,7 +918,6 @@ async function checkServiceFile({ serviceFile, nodeBin, binary, vault, dataFile,
 			vault,
 			dataFile,
 			lockFile,
-			tokenFile,
 			requireDoctor: true,
 		}),
 	];
@@ -1012,13 +1008,20 @@ function checkCommand(label, command, expected) {
 		["--vault", expected.vault],
 		["--data-file", expected.dataFile],
 		["--lock-file", expected.lockFile],
-		["--token-file", expected.tokenFile],
 	]) {
 		checks.push({
 			name: `${label}-${flag.slice(2)}`,
 			expected: value,
 			actual: valueAfterFlag(tokens, flag),
 			ok: valueAfterFlag(tokens, flag) === value,
+		});
+	}
+	for (const flag of ["--token", "--token-file", "--token-stdin"]) {
+		checks.push({
+			name: `${label}-no-${flag.slice(2)}`,
+			expected: false,
+			actual: tokens.includes(flag),
+			ok: !tokens.includes(flag),
 		});
 	}
 	if (expected.requireDoctor) {
@@ -1216,7 +1219,7 @@ function summarizeReadiness(result, { checkOnly, verifyRunning, skipSystemctl, s
 	const checks = [
 		["service-identity", result.serviceIdentityChecks],
 		["managed-directories", result.managedDirectoryPreparation],
-		["secret-files", result.secretFileChecks],
+		["authentication-files", result.authFileChecks],
 		["service-access", result.serviceAccessChecks],
 		["metadata", result.metadataChecks],
 		["node-version", result.nodeVersionCheck],
@@ -1269,12 +1272,6 @@ function describeFailure(err) {
 		message: err instanceof Error ? err.message : String(err),
 		detail: null,
 	};
-}
-
-function createRedactor(secrets) {
-	const values = [...new Set(secrets.filter((value) => typeof value === "string" && value.length > 0))];
-	if (values.length === 0) return redactNoop;
-	return (text) => values.reduce((out, secret) => out.split(secret).join("[redacted]"), String(text));
 }
 
 function redactNoop(text) {
@@ -1330,12 +1327,10 @@ Options:
   --data-file <path>     Primary headless data.json. Defaults to /var/lib/kaos-headless/data.json.
   --lock-file <path>     Primary lock file. Defaults to /run/kaos-headless/kaos.lock.
   --env-file <path>      Environment file. Defaults to /etc/kaos/headless.env.
-  --token-file <path>    KAOS token file. Defaults to /etc/kaos/sync-token.
+  --identity-file <path> Protected 0600 device identity. Defaults from KAOS_IDENTITY_FILE.
   --metadata-path <path> Install metadata JSON. Defaults below --binary when present.
   --smoke-script <path>  Smoke script path. Defaults next to this script.
-  --smoke-work-dir <path>
-                         Peer runtime workspace passed to the smoke helper.
-                         Defaults to a temp directory selected by the smoke helper.
+  --smoke-work-dir <path> Retained for compatibility; must be outside the vault when supplied.
   --service <name>       systemd service name. Defaults to kaos-headless-host.
   --service-file <path>  systemd service file used to infer the Node binary.
                          Defaults to /etc/systemd/system/kaos-headless-host.service when present.
@@ -1348,14 +1343,14 @@ Options:
   --timeout-ms <ms>      Per-command timeout. Defaults to 120000.
   --skip-service-file-check
                          Do not verify that the systemd service file matches
-                         --binary/--vault/--data-file/--lock-file/--env-file/--token-file.
+					 --binary/--vault/--data-file/--lock-file/--env-file and contains no legacy credential flags.
   --skip-metadata-check  Do not verify install metadata sha256/path coherence.
   --skip-service-identity-check
                          Do not verify that service User=/Group= exist.
   --require-service-identity-check
                          Verify service User=/Group= even when not running as root.
   --skip-service-access-check
-                         Do not verify service User= access to binary/vault/data/lock/env/token paths.
+                         Do not verify service User= access to binary/vault/data/lock/env/identity paths.
   --require-service-access-check
                          Verify service User= access even when not running as root.
   --check-only           Run preflight, metadata/service checks, and doctor without

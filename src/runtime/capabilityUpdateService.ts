@@ -13,6 +13,7 @@ import { attachmentSizeCapKB } from "../settings/settingsStore";
 import { obsidianRequest } from "../utils/http";
 import { formatUnknown } from "../utils/format";
 import { compareSemver } from "../utils/semver";
+import { getDeviceAuthorizationHeader } from "../sync/authHeader";
 import {
 	evaluateGuidedServerUpdateState,
 	type GuidedServerUpdateStatus,
@@ -156,7 +157,7 @@ export function isServerCapabilities(value: unknown): value is ServerCapabilitie
 	if (typeof value !== "object" || value === null) return false;
 	const candidate = value as Partial<ServerCapabilities>;
 	return typeof candidate.claimed === "boolean" &&
-		(candidate.authMode === "env" || candidate.authMode === "claim" || candidate.authMode === "unclaimed") &&
+		(candidate.authMode === "device" || candidate.authMode === "unclaimed") &&
 		typeof candidate.attachments === "boolean" &&
 		typeof candidate.snapshots === "boolean" &&
 		(candidate.maxBlobUploadBytes === undefined ||
@@ -507,8 +508,7 @@ export class CapabilityUpdateService {
 	async syncUpdateMetadataToServer(reason: string): Promise<void> {
 		const settings = this.deps.getSettings();
 		const host = settings.host.trim().replace(/\/$/, "");
-		const token = settings.token.trim();
-		if (!host || !token) return;
+		if (!host || !settings.authorizationHeader) return;
 
 		const payload = this.buildUpdateMetadataPayload();
 		if (!payload) {
@@ -524,7 +524,7 @@ export class CapabilityUpdateService {
 				url: `${host}/api/update-metadata`,
 				method: "POST",
 				headers: {
-					Authorization: `Bearer ${token}`,
+					Authorization: await getDeviceAuthorizationHeader(settings),
 					"Content-Type": "application/json",
 				},
 				body: JSON.stringify(payload),
@@ -605,7 +605,7 @@ export class CapabilityUpdateService {
 		}
 
 		try {
-			this.serverCapabilities = await fetchServerCapabilities(settings.host, settings.token);
+			this.serverCapabilities = await fetchServerCapabilities(settings.host);
 			const serverVersion = (this.serverCapabilities as { serverVersion?: unknown } | null)?.serverVersion;
 			if (typeof serverVersion === "string" && serverVersion.trim()) {
 				this.legacyServerDetected = false;

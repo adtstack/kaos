@@ -6,6 +6,7 @@ import { appendTraceParams, type TraceHttpContext } from "../observability/trace
 import { obsidianRequest } from "../utils/http";
 import { createNestedActiveMeta, decodeFileMeta, isFileMetaDeletedValue } from "./fileMeta";
 import { ORIGIN_RESTORE } from "./origins";
+import { getDeviceAuthorizationHeader } from "./authHeader";
 
 export type FileHistoryManifestKind = "file-history";
 export type FileHistoryStorageVersion = "v2";
@@ -172,7 +173,7 @@ async function serverPost(
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
-			Authorization: `Bearer ${settings.token}`,
+			Authorization: await getDeviceAuthorizationHeader(settings),
 		},
 		body: body ? JSON.stringify(body) : "{}",
 		contentType: "application/json",
@@ -193,7 +194,7 @@ async function serverGet(
 		url,
 		method: "GET",
 		headers: {
-			Authorization: `Bearer ${settings.token}`,
+			Authorization: await getDeviceAuthorizationHeader(settings),
 		},
 	});
 	if (res.status < 200 || res.status >= 300) {
@@ -298,7 +299,7 @@ export async function downloadFileHistoryContent(
 		url,
 		method: "GET",
 		headers: {
-			Authorization: `Bearer ${settings.token}`,
+			Authorization: await getDeviceAuthorizationHeader(settings),
 		},
 	});
 	if (res.status !== 200) {

@@ -8,6 +8,7 @@ import {
 import type { VaultSyncSettings } from "../settings";
 import { EXTERNAL_EDIT_BEHAVIOR } from "../sync/externalEditBehavior";
 import { obsidianRequest } from "../utils/http";
+import { getDeviceAuthorizationHeader } from "../sync/authHeader";
 
 interface TraceRuntimeDeps {
 	app: App;
@@ -166,7 +167,7 @@ export class TraceRuntimeController {
 	private async fetchServerTrace(): Promise<void> {
 		if (!this.logger?.isEnabled) return;
 		const settings = this.deps.getSettings();
-		if (!settings.host || !settings.token || !settings.vaultId) return;
+		if (!settings.host || !settings.authorizationHeader || !settings.vaultId) return;
 		if (this.serverInFlight) return;
 
 		this.serverInFlight = true;
@@ -181,7 +182,7 @@ export class TraceRuntimeController {
 				url,
 				method: "GET",
 				headers: {
-					Authorization: `Bearer ${settings.token}`,
+					Authorization: await getDeviceAuthorizationHeader(settings),
 				},
 			});
 			if (res.status !== 200) {

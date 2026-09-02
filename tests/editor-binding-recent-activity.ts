@@ -5105,6 +5105,150 @@ console.log("\n--- Test 29: rapid same-leaf switch binds the replacement without
 	clearPendingHealthChecks(manager);
 }
 
+console.log("\n--- Test 30: batched projection+typing update is re-pushed to Y.Text ---");
+{
+	// y-codemirror's ySyncPlugin skips the whole ViewUpdate when
+	// transactions[0] carries its ySync annotation, so a user transaction
+	// batched behind a provider projection never reaches Y.Text. The resync
+	// guard must detect the divergence and re-push the final editor document.
+	const { manager, binding, traceRecords, setLiveEditorContent } = buildManagerFixture({
+		lastEditorChangeAgeMs: 5000,
+		lastEditorDocChangeAgeMs: null,
+	});
+	(manager as unknown as { maybeHealBinding: () => void }).maybeHealBinding = () => {};
+	const conf = new YSyncConfig(binding.ytext, { setLocalStateField: () => {} } as never);
+	let state = EditorState.create({
+		doc: "hello",
+		extensions: [ySyncFacet.of(conf)],
+	});
+	const providerTransaction = state.update({
+		changes: { from: 5, to: 5, insert: " world" },
+	});
+	state = providerTransaction.state;
+	const userTransaction = state.update({
+		changes: { from: 11, to: 11, insert: "!" },
+		userEvent: "input.type",
+	});
+	state = userTransaction.state;
+	(binding.cm as unknown as { state: EditorState }).state = state;
+	setLiveEditorContent("hello world!");
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "hello");
+
+	(manager as unknown as { handleLiveEditorUpdate: (update: unknown) => void })
+		.handleLiveEditorUpdate({
+			view: binding.cm,
+			docChanged: true,
+			transactions: [providerTransaction, userTransaction],
+		});
+
+	assertEq(
+		binding.ytext.toString(),
+		"hello world!",
+		"typing dropped by the y-sync batch guard is re-pushed into Y.Text",
+	);
+	assertEq(
+		traceRecords.some((record) => record.msg === "y-sync-batched-transaction-resynced"),
+		true,
+		"batched-transaction resync emits its trace event",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 30a: aligned batched update never re-pushes ---");
+{
+	const { manager, binding, traceRecords, setLiveEditorContent } = buildManagerFixture({
+		lastEditorChangeAgeMs: 5000,
+		lastEditorDocChangeAgeMs: null,
+	});
+	(manager as unknown as { maybeHealBinding: () => void }).maybeHealBinding = () => {};
+	const conf = new YSyncConfig(binding.ytext, { setLocalStateField: () => {} } as never);
+	let state = EditorState.create({
+		doc: "hello",
+		extensions: [ySyncFacet.of(conf)],
+	});
+	const providerTransaction = state.update({
+		changes: { from: 5, to: 5, insert: " world" },
+	});
+	state = providerTransaction.state;
+	const userTransaction = state.update({
+		changes: { from: 11, to: 11, insert: "!" },
+		userEvent: "input.type",
+	});
+	state = userTransaction.state;
+	(binding.cm as unknown as { state: EditorState }).state = state;
+	setLiveEditorContent("hello world!");
+	// Y.Text already matches the final document: y-sync was not skipped (or the
+	// resync already ran) and no further push may fire.
+	binding.ytext.delete(0, binding.ytext.length);
+	binding.ytext.insert(0, "hello world!");
+
+	(manager as unknown as { handleLiveEditorUpdate: (update: unknown) => void })
+		.handleLiveEditorUpdate({
+			view: binding.cm,
+			docChanged: true,
+			transactions: [providerTransaction, userTransaction],
+		});
+
+	assertEq(
+		binding.ytext.toString(),
+		"hello world!",
+		"aligned Y.Text is left untouched",
+	);
+	assertEq(
+		traceRecords.some((record) => record.msg === "y-sync-batched-transaction-resynced"),
+		false,
+		"no resync trace when Y.Text already matches the editor",
+	);
+	clearPendingHealthChecks(manager);
+}
+
+console.log("\n--- Test 31: shield preservation rejects mid-word interleaving ---");
+{
+	const { manager } = buildManagerFixture({
+		lastEditorChangeAgeMs: 60000,
+		lastEditorDocChangeAgeMs: null,
+	});
+	const preserves = (editorContent: string, incomingContent: string): boolean =>
+		(manager as unknown as {
+			incomingContentPreservesEditorContent: (
+				editorContent: string,
+				incomingContent: string,
+			) => boolean;
+		}).incomingContentPreservesEditorContent(editorContent, incomingContent);
+
+	assertEq(
+		preserves("hello world", "helREMOTElo world"),
+		false,
+		"mid-word interleaved insert no longer counts as preserving editor content",
+	);
+	assertEq(
+		preserves("hello world", "hello world\ntyped line"),
+		true,
+		"append after the final line preserves editor content",
+	);
+	assertEq(
+		preserves("a\nb", "a\ninserted\nb"),
+		true,
+		"whole-line insertion between lines preserves editor content",
+	);
+	assertEq(
+		preserves("hello", "hello world"),
+		true,
+		"plain suffix append preserves editor content",
+	);
+	assertEq(
+		preserves("hello world", "hello"),
+		false,
+		"deleting editor characters does not preserve editor content",
+	);
+	assertEq(
+		preserves("", "anything"),
+		true,
+		"empty editor content is trivially preserved",
+	);
+}
+
 console.log("\n──────────────────────────────────────────────────");
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log("──────────────────────────────────────────────────");

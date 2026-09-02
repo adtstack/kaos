@@ -14,6 +14,7 @@ import {
 
 const root = await mkdtemp(join(tmpdir(), "kaos-headless-host-cli-"));
 const vaultRoot = join(root, "vault");
+const identityFile = join(root, "identities", "device.identity.json");
 const dataFile = join(root, "data", "data.json");
 const doctorDataFile = join(root, "data", "doctor-data.json");
 const strictDoctorDataFile = join(root, "data", "strict-doctor-data.json");
@@ -26,6 +27,8 @@ const unloadFailureLockFile = join(root, "locks", "unload-failure.lock");
 
 try {
 	await mkdir(vaultRoot, { recursive: true });
+	await mkdir(resolve(identityFile, ".."), { recursive: true, mode: 0o700 });
+	await writeFile(identityFile, "{}\n", { mode: 0o600 });
 	buildProductPluginBundle();
 	buildHeadlessHost();
 	await installVaultPlugin(vaultRoot);
@@ -42,12 +45,12 @@ try {
 		lockFile,
 		"--host",
 		"http://127.0.0.1:9",
-		"--token",
-		"token-from-cli",
 		"--vault-id",
 		"vault-from-cli",
 		"--device-name",
 		"device-from-cli",
+		"--identity-file",
+		identityFile,
 		"--disable-attachments",
 	], {
 		encoding: "utf8",
@@ -56,12 +59,13 @@ try {
 	assert.equal(boot.status, 0, boot.stderr || boot.stdout);
 	const data = JSON.parse(await readFile(dataFile, "utf8"));
 	assert.equal(data.host, "http://127.0.0.1:9");
-	assert.equal(data.token, "token-from-cli");
 	assert.equal(data.vaultId, "vault-from-cli");
 	assert.equal(data.deviceName, "device-from-cli");
+	assert.equal(data.identityFile, identityFile);
+	assert.equal(Object.prototype.hasOwnProperty.call(data, "token"), false);
 	assert.equal(data.enableAttachmentSync, false);
 	assert.equal(existsSync(lockFile), false, "boot-only should release the lock file");
-	console.log("  PASS  CLI flags persisted expected settings");
+	console.log("  PASS  CLI flags persist device identity metadata without a token");
 
 	console.log("\n--- headless host cli: status and dump-config redact secrets ---");
 	const status = spawnSync(process.execPath, [
@@ -80,7 +84,7 @@ try {
 	assert.equal(status.status, 0, status.stderr || status.stdout);
 	const statusPayload = JSON.parse(status.stdout.trim());
 	assert.equal(statusPayload.kind, "status");
-	assert.equal(statusPayload.configured.tokenConfigured, true);
+	assert.equal(statusPayload.configured.identityFileConfigured, true);
 	assert.equal(Object.prototype.hasOwnProperty.call(statusPayload.configured, "token"), false);
 
 	const dumpConfig = spawnSync(process.execPath, [
@@ -90,8 +94,6 @@ try {
 		vaultRoot,
 		"--data-file",
 		dataFile,
-		"--token",
-		"override-token",
 	], {
 		encoding: "utf8",
 		timeout: 10_000,
@@ -99,13 +101,12 @@ try {
 	assert.equal(dumpConfig.status, 0, dumpConfig.stderr || dumpConfig.stdout);
 	const configPayload = JSON.parse(dumpConfig.stdout.trim());
 	assert.equal(configPayload.kind, "config");
-	assert.equal(configPayload.configured.tokenConfigured, true);
+	assert.equal(configPayload.configured.identityFileConfigured, true);
 	assert.equal(Object.prototype.hasOwnProperty.call(configPayload.configured, "token"), false);
-	console.log("  PASS  status/config commands redact token material");
+	console.log("  PASS  status/config commands expose no bearer-token material");
 
 	console.log("\n--- headless host cli: doctor reports local readiness without leaking secrets ---");
 	await writeFile(doctorDataFile, JSON.stringify({
-		token: "doctor-token",
 		vaultId: "doctor-vault",
 		deviceName: "doctor-device",
 	}, null, 2), "utf8");
@@ -126,10 +127,10 @@ try {
 	const doctorPayload = JSON.parse(doctor.stdout.trim());
 	assert.equal(doctorPayload.kind, "doctor");
 	assert.equal(doctorPayload.ok, true);
-	assert.equal(doctorPayload.configured.tokenConfigured, true);
+	assert.equal(doctorPayload.configured.identityFileConfigured, false);
 	assert.equal(Object.prototype.hasOwnProperty.call(doctorPayload.configured, "token"), false);
 	assert.ok(doctorPayload.checks.some((check) => check.name === "worker-capabilities" && check.ok === true));
-	console.log("  PASS  doctor covers local paths and redacts token material");
+	console.log("  PASS  doctor covers local paths without token material");
 
 	console.log("\n--- headless host cli: strict doctor requires sync config without network probe ---");
 	const strictMissing = spawnSync(process.execPath, [
@@ -154,9 +155,10 @@ try {
 
 	await writeFile(strictDoctorDataFile, JSON.stringify({
 		host: "https://worker.example.invalid",
-		token: "strict-doctor-token",
 		vaultId: "strict-doctor-vault",
 		deviceName: "strict-doctor-device",
+		deviceId: "device_12345678",
+		identityFile,
 	}, null, 2), "utf8");
 	const strictConfigured = spawnSync(process.execPath, [
 		"dist/kaos-headless-host.mjs",
@@ -176,11 +178,12 @@ try {
 	assert.equal(strictConfigured.status, 0, strictConfigured.stderr || strictConfigured.stdout);
 	const strictConfiguredPayload = JSON.parse(strictConfigured.stdout.trim());
 	assert.equal(strictConfiguredPayload.ok, true);
-	assert.equal(strictConfiguredPayload.configured.tokenConfigured, true);
+	assert.equal(strictConfiguredPayload.configured.identityFileConfigured, true);
 	assert.equal(Object.prototype.hasOwnProperty.call(strictConfiguredPayload.configured, "token"), false);
 	for (const name of ["vault-root-writable", "data-dir-writable", "lock-dir-writable"]) {
 		assert.ok(strictConfiguredPayload.checks.some((check) => check.name === name && check.ok), `${name} should pass`);
 	}
+	assert.ok(strictConfiguredPayload.checks.some((check) => check.name === "device-identity-protected" && check.ok), "protected device identity should pass");
 	assert.ok(strictConfiguredPayload.checks.some((check) => check.name === "worker-capabilities" && check.detail.includes("--skip-worker-capabilities")));
 	console.log("  PASS  strict doctor catches missing config and can skip network capabilities");
 

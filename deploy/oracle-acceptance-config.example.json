@@ -4,7 +4,7 @@
   "workerHost": "https://YOUR_WORKER_HOST",
   "vaultId": "YOUR_VAULT_ID",
   "deviceName": "oracle-headless",
-  "tokenFile": "/secure/local/path/to/sync-token",
+  "inviteFile": "/secure/local/path/to/device-enroll.invite",
   "evidenceRoot": "./oracle-acceptance-logs",
   "releaseDir": ".",
   "waitSshTimeoutMs": 300000,

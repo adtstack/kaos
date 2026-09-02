@@ -1,6 +1,6 @@
 /**
  * Eviction persistence proof — Issue #24 RCA.
- * 
+ *
  * Creates a file via Device A, waits for DO eviction (~160s),
  * then checks if Device B receives the file from durable storage.
  */

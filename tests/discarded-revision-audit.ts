@@ -24,13 +24,13 @@ function assert(condition: boolean, msg: string) {
 }
 
 function makeDeps(overrides: {
-	settings?: { host: string; token: string; vaultId: string };
+	settings?: { host: string; authorizationHeader?: () => Promise<string>; vaultId: string };
 	postJson?: (url: string, body: unknown) => Promise<{ ok: boolean }>;
 } = {}) {
 	const posts: Array<{ url: string; body: unknown }> = [];
 	return {
 		deps: {
-			getSettings: () => overrides.settings ?? { host: "https://kaos.example", token: "t", vaultId: "vault-a" },
+			getSettings: () => overrides.settings ?? { host: "https://kaos.example", authorizationHeader: async () => "Bearer ephemeral-session", vaultId: "vault-a" },
 			postJson: overrides.postJson ?? (async (url, body) => {
 				posts.push({ url, body });
 				return { ok: true };
@@ -79,12 +79,12 @@ console.log("\n--- Test 2: batch cap flushes immediately without waiting ---");
 
 console.log("\n--- Test 3: missing settings skips the POST silently ---");
 {
-	const { deps, posts } = makeDeps({ settings: { host: "", token: "", vaultId: "" } });
+	const { deps, posts } = makeDeps({ settings: { host: "", vaultId: "" } });
 	const audit = new DiscardedRevisionAudit(deps, { flushDelayMs: 5 });
 	audit.record("NOTES/note.md", "hash-1", "superseded-external-revision");
 	await wait(15);
 	await audit.flushNow();
-	assert(posts.length === 0, "no POST is attempted without host/token/vaultId");
+	assert(posts.length === 0, "no POST is attempted without host/device session/vaultId");
 }
 
 console.log("\n--- Test 4: transport failure is silent and does not block later records ---");

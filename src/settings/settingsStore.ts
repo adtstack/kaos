@@ -32,12 +32,22 @@ export function attachmentSizeCapKB(serverMaxBlobUploadBytes?: number | null): n
 export interface VaultSyncSettings {
 	/** Cloudflare Worker host, e.g. "https://sync.yourdomain.com" */
 	host: string;
-	/** Shared secret token for auth. */
-	token: string;
 	/** Unique vault identifier. Generated randomly if empty on first load. */
 	vaultId: string;
 	/** Human-readable device name shown in awareness/cursors. */
 	deviceName: string;
+	/** Local public device identifier. Its private key is stored outside data.json. */
+	deviceId: string;
+	/**
+	 * Headless-only path to a 0600 device identity file. Desktop and mobile use
+	 * IndexedDB instead and leave this blank.
+	 */
+	identityFile?: string;
+	/**
+	 * Runtime-only session provider. It is intentionally excluded from durable
+	 * plugin data; callers must never replace it with a long-lived secret.
+	 */
+	authorizationHeader?: () => Promise<string>;
 	/** Enable verbose console.log output for debugging. */
 	debug: boolean;
 	/** Pause propagation of suspicious YAML frontmatter transitions. */
@@ -74,9 +84,10 @@ export interface VaultSyncSettings {
 
 export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	host: "",
-	token: "",
 	vaultId: "",
 	deviceName: "",
+	deviceId: "",
+	identityFile: "",
 	debug: false,
 	frontmatterGuardEnabled: true,
 	excludePatterns: "",
@@ -105,6 +116,8 @@ export interface SettingsLoadResult<TState extends Partial<VaultSyncSettings>> {
 	settings: VaultSyncSettings;
 	persistedState: TState;
 	migrated: boolean;
+	/** A legacy shared token, held only in memory for one enrollment attempt. */
+	legacyMigrationToken: string | null;
 }
 
 /**
@@ -205,15 +218,23 @@ function readPersistedState<TState extends Partial<VaultSyncSettings>>(value: un
 
 export function readVaultSyncSettings(
 	data: (Partial<VaultSyncSettings> & ExternalEditPolicyCompatibilityFields) | null | undefined,
-): { settings: VaultSyncSettings; migrated: boolean } {
+): { settings: VaultSyncSettings; migrated: boolean; legacyMigrationToken: string | null } {
 	const rawRecord = isRecord(data) ? data : {};
 	const liveRecord = stripExternalEditPolicyCompatibilityFields(rawRecord);
+	const legacyMigrationToken = typeof rawRecord.token === "string" && rawRecord.token.trim()
+		? rawRecord.token.trim()
+		: null;
+	// data.json must never retain a reusable bearer credential.  Keep it only in
+	// the load result above so the caller can make one legacy enrollment request.
+	Reflect.deleteProperty(liveRecord, "token");
+	Reflect.deleteProperty(liveRecord, "authorizationHeader");
 	const settings = Object.assign(
 		{},
 		DEFAULT_SETTINGS,
 		liveRecord,
 	) as VaultSyncSettings;
-	let migrated = !hasCanonicalExternalEditPolicyCompatibilityFields(rawRecord);
+	let migrated = !hasCanonicalExternalEditPolicyCompatibilityFields(rawRecord)
+		|| legacyMigrationToken !== null;
 	const repairString = (key: keyof VaultSyncSettings): void => {
 		if (typeof settings[key] === "string") return;
 		(settings as unknown as Record<keyof VaultSyncSettings, unknown>)[key] =
@@ -228,9 +249,10 @@ export function readVaultSyncSettings(
 	};
 	for (const key of [
 		"host",
-		"token",
 		"vaultId",
 		"deviceName",
+		"deviceId",
+		"identityFile",
 		"excludePatterns",
 		"qaTraceSecret",
 		"updateRepoUrl",
@@ -308,7 +330,7 @@ export function readVaultSyncSettings(
 		);
 		migrated = true;
 	}
-	return { settings, migrated };
+	return { settings, migrated, legacyMigrationToken };
 }
 
 export class SettingsStore<TState extends Partial<VaultSyncSettings>> {
@@ -316,24 +338,31 @@ export class SettingsStore<TState extends Partial<VaultSyncSettings>> {
 
 	async load(): Promise<SettingsLoadResult<TState>> {
 		const persistedState = readPersistedState<TState>(await this.persistence.loadData());
-		const { settings, migrated } = readVaultSyncSettings(persistedState);
+		const { settings, migrated, legacyMigrationToken } = readVaultSyncSettings(persistedState);
+		Reflect.deleteProperty(persistedState as object, "token");
+		Reflect.deleteProperty(persistedState as object, "authorizationHeader");
 		return {
 			settings,
 			persistedState,
 			migrated,
+			legacyMigrationToken,
 		};
 	}
 
 	async save(state: TState): Promise<void> {
-		await this.persistence.saveData(
-			canonicalizeExternalEditPolicyCompatibilityFields({ ...state }),
-		);
+		const next = canonicalizeExternalEditPolicyCompatibilityFields({ ...state });
+		Reflect.deleteProperty(next, "authorizationHeader");
+		Reflect.deleteProperty(next, "token");
+		await this.persistence.saveData(next);
 	}
 
 	withSettings(state: TState, settings: VaultSyncSettings): TState {
-		return canonicalizeExternalEditPolicyCompatibilityFields({
+		const next = canonicalizeExternalEditPolicyCompatibilityFields({
 			...state,
 			...settings,
 		}) as TState;
+		Reflect.deleteProperty(next as object, "authorizationHeader");
+		Reflect.deleteProperty(next as object, "token");
+		return next;
 	}
 }

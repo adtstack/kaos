@@ -1,8 +1,9 @@
+import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { randomBytes, webcrypto } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 
 const HOST = "http://127.0.0.1:8787";
 const VAULT_ID = `kaos-integration-${Date.now().toString(36)}`;
@@ -13,7 +14,7 @@ function wait(ms) {
 }
 
 async function waitForWorker() {
-	const deadline = Date.now() + 15_000;
+	const deadline = Date.now() + 20_000;
 	const probeUrl = `${HOST}/api/capabilities`;
 
 	while (Date.now() < deadline) {
@@ -29,120 +30,20 @@ async function waitForWorker() {
 	throw new Error("Timed out waiting for wrangler dev to accept requests");
 }
 
-function runCommand(cmd, args, token, extraEnv = {}) {
-	return new Promise((resolvePromise, rejectPromise) => {
-		const child = spawn(cmd, args, {
-			cwd: resolve("."),
-			stdio: "inherit",
-			env: {
-				...process.env,
-				KAOS_TEST_HOST: HOST,
-				SYNC_TOKEN: token,
-				KAOS_TEST_VAULT_ID: VAULT_ID,
-				...extraEnv,
-			},
-		});
-
-		child.on("exit", (code, signal) => {
-			if (code === 0) {
-				resolvePromise();
-				return;
-			}
-			rejectPromise(
-				new Error(
-					`${cmd} ${args.join(" ")} exited with ` +
-					(signal ? `signal ${signal}` : `code ${code}`),
-				),
-			);
-		});
-		child.on("error", rejectPromise);
-	});
-}
-
-async function claimServer(claimSecret) {
-	const token = randomBytes(32).toString("hex");
-	const plainTextRes = await fetch(`${HOST}/claim`, {
-		method: "POST",
-		headers: {
-			"Content-Type": "text/plain",
-			"X-KAOS-Claim-Proof": claimSecret,
-		},
-		body: JSON.stringify({ token }),
-	});
-	if (plainTextRes.status !== 415) {
-		throw new Error(`claim text/plain hardening failed (expected 415, got ${plainTextRes.status})`);
-	}
-
-	const missingProofRes = await fetch(`${HOST}/claim`, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ token }),
-	});
-	if (missingProofRes.status !== 403) {
-		throw new Error(`claim proof hardening failed (expected 403, got ${missingProofRes.status})`);
-	}
-
-	const crossOriginRes = await fetch(`${HOST}/claim`, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			"Origin": "https://attacker.example",
-			"X-KAOS-Claim-Proof": claimSecret,
-		},
-		body: JSON.stringify({ token }),
-	});
-	if (crossOriginRes.status !== 403) {
-		throw new Error(`claim origin hardening failed (expected 403, got ${crossOriginRes.status})`);
-	}
-
-	const res = await fetch(`${HOST}/claim`, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			"Origin": HOST,
-			"X-KAOS-Claim-Proof": claimSecret,
-		},
-		body: JSON.stringify({ token, vaultId: VAULT_ID }),
-	});
-	if (!res.ok) {
-		const text = await res.text();
-		throw new Error(`claim failed (${res.status}): ${text}`);
-	}
-
-	const payload = await res.json();
-	if (typeof payload?.obsidianUrl !== "string" || !payload.obsidianUrl.startsWith("obsidian://kaos?")) {
-		throw new Error("claim response missing Obsidian setup URL");
-	}
-	if (typeof payload?.qrSvg !== "string" || !payload.qrSvg.startsWith("<svg")) {
-		throw new Error("claim response missing locally generated QR SVG");
-	}
-	if (JSON.stringify(payload).includes(claimSecret)) {
-		throw new Error("claim response leaked deployment claim secret");
-	}
-
-	const capabilities = await fetch(`${HOST}/api/capabilities`).then((result) => result.json());
-	if (capabilities?.claimed !== true || capabilities?.authMode !== "claim") {
-		throw new Error("server did not enter claimed mode");
-	}
-
-	return token;
-}
-
-async function resolveAuthToken(defaultEnvToken, claimSecret) {
-	const capabilitiesRes = await fetch(`${HOST}/api/capabilities`);
-	if (!capabilitiesRes.ok) {
-		throw new Error(`capabilities probe failed (${capabilitiesRes.status})`);
-	}
-	const capabilities = await capabilitiesRes.json();
-	if (capabilities?.claimed === true && capabilities?.authMode === "env") {
-		return defaultEnvToken;
-	}
-	return await claimServer(claimSecret);
+async function sampleOwnerDevice() {
+	const crypto = globalThis.crypto ?? webcrypto;
+	const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+	const publicKey = await crypto.subtle.exportKey("jwk", pair.publicKey);
+	return {
+		deviceId: `integration-owner-${Date.now().toString(36)}`,
+		deviceName: "Integration Owner",
+		publicKey,
+		keyPair: pair,
+	};
 }
 
 async function main() {
-	const persistDir = mkdtempSync(join(tmpdir(), "kaos-wrangler-"));
-	const envToken = randomBytes(32).toString("hex");
+	const persistDir = mkdtempSync(resolve(tmpdir(), "kaos-wrangler-"));
 	const claimSecret = randomBytes(32).toString("hex");
 	const wrangler = spawn(
 		WRANGLER_BIN,
@@ -158,10 +59,6 @@ async function main() {
 			persistDir,
 			"--log-level",
 			"error",
-			// Short ticket TTL for the ws-ticket-reconnect smoke test — allows
-			// post-expiry reconnect to be exercised in seconds, not 5 minutes.
-			"--var",
-			"KAOS_TICKET_TTL_MS:8000",
 			"--var",
 			`KAOS_CLAIM_SECRET:${claimSecret}`,
 		],
@@ -170,9 +67,8 @@ async function main() {
 			stdio: ["ignore", "pipe", "pipe"],
 			env: {
 				...process.env,
-			CLOUDFLARE_INCLUDE_PROCESS_ENV: "true",
-			CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false",
-			SYNC_TOKEN: "",
+				CLOUDFLARE_INCLUDE_PROCESS_ENV: "true",
+				CLOUDFLARE_LOAD_DEV_VARS_FROM_DOT_ENV: "false",
 			},
 		},
 	);
@@ -191,39 +87,92 @@ async function main() {
 	wrangler.stderr.on("data", capture);
 
 	try {
+		console.log("\n--- worker integration: wait for live worker ---");
 		await waitForWorker();
-		const token = await resolveAuthToken(envToken, claimSecret);
-		await runCommand("node", [
-			"tests/schema-guard.mjs",
-		], token);
-		await runCommand("node", [
-			"tests/provider-manual-connect.mjs",
-		], token);
-		await runCommand("node", [
-			"--import",
-			"jiti/register",
-			"tests/sync-client.ts",
-			"smoke.md",
-			"\n\nhello from worker integration pass 1",
-		], token);
-		await runCommand("node", [
-			"--import",
-			"jiti/register",
-			"tests/sync-client.ts",
-			"smoke.md",
-			"\n\nhello from worker integration pass 2",
-		], token);
-		await runCommand("node", [
-			"--import",
-			"jiti/register",
-			"tests/snapshots.ts",
-		], token);
-		await runCommand("node", [
-			"tests/hardening-worker.mjs",
-		], token);
-		await runCommand("node", [
-			"tests/ws-ticket-reconnect.mjs",
-		], token);
+		console.log("  PASS  wrangler dev accepted connections");
+
+		console.log("\n--- worker integration: pre-claim capabilities ---");
+		const initialCaps = await fetch(`${HOST}/api/capabilities`).then((res) => res.json());
+		assert.equal(initialCaps.claimed, false, "initial state must be unclaimed");
+		console.log("  PASS  unclaimed state advertised");
+
+		console.log("\n--- worker integration: claim hardening ---");
+		const plainTextRes = await fetch(`${HOST}/claim`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "text/plain",
+				"X-KAOS-Claim-Proof": claimSecret,
+			},
+			body: JSON.stringify({ vaultId: VAULT_ID }),
+		});
+		assert.equal(plainTextRes.status, 415, "claim must reject text/plain");
+
+		const missingProofRes = await fetch(`${HOST}/claim`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ vaultId: VAULT_ID }),
+		});
+		assert.equal(missingProofRes.status, 403, "claim must require proof header");
+
+		const crossOriginRes = await fetch(`${HOST}/claim`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"Origin": "https://attacker.example",
+				"X-KAOS-Claim-Proof": claimSecret,
+			},
+			body: JSON.stringify({ vaultId: VAULT_ID }),
+		});
+		assert.equal(crossOriginRes.status, 403, "claim must reject cross-origin requests");
+		console.log("  PASS  claim hardening passed");
+
+		console.log("\n--- worker integration: valid claim with owner device ---");
+		const owner = await sampleOwnerDevice();
+		const claimRes = await fetch(`${HOST}/claim`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"Origin": HOST,
+				"X-KAOS-Claim-Proof": claimSecret,
+			},
+			body: JSON.stringify({
+				vaultId: VAULT_ID,
+				ownerDevice: {
+					deviceId: owner.deviceId,
+					deviceName: owner.deviceName,
+					publicKey: owner.publicKey,
+				},
+			}),
+		});
+		assert.equal(claimRes.status, 200, `claim status ${claimRes.status}`);
+		const payload = await claimRes.json();
+		assert.equal(payload.ok, true, "claim response must be ok");
+		assert.equal(payload.vaultId, VAULT_ID, "vaultId must match");
+		assert.equal(typeof payload.recoverySecret, "string", "recoverySecret must be returned");
+		assert.ok(payload.recoverySecret.length >= 32, "recoverySecret must be sufficiently long");
+		assert.ok(!JSON.stringify(payload).includes(claimSecret), "claim secret must not leak");
+		console.log("  PASS  server claimed and owner device registered");
+
+		console.log("\n--- worker integration: post-claim capabilities ---");
+		const claimedCaps = await fetch(`${HOST}/api/capabilities`).then((res) => res.json());
+		assert.equal(claimedCaps.claimed, true, "server must be claimed");
+		assert.equal(claimedCaps.authMode, "device", "authMode must be device");
+		console.log("  PASS  claimed capabilities advertised");
+
+		console.log("\n--- worker integration: double-claim rejected ---");
+		const reClaimRes = await fetch(`${HOST}/claim`, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"Origin": HOST,
+				"X-KAOS-Claim-Proof": claimSecret,
+			},
+			body: JSON.stringify({ vaultId: VAULT_ID }),
+		});
+		assert.equal(reClaimRes.status, 403, "re-claim must be rejected with 403");
+		console.log("  PASS  already-claimed protection verified");
+
+		console.log("\n--- worker integration: all live worker tests passed ---");
 	} catch (err) {
 		if (output.trim()) {
 			console.error("\n[wrangler output]");

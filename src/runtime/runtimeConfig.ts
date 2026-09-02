@@ -3,8 +3,8 @@ import { parseExcludePatterns } from "../sync/exclude";
 
 export interface RuntimeConfig {
 	host: string;
-	token: string;
 	vaultId: string;
+	authorizationHeader?: () => Promise<string>;
 	deviceName: string;
 	debug: boolean;
 	frontmatterGuardEnabled: boolean;
@@ -28,8 +28,8 @@ export function buildRuntimeConfig(
 ): RuntimeConfig {
 	return {
 		host: settings.host.trim(),
-		token: settings.token.trim(),
 		vaultId: settings.vaultId.trim(),
+		authorizationHeader: settings.authorizationHeader,
 		deviceName: settings.deviceName.trim(),
 		debug: settings.debug,
 		frontmatterGuardEnabled: settings.frontmatterGuardEnabled,

@@ -164,16 +164,16 @@ does not depend on the temporary unpacked bundle surviving reboot.
 
 Minimum Oracle VM bootstrap:
 
-  printf "%s" "YOUR_SYNC_TOKEN" | sudo node bootstrap-headless-host-oracle.mjs \\
+  sudo node bootstrap-headless-host-oracle.mjs \\
     --host https://YOUR_WORKER_HOST \\
     --vault-id YOUR_VAULT_ID \\
-    --device-name server-headless \\
-    --token-stdin
+    --device-name server-headless
 
 This creates the kaos service group/user, /opt/kaos, /srv/kaos/vault,
-/var/lib/kaos-headless, /etc/kaos/headless.env, and /etc/kaos/sync-token.
-The env/token files are owned as root:kaos and chmod 0640. Existing env/token
-files are preserved unless --force-env or --force-token is passed.
+/var/lib/kaos-headless, and /etc/kaos/headless.env. The environment file is
+root:kaos 0640; the service state directory is kaos:kaos 0700. No shared
+credential is written. The service identity is created only by the service
+account during the enrollment command below.
 The headless host binary is only the runner. It loads the KAOS Obsidian plugin
 from the configured vault, by default /srv/kaos/vault/.obsidian/plugins/kaos.
 Install or sync the plugin into that vault before starting the service; the
@@ -208,8 +208,9 @@ The update wrapper also runs the same bundle verification automatically whenever
 --bundle-dir is used. Keep the explicit command above as a visible pre-install
 gate when operating by hand.
 
-For a logged first-install rehearsal, run the install phase from this unpacked
-directory, reboot, then run the post-reboot phase:
+For a logged first-install rehearsal, create a one-time Owner invitation in the
+KAOS settings UI, run the install phase, compare its displayed fingerprint,
+approve it as Owner, then activate and reboot:
 
   node run-headless-host-oracle-rehearsal.mjs \\
     --phase install \\
@@ -217,7 +218,13 @@ directory, reboot, then run the post-reboot phase:
     --host https://YOUR_WORKER_HOST \\
     --vault-id YOUR_VAULT_ID \\
     --device-name server-headless \\
-    --token-file /secure/local/path/to/sync-token \\
+    --invite-file /secure/local/path/to/device-enroll.invite \\
+    --log-dir "$HOME/kaos-headless-rehearsal"
+
+  # Compare and approve the pending device in the Owner UI, then:
+  sudo node run-headless-host-oracle-rehearsal.mjs \\
+    --phase activate \\
+    --confirm-owner-approved \\
     --log-dir "$HOME/kaos-headless-rehearsal"
 
   sudo reboot
@@ -266,7 +273,7 @@ To check an already installed configuration without restart or smoke:
     --data-file /var/lib/kaos-headless/data.json \\
     --lock-file /run/kaos-headless/kaos.lock \\
     --env-file /etc/kaos/headless.env \\
-    --token-file /etc/kaos/sync-token \\
+    --identity-file /var/lib/kaos-headless/device-identity.json \\
     --check-only
 
 After reboot, verify that the service is still enabled and came up without
@@ -286,7 +293,7 @@ The acceptance wrapper does this full sequence and requires an explicit
     --ssh-target opc@YOUR_ORACLE_VM \\
     --worker-host https://YOUR_WORKER_HOST \\
     --vault-id YOUR_VAULT_ID \\
-    --token-file /secure/local/path/to/sync-token \\
+    --invite-file /secure/local/path/to/device-enroll.invite \\
     --remote-dir kaos-headless-acceptance-YYYYMMDDTHHMMSSZ \\
     --evidence-root ./oracle-acceptance-logs \\
     --release-dir . \\
@@ -296,8 +303,8 @@ Equivalent explicit release-asset arguments are:
 --skip-local-prepare --zip ./kaos-headless-host-oracle.zip --checksum ./kaos-headless-host-oracle.zip.sha256
 
 To avoid rebuilding long commands by hand, store non-secret defaults in
-acceptance-config.json. Keep the token itself out of this file; point tokenFile
-at a separate local file. Choose --dry-run or --confirm-reboot on the command
+acceptance-config.json. Keep the one-time invitation out of this file; point
+inviteFile at a separate protected file. Choose --dry-run or --confirm-reboot on the command
 line for each run, not in the config. This bundle includes
 oracle-acceptance-config.example.json as a starting point:
 
@@ -309,7 +316,7 @@ oracle-acceptance-config.example.json as a starting point:
     "workerHost": "https://YOUR_WORKER_HOST",
     "vaultId": "YOUR_VAULT_ID",
     "deviceName": "server-headless",
-    "tokenFile": "/secure/local/path/to/sync-token",
+    "inviteFile": "/secure/local/path/to/device-enroll.invite",
     "evidenceRoot": "./oracle-acceptance-logs",
     "releaseDir": "."
   }
@@ -318,8 +325,8 @@ oracle-acceptance-config.example.json as a starting point:
     --config ./acceptance-config.json \\
     --validate-local
 
---validate-local checks config placeholders such as YOUR_* and YYYYMMDD*, token
-file readability, release zip/checksum integrity, required local helpers, and
+--validate-local checks config placeholders such as YOUR_* and YYYYMMDD*,
+protected invitation-file permissions, release zip/checksum integrity, required local helpers, and
 local bundle verification by temporarily extracting the release zip and running
 verify-headless-host-bundle.mjs without running ssh/scp or writing evidence.
 
@@ -343,7 +350,7 @@ earlier successful phase results into the final summary:
 
   node run-headless-host-oracle-acceptance.mjs \\
     --resume-from-summary ./oracle-acceptance-logs/acceptance-summary.json \\
-    --secret-file /secure/local/path/to/sync-token \\
+    --confirm-owner-approved \\
     --release-dir . \\
     --confirm-reboot
 
@@ -351,7 +358,6 @@ To re-check a copied evidence root later:
 
   node verify-headless-host-oracle-acceptance.mjs \\
     --summary-file ./oracle-acceptance-logs/acceptance-summary.json \\
-    --secret-file /secure/local/path/to/sync-token \\
     --require-full
 
 Before scheduling reboot, rerun the same command with --dry-run. Dry-run prints
@@ -362,8 +368,7 @@ The same wrapper can request the reboot in a structured phase:
   node run-headless-host-oracle-remote-rehearsal.mjs \\
     --phase reboot \\
     --ssh-target opc@YOUR_ORACLE_VM \\
-    --remote-dir kaos-headless-rehearsal-YYYYMMDDTHHMMSSZ \\
-    --secret-file /secure/local/path/to/sync-token
+    --remote-dir kaos-headless-rehearsal-YYYYMMDDTHHMMSSZ
 
 You can reuse the installed update wrapper to run the verification postflight
 without downloading or reinstalling anything. Do not combine --postflight-only
@@ -386,12 +391,12 @@ Or run postflight directly, which is the simplest post-reboot check:
     --data-file /var/lib/kaos-headless/data.json \\
     --lock-file /run/kaos-headless/kaos.lock \\
     --env-file /etc/kaos/headless.env \\
-    --token-file /etc/kaos/sync-token \\
+    --identity-file /var/lib/kaos-headless/device-identity.json \\
     --smoke-script /opt/kaos/smoke-headless-host-sync.mjs \\
     --smoke-work-dir /var/lib/kaos-headless/smoke-work \\
     --verify-running
 
-For a lower-level install before /etc/kaos/headless.env and the token are ready,
+For a lower-level install before enrollment and Owner approval are complete,
 omit postflight:
 
   sudo node update-headless-host-from-release.mjs \\

@@ -414,13 +414,11 @@ console.log("\n--- Test 8: public capabilities do not expose private update meta
 
 console.log("\n--- Test 9: /api/capabilities route splits public and authenticated metadata ---");
 {
-	const token = "correct-token";
 	const env = {
-		SYNC_TOKEN: token,
 		KAOS_BUCKET: {},
 		KAOS_CONFIG: makeConfigNamespace({
 			claimed: true,
-			tokenHash: "unused-env-token-mode",
+			vaultId: "vault_12345678",
 			updateProvider: "github",
 			updateRepoUrl: "https://github.com/private/fork",
 			updateRepoBranch: "secret-branch",
@@ -435,22 +433,14 @@ console.log("\n--- Test 9: /api/capabilities route splits public and authenticat
 	assert(publicCaps.updateRepoUrl === null, "public capabilities route hides update repo URL");
 	assert(publicCaps.updateRepoBranch === null, "public capabilities route hides update repo branch");
 
-	const wrongTokenRes = await worker.fetch(new Request("https://example.test/api/capabilities", {
-		headers: { Authorization: "Bearer wrong-token" },
+	const bearerRes = await worker.fetch(new Request("https://example.test/api/capabilities", {
+		headers: { Authorization: "Bearer old-or-stolen-token" },
 	}), env);
-	const wrongTokenCaps = await wrongTokenRes.json() as Record<string, unknown>;
-	assert(wrongTokenRes.status === 200, "wrong-token capabilities route returns public 200");
-	assert(wrongTokenCaps.updateRepoUrl === null, "wrong-token capabilities route still hides update repo URL");
-
-	const privateRes = await worker.fetch(new Request("https://example.test/api/capabilities", {
-		headers: { Authorization: `Bearer ${token}` },
-	}), env);
-	const privateCaps = await privateRes.json() as Record<string, unknown>;
-	assert(privateRes.status === 200, "authenticated capabilities route returns 200");
-	assert(privateCaps.updateProvider === "github", "authenticated capabilities route includes update provider");
-	assert(privateCaps.updateRepoUrl === "https://github.com/private/fork", "authenticated capabilities route includes update repo URL");
-	assert(privateCaps.updateRepoBranch === "secret-branch", "authenticated capabilities route includes update repo branch");
-	assert(privateCaps.maxBlobUploadBytes === MAX_BLOB_UPLOAD_BYTES, "capabilities route exposes max blob upload bytes");
+	const bearerCaps = await bearerRes.json() as Record<string, unknown>;
+	assert(bearerRes.status === 200, "capabilities route remains public when a bearer is supplied");
+	assert(bearerCaps.updateRepoUrl === null, "capabilities never leak private metadata for a bearer value");
+	assert(bearerCaps.authMode === "device", "capabilities advertise device authentication only");
+	assert(bearerCaps.maxBlobUploadBytes === MAX_BLOB_UPLOAD_BYTES, "capabilities route exposes max blob upload bytes");
 }
 
 console.log("\n──────────────────────────────────────────────────");

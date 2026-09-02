@@ -13,8 +13,11 @@ is configured.
 - Durable Object storage persists the live CRDT snapshot.
 - Attachments are uploaded through the Worker and stored in R2.
 - Snapshots are gzipped CRDT archives stored in R2.
-- Auth uses the claimed setup token by default, with `SYNC_TOKEN` as an optional hard override.
-- The one-time claim is protected by a separate deploy-time `KAOS_CLAIM_SECRET`.
+- Each client authenticates by proving possession of its own P-256 device key.
+- The Config Durable Object is the authoritative registry for device roles,
+  approval state, short sessions, one-time socket tickets, and audit events.
+- The one-time server claim is protected by a separate deploy-time
+  `KAOS_CLAIM_SECRET`.
 
 ## Standard deploy
 
@@ -22,7 +25,7 @@ Use the **Deploy to Cloudflare** button above for the default setup. It targets 
 The deploy flow reads `.env.example` and prompts for `KAOS_CLAIM_SECRET`. Choose
 a unique random value of 32–512 visible ASCII characters without spaces and
 keep it until the first claim succeeds. This secret only proves ownership of the fresh deployment; it
-is not the sync token and is never included in a setup link.
+is not a sync credential and is never included in a setup link.
 
 The local `wrangler.toml` in this directory defines:
 
@@ -32,16 +35,40 @@ The local `wrangler.toml` in this directory defines:
 
 The default deploy is text-only:
 
-- no `SYNC_TOKEN` secret is required up front
 - `KAOS_CLAIM_SECRET` is required to authorize the one-time claim
 - no R2 binding is required up front
 - the first browser visit shows the claim page
 
 On first visit, enter the same `KAOS_CLAIM_SECRET` you chose during deployment.
-The claim page then generates a different sync token in the browser and returns
-an `obsidian://kaos?...` setup link. The claim secret is sent only in the
-same-origin claim request header and is never returned, logged, or embedded in
-the link.
+The claim page generates a vault ID and a seven-day migration verifier but never
+shows a shared sync credential. The claim secret is sent only in the same-origin
+claim request header and is never returned, logged, or embedded in a link.
+
+Before registering the first device, generate and store an offline recovery
+secret in a `0600` file. Configure that value as `KAOS_RECOVERY_SECRET` in the
+Worker secret store, then use the terminal recovery flow to create the first
+Owner. Store the recovery file separately from the server secret. Recovery
+revokes every existing device, session, invitation, and socket ticket before
+activating the replacement Owner and its new recovery value.
+
+For a persistent terminal or headless host, create a `0700` state directory
+first, then use protected files rather than shell arguments or environment
+variables:
+
+```text
+kaos-headless-host device recover \
+  --host https://sync.example --vault-id <vault-id> --device-name <name> \
+  --identity-file <0600-identity-file> \
+  --recovery-file <0600-bootstrap-recovery-file> \
+  --next-recovery-file <new-0600-recovery-file> \
+  --confirm-revoke-all
+```
+
+For every later terminal device, an Owner creates an invite in KAOS, writes the
+short-lived invite to a `0600` file, and runs `device enroll` with that file and
+its own `0600` identity file. The CLI rejects symbolic links, non-regular files,
+loose permissions, unsafe parent directories, and `--token`/environment-token
+paths.
 
 ## Guided server update for an existing deploy
 
@@ -109,10 +136,9 @@ npm run dev -- --var KAOS_CLAIM_SECRET:local-claim-secret-at-least-32-chars
 
 The local Worker will be served by Wrangler. Use its printed local URL as the plugin's **Server host**.
 
-Passing `SYNC_TOKEN` locally is optional. If you set it, the server starts in
-the explicit environment-token mode and does not use the claim flow. If you
-omit it, provide `KAOS_CLAIM_SECRET` as shown above, then enter that value in
-the browser to claim the server.
+Shared-token environment variables are not supported. Provide
+`KAOS_CLAIM_SECRET` as shown above, claim in the browser, then register a
+device key through the recovery/enrollment flow.
 
 For the canonical same-machine and LAN multi-device procedure, including
 Wrangler bind options, isolated persistence, QA vault setup, and plaintext-HTTP
@@ -128,7 +154,7 @@ npm run deploy
 ```
 
 Use a unique value of at least 32 characters. Do not store its value in
-`wrangler.toml` or reuse the sync token. An unclaimed server without a valid
+`wrangler.toml` or reuse a recovery secret. An unclaimed server without a valid
 `KAOS_CLAIM_SECRET` fails closed and will not accept `/claim` requests.
 
 `npm run deploy` runs `scripts/auto-bind-r2.mjs` first. If no existing
@@ -154,11 +180,12 @@ The commit SHA lets us verify the exact server snapshot Cloudflare built, which 
 
 ### WebSocket sync
 
-- Obtain a short-lived ticket with `POST /vault/<vaultId>/auth/ticket`.
-- Connect to `wss://<host>/vault/sync/<vaultId>?ticket=<short-lived-ticket>`.
-- Legacy `?token=<setup-token>` remains available only for older plugin clients
-  during the migration window and can be disabled with
-  `KAOS_DISABLE_LEGACY_WS_TOKEN`.
+- Obtain a five-minute, single-use ticket with `POST /vault/<vaultId>/auth/ticket`.
+  This HTTP request uses an in-memory five-minute device session in the
+  `Authorization` header.
+- Connect to `wss://<host>/vault/sync/<vaultId>` with the ticket only in
+  `Sec-WebSocket-Protocol: kaos-ticket.<ticket>`.
+- URL query credentials, including `?token=` and `?ticket=`, are rejected.
 
 ### Blob APIs
 
@@ -173,13 +200,23 @@ The commit SHA lets us verify the exact server snapshot Cloudflare built, which 
 - `GET /vault/<vaultId>/snapshots`
 - `GET /vault/<vaultId>/snapshots/<snapshotId>`
 
+### Device administration
+
+- `GET /vault/<vaultId>/devices` — Owner only; list device IDs, names,
+  fingerprints, roles, states, and timestamps.
+- `POST /vault/<vaultId>/devices/invite` — Owner only; creates one Member
+  enrollment invite (ten minutes by default, at most one hour).
+- `POST /vault/<vaultId>/devices/approve`, `/role`, and `/revoke` — Owner only.
+
 ### Debug
 
 - `GET /vault/<vaultId>/debug/recent`
 
-All HTTP endpoints require `Authorization: Bearer <setup-token>` once the server has been claimed.
-
-If you set `SYNC_TOKEN`, that environment value becomes the required token instead.
+All private HTTP endpoints require `Authorization: Bearer <device-session>`.
+Sessions last five minutes and are issued only after the registered private key
+signs a fresh 90-second challenge. The legacy shared credential can make only a
+pending enrollment request during the seven-day migration window; it cannot
+sync, obtain a session, or become an Owner.
 
 ## Operational safeguards
 
@@ -187,6 +224,10 @@ If you set `SYNC_TOKEN`, that environment value becomes the required token inste
 - Blob existence checks use bounded concurrency.
 - Snapshot creation is daily-idempotent through the `/snapshots/maybe` route.
 - Snapshot archives are stored compressed to keep R2 usage modest.
+- Device approval, role change, revocation, and recovery increment the auth
+  generation, invalidate every session/ticket for that vault, and close its live
+  WebSocket connections. Audit records contain only device IDs and key
+  fingerprints, never session, invite, or recovery values.
 - Worker, Durable Object, storage, timer, and retry changes must follow the
   [Durable Object cost guardrails](../docs/engineering/durable-object-cost-guardrails.md).
   Run `npm run guard:do-cost` before committing those changes.

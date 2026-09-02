@@ -29,11 +29,11 @@ Wrangler/workerd는 로컬 실행 도구로 사용하지만 Cloudflare 계정, �
 
 1. 실제 vault나 실제 sync ID를 사용하지 않는다.
 2. `qa:prepare --clean`은 이 절차를 위해 만든 전용 경로에만 사용한다.
-3. 모든 장치는 같은 `vaultId`와 token을 사용하고, `deviceName`은 서로 다르게
-   설정한다.
+3. 모든 장치는 같은 `vaultId`를 사용하되, 각 장치의 공개키와 `deviceName`은
+   서로 다르게 설정한다.
 4. QA product build와 `kaos-qa-harness`는 실제 vault에 설치하지 않는다.
-5. LAN의 평문 HTTP는 격리된 신뢰 네트워크에서만 사용한다. token이 암호화되지
-   않은 채 전송된다.
+5. LAN의 평문 HTTP는 격리된 신뢰 네트워크에서만 사용한다. 장치 세션은 짧지만
+   평문 구간에서 탈취될 수 있으므로 운영 환경에는 HTTPS를 사용한다.
 6. 한 번의 검증 중에는 commit, plugin bundle, Worker 코드와 persistence 경로를
    바꾸지 않는다.
 
@@ -46,9 +46,8 @@ Wrangler/workerd는 로컬 실행 도구로 사용하지만 Cloudflare 계정, �
 | 신뢰할 수 없는 네트워크 | HTTPS origin | 환경별 | 이 문서의 평문 LAN 절차를 사용하지 않음 |
 
 KAOS setup link는 보안상 localhost가 아닌 HTTP origin을 거부한다. 따라서 LAN
-HTTP 테스트에서는 setup link나 QR 설정을 사용하지 말고 KAOS 설정의
-`Manual connection`에서 값을 직접 입력한다. 수동 입력 경로는 경고 후 연결을
-허용한다.
+HTTP 테스트에서는 서버와 vault 정보를 입력한 뒤 Owner 장치에서 만든 짧은 초대를
+사용한다. 수동 입력 경로는 경고 후 장치 승인 요청을 허용한다.
 
 모바일 OS 또는 네트워크 정책이 평문 HTTP/WebSocket을 차단할 수 있다. 코드상
 수동 LAN HTTP는 허용되지만, 실기기에서 연결되지 않으면 먼저 브라우저의
@@ -109,8 +108,8 @@ registry 네트워크가 필요한 공급망 점검이므로 기능 테스트와
 
 ## 6. 로컬 Worker 실행
 
-아래 token은 QA 전용 예시다. 운영 token으로 재사용하지 않는다. persistence
-경로도 실행마다 새 suffix를 사용한다.
+아래 claim secret은 QA 전용 예시다. 운영 비밀값으로 재사용하지 않는다.
+persistence 경로도 실행마다 새 suffix를 사용한다.
 
 ### 6.1 같은 컴퓨터에서만 연결
 
@@ -121,7 +120,7 @@ npm --prefix server run dev -- \
   --ip 127.0.0.1 \
   --port 8787 \
   --persist-to /tmp/kaos-wrangler-qa-v1103-run1 \
-  --var SYNC_TOKEN:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  --var KAOS_CLAIM_SECRET:qa-claim-secret-0123456789abcdef0123456789abcdef
 ```
 
 ### 6.2 같은 LAN의 다른 단말도 연결
@@ -133,7 +132,7 @@ npm --prefix server run dev -- \
   --ip 0.0.0.0 \
   --port 8787 \
   --persist-to /tmp/kaos-wrangler-qa-v1103-run1 \
-  --var SYNC_TOKEN:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  --var KAOS_CLAIM_SECRET:qa-claim-secret-0123456789abcdef0123456789abcdef
 ```
 
 호스트 컴퓨터에서 확인:
@@ -208,7 +207,6 @@ npm run qa:prepare -- --fixture 001-basic-markdown --dest /tmp/kaos-qa-b --clean
 | 항목 | 장치 A | 장치 B |
 |---|---|---|
 | Server URL | `http://127.0.0.1:8787` | `http://127.0.0.1:8787` |
-| Sync token | 6절의 QA token | 같은 token |
 | Vault ID | A에 생성된 값 | A와 정확히 같은 값 |
 | Device name | `qa-device-a` | `qa-device-b` |
 
@@ -222,9 +220,10 @@ LAN의 실제 다른 단말에서는 `127.0.0.1` 대신
 `http://HOST_LAN_IP:8787`을 수동 입력한다. `127.0.0.1`은 각 단말 자기 자신을
 뜻하므로 공유할 수 없다.
 
-설정 후 두 장치에서 KAOS를 한 번 disable/enable하거나 Obsidian을 다시 시작한다.
-Dashboard에서 두 장치 모두 연결됐고 같은 vault를 보고 있는지 확인한 뒤
-테스트한다.
+먼저 서버 claim 후 복구 흐름으로 Owner A를 등록한다. A에서 단기 초대를 만들고 B의
+등록 요청을 만든 뒤, A에서 B의 지문과 짧은 대조 코드를 확인해 승인한다. 그 다음
+두 장치에서 KAOS를 한 번 disable/enable하거나 Obsidian을 다시 시작한다.
+Dashboard에서 두 장치 모두 연결됐고 같은 vault를 보고 있는지 확인한 뒤 테스트한다.
 
 ## 10. Harness 준비 확인
 
@@ -500,7 +499,7 @@ CDP가 없는 Android/iOS에서는 아래 수동 절차를 사용한다.
 2. 단말 브라우저에서 `http://HOST_LAN_IP:8787/api/capabilities`를 확인한다.
 3. 동일 commit의 KAOS bundle을 전용 QA vault에 설치한다. witness 명령이 필요하면
    `kaos-qa-harness`도 함께 설치하며 실제 vault에는 설치하지 않는다.
-4. setup link 대신 Server URL, token, Vault ID를 수동 입력한다.
+4. Server URL과 Vault ID를 입력하고, Owner 장치가 만든 단기 초대로 승인 요청을 만든다.
 5. 장치 이름을 실제 장치별로 고유하게 지정한다.
 6. 먼저 단순 edit roundtrip을 하고, 이어서 12.1~12.3과 13.2를 반복한다.
 7. 각 장치의 명령 팔레트에서 `Start telemetry trace`를 실행하고 시나리오 후
@@ -531,7 +530,7 @@ bun run qa:analyze-bundles -- device-a.ndjson device-b.ndjson --out qa-runs/manu
 - `analyzer-report.json`
 - `result.json`, `meta.json`, `run.log`
 
-`qa-runs/`는 gitignored다. 재현 가능한 결함의 증거를 commit해야 한다면 token,
+`qa-runs/`는 gitignored다. 재현 가능한 결함의 증거를 commit해야 한다면 초대값,
 실제 경로, 파일명과 개인 내용을 제거한 별도 sanitized fixture/summary만 추가한다.
 
 PASS는 UI가 잠시 같아 보이는 것으로 판정하지 않는다. 최소 조건은 다음과 같다.
@@ -560,7 +559,7 @@ PASS는 UI가 잠시 같아 보이는 것으로 판정하지 않는다. 최소 �
 |---|---|
 | 다른 단말에서 capabilities가 열리지 않음 | `--ip 0.0.0.0`, LAN IP, 방화벽, Wi-Fi isolation |
 | LAN setup link가 invalid | 의도된 보안 동작; Manual connection 사용 |
-| 401/403 또는 ticket 오류 | Worker와 plugin의 token이 정확히 같은지 확인 |
+| 401/403 또는 ticket 오류 | 장치가 승인됐는지, identity가 해당 host/vault용인지, 세션을 새로 발급할 수 있는지 확인 |
 | 두 장치가 연결됐지만 파일이 안 옴 | `vaultId`가 byte-for-byte 같은지 확인 |
 | `__KAOS_QA__`가 없음 | QA product build, harness, `qaDebugMode`, plugin 활성화 확인 |
 | 두 장치 bundle hash가 다름 | 둘 다 종료하고 build 후 두 vault를 다시 prepare |

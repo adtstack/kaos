@@ -11,6 +11,11 @@ async function main() {
 		printUsage();
 		return;
 	}
+	for (const legacy of ["token", "token-file", "token-stdin", "skip-token", "force-token"]) {
+		if (raw[legacy] !== undefined) {
+			throw new Error(`--${legacy} is no longer supported. Enroll a protected device identity after installing the host.`);
+		}
+	}
 
 	const dryRun = raw["dry-run"] === "true";
 	const allowNonRoot = raw["allow-non-root"] === "true";
@@ -27,7 +32,10 @@ async function main() {
 	const dataDir = resolve(raw["data-dir"] ?? "/var/lib/kaos-headless");
 	const etcDir = resolve(raw["etc-dir"] ?? "/etc/kaos");
 	const envFile = resolve(raw["env-file"] ?? `${etcDir}/headless.env`);
-	const tokenFile = resolve(raw["token-file"] ?? `${etcDir}/sync-token`);
+	const identityFile = resolve(raw["identity-file"] ?? `${dataDir}/device-identity.json`);
+	if (dirname(identityFile) !== dataDir) {
+		throw new Error("--identity-file must be directly inside --data-dir so its parent can be protected for the service account.");
+	}
 	const commands = {
 		id: raw["id-command"] ?? "id",
 		getent: raw["getent-command"] ?? "getent",
@@ -44,7 +52,7 @@ async function main() {
 
 	await ensureDirectory({ name: "install-dir", path: installDir, mode: 0o755, owner: "root:root", commands, dryRun, actions });
 	await ensureDirectory({ name: "vault", path: vault, mode: 0o755, owner: `${user}:${group}`, commands, dryRun, actions });
-	await ensureDirectory({ name: "data-dir", path: dataDir, mode: 0o755, owner: `${user}:${group}`, commands, dryRun, actions });
+	await ensureDirectory({ name: "data-dir", path: dataDir, mode: 0o700, owner: `${user}:${group}`, commands, dryRun, actions });
 	await ensureDirectory({ name: "etc-dir", path: etcDir, mode: 0o755, owner: "root:root", commands, dryRun, actions });
 
 	if (raw["skip-env"] !== "true") {
@@ -53,6 +61,7 @@ async function main() {
 			host: raw.host,
 			vaultId: raw["vault-id"],
 			deviceName: raw["device-name"] ?? "server-headless",
+			identityFile,
 			attachmentSync: raw["enable-attachments"] === "true" ? "true" : "false",
 			force: raw["force-env"] === "true",
 			owner: `root:${group}`,
@@ -61,17 +70,7 @@ async function main() {
 			actions,
 		});
 	}
-	if (raw["skip-token"] !== "true") {
-		await ensureTokenFile({
-			path: tokenFile,
-			token: await readToken(raw, tokenFile, dryRun),
-			force: raw["force-token"] === "true",
-			owner: `root:${group}`,
-			commands,
-			dryRun,
-			actions,
-		});
-	}
+	await describeIdentityFile({ path: identityFile, owner: `${user}:${group}`, dryRun, actions });
 
 	console.log(JSON.stringify({
 		kind: "headless-host-oracle-bootstrap",
@@ -85,8 +84,9 @@ async function main() {
 			dataDir,
 			etcDir,
 			envFile,
-			tokenFile,
+			identityFile,
 		},
+		nextStep: "Run device enroll as the service account with a one-time invite file, then approve its displayed fingerprint as an Owner before starting sync.",
 		actions,
 	}, null, 2));
 }
@@ -104,10 +104,7 @@ function parseArgs(argv) {
 			"allow-non-root",
 			"skip-user",
 			"skip-env",
-			"skip-token",
 			"force-env",
-			"force-token",
-			"token-stdin",
 			"enable-attachments",
 		]) {
 			if (arg === `--${flag}`) {
@@ -181,7 +178,7 @@ async function ensureDirectory({ name, path, mode, owner, commands, dryRun, acti
 	});
 }
 
-async function ensureEnvFile({ path, host, vaultId, deviceName, attachmentSync, force, owner, commands, dryRun, actions }) {
+async function ensureEnvFile({ path, host, vaultId, deviceName, identityFile, attachmentSync, force, owner, commands, dryRun, actions }) {
 	const existed = existsSync(path);
 	const shouldWrite = force || !existed;
 	if (shouldWrite && (!host || !vaultId) && !dryRun) {
@@ -194,6 +191,7 @@ async function ensureEnvFile({ path, host, vaultId, deviceName, attachmentSync, 
 				`KAOS_HOST=${host}`,
 				`KAOS_VAULT_ID=${vaultId}`,
 				`KAOS_DEVICE_NAME=${deviceName}`,
+				`KAOS_IDENTITY_FILE=${identityFile}`,
 				`KAOS_ENABLE_ATTACHMENT_SYNC=${attachmentSync}`,
 				"",
 			].join("\n"), "utf8");
@@ -212,46 +210,16 @@ async function ensureEnvFile({ path, host, vaultId, deviceName, attachmentSync, 
 	});
 }
 
-async function ensureTokenFile({ path, token, force, owner, commands, dryRun, actions }) {
-	const existed = existsSync(path);
-	const shouldWrite = force || !existed;
-	if (shouldWrite && !token && !dryRun) {
-		throw new Error("--token or --token-stdin is required when writing sync-token");
-	}
-	if (!dryRun) {
-		await mkdir(dirname(path), { recursive: true });
-		if (shouldWrite) {
-			await writeFile(path, token, "utf8");
-		}
-		await chmod(path, 0o640);
-		runRequired("chown:token-file", commands.chown, [owner, path], actions);
-	}
+async function describeIdentityFile({ path, owner, dryRun, actions }) {
 	actions.push({
-		name: "token-file",
+		name: "device-identity-file",
 		path,
 		owner,
-		mode: "0640",
-		written: shouldWrite,
-		preserved: existed && !force,
+		mode: "0600",
+		exists: existsSync(path),
+		enrollmentRequired: !existsSync(path),
 		dryRun,
 	});
-}
-
-async function readToken(raw, tokenFile, dryRun) {
-	if (raw.token !== undefined) return raw.token;
-	if (raw["token-stdin"] === "true") return (await readStdin()).trim();
-	if (existsSync(tokenFile) && raw["force-token"] !== "true") return null;
-	if (dryRun) return null;
-	return null;
-}
-
-async function readStdin() {
-	process.stdin.setEncoding("utf8");
-	let text = "";
-	for await (const chunk of process.stdin) {
-		text += chunk;
-	}
-	return text;
 }
 
 function runCheck(command, args) {
@@ -294,8 +262,7 @@ Options:
   --host <url>              KAOS Worker host written to /etc/kaos/headless.env.
   --vault-id <id>           KAOS vault id written to /etc/kaos/headless.env.
   --device-name <name>      Device name. Defaults to server-headless.
-  --token <token>           Sync token to write. Prefer --token-stdin for shells.
-  --token-stdin             Read sync token from stdin.
+  --identity-file <path>    Device identity location. Defaults to <data-dir>/device-identity.json.
   --enable-attachments      Set KAOS_ENABLE_ATTACHMENT_SYNC=true. Defaults false.
   --user <name>             Service user. Defaults to kaos.
   --group <name>            Service group. Defaults to --user.
@@ -303,15 +270,12 @@ Options:
   --shell <path>            Service shell. Defaults to /sbin/nologin.
   --install-dir <path>      Install directory. Defaults to /opt/kaos.
   --vault <path>            Vault directory. Defaults to /srv/kaos/vault.
-  --data-dir <path>         Data directory. Defaults to /var/lib/kaos-headless.
+  --data-dir <path>         Private service data directory. Defaults to /var/lib/kaos-headless.
   --etc-dir <path>          Config directory. Defaults to /etc/kaos.
   --env-file <path>         Env file. Defaults to /etc/kaos/headless.env.
-  --token-file <path>       Token file. Defaults to /etc/kaos/sync-token.
   --force-env               Rewrite env file if it already exists.
-  --force-token             Rewrite token file if it already exists.
   --skip-user               Do not create/check service user or group.
   --skip-env                Do not write/chmod/chown env file.
-  --skip-token              Do not write/chmod/chown token file.
   --dry-run                 Print planned actions without writing.
   --allow-non-root          Allow writes as non-root. Intended for tests.
   --id-command <path>       id command override for tests.

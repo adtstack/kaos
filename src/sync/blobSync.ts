@@ -208,7 +208,7 @@ interface ExistsResult {
 class BlobHttpClient {
 	constructor(
 		private host: string,
-		private token: string,
+		private getAuthorizationHeader: () => Promise<string>,
 		private vaultId: string,
 		private trace?: TraceHttpContext,
 	) {}
@@ -223,9 +223,9 @@ class BlobHttpClient {
 		);
 	}
 
-	private authHeaders(): Record<string, string> {
+	private async authHeaders(): Promise<Record<string, string>> {
 		return {
-			Authorization: `Bearer ${this.token}`,
+			Authorization: await this.getAuthorizationHeader(),
 		};
 	}
 
@@ -239,7 +239,7 @@ class BlobHttpClient {
 			requestBlobUrl({
 				url: this.url(`/${hash}`),
 				method: "PUT",
-				headers: this.authHeaders(),
+				headers: await this.authHeaders(),
 				body: data,
 				contentType,
 			}),
@@ -259,7 +259,7 @@ class BlobHttpClient {
 			requestBlobUrl({
 				url: this.url(`/${hash}`),
 				method: "GET",
-				headers: this.authHeaders(),
+				headers: await this.authHeaders(),
 			}),
 			timeoutMs,
 			`blob download ${hash.slice(0, 12)}…`,
@@ -279,7 +279,7 @@ class BlobHttpClient {
 				url: this.url("/exists"),
 				method: "POST",
 				contentType: "application/json",
-				headers: this.authHeaders(),
+				headers: await this.authHeaders(),
 				body: JSON.stringify({ hashes }),
 			}),
 			EXISTS_TIMEOUT_MS,
@@ -697,7 +697,7 @@ export class BlobSyncManager {
 		private vaultSync: VaultSync,
 		settings: {
 			host: string;
-			token: string;
+			getAuthorizationHeader: () => Promise<string>;
 			vaultId: string;
 			maxAttachmentSizeKB: number;
 			attachmentConcurrency: number;
@@ -722,7 +722,7 @@ export class BlobSyncManager {
 	) {
 		this.blobClient = new BlobHttpClient(
 			settings.host,
-			settings.token,
+			settings.getAuthorizationHeader,
 			settings.vaultId,
 			settings.trace,
 		);
@@ -1861,6 +1861,19 @@ export class BlobSyncManager {
 
 	getPreservedUnresolvedEntries(): PreservedUnresolvedEntry[] {
 		return this.preservedUnresolved.getEntries();
+	}
+
+	resolvePreservedUnresolvedEpisode(
+		path: string,
+		expectedEpisodeId: string | null,
+	): boolean {
+		if (expectedEpisodeId === null) return false;
+		const normalized = normalizePath(path);
+		if (this.preservedUnresolved.resolveEpisode(normalized, expectedEpisodeId)) {
+			this.onPreservedUnresolvedChanged?.();
+			return true;
+		}
+		return false;
 	}
 
 	isKeepLocalDownloadConflictPending(path: string, episodeId: string): boolean {

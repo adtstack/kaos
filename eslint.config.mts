@@ -127,6 +127,7 @@ export default tseslint.config(
 	globalIgnores([
 		"node_modules",
 		"dist",
+		"public",
 		"server/dist",
 		"server/.wrangler",
 		"server/.partykit",

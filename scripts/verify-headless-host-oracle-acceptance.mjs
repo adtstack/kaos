@@ -7,7 +7,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
-const FULL_PHASES = ["preflight", "install", "reboot", "post-reboot", "update"];
+const FULL_PHASES = ["preflight", "install", "activate", "reboot", "post-reboot", "update"];
 
 async function main() {
 	const raw = parseArgs(process.argv.slice(2));
@@ -15,14 +15,15 @@ async function main() {
 		printUsage();
 		return;
 	}
+	for (const legacy of ["token", "token-file", "secret-file"]) {
+		if (raw[legacy] !== undefined) throw new Error(`--${legacy} is no longer supported.`);
+	}
 
 	const evidenceRoot = raw["evidence-root"] ? resolve(raw["evidence-root"]) : null;
 	const summaryFile = resolve(raw["summary-file"] ?? join(evidenceRoot ?? ".", "acceptance-summary.json"));
 	const summaryText = await readFile(summaryFile, "utf8");
 	const summary = JSON.parse(summaryText);
-	const secretFile = raw["secret-file"] ? resolve(raw["secret-file"]) : null;
-	const secret = secretFile ? await readFile(secretFile, "utf8").catch(() => "") : "";
-	const redactor = createRedactor([secret]);
+	const redactor = createRedactor([]);
 	const requireFull = raw["require-full"] === "true";
 	const checks = [];
 	const verifications = [];
@@ -33,7 +34,7 @@ async function main() {
 	const phaseEvidenceDirs = Object.fromEntries(
 		evidencePhases.map((phase) => [phase, resolvePhaseEvidenceDir({ phase, root, summary })]),
 	);
-	const summarySecretLeakCheck = checkSummarySecretLeak(summaryText, secret, summaryFile, checks);
+	const summaryLegacyCredentialCheck = checkSummaryLegacyCredential(summaryText, summaryFile, checks);
 
 	addCheck(checks, "summary:shape", summary.kind === "headless-host-oracle-acceptance" && summary.dryRun === false, {
 		kind: summary.kind ?? null,
@@ -139,7 +140,7 @@ async function main() {
 
 	for (const phase of evidencePhases) {
 		const logDir = phaseEvidenceDirs[phase];
-		const result = runPhaseVerifier({ phase, logDir, secretFile, redactor });
+		const result = runPhaseVerifier({ phase, logDir, redactor });
 		verifications.push(result);
 		addCheck(checks, `phase:${phase}:evidence`, result.ok, {
 			phase,
@@ -158,7 +159,7 @@ async function main() {
 		requireFull,
 		phases,
 		checks,
-		summarySecretLeakCheck,
+		summaryLegacyCredentialCheck,
 		verifications,
 		failedChecks,
 	};
@@ -192,7 +193,7 @@ function isContiguousPhaseSlice(phases) {
 	return true;
 }
 
-function runPhaseVerifier({ phase, logDir, secretFile, redactor }) {
+function runPhaseVerifier({ phase, logDir, redactor }) {
 	const verifier = resolveLocalHelper("verify-headless-host-oracle-rehearsal.mjs");
 	const args = [
 		verifier,
@@ -205,9 +206,6 @@ function runPhaseVerifier({ phase, logDir, secretFile, redactor }) {
 		args.push("--mode", "update");
 	} else {
 		args.push("--require-reboot-request");
-	}
-	if (secretFile) {
-		args.push("--secret-file", secretFile);
 	}
 	const result = spawnSync(process.execPath, args, {
 		encoding: "utf8",
@@ -229,26 +227,13 @@ function runPhaseVerifier({ phase, logDir, secretFile, redactor }) {
 	};
 }
 
-function checkSummarySecretLeak(text, secret, summaryFile, checks) {
-	const needles = typeof secret === "string"
-		? [secret, secret.trim()].filter((value) => value.length >= 3)
-		: [];
-	if (needles.length === 0) {
-		const result = { ok: true, skipped: true, reason: "no secret supplied" };
-		addCheck(checks, "summary:secret-leak", true, {
-			file: summaryFile,
-			...result,
-		});
-		return result;
-	}
-	const leaked = needles.some((needle) => text.includes(needle));
+function checkSummaryLegacyCredential(text, summaryFile, checks) {
 	const result = {
-		ok: !leaked,
+		ok: !/KAOS_SYNC_TOKEN|SYNC_TOKEN|sync-token|--token(?:\s|=|-)/.test(text),
 		file: summaryFile,
-		leaked: leaked ? true : false,
-		error: leaked ? "secret material must not appear in acceptance summary" : undefined,
+		error: "legacy shared credential configuration must not appear in acceptance summary",
 	};
-	addCheck(checks, "summary:secret-leak", result.ok, result);
+	addCheck(checks, "summary:legacy-credential-absent", result.ok, result);
 	return result;
 }
 
@@ -313,17 +298,7 @@ function createRedactor(secrets) {
 }
 
 function redactArgs(args) {
-	const redacted = [];
-	for (let i = 0; i < args.length; i++) {
-		const arg = args[i];
-		if (arg === "--secret-file") {
-			redacted.push(arg, "[secret-file]");
-			i++;
-			continue;
-		}
-		redacted.push(String(arg));
-	}
-	return redacted;
+	return args.map((arg) => String(arg));
 }
 
 function parseJsonOutput(text) {
@@ -351,9 +326,7 @@ Options:
   --evidence-root <path>  Local evidence root containing install/,
                           post-reboot/, and update/ directories. Defaults to
                           the summary file directory.
-  --secret-file <path>    Sync token file for summary and child verifier
-                          secret-leak checks.
-  --require-full          Require preflight, install, reboot, post-reboot, and
+  --require-full          Require preflight, install, activate, reboot, post-reboot, and
                           update phases to be present in this exact order.
   --help, -h              Print this help.
 `);

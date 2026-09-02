@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { webcrypto } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -37,11 +38,25 @@ try {
 	console.log("  PASS  real plugin booted and unloaded");
 
 	console.log("\n--- headless host smoke: configured daemon enters sync init path ---");
+	const identityFile = join(root, "identity", "device-identity.json");
+	await mkdir(join(root, "identity"), { recursive: true, mode: 0o700 });
+	const keyPair = await webcrypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+	const privateKey = await webcrypto.subtle.exportKey("jwk", keyPair.privateKey);
+	const publicKey = await webcrypto.subtle.exportKey("jwk", keyPair.publicKey);
+	await writeFile(identityFile, `${JSON.stringify({
+		version: 1,
+		deviceId: "headless-host-smoke-device",
+		host: "http://127.0.0.1:65530",
+		vaultId: "headless-host-smoke-vault",
+		privateKey,
+		publicKey,
+	})}\n`, { encoding: "utf8", mode: 0o600 });
 	await writeFile(dataFile, JSON.stringify({
 		host: "http://127.0.0.1:65530",
-		token: "test-token",
 		vaultId: "headless-host-smoke-vault",
 		deviceName: "headless-host-smoke",
+		deviceId: "headless-host-smoke-device",
+		identityFile,
 		enableAttachmentSync: false,
 	}, null, 2), "utf8");
 	const daemon = spawn(process.execPath, [

@@ -12,13 +12,11 @@ EnvironmentFile=/etc/kaos/headless.env
 ExecStartPre=/usr/bin/node -- /opt/kaos/kaos-headless-host.mjs --doctor --require-sync-config --skip-worker-capabilities \
   --vault /srv/kaos/vault \
   --data-file /var/lib/kaos-headless/data.json \
-  --lock-file /run/kaos-headless/kaos.lock \
-  --token-file /etc/kaos/sync-token
+  --lock-file /run/kaos-headless/kaos.lock
 ExecStart=/usr/bin/node -- /opt/kaos/kaos-headless-host.mjs \
   --vault /srv/kaos/vault \
   --data-file /var/lib/kaos-headless/data.json \
   --lock-file /run/kaos-headless/kaos.lock \
-  --token-file /etc/kaos/sync-token \
   --poll-interval-ms 1000
 Restart=on-failure
 RestartSec=5

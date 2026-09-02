@@ -34,7 +34,6 @@ const ALLOWED_OPTIONS = new Set([
 	"service-path",
 	"state-home",
 	"systemctl-command",
-	"token-file",
 	"user",
 	"userdel-command",
 	"vault",
@@ -88,7 +87,7 @@ async function main() {
 		await removeManagedDirectory({ name: "run-dir", path: paths.runDir, dryRun, actions });
 	}
 	await removeManagedFile({ name: "env-file", path: paths.envFile, dryRun, actions });
-	await removeManagedFile({ name: "token-file", path: paths.tokenFile, dryRun, actions });
+	await removeManagedFile({ name: "legacy-credential-file", path: paths.legacyCredentialFile, dryRun, actions });
 	if (paths.installConfig) {
 		await removeManagedFile({ name: "install-config", path: paths.installConfig, dryRun, actions });
 	}
@@ -169,7 +168,7 @@ function systemPaths(raw) {
 		configDirName: "etc-dir",
 		serviceDir: null,
 		envFile: resolve(raw["env-file"] ?? join(etcDir, "headless.env")),
-		tokenFile: resolve(raw["token-file"] ?? join(etcDir, "sync-token")),
+		legacyCredentialFile: resolve(join(etcDir, "sync-token")),
 		installConfig: null,
 		vault: resolve(raw.vault ?? "/srv/kaos/vault"),
 		user: raw.user ?? "kaos",
@@ -199,7 +198,7 @@ function userPaths(raw) {
 		configDirName: "config-dir",
 		serviceDir,
 		envFile: resolve(raw["env-file"] ?? join(configDir, "headless.env")),
-		tokenFile: resolve(raw["token-file"] ?? join(configDir, "sync-token")),
+		legacyCredentialFile: resolve(join(configDir, "sync-token")),
 		installConfig: join(configDir, "install.json"),
 		vault: raw.vault ? resolve(raw.vault) : null,
 		user: null,
@@ -217,7 +216,7 @@ function assertRemovalPaths(paths) {
 		"run-dir": paths.runDir,
 		"config-dir": paths.configDir,
 		"env-file": paths.envFile,
-		"token-file": paths.tokenFile,
+		"legacy-credential-file": paths.legacyCredentialFile,
 		"install-config": paths.installConfig,
 		"service-dir": paths.serviceDir,
 		"kaos-command": paths.binKaos,
@@ -410,7 +409,7 @@ function summarizePaths(paths) {
 		runDir: paths.runDir,
 		configDir: paths.configDir,
 		envFile: paths.envFile,
-		tokenFile: paths.tokenFile,
+		legacyCredentialFile: paths.legacyCredentialFile,
 		installConfig: paths.installConfig,
 		vault: paths.vault,
 	};
@@ -438,7 +437,6 @@ Options:
   --run-dir <path>         Runtime lock directory.
   --etc-dir <path>         System configuration directory.
   --env-file <path>        Environment file.
-  --token-file <path>      Sync token file.
   --user <name>            Service user for --remove-user. Defaults to kaos.
   --group <name>           Service group for --remove-group. Defaults to --user.
   --home <path>            User home for --scope user.

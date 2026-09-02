@@ -215,7 +215,7 @@ export class AttachmentOrchestrator {
 			this.deps.log(`Attachment sync engine start blocked by stale authority (${reason})`);
 			return;
 		}
-		if (!runtimeConfig.host || !runtimeConfig.token) return;
+		if (!runtimeConfig.host || !runtimeConfig.authorizationHeader) return;
 		// Authority belongs to a manager instance. A stopped/unsupported manager
 		// must never lend its previously-open gate to a replacement.
 		this.uploadAuthorityReady = false;
@@ -227,7 +227,7 @@ export class AttachmentOrchestrator {
 			vaultSync,
 			{
 				host: runtimeConfig.host,
-				token: runtimeConfig.token,
+				getAuthorizationHeader: runtimeConfig.authorizationHeader,
 				vaultId: runtimeConfig.vaultId,
 				maxAttachmentSizeKB: runtimeConfig.maxAttachmentSizeKB,
 				attachmentConcurrency: runtimeConfig.attachmentConcurrency,

@@ -182,14 +182,6 @@ function isPreparedFileHistoryPendingUpload(value: unknown): value is PreparedFi
 		candidate.uploadedContentCount >= 0;
 }
 
-function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
-	if (a.byteLength !== b.byteLength) return false;
-	for (let i = 0; i < a.byteLength; i++) {
-		if (a[i] !== b[i]) return false;
-	}
-	return true;
-}
-
 function json(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
 		status,
@@ -296,6 +288,19 @@ export class VaultSyncServer extends YServer {
 		}
 	}
 
+	/**
+	 * Device tags are injected only after the Worker consumes a device-bound,
+	 * single-use ticket. They let the config plane close affected live sockets
+	 * without inspecting Yjs traffic.
+	 */
+	getConnectionTags(connection: Connection, ctx: ConnectionContext): string[] {
+		const deviceId = ctx.request.headers.get("X-KAOS-Device-ID");
+		if (typeof deviceId === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(deviceId)) {
+			return [`device:${deviceId}`];
+		}
+		return [];
+	}
+
 	handleMessage(connection: Connection, message: WSMessage): void {
 		super.handleMessage(connection, message);
 	}
@@ -304,6 +309,21 @@ export class VaultSyncServer extends YServer {
 		this.captureRoomIdHint(request);
 
 		const url = new URL(request.url);
+		if (request.method === "POST" && url.pathname === "/__kaos/auth/revoke") {
+			let body: { deviceId?: unknown; closeAll?: unknown } = {};
+			try { body = await request.json(); } catch { return json({ error: "invalid json" }, 400); }
+			const deviceId = typeof body.deviceId === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(body.deviceId)
+				? body.deviceId
+				: null;
+			const closeAll = body.closeAll === true || deviceId === null;
+			const connections = closeAll ? this.getConnections() : this.getConnections(`device:${deviceId}`);
+			let closed = 0;
+			for (const connection of connections) {
+				connection.close(4003, "device authorization changed");
+				closed++;
+			}
+			return json({ ok: true, closed });
+		}
 		if (request.method === "GET" && url.pathname === "/__kaos/meta") {
 			return json({
 				roomId: this.getRoomId(),

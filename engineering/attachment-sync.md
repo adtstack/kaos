@@ -24,7 +24,7 @@ To solve this, KAOS uses a strict, concurrency-limited worker pool. Concurrent R
 
 ### The Block-Level Chunking Trap
 
-I really like how Dropbox and Onedrive do block-level file sync. 
+I really like how Dropbox and Onedrive do block-level file sync.
 
 Imagine you had a 50 MB PDF, and you open it to read, and you make one highlight. The file is updated, so it has to be uploaded to the server. If we chunked a 50MB PDF into 50 separate 1MB blobs (actually, the blocks are much smaller, like 4KB) in R2, we would only have to upload the modified chunks when the file changes. However, this introduces a massive architectural burden: **Distributed Garbage Collection**.
 

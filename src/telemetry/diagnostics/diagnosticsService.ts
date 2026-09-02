@@ -322,7 +322,7 @@ export class DiagnosticsService {
 			generationMs: Date.now() - startedAt,
 			settings: {
 				host: settings.host,
-				token: settings.token,
+				deviceId: settings.deviceId,
 				vaultId: settings.vaultId,
 				deviceName: settings.deviceName,
 				debug: settings.debug,

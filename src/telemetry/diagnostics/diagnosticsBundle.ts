@@ -56,7 +56,7 @@ export interface DiagnosticsBundleInput {
 	generationMs: number;
 	settings: {
 		host: string;
-		token: string | null | undefined;
+		deviceId: string;
 		vaultId: string;
 		deviceName: string;
 		debug: boolean;
@@ -154,7 +154,7 @@ export async function buildDiagnosticsBundle(
 		trace: input.trace ?? null,
 		settings: {
 			host: options.includeFilenames ? settings.host : "(redacted)",
-			token: { present: !!settings.token },
+			deviceAuthentication: { configured: !!settings.deviceId, deviceId: settings.deviceId || null },
 			vaultId: options.includeFilenames ? settings.vaultId : "(redacted)",
 			deviceName: options.includeFilenames ? settings.deviceName : "(redacted)",
 			debug: settings.debug,

@@ -189,7 +189,7 @@ function makeHarness(
 		defaultVaultSync as any,
 		{
 			host: "https://worker.example",
-			token: "token",
+			getAuthorizationHeader: async () => "Bearer device-session",
 			vaultId: "vault",
 			maxAttachmentSizeKB: 1024,
 			attachmentConcurrency: 1,
@@ -2716,7 +2716,7 @@ console.log("\n--- Test 15d.1a: setup-link scope changes cannot relabel a retiri
 	let runtimeConfig = {
 		enableAttachmentSync: true,
 		host: oldScope.host,
-		token: "token",
+		authorizationHeader: async () => "Bearer device-session",
 		vaultId: oldScope.vaultId,
 		maxAttachmentSizeKB: 1024,
 		attachmentConcurrency: 1,

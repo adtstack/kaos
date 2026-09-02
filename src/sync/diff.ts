@@ -26,7 +26,7 @@ export function applyDiffToYText(
 	ytext: Y.Text,
 	oldText: string,
 	newText: string,
-	origin: string,
+	origin: string | object,
 ): void {
 	if (oldText === newText) return;
 
@@ -87,6 +87,132 @@ export interface DiffPostconditionResult {
 	finalLength: number;
 }
 
+/**
+ * A replacement hunk discovered by diffing a variant against the base:
+ * baseText[baseStart..baseEnd) is replaced by `text` (empty text = pure
+ * deletion, baseStart === baseEnd = pure insertion).
+ */
+interface BaseReplacement {
+	baseStart: number;
+	baseEnd: number;
+	text: string;
+}
+
+export interface ConcurrentEditsMergeResult {
+	/** Merged text carrying both sides' non-overlapping changes. */
+	mergedText: string;
+	/**
+	 * True when the two sides changed overlapping base regions and the
+	 * concurrent side (currentText) won the overlap by preference.
+	 */
+	hadConflictingOverlap: boolean;
+}
+
+function diffBaseReplacements(
+	baseText: string,
+	variantText: string,
+): BaseReplacement[] {
+	const replacements: BaseReplacement[] = [];
+	let basePos = 0;
+	let start = -1;
+	let end = -1;
+	let text = "";
+	const flush = () => {
+		if (start !== -1) {
+			replacements.push({ baseStart: start, baseEnd: end, text });
+		}
+		start = -1;
+		end = -1;
+		text = "";
+	};
+	for (const [op, segText] of diff(baseText, variantText)) {
+		if (op === 0) {
+			flush();
+			basePos += segText.length;
+		} else if (op === 1) {
+			if (start === -1) {
+				start = basePos;
+				end = basePos;
+			}
+			text += segText;
+		} else {
+			if (start === -1) {
+				start = basePos;
+				end = basePos;
+			}
+			end = basePos + segText.length;
+			basePos = end;
+		}
+	}
+	flush();
+	return replacements;
+}
+
+/**
+ * Three-way merge at character granularity: baseText evolved concurrently into
+ * `currentText` (e.g. live editor typing that happened after a caller captured
+ * its base) and into `targetText` (the caller's authority decision). Both
+ * sides' changes are preserved whenever they touch disjoint base regions.
+ * Overlapping changes are resolved in favor of `currentText` — the newer,
+ * concurrent edits must never be silently discarded — and the conflict is
+ * reported so callers can re-plan instead of assuming the target landed.
+ */
+export function mergeConcurrentEdits(
+	baseText: string,
+	currentText: string,
+	targetText: string,
+): ConcurrentEditsMergeResult {
+	const ours = diffBaseReplacements(baseText, currentText);
+	const theirs = diffBaseReplacements(baseText, targetText);
+	let hadConflictingOverlap = false;
+
+	// Suppress every target hunk that overlaps a concurrent hunk (or exactly
+	// duplicates it) so the sequential apply below never has to drop live edits.
+	const suppressedTheirs = new Set<number>();
+	for (let k = 0; k < theirs.length; k++) {
+		const t = theirs[k]!;
+		let suppress = false;
+		for (const o of ours) {
+			const identical =
+				o.baseStart === t.baseStart &&
+				o.baseEnd === t.baseEnd &&
+				o.text === t.text;
+			if (identical) {
+				suppress = true;
+				break;
+			}
+			const overlaps =
+				t.baseStart < o.baseEnd && o.baseStart < t.baseEnd;
+			if (overlaps) {
+				suppress = true;
+				hadConflictingOverlap = true;
+				break;
+			}
+		}
+		if (suppress) suppressedTheirs.add(k);
+	}
+
+	const applied: BaseReplacement[] = [
+		...ours,
+		...theirs.filter((_, k) => !suppressedTheirs.has(k)),
+	].sort(
+		(a, b) =>
+			a.baseStart - b.baseStart ||
+			a.baseEnd - b.baseEnd ||
+			(a.text < b.text ? -1 : a.text > b.text ? 1 : 0),
+	);
+
+	let out = "";
+	let cursor = 0;
+	for (const hunk of applied) {
+		if (hunk.baseStart < cursor) continue;
+		out += baseText.slice(cursor, hunk.baseStart) + hunk.text;
+		cursor = Math.max(cursor, hunk.baseEnd);
+	}
+	out += baseText.slice(cursor);
+	return { mergedText: out, hadConflictingOverlap };
+}
+
 export function applyDiffToYTextWithPostcondition(
 	ytext: Y.Text,
 	oldText: string,
@@ -95,31 +221,46 @@ export function applyDiffToYTextWithPostcondition(
 ): DiffPostconditionResult {
 	const currentText = ytext.toJSON();
 	if (currentText !== oldText) {
-		// The caller's base became stale before commit. The authority decision is
-		// still valid, but replaying a patch computed from oldText would be unsafe.
-		// Rebase the targeted diff on the actual Y.Text instead of deleting and
-		// reinserting the whole document. This preserves stable CRDT positions and
-		// editor selections whenever surrounding text is unchanged.
-		applyDiffToYText(ytext, currentText, newText, origin);
-		const afterRebasedDiff = ytext.toJSON();
-		if (afterRebasedDiff === newText) {
+		// The caller's base became stale before commit: the Y.Text concurrently
+		// evolved (typically live editor typing while an async recovery lane was
+		// in flight). Replaying a patch computed from newText alone would delete
+		// everything typed in the gap — the "text merges together and
+		// disappears" failure mode. Merge the caller's intended oldText→newText
+		// change with the concurrent oldText→currentText change instead, and
+		// keep the merged result even when it no longer equals newText: callers
+		// observe finalMatchesExpected=false and re-plan with a fresh capture.
+		const concurrent = mergeConcurrentEdits(oldText, currentText, newText);
+		applyDiffToYText(ytext, currentText, concurrent.mergedText, origin);
+		const afterMergedDiff = ytext.toJSON();
+		if (afterMergedDiff === newText) {
 			return {
 				diffSkippedDueToStaleBase: true,
 				matchesAfterDiff: true,
 				forceReplaceApplied: false,
 				finalMatchesExpected: true,
-				finalLength: afterRebasedDiff.length,
+				finalLength: afterMergedDiff.length,
 			};
 		}
-
-		forceReplaceYText(ytext, newText, origin);
-		const afterForce = ytext.toJSON();
+		if (afterMergedDiff !== concurrent.mergedText) {
+			// The merge diff itself failed to land (should be unreachable: the
+			// base was read synchronously). Fall back to the explicit merge
+			// result rather than to newText, which lacks the concurrent edits.
+			forceReplaceYText(ytext, concurrent.mergedText, origin);
+			const afterForce = ytext.toJSON();
+			return {
+				diffSkippedDueToStaleBase: true,
+				matchesAfterDiff: false,
+				forceReplaceApplied: true,
+				finalMatchesExpected: afterForce === newText,
+				finalLength: afterForce.length,
+			};
+		}
 		return {
 			diffSkippedDueToStaleBase: true,
 			matchesAfterDiff: false,
-			forceReplaceApplied: true,
-			finalMatchesExpected: afterForce === newText,
-			finalLength: afterForce.length,
+			forceReplaceApplied: false,
+			finalMatchesExpected: false,
+			finalLength: afterMergedDiff.length,
 		};
 	}
 
