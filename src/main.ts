@@ -750,7 +750,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	async claimServerAsOwner(host: string, claimSecret: string): Promise<{ recoverySecret: string }> {
-		const targetHost = host.trim().replace(/\/$/, "");
+		let targetHost = host.trim().replace(/\/+$/, "");
+		if (!/^https?:\/\//i.test(targetHost)) {
+			targetHost = `https://${targetHost}`;
+		}
 		const vaultId = this.settings.vaultId || generateVaultId();
 		const client = this.createDeviceAuthClient(targetHost, vaultId, this.settings.deviceName);
 		const identity = await client.getIdentity();

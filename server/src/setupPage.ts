@@ -48,10 +48,11 @@ export function renderSetupPage(options: SetupPageOptions): string {
 <h1>Claim your KAOS server</h1><p>Claiming locks this server to a private vault. Devices authenticate with their own cryptographic keys.</p>
 <p class="muted">Server: <code>${host}</code></p>
 <div id="claim-form">
+  ${options.claimEnabled === true ? "" : `<div class="card" style="border-color:#ff8a8a; color:#ff8a8a; margin-bottom:12px;"><strong>Claiming is locked:</strong> Cloudflare Worker secret <code>KAOS_CLAIM_SECRET</code> is not configured. Please set a 32+ character secret using <code>npx wrangler secret put KAOS_CLAIM_SECRET</code> or via Cloudflare Dashboard.</div>`}
   <label>Deployment claim secret<input id="claim-secret" type="password" autocomplete="off"${disabled}></label>
   <button id="claim"${disabled}>Claim server</button>
 </div>
-<div id="status" class="status"></div>
+<div id="status" class="status">${options.claimEnabled === true ? "" : "Configure KAOS_CLAIM_SECRET to enable claiming."}</div>
 <div id="complete" hidden class="details">
   <h2>Server Claimed! Connect Primary Device</h2>
   <p>Your primary device will be registered as the <strong>Owner</strong>.</p>
@@ -64,7 +65,7 @@ export function renderSetupPage(options: SetupPageOptions): string {
   <div class="card">
     <div><strong>Option 2: Enter Pairing Code on another PC/Mobile</strong></div>
     <div class="code-badge" id="pairing-code"></div>
-    <p class="muted">In Obsidian Settings $\rightarrow$ KAOS $\rightarrow$ Paste this code. (Expires in 15 mins)</p>
+    <p class="muted">In Obsidian Settings → KAOS → Paste this code. (Expires in 15 mins)</p>
   </div>
 
   <div class="card">
@@ -90,8 +91,9 @@ button?.addEventListener("click",async()=>{
     if(!res.ok)throw new Error(body.error||"Claim failed");
     form.hidden=true;
     secret.value="";
-    const pairing=body.ownerPairing;
-    const deepLink="obsidian://kaos?action=claim-owner&host="+encodeURIComponent(location.origin)+"&vaultId="+encodeURIComponent(body.vaultId)+"&secret="+encodeURIComponent(pairing?.qrSecret||"");
+    const pairing = body.ownerPairing;
+    const cleanHost = location.origin.replace(/\\/+$/, "");
+    const deepLink="obsidian://kaos?action=claim-owner&host="+encodeURIComponent(cleanHost)+"&vaultId="+encodeURIComponent(body.vaultId)+"&secret="+encodeURIComponent(pairing?.qrSecret||"");
     document.getElementById("deep-link").href=deepLink;
     document.getElementById("pairing-code").textContent=pairing?.code||"";
     document.getElementById("recovery-secret").textContent=body.recoverySecret||"";

@@ -204,11 +204,11 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 			let pasteLinkInput = "";
 			new Setting(calloutContent)
-				.setName("Connect with pairing link")
-				.setDesc("Paste the connection link or pairing string copied from an owner device.")
+				.setName("Connect with pairing link or code")
+				.setDesc("Paste the connection link or 6-character pairing code copied from an owner device.")
 				.addText((text) =>
 					// eslint-disable-next-line obsidianmd/ui/sentence-case
-					text.setPlaceholder("obsidian://kaos?action=pair&...")
+					text.setPlaceholder("obsidian://kaos?action=pair&... or KAOS-XXX-XXX")
 						.onChange((val) => { pasteLinkInput = val.trim(); }),
 				)
 				.addButton((button) =>
@@ -216,12 +216,22 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 						.setCta()
 						.onClick(async () => {
 							if (!pasteLinkInput) {
-								new Notice("Please paste a pairing link.", 4000);
+								new Notice("Please paste a pairing link or code.", 4000);
 								return;
 							}
 							const params = parseConnectionString(pasteLinkInput);
-							if (!params || !params.host || !params.vaultId || (!params.secret && !params.code && !params.invite)) {
-								new Notice("Invalid pairing link format.", 6000);
+							if (!params) {
+								new Notice("Invalid pairing link or code format.", 6000);
+								return;
+							}
+							if (!params.host && this.host.settings.host) {
+								params.host = this.host.settings.host;
+							}
+							if (!params.vaultId && this.host.settings.vaultId) {
+								params.vaultId = this.host.settings.vaultId;
+							}
+							if (!params.host || !params.vaultId || (!params.secret && !params.code && !params.invite)) {
+								new Notice("Incomplete pairing details: server URL and vault ID are required.", 6000);
 								return;
 							}
 							button.setDisabled(true);
@@ -260,7 +270,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 				.addButton((button) =>
 					button.setButtonText("Claim as owner")
 						.onClick(async () => {
-							if (!claimHostInput || !claimSecretInput) {
+							const cleanHost = claimHostInput.trim().replace(/\/+$/, "");
+							const cleanSecret = claimSecretInput.trim();
+							if (!cleanHost || !cleanSecret) {
 								new Notice("Server URL and claim secret are required.", 5000);
 								return;
 							}
@@ -270,14 +282,19 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 							}
 							button.setDisabled(true);
 							try {
-								const result = await this.host.claimServerAsOwner(claimHostInput, claimSecretInput);
+								const result = await this.host.claimServerAsOwner(cleanHost, cleanSecret);
 								new Notice("Server claimed! This device is registered as owner.", 6000);
 								if (result.recoverySecret) {
 									new RecoveryKitModal(this.app, this.host.buildRecoveryKitText() || result.recoverySecret).open();
 								}
 								this.redisplayIfVisible();
 							} catch (err) {
-								new Notice(`Claim failed: ${err instanceof Error ? err.message : "unknown error"}`, 8000);
+								const rawMsg = err instanceof Error ? err.message : "unknown error";
+								if (rawMsg.includes("already_claimed")) {
+									new Notice("This server is already claimed. Connect using a pairing link/code, or reset server storage if needed.", 9000);
+								} else {
+									new Notice(`Claim failed: ${rawMsg}`, 8000);
+								}
 							} finally {
 								button.setDisabled(false);
 							}
