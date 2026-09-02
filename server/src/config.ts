@@ -159,7 +159,13 @@ export function generatePairingCode(): string {
 }
 
 export function normalizePairingCode(input: string): string {
-	return input.toUpperCase().replace(/[^23456789ABCDEFGHJKLMNPQRSTUVWXYZ]/g, "");
+	let raw = input.trim().toUpperCase();
+	if (raw.startsWith("KAOS-") || raw.startsWith("KAOS_") || raw.startsWith("KAOS ")) {
+		raw = raw.slice(5);
+	} else if (raw.startsWith("KAOS")) {
+		raw = raw.slice(4);
+	}
+	return raw.replace(/[^23456789ABCDEFGHJKLMNPQRSTUVWXYZ]/g, "");
 }
 
 function normalizeUpdateProvider(value: unknown): UpdateProvider | null {

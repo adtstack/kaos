@@ -135,9 +135,22 @@ function responseError(response: { status: number; json: unknown }): DeviceAuthH
 }
 
 function normalizeHost(host: string): string {
-	const value = host.trim().replace(/\/$/, "");
+	let value = host.trim().replace(/\/+$/, "");
 	if (!value) throw new Error("Server host is not configured");
+	if (!/^https?:\/\//i.test(value)) {
+		value = `https://${value}`;
+	}
 	return value;
+}
+
+function normalizeDevicePairingCode(input: string): string {
+	let raw = input.trim().toUpperCase();
+	if (raw.startsWith("KAOS-") || raw.startsWith("KAOS_") || raw.startsWith("KAOS ")) {
+		raw = raw.slice(5);
+	} else if (raw.startsWith("KAOS")) {
+		raw = raw.slice(4);
+	}
+	return raw.replace(/[^23456789ABCDEFGHJKLMNPQRSTUVWXYZ]/g, "");
 }
 
 function challengeMessage(input: { challengeId: string; nonce: string; vaultId: string; deviceId: string; authGeneration: number }): string {
@@ -174,9 +187,10 @@ export class DeviceAuthClient {
 
 	async pairWithCode(code: string): Promise<{ status: "active"; deviceId: string; fingerprint: string | null }> {
 		const identity = await this.getIdentity();
+		const cleanCode = normalizeDevicePairingCode(code);
 		const response = await this.post("/api/auth/pair", {
 			vaultId: this.config.vaultId,
-			code,
+			code: cleanCode,
 			device: {
 				deviceId: identity.deviceId,
 				deviceName: this.requiredDeviceName(),

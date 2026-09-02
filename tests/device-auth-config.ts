@@ -124,21 +124,21 @@ assert.equal((await call("/__kaos/auth/pair", {
 	},
 })).status, 403, "pairing secret is single-use");
 
-// 6. Test Pairing with 6-digit Code
+// 6. Test Pairing with formatted KAOS-XXX-XXX Code
 const codePairing = await call("/__kaos/devices/pair/create", { vaultId: VAULT_ID, session: ownerSession, ttlMs: 60_000 });
 assert.equal(codePairing.status, 200);
 const desktopMember = await publicKey();
 const desktopMemberId = "desktop-member-12345";
 const codePairRes = await call("/__kaos/auth/pair", {
 	vaultId: VAULT_ID,
-	code: codePairing.body.rawCode as string,
+	code: codePairing.body.code as string,
 	device: {
 		deviceId: desktopMemberId,
 		deviceName: "Desktop PC",
 		publicKey: desktopMember.publicJwk,
 	},
 });
-assert.equal(codePairRes.status, 200, "pairing with code succeeds");
+assert.equal(codePairRes.status, 200, "pairing with KAOS- formatted code succeeds");
 assert.equal(codePairRes.body.status, "active");
 
 // 7. Security validations on public key

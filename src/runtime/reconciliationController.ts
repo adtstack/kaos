@@ -8436,9 +8436,6 @@ export class ReconciliationController {
 				return { kind: "handled" };
 			}
 			if (existingText && openBoundAction?.kind === "import-disk-to-crdt") {
-				// Restore YAOS's visible-editor authority boundary: a disk snapshot
-				// must never replace an open editor that still agrees with CRDT. Keep
-				// that visible side, preserve disk as an artifact, then CAS write back.
 				const preserved = await this.preserveOpenBoundPlannerConflict({
 					file,
 					diskContent: content,
