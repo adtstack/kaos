@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
-const PHASE_ORDER = ["preflight", "install", "reboot", "post-reboot", "update"];
+const PHASE_ORDER = ["preflight", "install", "activate", "reboot", "post-reboot", "update"];
 const DEFAULT_ZIP = "dist/kaos-headless-host-oracle.zip";
 const DEFAULT_STAMP = new Date().toISOString().replace(/[:.]/g, "-");
 const CONFIG_ALIASES = new Map([
@@ -25,7 +25,7 @@ const CONFIG_ALIASES = new Map([
 	["postflightSmokeWorkDir", "postflight-smoke-work-dir"],
 	["releaseDir", "release-dir"],
 	["remoteDir", "remote-dir"],
-	["secretFile", "secret-file"],
+	["inviteFile", "invite-file"],
 	["servicePath", "service-path"],
 	["skipLocalPrepare", "skip-local-prepare"],
 	["skipPreflight", "skip-preflight"],
@@ -40,8 +40,7 @@ const CONFIG_ALIASES = new Map([
 	["startAt", "start-at"],
 	["stopAfter", "stop-after"],
 	["summaryFile", "summary-file"],
-	["tokenDestinationFile", "token-destination-file"],
-	["tokenFile", "token-file"],
+	["deviceIdentityFile", "device-identity-file"],
 	["updateRemoteDir", "update-remote-dir"],
 	["vaultId", "vault-id"],
 	["waitSshConnectTimeoutSec", "wait-ssh-connect-timeout-sec"],
@@ -66,9 +65,8 @@ const CONFIG_PATH_KEYS = new Set([
 	"evidence-root",
 	"identity-file",
 	"release-dir",
-	"secret-file",
+	"invite-file",
 	"summary-file",
-	"token-file",
 	"zip",
 ]);
 
@@ -77,6 +75,9 @@ async function main() {
 	if (parsed.help === "true") {
 		printUsage();
 		return;
+	}
+	for (const legacy of ["token", "token-file", "secret-file", "token-destination-file"]) {
+		if (parsed[legacy] !== undefined) throw new Error(`--${legacy} is no longer supported; use --invite-file for enrollment and an approved service device.`);
 	}
 	const withConfigDefaults = await applyConfigDefaults(parsed);
 	const resumeDefaults = await applyResumeSummaryDefaults(withConfigDefaults);
@@ -94,6 +95,12 @@ async function main() {
 	const initialCompleted = completedPrefixFromResumeSummary(resumeSummary, runPhases[0]);
 	const phases = mergeSummaryPhases(initialCompleted, runPhases);
 	validateAcceptanceOptions(raw, runPhases, remoteDir, updateRemoteDir);
+	if (runPhases.includes("install") && runPhases.includes("activate")) {
+		throw new Error("Initial install and activation must run separately: stop after install, have the Owner approve the displayed fingerprint, then resume at activate.");
+	}
+	if (runPhases.includes("activate") && raw["confirm-owner-approved"] !== "true" && raw["dry-run"] !== "true" && raw["validate-local"] !== "true") {
+		throw new Error("--confirm-owner-approved is required for activation after the Owner has approved the device fingerprint.");
+	}
 	const requiresConfirmReboot = runPhases.includes("reboot");
 	const confirmedReboot = raw["confirm-reboot"] === "true";
 	if (requiresConfirmReboot && !confirmedReboot && raw["dry-run"] !== "true" && raw["validate-local"] !== "true") {
@@ -102,11 +109,10 @@ async function main() {
 	if (runPhases.includes("install")) {
 		if (!raw["worker-host"]) throw new Error("--worker-host is required when acceptance includes install.");
 		if (!raw["vault-id"]) throw new Error("--vault-id is required when acceptance includes install.");
-		if (!raw["token-file"]) throw new Error("--token-file is required when acceptance includes install.");
+		if (!raw["invite-file"]) throw new Error("--invite-file is required when acceptance includes install.");
 	}
 
 	const evidenceDirs = evidenceDirsFor(phases, evidenceRoot);
-	const secretFile = raw["secret-file"] ?? raw["token-file"] ?? null;
 	if (raw["validate-local"] === "true") {
 		const payload = await validateLocalAcceptance({
 			raw,
@@ -116,7 +122,6 @@ async function main() {
 			evidenceRoot,
 			evidenceDirs,
 			summaryFile,
-			secretFile,
 			phases,
 			runPhases,
 			requiresConfirmReboot,
@@ -138,7 +143,6 @@ async function main() {
 			sshTarget,
 			remoteDir: phase === "update" ? updateRemoteDir : remoteDir,
 			evidenceRoot,
-			secretFile,
 		}));
 		console.log(JSON.stringify({
 			kind: "headless-host-oracle-acceptance",
@@ -166,7 +170,7 @@ async function main() {
 	}
 
 	await mkdir(evidenceRoot, { recursive: true });
-	const redactor = createRedactor([secretFile ? await readFile(secretFile, "utf8").catch(() => "") : ""]);
+	const redactor = createRedactor([]);
 	const completed = [...initialCompleted];
 	const basePayload = {
 		kind: "headless-host-oracle-acceptance",
@@ -193,7 +197,6 @@ async function main() {
 			sshTarget,
 			remoteDir: phase === "update" ? updateRemoteDir : remoteDir,
 			evidenceRoot,
-			secretFile,
 			redactor,
 		});
 		completed.push(step);
@@ -313,7 +316,6 @@ async function validateLocalAcceptance({
 	evidenceRoot,
 	evidenceDirs,
 	summaryFile,
-	secretFile,
 	phases,
 	runPhases,
 	requiresConfirmReboot,
@@ -330,7 +332,7 @@ async function validateLocalAcceptance({
 		"update-remote-dir": updateRemoteDir,
 		...(raw["worker-host"] ? { "worker-host": raw["worker-host"] } : {}),
 		...(raw["vault-id"] ? { "vault-id": raw["vault-id"] } : {}),
-		...(raw["token-file"] ? { "token-file": raw["token-file"] } : {}),
+		...(raw["invite-file"] ? { "invite-file": raw["invite-file"] } : {}),
 	});
 	addCheck(checks, "helper:remote-rehearsal", Boolean(findLocalHelper("run-headless-host-oracle-remote-rehearsal.mjs")), {
 		helper: "run-headless-host-oracle-remote-rehearsal.mjs",
@@ -343,10 +345,7 @@ async function validateLocalAcceptance({
 		});
 	}
 	if (needsInstall) {
-		await addReadableNonemptyFileCheck(checks, "token-file", resolve(raw["token-file"]));
-	}
-	if (secretFile && secretFile !== raw["token-file"]) {
-		await addReadableNonemptyFileCheck(checks, "secret-file", resolve(secretFile));
+		await addPrivateFileCheck(checks, "invite-file", resolve(raw["invite-file"]));
 	}
 	if (needsInstallOrUpdate) {
 		if (raw["skip-local-prepare"] === "true") {
@@ -406,19 +405,17 @@ function detectPlaceholder(value) {
 	return null;
 }
 
-async function addReadableNonemptyFileCheck(checks, name, path) {
+async function addPrivateFileCheck(checks, name, path) {
 	try {
-		const text = await readFile(path, "utf8");
-		addCheck(checks, `file:${name}`, text.trim().length > 0, {
+		const details = await lstat(path);
+		const ok = details.isFile() && !details.isSymbolicLink() && (details.mode & 0o077) === 0;
+		addCheck(checks, `file:${name}`, ok, {
 			path,
-			bytes: Buffer.byteLength(text),
-			error: `${name} must be readable and non-empty`,
+			mode: `0${(details.mode & 0o777).toString(8).padStart(3, "0")}`,
+			error: `${name} must be a regular 0600 file`,
 		});
 	} catch (err) {
-		addCheck(checks, `file:${name}`, false, {
-			path,
-			error: err instanceof Error ? err.message : String(err),
-		});
+		addCheck(checks, `file:${name}`, false, { path, error: err instanceof Error ? err.message : String(err) });
 	}
 }
 
@@ -620,7 +617,8 @@ function evidenceDirsFor(phases, evidenceRoot) {
 
 function nextStepAfter(lastPhase, { remoteDir, updateRemoteDir }) {
 	if (lastPhase === "preflight") return `rerun with --start-at install --remote-dir ${remoteDir}`;
-	if (lastPhase === "install") return `rerun with --start-at reboot --remote-dir ${remoteDir} --confirm-reboot`;
+	if (lastPhase === "install") return `Compare and approve the pending device fingerprint, then rerun with --start-at activate --confirm-owner-approved --remote-dir ${remoteDir}`;
+	if (lastPhase === "activate") return `rerun with --start-at reboot --remote-dir ${remoteDir} --confirm-reboot`;
 	if (lastPhase === "reboot") return `rerun with --start-at post-reboot --remote-dir ${remoteDir}`;
 	if (lastPhase === "post-reboot") return `rerun with --start-at update --remote-dir ${remoteDir} --update-remote-dir ${updateRemoteDir}`;
 	return "acceptance complete; inspect evidenceRoot and keep the update evidence with the release";
@@ -648,8 +646,8 @@ function selectedPhases(raw) {
 	return order.slice(start, stop + 1);
 }
 
-function planAcceptancePhase({ phase, raw, sshTarget, remoteDir, evidenceRoot, secretFile }) {
-	const args = buildAcceptancePhaseArgs({ phase, raw, sshTarget, remoteDir, evidenceRoot, secretFile });
+function planAcceptancePhase({ phase, raw, sshTarget, remoteDir, evidenceRoot }) {
+	const args = buildAcceptancePhaseArgs({ phase, raw, sshTarget, remoteDir, evidenceRoot });
 	return {
 		phase,
 		command: process.execPath,
@@ -659,8 +657,8 @@ function planAcceptancePhase({ phase, raw, sshTarget, remoteDir, evidenceRoot, s
 	};
 }
 
-function runAcceptancePhase({ phase, raw, sshTarget, remoteDir, evidenceRoot, secretFile, redactor }) {
-	const args = buildAcceptancePhaseArgs({ phase, raw, sshTarget, remoteDir, evidenceRoot, secretFile });
+function runAcceptancePhase({ phase, raw, sshTarget, remoteDir, evidenceRoot, redactor }) {
+	const args = buildAcceptancePhaseArgs({ phase, raw, sshTarget, remoteDir, evidenceRoot });
 	const result = spawnSync(process.execPath, args, { encoding: "utf8" });
 	const stdout = redactor(result.stdout ?? "");
 	const stderr = redactor(result.stderr ?? "");
@@ -676,7 +674,7 @@ function runAcceptancePhase({ phase, raw, sshTarget, remoteDir, evidenceRoot, se
 	};
 }
 
-function buildAcceptancePhaseArgs({ phase, raw, sshTarget, remoteDir, evidenceRoot, secretFile }) {
+function buildAcceptancePhaseArgs({ phase, raw, sshTarget, remoteDir, evidenceRoot }) {
 	const helper = resolveLocalHelper("run-headless-host-oracle-remote-rehearsal.mjs");
 	const args = [
 		helper,
@@ -695,22 +693,21 @@ function buildAcceptancePhaseArgs({ phase, raw, sshTarget, remoteDir, evidenceRo
 			raw["worker-host"],
 			"--vault-id",
 			raw["vault-id"],
-			"--token-file",
-			resolve(raw["token-file"]),
+			"--invite-file",
+			resolve(raw["invite-file"]),
 			"--evidence-dir",
 			join(evidenceRoot, "install"),
 		);
-		pushOptional(args, raw, ["device-name"]);
+		pushOptional(args, raw, ["device-name", "device-identity-file"]);
 		pushInstallUpdateOptions(args, raw);
 		pushLocalPrepareOptions(args, raw);
-		pushSecretFile(args, secretFile);
+	} else if (phase === "activate") {
+		args.push("--confirm-owner-approved");
+		pushOptional(args, raw, ["install-dir", "installed-runner", "service-path", "postflight-smoke-work-dir", "device-identity-file"]);
 	} else if (phase === "update") {
 		args.push("--evidence-dir", join(evidenceRoot, "update"));
 		pushInstallUpdateOptions(args, raw);
 		pushLocalPrepareOptions(args, raw);
-		pushSecretFile(args, secretFile);
-	} else if (phase === "reboot") {
-		pushSecretFile(args, secretFile);
 	} else if (phase === "post-reboot") {
 		args.push(
 			"--wait-for-ssh",
@@ -734,10 +731,9 @@ function buildAcceptancePhaseArgs({ phase, raw, sshTarget, remoteDir, evidenceRo
 			"data-file",
 			"lock-file",
 			"env-file",
-			"token-destination-file",
+			"device-identity-file",
 			"smoke-work-dir",
 		]);
-		pushSecretFile(args, secretFile);
 	}
 
 	return args;
@@ -764,6 +760,7 @@ function pushInstallUpdateOptions(args, raw) {
 		"metadata-path",
 		"postflight-smoke-work-dir",
 		"node",
+		"device-identity-file",
 	]);
 	if (raw["skip-remote-preflight"] === "true") args.push("--skip-remote-preflight");
 }
@@ -779,9 +776,6 @@ function pushOptional(args, raw, names) {
 	}
 }
 
-function pushSecretFile(args, secretFile) {
-	if (secretFile) args.push("--secret-file", resolve(secretFile));
-}
 
 function resolveLocalHelper(name) {
 	const found = findLocalHelper(name);
@@ -811,6 +805,7 @@ function parseArgs(argv) {
 		}
 		if ([
 			"--confirm-reboot",
+			"--confirm-owner-approved",
 			"--skip-preflight",
 			"--skip-update",
 			"--skip-local-prepare",
@@ -870,12 +865,12 @@ function redactArgs(args) {
 	const redacted = [];
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
-		if (arg === "--token-file" || arg === "--secret-file") {
-			redacted.push(arg, arg === "--token-file" ? "[token-file]" : "[secret-file]");
+		if (arg === "--invite-file") {
+			redacted.push(arg, "[invite-file]");
 			i++;
 			continue;
 		}
-		redacted.push(String(arg).replace(/sync-token/g, "[token-file]"));
+		redacted.push(String(arg));
 	}
 	return redacted;
 }
@@ -900,13 +895,13 @@ function printUsage() {
 
 Runs the full real-VM Oracle acceptance flow by delegating to
 run-headless-host-oracle-remote-rehearsal.mjs for each phase:
-preflight -> install -> reboot -> post-reboot -> update.
+preflight -> install -> activate -> reboot -> post-reboot -> update.
 
 Required for a full run:
   --ssh-target <user@host>
   --worker-host <url>
   --vault-id <id>
-  --token-file <path>
+  --invite-file <path>
   --confirm-reboot
 
 Common options:
@@ -919,7 +914,7 @@ Common options:
   --config <path>              JSON defaults for this command. CLI flags override
                                config values. Relative file paths in config are
                                resolved from the config file directory.
-  --validate-local             Validate config, token file, release assets, and
+  --validate-local             Validate config, protected invitation file, release assets, and
                                local bundle gates without running ssh/scp,
                                writing evidence, or requiring --confirm-reboot.
   --dry-run                    Print the exact phase plan without running ssh/scp,
@@ -928,7 +923,7 @@ Common options:
                                ssh target, remote dirs, evidence root, summary file,
                                and start phase from the saved result, then merges
                                earlier successful phases into the new summary.
-  --start-at <phase>           Resume at preflight, install, reboot, post-reboot, or update.
+  --start-at <phase>           Resume at preflight, install, activate, reboot, post-reboot, or update.
   --stop-after <phase>         Stop after a specific phase.
   --skip-preflight             Omit the standalone preflight phase.
   --skip-update                Omit the final update rehearsal.
@@ -950,7 +945,7 @@ Common options:
   --journal-since <value>      Forwarded journalctl --since value.
   --smoke-work-dir <path>      Forwarded standalone smoke work directory.
   --wait-ssh-timeout-ms <ms>   Forwarded post-reboot SSH wait timeout.
-  --secret-file <path>         Secret leak scan file. Defaults to --token-file.
+  --device-identity-file <path> Remote service identity location. Defaults to the protected system path.
   --ssh <path>                 SSH executable. Defaults to ssh.
   --scp <path>                 SCP executable. Defaults to scp.
   --timeout <ms>               Remote phase command timeout.
@@ -960,7 +955,7 @@ Example:
     --ssh-target opc@YOUR_ORACLE_VM \\
     --worker-host https://YOUR_WORKER_HOST \\
     --vault-id YOUR_VAULT_ID \\
-    --token-file /secure/local/path/to/sync-token \\
+		--invite-file /secure/local/path/to/device-enroll.invite \\
     --remote-dir kaos-headless-acceptance-YYYYMMDDTHHMMSSZ \\
     --evidence-root ./oracle-acceptance-logs \\
     --confirm-reboot

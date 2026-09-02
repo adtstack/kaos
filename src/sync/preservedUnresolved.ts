@@ -239,6 +239,16 @@ export class PreservedUnresolvedRegistry {
 		return this.entries.delete(normalized);
 	}
 
+	resolveEpisode(path: string, expectedEpisodeId: string): boolean {
+		const normalized = normalizePath(path);
+		const current = this.entries.get(normalized);
+		if (!current || getPreservedUnresolvedEpisodeId(current) !== expectedEpisodeId) {
+			return false;
+		}
+		this.paths.delete(normalized);
+		return this.entries.delete(normalized);
+	}
+
 	has(path: string): boolean {
 		return this.entries.has(normalizePath(path));
 	}
@@ -338,4 +348,46 @@ export class PreservedUnresolvedRegistry {
 			})),
 		};
 	}
+}
+
+export type AttentionAuditClassification = "active" | "retirable" | "needs-review";
+
+export interface AttentionAuditItem {
+	entry: PreservedUnresolvedEntry;
+	classification: AttentionAuditClassification;
+	rationale: string;
+	episodeId: string;
+	remoteDeleteFingerprint?: string | null;
+	pairPath?: string | null;
+}
+
+export interface AttentionAuditSummary {
+	totalCount: number;
+	activeCount: number;
+	retirableCount: number;
+	needsReviewCount: number;
+	byReason: Record<string, { active: number; retirable: number; needsReview: number }>;
+}
+
+export interface AttentionAuditResult {
+	timestamp: number;
+	items: AttentionAuditItem[];
+	summary: AttentionAuditSummary;
+}
+
+export interface AttentionRetirementTarget {
+	path: string;
+	kind: PreservedUnresolvedKind;
+	reason: PreservedUnresolvedReason;
+	episodeId: string;
+	expectedRemoteFingerprint?: string | null;
+	pairPath?: string | null;
+}
+
+export interface AttentionRetirementSummary {
+	retiredCount: number;
+	failedCount: number;
+	reasons: Record<string, number>;
+	retiredPaths: string[];
+	failedPaths: string[];
 }

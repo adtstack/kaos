@@ -3539,7 +3539,10 @@ console.log("\n--- Test 5f4b1: unchanged editor lineage never suppresses a disti
 	fix.controller.noteInterceptedExternalDiskMutation(older);
 	fix.controller.noteInterceptedExternalDiskMutation(newer);
 	clearMarkdownDrainTimer(fix.controller);
-	await new Promise<void>((resolve) => setTimeout(resolve, 0));
+	await waitForAsyncCondition(
+		() => fix.getDiscardedRevisions().some((record) => record.reason === "superseded-external-revision"),
+		"5f4b1 superseded discard",
+	);
 
 	assertEq(fix.getCreatedFiles().size, 0, "unchanged editor authority creates no conflict artifact");
 	assert(
@@ -3581,7 +3584,10 @@ console.log("\n--- Test 5f4b2: out-of-order reads preserve the older distinct re
 	fix.controller.noteInterceptedExternalDiskMutation(newer);
 	fix.controller.noteInterceptedExternalDiskMutation(older);
 	clearMarkdownDrainTimer(fix.controller);
-	await new Promise<void>((resolve) => setTimeout(resolve, 0));
+	await waitForAsyncCondition(
+		() => fix.getDiscardedRevisions().some((record) => record.reason === "superseded-external-revision"),
+		"5f4b2 superseded discard",
+	);
 
 	assertEq(fix.getCreatedFiles().size, 0, "delayed older read creates no conflict artifact");
 	assert(
@@ -3621,7 +3627,10 @@ console.log("\n--- Test 5f4b2a: subsequence content is not causal adoption proof
 	fix.controller.noteInterceptedExternalDiskMutation(older);
 	fix.controller.noteInterceptedExternalDiskMutation(newer);
 	clearMarkdownDrainTimer(fix.controller);
-	await new Promise<void>((resolve) => setTimeout(resolve, 0));
+	await waitForAsyncCondition(
+		() => fix.getDiscardedRevisions().some((record) => record.reason === "superseded-external-revision"),
+		"5f4b2a superseded discard",
+	);
 
 	assertEq(fix.getCreatedFiles().size, 0, "false-adoption candidate creates no conflict artifact");
 	assert(
@@ -3657,7 +3666,10 @@ console.log("\n--- Test 5f4b3: an editor-authority advance vetoes revision coale
 	fix.controller.noteInterceptedExternalDiskMutation(older);
 	fix.controller.noteInterceptedExternalDiskMutation(newer);
 	clearMarkdownDrainTimer(fix.controller);
-	await new Promise<void>((resolve) => setTimeout(resolve, 0));
+	await waitForAsyncCondition(
+		() => fix.getDiscardedRevisions().some((record) => record.reason === "superseded-external-revision"),
+		"5f4b3 superseded discard",
+	);
 
 	assertEq(fix.getCreatedFiles().size, 0, "intervening editor authority creates no conflict artifact");
 	assert(
@@ -3723,7 +3735,10 @@ console.log("\n--- Test 5f4b4: every distinct revision fails closed across linea
 		fix.controller.noteInterceptedExternalDiskMutation(older);
 		fix.controller.noteInterceptedExternalDiskMutation(newer);
 		clearMarkdownDrainTimer(fix.controller);
-		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		await waitForAsyncCondition(
+			() => fix.getDiscardedRevisions().some((record) => record.reason === "superseded-external-revision"),
+			`${scenario.label} superseded discard`,
+		);
 		assertEq(fix.getCreatedFiles().size, 0, `${scenario.label} creates no conflict artifact`);
 		assert(
 			fix.getDiscardedRevisions().some((record) => record.reason === "superseded-external-revision"),
@@ -3752,7 +3767,10 @@ console.log("\n--- Test 5f4c: newer revision durably preserves the superseded cu
 	fix.controller.noteInterceptedExternalDiskMutation(older);
 	fix.controller.noteInterceptedExternalDiskMutation(newer);
 	clearMarkdownDrainTimer(fix.controller);
-	await new Promise<void>((resolve) => setTimeout(resolve, 0));
+	await waitForAsyncCondition(
+		() => fix.getDiscardedRevisions().some((record) => record.reason === "superseded-external-revision"),
+		"5f4c superseded discard",
+	);
 
 	assertEq(fix.getCreatedFiles().size, 0, "newer revision creates no conflict artifact");
 	assertEq(
@@ -3801,7 +3819,10 @@ console.log("\n--- Test 5f4d: delayed older revision is preserved without changi
 	fix.controller.noteInterceptedExternalDiskMutation(
 		makeInterceptedCandidate(fix.path, older, 11),
 	);
-	await new Promise<void>((resolve) => setTimeout(resolve, 0));
+	await waitForAsyncCondition(
+		() => fix.getDiscardedRevisions().some((record) => record.reason === "superseded-external-revision"),
+		"5f4d superseded discard",
+	);
 
 	assertEq(fix.getCreatedFiles().size, 0, "older distinct revision creates no conflict artifact");
 	assert(

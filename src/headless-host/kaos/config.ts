@@ -3,9 +3,10 @@ import { dirname } from "node:path";
 
 export interface KaosHeadlessConfigPatch {
 	host?: string;
-	token?: string;
 	vaultId?: string;
 	deviceName?: string;
+	deviceId?: string;
+	identityFile?: string;
 	enableAttachmentSync?: boolean;
 }
 
@@ -33,10 +34,14 @@ export function mergeConfigPatch(data: Record<string, unknown>, patch: KaosHeadl
 		...patch,
 		...(patch.enableAttachmentSync !== undefined && { attachmentSyncExplicitlyConfigured: true }),
 	};
-	return {
+	const next = {
 		...data,
 		...Object.fromEntries(Object.entries(effectivePatch).filter(([, value]) => value !== undefined)),
 	};
+	// Older headless data.json files may contain the shared token.  Configuration
+	// now records only an identity path and public device ID.
+	delete next.token;
+	return next;
 }
 
 async function readExistingData(dataFile: string): Promise<Record<string, unknown>> {

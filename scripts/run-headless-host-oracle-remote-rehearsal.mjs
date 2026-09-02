@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
-import { mkdir, readFile } from "node:fs/promises";
+import { lstat, mkdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -19,11 +19,14 @@ async function main() {
 		printUsage();
 		return;
 	}
+	for (const legacy of ["token", "token-file", "secret-file"]) {
+		if (raw[legacy] !== undefined) throw new Error(`--${legacy} is no longer supported; the remote flow uses a one-time invite file and an approved device identity.`);
+	}
 
 	const phase = raw.phase ?? "install";
 	const sshTarget = raw["ssh-target"] ?? raw.target;
 	if (!sshTarget) throw new Error("--ssh-target is required.");
-	if (!["preflight", "install", "update", "reboot", "post-reboot"].includes(phase)) {
+	if (!["preflight", "install", "activate", "update", "reboot", "post-reboot"].includes(phase)) {
 		throw new Error(`unsupported --phase: ${phase}`);
 	}
 	const fetchLogDirRaw = raw["fetch-log-dir"] ?? raw["evidence-dir"] ?? null;
@@ -52,10 +55,8 @@ async function main() {
 	}
 	const zipPath = resolve(raw.zip ?? DEFAULT_ZIP);
 	const checksumPath = resolve(raw.checksum ?? `${zipPath}.sha256`);
-	const tokenFile = raw["token-file"] ? resolve(raw["token-file"]) : null;
-	const secretFile = raw["secret-file"] ? resolve(raw["secret-file"]) : tokenFile;
-	const tokenSecret = secretFile ? await readFile(secretFile, "utf8").catch(() => "") : "";
-	const redactor = createRedactor([tokenSecret]);
+	const inviteFile = raw["invite-file"] ? resolve(raw["invite-file"]) : null;
+	const redactor = createRedactor([]);
 	failureContext = {
 		phase,
 		sshTarget,
@@ -100,7 +101,8 @@ async function main() {
 		if (phase === "install") {
 			if (!raw["worker-host"]) throw new Error("--worker-host is required during install phase.");
 			if (!raw["vault-id"]) throw new Error("--vault-id is required during install phase.");
-			if (!tokenFile) throw new Error("--token-file is required during install phase.");
+			if (!inviteFile) throw new Error("--invite-file is required during install phase.");
+			await assertPrivateInputFile(inviteFile, "invite file");
 		}
 
 		await runLocalPrepare(raw, completed, redactor);
@@ -145,11 +147,11 @@ async function main() {
 		});
 		if (phase === "install") {
 			runScp({
-				name: "upload-token",
+				name: "upload-enrollment-invite",
 				command: scpCommand,
 				extraArgs: scpArgs,
-				source: tokenFile,
-				destination: remoteTarget(sshTarget, `${remoteDir}/sync-token`),
+				source: inviteFile,
+				destination: remoteTarget(sshTarget, `${remoteDir}/enroll.invite`),
 				completed,
 				redactor,
 			});
@@ -160,6 +162,18 @@ async function main() {
 			extraArgs: sshArgs,
 			target: sshTarget,
 			remoteScript: phase === "install" ? installRemoteScript(raw, remoteDir) : updateRemoteScript(raw, remoteDir),
+			completed,
+			redactor,
+			timeout: Number(raw.timeout ?? 900_000),
+		});
+	} else if (phase === "activate") {
+		if (raw["confirm-owner-approved"] !== "true") throw new Error("--confirm-owner-approved is required after the Owner has approved the enrolled device.");
+		runSsh({
+			name: "remote-activate-approved-device",
+			command: sshCommand,
+			extraArgs: sshArgs,
+			target: sshTarget,
+			remoteScript: activateRemoteScript(raw, remoteDir),
 			completed,
 			redactor,
 			timeout: Number(raw.timeout ?? 900_000),
@@ -206,7 +220,6 @@ async function main() {
 	if (verifyFetchedLogs) {
 		runLocalVerifier({
 			logDir: fetchedLogDir,
-			secretFile,
 			mode: verifierModeForPhase(phase),
 			requireRebootRequest: raw["require-reboot-request"] === "true",
 			completed,
@@ -224,7 +237,9 @@ async function main() {
 		verifiedFetchedLogs: verifyFetchedLogs,
 		completed,
 		nextStep: phase === "install"
-			? `reboot ${sshTarget}, then rerun with --phase post-reboot --wait-for-ssh --remote-dir ${remoteDir}`
+			? "Compare the displayed device fingerprint in the Owner UI, approve it, then rerun with --phase activate --confirm-owner-approved."
+			: phase === "activate"
+				? `approved device activated; reboot ${sshTarget}, then rerun with --phase post-reboot --wait-for-ssh --remote-dir ${remoteDir}`
 			: phase === "update"
 				? "update phase complete; fetched logs are update-verifiable with --mode update"
 				: phase === "reboot"
@@ -241,7 +256,7 @@ function verifierModeForPhase(phase) {
 	return "full";
 }
 
-function runLocalVerifier({ logDir, secretFile, mode, requireRebootRequest, completed, redactor }) {
+function runLocalVerifier({ logDir, mode, requireRebootRequest, completed, redactor }) {
 	const verifier = resolveLocalHelper("verify-headless-host-oracle-rehearsal.mjs");
 	const args = [
 		verifier,
@@ -257,9 +272,6 @@ function runLocalVerifier({ logDir, secretFile, mode, requireRebootRequest, comp
 		}
 		args.push("--require-reboot-request");
 	}
-	if (secretFile) {
-		args.push("--secret-file", secretFile);
-	}
 	const result = spawnSync(process.execPath, args, {
 		encoding: "utf8",
 		timeout: 120_000,
@@ -270,7 +282,6 @@ function runLocalVerifier({ logDir, secretFile, mode, requireRebootRequest, comp
 		logDir,
 		...(mode && mode !== "full" ? ["--mode", mode] : []),
 		...(requireRebootRequest ? ["--require-reboot-request"] : []),
-		...(secretFile ? ["--secret-file", "[secret-file]"] : []),
 	];
 	recordStep({
 		name: "verify-fetched-logs",
@@ -325,8 +336,6 @@ async function runLocalPrepare(raw, completed, redactor) {
 }
 
 function installRemoteScript(raw, remoteDir) {
-	const bundleDir = `${remoteDir}/kaos-headless-host-oracle`;
-	const tokenPath = `${remoteDir}/sync-token`;
 	const runnerArgs = [
 		"node",
 		"\"$BUNDLE_DIR/run-headless-host-oracle-rehearsal.mjs\"",
@@ -340,8 +349,8 @@ function installRemoteScript(raw, remoteDir) {
 		shellQuote(raw["vault-id"]),
 		"--device-name",
 		shellQuote(raw["device-name"] ?? "oracle-headless"),
-		"--token-file",
-		"\"$TOKEN_FILE\"",
+		"--invite-file",
+		"\"$INVITE_FILE\"",
 		"--log-dir",
 		"\"$REMOTE_DIR\"",
 	];
@@ -349,23 +358,43 @@ function installRemoteScript(raw, remoteDir) {
 		"install-dir",
 		"service-path",
 		"metadata-path",
+		"device-identity-file",
 		"postflight-smoke-work-dir",
 		"node",
 	]);
 	const parts = [
 		"set -euo pipefail",
-		`REMOTE_DIR=${shellQuote(remoteDir)}`,
-		`BUNDLE_DIR=${shellQuote(bundleDir)}`,
-		`TOKEN_FILE=${shellQuote(tokenPath)}`,
-		"trap 'rm -f \"$TOKEN_FILE\"' EXIT",
-		"cd \"$REMOTE_DIR\"",
-		"chmod 600 \"$TOKEN_FILE\"",
+		`cd ${shellQuote(remoteDir)}`,
+		"REMOTE_DIR=\"$(pwd)\"",
+		"BUNDLE_DIR=\"$REMOTE_DIR/kaos-headless-host-oracle\"",
+		"INVITE_FILE=\"$REMOTE_DIR/enroll.invite\"",
+		"trap 'rm -f \"$INVITE_FILE\"' EXIT",
+		"chmod 600 \"$INVITE_FILE\"",
 		"sha256sum -c kaos-headless-host-oracle.zip.sha256 | tee \"$REMOTE_DIR/01-zip-sha256.txt\"",
 		"rm -rf \"$BUNDLE_DIR\"",
 		"unzip -q kaos-headless-host-oracle.zip -d \"$BUNDLE_DIR\"",
 		runnerArgs.join(" "),
 	];
 	return parts.join("\n");
+}
+
+function activateRemoteScript(raw, remoteDir) {
+	const installDir = raw["install-dir"] ?? DEFAULT_INSTALL_DIR;
+	const installedRunner = raw["installed-runner"] ?? `${installDir}/run-headless-host-oracle-rehearsal.mjs`;
+	const runnerArgs = [
+		"node", "\"$INSTALLED_RUNNER\"", "--phase", "activate", "--confirm-owner-approved", "--log-dir", "\"$REMOTE_DIR\"",
+	];
+	pushOptionalRunnerArgs(runnerArgs, raw, [
+		"install-dir", "service-path", "installed-update-wrapper", "postflight-smoke-work-dir", "device-identity-file",
+	]);
+	return [
+		"set -euo pipefail",
+		`cd ${shellQuote(remoteDir)}`,
+		"REMOTE_DIR=\"$(pwd)\"",
+		`INSTALLED_RUNNER=${shellQuote(installedRunner)}`,
+		"test -r \"$INSTALLED_RUNNER\"",
+		runnerArgs.join(" "),
+	].join("\n");
 }
 
 function preflightRemoteScript(remoteDir) {
@@ -409,7 +438,6 @@ function preflightRemoteScript(remoteDir) {
 }
 
 function updateRemoteScript(raw, remoteDir) {
-	const bundleDir = `${remoteDir}/kaos-headless-host-oracle`;
 	const runnerArgs = [
 		"node",
 		"\"$BUNDLE_DIR/run-headless-host-oracle-rehearsal.mjs\"",
@@ -425,13 +453,14 @@ function updateRemoteScript(raw, remoteDir) {
 		"service-path",
 		"metadata-path",
 		"postflight-smoke-work-dir",
+		"device-identity-file",
 		"node",
 	]);
 	return [
 		"set -euo pipefail",
-		`REMOTE_DIR=${shellQuote(remoteDir)}`,
-		`BUNDLE_DIR=${shellQuote(bundleDir)}`,
-		"cd \"$REMOTE_DIR\"",
+		`cd ${shellQuote(remoteDir)}`,
+		"REMOTE_DIR=\"$(pwd)\"",
+		"BUNDLE_DIR=\"$REMOTE_DIR/kaos-headless-host-oracle\"",
 		"sha256sum -c kaos-headless-host-oracle.zip.sha256 | tee \"$REMOTE_DIR/01-zip-sha256.txt\"",
 		"rm -rf \"$BUNDLE_DIR\"",
 		"unzip -q kaos-headless-host-oracle.zip -d \"$BUNDLE_DIR\"",
@@ -462,7 +491,7 @@ function postRebootRemoteScript(raw, remoteDir) {
 		"data-file",
 		"lock-file",
 		"env-file",
-		"token-destination-file",
+		"device-identity-file",
 		"smoke-work-dir",
 	]);
 	return [
@@ -536,8 +565,8 @@ function runScp({ name, command, extraArgs = [], source, destination, completed,
 		encoding: "utf8",
 		timeout: 300_000,
 	});
-	const displayArgs = name === "upload-token"
-		? [...extraArgs, ...(recursive ? ["-r"] : []), "[token-file]", destination]
+	const displayArgs = name === "upload-enrollment-invite"
+		? [...extraArgs, ...(recursive ? ["-r"] : []), "[invite-file]", destination]
 		: args;
 	recordStep({ name, command, args, displayArgs, result, completed, redactor });
 }
@@ -677,8 +706,8 @@ function parseArgs(argv) {
 			out["wait-for-ssh"] = "true";
 			continue;
 		}
-		if (arg === "--require-reboot-request") {
-			out["require-reboot-request"] = "true";
+		if (arg === "--require-reboot-request" || arg === "--confirm-owner-approved") {
+			out[arg.slice(2)] = "true";
 			continue;
 		}
 		if (!arg.startsWith("--")) {
@@ -816,8 +845,23 @@ function createRedactor(secrets) {
 	};
 }
 
+async function assertPrivateInputFile(path, label) {
+	const details = await lstat(path);
+	if (!details.isFile() || details.isSymbolicLink() || (details.mode & 0o077) !== 0) {
+		throw new Error(`${label} must be a regular 0600 file: ${path}`);
+	}
+}
+
 function redactArgs(args) {
-	return args.map((arg) => arg.includes("sync-token") ? arg.replace(/sync-token/g, "[token-file]") : arg);
+	const redacted = [];
+	for (let index = 0; index < args.length; index++) {
+		redacted.push(args[index]);
+		if (args[index] === "--invite-file" && index + 1 < args.length) {
+			redacted.push("[invite-file]");
+			index++;
+		}
+	}
+	return redacted;
 }
 
 function trimOutput(text) {
@@ -829,7 +873,7 @@ function printUsage() {
 	console.log(`Usage: node scripts/run-headless-host-oracle-remote-rehearsal.mjs [options]
 
 Options:
-  --phase <preflight|install|update|reboot|post-reboot>
+  --phase <preflight|install|activate|update|reboot|post-reboot>
       Remote rehearsal phase. Defaults to install.
   --ssh-target <user@host>
       SSH target for the Oracle VM. Required.
@@ -854,6 +898,14 @@ Options:
       KAOS vault id. Required for install phase.
   --device-name <name>
       Headless device name. Defaults to oracle-headless.
+	--invite-file <path>
+	  One-time 0600 Owner invitation for the first install. It is uploaded only
+	  for enrollment and removed on the remote host immediately afterward.
+	--device-identity-file <path>
+	  Remote service identity path. Defaults to /var/lib/kaos-headless/device-identity.json.
+	--confirm-owner-approved
+	  Required for phase=activate after the Owner has compared and approved the
+	  pending device fingerprint in the KAOS UI.
   --install-dir <path>
       Optional remote install directory forwarded to the VM runner.
       The post-reboot phase also uses <install-dir>/run-headless-host-oracle-rehearsal.mjs
@@ -873,10 +925,6 @@ Options:
       Optional journalctl --since value for post-reboot evidence capture.
   --smoke-work-dir <path>
       Optional standalone smoke work directory for post-reboot evidence.
-  --token-file <path>
-      Local sync token file. Required for install phase. The token is uploaded
-      as <remote-dir>/sync-token for the install session and removed remotely
-      by the install script trap.
   --fetch-log-dir <path>
       Fetch remote rehearsal evidence into this local directory after the phase.
   --evidence-dir <path>
@@ -906,9 +954,6 @@ Options:
       Delay between wait-for-ssh attempts. Defaults to 5000.
   --wait-ssh-connect-timeout-sec <seconds>
       OpenSSH ConnectTimeout used by wait-for-ssh attempts. Defaults to 5.
-  --secret-file <path>
-      Optional sync token file for --verify-fetched-logs secret leak scanning.
-      Defaults to --token-file when that is provided.
   --ssh <path>
       SSH executable. Defaults to ssh.
   --scp <path>
@@ -929,11 +974,18 @@ Typical flow:
     --remote-dir kaos-headless-rehearsal-YYYYMMDDTHHMMSSZ \\
     --worker-host https://YOUR_WORKER_HOST \\
     --vault-id YOUR_VAULT_ID \\
-    --token-file /secure/local/path/to/sync-token \\
+		--invite-file /secure/local/path/to/device-enroll.invite \\
     --evidence-dir ./oracle-install-logs
 
   ssh opc@YOUR_ORACLE_VM sudo reboot
   # Or keep the reboot request inside the structured remote rehearsal flow:
+  npm run run:headless-host-oracle-remote-rehearsal -- \\
+		--phase activate \\
+		--confirm-owner-approved \\
+		--ssh-target opc@YOUR_ORACLE_VM \\
+		--remote-dir kaos-headless-rehearsal-YYYYMMDDTHHMMSSZ
+
+	# Only after activation succeeds, request reboot and collect post-reboot evidence.
   npm run run:headless-host-oracle-remote-rehearsal -- \\
     --phase reboot \\
     --ssh-target opc@YOUR_ORACLE_VM \\
@@ -951,8 +1003,7 @@ Typical flow:
     --remote-dir <directory printed by the install phase> \\
     --wait-for-ssh \\
     --require-reboot-request \\
-    --evidence-dir ./oracle-rehearsal-logs \\
-    --secret-file /secure/local/path/to/sync-token
+    --evidence-dir ./oracle-rehearsal-logs
 `);
 }
 

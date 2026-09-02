@@ -1,626 +1,196 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, rmdir, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { readFile, stat } from "node:fs/promises";
+import { resolve } from "node:path";
 import process from "node:process";
 
+/**
+ * The former smoke test started a second process with a copied shared secret.
+ * That is deliberately no longer a valid deployment test: a second device must
+ * be enrolled and explicitly approved by an Owner. This probe verifies that
+ * the installed service identity can complete the real device-key challenge.
+ */
 async function main() {
 	const raw = parseArgs(process.argv.slice(2));
-	if (raw.help === "true") {
-		printUsage();
-		return;
+	if (raw.help === "true") return printUsage();
+	for (const legacy of ["token", "token-file", "token-stdin", "peer-token-file"]) {
+		if (raw[legacy] !== undefined) throw new SmokeStepError("preflight:legacy-credential", `--${legacy} is no longer supported; use an approved device identity.`, { option: legacy });
 	}
+	if (hasLegacyEnvironment()) throw new SmokeStepError("preflight:legacy-credential", "Legacy shared credential environment variables are not permitted.", {});
 
 	const binary = resolve(raw.binary ?? "/opt/kaos/kaos-headless-host.mjs");
-	const primaryVault = resolve(raw.vault ?? "/srv/kaos/vault");
-	const primaryDataFile = resolve(raw["data-file"] ?? "/var/lib/kaos-headless/data.json");
-	const primaryLockFile = resolve(raw["lock-file"] ?? "/run/kaos-headless/kaos.lock");
+	const nodeBin = raw.node ?? process.execPath;
+	const vault = resolve(raw.vault ?? "/srv/kaos/vault");
+	const dataFile = resolve(raw["data-file"] ?? "/var/lib/kaos-headless/data.json");
+	const lockFile = resolve(raw["lock-file"] ?? "/run/kaos-headless/kaos.lock");
 	const envFile = resolve(raw["env-file"] ?? "/etc/kaos/headless.env");
-	const timeoutMs = parsePositiveInt(raw["timeout-ms"], 60_000, "timeout-ms");
-	const pollIntervalMs = parsePositiveInt(raw["poll-interval-ms"], 500, "poll-interval-ms");
-	const pollQuietMs = parseNonNegativeInt(raw["poll-quiet-ms"], 100, "poll-quiet-ms");
-	const keepFiles = raw["keep-files"] === "true";
-	const requireLock = raw["require-lock"] === "true";
-	const pluginId = raw["plugin-id"] ?? process.env.KAOS_PLUGIN_ID ?? "kaos";
-	const primaryPluginDir = resolve(raw["plugin-dir"] ?? process.env.KAOS_PLUGIN_DIR ?? join(primaryVault, ".obsidian", "plugins", pluginId));
-
-	const envConfig = await readEnvFileIfExists(envFile);
-	const dataConfig = await readJsonIfExists(primaryDataFile);
-	const host = readFirst(raw.host, process.env.KAOS_HOST, envConfig.KAOS_HOST, asString(dataConfig.host));
-	const vaultId = readFirst(raw["vault-id"], process.env.KAOS_VAULT_ID, envConfig.KAOS_VAULT_ID, asString(dataConfig.vaultId));
-	const tokenFile = raw["token-file"] ? resolve(raw["token-file"]) : await defaultTokenFile();
-	const token = readFirst(
-		raw.token,
-		process.env.KAOS_SYNC_TOKEN,
-		process.env.SYNC_TOKEN,
-		envConfig.KAOS_SYNC_TOKEN,
-		envConfig.SYNC_TOKEN,
-		tokenFile ? await readTokenFile(tokenFile) : undefined,
-		asString(dataConfig.token),
-	);
-	if (!host) throw new SmokeStepError("preflight:config", "Missing KAOS host. Use --host, KAOS_HOST, --env-file, or a populated --data-file.", { key: "host" });
-	if (!vaultId) throw new SmokeStepError("preflight:config", "Missing KAOS vault id. Use --vault-id, KAOS_VAULT_ID, --env-file, or a populated --data-file.", { key: "vaultId" });
-	if (!token) throw new SmokeStepError("preflight:config", "Missing KAOS token. Use --token, --token-file, KAOS_SYNC_TOKEN/SYNC_TOKEN, or a populated --data-file.", { key: "token" });
-	const primaryLock = requireLock ? await readPrimaryLock(primaryLockFile, { primaryVault, primaryDataFile }) : null;
-	await assertPath(primaryVault, "primary vault");
-	await assertPath(binary, "headless binary");
-
-	const workDir = resolve(raw["work-dir"] ?? await mkdtemp(join(tmpdir(), "kaos-headless-smoke-")));
-	const peerVault = join(workDir, "peer-vault");
-	assertNoVaultOverlap(primaryVault, peerVault, { workDir });
-	const peerDataFile = join(workDir, "peer-data.json");
-	const peerLockFile = join(workDir, "peer.lock");
-	const peerTokenFile = tokenFile ?? join(workDir, "peer-token");
-	const peerPluginDir = join(peerVault, ".obsidian", "plugins", pluginId);
-	const children = [];
-	await mkdir(peerVault, { recursive: true });
-	await installPeerPlugin(primaryPluginDir, peerPluginDir);
-	if (!tokenFile) {
-		await writeFile(peerTokenFile, token, "utf8");
-		await chmod(peerTokenFile, 0o600);
+	const timeoutMs = positiveInt(raw["timeout-ms"], 60_000, "timeout-ms");
+	const config = { ...await readEnvFile(envFile), ...await readJson(dataFile) };
+	if (hasLegacyConfig(config)) throw new SmokeStepError("preflight:legacy-credential", "Legacy shared credential configuration was found. Remove it before deploying.", {});
+	const host = first(raw.host, process.env.KAOS_HOST, config.KAOS_HOST, config.host);
+	const vaultId = first(raw["vault-id"], process.env.KAOS_VAULT_ID, config.KAOS_VAULT_ID, config.vaultId);
+	const deviceName = first(raw["device-name"], process.env.KAOS_DEVICE_NAME, config.KAOS_DEVICE_NAME, config.deviceName);
+	const identityFile = first(raw["identity-file"], process.env.KAOS_IDENTITY_FILE, config.KAOS_IDENTITY_FILE, config.identityFile);
+	if (!host || !vaultId || !deviceName || !identityFile) {
+		throw new SmokeStepError("preflight:config", "Missing host, vault ID, device name, or protected device identity.", {
+			host: Boolean(host), vaultId: Boolean(vaultId), deviceName: Boolean(deviceName), identityFile: Boolean(identityFile),
+		});
 	}
-	const redactor = createRedactor([token]);
+	await assertPath(binary, "headless binary");
+	await assertPath(vault, "vault");
+	await assertPath(dataFile, "data file");
+	await assertPath(envFile, "environment file");
+	if (raw["require-lock"] === "true") await assertLock(lockFile, { vault, dataFile });
 
-	const safeStamp = new Date().toISOString().replace(/[:.]/g, "-");
-	const defaultSmokeParent = raw.prefix === undefined ? "KAOS smoke" : null;
-	const prefix = normalizeVaultPath(raw.prefix ?? `${defaultSmokeParent}/${safeStamp}-${process.pid}`);
-	const localToPeerPath = normalizeVaultPath(`${prefix}/oracle-to-peer.md`);
-	const peerToLocalPath = normalizeVaultPath(`${prefix}/peer-to-oracle.md`);
-	assertVaultRelativePath(localToPeerPath);
-	assertVaultRelativePath(peerToLocalPath);
-	const localContent = `KAOS headless smoke local-to-peer\n${safeStamp}\n`;
-	const peerContent = `KAOS headless smoke peer-to-local\n${safeStamp}\n`;
+	const verified = await run(nodeBin, ["--", binary, "device", "verify",
+		"--host", host,
+		"--vault-id", vaultId,
+		"--device-name", deviceName,
+		"--identity-file", resolve(identityFile),
+		"--data-file", dataFile,
+	], timeoutMs);
+	const probe = parseJson(verified.stdout, "device verification output");
+	if (probe.kind !== "device-verified" || typeof probe.deviceId !== "string" || (probe.role !== "owner" && probe.role !== "member")) {
+		throw new SmokeStepError("device-verify", "Device verification returned an invalid result.", { stdout: trimOutput(verified.stdout), stderr: trimOutput(verified.stderr) });
+	}
 
-	let peer = null;
-	const completedStages = [];
-	const failureContext = {
-		kind: "headless-host-sync-smoke",
-		ok: false,
+	console.log(JSON.stringify({
+		kind: "headless-host-device-auth-smoke",
+		ok: true,
 		host,
 		vaultId,
-		tokenConfigured: true,
-		primaryVault,
-		primaryDataFile,
-		primaryLockFile,
-		primaryLock,
-		pluginId,
-		primaryPluginDir,
-		peerPluginDir,
-		peerVault,
-		paths: {
-			localToPeer: localToPeerPath,
-			peerToLocal: peerToLocalPath,
-		},
-	};
-	try {
-		peer = await runSmokeStage("peer-start", completedStages, { peerVault, peerDataFile, peerLockFile }, async () => startPeerHost({
-			binary,
-			peerVault,
-			peerDataFile,
-			peerLockFile,
-			peerTokenFile,
-			host,
-			vaultId,
-			pluginId,
-			peerPluginDir,
-			pollIntervalMs,
-			pollQuietMs,
-		}));
-		children.push(peer.child);
-		await runSmokeStage("peer-ready", completedStages, { peerVault }, async () => waitForOutput(peer, '"kind":"poller-started"', timeoutMs));
-
-		await runSmokeStage("oracle-to-peer:write-primary", completedStages, { path: localToPeerPath }, async () => writeVaultFile(primaryVault, localToPeerPath, localContent));
-		await runSmokeStage("oracle-to-peer:wait-peer", completedStages, { path: localToPeerPath }, async () => waitForFileContent(peerVault, localToPeerPath, localContent, timeoutMs));
-
-		await runSmokeStage("peer-to-oracle:write-peer", completedStages, { path: peerToLocalPath }, async () => writeVaultFile(peerVault, peerToLocalPath, peerContent));
-		await runSmokeStage("peer-to-oracle:wait-primary", completedStages, { path: peerToLocalPath }, async () => waitForFileContent(primaryVault, peerToLocalPath, peerContent, timeoutMs));
-
-		const cleanup = [];
-		if (!keepFiles) {
-			await runSmokeStage("cleanup:remove-primary", completedStages, { path: localToPeerPath }, async () => rmVaultPath(primaryVault, localToPeerPath));
-			await runSmokeStage("cleanup:wait-peer-missing", completedStages, { path: localToPeerPath }, async () => waitForMissing(peerVault, localToPeerPath, timeoutMs));
-			cleanup.push(localToPeerPath);
-			await runSmokeStage("cleanup:remove-peer", completedStages, { path: peerToLocalPath }, async () => rmVaultPath(peerVault, peerToLocalPath));
-			await runSmokeStage("cleanup:wait-primary-missing", completedStages, { path: peerToLocalPath }, async () => waitForMissing(primaryVault, peerToLocalPath, timeoutMs));
-			cleanup.push(peerToLocalPath);
-			await runSmokeStage("cleanup:remove-primary-prefix", completedStages, { path: prefix }, async () => rmVaultPath(primaryVault, prefix, { recursive: true }));
-			await runSmokeStage("cleanup:remove-peer-prefix", completedStages, { path: prefix }, async () => rmVaultPath(peerVault, prefix, { recursive: true }));
-			cleanup.push(prefix);
-			if (defaultSmokeParent) {
-				await runSmokeStage("cleanup:prune-primary-empty-parent", completedStages, { path: defaultSmokeParent }, async () => rmEmptyVaultDir(primaryVault, defaultSmokeParent));
-				await runSmokeStage("cleanup:prune-peer-empty-parent", completedStages, { path: defaultSmokeParent }, async () => rmEmptyVaultDir(peerVault, defaultSmokeParent));
-				cleanup.push(defaultSmokeParent);
-			}
-		}
-
-		console.log(JSON.stringify(redactObject({
-			...failureContext,
-			ok: true,
-			completedStages,
-			cleanup,
-		}, redactor), null, 2));
-	} catch (err) {
-		const failure = describeSmokeFailure(err, peer, redactor);
-		console.error(JSON.stringify(redactObject({
-			...failureContext,
-			ok: false,
-			completedStages,
-			failedStage: failure.stage,
-			error: failure.message,
-			failure,
-		}, redactor), null, 2));
-		process.exitCode = 1;
-	} finally {
-		for (const child of children.slice().reverse()) {
-			await stopChild(child);
-		}
-		if (raw["work-dir"] === undefined) {
-			await rm(workDir, { recursive: true, force: true });
-		}
-	}
+		deviceId: probe.deviceId,
+		role: probe.role,
+		identityFile: resolve(identityFile),
+		lockChecked: raw["require-lock"] === "true",
+		crossDeviceSync: "requires a separately enrolled and Owner-approved peer device",
+	}, null, 2));
 }
 
 function parseArgs(argv) {
 	const out = {};
-	for (let i = 0; i < argv.length; i++) {
-		const arg = argv[i];
-		if (arg === "--help" || arg === "-h") {
-			out.help = "true";
-			continue;
-		}
-		if (arg === "--keep-files") {
-			out["keep-files"] = "true";
-			continue;
-		}
-		if (arg === "--require-lock") {
-			out["require-lock"] = "true";
-			continue;
-		}
-		if (!arg.startsWith("--")) {
-			throw new Error(`unexpected positional argument: ${arg}`);
-		}
-		const withoutPrefix = arg.slice(2);
-		const eq = withoutPrefix.indexOf("=");
-		if (eq >= 0) {
-			out[withoutPrefix.slice(0, eq)] = withoutPrefix.slice(eq + 1);
-			continue;
-		}
-		const next = argv[i + 1];
-		if (!next || next.startsWith("--")) {
-			throw new Error(`missing value for --${withoutPrefix}`);
-		}
-		out[withoutPrefix] = next;
-		i++;
+	for (let index = 0; index < argv.length; index++) {
+		const arg = argv[index];
+		if (arg === "--help" || arg === "-h") { out.help = "true"; continue; }
+		if (arg === "--require-lock") { out["require-lock"] = "true"; continue; }
+		if (!arg.startsWith("--")) throw new Error(`unexpected positional argument: ${arg}`);
+		const keyValue = arg.slice(2);
+		const equal = keyValue.indexOf("=");
+		if (equal >= 0) { out[keyValue.slice(0, equal)] = keyValue.slice(equal + 1); continue; }
+		const value = argv[index + 1];
+		if (!value || value.startsWith("--")) throw new Error(`missing value for --${keyValue}`);
+		out[keyValue] = value;
+		index++;
 	}
 	return out;
 }
 
-async function installPeerPlugin(primaryPluginDir, peerPluginDir) {
-	await assertPath(primaryPluginDir, "primary plugin directory");
-	await assertPath(join(primaryPluginDir, "manifest.json"), "primary plugin manifest");
-	await assertPath(join(primaryPluginDir, "main.js"), "primary plugin main.js");
-	await mkdir(peerPluginDir, { recursive: true });
-	for (const file of ["manifest.json", "main.js", "telemetry.js", "styles.css"]) {
-		const source = join(primaryPluginDir, file);
-		if (!existsSync(source)) continue;
-		await copyFile(source, join(peerPluginDir, file));
-	}
-}
-
-function startPeerHost({ binary, peerVault, peerDataFile, peerLockFile, peerTokenFile, host, vaultId, pluginId, peerPluginDir, pollIntervalMs, pollQuietMs }) {
-	const child = spawn(process.execPath, [
-		"--",
-		binary,
-		"--vault",
-		peerVault,
-		"--data-file",
-		peerDataFile,
-		"--lock-file",
-		peerLockFile,
-		"--plugin-id",
-		pluginId,
-		"--plugin-dir",
-		peerPluginDir,
-		"--host",
-		host,
-		"--vault-id",
-		vaultId,
-		"--device-name",
-		"headless-smoke-peer",
-		"--token-file",
-		peerTokenFile,
-		"--disable-attachments",
-		"--poll-interval-ms",
-		String(pollIntervalMs),
-		"--poll-quiet-ms",
-		String(pollQuietMs),
-	], {
-		stdio: ["ignore", "pipe", "pipe"],
-	});
-	const output = { stdout: "", stderr: "", exited: false, exitCode: null, signal: null };
-	child.stdout.setEncoding("utf8");
-	child.stderr.setEncoding("utf8");
-	child.stdout.on("data", (chunk) => { output.stdout = trimOutput(output.stdout + chunk); });
-	child.stderr.on("data", (chunk) => { output.stderr = trimOutput(output.stderr + chunk); });
-	child.once("exit", (code, signal) => {
-		output.exited = true;
-		output.exitCode = code;
-		output.signal = signal;
-	});
-	return { child, output };
-}
-
-async function readEnvFileIfExists(path) {
+async function readEnvFile(path) {
 	try {
-		const text = await readFile(path, "utf8");
-		const out = {};
-		for (const line of text.split(/\r?\n/)) {
-			const trimmed = line.trim();
-			if (!trimmed || trimmed.startsWith("#")) continue;
-			const eq = trimmed.indexOf("=");
-			if (eq <= 0) continue;
-			const key = trimmed.slice(0, eq).trim();
-			let value = trimmed.slice(eq + 1).trim();
-			if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-				value = value.slice(1, -1);
-			}
-			out[key] = value;
+		const output = {};
+		for (const line of (await readFile(path, "utf8")).split(/\r?\n/)) {
+			const equal = line.indexOf("=");
+			if (equal <= 0 || line.trimStart().startsWith("#")) continue;
+			output[line.slice(0, equal).trim()] = line.slice(equal + 1).trim().replace(/^(["'])(.*)\1$/, "$2");
 		}
-		return out;
-	} catch {
-		return {};
-	}
+		return output;
+	} catch { return {}; }
 }
 
-async function readJsonIfExists(path) {
+async function readJson(path) {
 	try {
-		const value = JSON.parse(await readFile(path, "utf8"));
-		return typeof value === "object" && value !== null ? value : {};
-	} catch {
-		return {};
-	}
+		const parsed = JSON.parse(await readFile(path, "utf8"));
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+	} catch { return {}; }
 }
 
-async function defaultTokenFile() {
-	return existsSync("/etc/kaos/sync-token") ? "/etc/kaos/sync-token" : undefined;
+function hasLegacyEnvironment() {
+	return configured(process.env.KAOS_SYNC_TOKEN) || configured(process.env.SYNC_TOKEN);
 }
 
-async function readTokenFile(path) {
-	try {
-		const token = (await readFile(path, "utf8")).trim();
-		return token || undefined;
-	} catch {
-		return undefined;
-	}
+function hasLegacyConfig(config) {
+	return configured(config.KAOS_SYNC_TOKEN) || configured(config.SYNC_TOKEN) || configured(config.token);
 }
 
-function readFirst(...values) {
-	for (const value of values) {
-		if (typeof value === "string" && value.trim()) return value.trim();
-	}
+function configured(value) { return typeof value === "string" && value.trim().length > 0; }
+
+function first(...values) {
+	for (const value of values) if (typeof value === "string" && value.trim()) return value.trim();
 	return undefined;
 }
 
-function asString(value) {
-	return typeof value === "string" ? value : undefined;
-}
-
-async function readPrimaryLock(path, { primaryVault, primaryDataFile }) {
-	if (!existsSync(path)) {
-		throw new SmokeStepError("preflight:lock", `primary lock file is not present: ${path}`, { path });
-	}
-	let parsed;
-	try {
-		parsed = JSON.parse(await readFile(path, "utf8"));
-	} catch (err) {
-		throw new SmokeStepError("preflight:lock", `primary lock file is not readable JSON: ${path}`, {
-			path,
-			error: err instanceof Error ? err.message : String(err),
-		});
-	}
-	const info = summarizeLockInfo(path, parsed);
-	const mismatches = [];
-	if (info.runtime !== "kaos-headless-host") {
-		mismatches.push({ field: "runtime", expected: "kaos-headless-host", actual: info.runtime });
-	}
-	if (info.vaultRoot && resolve(info.vaultRoot) !== primaryVault) {
-		mismatches.push({ field: "vaultRoot", expected: primaryVault, actual: info.vaultRoot });
-	}
-	if (info.dataFile && resolve(info.dataFile) !== primaryDataFile) {
-		mismatches.push({ field: "dataFile", expected: primaryDataFile, actual: info.dataFile });
-	}
-	if (info.processAlive === false) {
-		mismatches.push({ field: "processAlive", expected: true, actual: false });
-	}
-	if (mismatches.length > 0) {
-		throw new SmokeStepError("preflight:lock", `primary lock file does not describe a running matching headless host: ${path}`, {
-			path,
-			lock: info,
-			mismatches,
-		});
-	}
-	return info;
-}
-
-function summarizeLockInfo(path, data) {
-	const pid = readPositiveInteger(data?.pid);
-	return {
-		path,
-		held: true,
-		runtime: asString(data?.runtime) ?? null,
-		pid,
-		hostname: asString(data?.hostname) ?? null,
-		startedAt: asString(data?.startedAt) ?? null,
-		vaultRoot: asString(data?.vaultRoot) ?? null,
-		dataFile: asString(data?.dataFile) ?? null,
-		processAlive: checkProcessAlive(pid),
-	};
-}
-
-function readPositiveInteger(value) {
-	return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null;
-}
-
-function checkProcessAlive(pid) {
-	if (pid === null) return null;
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (err) {
-		if (err?.code === "ESRCH") return false;
-		if (err?.code === "EPERM") return true;
-		return null;
-	}
-}
-
 async function assertPath(path, label) {
-	if (!existsSync(path)) throw new SmokeStepError("preflight:path", `${label} does not exist: ${path}`, { label, path });
+	try { await stat(path); } catch { throw new SmokeStepError("preflight:path", `Missing ${label}: ${path}`, { path, label }); }
 }
 
-function normalizeVaultPath(path) {
-	return path
-		.replace(/\\/g, "/")
-		.replace(/^\/+/, "")
-		.replace(/\/+/g, "/")
-		.replace(/\/$/, "");
-}
-
-async function writeVaultFile(vaultRoot, path, content) {
-	const abs = vaultAbsPath(vaultRoot, path);
-	await mkdir(dirname(abs), { recursive: true });
-	await writeFile(abs, content, "utf8");
-}
-
-async function rmVaultPath(vaultRoot, path, { recursive = false } = {}) {
-	const abs = vaultAbsPath(vaultRoot, path);
-	await rm(abs, { force: true, recursive });
-}
-
-async function rmEmptyVaultDir(vaultRoot, path) {
-	const abs = vaultAbsPath(vaultRoot, path);
-	try {
-		await rmdir(abs);
-	} catch (err) {
-		if (err && typeof err === "object" && ["ENOENT", "ENOTEMPTY", "EEXIST"].includes(err.code)) {
-			return;
-		}
-		throw err;
+async function assertLock(path, expected) {
+	if (!existsSync(path)) throw new SmokeStepError("preflight:lock", `Primary lock file is not present: ${path}`, { path });
+	let lock;
+	try { lock = JSON.parse(await readFile(path, "utf8")); } catch { throw new SmokeStepError("preflight:lock", `Primary lock file is not valid JSON: ${path}`, { path }); }
+	if (!lock || lock.runtime !== "kaos-headless-host" || resolve(lock.vaultRoot ?? "") !== expected.vault || resolve(lock.dataFile ?? "") !== expected.dataFile) {
+		throw new SmokeStepError("preflight:lock", "Primary lock does not describe this running headless host.", { path });
 	}
 }
 
-async function waitForFileContent(vaultRoot, path, expected, timeoutMs) {
-	const abs = vaultAbsPath(vaultRoot, path);
-	await waitUntil(async () => {
-		try {
-			return await readFile(abs, "utf8") === expected;
-		} catch {
-			return false;
-		}
-	}, timeoutMs);
-}
-
-async function waitForMissing(vaultRoot, path, timeoutMs) {
-	const abs = vaultAbsPath(vaultRoot, path);
-	await waitUntil(() => !existsSync(abs), timeoutMs);
-}
-
-function vaultAbsPath(vaultRoot, path) {
-	const normalized = normalizeVaultPath(path);
-	assertVaultRelativePath(normalized);
-	return join(vaultRoot, ...normalized.split("/"));
-}
-
-function assertVaultRelativePath(path) {
-	const normalized = normalizeVaultPath(path);
-	const segments = normalized.split("/");
-	if (!normalized || segments.some((segment) => segment === "." || segment === "..")) {
-		throw new SmokeStepError("preflight:path", `smoke path must stay inside the vault: ${path}`, { path });
-	}
-}
-
-function assertNoVaultOverlap(primaryVault, peerVault, { workDir }) {
-	if (!pathsOverlap(primaryVault, peerVault)) return;
-	throw new SmokeStepError("preflight:path", "smoke peer vault must not overlap the primary vault", {
-		primaryVault,
-		peerVault,
-		workDir,
+function run(command, args, timeoutMs) {
+	return new Promise((resolveRun, reject) => {
+		const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+		let stdout = "";
+		let stderr = "";
+		child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+		child.stdout.on("data", (chunk) => { stdout = trimOutput(stdout + chunk); });
+		child.stderr.on("data", (chunk) => { stderr = trimOutput(stderr + chunk); });
+		const timer = setTimeout(() => { child.kill("SIGTERM"); reject(new SmokeStepError("device-verify", `Device verification timed out after ${timeoutMs}ms.`, {})); }, timeoutMs);
+		child.once("error", (error) => { clearTimeout(timer); reject(new SmokeStepError("device-verify", error.message, {})); });
+		child.once("exit", (code, signal) => {
+			clearTimeout(timer);
+			if (code === 0) resolveRun({ stdout, stderr });
+			else reject(new SmokeStepError("device-verify", `Device verification failed (${signal ?? `exit ${code}`}).`, { stdout, stderr }));
+		});
 	});
 }
 
-function pathsOverlap(a, b) {
-	return pathCovers(a, b) || pathCovers(b, a);
+function parseJson(text, label) {
+	try { return JSON.parse(text); } catch { throw new SmokeStepError("device-verify", `Invalid ${label}.`, { stdout: trimOutput(text) }); }
 }
 
-function pathCovers(parent, child) {
-	const resolvedParent = resolve(parent);
-	const resolvedChild = resolve(child);
-	return resolvedParent === resolvedChild || resolvedChild.startsWith(`${resolvedParent}/`);
-}
-
-async function waitForOutput(peer, needle, timeoutMs) {
-	await waitUntil(() => {
-		if (peer.output.stdout.includes(needle) || peer.output.stderr.includes(needle)) return true;
-		if (peer.output.exited) {
-			throw new Error(`peer exited before output "${needle}" appeared`);
-		}
-		return false;
-	}, timeoutMs);
-}
-
-async function waitUntil(predicate, timeoutMs) {
-	const deadline = Date.now() + timeoutMs;
-	let lastError = null;
-	while (Date.now() < deadline) {
-		try {
-			if (await predicate()) return;
-		} catch (err) {
-			lastError = err;
-			break;
-		}
-		await sleep(100);
-	}
-	if (lastError) throw lastError;
-	throw new Error(`timed out after ${timeoutMs}ms`);
-}
-
-async function runSmokeStage(stage, completedStages, detail, fn) {
-	try {
-		const value = await fn();
-		completedStages.push(stage);
-		return value;
-	} catch (err) {
-		throw new SmokeStepError(stage, err instanceof Error ? err.message : String(err), detail);
-	}
+function trimOutput(value) { return value.length > 8000 ? value.slice(-8000) : value; }
+function positiveInt(value, fallback, name) {
+	if (value === undefined) return fallback;
+	const number = Number(value);
+	if (!Number.isInteger(number) || number <= 0) throw new Error(`--${name} must be a positive integer`);
+	return number;
 }
 
 class SmokeStepError extends Error {
-	constructor(stage, message, detail = null) {
-		super(message);
-		this.stage = stage;
-		this.detail = detail;
-	}
-}
-
-function describeSmokeFailure(err, peer, redactor = redactNoop) {
-	if (err instanceof SmokeStepError) {
-		return {
-			stage: err.stage,
-			message: redactor(err.message),
-			detail: redactObject(err.detail, redactor),
-			peer: peer ? summarizePeer(peer, redactor) : null,
-		};
-	}
-	return {
-		stage: "smoke",
-		message: redactor(err instanceof Error ? err.message : String(err)),
-		detail: null,
-		peer: peer ? summarizePeer(peer, redactor) : null,
-	};
-}
-
-function summarizePeer(peer, redactor = redactNoop) {
-	return {
-		exited: peer.output.exited,
-		exitCode: peer.output.exitCode,
-		signal: peer.output.signal,
-		stdout: redactor(peer.output.stdout.trim()),
-		stderr: redactor(peer.output.stderr.trim()),
-	};
-}
-
-function createRedactor(secrets) {
-	const values = [...new Set(secrets.filter((value) => typeof value === "string" && value.length > 0))];
-	if (values.length === 0) return redactNoop;
-	return (text) => values.reduce((out, secret) => out.split(secret).join("[redacted]"), String(text));
-}
-
-function redactNoop(text) {
-	return String(text);
-}
-
-function redactObject(value, redactor) {
-	if (typeof value === "string") return redactor(value);
-	if (Array.isArray(value)) return value.map((item) => redactObject(item, redactor));
-	if (value && typeof value === "object") {
-		return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactObject(item, redactor)]));
-	}
-	return value;
-}
-
-async function stopChild(child) {
-	if (!child || child.exitCode !== null || child.killed) return;
-	child.kill("SIGTERM");
-	await Promise.race([
-		new Promise((resolve) => child.once("exit", resolve)),
-		sleep(3_000).then(() => {
-			if (child.exitCode === null) child.kill("SIGKILL");
-		}),
-	]);
-}
-
-function trimOutput(text) {
-	return text.length > 20_000 ? text.slice(-20_000) : text;
-}
-
-function parsePositiveInt(value, fallback, label) {
-	if (value === undefined) return fallback;
-	const parsed = Number.parseInt(value, 10);
-	if (!Number.isFinite(parsed) || parsed <= 0) {
-		throw new Error(`--${label} must be a positive integer`);
-	}
-	return parsed;
-}
-
-function parseNonNegativeInt(value, fallback, label) {
-	if (value === undefined) return fallback;
-	const parsed = Number.parseInt(value, 10);
-	if (!Number.isFinite(parsed) || parsed < 0) {
-		throw new Error(`--${label} must be a non-negative integer`);
-	}
-	return parsed;
-}
-
-function sleep(ms) {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+	constructor(stage, message, details) { super(message); this.stage = stage; this.details = details; }
 }
 
 function printUsage() {
 	console.log(`Usage: node scripts/smoke-headless-host-sync.mjs [options]
 
+Verifies that the installed headless device can complete a signed challenge.
+It never accepts a shared credential or creates a copied peer identity.
+
 Options:
-  --binary <path>           Installed headless host binary. Defaults to /opt/kaos/kaos-headless-host.mjs.
-  --vault <path>            Primary Oracle/headless vault. Defaults to /srv/kaos/vault.
-  --data-file <path>        Primary headless data.json. Defaults to /var/lib/kaos-headless/data.json.
+  --binary <path>           Headless binary. Defaults to /opt/kaos/kaos-headless-host.mjs.
+  --node <path>             Node.js binary. Defaults to the current Node.js.
+  --vault <path>            Primary vault. Defaults to /srv/kaos/vault.
+  --data-file <path>        Headless data.json. Defaults to /var/lib/kaos-headless/data.json.
   --lock-file <path>        Primary lock file. Defaults to /run/kaos-headless/kaos.lock.
-  --env-file <path>         Environment file with KAOS_HOST, KAOS_VAULT_ID, and optional sync token.
-                            Defaults to /etc/kaos/headless.env.
-  --host <url>              KAOS Worker host. Overrides env/data config.
-  --vault-id <id>           KAOS vault id. Overrides env/data config.
-  --token-file <path>       KAOS token file. Defaults to /etc/kaos/sync-token when present.
-  --token <token>           KAOS token fallback. Prefer --token-file in production.
-  --plugin-id <id>          Vault plugin id/directory name. Defaults to kaos.
-  --plugin-dir <path>       Primary vault plugin directory copied into the smoke peer.
-  --prefix <path>           Smoke path prefix inside the vault. Defaults to KAOS smoke/<timestamp>.
-  --work-dir <path>         Peer runtime workspace. Defaults to a temp directory.
-  --timeout-ms <ms>         Per-step wait timeout. Defaults to 60000.
-  --poll-interval-ms <ms>   Peer host poll interval. Defaults to 500.
-  --poll-quiet-ms <ms>      Peer host quiet window. Defaults to 100.
-  --require-lock            Fail unless the primary service lock file exists.
-  --keep-files              Leave smoke files in the vault for inspection.
-  --help, -h                Print this help.
+  --env-file <path>         Environment file. Defaults to /etc/kaos/headless.env.
+  --identity-file <path>    Protected service device identity. Normally read from config.
+  --host <url>              Worker host override.
+  --vault-id <id>           Vault ID override.
+  --device-name <name>      Device name override.
+  --require-lock            Require a matching running primary lock.
+  --timeout-ms <ms>         Verification timeout. Defaults to 60000.
 `);
 }
 
-main().catch((err) => {
-	const failure = describeSmokeFailure(err, null);
-	console.error(JSON.stringify({
-		kind: "headless-host-sync-smoke",
-		ok: false,
-		failedStage: failure.stage,
-		error: failure.message,
-		failure,
-	}, null, 2));
+main().catch((error) => {
+	const details = error instanceof SmokeStepError ? { stage: error.stage, ...error.details } : {};
+	console.error(JSON.stringify({ kind: "headless-host-device-auth-smoke", ok: false, error: error instanceof Error ? error.message : String(error), ...details }));
 	process.exitCode = 1;
 });

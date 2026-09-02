@@ -65,6 +65,7 @@ try {
 	const oldRelease = join(releasesDir, "0.0.0");
 	const configDir = join(home, ".config", "kaos");
 	const stateDir = join(home, ".local", "state", "kaos-headless");
+	const identityFile = join(stateDir, "device.identity.json");
 	const runtimeDir = join(stateDir, "run", "kaos-headless");
 	const serviceDir = join(home, ".config", "systemd", "user");
 	const binDir = join(home, ".local", "bin");
@@ -86,9 +87,9 @@ try {
 	await writeFile(join(pluginDir, "manifest.json"), `${JSON.stringify(localPluginManifest, null, 2)}\n`, "utf8");
 	await writeFile(join(pluginDir, "data.json"), `${JSON.stringify({
 		host: "https://worker.example.invalid",
-		token: "secret-token",
 		vaultId: "vault-user",
 		deviceName: "desktop",
+		deviceId: "desktop-device-123",
 		enableAttachmentSync: true,
 	}, null, 2)}\n`, "utf8");
 	const paths = {
@@ -110,12 +111,13 @@ try {
 		runtimeDir,
 		lockFile: join(runtimeDir, "kaos.lock"),
 	};
-	await writeFile(paths.tokenFile, "secret-token", "utf8");
+	await writeFile(identityFile, "{}\n", { encoding: "utf8", mode: 0o600 });
 	await writeFile(paths.dataFile, `${JSON.stringify({
 		host: "https://worker.example.invalid",
-		token: "secret-token",
 		vaultId: "vault-user",
 		deviceName: "desktop-headless",
+		deviceId: "headless-device-123",
+		identityFile,
 		enableAttachmentSync: true,
 	}, null, 2)}\n`, "utf8");
 	await writeFile(paths.installConfig, `${JSON.stringify({
@@ -143,9 +145,9 @@ try {
 	assert.equal(JSON.parse(await readFile(join(pluginDir, "manifest.json"), "utf8")).version, pluginVersion);
 	assert.deepEqual(JSON.parse(await readFile(join(pluginDir, "data.json"), "utf8")), {
 		host: "https://worker.example.invalid",
-		token: "secret-token",
 		vaultId: "vault-user",
 		deviceName: "desktop",
+		deviceId: "desktop-device-123",
 		enableAttachmentSync: true,
 	});
 	const updatedConfig = JSON.parse(await readFile(paths.installConfig, "utf8"));

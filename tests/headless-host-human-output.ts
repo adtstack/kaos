@@ -20,14 +20,14 @@ const status = formatHeadlessStatus({
 		host: "https://sync.example",
 		vaultId: "vault-id",
 		deviceName: "headless-a",
-		tokenConfigured: true,
+		identityFileConfigured: true,
 		enableAttachmentSync: true,
 	},
 });
 assert.match(status, /^KAOS Headless Host/m);
 assert.match(status, /Runtime\s+running · PID 42/);
-assert.match(status, /Token\s+configured/);
-assert.doesNotMatch(status, /secret/i, "human status never renders token material");
+assert.match(status, /Device key\s+configured/);
+assert.doesNotMatch(status, /secret|token/i, "human status never renders credential material");
 
 const incompleteStatus = formatHeadlessStatus({
 	vaultRoot: "/vault",
@@ -35,7 +35,7 @@ const incompleteStatus = formatHeadlessStatus({
 	lockFile: "/run/kaos.lock",
 	pluginDir: "/vault/plugins/kaos",
 	lock: { held: true, info: { pid: 7, processAlive: false } },
-	configured: { tokenConfigured: false, enableAttachmentSync: false },
+	configured: { identityFileConfigured: false, enableAttachmentSync: false },
 });
 assert.match(incompleteStatus, /Runtime\s+stale lock · PID 7/);
 assert.match(incompleteStatus, /Worker\s+not configured/);

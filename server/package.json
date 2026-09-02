@@ -1,12 +1,12 @@
 {
 	"name": "kaos-server",
-	"version": "0.7.6",
+	"version": "0.8.0",
 	"private": true,
 	"description": "Cloudflare Worker server for Obsidian vault CRDT sync via y-partyserver",
 	"cloudflare": {
 		"bindings": {
 			"KAOS_CLAIM_SECRET": {
-				"description": "Required for first claim. Generate a unique 32–512 character visible-ASCII value without spaces in a password manager, then enter it once on the KAOS claim page. Do not reuse the sync token."
+				"description": "Required for first claim. Generate a unique 32–512 character visible-ASCII value without spaces in a password manager, then enter it once on the KAOS claim page. Keep it separate from the break-glass recovery secret."
 			}
 		}
 	},

@@ -57,6 +57,23 @@ import {
 } from "./socketTicket";
 import type { PendingBlobMutationBase } from "./pendingBlobIntentJournal";
 
+/**
+ * y-partyserver keeps connection parameters in its URL.  Keep its internal
+ * ticket placeholder, but strip it before the handshake and use the standard
+ * WebSocket subprotocol channel instead.  This prevents tickets from reaching
+ * request URLs, proxy logs, browser history, or referrer-like diagnostics.
+ */
+class TicketProtocolWebSocket {
+	constructor(url: string | URL) {
+		const parsed = new URL(String(url));
+		const ticket = parsed.searchParams.get("ticket");
+		parsed.searchParams.delete("ticket");
+		parsed.searchParams.delete("token");
+		if (!ticket) throw new Error("KAOS device ticket is missing from the WebSocket connection");
+		return new WebSocket(parsed.toString(), [`kaos-ticket.${ticket}`]) as unknown as TicketProtocolWebSocket;
+	}
+}
+
 export interface BlobRefCommitGuard {
 	/** Exact authoritative ref that must still occupy the path at commit. */
 	expectedCurrentRef: BlobRef | undefined;
@@ -455,7 +472,7 @@ export class VaultSync {
 			 * re-calling params().
 			 *
 			 * Pass force=true to bypass the ticket cache and always fetch fresh.
-			 * If the callback returns null the provider falls back to ?token=.
+			 * A missing ticket is an authentication failure; no bearer fallback exists.
 			 */
 				getSocketTicket?: (force?: boolean) => Promise<SocketTicketValue | null>;
 		},
@@ -520,7 +537,6 @@ export class VaultSync {
 			});
 
 		this._getSocketTicket = options?.getSocketTicket ?? null;
-		const longLivedToken = settings.token;
 		const syncPrefix = `/vault/sync/${encodeURIComponent(roomId)}`;
 
 		this.provider = new YSyncProvider(settings.host, roomId, this.ydoc, {
@@ -544,9 +560,6 @@ export class VaultSync {
 					p.trace = options.traceContext.traceId;
 					p.boot = options.traceContext.bootId;
 				}
-				// Prefer a short-lived ticket when available; fall back to the
-				// long-lived token for servers that do not yet support tickets.
-				//
 				// NOTE: this callback is invoked once by YProvider.connect() on
 				// initial connection.  y-partyserver's internal reconnect loop
 				// (setupWS) reuses provider.url directly without re-calling
@@ -569,10 +582,11 @@ export class VaultSync {
 					// Schedule proactive URL refresh before this ticket expires.
 					this.scheduleSocketTicketRefresh(ticketResult);
 				} else {
-					p.token = longLivedToken;
+					throw new Error("KAOS device ticket unavailable");
 				}
 				return p;
 			},
+			WebSocketPolyfill: TicketProtocolWebSocket as unknown as typeof WebSocket,
 			connect: false,
 			maxBackoffTime: MAX_BACKOFF_TIME_MS,
 		});
@@ -3298,7 +3312,8 @@ export class VaultSync {
 	}
 
 	/**
-	 * Replace the ticket value in provider.url, removing any legacy ?token=.
+	 * Replace the internal ticket placeholder in provider.url. The WebSocket
+	 * wrapper removes it before network I/O and sends it as a subprotocol.
 	 * Preserves all other query params (schemaVersion, _pk, device, trace, boot).
 	 */
 	private patchProviderTicket(value: string): void {

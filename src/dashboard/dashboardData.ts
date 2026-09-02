@@ -47,6 +47,7 @@ export function buildKaosDashboardData(input: KaosDashboardCollectorInput): Kaos
 		blobSafetyCopies: collectDashboardBlobSafetyCopies(input),
 		attention: collectDashboardAttention(input),
 		attentionTotalCount: getDashboardAttentionTotalCount(input),
+		attentionAudit: input.attentionAudit ?? null,
 		actions: {
 			syncInitialized: input.vaultSync !== null,
 			untrackedFileCount: input.reconciliationState.untrackedFileCount,
@@ -333,16 +334,24 @@ export function getDashboardAttentionTotalCount(
 		| "frontmatterQuarantineEntries"
 		| "reconciliationState"
 		| "remoteProjectionPolicyError"
-	>,
+	> & {
+		attentionAudit?: KaosDashboardCollectorInput["attentionAudit"];
+	},
 ): number {
 	const structuralPaths = new Set(
 		input.reconciliationState.unresolvedStructuralChangePaths,
 	);
-	const standalonePaths = new Set<string>();
-	for (const entry of input.preservedUnresolvedEntries) {
-		if (!structuralPaths.has(entry.path)) standalonePaths.add(entry.path);
+	let standaloneCount = 0;
+	if (input.attentionAudit) {
+		standaloneCount = input.attentionAudit.summary.activeCount;
+	} else {
+		const standalonePaths = new Set<string>();
+		for (const entry of input.preservedUnresolvedEntries) {
+			if (!structuralPaths.has(entry.path)) standalonePaths.add(entry.path);
+		}
+		standaloneCount = standalonePaths.size;
 	}
-	return standalonePaths.size
+	return standaloneCount
 		+ input.frontmatterQuarantineEntries.length
 		+ input.reconciliationState.unresolvedStructuralChangeGroupCount
 		+ input.reconciliationState.blockedDivergenceCount

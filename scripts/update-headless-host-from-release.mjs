@@ -35,11 +35,17 @@ let errorRedactor = redactNoop;
 
 async function main() {
 	const raw = parseArgs(process.argv.slice(2));
-	errorRedactor = await createUpdateRedactor(raw);
 	if (raw.help === "true") {
 		printUsage();
 		return;
 	}
+	for (const legacy of ["token", "token-file", "postflight-token-file"]) {
+		if (raw[legacy] !== undefined) throw new Error(`--${legacy} is no longer supported; postflight uses the approved service identity.`);
+	}
+	if (process.env.KAOS_SYNC_TOKEN || process.env.SYNC_TOKEN) {
+		throw new Error("Legacy shared credential environment variables are not permitted for release updates.");
+	}
+	errorRedactor = await createUpdateRedactor(raw);
 
 	const installDir = resolve(raw["install-dir"] ?? "/opt/kaos");
 	const serviceEnabled = raw["no-service"] !== "true";
@@ -766,8 +772,8 @@ function buildPostflightArgs({ raw, installDir, helpersEnabled, servicePath, met
 		raw["postflight-lock-file"] ?? "/run/kaos-headless/kaos.lock",
 		"--env-file",
 		raw["postflight-env-file"] ?? "/etc/kaos/headless.env",
-		"--token-file",
-		raw["postflight-token-file"] ?? "/etc/kaos/sync-token",
+		"--identity-file",
+		raw["postflight-identity-file"] ?? "/var/lib/kaos-headless/device-identity.json",
 		"--smoke-script",
 		defaultSmokeScript(raw, installDir, helpersEnabled),
 	];
@@ -957,53 +963,14 @@ function describeError(err) {
 }
 
 async function createUpdateRedactor(raw) {
-	const tokenFile = resolve(raw["postflight-token-file"] ?? "/etc/kaos/sync-token");
-	const envFile = resolve(raw["postflight-env-file"] ?? "/etc/kaos/headless.env");
-	const envSecrets = await readEnvSecrets(envFile);
 	const secrets = [
 		raw["github-token"],
 		process.env.GITHUB_TOKEN,
 		process.env.GH_TOKEN,
-		process.env.KAOS_SYNC_TOKEN,
-		process.env.SYNC_TOKEN,
-		await readSecretFile(tokenFile),
-		envSecrets.KAOS_SYNC_TOKEN,
-		envSecrets.SYNC_TOKEN,
 	];
 	const values = [...new Set(secrets.filter((value) => typeof value === "string" && value.length > 0))];
 	if (values.length === 0) return redactNoop;
 	return (text) => values.reduce((out, secret) => out.split(secret).join("[redacted]"), String(text));
-}
-
-async function readEnvSecrets(path) {
-	try {
-		const text = await readFile(path, "utf8");
-		const out = {};
-		for (const line of text.split(/\r?\n/)) {
-			const trimmed = line.trim();
-			if (!trimmed || trimmed.startsWith("#")) continue;
-			const eq = trimmed.indexOf("=");
-			if (eq <= 0) continue;
-			const key = trimmed.slice(0, eq).trim();
-			if (key !== "KAOS_SYNC_TOKEN" && key !== "SYNC_TOKEN") continue;
-			let value = trimmed.slice(eq + 1).trim();
-			if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-				value = value.slice(1, -1);
-			}
-			out[key] = value;
-		}
-		return out;
-	} catch {
-		return {};
-	}
-}
-
-async function readSecretFile(path) {
-	try {
-		return (await readFile(path, "utf8")).trim() || undefined;
-	} catch {
-		return undefined;
-	}
 }
 
 function redactObject(value, redactor) {
@@ -1181,14 +1148,14 @@ Options:
                             Lock file for postflight. Defaults to /run/kaos-headless/kaos.lock.
   --postflight-env-file <path>
                             Env file for postflight. Defaults to /etc/kaos/headless.env.
-  --postflight-token-file <path>
-                            Token file for postflight. Defaults to /etc/kaos/sync-token.
+  --postflight-identity-file <path>
+                            Protected service identity for postflight. Defaults to /var/lib/kaos-headless/device-identity.json.
   --postflight-metadata-path <path>
                             Install metadata file for postflight. Defaults to the update metadata path.
   --postflight-smoke-script <path>
                             Smoke helper path. Defaults below --install-dir, or next to this wrapper with --no-helper-scripts.
   --postflight-smoke-work-dir <path>
-                            Peer runtime workspace passed to the postflight smoke helper.
+                            Deprecated compatibility option; when supplied it must be outside the vault.
   --postflight-script <path>
                             Postflight helper path. Defaults below --install-dir, or next to this wrapper with --no-helper-scripts.
   --rollback-script <path>  Rollback helper path. Defaults below --install-dir, or next to this wrapper with --no-helper-scripts.

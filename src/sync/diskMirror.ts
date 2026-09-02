@@ -2803,17 +2803,17 @@ export class DiskMirror {
 		return entry ? getPreservedUnresolvedEpisodeId(entry) : null;
 	}
 
-	private resolvePreservedUnresolvedEpisode(
+	resolvePreservedUnresolvedEpisode(
 		path: string,
 		expectedEpisodeId: string | null,
-	): void {
-		if (expectedEpisodeId === null) return;
+	): boolean {
+		if (expectedEpisodeId === null) return false;
 		const normalized = normalizePath(path);
-		const current = this.preservedUnresolved.get(normalized);
-		if (!current || getPreservedUnresolvedEpisodeId(current) !== expectedEpisodeId) return;
-		if (this.preservedUnresolved.resolve(normalized)) {
+		if (this.preservedUnresolved.resolveEpisode(normalized, expectedEpisodeId)) {
 			this.onPreservedUnresolvedChanged?.();
+			return true;
 		}
+		return false;
 	}
 
 	private ensurePreservedUnresolved(

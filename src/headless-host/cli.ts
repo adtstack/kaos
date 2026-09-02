@@ -13,6 +13,16 @@ import {
 	formatHeadlessStatus,
 	shouldUseHumanOutput,
 } from "./humanOutput";
+import {
+	assertSecurePrivateFile,
+	createHeadlessDeviceIdentity,
+	HeadlessDeviceAuthClient,
+	readHeadlessDeviceIdentity,
+	readProtectedTextFile,
+	requestHeadlessEnrollment,
+	requestHeadlessRecovery,
+	writeNewRecoverySecret,
+} from "./kaos/deviceIdentity";
 
 type CliMode = "run" | "status" | "dump-config" | "doctor";
 
@@ -45,6 +55,11 @@ export async function runHeadlessHostCli(
 	argv: string[] = process.argv.slice(2),
 	deps: HeadlessHostRuntimeDeps = {},
 ): Promise<void> {
+	assertNoLegacyTokenEnvironment();
+	if (argv[0] === "device") {
+		await runDeviceCommand(argv.slice(1));
+		return;
+	}
 	const options = await parseArgs(argv);
 	if (options.mode === "status") {
 		await printStatus(options);
@@ -107,6 +122,7 @@ export async function runHeadlessHostCli(
 	process.once("uncaughtException", onUncaughtException);
 	process.once("unhandledRejection", onUnhandledRejection);
 	try {
+		assertNoLegacyTokenConfiguration(await readKaosHeadlessData(options.dataFile));
 		await mergeKaosHeadlessConfig(options.dataFile, options.configPatch);
 		const { app, plugin } = await bootPlugin({
 			vaultRoot: options.vaultRoot,
@@ -164,6 +180,9 @@ export async function runHeadlessHostCli(
 
 async function parseArgs(argv: string[]): Promise<CliOptions> {
 	const raw = parseKeyValueArgs(argv);
+	for (const forbidden of ["token", "token-file", "token-stdin"]) {
+		if (raw[forbidden] !== undefined) throw new Error(`--${forbidden} is no longer supported; enroll a device key instead.`);
+	}
 	if (raw.help === "true") {
 		printUsage();
 		process.exit(0);
@@ -173,7 +192,6 @@ async function parseArgs(argv: string[]): Promise<CliOptions> {
 	const dataFile = resolve(raw["data-file"] ?? join(vaultRoot, ".kaos-headless-host", "data.json"));
 	const pluginId = readStringOption(raw["plugin-id"], process.env.KAOS_PLUGIN_ID) ?? "kaos";
 	const pluginDir = resolve(raw["plugin-dir"] ?? process.env.KAOS_PLUGIN_DIR ?? join(vaultRoot, ".obsidian", "plugins", pluginId));
-	const token = await readToken(raw);
 	return {
 		mode: readMode(raw),
 		vaultRoot,
@@ -189,9 +207,10 @@ async function parseArgs(argv: string[]): Promise<CliOptions> {
 		forceJson: raw.json === "true",
 		configPatch: {
 			host: readStringOption(raw.host, process.env.KAOS_HOST),
-			token,
 			vaultId: readStringOption(raw["vault-id"], process.env.KAOS_VAULT_ID),
 			deviceName: readStringOption(raw["device-name"], process.env.KAOS_DEVICE_NAME),
+			deviceId: readStringOption(raw["device-id"]),
+			identityFile: readStringOption(raw["identity-file"]),
 			enableAttachmentSync: readAttachmentFlag(raw),
 		},
 	};
@@ -230,6 +249,10 @@ function parseKeyValueArgs(argv: string[]): Record<string, string> {
 			out["skip-worker-capabilities"] = "true";
 			continue;
 		}
+		if (arg === "--confirm-revoke-all") {
+			out["confirm-revoke-all"] = "true";
+			continue;
+		}
 		if (!arg.startsWith("--")) {
 			throw new Error(`unexpected positional argument: ${arg}`);
 		}
@@ -248,12 +271,104 @@ function parseKeyValueArgs(argv: string[]): Record<string, string> {
 	return out;
 }
 
-async function readToken(raw: Record<string, string>): Promise<string | undefined> {
-	if (raw.token?.trim()) return raw.token.trim();
-	if (raw["token-file"]) {
-		return (await readFile(resolve(raw["token-file"]), "utf8")).trim();
+async function runDeviceCommand(argv: string[]): Promise<void> {
+	const action = argv[0];
+	if (action !== "enroll" && action !== "pair" && action !== "recover" && action !== "verify") {
+		throw new Error("Usage: device pair …, device enroll …, device recover …, or device verify …");
 	}
-	return readStringOption(process.env.KAOS_SYNC_TOKEN, process.env.SYNC_TOKEN);
+	const options = await parseArgs(argv.slice(1));
+	const raw = parseKeyValueArgs(argv.slice(1));
+	const existing = await readKaosHeadlessData(options.dataFile);
+	assertNoLegacyTokenConfiguration(existing);
+	const config = mergeConfigPatch(existing, options.configPatch);
+	const identityFile = readStringOption(raw["identity-file"], typeof config.identityFile === "string" ? config.identityFile : undefined);
+	const host = readStringOption(raw.host, typeof config.host === "string" ? config.host : undefined);
+	const vaultId = readStringOption(raw["vault-id"], typeof config.vaultId === "string" ? config.vaultId : undefined);
+	const deviceName = readStringOption(raw["device-name"], typeof config.deviceName === "string" ? config.deviceName : undefined);
+	if (!identityFile || !host || !vaultId || !deviceName) {
+		throw new Error("--identity-file, --host, --vault-id, and --device-name are required (or must already exist in data.json).");
+	}
+	if (action === "verify") {
+		const identity = await readHeadlessDeviceIdentity(identityFile);
+		if (identity.host !== host.trim().replace(/\/$/, "") || identity.vaultId !== vaultId.trim()) {
+			throw new Error("Identity file belongs to a different --host or --vault-id.");
+		}
+		if (typeof config.deviceId === "string" && config.deviceId && config.deviceId !== identity.deviceId) {
+			throw new Error("Configured device ID does not match the protected identity file.");
+		}
+		const client = new HeadlessDeviceAuthClient({
+			host,
+			vaultId,
+			deviceName,
+			deviceId: identity.deviceId,
+			identityFile,
+			persistDeviceId: async () => undefined,
+		});
+		const session = await client.getSession();
+		log("device-verified", { deviceId: session.deviceId, role: session.role, expiresAt: session.expiresAt });
+		return;
+	}
+	if (action === "enroll" || action === "pair") {
+		const code = raw["code"];
+		const secret = raw["secret"];
+		const inviteFile = raw["invite-file"];
+		const invite = inviteFile ? await readProtectedTextFile(inviteFile) : undefined;
+		if (!code && !secret && !invite) {
+			throw new Error("device pair/enroll requires --code <CODE>, --secret <SECRET>, or --invite-file.");
+		}
+		const identity = await loadOrCreateIdentity(identityFile, host, vaultId);
+		const enrollment = await requestHeadlessEnrollment({ identity, deviceName, code, qrSecret: secret, invite });
+		await mergeKaosHeadlessConfig(options.dataFile, {
+			host: identity.host,
+			vaultId: identity.vaultId,
+			deviceName,
+			deviceId: identity.deviceId,
+			identityFile: resolve(identityFile),
+		});
+		log("device-enrollment", {
+			status: enrollment.status,
+			deviceId: identity.deviceId,
+			fingerprint: enrollment.fingerprint,
+			identityFile: resolve(identityFile),
+		});
+		return;
+	}
+
+	if (raw["confirm-revoke-all"] !== "true") {
+		throw new Error("device recover requires --confirm-revoke-all because it revokes every existing device, session, and invitation.");
+	}
+	const recoveryFile = raw["recovery-file"];
+	const nextRecoveryFile = raw["next-recovery-file"];
+	if (!recoveryFile || !nextRecoveryFile) {
+		throw new Error("device recover requires --recovery-file and a new --next-recovery-file, both protected regular files.");
+	}
+	const recoverySecret = await readProtectedTextFile(recoveryFile);
+	const nextRecoverySecret = await writeNewRecoverySecret(nextRecoveryFile);
+	const identity = await loadOrCreateIdentity(identityFile, host, vaultId);
+	try {
+		await requestHeadlessRecovery({ identity, deviceName, recoverySecret, nextRecoverySecret });
+	} catch (error) {
+		throw new Error(`Recovery did not complete; the new recovery file was created but is not active. ${errorMessage(error)}`);
+	}
+	await mergeKaosHeadlessConfig(options.dataFile, {
+		host: identity.host,
+		vaultId: identity.vaultId,
+		deviceName,
+		deviceId: identity.deviceId,
+		identityFile: resolve(identityFile),
+	});
+	log("device-recovery", { status: "completed", deviceId: identity.deviceId, identityFile: resolve(identityFile) });
+}
+
+async function loadOrCreateIdentity(identityFile: string, host: string, vaultId: string) {
+	if (await pathExists(identityFile)) {
+		const identity = await readHeadlessDeviceIdentity(identityFile);
+		if (identity.host !== host.trim().replace(/\/$/, "") || identity.vaultId !== vaultId.trim()) {
+			throw new Error("Identity file belongs to a different --host or --vault-id.");
+		}
+		return identity;
+	}
+	return await createHeadlessDeviceIdentity({ identityFile, host, vaultId });
 }
 
 function readStringOption(...values: Array<string | undefined>): string | undefined {
@@ -261,6 +376,18 @@ function readStringOption(...values: Array<string | undefined>): string | undefi
 		if (value?.trim()) return value.trim();
 	}
 	return undefined;
+}
+
+function assertNoLegacyTokenEnvironment(): void {
+	if (readStringOption(process.env.KAOS_SYNC_TOKEN, process.env.SYNC_TOKEN)) {
+		throw new Error("KAOS_SYNC_TOKEN and SYNC_TOKEN are no longer supported; remove them and use a protected device identity file.");
+	}
+}
+
+function assertNoLegacyTokenConfiguration(config: Record<string, unknown>): void {
+	if (typeof config.token === "string" && config.token.trim()) {
+		throw new Error("Legacy token material is present in data.json. Remove it before using device-key authentication.");
+	}
 }
 
 function readAttachmentFlag(raw: Record<string, string>): boolean | undefined {
@@ -291,7 +418,7 @@ Options:
   --dump-config               Print resolved config JSON with secrets redacted and exit.
   --doctor                    Check local paths and optional Worker capabilities, then exit.
   --json                      Force JSON output with --status or --doctor.
-  --require-sync-config       With --doctor, fail unless host/token/vaultId/deviceName are configured.
+  --require-sync-config       With --doctor, fail unless host/vaultId/deviceName/device identity are configured.
   --skip-worker-capabilities  With --doctor, skip the Worker /api/capabilities network probe.
   --vault <path>              Vault root. Defaults to a temporary directory.
   --data-file <path>          Plugin data.json path. Defaults below the vault root.
@@ -299,15 +426,19 @@ Options:
   --plugin-id <id>            Vault plugin id/directory name. Defaults to kaos.
   --plugin-dir <path>         Exact vault plugin directory. Defaults to <vault>/.obsidian/plugins/<plugin-id>.
   --host <url>                KAOS Worker host. Can also use KAOS_HOST.
-  --token <token>             KAOS auth token. Can also use KAOS_SYNC_TOKEN or SYNC_TOKEN.
-  --token-file <path>         Read KAOS auth token from a file.
-  --vault-id <id>             KAOS vault id. Can also use KAOS_VAULT_ID.
-  --device-name <name>        KAOS device name. Can also use KAOS_DEVICE_NAME.
+	--vault-id <id>             KAOS vault id. Can also use KAOS_VAULT_ID.
+	--device-name <name>        KAOS device name. Can also use KAOS_DEVICE_NAME.
+	--identity-file <path>      Protected 0600 headless device identity file.
   --enable-attachments        Persist enableAttachmentSync=true before boot.
   --disable-attachments       Persist enableAttachmentSync=false before boot.
   --boot-only                 Boot the real KAOS plugin, then unload and exit.
   --poll-interval-ms <ms>     External file scan interval. Defaults to 1000.
-  --poll-quiet-ms <ms>        File quiet window before emitting events. Defaults to 1100.
+	--poll-quiet-ms <ms>        File quiet window before emitting events. Defaults to 1100.
+
+Device enrollment:
+  device enroll --host <url> --vault-id <id> --device-name <name> --identity-file <0600-file> --invite-file <0600-file>
+  device verify --host <url> --vault-id <id> --device-name <name> --identity-file <0600-file>
+  device recover --host <url> --vault-id <id> --device-name <name> --identity-file <0600-file> --recovery-file <0600-file> --next-recovery-file <new-0600-file> --confirm-revoke-all
 `);
 }
 
@@ -357,6 +488,8 @@ async function printDoctor(options: CliOptions): Promise<boolean> {
 		checks.push(await checkPath("data-dir-writable", dirname(options.dataFile), constants.W_OK | constants.X_OK));
 		checks.push(await checkPath("lock-dir-writable", dirname(options.lockFile), constants.W_OK | constants.X_OK));
 		checks.push(...checkSyncConfig(data));
+		const identityFile = typeof data.identityFile === "string" ? data.identityFile.trim() : "";
+		checks.push(await checkProtectedIdentity(identityFile));
 	}
 	const host = typeof data.host === "string" ? data.host : "";
 	if (options.skipWorkerCapabilities) {
@@ -453,9 +586,10 @@ function checkProcessAlive(pid: number | null): boolean | null {
 function summarizeConfig(data: Record<string, unknown>): Record<string, unknown> {
 	return {
 		host: typeof data.host === "string" ? data.host : "",
-		tokenConfigured: typeof data.token === "string" && data.token.length > 0,
 		vaultId: typeof data.vaultId === "string" ? data.vaultId : "",
 		deviceName: typeof data.deviceName === "string" ? data.deviceName : "",
+		deviceId: typeof data.deviceId === "string" ? data.deviceId : "",
+		identityFileConfigured: typeof data.identityFile === "string" && data.identityFile.length > 0,
 		enableAttachmentSync: typeof data.enableAttachmentSync === "boolean" ? data.enableAttachmentSync : null,
 	};
 }
@@ -463,9 +597,10 @@ function summarizeConfig(data: Record<string, unknown>): Record<string, unknown>
 function checkSyncConfig(data: Record<string, unknown>): Array<{ name: string; ok: boolean; detail?: string }> {
 	return [
 		checkStringConfig(data, "host"),
-		checkStringConfig(data, "token"),
 		checkStringConfig(data, "vaultId"),
 		checkStringConfig(data, "deviceName"),
+		checkStringConfig(data, "deviceId"),
+		checkStringConfig(data, "identityFile"),
 	].map((check) => ({
 		name: `sync-config:${check.name}`,
 		ok: check.ok,
@@ -484,6 +619,16 @@ async function checkPath(name: string, path: string, mode = constants.F_OK): Pro
 		return { name, ok: true, detail: path };
 	} catch (err) {
 		return { name, ok: false, detail: err instanceof Error ? err.message : String(err) };
+	}
+}
+
+async function checkProtectedIdentity(path: string): Promise<{ name: string; ok: boolean; detail?: string }> {
+	if (!path) return { name: "device-identity-protected", ok: false, detail: "identityFile is missing" };
+	try {
+		await assertSecurePrivateFile(path);
+		return { name: "device-identity-protected", ok: true, detail: "regular file with protected permissions" };
+	} catch (err) {
+		return { name: "device-identity-protected", ok: false, detail: errorMessage(err) };
 	}
 }
 

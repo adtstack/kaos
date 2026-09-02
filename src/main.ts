@@ -64,6 +64,8 @@ import {
 	FrontmatterGuardCoordinator,
 } from "./sync/frontmatterGuardCoordinator";
 import { createSocketTicketCache, isTicketEndpointUnsupported } from "./sync/socketTicket";
+import { DeviceAuthClient } from "./sync/deviceAuth";
+import { getDeviceAuthorizationHeader } from "./sync/authHeader";
 import {
 	contentBaselineHash,
 	type DiskIndex,
@@ -199,6 +201,7 @@ import {
 import { AttachmentOrchestrator } from "./runtime/attachmentOrchestrator";
 import { EditorWorkspaceOrchestrator } from "./runtime/editorWorkspaceOrchestrator";
 import { SetupLinkController } from "./runtime/setupLinkController";
+import type { PairingModalOptions } from "./settings/PairDeviceModal";
 import { TraceRuntimeController } from "./runtime/traceRuntimeController";
 import { DiscardedRevisionAudit } from "./runtime/discardedRevisionAudit";
 import { obsidianRequest } from "./utils/http";
@@ -208,6 +211,12 @@ import {
 	buildKaosDashboardData,
 	getDashboardAttentionTotalCount,
 } from "./dashboard/dashboardData";
+import {
+	auditAttentionEntries,
+	classifyMarkdownRetirementSettlement,
+	isArchivePath,
+	type MarkdownRetirementSettlementDecision,
+} from "./dashboard/attentionAudit";
 import { withAttentionResolutionLock } from "./dashboard/attentionResolutionLock";
 import { mapWithConcurrency } from "./utils/concurrency";
 import {
@@ -215,6 +224,9 @@ import {
 	KaosDashboardView,
 } from "./dashboard/KaosDashboardView";
 import type {
+	AttentionAuditResult,
+	AttentionRetirementSummary,
+	AttentionRetirementTarget,
 	DashboardBlobConflictResolutionChoice,
 	DashboardBlobConflictResolutionResult,
 	DashboardBlobConflictResolutionTarget,
@@ -458,6 +470,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private persistedState: PersistedPluginState = {};
 	private persistWriteChain: Promise<void> = Promise.resolve();
 	private readonly settingsMutationQueue = new SettingsMutationQueue();
+	/** Legacy bearer read once from an older data.json; never persisted again. */
+	private legacyMigrationToken: string | null = null;
+	private deviceAuth: DeviceAuthClient | null = null;
+	private deviceAuthScope = "";
 	private diskIndexSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
 	/** Pending stability checks for newly created/dropped files. */
@@ -500,7 +516,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						method: "POST",
 						headers: {
 							"Content-Type": "application/json",
-							Authorization: `Bearer ${this.settings.token}`,
+							Authorization: await getDeviceAuthorizationHeader(this.settings),
 						},
 						body: JSON.stringify(body),
 					});
@@ -642,6 +658,136 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.runtimeConfig = this.buildEffectiveRuntimeConfig();
 		}
 		return this.runtimeConfig;
+	}
+
+	/** Attach an in-memory session provider; private key bytes never enter settings. */
+	private createDeviceAuthClient(host: string, vaultId: string, deviceName: string): DeviceAuthClient {
+		host = host.trim().replace(/\/$/, "");
+		vaultId = vaultId.trim();
+		deviceName = deviceName.trim();
+		if (!host || !vaultId || !deviceName) {
+			throw new Error("Server, vault ID, and device name are required for device authentication.");
+		}
+		const scope = `${host}\u0000${vaultId}\u0000${deviceName}`;
+		if (!this.deviceAuth || this.deviceAuthScope !== scope) {
+			this.deviceAuthScope = scope;
+			const config = {
+				host,
+				vaultId,
+				deviceName,
+				deviceId: this.settings.deviceId,
+				persistDeviceId: async (deviceId: string) => {
+					if (this.settings.deviceId === deviceId) return;
+					await this.updateSettings((settings) => {
+						settings.deviceId = deviceId;
+					}, "device-auth-device-id");
+				},
+			};
+			if (this.settings.identityFile?.trim()) {
+				const factory = (globalThis as unknown as Record<string, unknown>).__KAOS_HEADLESS_DEVICE_AUTH_FACTORY__ as {
+					create?(input: typeof config & { identityFile: string }): DeviceAuthClient;
+				} | undefined;
+				if (!factory?.create) throw new Error("Headless device authentication runtime is unavailable.");
+				this.deviceAuth = factory.create({ ...config, identityFile: this.settings.identityFile.trim() });
+			} else {
+				this.deviceAuth = new DeviceAuthClient(config);
+			}
+		}
+		return this.deviceAuth;
+	}
+
+	private getDeviceAuthClient(): DeviceAuthClient {
+		return this.createDeviceAuthClient(
+			this.settings.host,
+			this.settings.vaultId,
+			this.settings.deviceName,
+		);
+	}
+
+	private installDeviceAuthorizationProvider(): void {
+		this.settings.authorizationHeader = async () =>
+			await this.getDeviceAuthClient().authorizationHeader();
+	}
+
+	async createDevicePairingSession(): Promise<PairingModalOptions> {
+		const host = this.settings.host.trim().replace(/\/$/, "");
+		const vaultId = this.settings.vaultId.trim();
+		if (!host || !vaultId) throw new Error("Server and vault ID must be configured before creating a pairing code.");
+		const session = await this.getDeviceAuthClient().createPairingSession();
+		return {
+			code: session.code,
+			qrSecret: session.qrSecret,
+			expiresAt: session.expiresAt,
+			host,
+			vaultId,
+		};
+	}
+
+	async pairDeviceWithSecret(target: { host: string; vaultId: string; qrSecret: string }): Promise<{ status: "active"; deviceId: string; fingerprint: string | null }> {
+		const client = this.createDeviceAuthClient(target.host, target.vaultId, this.settings.deviceName);
+		return await client.pairWithSecret(target.qrSecret);
+	}
+
+	async pairDeviceWithCode(target: { host: string; vaultId: string; code: string }): Promise<{ status: "active"; deviceId: string; fingerprint: string | null }> {
+		const client = this.createDeviceAuthClient(target.host, target.vaultId, this.settings.deviceName);
+		return await client.pairWithCode(target.code);
+	}
+
+	hasSyncRuntime(): boolean {
+		return this.vaultSync !== null;
+	}
+
+	async listManagedDevices() {
+		return await this.getDeviceAuthClient().listDevices();
+	}
+
+	async changeManagedDeviceRole(deviceId: string, role: "owner" | "member"): Promise<void> {
+		await this.getDeviceAuthClient().changeDeviceRole(deviceId, role);
+	}
+
+	async revokeManagedDevice(deviceId: string): Promise<void> {
+		await this.getDeviceAuthClient().revokeDevice(deviceId);
+	}
+
+	async claimServerAsOwner(host: string, claimSecret: string): Promise<{ recoverySecret: string }> {
+		const targetHost = host.trim().replace(/\/$/, "");
+		const vaultId = this.settings.vaultId || generateVaultId();
+		const client = this.createDeviceAuthClient(targetHost, vaultId, this.settings.deviceName);
+		const identity = await client.getIdentity();
+		const response = await obsidianRequest({
+			url: `${targetHost}/claim`,
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"X-KAOS-Claim-Proof": claimSecret.trim(),
+			},
+			body: JSON.stringify({
+				vaultId,
+				ownerDevice: {
+					deviceId: identity.deviceId,
+					deviceName: this.settings.deviceName || "Primary Device",
+					publicKey: identity.publicKey,
+				},
+			}),
+		});
+		if (response.status !== 200) {
+			const body = response.json as { error?: string } | null;
+			throw new Error(body?.error || `Claim failed (${response.status})`);
+		}
+		const body = response.json as { recoverySecret?: string };
+		await this.updateSettings((settings) => {
+			settings.host = targetHost;
+			settings.vaultId = vaultId;
+		}, "direct-claim-owner");
+		await this.refreshServerCapabilities("direct-claim-owner");
+		if (!this.hasSyncRuntime()) await this.initSync();
+		return { recoverySecret: body.recoverySecret || "" };
+	}
+
+	async handleSetupLink(params: Record<string, string>): Promise<void> {
+		if (this.setupLinkController) {
+			await this.setupLinkController.handleSetupLink(params);
+		}
 	}
 
 	private getBlobSync(): BlobSyncManager | null {
@@ -3190,6 +3336,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				exportDiagnosticsWithFilenames: () => {
 					void (this.lab?.diagnosticsService as import("./telemetry/diagnostics/diagnosticsService").DiagnosticsService | undefined)?.exportDiagnosticsWithFilenames();
 				},
+				auditAttention: () => this.auditAttention(),
+				retireVerifiedAttention: (targets) => this.retireVerifiedAttention(targets),
 				resolveRemoteDeleteAttention: (target, choice) =>
 					this.resolveRemoteDeleteAttention(target, choice),
 				resolveMarkdownConflictAttention: (target, choice) =>
@@ -3274,6 +3422,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			isMarkdownPathSyncable: (path) => this.isMarkdownPathSyncable(path),
 			updateSettings: (mutator, reason) => this.updateSettings(mutator, reason),
 			refreshServerCapabilities: (reason) => this.refreshServerCapabilities(reason),
+			pairWithSecret: (target) => this.pairDeviceWithSecret(target),
+			pairWithCode: (target) => this.pairDeviceWithCode(target),
 			hasSyncRuntime: () => this.vaultSync !== null,
 			initSync: () => {
 				void this.initSync();
@@ -3296,6 +3446,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				settings.deviceName = `device-${Date.now().toString(36)}`;
 			}, "startup-generate-device-name");
 		}
+		this.installDeviceAuthorizationProvider();
 		await this.ensurePendingBlobIntentPersistence();
 		await this.ensureBlobSettledRefPersistence();
 
@@ -3462,7 +3613,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				durationMs,
 				outcome,
 				hostConfigured: !!this.settings.host,
-				tokenConfigured: !!this.settings.token,
+				deviceAuthenticationConfigured: !!this.settings.deviceId,
 			});
 			this.log(`Startup onload complete (${outcome}) in ${durationMs}ms`);
 		};
@@ -3480,18 +3631,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			return;
 		}
 
-		if (!this.settings.token) {
-			this.log("Token not configured — sync disabled");
-			const message = this.serverAuthMode === "env"
-				? "KAOS: configure the server token in settings to enable sync."
-				: this.serverAuthMode === "claim" || this.serverAuthMode === "unclaimed"
-						? "KAOS: claim the server in a browser, then use the KAOS setup link to fill in the token."
-						: "KAOS: configure a token in settings, or claim the server in a browser first.";
-			new Notice(message, 10000);
-			finishOnload("missing-token");
-			return;
-		}
-
 		// Parse exclude patterns and file size limit from settings
 		this.applyRuntimeSettings("onload-pre-sync");
 
@@ -3501,9 +3640,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				const url = new URL(this.settings.host);
 				const h = url.hostname;
 				if (url.protocol === "http:" && h !== "localhost" && h !== "127.0.0.1" && h !== "[::1]") {
-						this.log("WARNING: connecting over unencrypted HTTP to a remote host — token sent in plaintext");
-						new Notice(
-							"Connecting over unencrypted HTTP. Your token will be sent in plaintext. Use HTTPS for production.",
+					this.log("WARNING: connecting over unencrypted HTTP to a remote host exposes device sessions");
+					new Notice(
+						"Connecting over unencrypted HTTP can expose device sessions. Use HTTPS for production.",
 							8000,
 						);
 					}
@@ -3514,7 +3653,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		finishOnload("sync-started");
 	}
 
-	private async initSync(): Promise<void> {
+	async initSync(): Promise<void> {
 		const initSyncStartedAt = Date.now();
 		const initEntryAuthority = this.blobAuthorityScopeGuard.capture();
 		let initBlobRuntimeAuthority: {
@@ -3536,10 +3675,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.blobProviderReady = false;
 		this.trace("trace", "startup-init-sync-start", {
 			hostConfigured: !!this.settings.host,
-			tokenConfigured: !!this.settings.token,
+			deviceAuthenticationConfigured: !!this.settings.deviceId,
 			hasCachedCapabilities: this.capabilityUpdateService?.hasCachedCapabilities ?? false,
 		});
 		try {
+			// Do not construct a provider until the server has verified this device's
+			// P-256 proof and issued a short-lived session.
+			await this.getDeviceAuthClient().getSession();
 			this.idbDegradedHandled = false;
 			// A VaultSync replacement starts a new provider-generation namespace.
 			// Keep the gate closed until this runtime establishes policy from its
@@ -3579,43 +3721,30 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					const socketTicketAuth =
 						this.capabilityUpdateService?.capabilities?.socketTicketAuth;
 
-					// Known old server that explicitly signals no ticket support.
-					if (socketTicketAuth === false) return null;
+					if (socketTicketAuth === false || ticketCache.isUnsupported()) {
+						throw new Error("Server does not support required device socket tickets. Update the server before syncing.");
+					}
 
-					// Already confirmed this server does not have the ticket
-					// endpoint — skip the network probe.
-					if (ticketCache.isUnsupported()) return null;
-
-					// socketTicketAuth === true  → confirmed support.
-					// socketTicketAuth === undefined → capability not yet fetched
-					//   (first run, empty cache, slow background poll).
-					// Both: try the ticket endpoint.
-					//
-					// On a clean "endpoint not found" signal (404/405/501) from an
-					// unknown-capability server, mark the cache unsupported and fall
-					// back to ?token= for this connection.  Any other failure (auth,
-					// network, 5xx) must propagate — never silently downgrade to the
-					// long-lived token.
-					//
+					// Capability may not have completed on first start; probe once. A
+					// missing endpoint is fatal and never falls back to a bearer URL.
 					// force=true is used by VaultSync's proactive refresh timer to
 					// bypass the cache and always obtain a fresh ticket.
 					if (force) ticketCache.invalidate();
 
 					try {
-							return await ticketCache.get(
-								this.settings.host,
-								this.settings.token,
-								this.settings.vaultId,
-							);
+						return await ticketCache.get(
+							this.settings.host,
+							this.settings.vaultId,
+							() => getDeviceAuthorizationHeader(this.settings),
+						);
 					} catch (err) {
 						if (
 							socketTicketAuth === undefined
 							&& isTicketEndpointUnsupported(err)
 						) {
-							// Old server confirmed: stop probing on future reconnects.
+							// Old server confirmed: stop probing and fail closed.
 							ticketCache.markUnsupported();
-								this.log("socket ticket endpoint not found; using legacy ?token= for this connection");
-								return null;
+								throw new Error("Server does not support required device socket tickets. Update the server before syncing.");
 							}
 							// Real failure — propagate.
 							this.log(`socket ticket fetch failed: ${String(err)}`);
@@ -5628,6 +5757,226 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return current;
 	}
 
+	private async auditAttention(): Promise<AttentionAuditResult> {
+		const vaultSync = this.vaultSync;
+		const blobSync = this.getBlobSync();
+		const result = auditAttentionEntries({
+			vault: this.app.vault,
+			preservedUnresolvedEntries: this.collectPreservedUnresolvedEntries(),
+			vaultSync: this.vaultSync?.getDebugSnapshot() ?? null,
+			remoteDeleteResolutionState: {
+				markdownAvailable: vaultSync !== null && this.diskMirror !== null,
+				blobAvailable: vaultSync !== null && blobSync !== null,
+				getFingerprint: (kind, path) => kind === "markdown"
+					? vaultSync?.getAuthoritativeMarkdownDeleteSnapshot(path)?.fingerprint ?? null
+					: vaultSync?.getAuthoritativeBlobDeleteSnapshot(path)?.fingerprint ?? null,
+				isKeepLocalPending: (kind, path, episodeId) => kind === "blob"
+					&& blobSync?.isKeepLocalRemoteDeletePending(path, episodeId) === true,
+				getBlobRef: (path) => cloneBlobRef(vaultSync?.getBlobRef(path)) ?? null,
+			},
+			blobConflictResolutionState: {
+				available: vaultSync !== null
+					&& blobSync !== null
+					&& vaultSync.providerSynced
+					&& this.blobProviderReady
+					&& this.blobLocalPersistenceReady
+					&& this.blobSettledRefPersistenceHealthy,
+				isPathSyncable: (path) => this.isBlobPathSyncable(path),
+				getBlobRef: (path) => cloneBlobRef(vaultSync?.getBlobRef(path)) ?? null,
+				getBlobSourceVersion: (path) => vaultSync?.getBlobSourceVersion(path) ?? null,
+				isKeepLocalPending: (path, episodeId) =>
+					blobSync?.isKeepLocalDownloadConflictPending(path, episodeId) === true,
+				isUseRemoteResumePending: (path, episodeId) =>
+					blobSync?.isUseRemoteDownloadConflictResumePending(path, episodeId) === true,
+			},
+			remoteProjectionPolicyError: this.providerExcludeFileLastError,
+		});
+
+		this.trace("attention", "attention-audit-completed", {
+			total: result.summary.totalCount,
+			active: result.summary.activeCount,
+			retirable: result.summary.retirableCount,
+			needsReview: result.summary.needsReviewCount,
+		});
+
+		return result;
+	}
+
+	private async retireVerifiedAttention(
+		targets: AttentionRetirementTarget[],
+	): Promise<AttentionRetirementSummary> {
+		let retiredCount = 0;
+		let failedCount = 0;
+		const reasons: Record<string, number> = {};
+		const retiredPaths: string[] = [];
+		const failedPaths: string[] = [];
+
+		const diskMirror = this.diskMirror;
+		const blobSync = this.getBlobSync();
+
+		for (const target of targets) {
+			const normalizedPath = normalizePath(target.path);
+			const lockKey = `${target.kind}:${normalizedPath}`;
+
+			await withAttentionResolutionLock(
+				this.attentionResolutionInFlight,
+				lockKey,
+				normalizedPath,
+				async () => {
+					// 1. Double check current entry exists and matches episodeId
+					const current = this.collectPreservedUnresolvedEntries().find(
+						(e) => e.kind === target.kind && normalizePath(e.path) === normalizedPath,
+					);
+					if (
+						!current
+						|| getPreservedUnresolvedEpisodeId(current) !== target.episodeId
+						|| current.reason !== target.reason
+					) {
+						failedCount++;
+						failedPaths.push(normalizedPath);
+						this.trace("attention", "attention-retire-rejected", {
+							path: normalizedPath,
+							reason: "episode-or-reason-mismatch",
+							targetEpisodeId: target.episodeId,
+							currentEpisodeId: current ? getPreservedUnresolvedEpisodeId(current) : null,
+						});
+						return;
+					}
+
+					// 2. Double check forbidden reasons
+					if (current.reason === "conflict-winner-flush-deferred") {
+						failedCount++;
+						failedPaths.push(normalizedPath);
+						this.trace("attention", "attention-retire-rejected", {
+							path: normalizedPath,
+							reason: "forbidden-reason-conflict-winner-flush-deferred",
+						});
+						return;
+					}
+
+					// 3. Pre-flight check local file absence (for retirable markers on absent files)
+					const localFile = this.getDashboardLocalFileIdentity(normalizedPath);
+					if (localFile.kind !== "missing") {
+						// Unless target is the archive destination file in a collision pair
+						if (!(target.reason === "path-collision" && isArchivePath(normalizedPath))) {
+							failedCount++;
+							failedPaths.push(normalizedPath);
+							this.trace("attention", "attention-retire-rejected", {
+								path: normalizedPath,
+								reason: "local-file-reappeared",
+								localFileKind: localFile.kind,
+							});
+							return;
+						}
+					}
+
+					// 4. Pre-flight remote fingerprint check if one was expected
+					if (target.expectedRemoteFingerprint && this.vaultSync) {
+						const currentFingerprint = target.kind === "markdown"
+							? this.vaultSync.getAuthoritativeMarkdownDeleteSnapshot(normalizedPath)?.fingerprint ?? null
+							: this.vaultSync.getAuthoritativeBlobDeleteSnapshot(normalizedPath)?.fingerprint ?? null;
+						if (currentFingerprint !== target.expectedRemoteFingerprint) {
+							failedCount++;
+							failedPaths.push(normalizedPath);
+							this.trace("attention", "attention-retire-rejected", {
+								path: normalizedPath,
+								reason: "remote-fingerprint-mismatch",
+								expected: target.expectedRemoteFingerprint,
+								actual: currentFingerprint,
+							});
+							return;
+						}
+					}
+
+					// 4.5 Settlement proof for markdown markers: retiring deletes a
+					// divergence fence, and removing the fence is only lossless when
+					// the fenced divergence has actually settled. Mirror the proof
+					// tryHealFencedConflictWinnerFlush demands: the CRDT side must
+					// still equal the durable disk-index baseline (or be untracked),
+					// or — when the file still exists (archive collision pairs) — the
+					// disk side is at baseline or both sides converged. Without this,
+					// a "file is absent" symptom of the unresolved condition itself
+					// could batch-retire live fences and unblock winner-pick merges
+					// that discard the losing side.
+					if (target.kind === "markdown") {
+						const settlement = await this.verifyMarkdownRetirementSettlement(normalizedPath);
+						if (!settlement.ok) {
+							failedCount++;
+							failedPaths.push(normalizedPath);
+							this.trace("attention", "attention-retire-rejected", {
+								path: normalizedPath,
+								reason: "settlement-not-proven",
+								proof: settlement.proof,
+							});
+							return;
+						}
+					}
+
+					// 5. Remove from in-memory engine registries
+					if (target.kind === "markdown") {
+						diskMirror?.resolvePreservedUnresolvedEpisode(normalizedPath, target.episodeId);
+					} else {
+						blobSync?.resolvePreservedUnresolvedEpisode(normalizedPath, target.episodeId);
+					}
+
+					// Also remove from main's preservedUnresolvedEntries list
+					this.preservedUnresolvedEntries = this.preservedUnresolvedEntries.filter(
+						(e) => !(e.kind === target.kind && normalizePath(e.path) === normalizedPath && getPreservedUnresolvedEpisodeId(e) === target.episodeId),
+					);
+
+					retiredCount++;
+					retiredPaths.push(normalizedPath);
+					reasons[target.reason] = (reasons[target.reason] ?? 0) + 1;
+
+					this.trace("attention", "attention-marker-retired", {
+						path: normalizedPath,
+						kind: target.kind,
+						reason: target.reason,
+						episodeId: target.episodeId,
+						pairPath: target.pairPath ?? null,
+					});
+				},
+			);
+		}
+
+		if (retiredCount > 0) {
+			this.refreshStatusBar();
+			await this.persistPluginState();
+		}
+
+		return {
+			retiredCount,
+			failedCount,
+			reasons,
+			retiredPaths,
+			failedPaths,
+		};
+	}
+
+	/**
+	 * Settlement proof required before a markdown preserved-unresolved marker
+	 * may be retired. The fence exists because a divergence never settled;
+	 * deleting it is only provably lossless when the divergence actually
+	 * settled — see classifyMarkdownRetirementSettlement for the exact proof.
+	 */
+	private async verifyMarkdownRetirementSettlement(
+		normalizedPath: string,
+	): Promise<MarkdownRetirementSettlementDecision> {
+		const ytext = this.vaultSync?.getTextForPath(normalizedPath) ?? null;
+		const crdtContent = ytext ? ytext.toJSON() : null;
+		let diskContent: string | null = null;
+		if (this.getDashboardLocalFileIdentity(normalizedPath).kind === "file") {
+			diskContent = await this.app.vault.adapter
+				.read(normalizedPath)
+				.catch(() => null);
+		}
+		return classifyMarkdownRetirementSettlement({
+			crdtContent,
+			baselineHash: this.diskIndex[normalizedPath]?.contentHash ?? null,
+			diskContent,
+		});
+	}
+
 	private async resolveRemoteDeleteAttention(
 		target: DashboardRemoteDeleteResolutionTarget,
 		choice: DashboardRemoteDeleteResolutionChoice,
@@ -6437,10 +6786,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		const { settings, persistedState, migrated } = await this.settingsStore.load();
+		const { settings, persistedState, migrated, legacyMigrationToken } = await this.settingsStore.load();
 		const data = persistedState;
 		this.persistedState = persistedState;
 		this.settings = settings;
+		this.legacyMigrationToken = legacyMigrationToken;
 		// Prime the authority identity before reading any scope-owned state. This is
 		// intentionally guard-only: the first applyRuntimeSettings() call must not
 		// mistake startup hydration for a live scope transition and erase a valid
@@ -6986,47 +7336,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return this.capabilityUpdateService?.capabilities?.maxBlobUploadBytes ?? null;
 	}
 
-	buildSetupDeepLink(): string | null {
-		const host = this.settings.host?.trim().replace(/\/$/, "");
-		const token = this.settings.token?.trim();
-		const vaultId = this.settings.vaultId?.trim();
-		if (!host || !token || !vaultId) return null;
-		const params = new URLSearchParams({
-			action: "setup",
-			host,
-			token,
-			vaultId,
-		});
-		return `obsidian://kaos?${params.toString()}`;
-	}
-
-	buildMobileSetupUrl(): string | null {
-		const host = this.settings.host?.trim().replace(/\/$/, "");
-		const token = this.settings.token?.trim();
-		const vaultId = this.settings.vaultId?.trim();
-		if (!host || !token || !vaultId) return null;
-		const hash = new URLSearchParams({
-			host,
-			token,
-			vaultId,
-		});
-		return `${host}/mobile-setup#${hash.toString()}`;
-	}
-
 	buildRecoveryKitText(): string | null {
 		const host = this.settings.host?.trim().replace(/\/$/, "");
-		const token = this.settings.token?.trim();
 		const vaultId = this.settings.vaultId?.trim();
-		if (!host || !token || !vaultId) return null;
+		if (!host || !vaultId) return null;
 		return [
-			"KAOS Recovery Kit",
+			"KAOS Connection Reference (not a recovery credential)",
 			`Created: ${new Date().toISOString()}`,
 			"",
 			`Host: ${host}`,
-			`Token: ${token}`,
 			`Vault ID: ${vaultId}`,
 			"",
-			"Keep this in a password manager. You need host + token + vault ID to recover this sync room on a new device.",
+			"This file cannot authorize a device. Keep the separate recovery secret only in a protected offline 0600 file or password manager.",
 		].join("\n");
 	}
 
@@ -7048,7 +7369,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	async refreshRecoveryStorageStatus(reason = "manual"): Promise<void> {
 		void reason;
-		if (!this.settings.host || !this.settings.token || !this.settings.vaultId) {
+		if (!this.settings.host || !this.settings.authorizationHeader || !this.settings.vaultId) {
 			this.lastRecoveryStorageStatus = null;
 			this.lastRecoveryStorageStatusError = "Sync is not configured.";
 			return;

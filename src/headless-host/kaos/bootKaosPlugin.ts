@@ -9,6 +9,7 @@ import * as codeMirrorStateShim from "../codeMirrorStateShim";
 import * as codeMirrorViewShim from "../codeMirrorViewShim";
 import * as obsidianShim from "../obsidianShim";
 import { installHeadlessHostPolyfills } from "../polyfills";
+import { installHeadlessDeviceAuthFactory } from "./deviceIdentity";
 
 export interface BootKaosHeadlessPluginOptions {
 	vaultRoot: string;
@@ -22,6 +23,7 @@ export async function bootKaosHeadlessPlugin(options: BootKaosHeadlessPluginOpti
 	plugin: Plugin;
 }> {
 	installHeadlessHostPolyfills();
+	installHeadlessDeviceAuthFactory();
 	await mkdir(options.vaultRoot, { recursive: true });
 	await mkdir(dirname(options.dataFile), { recursive: true });
 	const vaultRoot = resolve(options.vaultRoot);

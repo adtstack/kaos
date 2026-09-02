@@ -322,6 +322,19 @@
 	margin: 0 0 8px;
 }
 
+.kaos-dashboard-attention-toolbar {
+	margin-bottom: 10px;
+}
+
+.kaos-dashboard-audit-summary {
+	margin-bottom: 10px;
+	padding: 10px 12px;
+}
+
+.kaos-dashboard-audit-summary .kaos-dashboard-row-actions {
+	margin-top: 8px;
+}
+
 .kaos-dashboard-structural-fields {
 	display: grid;
 	gap: 3px;

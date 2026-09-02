@@ -3,16 +3,11 @@ import { VaultSyncServer } from "./server";
 import { renderMobileSetupPage, renderRunningPage, renderSetupPage } from "./setupPage";
 import {
 	canonicalRepoForSetup,
-	getAuthStateCached,
+	getAuthStateWithConfig,
 	getCapabilities,
-	getHttpAuthToken,
-	getStoredServerConfigCached,
 	handleValidatedClaimRoute,
-	handleUpdateMetadataRoute,
 	isClaimSecretConfigured,
-	isAuthorized,
 	preflightClaimRequest,
-	rejectUnauthorizedVaultRequest,
 	supportsBuckets,
 } from "./routes/auth";
 import type { ValidatedClaimRequest } from "./routes/auth";
@@ -21,9 +16,15 @@ import { corsPreflight, createCspNonce, html, json, withCors } from "./routes/ht
 import { handleSnapshotRoute } from "./routes/snapshots";
 import { handleRecoveryContentRoute, handleRecoverySnapshotRoute } from "./routes/recoverySnapshots";
 import { handleSyncSocketRoute, parseSyncPath } from "./routes/syncSocket";
-import { handleTicketRoute } from "./routes/ticket";
 import { fetchVaultDebug, fetchVaultDocument, handleVaultTraceRoute, recordVaultTrace } from "./routes/trace";
-import type { AuthState, AuthStateCached, Env } from "./routes/types";
+import {
+	authorizeDeviceRequest,
+	handleOwnerDeviceRoute,
+	handleOwnerUpdateMetadataRoute,
+	handlePublicDeviceAuthRoute,
+	issueSocketTicket,
+} from "./routes/deviceAuth";
+import type { AuthStateWithConfig, Env } from "./routes/types";
 
 const LOG_PREFIX = "[kaos-sync:worker]";
 
@@ -31,7 +32,7 @@ const LOG_PREFIX = "[kaos-sync:worker]";
 //
 // INVARIANT (issue #40): unknown routes MUST return 404 before any Durable
 // Object namespace is touched.  classifyWorkerRoute() is a pure function that
-// inspects only the request method and pathname.  getAuthStateCached() — which
+// inspects only the request method and pathname.  getAuthStateWithConfig() — which
 // contacts KAOS_CONFIG — is only called for routes that classifyWorkerRoute
 // recognises as valid KAOS routes.  Junk paths (/wp-login.php, /favicon.ico,
 // /random-garbage) never reach the DO.
@@ -48,6 +49,8 @@ type WorkerRoute =
 	| { kind: "capabilities" }
 	| { kind: "claim" }
 	| { kind: "update-metadata" }
+	| { kind: "device-auth"; action: "recover" | "pair" | "challenge" | "session" }
+	| { kind: "device-management"; vaultId: string; action: "list" | "pair-create" | "role" | "revoke" }
 	| { kind: "sync-socket"; vaultId: string }
 	| { kind: "vault"; vaultId: string; resource: string; rest: string[] }
 	| { kind: "not-found" };
@@ -215,6 +218,11 @@ function classifyWorkerRoute(req: Request, url: URL): WorkerRoute {
 		return { kind: "update-metadata" };
 	}
 
+	const deviceAuthPath = url.pathname.match(/^\/api\/auth\/(recover|pair|challenge|session)$/);
+	if (req.method === "POST" && deviceAuthPath?.[1]) {
+		return { kind: "device-auth", action: deviceAuthPath[1] as "recover" | "pair" | "challenge" | "session" };
+	}
+
 	// parseSyncPath MUST run before parseVaultPath.  /vault/sync/:vaultId
 	// would otherwise be misread as vaultId="sync", resource=:vaultId and then
 	// rejected by the resource whitelist as not-found.
@@ -225,6 +233,21 @@ function classifyWorkerRoute(req: Request, url: URL): WorkerRoute {
 
 	const vaultRoute = parseVaultPath(url.pathname);
 	if (vaultRoute && vaultRoute.resource !== null) {
+		if (vaultRoute.resource === "devices") {
+			if (req.method === "GET" && vaultRoute.rest.length === 0) return { kind: "device-management", vaultId: vaultRoute.vaultId, action: "list" };
+			if (req.method === "POST") {
+				if (vaultRoute.rest.length === 2 && vaultRoute.rest[0] === "pair" && vaultRoute.rest[1] === "create") {
+					return { kind: "device-management", vaultId: vaultRoute.vaultId, action: "pair-create" };
+				}
+				if (vaultRoute.rest.length === 1) {
+					const action = vaultRoute.rest[0];
+					if (action === "role" || action === "revoke") {
+						return { kind: "device-management", vaultId: vaultRoute.vaultId, action };
+					}
+				}
+			}
+			return { kind: "not-found" };
+		}
 		// Resource whitelist: unknown resources 404 before auth.
 		if (!VALID_VAULT_RESOURCES.has(vaultRoute.resource)) {
 			return { kind: "not-found" };
@@ -258,6 +281,8 @@ function routeBucket(route: WorkerRoute): string {
 		case "capabilities": return "api_capabilities";
 		case "claim": return "claim";
 		case "update-metadata": return "api_update_metadata";
+		case "device-auth": return `api_auth_${route.action.replace("-", "_")}`;
+		case "device-management": return `vault_devices_${route.action}`;
 		case "sync-socket": return "vault_sync";
 		case "vault": return `vault_${route.resource}`;
 		case "not-found": return "not_found";
@@ -270,7 +295,7 @@ function logWorkerRequest(args: {
 	method: string;
 	status: number;
 	durationMs: number;
-	auth: "skipped" | "env" | "claim" | "unclaimed";
+	auth: "skipped" | "device" | "unclaimed";
 	isWebSocket: boolean;
 	cfRay: string | null;
 }): void {
@@ -307,7 +332,7 @@ function logWorkerRequest(args: {
 function logVaultRejection(
 	req: Request,
 	vaultId: string,
-	reason: "unclaimed" | "server_misconfigured" | "unauthorized",
+	reason: string,
 ): void {
 	// Truncate vaultId so it cannot become a correlation handle in exported
 	// worker logs, while still being useful for debugging.
@@ -318,54 +343,20 @@ function logVaultRejection(
 	);
 }
 
-async function rejectAndLogUnauthorizedVaultRequest(
-	req: Request,
-	env: Env,
-	authState: AuthState,
-	vaultId: string,
-): Promise<Response | null> {
-	const rejection = await rejectUnauthorizedVaultRequest(req, env, authState, vaultId);
-	if (rejection) {
-		logVaultRejection(req, vaultId, rejection.reason);
-	}
-	return rejection?.response ?? null;
-}
-
 // ── Capabilities ──────────────────────────────────────────────────────────────
 
 /**
- * Extract the StoredServerConfig carried in the AuthState (claim/unclaimed
- * modes only — env mode has no config).  Returns null for env mode or when
- * the config was not populated (e.g. old uncached getAuthState callers).
- *
- * When called with AuthStateCached (the return of getAuthStateCached), config
- * is always present for claim/unclaimed modes — no ?? null needed.
+ * The cached device-auth state always carries Config Durable Object state.
  */
-function getConfigFromAuthState(authState: AuthStateCached): StoredServerConfig | null {
-	if (authState.mode === "claim" || authState.mode === "unclaimed") {
-		return authState.config;
-	}
-	return null;
+function getConfigFromAuthState(authState: AuthStateWithConfig): StoredServerConfig | null {
+	return authState.config;
 }
 
-async function handleCapabilities(req: Request, env: Env, authState: AuthStateCached): Promise<Response> {
-	// Prefer the config already carried in the AuthState (populated by
-	// getAuthStateCached in claim/unclaimed modes — zero extra DO calls).
-	let config = getConfigFromAuthState(authState);
+async function handleCapabilities(req: Request, env: Env, authState: AuthStateWithConfig): Promise<Response> {
+	const config = getConfigFromAuthState(authState);
 
-	if (!config) {
-		// env mode: getAuthStateCached returns early without fetching config,
-		// so we fetch it here with the same cached path.
-		try {
-			config = await getStoredServerConfigCached(env);
-		} catch (err) {
-			console.warn(`${LOG_PREFIX} config fetch failed for capabilities:`, err);
-		}
-	}
-
-	const includePrivateUpdateMetadata = authState.claimed
-		&& await isAuthorized(authState, getHttpAuthToken(req));
-	return json(getCapabilities(authState, env, config, { includePrivateUpdateMetadata }));
+	void req;
+	return json(getCapabilities(authState, env, config, { includePrivateUpdateMetadata: false }));
 }
 
 // ── Worker ────────────────────────────────────────────────────────────────────
@@ -394,24 +385,10 @@ const worker = {
 		}
 
 		// A first-claim request is public, so reject every statelessly invalid shape
-		// before paying for KAOS_CONFIG. Preserve the legacy SYNC_TOKEN lock without
-		// parsing a body or consulting the Config Durable Object.
+		// before paying for KAOS_CONFIG. A legacy migration value is never a
+		// server lock or a runtime authorization path in device-auth mode.
 		let validatedClaim: ValidatedClaimRequest | null = null;
 		if (route.kind === "claim") {
-			const envToken = env.SYNC_TOKEN?.trim();
-			if (envToken) {
-				const response = json({ error: "already_claimed" }, 403);
-				logWorkerRequest({
-					route,
-					method: req.method,
-					status: response.status,
-					durationMs: Date.now() - start,
-					auth: "env",
-					isWebSocket,
-					cfRay,
-				});
-				return response;
-			}
 			const preflight = await preflightClaimRequest(req, env);
 			if (!preflight.ok) {
 				logWorkerRequest({
@@ -429,7 +406,7 @@ const worker = {
 		}
 
 		// Only recognised and (for /claim) statelessly validated routes reach here.
-		const authState = await getAuthStateCached(env);
+		const authState = await getAuthStateWithConfig(env);
 		let response: Response;
 
 		if (route.kind === "home") {
@@ -437,7 +414,6 @@ const worker = {
 			const body = authState.claimed
 				? renderRunningPage({
 					host: url.origin,
-					authMode: authState.mode,
 					attachments: supportsBuckets(env),
 					snapshots: supportsBuckets(env),
 				})
@@ -465,22 +441,31 @@ const worker = {
 			// route.kind=claim can reach auth only through the successful preflight.
 			response = await handleValidatedClaimRoute(validatedClaim!, env, authState);
 		} else if (route.kind === "update-metadata") {
-			response = withCors(await handleUpdateMetadataRoute(req, env, authState));
+			const config = getConfigFromAuthState(authState);
+			response = withCors(config?.vaultId
+				? await handleOwnerUpdateMetadataRoute(req, env, config.vaultId)
+				: json({ error: "unclaimed" }, 503));
+		} else if (route.kind === "device-auth") {
+			response = withCors(await handlePublicDeviceAuthRoute(req, env, route.action));
+		} else if (route.kind === "device-management") {
+			response = withCors(await handleOwnerDeviceRoute(req, env, route.vaultId, route.action));
 		} else if (route.kind === "sync-socket") {
-			response = await handleSyncSocketRoute(req, env, authState, route.vaultId);
+			response = await handleSyncSocketRoute(req, env, route.vaultId);
 		} else {
 			// route.kind === "vault"
 			const { vaultId, resource, rest } = route;
 
-			const authFailure = await rejectAndLogUnauthorizedVaultRequest(req, env, authState, vaultId);
-			if (authFailure) {
-				response = withCors(authFailure);
-			} else if (resource === "debug" && req.method === "GET" && rest[0] === "recent") {
+			if (resource === "auth" && rest[0] === "ticket" && req.method === "POST") {
+				response = withCors(await issueSocketTicket(req, env, vaultId));
+			} else {
+				const deviceAuth = await authorizeDeviceRequest(req, env, vaultId);
+				if (!deviceAuth.ok) {
+					logVaultRejection(req, vaultId, deviceAuth.reason);
+					response = withCors(deviceAuth.response);
+				} else if (resource === "debug" && req.method === "GET" && rest[0] === "recent") {
 				response = withCors(await fetchVaultDebug(env, vaultId));
 			} else if (resource === "trace" && req.method === "POST" && rest.length === 0) {
 				response = withCors(await handleVaultTraceRoute(env, vaultId, req, json));
-			} else if (resource === "auth" && rest[0] === "ticket" && req.method === "POST") {
-				response = withCors(await handleTicketRoute(req, authState, vaultId, json, env));
 			} else if (resource === "blobs") {
 				response = withCors(await handleBlobRoute(env, vaultId, req, rest, json));
 			} else if (resource === "snapshots") {
@@ -496,6 +481,7 @@ const worker = {
 				response = withCors(await handleRecoveryContentRoute(env, vaultId, req, rest, json));
 			} else {
 				response = withCors(json({ error: "not found" }, 404));
+			}
 			}
 		}
 

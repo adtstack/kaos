@@ -9,11 +9,11 @@
  *   const ticketCache = createSocketTicketCache();
  *   const getSocketTicket = (force?: boolean) => {
  *     if (force) ticketCache.invalidate();
- *     return ticketCache.get(settings.host, settings.token, settings.vaultId);
+ *     return ticketCache.get(settings.host, settings.vaultId, getAuthorizationHeader);
  *   };
  *
  * The cache is intentionally simple: one ticket per VaultSync instance.
- * VaultSync is recreated on settings changes (host/token/vaultId), so the
+ * VaultSync is recreated on settings changes (host, device identity, or vaultId), so the
  * cache is automatically invalidated in those cases.
  *
  * VaultSync schedules a proactive provider URL refresh timer based on the
@@ -124,7 +124,11 @@ export interface SocketTicketCache {
 	 * Throws immediately if the server has already been confirmed unsupported
 	 * (see `markUnsupported`).
 	 */
-	get(host: string, token: string, vaultId: string): Promise<CachedSocketTicket>;
+	get(
+		host: string,
+		vaultId: string,
+		getAuthorizationHeader: () => Promise<string>,
+	): Promise<CachedSocketTicket>;
 	/** Discard the cached ticket, forcing a fresh fetch on the next get(). */
 	invalidate(): void;
 	/**
@@ -169,7 +173,11 @@ export function createSocketTicketCache(): SocketTicketCache {
 	let unsupported = false;
 
 	return {
-		async get(host: string, token: string, vaultId: string): Promise<CachedSocketTicket> {
+		async get(
+			host: string,
+			vaultId: string,
+			getAuthorizationHeader: () => Promise<string>,
+		): Promise<CachedSocketTicket> {
 			if (unsupported) {
 				throw new SocketTicketHttpError(404); // already confirmed missing
 			}
@@ -177,7 +185,7 @@ export function createSocketTicketCache(): SocketTicketCache {
 			if (cached && cached.localExpiresAt - now > TICKET_REFRESH_BUFFER_MS) {
 				return cached;
 			}
-			const fresh = await fetchSocketTicket(host, token, vaultId);
+			const fresh = await fetchSocketTicket(host, vaultId, getAuthorizationHeader);
 			cached = fresh;
 			return fresh;
 		},
@@ -199,9 +207,10 @@ export function createSocketTicketCache(): SocketTicketCache {
 // ---------------------------------------------------------------------------
 
 /**
- * Return a copy of `url` with `ticket` replaced by `ticketValue` and `token`
- * removed.  Other query parameters (schemaVersion, _pk, device, trace, boot,
- * etc.) are preserved untouched.
+ * Return a copy of `url` with `ticket` replaced by `ticketValue` and legacy
+ * `token` removed.  The URL is an internal provider hand-off only: the
+ * WebSocket wrapper removes ticket before network I/O and supplies it as the
+ * `kaos-ticket.*` subprotocol.
  *
  * Used by VaultSync.patchProviderTicket to keep provider.url current between
  * reconnects — y-partyserver's reconnect loop reads provider.url directly
@@ -220,14 +229,14 @@ export function patchTicketInUrl(url: string, ticketValue: string): string {
 
 async function fetchSocketTicket(
 	host: string,
-	token: string,
 	vaultId: string,
+	getAuthorizationHeader: () => Promise<string>,
 ): Promise<CachedSocketTicket> {
 	const base = host.replace(/\/$/, "");
 	const res = await obsidianRequest({
 		url: `${base}/vault/${encodeURIComponent(vaultId)}/auth/ticket`,
 		method: "POST",
-		headers: { Authorization: `Bearer ${token}` },
+		headers: { Authorization: await getAuthorizationHeader() },
 	});
 
 	if (res.status !== 200) {

@@ -1,149 +1,42 @@
-# Zero Config Onboarding
+# KAOS 기기 키 인증 설계
 
-Self-hosted software usually dies at the onboarding step. KAOS keeps the
-bootstrap entirely in the browser: the deploy form collects a one-time claim
-secret, and the setup page generates the long-lived sync token locally.
+KAOS의 동기화 권한은 공유 bearer token이 아니라 **승인된 기기 개인키의 서명**으로
+부여한다. Config Durable Object가 기기·권한·세션의 단일 기준이다.
 
-KAOS implements a consumer-grade, zero-terminal claim flow, while gracefully handling the realities of infrastructure paywalls.
+## 기기와 권한
 
-## The Framework Migration: Killing the CLI
+| 환경 | 개인키 보관 | 기본 권한 |
+| --- | --- | --- |
+| Obsidian 데스크톱·모바일 | IndexedDB의 비추출형 P-256 키 | Member 또는 Owner |
+| 상시 헤드리스 서버 | 서비스 전용 `0600` identity 파일 | Member |
+| 개인 터미널 CLI | 사용자 상태 디렉터리의 `0600` identity 파일 | Member |
+| CI·일회성 컨테이너 | 지원하지 않음 | 없음 |
 
-The first version of KAOS was built on PartyKit. PartyKit provided an incredible early abstraction - it wrapped Cloudflare's complex Durable Objects behind a simple "Room" API and made real-time multiplayer trivially easy to bootstrap.
+브라우저 키는 JavaScript가 원문을 내보낼 수 없도록 생성한다. 기기·Obsidian 프로필이
+완전히 침해된 상황까지 막지는 못하므로, 폐기와 짧은 세션으로 노출 시간을 제한한다.
 
-However, the deployment worked exclusively through their proprietary CLI. The problem is that users must login through partykit-cli to deploy, meaning we couldn't utilize Cloudflare's "One-Click Deployment" button. This violated our core onboarding goal: Zero-terminal, consumer-grade self-hosting.
+## 인증 흐름
 
-To unlock the deploy button, we stripped out the PartyKit framework and ported the entire transport layer to native Cloudflare Workers using y-partyserver, handle WebSocket transport and Durable Object coordination. We define the entire infrastructure (Workers, Durable Objects, and Storage) in a standard `wrangler.toml` file, eliminating the CLI entirely and allowing users to deploy straight from their browser.
+1. 새 기기는 Owner가 만든 단일 사용·짧은 만료 초대로 pending 등록을 요청한다.
+2. Owner는 기기 이름, 공개키 지문, 상호 대조 코드를 확인해 승인한다.
+3. 활성 기기는 서버 nonce에 P-256 서명을 제출해 5분 이하의 기기 세션을 받는다.
+4. HTTP는 `Authorization` 헤더만 사용한다. WebSocket은 단일 사용·5분 이하 ticket을
+   `Sec-WebSocket-Protocol`으로 한 번만 전달한다.
+5. 매 동기화 작업은 현재 `authGeneration`, 기기 상태, 역할을 Config DO에서 다시
+   확인한다.
 
-# The Single-Use Claim Architecture
+URL 쿼리 token/ticket과 장기 bearer token은 거부한다. 초대값·세션값·복구값·개인키는
+감사 로그, 진단 번들, 설정 내보내기, 명령행에 남기지 않는다.
 
-When deployed, the KAOS server boots into an "Unclaimed" state.
-- Deploy to Cloudflare requires a unique 32–512 character visible-ASCII
-  `KAOS_CLAIM_SECRET` without spaces.
-- The user visits the Worker URL and enters that same one-time ownership proof.
-- The browser utilizes crypto.getRandomValues() to generate a high-entropy token locally.
-- The user clicks "Claim". The sync token is sent as JSON and the separate
-  ownership proof is sent in `X-KAOS-Claim-Proof`.
-- The server requires same-origin browser requests, `application/json`, a
-  configured claim secret, and a constant-time proof match before touching the
-  Config Durable Object.
-- The server hashes the token (SHA-256) and stores only the hash inside a singleton Config Durable Object via an ACID transaction.
-- The setup route permanently locks itself.
+## 폐기와 복구
 
-The distinction is intentional: a completely public unclaimed endpoint has no
-signal that distinguishes the deploy owner from a bot. Origin and CORS checks
-stop browser CSRF but cannot stop a direct HTTP first-claim attempt. The
-deploy-time proof supplies that missing trust anchor without requiring a
-terminal. Existing claimed deployments and explicit `SYNC_TOKEN` deployments
-do not pass through this bootstrap path.
+Owner가 기기를 폐기하거나 권한을 바꾸면 해당 기기의 세션·ticket·WebSocket 연결을
+즉시 종료하고 `authGeneration`을 증가시킨다. Owner를 모두 잃었을 때만 별도 `0600`
+recovery 파일로 전체 폐기를 명시 확인해 실행한다. 복구는 모든 기존 기기·세션·초대를
+무효화하고, 새 Owner와 새 복구 검증값을 한 트랜잭션에서 만든다.
 
-For subsequent authentication, the plugin uses `Authorization: Bearer <token>` for HTTP endpoints.
+## 레거시 전환
 
-For WebSocket sync transport, the plugin uses **short-lived connection tickets** issued by the server.  Before opening a WebSocket connection the plugin calls `POST /vault/:vaultId/auth/ticket` with the long-lived bearer token in the Authorization header.  The server returns a ticket valid for 5 minutes, scoped to the specific vault, and signed with HMAC-SHA256.  Only the ticket appears in the WebSocket URL query parameter — the long-lived token never touches a URL.
-
-Old plugin versions that predate ticket auth continue to work during the migration window: the server accepts either a valid ticket (`?ticket=`) or a valid long-lived token (`?token=`) and emits a warning to Worker logs when the legacy path is used.
-
-## Current transport model
-
-- HTTP routes (`/vault/*`, setup helpers, snapshot APIs) authenticate with `Authorization: Bearer <token>`.
-- WebSocket sync (`/vault/sync/:room`) authenticates with a short-lived `?ticket=` signed by the server.  Legacy `?token=` is accepted during the migration window.
-- All traffic is expected over HTTPS/WSS in normal deployment.
-
-## Ticket auth detail
-
-The server issues tickets at `POST /vault/:vaultId/auth/ticket` (requires valid Bearer auth).  The ticket payload is:
-
-```json
-{ "v": 1, "aud": "kaos-ws", "vaultId": "...", "iat": <ms>, "exp": <ms>, "nonce": "<random>" }
-```
-
-Signed as `base64url(payload).base64url(HMAC-SHA256(signingKey, base64url(payload)))`.  The signing key is derived from the server's existing auth secret so no additional deployment secret is required.
-
-The plugin caches the ticket and refreshes it when less than 30 seconds remain, so reconnects reuse a valid cached ticket without an extra HTTP round-trip.
-
-## Reconnect behavior and the y-partyserver constraint
-
-`YProvider.connect()` evaluates the async `params()` callback exactly once, mutates `provider.url` with the result, then calls the base `WebsocketProvider.connect()`.  The internal reconnect loop (`setupWS`) reads `provider.url` directly on every subsequent reconnect without re-invoking `params()`.
-
-This means the ticket inserted on the initial connection would become stale after its 5-minute TTL, causing all reconnects after that point to present an expired ticket and receive 401 responses — permanently, until plugin reload.
-
-The fix is a proactive refresh manager in `VaultSync`:
-
-1. After the initial `params()` call succeeds with a ticket, `scheduleSocketTicketRefresh` sets a timer at `expiresAt - TICKET_REFRESH_BUFFER_MS` (i.e. 30 seconds before expiry).
-2. When the timer fires, it calls the ticket callback with `force=true`, which bypasses the cache and fetches a fresh ticket from the server.
-3. `patchProviderTicket` replaces `?ticket=` in `provider.url` with the new value and removes any legacy `?token=` if present.  Other query parameters (schemaVersion, `_pk`, trace context) are preserved.
-4. The timer reschedules itself based on the new ticket's `expiresAt`.
-5. On every `"disconnected"` status event, a best-effort refresh also fires before the internal reconnect timer retries.  This secondary path handles sleep/wake and abrupt network drops where the proactive timer may not have fired in time.  It races the first reconnect attempt (100ms backoff), but subsequent retries will use the updated URL.
-
-The `force=true` flag causes `ticketCache.invalidate()` to run before `ticketCache.get()`, guaranteeing a network fetch rather than returning the still-cached (but about-to-expire) ticket.
-
-If `y-partyserver` is upgraded, verify whether this behavior has changed — see also `engineering/warts-and-limits.md`.
-
-## Threat model notes
-
-The long-lived token is no longer placed in the WebSocket transport URL. A
-leaked connection ticket is bounded by the 5-minute TTL — normally useless by
-the time a log rotation or audit sees it.
-
-The setup deep link still carries the sync token during initial device pairing.
-The plugin therefore accepts it only as an explicit `action=setup`, requires a
-canonical HTTPS origin plus token and vault ID, confirms fresh setup, verifies
-the credentials before saving, and refuses to repoint an already configured
-vault to a different host or vault ID. Server replacement remains a settings
-screen operation.
-
-For legacy clients still using `?token=`, the risk profile is unchanged from v1: acceptable when TLS is enabled end-to-end and server logs are access-controlled.
-
-## Migration path: disabling legacy token auth
-
-Once all plugin clients in your deployment have upgraded to the ticket-aware version (identifiable by Worker logs no longer containing `"legacy ?token= WebSocket auth"`), set the operator flag to close the legacy path permanently:
-
-```toml
-# server/wrangler.toml
-[vars]
-KAOS_DISABLE_LEGACY_WS_TOKEN = "true"
-```
-
-When set, connections using `?token=` are rejected with 401 before the vault Durable Object is woken.  Ticket-authenticated connections are unaffected.
-
-The `wrangler.toml` included with the server contains this setting as a commented-out example with upgrade guidance.
-
-## Planned hardening (post-current)
-
-- Replace `tokenHash`-as-signing-key with a random per-server ticket signing secret generated at claim time and stored in the Config DO.  This removes the promotion of the token verifier hash to signing authority.  Existing deployments would backfill lazily on next claim.
-- Ensure auth material is redacted from traces and diagnostics by default.
-
-For the broader list of accepted compromises and tracked debt, see
-`engineering/warts-and-limits.md`.
-
-# The URI Protocol Handshake
-
-To eliminate the normal copy-paste step, the setup page generates a custom
-deep-link: `obsidian://kaos?action=setup&host=...&token=...&vaultId=...`.
-
-When clicked, the OS routes this to the Obsidian plugin. The plugin validates
-the complete target, shows the destination and local document count, performs
-an authenticated ticket preflight, then saves and starts sync. A configured
-vault cannot be redirected to another server or vault by a deep link.
-
-# Graceful Degradation and the Credit Card Wall
-
-Because KAOS utilizes native `wrangler.toml` bindings, Cloudflare can automatically provision Durable Objects and R2 buckets upon deployment.
-
-However, we made the intentional product decision **not** to force the R2 bucket binding in the default deployment template. Cloudflare enforces a strict requirement: users must have a primary payment method (credit card) on file to provision an R2 bucket. If KAOS required this binding by default, the "Deploy to Cloudflare" button would hit a billing wall, and users without a configured payment profile would abandon the setup.
-
-We solved this via Capability Negotiation:
-- The default KAOS deployment provisions only the text-sync CRDT engine (Worker + Durable Object). It requires no credit card.
-- When the Obsidian plugin connects, it performs a capability probe (`GET /api/capabilities`).
-- If the server lacks the `KAOS_BUCKET` binding, it returns `{ attachments: false, snapshots: false }`.
-- The plugin reads this and gracefully disables the attachment and snapshot UI. It continues to sync markdown text flawlessly.
-
-![Deploy-button resilience without mandatory R2](./diagrams/deploy-button-resilience-without-mandatory-r2.webp)
-
-
-Power users who want attachment sync can easily add the R2 binding later via the Cloudflare dashboard **one-step (Just add an R2 binding to the Worker)**. The server will dynamically detect the new binding, update its capabilities, and the plugin will unlock the UI without a single line of code changing.
-
-Follow-up deploys preserve that choice: `npm run deploy` runs
-`scripts/auto-bind-r2.mjs` first, and if the existing Worker already has a
-`KAOS_BUCKET` R2 binding, the script writes the matching `[[r2_buckets]]` block
-into `wrangler.toml` before Wrangler uploads the new version. If no existing
-binding is found, the deploy remains text-only.
+기존 공유 토큰은 최대 7일 동안 **승인 대기 등록 요청**에만 쓸 수 있다. 동기화,
+Owner 권한, URL/QR 전달에는 사용할 수 없으며, 기간 종료 시 서버와 클라이언트는
+레거시 경로와 평문 설정을 모두 거부한다.

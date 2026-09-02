@@ -21,6 +21,7 @@ export class MarkdownView {}
 
 /** Stub class. Used in instanceof checks inside DiskMirror's vault event handlers. */
 export class TFile {}
+export class TFolder {}
 
 /** Notice constructor used by runtime controllers. */
 export class Notice {

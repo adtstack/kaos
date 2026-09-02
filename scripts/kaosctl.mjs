@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
+import { createHash, webcrypto } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { createReadStream, createWriteStream } from "node:fs";
-import { access, chmod, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, readlink, rename, rm, symlink, writeFile } from "node:fs/promises";
-import { constants, openSync, closeSync } from "node:fs";
+import { access, chmod, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
 import { hostname, homedir, tmpdir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
 import readline from "node:readline/promises";
@@ -187,9 +187,18 @@ async function installInteractive(raw) {
 
 		const host = await promptText(tty, "Worker host", asNonEmptyString(pluginData.host));
 		const vaultId = await promptText(tty, "Vault id", asNonEmptyString(pluginData.vaultId));
-		const token = asNonEmptyString(pluginData.token) ?? await promptSecret(tty, "Sync token");
 		const defaultDevice = `${sanitizeDeviceName(hostname())}-headless`;
 		const deviceName = await promptText(tty, "Headless device name", defaultDevice);
+		const identityFileInput = await promptText(
+			tty,
+			"Protected device identity file",
+			asNonEmptyString(pluginData.identityFile) ?? paths.identityFile,
+		);
+		if (!identityFileInput.trim()) throw new Error("A protected device identity file is required.");
+		const identityFile = resolve(identityFileInput);
+		const inviteFileInput = await promptText(tty, "Owner invitation file (0600)", "");
+		if (!inviteFileInput.trim()) throw new Error("An Owner invitation file is required to enroll this headless device.");
+		const inviteFile = resolve(inviteFileInput);
 		const enableAttachmentSync = readBoolean(pluginData.enableAttachmentSync) ?? await promptYesNo(tty, "Enable attachment sync?", true);
 
 		writeTty(tty, "\nInstall summary\n");
@@ -198,8 +207,9 @@ async function installInteractive(raw) {
 		writeTty(tty, `  Plugin: ${pluginDir}\n`);
 		writeTty(tty, `  Host: ${host}\n`);
 		writeTty(tty, `  Vault id: ${vaultId}\n`);
-		writeTty(tty, `  Token: configured\n`);
 		writeTty(tty, `  Device: ${deviceName}\n`);
+		writeTty(tty, `  Device identity: ${identityFile}\n`);
+		writeTty(tty, `  Owner invitation: ${inviteFile}\n`);
 		writeTty(tty, `  Install dir: ${paths.installRoot}\n`);
 		writeTty(tty, `  Command: ${paths.binKaos}\n`);
 		const proceed = await promptYesNo(tty, "Continue?", true);
@@ -215,12 +225,23 @@ async function installInteractive(raw) {
 			pluginDir,
 			host,
 			vaultId,
-			token,
 			deviceName,
+			identityFile,
 			enableAttachmentSync,
 			releaseBaseUrl,
 			version,
 		});
+		runChecked(process.execPath, [
+			"--",
+			join(paths.currentLink, RUNNER),
+			"device", "enroll",
+			"--host", host,
+			"--vault-id", vaultId,
+			"--device-name", deviceName,
+			"--identity-file", identityFile,
+			"--invite-file", inviteFile,
+			"--data-file", paths.dataFile,
+		]);
 		await writeUserService({ paths, vaultRoot, pluginDir });
 		await linkKaosCommands(paths);
 
@@ -232,7 +253,7 @@ async function installInteractive(raw) {
 			writeTty(tty, `Add ${paths.binDir} to PATH if the kaos command is not found in a new shell.\n`);
 		}
 		if (await commandExists("systemctl")) {
-			const enableNow = await promptYesNo(tty, "Start and enable the user service now?", true);
+			const enableNow = await promptYesNo(tty, "Owner approval is required before syncing. Start and enable the user service now?", false);
 			if (enableNow) {
 				runChecked("systemctl", ["--user", "daemon-reload"]);
 				runChecked("systemctl", ["--user", "enable", "--now", "kaos-headless-host"]);
@@ -532,6 +553,11 @@ async function runHistoryCommand(argv) {
 }
 
 async function resolveHistoryConnection(raw) {
+	if (["token", "token-file", "token-stdin"].some((name) => raw[name] !== undefined)
+		|| asNonEmptyString(process.env.KAOS_SYNC_TOKEN)
+		|| asNonEmptyString(process.env.SYNC_TOKEN)) {
+		throw new Error("Legacy token flags and environment variables are no longer supported; use a protected device identity file.");
+	}
 	const defaults = defaultUserPaths();
 	const explicitConfig = asNonEmptyString(raw.config);
 	const configPath = explicitConfig ? resolveUserPath(explicitConfig) : defaults.installConfig;
@@ -550,18 +576,27 @@ async function resolveHistoryConnection(raw) {
 		pluginDir ? join(pluginDir, "data.json") : null,
 	]);
 	const data = await readHistoryConfig(dataFiles);
-	const tokenFile = raw["token-file"]
-		? resolveUserPath(raw["token-file"])
-		: (isRecord(installConfig) ? paths.tokenFile : null);
-	const token = asNonEmptyString(raw.token)
-		?? await readHistoryToken(tokenFile)
-		?? asNonEmptyString(data?.token);
+	if (asNonEmptyString(installConfig?.token) || asNonEmptyString(data?.token)) {
+		throw new Error("Legacy token material is present in configuration. Remove it before using this device-key command.");
+	}
 	const host = asNonEmptyString(raw.host) ?? asNonEmptyString(data?.host);
 	const vaultId = asNonEmptyString(raw["vault-id"]) ?? asNonEmptyString(data?.vaultId);
-	if (!host || !vaultId || !token) {
-		throw new Error("File history needs host, vault id, and token. Install KAOS headless first or pass --host, --vault-id, and --token.");
+	const identityFile = raw["identity-file"]
+		? resolveUserPath(raw["identity-file"])
+		: asNonEmptyString(data?.identityFile) ?? paths.identityFile;
+	if (!host || !vaultId || !identityFile) {
+		throw new Error("File history needs host, vault id, and a protected device identity file.");
 	}
-	return { host: host.replace(/\/$/, ""), vaultId, token };
+	const canonicalHost = host.replace(/\/$/, "");
+	return {
+		host: canonicalHost,
+		vaultId,
+		authorizationHeader: createDeviceAuthorizationProvider({
+			host: canonicalHost,
+			vaultId,
+			identityFile,
+		}),
+	};
 }
 
 async function readHistoryConfig(paths) {
@@ -573,28 +608,107 @@ async function readHistoryConfig(paths) {
 	return config;
 }
 
-async function readHistoryToken(path) {
-	if (!path) return null;
-	try {
-		return asNonEmptyString(await readFile(path, "utf8"));
-	} catch {
-		return null;
-	}
-}
-
 function historyApiUrl(connection, endpoint) {
 	return `${connection.host}/vault/${encodeURIComponent(connection.vaultId)}/${endpoint}`;
 }
 
 async function historyFetch(connection, endpoint) {
 	const res = await fetch(historyApiUrl(connection, endpoint), {
-		headers: { Authorization: `Bearer ${connection.token}` },
+		headers: { Authorization: await connection.authorizationHeader() },
 	});
 	if (!res.ok) {
 		const text = await res.text();
 		throw new Error(`file history request failed (${res.status}): ${text || res.statusText}`);
 	}
 	return res;
+}
+
+function createDeviceAuthorizationProvider({ host, vaultId, identityFile }) {
+	let session = null;
+	return async () => {
+		if (session && session.expiresAt - Date.now() > 30_000) return `Bearer ${session.value}`;
+		session = await createDeviceSession({ host, vaultId, identityFile });
+		return `Bearer ${session.value}`;
+	};
+}
+
+async function createDeviceSession({ host, vaultId, identityFile }) {
+	const identity = await readProtectedDeviceIdentity(identityFile);
+	if (identity.host.replace(/\/$/, "") !== host || identity.vaultId !== vaultId) {
+		throw new Error("Device identity belongs to a different Worker or vault.");
+	}
+	const challengeResponse = await fetch(`${host}/api/auth/challenge`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ vaultId, deviceId: identity.deviceId }),
+	});
+	const challenge = await readJsonObject(challengeResponse);
+	if (!challengeResponse.ok) throw new Error(`Device challenge rejected (${challengeResponse.status}).`);
+	if (typeof challenge.challengeId !== "string" || typeof challenge.nonce !== "string" || typeof challenge.authGeneration !== "number") {
+		throw new Error("Worker returned a malformed device challenge.");
+	}
+	const crypto = globalThis.crypto ?? webcrypto;
+	const privateKey = await crypto.subtle.importKey("jwk", identity.privateKey, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+	const message = `kaos-device-auth-v1|${challenge.challengeId}|${challenge.nonce}|${vaultId}|${identity.deviceId}|${challenge.authGeneration}`;
+	const signature = Buffer.from(await crypto.subtle.sign(
+		{ name: "ECDSA", hash: "SHA-256" },
+		privateKey,
+		new TextEncoder().encode(message),
+	)).toString("base64url");
+	const sessionResponse = await fetch(`${host}/api/auth/session`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ vaultId, deviceId: identity.deviceId, challengeId: challenge.challengeId, signature }),
+	});
+	const payload = await readJsonObject(sessionResponse);
+	if (!sessionResponse.ok || typeof payload.session !== "string" || typeof payload.expiresAt !== "number") {
+		throw new Error(`Device session rejected (${sessionResponse.status}).`);
+	}
+	return { value: payload.session, expiresAt: payload.expiresAt };
+}
+
+async function readProtectedDeviceIdentity(path) {
+	const absolute = resolveUserPath(path);
+	// macOS spells its secure temporary hierarchy through /var, which is a
+	// system alias for /private/var. Resolve the *parent* first, then inspect
+	// the canonical path. This accepts that OS alias without accepting a
+	// caller-controlled file or directory symlink.
+	const canonicalParent = await realpath(dirname(absolute));
+	const protectedPath = join(canonicalParent, basename(absolute));
+	const details = await lstat(protectedPath);
+	if (details.isSymbolicLink() || !details.isFile() || (details.mode & 0o077) !== 0) {
+		throw new Error("Device identity must be a protected regular 0600 file.");
+	}
+	const ownUid = typeof process.getuid === "function" ? process.getuid() : null;
+	if (ownUid !== null && details.uid !== 0 && details.uid !== ownUid) {
+		throw new Error("Device identity is not owned by this account.");
+	}
+	for (let directory = canonicalParent; ; directory = dirname(directory)) {
+		const parent = await lstat(directory);
+		const isStickySystemDir = (parent.mode & 0o1000) !== 0 && parent.uid === 0;
+		if (!parent.isDirectory() || parent.isSymbolicLink() || ((parent.mode & 0o022) !== 0 && !isStickySystemDir)) {
+			throw new Error("Device identity is below an unsafe directory.");
+		}
+		if (ownUid !== null && parent.uid !== 0 && parent.uid !== ownUid) {
+			throw new Error("Device identity is below a directory not owned by this account.");
+		}
+		if (dirname(directory) === directory) break;
+	}
+	let parsed;
+	try { parsed = JSON.parse(await readFile(protectedPath, "utf8")); } catch { throw new Error("Device identity is not valid JSON."); }
+	if (!isRecord(parsed) || typeof parsed.deviceId !== "string" || typeof parsed.host !== "string" || typeof parsed.vaultId !== "string" || !isRecord(parsed.privateKey)) {
+		throw new Error("Device identity is malformed.");
+	}
+	return parsed;
+}
+
+async function readJsonObject(response) {
+	try {
+		const value = await response.json();
+		return isRecord(value) ? value : {};
+	} catch {
+		return {};
+	}
 }
 
 async function historyFetchJson(connection, endpoint) {
@@ -1843,11 +1957,11 @@ function defaultUserPaths() {
 		configDir: join(configHome, "kaos"),
 		installConfig: join(configHome, "kaos", "install.json"),
 		envFile: join(configHome, "kaos", "headless.env"),
-		tokenFile: join(configHome, "kaos", "sync-token"),
 		serviceDir: join(configHome, "systemd", "user"),
 		serviceFile: join(configHome, "systemd", "user", DEFAULT_SERVICE_NAME),
 		stateDir: join(stateHome, "kaos-headless"),
 		dataFile: join(stateHome, "kaos-headless", "data.json"),
+		identityFile: join(stateHome, "kaos-headless", "device.identity.json"),
 		runtimeDir: join(runtimeBase, "kaos-headless"),
 		lockFile: join(runtimeBase, "kaos-headless", "kaos.lock"),
 	};
@@ -1969,7 +2083,7 @@ async function enableVaultPlugin(vaultRoot, pluginId) {
 	await writeFile(communityPlugins, `${JSON.stringify([...enabled, pluginId], null, 2)}\n`, "utf8");
 }
 
-async function writeHeadlessConfig({ paths, vaultRoot, pluginDir, host, vaultId, token, deviceName, enableAttachmentSync, releaseBaseUrl, version }) {
+async function writeHeadlessConfig({ paths, vaultRoot, pluginDir, host, vaultId, deviceName, identityFile, enableAttachmentSync, releaseBaseUrl, version }) {
 	await mkdir(paths.configDir, { recursive: true });
 	await mkdir(paths.stateDir, { recursive: true });
 	await mkdir(paths.runtimeDir, { recursive: true });
@@ -1980,13 +2094,11 @@ async function writeHeadlessConfig({ paths, vaultRoot, pluginDir, host, vaultId,
 		`KAOS_ENABLE_ATTACHMENT_SYNC=${enableAttachmentSync ? "true" : "false"}`,
 		"",
 	].join("\n"), { encoding: "utf8", mode: 0o600 });
-	await writeFile(paths.tokenFile, token, { encoding: "utf8", mode: 0o600 });
-	await chmod(paths.tokenFile, 0o600).catch(() => undefined);
 	await writeJsonAtomic(paths.dataFile, {
 		host,
-		token,
 		vaultId,
 		deviceName,
+		identityFile,
 		enableAttachmentSync,
 		attachmentSyncExplicitlyConfigured: true,
 	}, 0o600);
@@ -2013,7 +2125,7 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile=${systemdQuote(paths.envFile)}
 ExecStartPre=${systemdQuote(nodeBin)} -- ${systemdQuote(paths.binKaos)} update --startup --config ${systemdQuote(paths.installConfig)}
-ExecStart=${systemdQuote(nodeBin)} -- ${systemdQuote(join(paths.currentLink, RUNNER))} --vault ${systemdQuote(vaultRoot)} --data-file ${systemdQuote(paths.dataFile)} --lock-file ${systemdQuote(paths.lockFile)} --token-file ${systemdQuote(paths.tokenFile)} --plugin-dir ${systemdQuote(pluginDir)}
+ExecStart=${systemdQuote(nodeBin)} -- ${systemdQuote(join(paths.currentLink, RUNNER))} --vault ${systemdQuote(vaultRoot)} --data-file ${systemdQuote(paths.dataFile)} --lock-file ${systemdQuote(paths.lockFile)} --plugin-dir ${systemdQuote(pluginDir)}
 Restart=on-failure
 RestartSec=5
 
@@ -2089,8 +2201,6 @@ function doctorArgs({ config, paths }) {
 		paths.dataFile,
 		"--lock-file",
 		paths.lockFile,
-		"--token-file",
-		paths.tokenFile,
 		"--plugin-dir",
 		config.pluginDir,
 	];
@@ -2387,22 +2497,6 @@ async function promptYesNo(tty, label, defaultYes) {
 	}
 }
 
-async function promptSecret(tty, label) {
-	while (true) {
-		const fd = openSync("/dev/tty", "r+");
-		try {
-			spawnSync("stty", ["-echo"], { stdio: [fd, fd, fd] });
-			const value = await tty.rl.question(`${label}: `);
-			writeTty(tty, "\n");
-			if (value.trim()) return value.trim();
-			writeTty(tty, `${label} is required.\n`);
-		} finally {
-			spawnSync("stty", ["echo"], { stdio: [fd, fd, fd] });
-			closeSync(fd);
-		}
-	}
-}
-
 function printUsage() {
 	console.log(`Usage:
   kaos install
@@ -2457,8 +2551,7 @@ Connection options:
   --config <path>       KAOS headless install config.
   --host <url>          KAOS Worker host.
   --vault-id <id>       KAOS vault id.
-  --token <token>       KAOS auth token.
-  --token-file <path>   Read the KAOS auth token from a file.
+  --identity-file <path> Protected 0600 device identity file.
   --data-file <path>    Read the KAOS plugin/headless data file.
 `);
 }

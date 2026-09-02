@@ -27,7 +27,7 @@ export function formatHeadlessStatus(status: HeadlessStatusOutput): string {
 		["Worker", formatConfiguredValue(status.configured.host)],
 		["Vault ID", formatConfiguredValue(status.configured.vaultId)],
 		["Device", formatConfiguredValue(status.configured.deviceName)],
-		["Token", status.configured.tokenConfigured === true ? "configured" : "not configured"],
+		["Device key", status.configured.identityFileConfigured === true ? "configured" : "not configured"],
 		["Attachments", formatAttachmentSetting(status.configured.enableAttachmentSync)],
 	]);
 }

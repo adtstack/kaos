@@ -9,7 +9,7 @@
  * Invariants tested:
  *   Safe mode (includeFilenames: false):
  *     - host is "(redacted)", not the actual server URL
- *     - token: only { present: bool } — no prefix, no length
+ *     - device authentication is represented only by non-secret configuration state
  *     - vaultId is "(redacted)"
  *     - deviceName is "(redacted)"
  *     - known vault paths do not appear anywhere in the serialised bundle
@@ -89,7 +89,7 @@ function makeInput(overrides: Partial<DiagnosticsBundleInput> = {}): Diagnostics
 		generationMs: 123,
 		settings: {
 			host: SENSITIVE_HOST,
-			token: "secret-token",
+			deviceId: "device-fixture-123",
 			vaultId: SENSITIVE_VAULT,
 			deviceName: SENSITIVE_DEVICE,
 			debug: false,
@@ -212,17 +212,10 @@ console.log("\n--- Test 1: safe mode — settings redaction ---");
 	assert(settings.vaultId === "(redacted)", "safe mode: vaultId is (redacted)");
 	assert(settings.deviceName === "(redacted)", "safe mode: deviceName is (redacted)");
 	assert(
-		typeof settings.token === "object" && settings.token !== null && "present" in (settings.token as object),
-		"safe mode: token is { present: bool }",
+		(settings.deviceAuthentication as Record<string, unknown>)?.configured === true,
+		"safe mode: device authentication reports only configured state",
 	);
-	assert(
-		!(settings.token as Record<string, unknown>)["prefix"],
-		"safe mode: token has no prefix field",
-	);
-	assert(
-		!(settings.token as Record<string, unknown>)["length"],
-		"safe mode: token has no length field",
-	);
+	assert(!("token" in settings), "safe mode: diagnostics contain no bearer-token field");
 	assert(
 		settings.externalEditBehavior === "include-open-files-safely",
 		"safe mode: diagnostics report the one effective external-edit behavior",

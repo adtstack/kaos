@@ -1,19 +1,22 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
-import { PairDeviceModal } from "./PairDeviceModal";
+import { PairDeviceModal, type PairingModalOptions } from "./PairDeviceModal";
 import { RecoveryKitModal } from "./RecoveryKitModal";
+import { ConfirmModal } from "../ui/ConfirmModal";
 import {
 	attachmentSizeCapKB,
 	type VaultSyncSettings,
 } from "./settingsStore";
 import type { RecoveryStorageAuditReport } from "../sync/recoverySnapshotClient";
+import type { ManagedDevice } from "../sync/deviceAuth";
 import { randomBase64Url } from "../utils/base64url";
 import { SettingsCapabilityRefreshSession } from "./settingsCapabilityRefresh";
 import {
 	KAOS_EXCLUDE_FILE_PATH,
 	parseExcludePatterns,
 } from "../sync/exclude";
+import { parseConnectionString } from "../runtime/setupLinkController";
 
-type SettingsAuthMode = "env" | "claim" | "unclaimed" | "unknown";
+type SettingsAuthMode = "device" | "unclaimed" | "unknown";
 type SettingsStatusState = "disconnected" | "loading" | "syncing" | "connected" | "offline" | "error" | "unauthorized";
 
 interface SettingsUpdateState {
@@ -59,8 +62,16 @@ export interface VaultSyncSettingsHost {
 	getSettingsStatusSummary(): { state: SettingsStatusState; label: string };
 	getUpdateState(): SettingsUpdateState;
 	getRecoveryStorageStatusState(): SettingsRecoveryStorageState;
-	buildSetupDeepLink(): string | null;
-	buildMobileSetupUrl(): string | null;
+	createDevicePairingSession(): Promise<PairingModalOptions>;
+	pairDeviceWithSecret(target: { host: string; vaultId: string; qrSecret: string }): Promise<{ status: "active"; deviceId: string; fingerprint: string | null }>;
+	pairDeviceWithCode(target: { host: string; vaultId: string; code: string }): Promise<{ status: "active"; deviceId: string; fingerprint: string | null }>;
+	claimServerAsOwner?(host: string, claimSecret: string): Promise<{ recoverySecret: string }>;
+	handleSetupLink?(params: Record<string, string>): Promise<void>;
+	listManagedDevices(): Promise<ManagedDevice[]>;
+	changeManagedDeviceRole(deviceId: string, role: "owner" | "member"): Promise<void>;
+	revokeManagedDevice(deviceId: string): Promise<void>;
+	hasSyncRuntime(): boolean;
+	initSync(): Promise<void> | void;
 	buildRecoveryKitText(): string | null;
 }
 
@@ -169,11 +180,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 		containerEl.addClass("kaos-settings-tab");
-		const setupIncomplete = !this.host.settings.host || !this.host.settings.token;
+		const setupIncomplete = !this.host.settings.host || !this.host.settings.deviceId;
 		const capabilityRefreshGeneration =
 			this.capabilityRefreshSession.beginDisplay(!setupIncomplete);
 		const capabilityRefreshInFlight = this.capabilityRefreshSession.isInFlight;
-		const authMode = this.host.serverAuthMode;
 		const attachmentsAvailable = this.host.serverSupportsAttachments;
 		const attachmentCapKB = attachmentSizeCapKB(this.host.serverMaxBlobUploadBytes);
 		const syncStatus = this.host.getSettingsStatusSummary();
@@ -182,28 +192,104 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 		if (setupIncomplete) {
 			const callout = containerEl.createDiv({ cls: "callout kaos-settings-setup-callout" });
-			callout.setAttr("data-callout", "warning");
+			callout.setAttr("data-callout", "info");
 
 			const calloutTitle = callout.createDiv({ cls: "callout-title" });
-			calloutTitle.createSpan({ text: "Setup required" });
+			calloutTitle.createSpan({ text: "Quick Setup & Pairing" });
 
 			const calloutContent = callout.createDiv({ cls: "callout-content" });
 			calloutContent.createEl("p", {
-				text: "This plugin needs a free sync server to sync your data. It costs $0 and takes about 15 seconds.",
+				text: "Connect this device to an existing vault using a pairing link or code, or claim a newly deployed server.",
 			});
 
-			calloutContent.createEl("p", {
-				text: "After deployment, open your server URL, claim the server, then use the setup link.",
-				cls: "kaos-settings-setup-hint",
-			});
+			let pasteLinkInput = "";
+			new Setting(calloutContent)
+				.setName("Connect with pairing link")
+				.setDesc("Paste the connection link or pairing string copied from an owner device.")
+				.addText((text) =>
+					// eslint-disable-next-line obsidianmd/ui/sentence-case
+					text.setPlaceholder("obsidian://kaos?action=pair&...")
+						.onChange((val) => { pasteLinkInput = val.trim(); }),
+				)
+				.addButton((button) =>
+					button.setButtonText("Connect")
+						.setCta()
+						.onClick(async () => {
+							if (!pasteLinkInput) {
+								new Notice("Please paste a pairing link.", 4000);
+								return;
+							}
+							const params = parseConnectionString(pasteLinkInput);
+							if (!params || !params.host || !params.vaultId || (!params.secret && !params.code && !params.invite)) {
+								new Notice("Invalid pairing link format.", 6000);
+								return;
+							}
+							button.setDisabled(true);
+							try {
+								if (this.host.handleSetupLink) {
+									await this.host.handleSetupLink(params);
+								} else if (params.secret) {
+									await this.host.pairDeviceWithSecret({ host: params.host, vaultId: params.vaultId, qrSecret: params.secret });
+								} else if (params.code) {
+									await this.host.pairDeviceWithCode({ host: params.host, vaultId: params.vaultId, code: params.code });
+								}
+								this.redisplayIfVisible();
+							} catch (err) {
+								new Notice(`Connection failed: ${err instanceof Error ? err.message : "unknown error"}`, 8000);
+							} finally {
+								button.setDisabled(false);
+							}
+						}),
+				);
+
+			let claimHostInput = this.host.settings.host || "";
+			let claimSecretInput = "";
+			new Setting(calloutContent)
+				.setName("Claim new server as owner")
+				.setDesc("Enter your server URL and deploy claim secret to register this device as the primary owner.")
+				.addText((text) =>
+					text.setPlaceholder("https://your-worker.workers.dev")
+						.setValue(claimHostInput)
+						.onChange((val) => { claimHostInput = val.trim(); }),
+				)
+				.addText((text) => {
+					text.setPlaceholder("Deployment claim secret")
+						.onChange((val) => { claimSecretInput = val.trim(); });
+					text.inputEl.type = "password";
+				})
+				.addButton((button) =>
+					button.setButtonText("Claim as owner")
+						.onClick(async () => {
+							if (!claimHostInput || !claimSecretInput) {
+								new Notice("Server URL and claim secret are required.", 5000);
+								return;
+							}
+							if (!this.host.claimServerAsOwner) {
+								new Notice("Direct claim is not supported in this runtime.", 5000);
+								return;
+							}
+							button.setDisabled(true);
+							try {
+								const result = await this.host.claimServerAsOwner(claimHostInput, claimSecretInput);
+								new Notice("Server claimed! This device is registered as owner.", 6000);
+								if (result.recoverySecret) {
+									new RecoveryKitModal(this.app, this.host.buildRecoveryKitText() || result.recoverySecret).open();
+								}
+								this.redisplayIfVisible();
+							} catch (err) {
+								new Notice(`Claim failed: ${err instanceof Error ? err.message : "unknown error"}`, 8000);
+							} finally {
+								button.setDisabled(false);
+							}
+						}),
+				);
 
 			new Setting(calloutContent)
-				.setName("Deploy your server")
-				.setDesc("Start one-click deployment in your browser.")
+				.setName("Don't have a server yet?")
+				.setDesc("Deploy a free sync server on Cloudflare ($0, 15 seconds).")
 				.addButton((button) =>
 					button
-						.setButtonText("Open deploy page")
-						.setCta()
+						.setButtonText("Open Cloudflare deploy")
 						.onClick(() => {
 							window.open(CLOUDFLARE_DEPLOY_URL, "_blank", "noopener");
 						}),
@@ -223,7 +309,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					cls: "kaos-settings-status-title",
 				});
 			titleWrap.createEl("div", {
-				text: "Use the actions below to pair more devices or back up your connection details.",
+			text: "Use the actions below to create a short-lived approval request or save non-secret connection details.",
 				cls: "kaos-settings-status-subtitle",
 			});
 
@@ -240,19 +326,16 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			const actionRow = card.createDiv({ cls: "modal-button-container kaos-settings-status-actions" });
 
 				actionRow.createEl("button", { text: "Pair another device" }).addEventListener("click", () => {
-					const deepLink = this.host.buildSetupDeepLink();
-					const mobileUrl = this.host.buildMobileSetupUrl();
-					if (!deepLink || !mobileUrl) {
-						new Notice("Configure the server URL, sync token, and vault ID before pairing.", 7000);
-						return;
-					}
-					new PairDeviceModal(this.app, deepLink, mobileUrl).open();
-			});
+					void this.host.createDevicePairingSession().then(
+						(options) => new PairDeviceModal(this.app, options).open(),
+						(err) => new Notice(`Could not create pairing session: ${err instanceof Error ? err.message : "Owner permission required"}`, 7000),
+					);
+				});
 
 				actionRow.createEl("button", { text: "Backup connection details" }).addEventListener("click", () => {
 					const recoveryKit = this.host.buildRecoveryKitText();
 					if (!recoveryKit) {
-						new Notice("Configure the server URL, sync token, and vault ID before exporting connection details.", 7000);
+						new Notice("Configure the server URL and vault ID before exporting connection details.", 7000);
 						return;
 					}
 					new RecoveryKitModal(this.app, recoveryKit).open();
@@ -585,7 +668,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		const manualBody = manualDetails.createDiv({ cls: "kaos-settings-details-body" });
 				if (setupIncomplete) {
 					manualBody.createEl("p", {
-						text: "Claim your server in the browser, then use the setup link. You can also enter the connection details manually here.",
+					text: "Enter the server URL and vault ID, then open a short-lived invitation from an owner device to request approval.",
 							cls: "kaos-settings-details-intro",
 						});
 					}
@@ -607,31 +690,74 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 			if (isInsecureRemoteHost(this.host.settings.host)) {
 				manualBody.createEl("p", {
-					text: "This remote connection is unencrypted. Your sync token will be sent in plaintext. Use HTTPS for production.",
+					text: "This remote connection is unencrypted. Device sessions can be exposed. Use HTTPS for production.",
 					cls: "kaos-settings-security-warning",
 				});
 			}
 
 			new Setting(manualBody)
-				.setName("Sync token")
-				.setDesc(
-					authMode === "unclaimed"
-						? "Leave this blank until you claim the server in a browser, then use the setup link."
-						: authMode === "env"
-							? "Must match the SYNC_TOKEN configured on the server."
-							: "This is usually filled in automatically by the setup link after you claim the server.",
-				)
-				.addText((text) =>
-					text
-						.setPlaceholder("Paste your sync token")
-						.setValue(this.host.settings.token)
-						.onChange(async (value) => {
-							await this.host.updateSettings((settings) => {
-								settings.token = value.trim();
-							}, "settings:token");
-							this.redisplayIfVisible();
-					}),
-			);
+				.setName("Device pairing")
+				.setDesc("Connect this device to an existing vault using a 6-character pairing code generated on an owner device.");
+
+			let manualCodeInput = "";
+			new Setting(manualBody)
+				.setName("Connect with pairing code")
+				// eslint-disable-next-line obsidianmd/ui/sentence-case
+				.setDesc("Enter the 6-character code (e.g. KAOS-7X9K42) shown on your other device.")
+				.addText((text) => {
+					// eslint-disable-next-line obsidianmd/ui/sentence-case
+					text.setPlaceholder("KAOS-XXXXXX")
+						.onChange((value) => {
+							manualCodeInput = value.trim();
+						});
+				})
+				.addButton((button) => {
+					button.setButtonText("Connect")
+						.setCta()
+						.onClick(async () => {
+							if (!manualCodeInput) {
+								new Notice("Please enter a pairing code.", 4000);
+								return;
+							}
+							const host = this.host.settings.host.trim().replace(/\/$/, "");
+							const vaultId = this.host.settings.vaultId.trim();
+							if (!host || !vaultId) {
+								new Notice("Server URL and vault ID must be set first.", 6000);
+								return;
+							}
+							button.setDisabled(true);
+							try {
+								await this.host.pairDeviceWithCode({
+									host,
+									vaultId,
+									code: manualCodeInput,
+								});
+								new Notice("Device paired successfully! Starting sync…", 5000);
+								if (!this.host.hasSyncRuntime()) await this.host.initSync();
+								this.redisplayIfVisible();
+							} catch (err) {
+								new Notice(`Pairing failed: ${err instanceof Error ? err.message : "invalid or expired code"}`, 8000);
+							} finally {
+								button.setDisabled(false);
+							}
+						});
+				});
+
+			const deviceRequests = manualBody.createDiv({ cls: "kaos-settings-device-requests" });
+			new Setting(manualBody)
+				.setName("Manage paired devices")
+				.setDesc("View active devices connected to this vault.")
+				.addButton((button) => button.setButtonText("Refresh list").onClick(async () => {
+					button.setDisabled(true);
+					try {
+						this.renderManagedDevices(deviceRequests, await this.host.listManagedDevices());
+					} catch (error) {
+						deviceRequests.empty();
+						deviceRequests.createEl("p", { text: `Could not load devices: ${error instanceof Error ? error.message : "unknown error"}` });
+					} finally {
+						button.setDisabled(false);
+					}
+				}));
 
 		const advancedDetails = createDetailsSection(containerEl, "Advanced", false);
 		const advancedBody = advancedDetails.createDiv({ cls: "kaos-settings-details-body" });
@@ -764,13 +890,104 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			);
 
 			advancedBody.createEl("p", {
-				text: "Changing the server URL, sync token, or vault ID requires reloading the plugin.",
+				text: "Changing the server URL or vault ID requires reloading the plugin and approving this device again.",
 				cls: "setting-item-description",
 			});
 
 		if (capabilityRefreshGeneration !== null) {
 			void this.refreshCapabilitiesOnOpen(capabilityRefreshGeneration);
 		}
+	}
+
+	private renderManagedDevices(containerEl: HTMLElement, devices: ManagedDevice[]): void {
+		containerEl.empty();
+		const active = devices.filter((device) => device.status === "active" && device.id !== this.host.settings.deviceId);
+		if (active.length === 0) {
+			containerEl.createEl("p", { text: "No other active devices connected to this vault." });
+			return;
+		}
+		containerEl.createEl("p", { text: "Active devices:" });
+		for (const device of active) {
+			const row = containerEl.createDiv({ cls: "kaos-settings-device-request" });
+			row.createEl("p", { text: `${device.name} (${device.role.toUpperCase()}) — ${device.fingerprint}` });
+			const nextRole = device.role === "owner" ? "member" : "owner";
+			new Setting(row)
+				.setName(nextRole === "owner" ? "Make Owner" : "Make Member")
+				.setDesc(nextRole === "owner"
+					? "Owner devices can create pairings and revoke devices."
+					: "Members can sync but cannot manage other devices.")
+				.addButton((button) => button.setButtonText(nextRole === "owner" ? "Make Owner" : "Make Member").setWarning().onClick(async () => {
+					if (!await this.confirmDeviceRoleChange(device, nextRole)) return;
+					button.setDisabled(true);
+					try {
+						await this.host.changeManagedDeviceRole(device.id, nextRole);
+						new Notice(`Device role changed to ${nextRole}.`);
+						this.renderManagedDevices(containerEl, await this.host.listManagedDevices());
+					} catch (error) {
+						button.setDisabled(false);
+						new Notice(`Device role change failed: ${error instanceof Error ? error.message : "unknown error"}`);
+					}
+				}));
+			new Setting(row)
+				.setName("Revoke device")
+				.setDesc("Immediately terminates this device's sync access.")
+				.addButton((button) => button.setButtonText("Revoke").setWarning().onClick(async () => {
+					if (!await this.confirmDeviceRevocation(device)) return;
+					button.setDisabled(true);
+					try {
+						await this.host.revokeManagedDevice(device.id);
+						new Notice("Device revoked.");
+						this.renderManagedDevices(containerEl, await this.host.listManagedDevices());
+					} catch (error) {
+						button.setDisabled(false);
+						new Notice(`Device revocation failed: ${error instanceof Error ? error.message : "unknown error"}`);
+					}
+				}));
+		}
+	}
+
+	private async confirmDeviceRevocation(device: ManagedDevice): Promise<boolean> {
+		return await new Promise((resolve) => {
+			new ConfirmModal(
+				this.app,
+				"Revoke KAOS device",
+				`Revoke ${device.name}? Its device key, sessions, and socket tickets will stop working immediately.`,
+				() => resolve(true),
+				"Revoke device",
+				"Cancel",
+				() => resolve(false),
+			).open();
+		});
+	}
+
+	private async confirmDeviceRejection(device: ManagedDevice): Promise<boolean> {
+		return await new Promise((resolve) => {
+			new ConfirmModal(
+				this.app,
+				"Reject KAOS device request",
+				`Reject the pending request from ${device.name}? Its public key will not be able to sync.`,
+				() => resolve(true),
+				"Reject request",
+				"Cancel",
+				() => resolve(false),
+			).open();
+		});
+	}
+
+	private async confirmDeviceRoleChange(device: ManagedDevice, role: "owner" | "member"): Promise<boolean> {
+		return await new Promise((resolve) => {
+			new ConfirmModal(
+				this.app,
+				role === "owner" ? "Make KAOS device an Owner" : "Make KAOS device a Member",
+				role === "owner"
+					? `${device.name} will be able to approve, change roles, and revoke devices. Confirm its fingerprint through a separate channel first.`
+					: `${device.name} will keep sync access but lose device-management authority.`,
+				() => resolve(true),
+				role === "owner" ? "Make Owner" : "Make Member",
+				"Cancel",
+				() => resolve(false),
+			).open();
+		});
 	}
 
 	hide(): void {

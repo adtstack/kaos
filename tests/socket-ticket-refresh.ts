@@ -6,7 +6,9 @@ import {
 	SocketTicketHttpError,
 	socketTicketRetryDelayMs,
 } from "../src/sync/socketTicket";
-import { TICKET_TTL_MS } from "../server/src/routes/ticket";
+import { DEVICE_TICKET_TTL_MS } from "../server/src/config";
+
+const TICKET_TTL_MS = DEVICE_TICKET_TTL_MS;
 
 let passed = 0;
 let failed = 0;
@@ -294,16 +296,16 @@ console.log("\n--- socket ticket refresh: success preserves the normal five-minu
 	try {
 		const sync = makeHarness(async () => ({
 			value: "fresh",
-			expiresAt: 1_000_000 + TICKET_TTL_MS,
-			localExpiresAt: 1_000_000 + TICKET_TTL_MS,
-			ttlMs: TICKET_TTL_MS,
+			expiresAt: 1_000_000 + DEVICE_TICKET_TTL_MS,
+			localExpiresAt: 1_000_000 + DEVICE_TICKET_TTL_MS,
+			ttlMs: DEVICE_TICKET_TTL_MS,
 		}));
 		sync._socketTicketRefreshFailureCount = 4;
 		assert(await sync.refreshProviderTicketUrl(true), "successful proactive refresh returns true");
 		assertEqual(sync._socketTicketRefreshFailureCount, 0, "successful ticket fetch resets backoff");
 		assertEqual(
 			activeTimers(clock.timers)[0]?.delay,
-			TICKET_TTL_MS - 30_000,
+			DEVICE_TICKET_TTL_MS - 30_000,
 			"five-minute ticket still refreshes 30 seconds before expiry",
 		);
 		assert(new URL(sync.provider.url).searchParams.get("ticket") === "fresh", "provider URL receives fresh ticket");

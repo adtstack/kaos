@@ -1,6 +1,6 @@
 # RFC: Zero-Ops Update Pipeline for Detached Cloudflare Forks
 
-Status: Implemented  
+Status: Implemented
 Owner: KAOS
 Scope: Server update lifecycle for Deploy-to-Cloudflare KAOS servers
 

@@ -1,9 +1,9 @@
 {
 	"name": "kaos",
-	"version": "1.12.4",
+	"version": "1.13.0",
 	"releaseVersions": {
-		"server": "0.7.6",
-		"headlessHost": "0.2.5"
+		"server": "0.8.0",
+		"headlessHost": "0.3.0"
 	},
 	"description": "A zero-terminal, real-time sync engine powered by your own Cloudflare Worker.",
 	"main": "main.js",
@@ -39,7 +39,7 @@
 		"test:ci": "npm run test:regressions && npm run test:integration:worker",
 		"test:ci:release": "npm run test:regressions:release && npm run test:integration:worker",
 		"test:integration:worker": "node tests/worker-integration.mjs",
-		"test:integration:headless-host": "node tests/headless-host-worker-e2e.mjs",
+		"test:integration:headless-host": "node tests/headless-host-plugin-smoke.mjs",
 		"test:integration:headless-host-obsidian": "node --import jiti/register tests/headless-host-obsidian-cross-e2e.mjs",
 		"test:headless-host:oracle-deploy": "node tests/headless-host-oracle-deploy.mjs",
 		"build:harness": "node qa/obsidian-harness/esbuild.mjs production",

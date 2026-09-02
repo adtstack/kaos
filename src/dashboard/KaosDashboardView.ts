@@ -1,5 +1,8 @@
 import { App, ItemView, Modal, Notice, Platform, TFile, type WorkspaceLeaf } from "obsidian";
 import type {
+	AttentionAuditResult,
+	AttentionRetirementSummary,
+	AttentionRetirementTarget,
 	DashboardAttentionItem,
 	DashboardBlobConflictResolutionChoice,
 	DashboardBlobConflictResolutionResult,
@@ -64,6 +67,10 @@ export interface KaosDashboardActions {
 	showRecoveryHistory(target?: DashboardRecoveryHistoryTarget): Promise<void>;
 	exportDiagnostics(): void;
 	exportDiagnosticsWithFilenames(): void;
+	auditAttention(): Promise<AttentionAuditResult>;
+	retireVerifiedAttention(
+		targets: AttentionRetirementTarget[],
+	): Promise<AttentionRetirementSummary>;
 	resolveRemoteDeleteAttention(
 		target: DashboardRemoteDeleteResolutionTarget,
 		choice: DashboardRemoteDeleteResolutionChoice,
@@ -99,6 +106,9 @@ export class KaosDashboardView extends ItemView {
 	private error: string | null = null;
 	private refreshTimer: number | null = null;
 	private readonly pendingAttentionEpisodes = new Set<string>();
+	private isAuditingAttention = false;
+	private isRetiringAttention = false;
+	private lastAuditResult: AttentionAuditResult | null = null;
 
 	constructor(
 		leaf: WorkspaceLeaf,
@@ -148,6 +158,7 @@ export class KaosDashboardView extends ItemView {
 		this.render();
 		try {
 			this.data = await this.deps.collectData();
+			this.lastAuditResult = null;
 		} catch (err) {
 			this.error = formatUnknown(err);
 			if (!silent) new Notice("Dashboard failed to refresh. Check console.", 5000);
@@ -199,10 +210,7 @@ export class KaosDashboardView extends ItemView {
 		header.createEl("h2", { text: "Dashboard" });
 		const meta = header.createDiv({ cls: "kaos-dashboard-muted" });
 		if (this.data) {
-			const deviceName = formatDashboardDeviceName(
-				this.data.settings.deviceName,
-				this.data.settings.deviceName,
-			);
+			const deviceName = this.data.settings.deviceName;
 			meta.setText(`${formatDateTime(this.data.generatedAt)} · ${deviceName}`);
 			if (this.loading) meta.appendText(" · refreshing");
 		} else if (this.loading) {
@@ -630,6 +638,40 @@ export class KaosDashboardView extends ItemView {
 			section.createDiv({ text: "No files currently need attention.", cls: "kaos-dashboard-muted" });
 			return;
 		}
+
+		const toolbar = section.createDiv({ cls: "kaos-dashboard-row-actions kaos-dashboard-attention-toolbar" });
+		this.button(
+			toolbar,
+			this.isAuditingAttention ? "Auditing Attention…" : "Audit Attention",
+			() => this.runAttentionAudit(),
+			this.isAuditingAttention || this.isRetiringAttention,
+		);
+
+		const audit = this.lastAuditResult ?? this.data?.attentionAudit;
+		if (audit) {
+			const auditSummaryBox = section.createDiv({
+				cls: "kaos-dashboard-callout is-muted kaos-dashboard-audit-summary",
+			});
+			const stats = [
+				`즉시 조치 필요: ${audit.summary.activeCount}`,
+				`검증 후 퇴역 가능: ${audit.summary.retirableCount}`,
+				`추가 확인 필요: ${audit.summary.needsReviewCount}`,
+			];
+			auditSummaryBox.createDiv({ text: stats.join(" · "), cls: "kaos-dashboard-muted" });
+
+			if (audit.summary.retirableCount > 0) {
+				const retirableActions = auditSummaryBox.createDiv({ cls: "kaos-dashboard-row-actions" });
+				this.button(
+					retirableActions,
+					this.isRetiringAttention
+						? "Retiring verified markers…"
+						: `Retire Verified Attention (${audit.summary.retirableCount})`,
+					() => this.confirmRetireVerifiedAttention(audit),
+					this.isAuditingAttention || this.isRetiringAttention,
+				);
+			}
+		}
+
 		if (items.length < totalCount) {
 			section.createDiv({
 				text: `Showing ${items.length} representative row(s) for ${totalCount} attention item(s).`,
@@ -911,6 +953,13 @@ export class KaosDashboardView extends ItemView {
 						this.render();
 					}
 				},
+				downloading ? "Download remote" : "Keep local absence",
+				"Cancel",
+				() => {
+					this.pendingAttentionEpisodes.delete(episodeKey);
+					this.render();
+					resolve();
+				},
 				downloading ? "mod-cta" : "mod-warning",
 			).open();
 		});
@@ -1085,6 +1134,68 @@ export class KaosDashboardView extends ItemView {
 			attention: nextAttention,
 			attentionTotalCount: Math.max(0, this.data.attentionTotalCount - 1),
 		};
+	}
+
+	private async runAttentionAudit(): Promise<void> {
+		if (this.isAuditingAttention || this.isRetiringAttention) return;
+		this.isAuditingAttention = true;
+		this.render();
+		try {
+			this.lastAuditResult = await this.deps.actions.auditAttention();
+			await this.refresh();
+			new Notice(
+				`Attention audit completed: ${this.lastAuditResult.summary.retirableCount} retirable, ${this.lastAuditResult.summary.activeCount} active.`,
+			);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			new Notice(`Attention audit failed: ${message}`);
+		} finally {
+			this.isAuditingAttention = false;
+			this.render();
+		}
+	}
+
+	private async confirmRetireVerifiedAttention(audit: AttentionAuditResult): Promise<void> {
+		if (this.isAuditingAttention || this.isRetiringAttention) return;
+		const retirableItems = audit.items.filter((item) => item.classification === "retirable");
+		if (retirableItems.length === 0) return;
+
+		const targets: AttentionRetirementTarget[] = retirableItems.map((item) => ({
+			path: item.entry.path,
+			kind: item.entry.kind,
+			reason: item.entry.reason,
+			episodeId: item.episodeId,
+			expectedRemoteFingerprint: item.remoteDeleteFingerprint ?? undefined,
+			pairPath: item.pairPath ?? undefined,
+		}));
+
+		new ConfirmModal(
+			this.app,
+			`Retire ${targets.length} verified attention marker(s)?`,
+			"This will retire historical markers whose paths are absent locally and confirmed settled remotely. No local files, remote documents, or backups will be deleted.",
+			async () => {
+				this.isRetiringAttention = true;
+				this.render();
+				try {
+					const summary = await this.deps.actions.retireVerifiedAttention(targets);
+					this.lastAuditResult = null;
+					await this.refresh();
+					new Notice(
+						`Retired ${summary.retiredCount} attention marker(s)${summary.failedCount > 0 ? ` (${summary.failedCount} skipped due to state change)` : ""}.`,
+					);
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					new Notice(`Attention retirement failed: ${message}`);
+				} finally {
+					this.isRetiringAttention = false;
+					this.render();
+				}
+			},
+			`Retire ${targets.length} marker(s)`,
+			"Cancel",
+			() => {},
+			"mod-cta",
+		).open();
 	}
 
 	private markAttentionEpisodePending(

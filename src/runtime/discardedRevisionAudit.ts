@@ -34,7 +34,7 @@ export interface DiscardedRevisionRecord {
 }
 
 export interface DiscardedRevisionAuditDeps {
-	getSettings(): { host: string; token: string; vaultId: string };
+	getSettings(): { host: string; authorizationHeader?: () => Promise<string>; vaultId: string };
 	/** Injectable transport for tests; the plugin wires obsidianRequest. */
 	postJson?: (url: string, body: unknown) => Promise<{ ok: boolean }>;
 }
@@ -92,7 +92,7 @@ export class DiscardedRevisionAudit {
 	private async flush(): Promise<void> {
 		if (this.flushing || this.queue.length === 0) return;
 		const settings = this.deps.getSettings();
-		if (!settings.host || !settings.token || !settings.vaultId) return;
+		if (!settings.host || !settings.authorizationHeader || !settings.vaultId) return;
 
 		this.flushing = true;
 		const batch = this.queue.splice(0, AUDIT_MAX_BATCH);

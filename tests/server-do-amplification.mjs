@@ -87,8 +87,8 @@ console.log("\n--- Test 2: index.ts classifies routes before auth (unknown paths
 		"index.ts no longer calls uncached getAuthState(env) in the fetch handler",
 	);
 	assert(
-		source.includes("getAuthStateCached("),
-		"index.ts calls getAuthStateCached instead of getAuthState",
+		source.includes("getAuthStateWithConfig("),
+		"index.ts obtains request-scoped Config state without an authorization cache",
 	);
 	// Vault resource whitelist must be present
 	assert(
@@ -128,55 +128,37 @@ console.log("\n--- Test 2: index.ts classifies routes before auth (unknown paths
 		"parseSyncPath() is called before parseVaultPath() in classifyWorkerRoute (sync ordering invariant)",
 	);
 
-	// Verify not-found short-circuit appears BEFORE the getAuthStateCached call
+	// Verify not-found short-circuit appears BEFORE the request-scoped Config call
 	// in the worker fetch handler body.
 	const fetchStart = source.indexOf("async fetch(req:");
 	assert(fetchStart !== -1, "fetch handler is found in index.ts");
 	if (fetchStart !== -1) {
 		const afterFetch = source.slice(fetchStart);
 		const notFoundPos = afterFetch.indexOf('route.kind === "not-found"');
-		const authCachedPos = afterFetch.indexOf("getAuthStateCached(");
+		const authCachedPos = afterFetch.indexOf("getAuthStateWithConfig(");
 		assert(
 			notFoundPos !== -1 && authCachedPos !== -1 && notFoundPos < authCachedPos,
-			"not-found check (no DO access) appears before getAuthStateCached call in fetch handler",
+			"not-found check (no DO access) appears before request-scoped Config lookup in fetch handler",
 		);
 	}
 }
 
-// ── Test 3: auth.ts has TTL cache ─────────────────────────────────────────────
-console.log("\n--- Test 3: auth.ts has TTL cache for KAOS_CONFIG fetches ---");
+// ── Test 3: auth.ts has no TTL authorization cache ───────────────────────────
+console.log("\n--- Test 3: auth.ts deliberately avoids a Worker-global authorization cache ---");
 {
 	const source = readFileSync(authPath, "utf8");
 
 	assert(
-		/AUTH_CONFIG_CACHE_TTL_MS/.test(source),
-		"auth.ts defines AUTH_CONFIG_CACHE_TTL_MS",
-	);
-	assert(
-		/cachedConfig/.test(source),
-		"auth.ts has a cachedConfig module-level variable",
-	);
-	assert(
-		/getStoredServerConfigCached/.test(source),
-		"auth.ts exports getStoredServerConfigCached",
+		!/AUTH_CONFIG_CACHE_TTL_MS|cachedConfig|getStoredServerConfigCached|getAuthStateCached/.test(source),
+		"auth.ts has no TTL cache that could preserve a revoked device session",
 	);
 	assert(
 		/invalidateStoredServerConfigCache/.test(source),
-		"auth.ts exports invalidateStoredServerConfigCache",
+		"compatibility invalidation export documents that there is no cache to clear",
 	);
 	assert(
-		/getAuthStateCached/.test(source),
-		"auth.ts exports getAuthStateCached",
-	);
-	// Ensure handleClaimRoute calls invalidateStoredServerConfigCache
-	assert(
-		/handleClaimRoute[\s\S]*?invalidateStoredServerConfigCache/.test(source),
-		"handleClaimRoute calls invalidateStoredServerConfigCache after successful claim",
-	);
-	// Ensure handleUpdateMetadataRoute calls invalidateStoredServerConfigCache
-	assert(
-		/handleUpdateMetadataRoute[\s\S]*?invalidateStoredServerConfigCache/.test(source),
-		"handleUpdateMetadataRoute calls invalidateStoredServerConfigCache after successful update",
+		/getAuthStateWithConfig/.test(source) && /getStoredServerConfig/.test(source),
+		"request-scoped auth state is read from Config",
 	);
 }
 
@@ -305,32 +287,32 @@ console.log("\n--- Test 7: index.ts has route-bucket logging with not_found samp
 	);
 }
 
-// ── Test 8: AuthStateCached type exists with required config ──────────────────
-console.log("\n--- Test 8: AuthStateCached type has required config for claim/unclaimed modes ---");
+// ── Test 8: AuthStateWithConfig type keeps Config state request-scoped ───────
+console.log("\n--- Test 8: AuthStateWithConfig carries required Config state without caching ---");
 {
 	const typesPath = resolve(here, "../server/src/routes/types.ts");
 	const source = readFileSync(typesPath, "utf8");
 
 	assert(
-		/AuthStateCached/.test(source),
-		"types.ts defines AuthStateCached",
+		/AuthStateWithConfig/.test(source),
+		"types.ts defines AuthStateWithConfig",
 	);
-	// In AuthStateCached, config must be required (not optional) for claim/unclaimed
+	// Config must be required for both device and unclaimed modes.
 	// The type definition should have `config: StoredServerConfig` (no ?)
-	const cachedTypePos = source.indexOf("export type AuthStateCached");
-	assert(cachedTypePos !== -1, "AuthStateCached is found in types.ts");
+	const cachedTypePos = source.indexOf("export type AuthStateWithConfig");
+	assert(cachedTypePos !== -1, "AuthStateWithConfig is found in types.ts");
 	if (cachedTypePos !== -1) {
 		// Grab the type definition block (large enough to cover all three variants)
 		const typeBlock = source.slice(cachedTypePos, cachedTypePos + 400);
 		// Should NOT have "config?" (optional) in the cached type
 		assert(
 			!/config\?:/.test(typeBlock),
-			"AuthStateCached claim/unclaimed variants have required config (no config?)",
+			"AuthStateWithConfig variants have required config (no config?)",
 		);
 		// Should have "config: StoredServerConfig" (required)
 		assert(
 			/config:\s*StoredServerConfig/.test(typeBlock),
-			"AuthStateCached has required config: StoredServerConfig",
+			"AuthStateWithConfig has required config: StoredServerConfig",
 		);
 	}
 }
@@ -342,6 +324,7 @@ console.log("\n--- Test 9: getServerByName server calls are explicitly allowlist
 	// Any new call must be cost-reviewed and added here with an explanation in
 	// docs/engineering/durable-object-cost-guardrails.md.
 	const approvedCalls = new Map([
+		["routes/deviceAuth.ts", 1], // immediate close signal after device revocation or approval
 		["routes/recoverySnapshots.ts", 1], // document-based recovery snapshot mutation
 		["routes/snapshots.ts", 1], // document-based daily snapshot mutation
 		["routes/syncSocket.ts", 1], // accepted WebSocket sync connection

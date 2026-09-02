@@ -3,6 +3,12 @@ import type { RecoveryStorageAuditReport } from "../sync/recoverySnapshotClient"
 import type { DiskIndex } from "../sync/diskIndex";
 import type { FrontmatterQuarantineEntry } from "../sync/frontmatterQuarantine";
 import type {
+	AttentionAuditClassification,
+	AttentionAuditItem,
+	AttentionAuditResult,
+	AttentionAuditSummary,
+	AttentionRetirementSummary,
+	AttentionRetirementTarget,
 	PreservedUnresolvedEntry,
 	PreservedUnresolvedKind,
 	PreservedUnresolvedReason,
@@ -289,6 +295,7 @@ export interface KaosDashboardData {
 	blobSafetyCopies: DashboardConflictArtifact[];
 	attention: DashboardAttentionItem[];
 	attentionTotalCount: number;
+	attentionAudit?: AttentionAuditResult | null;
 	actions: DashboardActionState;
 }
 
@@ -370,4 +377,14 @@ export interface KaosDashboardCollectorInput {
 	recentChanges: DashboardRecentChanges;
 	openFileCount: number;
 	snapshotsAvailable: boolean;
+	attentionAudit?: AttentionAuditResult | null;
 }
+
+export type {
+	AttentionAuditClassification,
+	AttentionAuditItem,
+	AttentionAuditResult,
+	AttentionAuditSummary,
+	AttentionRetirementSummary,
+	AttentionRetirementTarget,
+};
