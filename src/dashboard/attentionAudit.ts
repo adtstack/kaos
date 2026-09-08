@@ -52,7 +52,11 @@ export function isArchivePath(path: string): boolean {
 	return normalized.startsWith("archive/")
 		|| normalized.includes("/archive/")
 		|| normalized.includes("/_archive/")
-		|| normalized.startsWith("_archive/");
+		|| normalized.startsWith("_archive/")
+		|| normalized.startsWith("archives/")
+		|| normalized.includes("/archives/")
+		|| normalized.includes("/_archives/")
+		|| normalized.startsWith("_archives/");
 }
 
 export interface MarkdownRetirementSettlementInput {
@@ -153,7 +157,7 @@ export function auditAttentionEntries(
 					items.push({
 						entry,
 						classification: "retirable",
-						rationale: `Verified Archive move pair with "${pairInfo.pairPath}". Source absent and target settled.`,
+						rationale: `Verified move pair with "${pairInfo.pairPath}". Source absent and target settled.`,
 						episodeId,
 						pairPath: pairInfo.pairPath,
 					});
@@ -438,45 +442,45 @@ function findPathCollisionPairs(
 		const first = group[0];
 		const second = group[1];
 		if (group.length === 2 && first && second) {
-			const firstIsArchive = isArchivePath(first.path);
-			const secondIsArchive = isArchivePath(second.path);
+			const firstState = checkLocalFile(vault, first.path);
+			const secondState = checkLocalFile(vault, second.path);
 
-			if (firstIsArchive !== secondIsArchive) {
-				const source = firstIsArchive ? second : first;
-				const target = firstIsArchive ? first : second;
-
-				const sourceState = checkLocalFile(vault, source.path);
-				const targetState = checkLocalFile(vault, target.path);
+			if (
+				(firstState.kind === "missing" && secondState.kind === "file")
+				|| (firstState.kind === "file" && secondState.kind === "missing")
+			) {
+				const source = firstState.kind === "missing" ? first : second;
+				const target = firstState.kind === "file" ? first : second;
 
 				const normSource = normalizePath(source.path);
 				const normTarget = normalizePath(target.path);
 
-				if (sourceState.kind === "missing" && targetState.kind === "file") {
-					map.set(normSource, {
-						status: "retirable-archive-pair",
-						pairPath: normTarget,
-						reason: `Source "${source.path}" is missing and target "${target.path}" exists in Archive.`,
-					});
-					map.set(normTarget, {
-						status: "retirable-archive-pair",
-						pairPath: normSource,
-						reason: `Target "${target.path}" exists in Archive and source "${source.path}" is missing.`,
-					});
-					continue;
-				}
-
 				map.set(normSource, {
-					status: "needs-review",
+					status: "retirable-archive-pair",
 					pairPath: normTarget,
-					reason: `Archive move pair incomplete: source is ${sourceState.kind}, target is ${targetState.kind}.`,
+					reason: `Source "${source.path}" is missing and target "${target.path}" exists.`,
 				});
 				map.set(normTarget, {
-					status: "needs-review",
+					status: "retirable-archive-pair",
 					pairPath: normSource,
-					reason: `Archive move pair incomplete: source is ${sourceState.kind}, target is ${targetState.kind}.`,
+					reason: `Target "${target.path}" exists and source "${source.path}" is missing.`,
 				});
 				continue;
 			}
+
+			const normFirst = normalizePath(first.path);
+			const normSecond = normalizePath(second.path);
+			map.set(normFirst, {
+				status: "needs-review",
+				pairPath: normSecond,
+				reason: `Move pair incomplete: "${first.path}" is ${firstState.kind}, "${second.path}" is ${secondState.kind}.`,
+			});
+			map.set(normSecond, {
+				status: "needs-review",
+				pairPath: normFirst,
+				reason: `Move pair incomplete: "${first.path}" is ${firstState.kind}, "${second.path}" is ${secondState.kind}.`,
+			});
+			continue;
 		}
 
 		// If more than 2 or ambiguous pairings
@@ -493,7 +497,7 @@ function findPathCollisionPairs(
 	return map;
 }
 
-function buildSummary(items: AttentionAuditItem[]): AttentionAuditSummary {
+export function buildSummary(items: AttentionAuditItem[]): AttentionAuditSummary {
 	let activeCount = 0;
 	let retirableCount = 0;
 	let needsReviewCount = 0;

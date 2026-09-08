@@ -5354,6 +5354,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			: { status: "unavailable" as const, message: "File history storage service not initialized." };
 		const vaultSync = this.vaultSync;
 		const blobSync = this.getBlobSync();
+		const preservedUnresolvedEntries = this.collectPreservedUnresolvedEntries();
+		const attentionAudit = preservedUnresolvedEntries.length > 0
+			? await this.auditAttention()
+			: null;
 		return buildKaosDashboardData({
 			app: this.app,
 			generatedAt: new Date().toISOString(),
@@ -5369,7 +5373,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			vaultSync: this.vaultSync?.getDebugSnapshot() ?? null,
 			diskMirror: this.diskMirror?.getDebugSnapshot() ?? null,
 			blobSync: this.getBlobSync()?.getDebugSnapshot() ?? null,
-			preservedUnresolvedEntries: this.collectPreservedUnresolvedEntries(),
+			preservedUnresolvedEntries,
+			attentionAudit,
 			remoteProjectionPolicyError: this.providerExcludeFileLastError,
 			remoteDeleteResolutionState: {
 				markdownAvailable: vaultSync !== null && this.diskMirror !== null,
@@ -5860,8 +5865,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					// 3. Pre-flight check local file absence (for retirable markers on absent files)
 					const localFile = this.getDashboardLocalFileIdentity(normalizedPath);
 					if (localFile.kind !== "missing") {
-						// Unless target is the archive destination file in a collision pair
-						if (!(target.reason === "path-collision" && isArchivePath(normalizedPath))) {
+						// Unless target is the destination file in a verified collision pair or archive path
+						if (!(target.reason === "path-collision" && (isArchivePath(normalizedPath) || target.pairPath))) {
 							failedCount++;
 							failedPaths.push(normalizedPath);
 							this.trace("attention", "attention-retire-rejected", {
@@ -6359,6 +6364,125 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			case "server_update_required":
 				return { label: state.kind, tone: "error" };
 		}
+	}
+
+	public getHeadlessRuntimeSnapshot(): {
+		connection: {
+			status: string;
+			rttMs: number | null;
+			fatalAuthCode: string | null;
+		};
+		sync: {
+			serverAppliedLocalState: boolean;
+			lastServerReceiptEchoAt: number | null;
+			lastKnownServerReceiptEchoAt: number | null;
+			activeMarkdownPathsCount: number;
+			crdtPathCount: number;
+			reconcileInFlight: boolean;
+			reconcilePending: boolean;
+			schemaVersion: number | null;
+		};
+		attachments: {
+			enabled: boolean;
+			transferStatus: string | null;
+			pendingUploads: number;
+			pendingDownloads: number;
+		};
+		attention: {
+			totalCount: number;
+			preservedUnresolved: PreservedUnresolvedEntry[];
+			structuralChanges: Array<{
+				reason: string;
+				oldPaths: string[];
+				newPaths: string[];
+				contentHashPrefix: string;
+			}>;
+			quarantine: FrontmatterQuarantineEntry[];
+			providerExcludeError: string | null;
+		};
+	} {
+		const connectionState = this.connectionController?.getState();
+		const blobSync = this.getBlobSync();
+		const reconciliationState = this.reconciliationController?.getState();
+		const preserved = this.collectPreservedUnresolvedEntries();
+		const structural = reconciliationState?.unresolvedStructuralChangeSample ?? [];
+		const quarantine = this.frontmatterQuarantineEntries ?? [];
+		const totalAttention = getDashboardAttentionTotalCount({
+			preservedUnresolvedEntries: preserved,
+			frontmatterQuarantineEntries: quarantine,
+			reconciliationState,
+			remoteProjectionPolicyError: this.providerExcludeFileLastError,
+		});
+		return {
+			connection: {
+				status: connectionState?.kind ?? "unknown",
+				rttMs: (connectionState as { metrics?: { rttMs?: number } })?.metrics?.rttMs ?? null,
+				fatalAuthCode: this.vaultSync?.fatalAuthCode ?? null,
+			},
+			sync: {
+				serverAppliedLocalState: this.vaultSync?.serverAppliedLocalState ?? false,
+				lastServerReceiptEchoAt: this.vaultSync?.lastServerReceiptEchoAt ?? null,
+				lastKnownServerReceiptEchoAt: this.vaultSync?.lastKnownServerReceiptEchoAt ?? null,
+				activeMarkdownPathsCount: this.vaultSync?.getActiveMarkdownPaths().length ?? 0,
+				crdtPathCount: this.vaultSync?.getActiveMarkdownPaths().length ?? 0,
+				reconcileInFlight: reconciliationState?.reconcileInFlight ?? false,
+				reconcilePending: reconciliationState?.reconcilePending ?? false,
+				schemaVersion: this.vaultSync?.storedSchemaVersion ?? null,
+			},
+			attachments: {
+				enabled: this.settings.enableAttachmentSync === true,
+				transferStatus: blobSync?.transferStatus ?? null,
+				pendingUploads: blobSync?.pendingUploads ?? 0,
+				pendingDownloads: blobSync?.pendingDownloads ?? 0,
+			},
+			attention: {
+				totalCount: totalAttention,
+				preservedUnresolved: preserved,
+				structuralChanges: structural,
+				quarantine,
+				providerExcludeError: this.providerExcludeFileLastError,
+			},
+		};
+	}
+
+	public async triggerManualSync(): Promise<{ ok: boolean; message?: string }> {
+		if (!this.vaultSync) {
+			return { ok: false, message: "Sync engine is not initialized yet." };
+		}
+		try {
+			await this.runReconciliation("conservative");
+			return { ok: true, message: "Reconciliation completed." };
+		} catch (err) {
+			return { ok: false, message: `Reconciliation failed: ${err instanceof Error ? err.message : String(err)}` };
+		}
+	}
+
+	public async resolvePreservedUnresolvedEntry(
+		path: string,
+		action: "keep-local" | "accept-delete",
+	): Promise<void> {
+		const normalized = normalizePath(path);
+		const current = this.collectPreservedUnresolvedEntries().find(
+			(e) => normalizePath(e.path) === normalized,
+		);
+		if (!current) {
+			throw new Error(`Preserved unresolved entry not found: ${path}`);
+		}
+		if (action === "accept-delete") {
+			const file = this.app.vault.getAbstractFileByPath(normalized);
+			if (file instanceof TFile) {
+				await this.app.fileManager.trashFile(file).catch(() => undefined);
+			}
+		}
+		if (current.kind === "markdown") {
+			this.diskMirror?.resolvePreservedUnresolvedEpisode(normalized, getPreservedUnresolvedEpisodeId(current));
+		} else {
+			this.getBlobSync()?.resolvePreservedUnresolvedEpisode(normalized, getPreservedUnresolvedEpisodeId(current));
+		}
+		this.preservedUnresolvedEntries = this.preservedUnresolvedEntries.filter(
+			(e) => !(e.kind === current.kind && normalizePath(e.path) === normalized),
+		);
+		await this.saveSettings();
 	}
 
 	private updateStatusBar(_coarseState: SyncStatus): void {

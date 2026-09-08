@@ -1,9 +1,9 @@
 {
 	"name": "kaos",
-	"version": "1.13.1",
+	"version": "1.13.2",
 	"releaseVersions": {
-		"server": "0.8.1",
-		"headlessHost": "0.3.1"
+		"server": "0.8.2",
+		"headlessHost": "0.3.2"
 	},
 	"description": "A zero-terminal, real-time sync engine powered by your own Cloudflare Worker.",
 	"main": "main.js",

@@ -11,8 +11,11 @@ import { HeadlessHostLockfile } from "./kaos/lockfile";
 import {
 	formatHeadlessDoctor,
 	formatHeadlessStatus,
+	type HeadlessLiveStatus,
 	shouldUseHumanOutput,
 } from "./humanOutput";
+import { DaemonStatePublisher } from "./kaos/daemonStatePublisher";
+import { DaemonIpcServer } from "./kaos/daemonIpcServer";
 import {
 	assertSecurePrivateFile,
 	createHeadlessDeviceIdentity,
@@ -47,7 +50,7 @@ export interface HeadlessHostRuntimeDeps {
 	createPoller?: (
 		vault: Awaited<ReturnType<typeof bootKaosHeadlessPlugin>>["app"]["vault"],
 		options: HeadlessVaultPollerOptions,
-	) => Pick<HeadlessVaultPoller, "start" | "stop">;
+	) => Pick<HeadlessVaultPoller, "start" | "stop" | "pollOnce">;
 	waitForever?: () => Promise<void>;
 }
 
@@ -122,8 +125,10 @@ export async function runHeadlessHostCli(
 	process.once("uncaughtException", onUncaughtException);
 	process.once("unhandledRejection", onUnhandledRejection);
 	try {
-		assertNoLegacyTokenConfiguration(await readKaosHeadlessData(options.dataFile));
+		const rawData = await readKaosHeadlessData(options.dataFile);
+		assertNoLegacyTokenConfiguration(rawData);
 		await mergeKaosHeadlessConfig(options.dataFile, options.configPatch);
+		const effectiveData = mergeConfigPatch(rawData, options.configPatch);
 		const { app, plugin } = await bootPlugin({
 			vaultRoot: options.vaultRoot,
 			dataFile: options.dataFile,
@@ -134,10 +139,38 @@ export async function runHeadlessHostCli(
 			intervalMs: options.pollIntervalMs,
 			quietMs: options.pollQuietMs,
 		});
+		const publisher = new DaemonStatePublisher({
+			vaultRoot: options.vaultRoot,
+			dataFile: options.dataFile,
+			config: {
+				host: typeof effectiveData.host === "string" ? effectiveData.host : undefined,
+				vaultId: typeof effectiveData.vaultId === "string" ? effectiveData.vaultId : undefined,
+				deviceName: typeof effectiveData.deviceName === "string" ? effectiveData.deviceName : undefined,
+				deviceId: typeof effectiveData.deviceId === "string" ? effectiveData.deviceId : undefined,
+			},
+			plugin,
+		});
+		await publisher.start();
+		let ipcServer: DaemonIpcServer | null = null;
+		if (!options.bootOnly) {
+			ipcServer = new DaemonIpcServer({
+				socketPath: publisher.socketFile,
+				publisher,
+				plugin: plugin as unknown as import("./kaos/daemonIpcServer").IpcPluginTarget,
+				poller,
+			});
+			await ipcServer.start().catch((err) => {
+				log("ipc-server-start-failed", { error: errorMessage(err) });
+			});
+		}
 		let stopped = false;
 		shutdown = async (reason: string): Promise<void> => {
 			if (stopped) return;
 			stopped = true;
+			if (ipcServer) {
+				await ipcServer.stop().catch(() => undefined);
+			}
+			await publisher.stop(reason).catch(() => undefined);
 			poller.stop();
 			let unloadError: unknown;
 			try {
@@ -161,6 +194,8 @@ export async function runHeadlessHostCli(
 			vaultRoot: options.vaultRoot,
 			dataFile: options.dataFile,
 			lockFile: options.lockFile,
+			statusFile: publisher.statusFile,
+			socketFile: publisher.socketFile,
 			pluginId: options.pluginId,
 			pluginDir: options.pluginDir,
 		});
@@ -445,6 +480,15 @@ Device enrollment:
 async function printStatus(options: CliOptions): Promise<void> {
 	const data = mergeConfigPatch(await readKaosHeadlessData(options.dataFile), options.configPatch);
 	const lock = await readLockStatus(options.lockFile);
+	const statusFilePath = join(dirname(options.dataFile), "status.json");
+	let live: HeadlessLiveStatus | null = null;
+	if (await pathExists(statusFilePath)) {
+		try {
+			live = JSON.parse(await readFile(statusFilePath, "utf8")) as HeadlessLiveStatus;
+		} catch {
+			live = null;
+		}
+	}
 	const status = {
 		vaultRoot: options.vaultRoot,
 		dataFile: options.dataFile,
@@ -454,6 +498,7 @@ async function printStatus(options: CliOptions): Promise<void> {
 		lockHeld: lock.held,
 		lock,
 		configured: summarizeConfig(data),
+		live,
 	};
 	if (useHumanOutput(options)) {
 		console.log(formatHeadlessStatus(status));

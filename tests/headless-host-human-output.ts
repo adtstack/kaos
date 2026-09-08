@@ -52,6 +52,95 @@ const unknownLockStatus = formatHeadlessStatus({
 assert.match(unknownLockStatus, /Runtime\s+lock present/);
 assert.match(unknownLockStatus, /Attachments\s+default/);
 
+const liveStatus = formatHeadlessStatus({
+	vaultRoot: "/vault",
+	dataFile: "/vault/data.json",
+	lockFile: "/run/kaos.lock",
+	pluginDir: "/vault/plugins/kaos",
+	lock: { held: true, info: { pid: 100, processAlive: true } },
+	configured: {
+		host: "https://sync.example",
+		vaultId: "vault-id",
+		deviceName: "headless-live",
+		identityFileConfigured: true,
+		enableAttachmentSync: true,
+	},
+	live: {
+		daemon: {
+			alive: true,
+			uptimeSeconds: 150,
+			memoryRssBytes: 52428800,
+		},
+		connection: {
+			status: "connected",
+			rttMs: 35,
+		},
+		sync: {
+			serverAppliedLocalState: true,
+			reconcileInFlight: true,
+			activeMarkdownPathsCount: 42,
+		},
+		attention: {
+			totalCount: 3,
+			items: [],
+			providerExcludeError: null,
+		},
+		attachments: {
+			enabled: true,
+			transferStatus: null,
+			pendingUploads: 2,
+			pendingDownloads: 1,
+		},
+	},
+});
+assert.match(liveStatus, /Runtime\s+running · PID 100 \(uptime 2m · 50MB\)/);
+assert.match(liveStatus, /Sync status\s+connected · RTT 35ms/);
+assert.match(liveStatus, /Sync state\s+in-sync, reconciling, 42 tracked files/);
+assert.match(liveStatus, /Attention\s+3 items needing review/);
+assert.match(liveStatus, /Attachments\s+enabled · pending: ↑2 ↓1/);
+
+const cleanLiveStatus = formatHeadlessStatus({
+	vaultRoot: "/vault",
+	dataFile: "/vault/data.json",
+	lockFile: "/run/kaos.lock",
+	pluginDir: "/vault/plugins/kaos",
+	lock: { held: true, info: { pid: 101, processAlive: true } },
+	configured: {
+		host: "https://sync.example",
+		vaultId: "vault-id",
+		deviceName: "headless-clean",
+	},
+	live: {
+		daemon: {
+			alive: true,
+			uptimeSeconds: 30,
+		},
+		connection: {
+			status: "connecting",
+			rttMs: null,
+		},
+		sync: {
+			serverAppliedLocalState: false,
+			reconcileInFlight: false,
+		},
+		attention: {
+			totalCount: 0,
+			items: [],
+			providerExcludeError: null,
+		},
+		attachments: {
+			enabled: true,
+			transferStatus: "syncing 1/3",
+			pendingUploads: 0,
+			pendingDownloads: 0,
+		},
+	},
+});
+assert.match(cleanLiveStatus, /Runtime\s+running · PID 101 \(uptime 0m\)/);
+assert.match(cleanLiveStatus, /Sync status\s+connecting/);
+assert.match(cleanLiveStatus, /Attention\s+0 items \(clean\)/);
+assert.match(cleanLiveStatus, /Attachments\s+default · syncing 1\/3/);
+
 const doctor = formatHeadlessDoctor({
 	ok: false,
 	lock: { held: false },

@@ -918,12 +918,22 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
 	private renderManagedDevices(containerEl: HTMLElement, devices: ManagedDevice[]): void {
 		containerEl.empty();
+		const currentDevice = devices.find((device) => device.id === this.host.settings.deviceId);
+		const currentName = currentDevice?.name ?? this.host.settings.deviceName ?? "This device";
+		const currentRole = currentDevice ? ` (${currentDevice.role.toUpperCase()})` : "";
+		const currentFingerprint = currentDevice?.fingerprint ? ` — ${currentDevice.fingerprint}` : "";
+
+		const currentDiv = containerEl.createDiv({ cls: "kaos-settings-device-current" });
+		currentDiv.createEl("p", {
+			text: `Current device: ${currentName}${currentRole}${currentFingerprint} (this device)`,
+		});
+
 		const active = devices.filter((device) => device.status === "active" && device.id !== this.host.settings.deviceId);
 		if (active.length === 0) {
 			containerEl.createEl("p", { text: "No other active devices connected to this vault." });
 			return;
 		}
-		containerEl.createEl("p", { text: "Active devices:" });
+		containerEl.createEl("p", { text: "Other connected devices:" });
 		for (const device of active) {
 			const row = containerEl.createDiv({ cls: "kaos-settings-device-request" });
 			row.createEl("p", { text: `${device.name} (${device.role.toUpperCase()}) — ${device.fingerprint}` });

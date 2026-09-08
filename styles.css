@@ -1039,6 +1039,20 @@
 	margin-top: -8px;
 }
 
+.kaos-settings-device-current {
+	margin: 8px 0 12px;
+	padding: 8px 12px;
+	background: var(--background-secondary);
+	border-radius: 6px;
+	border: 1px solid var(--background-modifier-border);
+}
+
+.kaos-settings-device-current p {
+	margin: 0;
+	color: var(--text-muted);
+	font-size: 13px;
+}
+
 /*
  * Snapshot modals
  */
