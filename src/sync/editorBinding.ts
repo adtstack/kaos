@@ -2,6 +2,7 @@ import {
 	Annotation,
 	Compartment,
 	EditorState,
+	Text,
 	Transaction,
 	type Extension,
 	type TransactionSpec,
@@ -257,7 +258,7 @@ type EditorAuthorityTransactionSource =
 	| "external-reload-correction";
 
 interface EditorAuthorityTransactionProvenance {
-	content: string;
+	content: string | Text;
 	source: EditorAuthorityTransactionSource;
 }
 
@@ -389,7 +390,7 @@ export class EditorBindingManager {
 	private lastUserDocChangeAtByCm = new WeakMap<EditorView, number>();
 	private editorRevisionByCm = new WeakMap<EditorView, number>();
 	private editorAuthorityRevisionByCm = new WeakMap<EditorView, number>();
-	private editorAuthorityContentByCm = new WeakMap<EditorView, string>();
+	private editorAuthorityContentByCm = new WeakMap<EditorView, string | Text>();
 	private bindingEpochByLeafId = new Map<string, number>();
 	private pendingReplacementCmToLeafId = new WeakMap<EditorView, string>();
 	private lastTypingAwarenessAtByLeaf = new Map<string, number>();
@@ -1481,6 +1482,19 @@ export class EditorBindingManager {
 		});
 	}
 
+	private getEditorAuthorityContent(cm: EditorView): string | null {
+		const stored = this.editorAuthorityContentByCm.get(cm);
+		if (!stored) return null;
+		if (typeof stored === "string") return stored;
+		try {
+			const str = stored.toString();
+			this.editorAuthorityContentByCm.set(cm, str);
+			return str;
+		} catch {
+			return null;
+		}
+	}
+
 	/**
 	 * Capture an optimistic-concurrency ticket for every visible editor of a
 	 * path. The ticket deliberately includes editors that have not completed a
@@ -1517,7 +1531,7 @@ export class EditorBindingManager {
 					editorAuthorityRevision:
 						cm ? (this.editorAuthorityRevisionByCm.get(cm) ?? 0) : 0,
 					editorAuthorityContent:
-						cm ? (this.editorAuthorityContentByCm.get(cm) ?? null) : null,
+						cm ? (this.getEditorAuthorityContent(cm)) : null,
 					editorDocument: cm?.state.doc ?? null,
 					editorContent,
 				};
@@ -1676,7 +1690,7 @@ export class EditorBindingManager {
 			expectedFileId,
 			facetTextLength:
 				facetText instanceof Y.Text
-						? facetText.toJSON().length
+						? facetText.length
 						: null,
 			cmDocLength: cm.state.doc.length,
 		};
@@ -2349,7 +2363,7 @@ export class EditorBindingManager {
 			// the event-time host proof onto it.
 			return false;
 		}
-		if (this.editorAuthorityContentByCm.get(binding.cm) === currentText) {
+		if (this.getEditorAuthorityContent(binding.cm) === currentText) {
 			return true;
 		}
 		return this.isExactYTextFirstExternalDiskHostSuccessorPreimage(
@@ -2437,8 +2451,13 @@ export class EditorBindingManager {
 		transaction: Transaction,
 	): Pick<TransactionSpec, "annotations" | "effects"> | null {
 		const match = this.findBindingForState(transaction.startState);
-		const editorContent = transaction.startState.doc.toString();
-		const hostProjectionFence = match
+		const hasPendingFence = this.pendingExternalDiskHostProjectionFences.has(
+			transaction.startState,
+		);
+		const editorContent = hasPendingFence
+			? transaction.startState.doc.toString()
+			: null;
+		const hostProjectionFence = (match && hasPendingFence && editorContent !== null)
 			? this.getExternalDiskHostProjectionFence(
 				transaction,
 				match.leafId,
@@ -2462,14 +2481,14 @@ export class EditorBindingManager {
 			return null;
 		}
 
-		const incomingContent = transaction.newDoc.toString();
 		const existingExternalReloadBypass = transaction.annotation(
 			EXTERNAL_RELOAD_FILTER_BYPASS,
 		);
 		if (existingExternalReloadBypass) {
 			return this.buildExternalReloadBypassSpec(existingExternalReloadBypass);
 		}
-		if (hostProjectionFence && match) {
+		if (hostProjectionFence && match && editorContent !== null) {
+			const incomingContent = transaction.newDoc.toString();
 			const { leafId, binding } = match;
 			this.trace?.("editor", "external-disk-editor-host-merge-filter-bypassed", {
 				path: binding.path,
@@ -2491,7 +2510,7 @@ export class EditorBindingManager {
 		if (this.isUserTransaction(transaction)) {
 			return {
 				annotations: EDITOR_AUTHORITY_TRANSACTION.of({
-					content: incomingContent,
+					content: transaction.newDoc,
 					source: "user",
 				}),
 			};
@@ -2500,6 +2519,8 @@ export class EditorBindingManager {
 		const { leafId, binding } = match;
 		if (this.editorAuthorityShieldLeafIds.has(leafId)) return null;
 		const currentYTextContent = binding.ytext.toJSON();
+		const incomingContent = transaction.newDoc.toString();
+		const nonUserEditorContent = editorContent ?? transaction.startState.doc.toString();
 		const pendingPatch = this.pendingYTextPatches.get(binding.ytext);
 		const validPendingPatch =
 			pendingPatch &&
@@ -2562,7 +2583,7 @@ export class EditorBindingManager {
 				path: binding.path,
 				leafId,
 				bindingEpoch: this.bindingEpochByLeafId.get(leafId) ?? 0,
-				beforeContent: editorContent,
+				beforeContent: nonUserEditorContent,
 				externalContent: incomingContent,
 			});
 		}
@@ -2574,7 +2595,7 @@ export class EditorBindingManager {
 			this.prepareExternalDiskHostProjection({
 				leafId,
 				binding,
-				currentText: editorContent,
+				currentText: nonUserEditorContent,
 				incomingText: incomingContent,
 				candidate: pendingDiskMutation,
 			})
@@ -2595,16 +2616,16 @@ export class EditorBindingManager {
 				path: binding.path,
 				leafId,
 				bindingEpoch: this.bindingEpochByLeafId.get(leafId) ?? 0,
-				beforeContent: editorContent,
+				beforeContent: nonUserEditorContent,
 				externalContent: incomingContent,
 			});
 		}
 
-		if (currentYTextContent !== editorContent) return null;
+		if (currentYTextContent !== nonUserEditorContent) return null;
 		this.captureRecentEditorOriginChange(
 			leafId,
 			binding,
-			editorContent,
+			nonUserEditorContent,
 			incomingContent,
 			transaction.startState,
 		);
@@ -3442,7 +3463,7 @@ export class EditorBindingManager {
 	private handleLiveEditorUpdate(update: ViewUpdate): void {
 		const userDocumentEdit = this.isUserDocumentEdit(update);
 		let editorAuthorityAdvanceCount = 0;
-		let latestEditorAuthorityContent: string | null = null;
+		let latestEditorAuthorityContent: string | Text | null = null;
 		const externalReloadBypasses: ExternalReloadFilterBypass[] = [];
 		for (const transaction of update.transactions) {
 			if (!transaction.docChanged) continue;
@@ -3458,7 +3479,7 @@ export class EditorBindingManager {
 				const annotated = transaction.annotation(EDITOR_AUTHORITY_TRANSACTION);
 				try {
 					latestEditorAuthorityContent = annotated?.content
-						?? transaction.newDoc.toString();
+						?? transaction.newDoc;
 				} catch {
 					// Synthetic harness transactions may omit newDoc. A missing exact
 					// snapshot fails closed below without changing activity detection.
@@ -3470,7 +3491,7 @@ export class EditorBindingManager {
 			const provenance = transaction.annotation(EDITOR_AUTHORITY_TRANSACTION);
 			if (
 				provenance &&
-				typeof provenance.content === "string"
+				(typeof provenance.content === "string" || provenance.content instanceof Text)
 			) {
 				editorAuthorityAdvanceCount += 1;
 				latestEditorAuthorityContent = provenance.content;
@@ -3518,7 +3539,13 @@ export class EditorBindingManager {
 			this.deferExternalReloadFilterBypassRollback(update.view, bypass);
 		}
 		this.resyncDroppedBatchEdits(update, match.leafId, match.binding);
-		this.maybeHealBinding(match.leafId, match.binding, "live-update");
+		if (update.docChanged) {
+			this.scheduleHealthCheck(
+				match.leafId,
+				LIVE_UPDATE_HEALTH_RETRY_DELAY_MS,
+				"live-update",
+			);
+		}
 	}
 
 	/**
@@ -4146,7 +4173,10 @@ export class EditorBindingManager {
 			});
 			return false;
 		}
-		if (cmContent !== editorContent) {
+		if (
+			cmContent !== editorContent &&
+			normalizeEditorText(cmContent) !== normalizeEditorText(editorContent)
+		) {
 			this.trace?.("editor", "binding-apply-cm-diverged", {
 				action: input.action,
 				path: input.filePath,
@@ -4179,7 +4209,10 @@ export class EditorBindingManager {
 		}
 
 		const crdtContent = input.ytext.toJSON();
-		if (cmContent === crdtContent) {
+		if (
+			cmContent === crdtContent ||
+			normalizeEditorText(cmContent) === normalizeEditorText(crdtContent)
+		) {
 			return true;
 		}
 
@@ -4305,7 +4338,10 @@ export class EditorBindingManager {
 				return null;
 			}
 			const crdtContent = existingText.toJSON();
-			if (currentContent !== crdtContent) {
+			const contentDiverged =
+				currentContent !== crdtContent &&
+				normalizeEditorText(currentContent) !== normalizeEditorText(crdtContent);
+			if (contentDiverged && !reason.startsWith("heal")) {
 				this.trace?.("editor", "binding-target-editor-diverged", {
 					path: file.path,
 					reason,

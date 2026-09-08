@@ -81,6 +81,33 @@ function buildBadSchemaArtifact(baselineVersion, schemaVersion) {
 	return badArtifactPath;
 }
 
+function buildMigrationRequiredArtifact(baselineVersion) {
+	const migrationReleaseDir = join(tempDir, "migration-release");
+	const migrationArtifactPath = join(tempDir, "migration-server.zip");
+	mkdirSync(join(migrationReleaseDir, "src"), { recursive: true });
+	const migrationVersion = baselineVersion
+		.replace(/SERVER_VERSION = "[^"]+"/, 'SERVER_VERSION = "98.0.0"')
+		.replace(/SERVER_MIGRATION_REQUIRED = (true|false);/, 'SERVER_MIGRATION_REQUIRED = true;');
+	writeFileSync(join(migrationReleaseDir, "src/version.ts"), migrationVersion);
+	writeFileSync(
+		join(migrationReleaseDir, "kaos-server-manifest.json"),
+		`${JSON.stringify({
+			serverVersion: "98.0.0",
+			pluginVersion: "98.0.0",
+			serverMinSchemaVersion: 4,
+			serverMaxSchemaVersion: 4,
+			protectedFiles: ["wrangler.toml"],
+			updateOwnedPaths: ["src/version.ts"],
+			migrationRequired: true,
+		}, null, 2)}\n`,
+	);
+	execFileSync("zip", ["-qr", migrationArtifactPath, "."], {
+		cwd: migrationReleaseDir,
+		stdio: "inherit",
+	});
+	return migrationArtifactPath;
+}
+
 function testAutoR2BindingHelpers() {
 	const baseWrangler = [
 		'name = "kaos"',
@@ -162,14 +189,25 @@ function testAutoR2BindingHelpers() {
 
 try {
 	const updateManifest = JSON.parse(readFileSync(updateManifestPath, "utf8"));
-	if (
-		updateManifest.migrationRequired !== true
-		|| updateManifest.upgradeOrder !== "plugin-first"
-		|| updateManifest.autoUpdateEligible !== false
-	) {
-		throw new Error(
-			`Migration release manifest is not plugin-first and fail-closed: ${JSON.stringify(updateManifest)}`,
-		);
+	if (updateManifest.migrationRequired) {
+		if (
+			updateManifest.upgradeOrder !== "plugin-first"
+			|| updateManifest.autoUpdateEligible !== false
+		) {
+			throw new Error(
+				`Migration release manifest is not plugin-first and fail-closed: ${JSON.stringify(updateManifest)}`,
+			);
+		}
+	} else {
+		if (
+			updateManifest.upgradeOrder !== "either"
+			|| updateManifest.autoUpdateEligible !== true
+			|| updateManifest.releaseType !== "compatible"
+		) {
+			throw new Error(
+				`Compatible release manifest is invalid: ${JSON.stringify(updateManifest)}`,
+			);
+		}
 	}
 	if (!String(updateManifest.upgradeGuideUrl).endsWith("#guided-server-update")) {
 		throw new Error(`Migration release guide URL is invalid: ${String(updateManifest.upgradeGuideUrl)}`);
@@ -216,10 +254,11 @@ try {
 	run("git", ["add", "-A"]);
 	run("git", ["commit", "-qm", "simulate older deployed server"]);
 
+	const migrationArtifactPath = buildMigrationRequiredArtifact(baselineVersion);
 	const migrationGuardOutput = runExpectFailure("node", ["scripts/update-from-release.mjs"], {
 		env: {
 			...process.env,
-			KAOS_RELEASE_FILE: artifactPath,
+			KAOS_RELEASE_FILE: migrationArtifactPath,
 		},
 	});
 	if (!migrationGuardOutput.includes("migration-required")) {
@@ -234,7 +273,7 @@ try {
 		env: {
 			...process.env,
 			KAOS_RELEASE_FILE: artifactPath,
-			KAOS_ALLOW_MIGRATION_UPDATE: "true",
+			...(updateManifest.migrationRequired ? { KAOS_ALLOW_MIGRATION_UPDATE: "true" } : {}),
 		},
 	});
 

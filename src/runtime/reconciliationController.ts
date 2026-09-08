@@ -6582,14 +6582,26 @@ export class ReconciliationController {
 			return now + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS;
 		}
 		if (input.sourceReason === "create") {
-			return authority.content === input.diskContent
+			return (
+				authority.content === input.diskContent ||
+				normalizeEditorText(authority.content) === normalizeEditorText(input.diskContent)
+			)
 				? null
 				: now + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS;
 		}
 		if (!input.cameFromDirtyQueue) return null;
 
-		if (authority.content === input.diskContent) return null;
-		if (input.crdtContent !== null && authority.content === input.crdtContent) return null;
+		if (
+			authority.content === input.diskContent ||
+			normalizeEditorText(authority.content) === normalizeEditorText(input.diskContent)
+		) return null;
+		if (
+			input.crdtContent !== null &&
+			(
+				authority.content === input.crdtContent ||
+				normalizeEditorText(authority.content) === normalizeEditorText(input.crdtContent)
+			)
+		) return null;
 		return now + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS;
 	}
 
@@ -6656,8 +6668,12 @@ export class ReconciliationController {
 					authority.kind === "single" &&
 					(
 						authority.content === input.crdtContent ||
+						normalizeEditorText(authority.content) === normalizeEditorText(input.crdtContent) ||
 						(
-							authority.content === input.diskContent &&
+							(
+								authority.content === input.diskContent ||
+								normalizeEditorText(authority.content) === normalizeEditorText(input.diskContent)
+							) &&
 							diskIsDurableBaseline
 						)
 					)
@@ -6676,8 +6692,14 @@ export class ReconciliationController {
 		}
 
 		if (authority.kind !== "single") return null;
-		if (authority.content === input.diskContent) return null;
-		if (authority.content === input.crdtContent) return null;
+		if (
+			authority.content === input.diskContent ||
+			normalizeEditorText(authority.content) === normalizeEditorText(input.diskContent)
+		) return null;
+		if (
+			authority.content === input.crdtContent ||
+			normalizeEditorText(authority.content) === normalizeEditorText(input.crdtContent)
+		) return null;
 
 		// Startup can receive provider state before the CM6 binding has begun
 		// tracking user edits. If the live editor is already ahead of both disk

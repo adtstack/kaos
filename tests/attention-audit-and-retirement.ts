@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
 	auditAttentionEntries,
+	buildSummary,
 	classifyMarkdownRetirementSettlement,
 	isArchivePath,
 } from "../src/dashboard/attentionAudit";
@@ -107,8 +108,10 @@ console.log("\n--- PreservedUnresolvedRegistry resolveEpisode ---");
 console.log("\n--- isArchivePath helper ---");
 {
 	assert.equal(isArchivePath("Archive/2026/note.md"), true);
+	assert.equal(isArchivePath("ARCHIVES/PROJECT/2026/note.md"), true);
 	assert.equal(isArchivePath("notes/archive/note.md"), true);
 	assert.equal(isArchivePath("_archive/note.md"), true);
+	assert.equal(isArchivePath("_archives/note.md"), true);
 	assert.equal(isArchivePath("notes/active-note.md"), false);
 }
 
@@ -265,6 +268,74 @@ console.log("\n--- Attention Audit: Path Collision Archive Pair ---");
 	assert.equal(auditIncomplete.summary.needsReviewCount, 2, "incomplete archive pair needs review");
 }
 
+console.log("\n--- Attention Audit: Archive Restore and General Move Pairs ---");
+{
+	const vault = new MockVault();
+	vault.addFile("NOTES/RestoredProject.md"); // restored note exists, archive source missing
+
+	const archiveSourceEntry: PreservedUnresolvedEntry = {
+		path: "ARCHIVES/PROJECT/2026/RestoredProject.md",
+		kind: "markdown",
+		reason: "path-collision",
+		firstSeenAt: 1000,
+		lastSeenAt: 1000,
+		episodeId: "coll-ep-arch-src",
+	};
+
+	const noteTargetEntry: PreservedUnresolvedEntry = {
+		path: "NOTES/RestoredProject.md",
+		kind: "markdown",
+		reason: "path-collision",
+		firstSeenAt: 1000,
+		lastSeenAt: 1000,
+		episodeId: "coll-ep-note-dst",
+	};
+
+	const auditRestore = auditAttentionEntries({
+		vault,
+		preservedUnresolvedEntries: [archiveSourceEntry, noteTargetEntry],
+	});
+
+	assert.equal(auditRestore.summary.retirableCount, 2, "both endpoints of archive restore are retirable");
+	assert.equal(auditRestore.summary.activeCount, 0);
+	assert.equal(auditRestore.summary.needsReviewCount, 0);
+
+	const restoreSrc = auditRestore.items.find((i) => i.entry.path === "ARCHIVES/PROJECT/2026/RestoredProject.md");
+	assert.equal(restoreSrc?.classification, "retirable");
+	assert.equal(restoreSrc?.pairPath, "NOTES/RestoredProject.md");
+
+	const restoreDst = auditRestore.items.find((i) => i.entry.path === "NOTES/RestoredProject.md");
+	assert.equal(restoreDst?.classification, "retirable");
+	assert.equal(restoreDst?.pairPath, "ARCHIVES/PROJECT/2026/RestoredProject.md");
+
+	// General move pair (e.g. docs/OLD to OLD)
+	vault.addFile("OLD/JOURNALS/DAILY/2023/2023-11-08.md");
+	const oldSourceEntry: PreservedUnresolvedEntry = {
+		path: "docs/OLD/JOURNALS/DAILY/2023/2023-11-08.md",
+		kind: "markdown",
+		reason: "path-collision",
+		firstSeenAt: 1000,
+		lastSeenAt: 1000,
+		episodeId: "coll-ep-old-src",
+	};
+	const oldTargetEntry: PreservedUnresolvedEntry = {
+		path: "OLD/JOURNALS/DAILY/2023/2023-11-08.md",
+		kind: "markdown",
+		reason: "path-collision",
+		firstSeenAt: 1000,
+		lastSeenAt: 1000,
+		episodeId: "coll-ep-old-dst",
+	};
+
+	const auditMove = auditAttentionEntries({
+		vault,
+		preservedUnresolvedEntries: [oldSourceEntry, oldTargetEntry],
+	});
+
+	assert.equal(auditMove.summary.retirableCount, 2, "both endpoints of general move pair are retirable");
+	assert.equal(auditMove.summary.activeCount, 0);
+}
+
 console.log("\n--- Attention Audit: Legacy Missing Blob & Stuck Local Mutation ---");
 {
 	const vault = new MockVault();
@@ -394,6 +465,107 @@ console.log("\n--- Retirement settlement proof: only settled divergences retire 
 		false,
 		"CRDT moved with the file missing keeps the fence",
 	);
+}
+
+console.log("\n--- Individual retirement: buildSummary dynamic recalculation ---");
+{
+	const vault = new MockVault();
+	vault.addFile("Archive/2026/A.md");
+	vault.addFile("Archive/2026/B.md");
+
+	const entryA_src: PreservedUnresolvedEntry = {
+		path: "Projects/A.md",
+		kind: "markdown",
+		reason: "path-collision",
+		firstSeenAt: 1000,
+		lastSeenAt: 1000,
+		episodeId: "coll-a-src",
+	};
+	const entryA_dst: PreservedUnresolvedEntry = {
+		path: "Archive/2026/A.md",
+		kind: "markdown",
+		reason: "path-collision",
+		firstSeenAt: 1000,
+		lastSeenAt: 1000,
+		episodeId: "coll-a-dst",
+	};
+	const entryB_src: PreservedUnresolvedEntry = {
+		path: "Projects/B.md",
+		kind: "markdown",
+		reason: "path-collision",
+		firstSeenAt: 1000,
+		lastSeenAt: 1000,
+		episodeId: "coll-b-src",
+	};
+	const entryB_dst: PreservedUnresolvedEntry = {
+		path: "Archive/2026/B.md",
+		kind: "markdown",
+		reason: "path-collision",
+		firstSeenAt: 1000,
+		lastSeenAt: 1000,
+		episodeId: "coll-b-dst",
+	};
+	const activeEntry: PreservedUnresolvedEntry = {
+		path: "Active/Doc.md",
+		kind: "markdown",
+		reason: "conflict-winner-flush-deferred",
+		firstSeenAt: 1000,
+		lastSeenAt: 1000,
+		episodeId: "cwfd-doc",
+	};
+
+	const audit = auditAttentionEntries({
+		vault,
+		preservedUnresolvedEntries: [entryA_src, entryA_dst, entryB_src, entryB_dst, activeEntry],
+	});
+
+	assert.equal(audit.summary.totalCount, 5);
+	assert.equal(audit.summary.retirableCount, 4);
+	assert.equal(audit.summary.activeCount, 1);
+
+	// Simulate retiring 1 item individually
+	const singleRetireTarget = audit.items.find((i) => i.entry.path === "Projects/A.md");
+	assert.ok(singleRetireTarget);
+	assert.equal(singleRetireTarget.classification, "retirable");
+
+	// Filter out the retired item and recompute summary
+	const remainingItems = audit.items.filter((i) => i.entry.path !== "Projects/A.md");
+	const updatedSummary = {
+		...buildSummary(remainingItems),
+	};
+
+	assert.equal(updatedSummary.totalCount, 4);
+	assert.equal(updatedSummary.retirableCount, 3);
+	assert.equal(updatedSummary.activeCount, 1);
+}
+
+console.log("\n--- Auto-audit in dashboard data: incorporates attentionAudit count ---");
+{
+	const vault = new MockVault();
+	const entryAbsent: PreservedUnresolvedEntry = {
+		path: "notes/deleted.md",
+		kind: "markdown",
+		reason: "remote-delete-missing-baseline",
+		firstSeenAt: 1000,
+		lastSeenAt: 1000,
+		episodeId: "rd-1",
+	};
+
+	const audit = auditAttentionEntries({
+		vault,
+		preservedUnresolvedEntries: [entryAbsent],
+		remoteDeleteResolutionState: {
+			markdownAvailable: true,
+			blobAvailable: true,
+			getFingerprint: () => "fp-1",
+			isKeepLocalPending: () => false,
+			getBlobRef: () => null,
+		},
+	});
+
+	assert.equal(audit.summary.retirableCount, 1);
+	assert.equal(audit.summary.activeCount, 0);
+	assert.equal(audit.items[0].classification, "retirable");
 }
 
 console.log("\nAll Attention Audit & Retirement tests passed successfully!\n");

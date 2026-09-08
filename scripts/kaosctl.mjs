@@ -3,13 +3,14 @@ import { createHash, webcrypto } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { createReadStream, createWriteStream } from "node:fs";
 import { access, chmod, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
-import { constants } from "node:fs";
+import { constants, existsSync } from "node:fs";
 import { hostname, homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import process from "node:process";
 import readline from "node:readline/promises";
 import { emitKeypressEvents } from "node:readline";
+import { createConnection } from "node:net";
 import { gunzipSync } from "node:zlib";
 import { unzipSync } from "fflate";
 
@@ -53,6 +54,10 @@ async function main() {
 	}
 	if (command === "status") {
 		await printStatus(parseArgs(args));
+		return;
+	}
+	if (command === "sync") {
+		await runSyncCommand(parseArgs(args));
 		return;
 	}
 	if (command === "doctor") {
@@ -366,6 +371,91 @@ function runUserServiceCommand(command, args) {
 	runChecked("systemctl", ["--user", command, "kaos-headless-host"]);
 }
 
+function findDaemonSocket(config, paths) {
+	const candidates = [];
+	if (paths?.dataFile) candidates.push(join(dirname(paths.dataFile), "daemon.sock"));
+	if (config?.vaultRoot) candidates.push(join(config.vaultRoot, ".kaos-headless-host", "daemon.sock"));
+	if (paths?.runtimeDir) candidates.push(join(paths.runtimeDir, "daemon.sock"));
+	return candidates.find((c) => existsSync(c)) ?? candidates[0] ?? null;
+}
+
+function findDaemonStatusFile(config, paths) {
+	const candidates = [];
+	if (paths?.dataFile) candidates.push(join(dirname(paths.dataFile), "status.json"));
+	if (config?.vaultRoot) candidates.push(join(config.vaultRoot, ".kaos-headless-host", "status.json"));
+	if (paths?.runtimeDir) candidates.push(join(paths.runtimeDir, "status.json"));
+	return candidates.find((c) => existsSync(c)) ?? candidates[0] ?? null;
+}
+
+async function sendDaemonIpc(socketPath, request, timeoutMs = 4000) {
+	if (!socketPath || !existsSync(socketPath)) {
+		return null;
+	}
+	return new Promise((resolve) => {
+		let timer = null;
+		let socket = null;
+		const finish = (result) => {
+			if (timer) clearTimeout(timer);
+			if (socket) {
+				socket.destroy();
+				socket = null;
+			}
+			resolve(result);
+		};
+		timer = setTimeout(() => {
+			if (process.env.KAOS_DEBUG_IPC) console.error("[kaos-ipc-client-timeout] socketPath:", socketPath);
+			finish(null);
+		}, timeoutMs);
+		socket = createConnection(socketPath, () => {
+			socket.write(JSON.stringify(request) + "\n");
+		});
+		let buffer = "";
+		socket.setEncoding("utf8");
+		socket.on("data", (chunk) => {
+			buffer += chunk;
+			const idx = buffer.indexOf("\n");
+			if (idx >= 0) {
+				const line = buffer.slice(0, idx).trim();
+				try {
+					finish(JSON.parse(line));
+				} catch {
+					finish(null);
+				}
+			}
+		});
+		socket.on("error", (err) => {
+			if (process.env.KAOS_DEBUG_IPC) console.error("[kaos-ipc-client-error]", err);
+			finish(null);
+		});
+	});
+}
+
+async function runSyncCommand(raw) {
+	const config = await readJsonFile(resolve(raw.config ?? defaultUserPaths().installConfig)).catch(() => null);
+	const paths = config ? pathsFromConfig(config) : defaultUserPaths();
+	const socketPath = findDaemonSocket(config, paths);
+
+	if (useHumanCommandOutput(raw)) {
+		console.log("Triggering KAOS headless sync...");
+	}
+	const ipcResp = socketPath ? await sendDaemonIpc(socketPath, { command: "sync" }, 15000) : null;
+	if (ipcResp?.ok) {
+		if (raw.json === "true") {
+			console.log(JSON.stringify({ kind: "kaos-sync", ok: true, result: ipcResp.result }, null, 2));
+		} else {
+			console.log("Sync completed successfully.");
+			if (ipcResp.result?.message) {
+				console.log(`Result: ${ipcResp.result.message}`);
+			}
+		}
+		return;
+	}
+	if (ipcResp && !ipcResp.ok) {
+		throw new Error(`Sync failed: ${ipcResp.error ?? "unknown daemon error"}`);
+	}
+	throw new Error("Headless daemon is not running or IPC socket is unreachable. Start the service with `kaos start` first.");
+}
+
 async function printStatus(raw) {
 	const config = await readJsonFile(resolve(raw.config ?? defaultUserPaths().installConfig));
 	const paths = pathsFromConfig(config);
@@ -379,6 +469,19 @@ async function printStatus(raw) {
 	} catch {
 		latestVersion = null;
 	}
+
+	let live = null;
+	const socketPath = findDaemonSocket(config, paths);
+	const ipcStatus = socketPath ? await sendDaemonIpc(socketPath, { command: "status" }, 1500) : null;
+	if (ipcStatus?.ok && ipcStatus.result) {
+		live = ipcStatus.result;
+	} else {
+		const statusFile = findDaemonStatusFile(config, paths);
+		if (statusFile && existsSync(statusFile)) {
+			live = await readJsonIfExists(statusFile);
+		}
+	}
+
 	const status = {
 		kind: "kaos-user-status",
 		ok: true,
@@ -388,6 +491,7 @@ async function printStatus(raw) {
 		vaultRoot: config.vaultRoot,
 		pluginDir: config.pluginDir,
 		serviceFile: paths.serviceFile,
+		live,
 	};
 	if (useHumanCommandOutput(raw)) {
 		console.log(formatUserStatus(status));
@@ -420,13 +524,54 @@ function formatUserStatus(status) {
 	} else {
 		update = "check unavailable";
 	}
-	return formatOutputRows("KAOS Headless", [
-		["Version", formatOutputValue(status.currentVersion)],
-		["Update", update],
-		["Vault", formatOutputValue(status.vaultRoot)],
-		["Plugin", formatOutputValue(status.pluginDir)],
-		["Service file", formatOutputValue(status.serviceFile)],
-	]);
+
+	const live = status.live;
+	const rows = [];
+
+	if (live?.daemon) {
+		let daemonText = live.daemon.alive ? `Running (PID ${live.daemon.pid}` : "Stopped";
+		if (live.daemon.alive && typeof live.daemon.uptimeSeconds === "number") {
+			const mins = Math.floor(live.daemon.uptimeSeconds / 60);
+			const mem = Math.round((live.daemon.memoryRssBytes ?? 0) / (1024 * 1024));
+			daemonText += `, uptime ${mins}m, memory ${mem}MB)`;
+		} else if (!live.daemon.alive && live.daemon.shutdownReason) {
+			daemonText += ` (shutdown: ${live.daemon.shutdownReason})`;
+		}
+		rows.push(["Daemon", daemonText]);
+	}
+
+	if (live?.connection) {
+		let connText = live.connection.status ?? "unknown";
+		if (typeof live.connection.rttMs === "number") {
+			connText += ` (RTT ${live.connection.rttMs}ms)`;
+		}
+		rows.push(["Sync status", connText]);
+	}
+
+	if (live?.sync) {
+		const syncParts = [];
+		if (live.sync.serverAppliedLocalState) syncParts.push("in-sync");
+		if (live.sync.reconcileInFlight) syncParts.push("reconciling");
+		if (typeof live.sync.activeMarkdownPathsCount === "number") {
+			syncParts.push(`${live.sync.activeMarkdownPathsCount} tracked files`);
+		}
+		if (syncParts.length > 0) {
+			rows.push(["Sync state", syncParts.join(", ")]);
+		}
+	}
+
+	if (live?.attention !== undefined) {
+		const count = Number(live.attention.totalCount ?? 0);
+		rows.push(["Attention", count > 0 ? `${count} items needing review (run kaos conflicts)` : "0 items (clean)"]);
+	}
+
+	rows.push(["Version", formatOutputValue(status.currentVersion)]);
+	rows.push(["Update", update]);
+	rows.push(["Vault", formatOutputValue(status.vaultRoot)]);
+	rows.push(["Plugin", formatOutputValue(status.pluginDir)]);
+	rows.push(["Service file", formatOutputValue(status.serviceFile)]);
+
+	return formatOutputRows("KAOS Headless", rows);
 }
 
 function formatUserDoctor(result) {
@@ -1600,7 +1745,33 @@ function renderLineDiff(left, right, { leftLabel, rightLabel, full }) {
 
 async function applyConflictAction(raw, id, action) {
 	const { context, item } = await requireConflictItemWithContext(raw, id);
-	await assertNoHeadlessLock(context);
+	const lock = await readResolverLock(context);
+	if (lock.held) {
+		const socketCandidates = [
+			context.dataFiles[0] ? join(dirname(context.dataFiles[0]), "daemon.sock") : null,
+			join(context.vaultRoot, ".kaos-headless-host", "daemon.sock"),
+			lock.path ? join(dirname(lock.path), "daemon.sock") : null,
+		].filter(Boolean);
+		const socketPath = socketCandidates.find((c) => existsSync(c));
+		const ping = socketPath ? await sendDaemonIpc(socketPath, { command: "ping" }, 1000) : null;
+		if (ping?.ok && item.type === "preserved-unresolved") {
+			const ipcResp = await sendDaemonIpc(socketPath, {
+				command: "conflicts.resolve",
+				params: { path: item.path, action },
+			}, 10000);
+			if (ipcResp?.ok) {
+				return {
+					kind: "kaos-conflict-resolution",
+					ok: true,
+					action,
+					id,
+					path: item.path,
+					online: true,
+				};
+			}
+		}
+		await assertNoHeadlessLock(context);
+	}
 	if (item.type === "preserved-unresolved") {
 		if (!["keep-local", "accept-delete"].includes(action)) {
 			throw new Error(`${action} is only valid for conflict artifacts`);
@@ -1624,6 +1795,17 @@ async function applyConflictAction(raw, id, action) {
 		if (item.currentExists) await moveVaultFileToTrash(context, item.currentPath, workspace.trashDir);
 		await removePreservedUnresolvedEntries(context, item);
 	}
+
+	const socketCandidates = [
+		context.dataFiles[0] ? join(dirname(context.dataFiles[0]), "daemon.sock") : null,
+		join(context.vaultRoot, ".kaos-headless-host", "daemon.sock"),
+		context.lockFile ? join(dirname(context.lockFile), "daemon.sock") : null,
+	].filter(Boolean);
+	const activeSocket = socketCandidates.find((c) => existsSync(c));
+	if (activeSocket) {
+		void sendDaemonIpc(activeSocket, { command: "sync" }, 2000).catch(() => undefined);
+	}
+
 	return {
 		kind: "kaos-conflict-resolution",
 		ok: true,
@@ -2505,6 +2687,7 @@ function printUsage() {
   kaos stop
   kaos uninstall [--dry-run] [--yes] [--purge-vault --vault <path>]
   kaos status [--json]
+  kaos sync [--json]
   kaos doctor [--json]
   kaos ui [--vault <path>]
   kaos conflicts <command> [options]

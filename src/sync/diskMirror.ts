@@ -13,6 +13,7 @@ import {
 import { isLocalOrigin } from "./origins";
 import { contentBaselineHash } from "./diskIndex";
 import { getOpenFileViewsForPath } from "../utils/openFileViews";
+import { normalizeEditorText } from "../utils/editorTextNormalization";
 import {
 	PreservedUnresolvedRegistry,
 	getPreservedUnresolvedEpisodeId,
@@ -3594,7 +3595,11 @@ export class DiskMirror {
 		if (expectedCrdtContent == null) return false;
 		for (const view of this.getOpenMarkdownViewsForPath(path)) {
 			try {
-				if (view.editor.getValue() !== expectedCrdtContent) {
+				const val = view.editor.getValue();
+				if (
+					val !== expectedCrdtContent &&
+					normalizeEditorText(val) !== normalizeEditorText(expectedCrdtContent)
+				) {
 					return true;
 				}
 			} catch {

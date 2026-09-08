@@ -1,5 +1,6 @@
-import { App, ItemView, Modal, Notice, Platform, TFile, type WorkspaceLeaf } from "obsidian";
+import { App, ItemView, Modal, Notice, Platform, TFile, normalizePath, type WorkspaceLeaf } from "obsidian";
 import type {
+	AttentionAuditItem,
 	AttentionAuditResult,
 	AttentionRetirementSummary,
 	AttentionRetirementTarget,
@@ -53,6 +54,7 @@ import {
 	type ConflictResolutionChoice,
 	type ConflictResolutionSnapshot,
 } from "./conflictResolution";
+import { buildSummary } from "./attentionAudit";
 
 export const KAOS_DASHBOARD_VIEW_TYPE = "kaos-dashboard";
 
@@ -158,7 +160,6 @@ export class KaosDashboardView extends ItemView {
 		this.render();
 		try {
 			this.data = await this.deps.collectData();
-			this.lastAuditResult = null;
 		} catch (err) {
 			this.error = formatUnknown(err);
 			if (!silent) new Notice("Dashboard failed to refresh. Check console.", 5000);
@@ -648,6 +649,13 @@ export class KaosDashboardView extends ItemView {
 		);
 
 		const audit = this.lastAuditResult ?? this.data?.attentionAudit;
+		const auditItemByPath = new Map<string, AttentionAuditItem>();
+		if (audit) {
+			for (const auditItem of audit.items) {
+				auditItemByPath.set(normalizePath(auditItem.entry.path), auditItem);
+			}
+		}
+
 		if (audit) {
 			const auditSummaryBox = section.createDiv({
 				cls: "kaos-dashboard-callout is-muted kaos-dashboard-audit-summary",
@@ -686,19 +694,37 @@ export class KaosDashboardView extends ItemView {
 		for (const item of items) {
 			const row = list.createDiv({ cls: `kaos-dashboard-row ${toneClass(item.tone)}` });
 			row.createDiv({ text: item.path ?? item.title, cls: "kaos-dashboard-path" });
+			const path = item.path;
+			const normalizedPath = path ? normalizePath(path) : null;
+			const auditItem = normalizedPath ? auditItemByPath.get(normalizedPath) : null;
+
 			if (item.structuralChange) {
 				this.renderStructuralChangeDetail(row, item.structuralChange);
 			} else {
-				row.createDiv({ text: `${item.title} · ${item.detail}`, cls: "kaos-dashboard-muted" });
+				let detailText = `${item.title} · ${item.detail}`;
+				if (auditItem && auditItem.classification === "retirable") {
+					detailText = `[retirable] ${auditItem.rationale}`;
+				}
+				row.createDiv({ text: detailText, cls: "kaos-dashboard-muted" });
 			}
 			if (item.lastSeenAt) {
 				row.createDiv({ text: `last ${formatDateTime(item.lastSeenAt)}`, cls: "kaos-dashboard-muted" });
 			}
-			const path = item.path;
 			if (path) {
 				const actions = row.createDiv({ cls: "kaos-dashboard-row-actions kaos-dashboard-attention-actions" });
 				this.button(actions, "Open file", () => this.openPath(path));
 				this.button(actions, "Copy path", () => this.copyPath(path));
+
+				if (auditItem && auditItem.classification === "retirable") {
+					this.button(
+						actions,
+						this.isRetiringAttention ? "Retiring…" : "Retire marker",
+						() => this.confirmRetireSingleAttention(auditItem),
+						this.isAuditingAttention || this.isRetiringAttention,
+						auditItem.rationale,
+					);
+				}
+
 				const resolution = item.resolution;
 				if (resolution?.kind === "remote-delete") {
 					const actionPending = this.pendingAttentionEpisodes.has(
@@ -800,13 +826,15 @@ export class KaosDashboardView extends ItemView {
 					);
 					useRemoteButton.classList.add("mod-warning");
 				} else {
-					this.button(
-						actions,
-						"Manual review required",
-						async () => undefined,
-						true,
-						this.getManualAttentionReason(item),
-					);
+					if (!auditItem || auditItem.classification !== "retirable") {
+						this.button(
+							actions,
+							"Manual review required",
+							async () => undefined,
+							true,
+							auditItem ? auditItem.rationale : this.getManualAttentionReason(item),
+						);
+					}
 				}
 			} else {
 				const actions = row.createDiv({ cls: "kaos-dashboard-row-actions kaos-dashboard-attention-actions" });
@@ -1192,6 +1220,58 @@ export class KaosDashboardView extends ItemView {
 				}
 			},
 			`Retire ${targets.length} marker(s)`,
+			"Cancel",
+			() => {},
+			"mod-cta",
+		).open();
+	}
+
+	private async confirmRetireSingleAttention(auditItem: AttentionAuditItem): Promise<void> {
+		if (this.isAuditingAttention || this.isRetiringAttention) return;
+		const target: AttentionRetirementTarget = {
+			path: auditItem.entry.path,
+			kind: auditItem.entry.kind,
+			reason: auditItem.entry.reason,
+			episodeId: auditItem.episodeId,
+			expectedRemoteFingerprint: auditItem.remoteDeleteFingerprint ?? undefined,
+			pairPath: auditItem.pairPath ?? undefined,
+		};
+
+		new ConfirmModal(
+			this.app,
+			`Retire attention marker for "${auditItem.entry.path}"?`,
+			`This will retire the verified attention marker for "${auditItem.entry.path}".\n\nReason: ${auditItem.rationale}\n\nNo local files, remote documents, or backups will be deleted.`,
+			async () => {
+				this.isRetiringAttention = true;
+				this.render();
+				try {
+					const summary = await this.deps.actions.retireVerifiedAttention([target]);
+					if (summary.retiredCount > 0) {
+						new Notice(`Retired attention marker: ${auditItem.entry.path}`);
+						if (this.lastAuditResult) {
+							this.lastAuditResult.items = this.lastAuditResult.items.filter(
+								(i) => !(
+									i.entry.kind === target.kind
+									&& normalizePath(i.entry.path) === normalizePath(target.path)
+									&& i.episodeId === target.episodeId
+								),
+							);
+							this.lastAuditResult.summary = buildSummary(this.lastAuditResult.items);
+						}
+						await this.refresh(true);
+					} else if (summary.failedCount > 0) {
+						new Notice(`Retirement skipped for "${auditItem.entry.path}" due to state change.`);
+						await this.refresh(true);
+					}
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					new Notice(`Attention retirement failed: ${message}`);
+				} finally {
+					this.isRetiringAttention = false;
+					this.render();
+				}
+			},
+			"Retire marker",
 			"Cancel",
 			() => {},
 			"mod-cta",
