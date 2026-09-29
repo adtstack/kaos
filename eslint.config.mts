@@ -35,6 +35,7 @@ export default tseslint.config(
 				{
 					enforceCamelCaseLower: true,
 					ignoreWords: ["Cloudflare", "KAOS"],
+					ignoreRegex: ["^KAOS:"],
 				},
 			],
 		},

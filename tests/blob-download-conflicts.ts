@@ -305,37 +305,34 @@ function installRemoteDeleteAuthority(
 	};
 }
 
-console.log("\n--- Test 1: a local edit during download defers the old disk epoch and then converges ---");
+console.log("\n--- Test 1: existing attachment changed during download is quarantined ---");
 {
 	const { manager, files, put, traces, getModifyCalls } = makeHarness();
 	const localOld = bytes("local-old");
 	const localOldHash = await sha256Hex(localOld);
 	put("img.png", localOld);
-	let changed = false;
 	await runDownload(manager, "img.png", bytes("remote"), () => {
-		if (!changed) {
-			changed = true;
-			put("img.png", bytes("local-new"));
-		}
+		put("img.png", bytes("local-new"));
 	}, localOldHash);
 
-	assert(text(files.get("img.png")!.data) === "local-new", "the first attempt never overwrites a changed local epoch");
-	assert((manager as any).downloadQueue.get("img.png")?.status === "pending", "the changed epoch remains queued for retry");
-	assert(
-		traces.some((event) => event.msg === "authoritative-remote-retry"),
-		"the exact local-epoch retry is traced",
+	const conflict = Array.from(files.keys()).find((path) =>
+		path.startsWith("img (KAOS remote conflict") && path.endsWith(".png")
 	);
-
-	await runQueuedDownloadAttempt(manager, "img.png");
-	const backup = findVisibleLocalBackupPath(files, "img.png");
-	assert(text(files.get("img.png")!.data) === "remote", "a fresh attempt installs the authoritative remote bytes");
-	assert(backup ? text(files.get(backup)!.data) === "local-new" : false, "the exact local edit remains in a safety backup");
-	assert(!Array.from(files.keys()).some((path) => path.includes("KAOS remote conflict")), "no remote conflict artifact is created");
+	assert(text(files.get("img.png")!.data) === "local-new", "local changed attachment is preserved");
+	assert(!!conflict, "remote bytes are written to a conflict artifact");
+	assert(conflict ? text(files.get(conflict)!.data) === "remote" : false, "conflict artifact contains remote bytes");
 	assert(getModifyCalls() === 0, "hash-to-commit local edit race never reaches modifyBinary");
-	assert(!manager.isPreservedUnresolved("img.png"), "automatic convergence creates no durable Attention marker");
+	assert(manager.isPreservedUnresolved("img.png"), "hash-to-commit race records durable Attention");
+	assert(
+		traces.some((event) =>
+			event.msg === "download-conflict-quarantined" &&
+			event.details?.reason === "existing-changed-during-download"
+		),
+		"download conflict quarantine is traced",
+	);
 }
 
-console.log("\n--- Test 1b: same-bytes TFile ABA retries before authoritative replacement ---");
+console.log("\n--- Test 1b: same-bytes TFile ABA during hash is quarantined ---");
 {
 	const { app, manager, files, put, replace, getModifyCalls } = makeHarness();
 	const local = bytes("same local bytes");
@@ -361,39 +358,40 @@ console.log("\n--- Test 1b: same-bytes TFile ABA retries before authoritative re
 	);
 
 	assert(replaced, "test replaces the target TFile while its original bytes are hashed");
-	assert(text(files.get("img.png")!.data) === "same local bytes", "the ABA replacement remains untouched in the stale attempt");
+	assert(text(files.get("img.png")!.data) === "same local bytes", "same-bytes replacement remains untouched in the stale attempt");
 	assert((manager as any).downloadQueue.get("img.png")?.status === "pending", "identity ABA is retried with a fresh disk epoch");
 	await runQueuedDownloadAttempt(manager, "img.png");
-	const backup = findVisibleLocalBackupPath(files, "img.png");
-	assert(text(files.get("img.png")!.data) === "remote candidate", "the fresh attempt installs the authoritative remote bytes");
-	assert(backup ? text(files.get(backup)!.data) === "same local bytes" : false, "the ABA local bytes remain in a safety backup");
-	assert(!Array.from(files.keys()).some((path) => path.includes("KAOS remote conflict")), "identity ABA creates no conflict artifact");
+	const conflict = Array.from(files.keys()).find((path) => path.includes("KAOS remote conflict"));
+	assert(text(files.get("img.png")!.data) === "same local bytes", "the fresh attempt preserves the local file");
+	assert(!!conflict, "remote candidate is preserved after same-bytes identity ABA");
 	assert(getModifyCalls() === 0, "same-bytes TFile ABA never reaches modifyBinary");
-	assert(!manager.isPreservedUnresolved("img.png"), "identity ABA creates no Attention marker");
+	assert(manager.isPreservedUnresolved("img.png"), "same-bytes TFile ABA records durable Attention");
 }
 
-console.log("\n--- Test 2: stable differing attachment yields to the authoritative remote ref ---");
+console.log("\n--- Test 2: stable differing attachment is preserved, never overwritten ---");
 {
 	const { manager, files, put, traces, getModifyCalls } = makeHarness();
 	put("img.png", bytes("local-old"));
 	await runDownload(manager, "img.png", bytes("remote"));
 
-	const backup = findVisibleLocalBackupPath(files, "img.png");
-	assert(text(files.get("img.png")!.data) === "remote", "stable divergence installs the authoritative remote bytes");
-	assert(backup ? text(files.get(backup)!.data) === "local-old" : false, "the independent local bytes remain in a safety backup");
-	assert(!Array.from(files.keys()).some((path) => path.includes("KAOS remote conflict")), "stable divergence creates no remote conflict artifact");
+	const conflict = Array.from(files.keys()).find((path) => path.includes("KAOS remote conflict"));
+	assert(text(files.get("img.png")!.data) === "local-old", "stable local attachment is never overwritten by remote bytes");
+	assert(!!conflict, "differing remote bytes are preserved in a conflict artifact");
+	assert(conflict ? text(files.get(conflict)!.data) === "remote" : false, "artifact contains the remote candidate");
 	assert(getModifyCalls() === 0, "existing-file download never calls modifyBinary");
-	assert(!manager.isPreservedUnresolved("img.png"), "stable divergence creates no durable Attention marker");
+	assert(manager.isPreservedUnresolved("img.png"), "existing mismatch records durable Attention");
 	assert(
 		traces.some((event) =>
-			event.msg === "download-overwrite-decision" &&
-			event.details?.action === "authoritative-remote-wins"
+			event.msg === "download-conflict-quarantined" &&
+			event.details?.action === "preserve-local-and-remote-artifact"
 		),
-		"the authoritative remote decision is traced",
+		"non-overwrite decision is traced",
 	);
-	const debug = manager.getDebugSnapshot();
-	assert(debug.blobConflictArtifacts === 0, "automatic remote resolution does not increment true conflicts");
-	assert(debug.blobSafetyBackups === 1, "automatic remote resolution records one safety backup");
+	manager.handleFileChange(files.get("img.png")!.file);
+	assert(manager.isPreservedUnresolved("img.png"), "a later modify event cannot implicitly clear the blob conflict");
+	assert(!(manager as any).uploadDebounce.has("img.png"), "a later modify event does not schedule an implicit upload");
+	assert(!(manager as any).uploadQueue.has("img.png"), "only an explicit Keep local action may queue the conflicted attachment");
+	assert(conflict ? files.has(conflict) : false, "the remote conflict candidate remains available for an explicit choice");
 }
 
 console.log("\n--- Test 2b: exact existing remote hash settles without a write ---");
@@ -413,7 +411,7 @@ console.log("\n--- Test 2b: exact existing remote hash settles without a write -
 	assert(!manager.isPreservedUnresolved("img.png"), "exact equality creates no Attention marker");
 }
 
-console.log("\n--- Test 2c: repeated remote candidate settles without duplicate backups ---");
+console.log("\n--- Test 2c: repeated remote candidate dedupes the conflict artifact ---");
 {
 	const { manager, files, put } = makeHarness();
 	put("img.png", bytes("local stays"));
@@ -422,11 +420,9 @@ console.log("\n--- Test 2c: repeated remote candidate settles without duplicate 
 	await runDownload(manager, "img.png", remote);
 
 	const conflicts = Array.from(files.keys()).filter((path) => path.includes("KAOS remote conflict"));
-	assert(conflicts.length === 0, "identical repeated remote bytes create no conflict artifact");
-	assert(text(files.get("img.png")!.data) === "same remote candidate", "the authoritative remote remains canonical");
-	assert(findVisibleLocalBackupPath(files, "img.png") !== undefined, "the original local candidate has one visible backup");
-	assert(manager.getDebugSnapshot().blobSafetyBackups === 1, "the equality rerun creates no duplicate safety backup");
-	assert(!manager.isPreservedUnresolved("img.png"), "repeated settlement creates no Attention condition");
+	assert(conflicts.length === 1, "identical repeated remote bytes reuse one conflict artifact");
+	assert(text(files.get("img.png")!.data) === "local stays", "artifact dedupe never changes the local target");
+	assert(manager.isPreservedUnresolved("img.png"), "artifact dedupe retains one Attention condition");
 }
 
 console.log("\n--- Test 2c.1: hash-equal upload reconciliation completes progress ---");
@@ -535,15 +531,14 @@ console.log("\n--- Test 2e: a different local hash uses authoritative-remote pol
 
 	await runDownload(manager, path, h2, undefined, getBlobRefPriorHashes(h2Ref));
 
-	const backup = findVisibleLocalBackupPath(files, path);
-	assert(text(files.get(path)!.data) === "remote H2", "the live remote ref becomes canonical despite unrelated local provenance");
-	assert(backup ? text(files.get(backup)!.data) === "independent local edit" : false, "the independent local edit remains in a safety backup");
-	assert(!Array.from(files.keys()).some((candidate) => candidate.includes("KAOS remote conflict")), "no remote conflict artifact is created");
+	const conflict = Array.from(files.values()).find((stored) => text(stored.data) === "remote H2");
+	assert(text(files.get(path)!.data) === "independent local edit", "a non-H1 local attachment remains untouched");
+	assert(!!conflict && conflict.file.path !== path, "the rejected H2 candidate is preserved as an artifact");
 	assert(getModifyCalls() === 0, "provenance mismatch never reaches modifyBinary");
-	assert(!manager.isPreservedUnresolved(path), "provenance mismatch is automatically settled");
+	assert(manager.isPreservedUnresolved(path), "provenance mismatch records durable Attention");
 	const debug = manager.getDebugSnapshot();
-	assert(debug.blobConflictArtifacts === 0, "authoritative remote convergence increments no true conflicts");
-	assert(debug.blobSafetyBackups === 1, "authoritative remote convergence records one safety copy");
+	assert(debug.blobConflictArtifacts === 1, "a divergent remote candidate increments the true conflict count");
+	assert(debug.blobSafetyBackups === 0, "a divergent conflict is not mislabeled as a clean safety copy");
 }
 
 console.log("\n--- Test 2f: H1 -> H2 -> H3 supersede accepts either contiguous disk state ---");
@@ -619,7 +614,7 @@ console.log("\n--- Test 2f: H1 -> H2 -> H3 supersede accepts either contiguous d
 	}
 }
 
-console.log("\n--- Test 2g: discontinuous provenance still converges to the live remote ref ---");
+console.log("\n--- Test 2g: discontinuous supersede provenance fails closed ---");
 {
 	const path = "broken-lineage.png";
 	const h1 = bytes("lineage H1");
@@ -681,12 +676,13 @@ console.log("\n--- Test 2g: discontinuous provenance still converges to the live
 	item.status = "processing";
 	await (manager as any).processDownload(item);
 
-	const backup = findVisibleLocalBackupPath(files, path);
-	assert(text(files.get(path)!.data) === "lineage H3", "discontinuous lineage does not override live remote authority");
+	assert(text(files.get(path)!.data) === "lineage H1", "discontinuous lineage preserves the local file");
 	assert(getModifyCalls() === 0, "discontinuous lineage never reaches modifyBinary");
-	assert(!manager.isPreservedUnresolved(path), "discontinuous lineage creates no durable Attention");
-	assert(backup ? text(files.get(backup)!.data) === "lineage H1" : false, "the local H1 candidate remains in a safety backup");
-	assert(!Array.from(files.keys()).some((candidate) => candidate.includes("KAOS remote conflict")), "no remote conflict artifact is emitted");
+	assert(manager.isPreservedUnresolved(path), "discontinuous lineage records durable Attention");
+	assert(
+		Array.from(files.values()).some((stored) => stored.file.path !== path && text(stored.data) === "lineage H3"),
+		"discontinuous lineage preserves H3 in a conflict artifact",
+	);
 }
 
 console.log("\n--- Test 2h: queue export/import preserves effective provenance ---");
@@ -848,7 +844,7 @@ console.log("\n--- Test 2j: same target hash with changed lineage rejects the st
 	);
 }
 
-console.log("\n--- Test 2k: malformed lineage grants no causal trust but remote authority still converges ---");
+console.log("\n--- Test 2k: malformed or oversized causal lineage fails closed ---");
 {
 	const h1 = bytes("bounded H1");
 	const h2 = bytes("bounded H2");
@@ -883,11 +879,9 @@ console.log("\n--- Test 2k: malformed lineage grants no causal trust but remote 
 
 		await runDownload(manager, path, h2, undefined, variant.priorHashes);
 
-		const backup = findVisibleLocalBackupPath(files, path);
-		assert(text(files.get(path)!.data) === "bounded H2", `${variant.label}: the live remote ref becomes canonical`);
-		assert(getModifyCalls() === 0, `${variant.label}: invalid lineage grants no causal overwrite shortcut`);
-		assert(backup ? text(files.get(backup)!.data) === "bounded H1" : false, `${variant.label}: local bytes remain in a safety backup`);
-		assert(!manager.isPreservedUnresolved(path), `${variant.label}: automatic convergence records no Attention`);
+		assert(text(files.get(path)!.data) === "bounded H1", `${variant.label}: invalid lineage preserves the local target`);
+		assert(getModifyCalls() === 0, `${variant.label}: invalid lineage grants no overwrite authority`);
+		assert(manager.isPreservedUnresolved(path), `${variant.label}: invalid lineage records durable Attention`);
 	}
 }
 
@@ -923,10 +917,8 @@ console.log("\n--- Test 2l: upload rejects a current ref that diverged from the 
 	(manager as any).blobClient = { download: async () => remote };
 	downloadItem.status = "processing";
 	await (manager as any).processDownload(downloadItem);
-	const backup = findVisibleLocalBackupPath(files, path);
-	assert(text(files.get(path)!.data) === "remote fork HA", "stale upload recovery installs the authoritative remote ref");
-	assert(backup ? text(files.get(backup)!.data) === "local fork HB" : false, "stale local upload bytes remain in a safety backup");
-	assert(!manager.isPreservedUnresolved(path), "stale upload recovery converges without Attention");
+	assert(text(files.get(path)!.data) === "local fork HB", "remote recovery preserves the divergent local attachment");
+	assert(manager.isPreservedUnresolved(path), "remote recovery quarantines the offline fork conflict");
 }
 
 console.log("\n--- Test 2m: upload succeeds only against its exact settled base ref ---");
@@ -982,7 +974,7 @@ console.log("\n--- Test 2m: upload succeeds only against its exact settled base 
 	);
 }
 
-console.log("\n--- Test 2n: a local historical revert yields to the live remote ref with a backup ---");
+console.log("\n--- Test 2n: an intentional H2 -> H1 disk revert is not mistaken for a lagging replica ---");
 {
 	const path = "intentional-local-revert.png";
 	const h1 = bytes("historical H1 restored intentionally by the user");
@@ -1020,21 +1012,23 @@ console.log("\n--- Test 2n: a local historical revert yields to the live remote 
 		getBlobRefPriorHashes(h3Ref),
 	);
 
-	const backup = findVisibleLocalBackupPath(files, path);
-	assert(
-		text(files.get(path)!.data) === text(h3),
-		"the authoritative remote H3 becomes canonical",
+	const remoteArtifact = Array.from(files.values()).find(
+		(stored) => stored.file.path !== path && text(stored.data) === text(h3),
 	);
 	assert(
-		backup ? text(files.get(backup)!.data) === text(h1) : false,
-		"the intentional local H1 revert remains in a safety backup",
+		text(files.get(path)!.data) === text(h1),
+		"the intentional local H1 revert remains canonical",
 	);
-	assert(!Array.from(files.keys()).some((candidate) => candidate.includes("KAOS remote conflict")), "authoritative H3 creates no conflict artifact");
+	assert(
+		!findVisibleLocalBackupPath(files, path),
+		"historical H1 is never moved aside as a clean lagging replica",
+	);
+	assert(!!remoteArtifact, "authoritative H3 is preserved in a remote conflict artifact");
 	assert(getModifyCalls() === 0, "the reverted disk epoch is never overwritten with modifyBinary");
-	assert(!manager.isPreservedUnresolved(path), "the H1/H3 divergence is settled without Attention");
+	assert(manager.isPreservedUnresolved(path), "the H1/H3 conflict records durable Attention");
 	assert(
-		settledRefs[path]?.hash === h3Hash,
-		"authoritative convergence advances the durable settlement proof to H3",
+		settledRefs[path]?.hash === h2Hash,
+		"conflict handling does not rewrite the durable H2 settlement proof",
 	);
 }
 
@@ -1246,7 +1240,42 @@ for (const hasSettlement of [true, false]) {
 	await manager.destroy();
 }
 
-console.log("\n--- Test 3: create race mismatch converges through a local safety backup ---");
+console.log("\n--- Test 2u: offline local modification is preserved and true conflict is quarantined ---");
+{
+	const path = "offline-mod.png";
+	const baseline = bytes("baseline content");
+	const baselineHash = await sha256Hex(baseline);
+	const localModified = bytes("locally modified while offline");
+	const { manager, files, put } = makeHarness(
+		undefined,
+		{ [path]: { hash: baselineHash, size: baseline.byteLength } },
+	);
+	put(path, localModified);
+
+	// 1. Reconcile with unchanged remote baseline correctly queues an upload, not a download
+	const reconcileResult = manager.reconcile("authoritative", []);
+	assert(reconcileResult.uploadQueued === 1, "reconcile queues upload for offline modification");
+	assert(reconcileResult.downloadQueued === 0, "reconcile does not queue download when remote matches baseline");
+	assert((manager as any).uploadQueue.has(path), "upload queue has the modified path");
+	(manager as any).uploadQueue.clear();
+
+	// 2. If a divergent remote download executes, canonical path is NEVER overwritten
+	(manager as any).blobClient = { download: async () => baseline };
+	(manager as any).enqueueDownload(path, baselineHash, baseline.byteLength);
+	const item = (manager as any).downloadQueue.get(path);
+	item.status = "processing";
+	await (manager as any).processDownload(item);
+
+	assert(text(files.get(path)!.data) === text(localModified), "local offline modifications are strictly preserved at canonical path");
+	assert(!findVisibleLocalBackupPath(files, path), "authoritative-remote-wins is gone: no demoting local file to KAOS local backup");
+	assert(
+		Array.from(files.keys()).some((candidate) => candidate.includes("KAOS remote conflict")),
+		"divergent remote version is saved to a visible conflict artifact",
+	);
+	assert(manager.isPreservedUnresolved(path), "divergent file is quarantined under preservedUnresolved for user attention");
+}
+
+console.log("\n--- Test 3: create race mismatch is quarantined instead of overwritten ---");
 {
 	const { app, manager, files, put, traces } = makeHarness();
 	const originalCreateBinary = app.vault.createBinary;
@@ -1264,17 +1293,18 @@ console.log("\n--- Test 3: create race mismatch converges through a local safety
 
 	await runDownload(manager, "img.png", bytes("remote"));
 
-	const backup = findVisibleLocalBackupPath(files, "img.png");
-	assert(text(files.get("img.png")!.data) === "remote", "create-race converges to the authoritative remote bytes");
-	assert(backup ? text(files.get(backup)!.data) === "local-race" : false, "create-race local bytes remain in a safety backup");
-	assert(!Array.from(files.keys()).some((path) => path.includes("KAOS remote conflict")), "create-race emits no conflict artifact");
-	assert(!manager.isPreservedUnresolved("img.png"), "create-race emits no Attention marker");
+	const conflict = Array.from(files.keys()).find((path) =>
+		path.startsWith("img (KAOS remote conflict") && path.endsWith(".png")
+	);
+	assert(text(files.get("img.png")!.data) === "local-race", "create-race local attachment is preserved");
+	assert(!!conflict, "remote bytes are written to a conflict artifact after create race");
+	assert(conflict ? text(files.get(conflict)!.data) === "remote" : false, "create-race conflict contains remote bytes");
 	assert(
 		traces.some((event) =>
-			event.msg === "download-overwrite-decision" &&
-			event.details?.action === "authoritative-remote-wins"
+			event.msg === "download-conflict-quarantined" &&
+			event.details?.reason === "create-race-mismatch"
 		),
-		"create-race authoritative resolution is traced",
+		"create-race mismatch quarantine is traced",
 	);
 }
 
@@ -1441,12 +1471,14 @@ console.log("\n--- Test 4c: H2 arriving inside createBinary retires operation-ow
 
 console.log("\n--- Test 4d: sourceVersion ABA restores local bytes and retries the new episode ---");
 {
-	const { app, manager, files, put, traces } = makeHarness();
 	const path = "source-version-aba.png";
 	const local = bytes("local before source ABA");
+	const localHash = await sha256Hex(local);
 	const remote = bytes("remote with stable hash");
 	const remoteHash = await sha256Hex(remote);
-	const remoteRef: BlobRef = { hash: remoteHash, size: remote.byteLength };
+	const localRef: BlobRef = { hash: localHash, size: local.byteLength };
+	const remoteRef: BlobRef = createCausalBlobRef(remoteHash, remote.byteLength, localRef);
+	const { app, manager, files, put, traces } = makeHarness(undefined, { [path]: localRef });
 	let sourceVersion = "1:episode-a";
 	(manager as any).vaultSync = {
 		getBlobRef: () => remoteRef,
@@ -1466,7 +1498,7 @@ console.log("\n--- Test 4d: sourceVersion ABA restores local bytes and retries t
 		}
 	};
 
-	await runDownload(manager, path, remote);
+	await runDownload(manager, path, remote, undefined, getBlobRefPriorHashes(remoteRef));
 	const firstBackup = findVisibleLocalBackupPath(files, path);
 	assert(changedEpisode, "the test replaces the sourceVersion episode during the no-clobber swap");
 	assert(text(files.get(path)!.data) === text(local), "the stale episode restores the exact local bytes to canonical path");
@@ -1480,20 +1512,22 @@ console.log("\n--- Test 4d: sourceVersion ABA restores local bytes and retries t
 	assert(
 		traces.some((event) =>
 			event.msg === "download-overwrite-decision"
-			&& event.details?.action === "authoritative-remote-wins"
+			&& event.details?.action === "swap-clean-prior-ref-no-clobber"
 		),
-		"the current source episode records an authoritative remote win",
+		"the current source episode cleanly advances the prior ref",
 	);
 }
 
 console.log("\n--- Test 4d.1: same-ref source episode queues a rerun after stage creation ---");
 {
-	const { manager, files, put, traces } = makeHarness();
 	const path = "same-ref-source-episode.png";
 	const local = bytes("local before same-ref episode change");
+	const localHash = await sha256Hex(local);
 	const remote = bytes("remote bytes with a stable hash");
 	const remoteHash = await sha256Hex(remote);
-	const remoteRef: BlobRef = { hash: remoteHash, size: remote.byteLength };
+	const localRef: BlobRef = { hash: localHash, size: local.byteLength };
+	const remoteRef: BlobRef = createCausalBlobRef(remoteHash, remote.byteLength, localRef);
+	const { manager, files, put, traces } = makeHarness(undefined, { [path]: localRef });
 	let sourceVersion = "1:episode-a";
 	(manager as any).vaultSync = {
 		getBlobRef: () => remoteRef,
@@ -1513,14 +1547,19 @@ console.log("\n--- Test 4d.1: same-ref source episode queues a rerun after stage
 			changedEpisode = true;
 			sourceVersion = "1:episode-b";
 			assert(
-				(manager as any).scheduleDownload(path, remoteHash, remote.byteLength),
+				(manager as any).scheduleDownload(
+					path,
+					remoteHash,
+					remote.byteLength,
+					getBlobRefPriorHashes(remoteRef),
+				),
 				"the same-ref new source episode is accepted while the old stage exists",
 			);
 		}
 		return stage;
 	};
 
-	await runDownload(manager, path, remote);
+	await runDownload(manager, path, remote, undefined, getBlobRefPriorHashes(remoteRef));
 	assert(changedEpisode, "the test replaces the source episode after stage creation");
 	assert(
 		(manager as any).downloadQueue.get(path)?.status === "pending",
@@ -1595,10 +1634,14 @@ for (const replacementMode of ["same-file", "tfile-aba"] as const) {
 
 console.log("\n--- Test 4e.1: replacement failure restores canonical local bytes before retry ---");
 {
-	const { app, manager, files, put } = makeHarness();
 	const path = "authoritative-replacement-retry.png";
 	const local = bytes("local survives failed replacement");
+	const localHash = await sha256Hex(local);
 	const remote = bytes("remote after retry");
+	const remoteHash = await sha256Hex(remote);
+	const localRef: BlobRef = { hash: localHash, size: local.byteLength };
+	const remoteRef = createCausalBlobRef(remoteHash, remote.byteLength, localRef);
+	const { app, manager, files, put } = makeHarness(undefined, { [path]: localRef });
 	put(path, local);
 	const originalCreateBinary = app.vault.createBinary;
 	let failedRemoteCreate = false;
@@ -1612,7 +1655,7 @@ console.log("\n--- Test 4e.1: replacement failure restores canonical local bytes
 		return originalCreateBinary(candidate, data);
 	};
 
-	await runDownload(manager, path, remote);
+	await runDownload(manager, path, remote, undefined, getBlobRefPriorHashes(remoteRef));
 	const firstBackup = findVisibleLocalBackupPath(files, path);
 	assert(failedRemoteCreate, "the authoritative remote create fails after the local backup move");
 	assert(text(files.get(path)!.data) === text(local), "the exact local bytes are restored to canonical path");
@@ -3049,9 +3092,9 @@ console.log("\n--- Test 17: importQueue preserves rerunResets near cap ---");
 	assert(downloadItem.status === "pending", "download status normalized to pending");
 }
 
-// ── Test 18: deferred authoritative retry does not cache unapplied bytes ────
+// ── Test 18: download conflict artifact does not update target hash cache ────
 
-console.log("\n--- Test 18: deferred authoritative retry does not pollute target hash cache ---");
+console.log("\n--- Test 18: conflict artifact does not pollute target hash cache ---");
 {
 	const { manager, files, put, traces } = makeHarness();
 	const existing = put("target.png", bytes("local version"));
@@ -3064,13 +3107,9 @@ console.log("\n--- Test 18: deferred authoritative retry does not pollute target
 		hash: originalHash,
 	};
 
-	// Simulate a local edit after the initial exact disk snapshot.
+	// Simulate download that creates a conflict artifact
 	const remoteData = bytes("remote version");
 	const remoteHash = await sha256Hex(remoteData);
-	(manager as any).__defaultBlobRefs.set("target.png", {
-		hash: remoteHash,
-		size: remoteData.byteLength,
-	});
 	(manager as any).blobClient = {
 		download: async () => {
 			put("target.png", bytes("local changed during download"));
@@ -3089,7 +3128,8 @@ console.log("\n--- Test 18: deferred authoritative retry does not pollute target
 		rerunResets: 0,
 	};
 
-	// Put a different cached hash; the exact read must still control the decision.
+	// Put a different stat so getCachedHash returns the original hash but it differs
+	// from item.hash — this makes it take the conflict path
 	const stat = existing.file.stat;
 	(manager as any).hashCache["target.png"] = {
 		mtime: stat.mtime,
@@ -3103,15 +3143,12 @@ console.log("\n--- Test 18: deferred authoritative retry does not pollute target
 	const targetEntry = (manager as any).hashCache["target.png"];
 	assert(
 		targetEntry?.hash !== remoteHash,
-		"target hash cache is not updated to unapplied remote bytes",
+		"target hash cache NOT updated to remote hash after conflict",
 	);
 	assert(
 		typeof targetEntry?.hash === "string" && targetEntry.hash.length > 0,
-		"target hash cache keeps a local-file hash after the deferred attempt",
+		"target hash cache keeps a local-file hash after conflict",
 	);
-	assert(item.status === "pending", "the changed disk epoch remains queued for a fresh attempt");
-	assert(!Array.from(files.keys()).some((path) => path.includes("KAOS remote conflict")), "the deferred attempt emits no conflict artifact");
-	assert(traces.some((event) => event.msg === "authoritative-remote-retry"), "the deferred attempt records its retry reason");
 
 	await manager.destroy();
 }
@@ -3340,7 +3377,7 @@ for (const replacementMode of ["same-file", "tfile-aba"] as const) {
 
 console.log("\n--- Test 23: promise-reaction edits before settled-base publication fail closed ---");
 for (const replacementMode of ["same-file", "tfile-aba"] as const) {
-	const { manager, files, put, replace } = makeHarness();
+	const { manager, files, put, replace, traces } = makeHarness();
 	const path = `upload-microtask-${replacementMode}.png`;
 	const first = bytes(`C1-${replacementMode}`);
 	const second = bytes(`C2-${replacementMode}`);
@@ -3419,21 +3456,18 @@ for (const replacementMode of ["same-file", "tfile-aba"] as const) {
 	recovery.status = "processing";
 	await (manager as any).processDownload(recovery);
 	assert(
-		text(files.get(path)!.data) === text(first),
-		`${replacementMode}: stale upload recovery installs authoritative H1`,
-	);
-	const backup = findVisibleLocalBackupPath(files, path);
-	assert(
-		backup ? text(files.get(backup)!.data) === text(second) : false,
-		`${replacementMode}: stale C2 remains in a local safety backup`,
+		text(files.get(path)!.data) === text(second),
+		`${replacementMode}: fail-closed recovery preserves the exact C2 disk epoch`,
 	);
 	assert(
-		!manager.isPreservedUnresolved(path),
-		`${replacementMode}: recovery converges without durable Attention`,
+		Array.from(files.values()).some(
+			(stored) => stored.file.path !== path && text(stored.data) === text(first),
+		),
+		`${replacementMode}: fail-closed recovery preserves authoritative H1 in a conflict artifact`,
 	);
 	assert(
-		!Array.from(files.keys()).some((candidate) => candidate.includes("KAOS remote conflict")),
-		`${replacementMode}: recovery creates no remote conflict artifact`,
+		manager.isPreservedUnresolved(path),
+		`${replacementMode}: pre-settlement C2 is surfaced as durable Attention`,
 	);
 }
 

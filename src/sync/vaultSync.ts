@@ -29,6 +29,7 @@ import {
 	type MetaShapeStats,
 } from "./fileMeta";
 import { ORIGIN_SEED, isLocalOrigin } from "./origins";
+import { decideSafeReconcileMode } from "../runtime/reconcile/safeReconcileModePolicy";
 import type { VaultSyncSettings } from "../settings";
 import type { TraceHttpContext, TraceRecord } from "../observability/traceContext";
 import { randomBase64Url } from "../utils/base64url";
@@ -373,6 +374,12 @@ export class VaultSync {
 	};
 
 	private _localReady = false;
+	/** Construction timestamp backing the startup-cost timings below. */
+	private readonly constructedAt = Date.now();
+	/** ms from construction until the local IDB cache finished loading. */
+	private _localPersistenceReadyMs: number | null = null;
+	/** ms from construction until the provider finished its initial sync. */
+	private _providerSyncReadyMs: number | null = null;
 	private _providerSynced = false;
 
 	/**
@@ -409,6 +416,14 @@ export class VaultSync {
 	private _renameTimer: ReturnType<typeof setTimeout> | null = null;
 	/** Callback invoked after a rename batch is flushed. */
 	private _onRenameBatchFlushed: ((renames: Map<string, string>) => void) | null = null;
+	/**
+	 * Callback invoked at most once, when the local IndexedDB-backed replica
+	 * finishes hydrating (possibly after startup already timed out waiting and
+	 * ran a downgraded conservative pass). Lets the host promote the next
+	 * reconcile to authoritative immediately instead of waiting for the
+	 * status tick.
+	 */
+	private _onLocalPersistenceReady: (() => void) | null = null;
 
 	private readonly _device: string | undefined;
 	private readonly debug: boolean;
@@ -641,6 +656,9 @@ export class VaultSync {
 		});
 		this.provider.on("sync", (synced: boolean) => {
 			if (!synced) return;
+			if (this._providerSyncReadyMs === null) {
+				this._providerSyncReadyMs = Date.now() - this.constructedAt;
+			}
 			this.markSocketTicketSyncSucceeded();
 		});
 
@@ -729,11 +747,25 @@ export class VaultSync {
 	private markLocalPersistenceReady(): void {
 		if (this._localReady) return;
 		this._localReady = true;
+		if (this._localPersistenceReadyMs === null) {
+			this._localPersistenceReadyMs = Date.now() - this.constructedAt;
+		}
 		this._pathIndexesDirty = true;
 		this.log(
-			`IndexedDB loaded (pathToId: ${this.pathToId.size}, ` +
+			`IndexedDB loaded in ${this._localPersistenceReadyMs}ms (pathToId: ${this.pathToId.size}, ` +
 			`initialized: ${this.isInitialized})`,
 		);
+		this._onLocalPersistenceReady?.();
+	}
+
+	/**
+	 * Register a one-shot callback fired when local persistence hydration
+	 * completes. Fired at most once per runtime; registration after the
+	 * replica is already hydrated invokes the callback immediately.
+	 */
+	onLocalPersistenceReady(callback: () => void): void {
+		this._onLocalPersistenceReady = callback;
+		if (this._localReady) callback();
 	}
 
 	waitForProviderSync(): Promise<boolean> {
@@ -1319,21 +1351,24 @@ export class VaultSync {
 	 * Determine which reconciliation mode is safe given current state.
 	 *
 	 * Authoritative when:
-	 *   - Provider synced (we have the full server state), OR
-	 *   - Local cache loaded AND sentinel says initialized AND
-	 *     pathToId is non-empty (protects against partial IndexedDB persistence)
+	 *   - Local cache loaded AND provider synced (we have both replicas), OR
+	 *   - Local cache loaded AND sentinel says initialized AND schemaVersion
+	 *     is present (protects against partial IndexedDB persistence)
 	 *
-	 * Conservative otherwise.
+	 * Conservative otherwise. Provider sync alone is NOT sufficient: while
+	 * the local replica is still hydrating the doc holds only server state,
+	 * and a server room behind this device's newest operations would be
+	 * projected onto disk as if it were newer (visible revert). See
+	 * decideSafeReconcileMode for the full rationale.
 	 */
 	getSafeReconcileMode(): ReconcileMode {
-		if (this._providerSynced) return "authoritative";
-		// Use schemaVersion presence (set atomically with initialized) as
-		// proof that IDB loaded real data. Unlike pathToId.size > 0 this
-		// correctly handles legitimately-empty-but-initialized vaults.
-		if (this._localReady && this.isInitialized && this.sys.get("schemaVersion") !== undefined) {
-			return "authoritative";
-		}
-		return "conservative";
+		return decideSafeReconcileMode({
+			providerSynced: this._providerSynced,
+			localReady: this._localReady,
+			idbError: this._idbError,
+			initialized: this.isInitialized,
+			schemaVersionKnown: this.sys.get("schemaVersion") !== undefined,
+		});
 	}
 
 	reconcileVault(
@@ -3491,6 +3526,8 @@ export class VaultSync {
 		pathBindingCollisionCount: number;
 		storedSchemaVersion: number | null;
 		blobPathCount: number;
+		localPersistenceReadyMs: number | null;
+		providerSyncReadyMs: number | null;
 		serverReceipt: ReturnType<ServerAckTracker["getState"]> & { persistenceUnavailable: boolean };
 		serverReceiptStartupValidation: ServerReceiptStartupValidation;
 		svEcho: SvEchoCounters;
@@ -3510,6 +3547,8 @@ export class VaultSync {
 			pathBindingCollisionCount: this._activePathCollisions.size,
 			storedSchemaVersion: this.storedSchemaVersion,
 			blobPathCount: this.pathToBlob.size,
+			localPersistenceReadyMs: this._localPersistenceReadyMs,
+			providerSyncReadyMs: this._providerSyncReadyMs,
 			serverReceipt: {
 				...this.serverAckTracker.getState(),
 				persistenceUnavailable: this._serverAckPersistenceUnavailable,
@@ -3517,6 +3556,14 @@ export class VaultSync {
 			serverReceiptStartupValidation: this._serverReceiptStartupValidation,
 			svEcho: this.svEchoCounters,
 		};
+	}
+
+	/**
+	 * Approximate CRDT state size in bytes. Full encode cost — diagnostics and
+	 * sync-check only, never a startup path.
+	 */
+	getApproximateDocBytes(): number {
+		return Y.encodeStateAsUpdate(this.ydoc).byteLength;
 	}
 
 	private resolvePendingProviderSyncWaiters(value: boolean): void {

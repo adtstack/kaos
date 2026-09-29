@@ -27,6 +27,8 @@ export const PRODUCT_EVENT_KIND = {
 	reconcileComplete: "reconcile.complete",
 	reconcileFileDecision: "reconcile.file.decision",
 	reconcileSafetyBrakeTriggered: "reconcile.safety_brake.triggered",
+	reconcileModeDowngraded: "reconcile.mode.downgraded",
+	reconcileForcedUnhydrated: "reconcile.forced_unhydrated",
 
 	// Recovery
 	recoveryDecision: "recovery.decision",
@@ -42,6 +44,7 @@ export const PRODUCT_EVENT_KIND = {
 	editorHealApplied: "editor.heal.applied",
 	editorRepairApplied: "editor.repair.applied",
 	editorAuthorityShieldApplied: "editor.authority_shield.applied",
+	providerRegressiveDeleteSuspected: "editor.provider_regressive_delete.suspected",
 } as const;
 
 export type ProductEventKind =

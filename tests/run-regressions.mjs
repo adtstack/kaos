@@ -110,6 +110,7 @@ const suites = [
 	[JITI, "tests/markdown-remote-delete-trash-preference.ts"],
 	[JITI, "tests/markdown-attention-resolution.ts"],
 	[JITI, "tests/closed-file-conflict.ts"],
+	[JITI, "tests/composition-aware-ysync.ts"],
 	[JITI, "tests/preserved-unresolved-registry.ts"],
 	[NODE, "tests/markdown-ingest-regressions.mjs"],
 	[JITI, "tests/closed-file-mirror.ts"],
@@ -207,6 +208,11 @@ const suites = [
 	[JITI, "tests/path-category.ts"],
 	[JITI, "tests/exclude-file.ts"],
 	[JITI, "tests/remote-projection-policy-gate.ts"],
+	[JITI, "tests/room-transition-reset.ts"],
+	[JITI, "tests/room-divergence-policy.ts"],
+	[JITI, "tests/sync-check-report.ts"],
+	[JITI, "tests/read-skip-policy.ts"],
+	[JITI, "tests/disk-stat-store-migration.ts"],
 	[JITI, "tests/provider-policy-bootstrap-wiring.ts"],
 	[JITI, "tests/provider-policy-settlement-coordinator.ts"],
 	[JITI, "tests/conflict-artifact-path.ts"],
@@ -230,6 +236,13 @@ const suites = [
 	// Autophagy: ReconciliationController planner/executor
 	[JITI, "tests/closed-file-planner.ts"],
 	[JITI, "tests/open-bound-file-planner.ts"],
+	// Hydration gate: authoritative reconcile requires local replica
+	[JITI, "tests/safe-reconcile-mode-policy.ts"],
+	[JITI, "tests/reconcile-mode-gate-wiring.ts"],
+	// External-disk host-projection proof window (R5)
+	[JITI, "tests/external-disk-proof-window-wiring.ts"],
+	// Attention/preserved-unresolved persistence debouncing and aux state wiring
+	[JITI, "tests/preserved-unresolved-persistence-wiring.ts"],
 	// Autophagy: Baseline advancement policy
 	[JITI, "tests/baseline-advancement-policy.ts"],
 	// Autophagy: Safety brake policy

@@ -83,6 +83,7 @@ export class SnapshotService {
 	private recoverySnapshotRetryTimer: ReturnType<typeof setTimeout> | null = null;
 	private debouncedRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
 	private recoverySnapshotInFlight = false;
+	private destroyed = false;
 	private lastAutoSnapshotAt = 0;
 	private pendingLocalEdits = false;
 	private readonly dashboardSnapshotCache = new DashboardSnapshotCache();
@@ -336,11 +337,38 @@ export class SnapshotService {
 			return;
 		}
 
-		new Notice("Creating file history point...");
+		if (this.recoverySnapshotInFlight) {
+			new Notice("File history creation already in progress.");
+			return;
+		}
+
+		this.recoverySnapshotInFlight = true;
+		const progressNotice = new Notice("Creating file history point...", 0);
 		try {
-			const result = await this.requestFileHistoryPoint(true);
+			let result = await this.requestFileHistoryPoint(true);
 			this.lastAutoSnapshotAt = Date.now();
 			this.pendingLocalEdits = false;
+
+			let iterations = 0;
+			const maxIterations = 100;
+			while (result.status === "pending" && !this.destroyed && iterations < maxIterations) {
+				iterations++;
+				const pending = result.pending;
+				if (pending && pending.totalContentCount > 0) {
+					const pct = Math.round((pending.uploadedContentCount / pending.totalContentCount) * 100);
+					const msg = `Uploading file history: ${pending.uploadedContentCount}/${pending.totalContentCount} (${pct}%)...`;
+					progressNotice.setMessage(msg);
+					this.deps.log(msg);
+				} else {
+					progressNotice.setMessage("Uploading file history...");
+				}
+				await new Promise((resolve) => setTimeout(resolve, 1000));
+				result = await this.requestFileHistoryPoint(true);
+				this.lastAutoSnapshotAt = Date.now();
+				this.pendingLocalEdits = false;
+			}
+			progressNotice.hide();
+
 			if (result.status === "created") {
 				this.invalidateDashboardSnapshotCache();
 				const changed = typeof result.index?.changedCount === "number"
@@ -356,7 +384,10 @@ export class SnapshotService {
 				new Notice(`File history unavailable: ${result.reason ?? "server storage unavailable"}`);
 			}
 		} catch (err) {
+			progressNotice.hide();
 			this.showSnapshotFailure("File history point failed", "File history", err);
+		} finally {
+			this.recoverySnapshotInFlight = false;
 		}
 	}
 
@@ -375,11 +406,38 @@ export class SnapshotService {
 			return;
 		}
 
-		new Notice("Resetting file history baseline...");
+		if (this.recoverySnapshotInFlight) {
+			new Notice("File history creation already in progress.");
+			return;
+		}
+
+		this.recoverySnapshotInFlight = true;
+		const progressNotice = new Notice("Resetting file history baseline...", 0);
 		try {
-			const result = await this.requestFileHistoryPoint(true);
+			let result = await this.requestFileHistoryPoint(true);
 			this.lastAutoSnapshotAt = Date.now();
 			this.pendingLocalEdits = false;
+
+			let iterations = 0;
+			const maxIterations = 100;
+			while (result.status === "pending" && !this.destroyed && iterations < maxIterations) {
+				iterations++;
+				const pending = result.pending;
+				if (pending && pending.totalContentCount > 0) {
+					const pct = Math.round((pending.uploadedContentCount / pending.totalContentCount) * 100);
+					const msg = `Uploading file history: ${pending.uploadedContentCount}/${pending.totalContentCount} (${pct}%)...`;
+					progressNotice.setMessage(msg);
+					this.deps.log(msg);
+				} else {
+					progressNotice.setMessage("Uploading file history...");
+				}
+				await new Promise((resolve) => setTimeout(resolve, 1000));
+				result = await this.requestFileHistoryPoint(true);
+				this.lastAutoSnapshotAt = Date.now();
+				this.pendingLocalEdits = false;
+			}
+			progressNotice.hide();
+
 			if (result.status === "created") {
 				this.invalidateDashboardSnapshotCache();
 				const changed = typeof result.index?.changedCount === "number"
@@ -395,11 +453,15 @@ export class SnapshotService {
 				new Notice(`File history unavailable: ${result.reason ?? "server storage unavailable"}`);
 			}
 		} catch (err) {
+			progressNotice.hide();
 			this.showSnapshotFailure("File history baseline reset failed", "File history", err);
+		} finally {
+			this.recoverySnapshotInFlight = false;
 		}
 	}
 
 	destroy(): void {
+		this.destroyed = true;
 		if (this.debouncedRecoveryTimer) {
 			clearTimeout(this.debouncedRecoveryTimer);
 			this.debouncedRecoveryTimer = null;
@@ -617,6 +679,7 @@ export class SnapshotService {
 					? {
 						initialManifestId: target.initialManifestId,
 						initialFileId: target.initialFileId,
+						initialPath: target.initialPath,
 						autoExpandDiff: target.autoExpandDiff,
 					}
 					: undefined,
@@ -626,6 +689,13 @@ export class SnapshotService {
 		} catch (err) {
 			this.showSnapshotFailure("Failed to load file history", "File history", err);
 		}
+	}
+
+	async showFileHistoryForPath(path: string): Promise<void> {
+		await this.showRecoveryHistory({
+			initialPath: path,
+			autoExpandDiff: true,
+		});
 	}
 
 	/**

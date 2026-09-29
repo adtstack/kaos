@@ -287,6 +287,8 @@ function buildFixture(initial: {
 		}) as never,
 		getVaultSync: () => vaultSync as never,
 		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			shouldSuppressCreate: async () => false,
 			shouldSuppressModify: async () => false,
 			isPreservedUnresolved: () => false,

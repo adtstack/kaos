@@ -83,8 +83,8 @@ function parseArgs(argv) {
 	const out = {};
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
-		if (["--startup", "--json", "--full", "--force"].includes(arg)) {
-			out[arg.slice(2)] = "true";
+		if (["--startup", "--json", "--full", "--force", "--yes", "-y", "--non-interactive", "--enable-attachments", "--disable-attachments"].includes(arg)) {
+			out[arg.replace(/^-+/, "")] = "true";
 			continue;
 		}
 		if (arg === "--help" || arg === "-h") {
@@ -129,6 +129,86 @@ async function uninstallUserHeadless(args) {
 	}
 }
 
+function expandTildePath(inputPath) {
+	if (!inputPath || typeof inputPath !== "string") return "";
+	const trimmed = inputPath.trim();
+	if (!trimmed) return "";
+	return resolve(trimmed.replace(/^~(?=$|\/)/, homedir()));
+}
+
+function parseInvitationInput(rawInput) {
+	if (!rawInput || typeof rawInput !== "string") return null;
+	let text = rawInput.trim();
+	if (!text) return null;
+
+	if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+		text = text.slice(1, -1).trim();
+	}
+	if (text.startsWith("<") && text.endsWith(">")) {
+		text = text.slice(1, -1).trim();
+	}
+	const mdMatch = text.match(/\[.*?\]\((.+?)\)/);
+	if (mdMatch?.[1]) {
+		text = mdMatch[1].trim();
+	}
+
+	if (text.startsWith("obsidian://") || text.startsWith("http://") || text.startsWith("https://")) {
+		try {
+			const url = new URL(text);
+			const params = {};
+			for (const [k, v] of url.searchParams.entries()) params[k] = v;
+			if (url.hash) {
+				const hashStr = url.hash.startsWith("#") ? url.hash.slice(1) : url.hash;
+				const hashParams = new URLSearchParams(hashStr);
+				for (const [k, v] of hashParams.entries()) {
+					if (!params[k]) params[k] = v;
+				}
+			}
+			let host = params.host || "";
+			if (!host && (url.protocol === "http:" || url.protocol === "https:")) {
+				host = url.origin;
+			}
+			if (host) host = host.replace(/\/+$/, "");
+			const vaultId = (params.vaultId || "").trim();
+			const invite = (params.invite || "").trim();
+			const code = (params.code || "").trim();
+			return {
+				host: host || undefined,
+				vaultId: vaultId || undefined,
+				invite: invite || undefined,
+				code: code || undefined,
+			};
+		} catch {
+			// fall through
+		}
+	}
+
+	if (text.includes("=") && (text.includes("host=") || text.includes("vaultId=") || text.includes("invite=") || text.includes("code="))) {
+		try {
+			const cleanQuery = text.startsWith("?") ? text.slice(1) : text;
+			const qParams = new URLSearchParams(cleanQuery);
+			const host = (qParams.get("host") || "").trim().replace(/\/+$/, "");
+			const vaultId = (qParams.get("vaultId") || "").trim();
+			const invite = (qParams.get("invite") || "").trim();
+			const code = (qParams.get("code") || "").trim();
+			return {
+				host: host || undefined,
+				vaultId: vaultId || undefined,
+				invite: invite || undefined,
+				code: code || undefined,
+			};
+		} catch {
+			// fall through
+		}
+	}
+
+	if (/^[A-Za-z0-9_-]{6,512}$/.test(text)) {
+		return { invite: text };
+	}
+
+	return null;
+}
+
 async function installInteractive(raw) {
 	if (raw.help === "true") {
 		printUsage();
@@ -158,7 +238,15 @@ async function installInteractive(raw) {
 
 		writeTty(tty, "\nKAOS headless interactive installer\n\n");
 		assertNodeVersion();
-		const vaultRoot = await promptVaultRoot(tty);
+		let vaultRoot;
+		if (raw.vault || raw["vault-root"]) {
+			vaultRoot = expandTildePath(raw.vault || raw["vault-root"]);
+			if (!await pathExists(vaultRoot)) {
+				throw new Error(`Vault does not exist: ${vaultRoot}`);
+			}
+		} else {
+			vaultRoot = await promptVaultRoot(tty);
+		}
 		const pluginDir = join(vaultRoot, ".obsidian", "plugins", "kaos");
 		const pluginState = await inspectVaultPlugin(pluginDir);
 		const pluginData = pluginState.data ?? {};
@@ -173,7 +261,7 @@ async function installInteractive(raw) {
 		}
 
 		if (!pluginState.usable) {
-			const installPlugin = await promptYesNo(tty, "Install the KAOS plugin into this vault now?", true);
+			const installPlugin = raw.yes === "true" || raw.force === "true" || await promptYesNo(tty, "Install the KAOS plugin into this vault now?", true);
 			if (!installPlugin) {
 				throw new Error("KAOS plugin is required in the vault before headless can run.");
 			}
@@ -190,21 +278,61 @@ async function installInteractive(raw) {
 			writeTty(tty, "Installed KAOS plugin into the vault.\n");
 		}
 
-		const host = await promptText(tty, "Worker host", asNonEmptyString(pluginData.host));
-		const vaultId = await promptText(tty, "Vault id", asNonEmptyString(pluginData.vaultId));
+		let parsedInvite = null;
+		if (raw.invite || raw["invite-code"] || raw["invite-link"]) {
+			parsedInvite = parseInvitationInput(raw.invite || raw["invite-code"] || raw["invite-link"]);
+		} else {
+			writeTty(tty, "\nConnection setup:\n");
+			writeTty(tty, "Paste your pairing invitation from Obsidian (Desktop deep link, Mobile setup URL, or invite code),\n");
+			writeTty(tty, "or press Enter to configure host and vault ID manually.\n");
+			const invitationInput = await promptOptionalText(tty, "Invitation link or code (optional)");
+			if (invitationInput) {
+				parsedInvite = parseInvitationInput(invitationInput);
+				if (parsedInvite?.host && parsedInvite?.vaultId) {
+					writeTty(tty, "  ✔ Auto-configured host and vault ID from invitation link.\n");
+				}
+			}
+		}
+
+		const host = await promptText(tty, "Worker host", raw.host || parsedInvite?.host || asNonEmptyString(pluginData.host));
+		const vaultId = await promptText(tty, "Vault id", raw["vault-id"] || parsedInvite?.vaultId || asNonEmptyString(pluginData.vaultId));
 		const defaultDevice = `${sanitizeDeviceName(hostname())}-headless`;
-		const deviceName = await promptText(tty, "Headless device name", defaultDevice);
+		const deviceName = await promptText(tty, "Headless device name", raw["device-name"] || defaultDevice);
 		const identityFileInput = await promptText(
 			tty,
 			"Protected device identity file",
-			asNonEmptyString(pluginData.identityFile) ?? paths.identityFile,
+			raw["identity-file"] || asNonEmptyString(pluginData.identityFile) || paths.identityFile,
 		);
 		if (!identityFileInput.trim()) throw new Error("A protected device identity file is required.");
-		const identityFile = resolve(identityFileInput);
-		const inviteFileInput = await promptText(tty, "Owner invitation file (0600)", "");
-		if (!inviteFileInput.trim()) throw new Error("An Owner invitation file is required to enroll this headless device.");
-		const inviteFile = resolve(inviteFileInput);
-		const enableAttachmentSync = readBoolean(pluginData.enableAttachmentSync) ?? await promptYesNo(tty, "Enable attachment sync?", true);
+		const identityFile = expandTildePath(identityFileInput);
+
+		let inviteToken = parsedInvite?.invite || parsedInvite?.code;
+		let inviteFile = null;
+		let tempInviteFile = null;
+
+		if (raw["invite-file"]) {
+			inviteFile = expandTildePath(raw["invite-file"]);
+		} else if (!inviteToken) {
+			const inviteInput = await promptText(tty, "Owner invitation token or file (0600)", "");
+			if (!inviteInput.trim()) throw new Error("An Owner invitation token or file is required to enroll this headless device.");
+			const candidatePath = expandTildePath(inviteInput);
+			if (await pathExists(candidatePath)) {
+				inviteFile = candidatePath;
+			} else {
+				const parsed = parseInvitationInput(inviteInput);
+				inviteToken = parsed?.invite || parsed?.code || inviteInput.trim();
+			}
+		}
+
+		if (!inviteFile && inviteToken) {
+			tempInviteFile = join(workDir, "invite-token.txt");
+			await writeFile(tempInviteFile, `${inviteToken.trim()}\n`, { encoding: "utf8", mode: 0o600 });
+			inviteFile = tempInviteFile;
+		}
+
+		if (!inviteFile) throw new Error("An Owner invitation file or token is required to enroll this headless device.");
+
+		const enableAttachmentSync = readBoolean(raw["enable-attachments"]) ?? readBoolean(pluginData.enableAttachmentSync) ?? await promptYesNo(tty, "Enable attachment sync?", true);
 
 		writeTty(tty, "\nInstall summary\n");
 		writeTty(tty, `  Version: ${version}\n`);
@@ -214,10 +342,10 @@ async function installInteractive(raw) {
 		writeTty(tty, `  Vault id: ${vaultId}\n`);
 		writeTty(tty, `  Device: ${deviceName}\n`);
 		writeTty(tty, `  Device identity: ${identityFile}\n`);
-		writeTty(tty, `  Owner invitation: ${inviteFile}\n`);
+		writeTty(tty, `  Owner invitation: ${tempInviteFile ? "(token provided)" : inviteFile}\n`);
 		writeTty(tty, `  Install dir: ${paths.installRoot}\n`);
 		writeTty(tty, `  Command: ${paths.binKaos}\n`);
-		const proceed = await promptYesNo(tty, "Continue?", true);
+		const proceed = raw.yes === "true" || raw.force === "true" || await promptYesNo(tty, "Continue?", true);
 		if (!proceed) throw new Error("install cancelled");
 
 		await installUserRelease({ userZip, version, paths });
@@ -247,6 +375,9 @@ async function installInteractive(raw) {
 			"--invite-file", inviteFile,
 			"--data-file", paths.dataFile,
 		]);
+		if (tempInviteFile) {
+			await rm(tempInviteFile, { force: true }).catch(() => undefined);
+		}
 		await writeUserService({ paths, vaultRoot, pluginDir });
 		await linkKaosCommands(paths);
 
@@ -258,7 +389,7 @@ async function installInteractive(raw) {
 			writeTty(tty, `Add ${paths.binDir} to PATH if the kaos command is not found in a new shell.\n`);
 		}
 		if (await commandExists("systemctl")) {
-			const enableNow = await promptYesNo(tty, "Owner approval is required before syncing. Start and enable the user service now?", false);
+			const enableNow = raw.yes === "true" || await promptYesNo(tty, "Owner approval is required before syncing. Start and enable the user service now?", false);
 			if (enableNow) {
 				runChecked("systemctl", ["--user", "daemon-reload"]);
 				runChecked("systemctl", ["--user", "enable", "--now", "kaos-headless-host"]);
@@ -694,6 +825,55 @@ async function runHistoryCommand(argv) {
 		console.log(await renderHistoryEventDiff(connection, id, { full: raw.full === "true" }));
 		return;
 	}
+	if (subcommand === "create") {
+		const forceFull = raw.force === "true" || raw["force-full"] === "true";
+		const device = asNonEmptyString(raw.device) || undefined;
+		const maxIterations = 100;
+		let iterations = 0;
+		let result;
+
+		while (iterations < maxIterations) {
+			iterations++;
+			result = await historyFetchJson(connection, "recovery-snapshots/maybe", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ device, forceFull }),
+			});
+
+			if (result.status === "pending") {
+				const pending = result.pending;
+				if (raw.json !== "true") {
+					if (pending && pending.totalContentCount > 0) {
+						const pct = Math.round((pending.uploadedContentCount / pending.totalContentCount) * 100);
+						process.stdout.write(`\rUploading file history: ${pending.uploadedContentCount}/${pending.totalContentCount} (${pct}%)...`);
+					} else {
+						process.stdout.write(`\rUploading file history...`);
+					}
+				}
+				await new Promise((resolve) => setTimeout(resolve, 1000));
+			} else {
+				break;
+			}
+		}
+
+		if (raw.json !== "true" && iterations > 1) {
+			process.stdout.write("\n");
+		}
+
+		if (raw.json === "true") {
+			console.log(JSON.stringify(result, null, 2));
+		} else if (result.status === "created") {
+			const changed = typeof result.index?.changedCount === "number"
+				? `${result.index.changedCount} changed file(s)`
+				: "changes recorded";
+			console.log(`File history point created: ${result.manifestId} (${changed})`);
+		} else if (result.status === "noop") {
+			console.log(result.reason ?? "No file changes since the latest file history point.");
+		} else {
+			console.log(`File history unavailable: ${result.reason ?? "server storage unavailable"}`);
+		}
+		return;
+	}
 	throw new Error(`unknown history command: ${subcommand}`);
 }
 
@@ -757,9 +937,14 @@ function historyApiUrl(connection, endpoint) {
 	return `${connection.host}/vault/${encodeURIComponent(connection.vaultId)}/${endpoint}`;
 }
 
-async function historyFetch(connection, endpoint) {
+async function historyFetch(connection, endpoint, options = {}) {
 	const res = await fetch(historyApiUrl(connection, endpoint), {
-		headers: { Authorization: await connection.authorizationHeader() },
+		method: options.method || "GET",
+		headers: {
+			Authorization: await connection.authorizationHeader(),
+			...(options.headers || {}),
+		},
+		body: options.body,
 	});
 	if (!res.ok) {
 		const text = await res.text();
@@ -856,8 +1041,8 @@ async function readJsonObject(response) {
 	}
 }
 
-async function historyFetchJson(connection, endpoint) {
-	return await (await historyFetch(connection, endpoint)).json();
+async function historyFetchJson(connection, endpoint, options = {}) {
+	return await (await historyFetch(connection, endpoint, options)).json();
 }
 
 async function listHistoryPoints(connection, raw = {}) {
@@ -2679,9 +2864,14 @@ async function promptYesNo(tty, label, defaultYes) {
 	}
 }
 
+async function promptOptionalText(tty, label) {
+	const value = (await tty.rl.question(`${label}: `)).trim();
+	return value || null;
+}
+
 function printUsage() {
 	console.log(`Usage:
-  kaos install
+  kaos install [--invite <link-or-code>] [--vault <path>] [--yes]
   kaos update [--startup]
   kaos start
   kaos stop
@@ -2694,9 +2884,9 @@ function printUsage() {
   kaos history [--config <path>]
   kaos history <list|show|diff|tui> [options]
 
-Install is always interactive. Update is non-interactive and is used by the
-user systemd service during startup. Start and stop control the installed
-user service.
+Install configures and enrolls a new headless host. Update is non-interactive
+and is used by the user systemd service during startup. Start and stop control
+the installed user service.
 `);
 }
 
@@ -2722,6 +2912,7 @@ function printHistoryUsage() {
 	console.log(`Usage:
   kaos history [--config <path>]
   kaos history list [--limit <n>] [--cursor <point-id>] [--json]
+  kaos history create [--force] [--device <name>] [--json]
   kaos history show <point-id> [--json]
   kaos history diff <point-id>:<entry-index> [--full]
   kaos history tui

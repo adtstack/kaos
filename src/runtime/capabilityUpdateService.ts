@@ -372,7 +372,6 @@ export class CapabilityUpdateService {
 	async beginGuidedServerUpdate(now = Date.now()): Promise<boolean> {
 		const updateState = this.getUpdateState(now);
 		if (!updateState.guidedServerUpdateAvailable || !updateState.latestServerVersion || !updateState.updateActionUrl) {
-			// eslint-disable-next-line obsidianmd/ui/sentence-case -- KAOS is the product acronym.
 			new Notice("KAOS: guided server update is not available for the current settings or release.", 8000);
 			return false;
 		}
@@ -832,7 +831,6 @@ export class CapabilityUpdateService {
 				new Notice(`KAOS: server updated to ${previous?.targetVersion ?? "the target version"}.`, 8000);
 			} else if (result.status === "timed-out") {
 				this.deps.log(`Guided server update timed out: target=${previous?.targetVersion ?? "unknown"}`);
-				// eslint-disable-next-line obsidianmd/ui/sentence-case -- KAOS is the product acronym.
 				new Notice("KAOS: still waiting for the server update. Open the update action again if needed.", 10000);
 			}
 		}

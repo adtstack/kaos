@@ -241,7 +241,7 @@ interface FileMetaLike {
 }
 
 const RECOVERY_SCHEMA_VERSION = 3;
-const RECOVERY_FETCH_CONCURRENCY = 2;
+const RECOVERY_FETCH_CONCURRENCY = 5;
 const DEFAULT_RECOVERY_AUDIT_MANIFEST_LIMIT = 20;
 const DEFAULT_RECOVERY_AUDIT_CONTENT_LIMIT = 200;
 const LATEST_INDEX_KEY_SUFFIX = "latest-index.json";
@@ -268,6 +268,43 @@ export function recoveryContentKey(vaultId: string, hash: string): string {
 	return `${RECOVERY_V2_PREFIX}/${vaultId}/recovery/content/${hash}.md.gz`;
 }
 
+export function recoveryPendingUploadKey(vaultId: string): string {
+	return `${RECOVERY_V2_PREFIX}/${vaultId}/recovery/.pending-upload.json.gz`;
+}
+
+export async function persistPendingRecoveryUpload(
+	bucket: R2Bucket,
+	vaultId: string,
+	prepared: PreparedFileHistoryPendingUpload,
+): Promise<void> {
+	const bytes = encoder.encode(JSON.stringify(prepared));
+	await bucket.put(recoveryPendingUploadKey(vaultId), gzipSync(bytes), {
+		httpMetadata: { contentType: "application/gzip" },
+	});
+}
+
+export async function readPendingRecoveryUpload(
+	bucket: R2Bucket,
+	vaultId: string,
+): Promise<unknown> {
+	const object = await bucket.get(recoveryPendingUploadKey(vaultId));
+	if (!object) return null;
+	try {
+		const buffer = await object.arrayBuffer();
+		const decompressed = gunzipSync(new Uint8Array(buffer));
+		return JSON.parse(new TextDecoder().decode(decompressed));
+	} catch {
+		return null;
+	}
+}
+
+export async function deletePendingRecoveryUpload(
+	bucket: R2Bucket,
+	vaultId: string,
+): Promise<void> {
+	await bucket.delete(recoveryPendingUploadKey(vaultId));
+}
+
 function recoveryLatestIndexKey(vaultId: string): string {
 	return `${RECOVERY_V2_PREFIX}/${vaultId}/recovery/${LATEST_INDEX_KEY_SUFFIX}`;
 }
@@ -292,14 +329,53 @@ function generateRecoveryManifestId(now = new Date()): string {
 	return `${ts}-${rand}`;
 }
 
+const CROCKFORD_BASE32 = "0123456789abcdefghjkmnpqrstvwxyz";
+
+function decodeCrockfordTimestamp(str: string): number | null {
+	let time = 0;
+	for (let i = 0; i < str.length; i++) {
+		let char = str[i].toLowerCase();
+		if (char === "o") char = "0";
+		else if (char === "i" || char === "l") char = "1";
+		const val = CROCKFORD_BASE32.indexOf(char);
+		if (val === -1) return null;
+		time = time * 32 + val;
+	}
+	return Number.isSafeInteger(time) && time > 0 ? time : null;
+}
+
 function createdAtFromRecoveryManifestId(manifestId: string): string | null {
-	const match = /^([0-9a-z]+)-([0-9a-f]{8,})$/.exec(manifestId);
-	if (!match) return null;
-	const ts = Number.parseInt(match[1] ?? "", 36);
-	if (!Number.isSafeInteger(ts) || ts <= 0) return null;
-	const date = new Date(ts);
-	if (Number.isNaN(date.getTime())) return null;
-	return date.toISOString();
+	// Format 1: Legacy <base36-timestamp>-<hex-rand>, e.g. "m0abc...-1a2b3c4d", optionally prefixed with "rec-"
+	const legacyMatch = /^(?:rec-)?([0-9a-z]+)-([0-9a-f]{8,})$/i.exec(manifestId);
+	if (legacyMatch) {
+		const ts = Number.parseInt(legacyMatch[1] ?? "", 36);
+		if (Number.isSafeInteger(ts) && ts > 0) {
+			const date = new Date(ts);
+			if (!Number.isNaN(date.getTime())) return date.toISOString();
+		}
+	}
+
+	// Format 2: ULID format (26 Crockford base32 characters), optionally prefixed with "rec-", e.g. "rec-01K4M1N7..." or "01K4M1N7..."
+	const ulidMatch = /^(?:rec-)?([0-9a-hj-km-np-tv-z]{26})$/i.exec(manifestId);
+	if (ulidMatch) {
+		const ts = decodeCrockfordTimestamp(ulidMatch[1].slice(0, 10));
+		if (ts !== null) {
+			const date = new Date(ts);
+			if (!Number.isNaN(date.getTime())) return date.toISOString();
+		}
+	}
+
+	// Format 3: Fallback for any rec-<epoch-millis> or numeric timestamp
+	if (manifestId.startsWith("rec-")) {
+		const raw = manifestId.slice(4);
+		const numeric = Number(raw);
+		if (Number.isSafeInteger(numeric) && numeric > 0) {
+			const date = new Date(numeric);
+			if (!Number.isNaN(date.getTime())) return date.toISOString();
+		}
+	}
+
+	return null;
 }
 
 function manifestIdFromRecoveryManifestKey(vaultId: string, key: string): string | null {
@@ -950,11 +1026,10 @@ async function readRecoveryManifestRaw(
 	manifestId: string,
 	bucket: R2Bucket,
 ): Promise<{ exists: boolean; manifest: RecoveryManifest | null; error?: string }> {
-	if (!/^([0-9a-z]+)-([0-9a-f]{8,})$/.test(manifestId)) {
+	const createdAt = createdAtFromRecoveryManifestId(manifestId);
+	if (!createdAt) {
 		return { exists: false, manifest: null, error: "invalid manifest id" };
 	}
-	const createdAt = createdAtFromRecoveryManifestId(manifestId);
-	if (!createdAt) return { exists: false, manifest: null, error: "invalid manifest timestamp" };
 	const day = createdAt.slice(0, 10);
 	try {
 		const object = await bucket.get(recoveryManifestKey(vaultId, day, manifestId));
@@ -1934,10 +2009,9 @@ export async function getRecoveryManifest(
 	manifestId: string,
 	bucket: R2Bucket,
 ): Promise<RecoveryManifest | null> {
-	if (!/^([0-9a-z]+)-([0-9a-f]{8,})$/.test(manifestId)) return null;
-	const ts = Number.parseInt(manifestId.split("-")[0] ?? "", 36);
-	if (!Number.isSafeInteger(ts) || ts <= 0) return null;
-	const day = new Date(ts).toISOString().slice(0, 10);
+	const createdAt = createdAtFromRecoveryManifestId(manifestId);
+	if (!createdAt) return null;
+	const day = createdAt.slice(0, 10);
 	const object = await bucket.get(recoveryManifestKey(vaultId, day, manifestId));
 	if (!object) return null;
 	return await decodeRecoveryManifestObject(object);

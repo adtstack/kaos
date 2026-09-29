@@ -176,12 +176,41 @@ assert.equal((await call("/__kaos/devices/role", {
 ownerSession = await sessionFor({ deviceId: OWNER_ID, privateKey: owner.privateKey });
 memberSession = await sessionFor({ deviceId: MEMBER_ID, privateKey: member.privateKey });
 
-// 11. Final owner cannot be demoted
+// 11. Device rename: Member renames itself, Owner renames Member, Member cannot rename Owner
+const renameSelf = await call("/__kaos/devices/rename", {
+	vaultId: VAULT_ID, session: memberSession, targetDeviceId: MEMBER_ID, deviceName: "Member Renamed Self",
+});
+assert.equal(renameSelf.status, 200, "Member can rename itself");
+assert.equal(renameSelf.body.deviceName, "Member Renamed Self");
+
+const listAfterSelfRename = await call("/__kaos/devices/list", { vaultId: VAULT_ID, session: ownerSession });
+assert.equal(listAfterSelfRename.status, 200);
+const renamedMember = (listAfterSelfRename.body.devices as Array<{ id: string; name: string }>).find((d) => d.id === MEMBER_ID);
+assert.equal(renamedMember?.name, "Member Renamed Self");
+
+const memberRenameOwner = await call("/__kaos/devices/rename", {
+	vaultId: VAULT_ID, session: memberSession, targetDeviceId: OWNER_ID, deviceName: "Hacked Owner Name",
+});
+assert.equal(memberRenameOwner.status, 403, "Member cannot rename Owner");
+
+const ownerRenameMember = await call("/__kaos/devices/rename", {
+	vaultId: VAULT_ID, session: ownerSession, targetDeviceId: MEMBER_ID, deviceName: "Renamed By Owner",
+});
+assert.equal(ownerRenameMember.status, 200, "Owner can rename Member");
+
+const badRename = await call("/__kaos/devices/rename", {
+	vaultId: VAULT_ID, session: ownerSession, targetDeviceId: MEMBER_ID, deviceName: "   ",
+});
+assert.equal(badRename.status, 400, "Whitespace device name rejected");
+
+assert.equal((await call("/__kaos/auth/validate-session", { vaultId: VAULT_ID, session: memberSession })).status, 200, "session remains valid after rename");
+
+// 12. Final owner cannot be demoted
 assert.equal((await call("/__kaos/devices/role", {
 	vaultId: VAULT_ID, session: ownerSession, targetDeviceId: OWNER_ID, role: "member",
 })).status, 409, "final Owner cannot be demoted");
 
-// 12. Revocation
+// 13. Revocation
 const staleTicket = await call("/__kaos/auth/ticket", { vaultId: VAULT_ID, session: memberSession });
 assert.equal((await call("/__kaos/devices/revoke", {
 	vaultId: VAULT_ID, session: ownerSession, targetDeviceId: MEMBER_ID,

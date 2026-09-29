@@ -234,7 +234,7 @@ console.log("\n--- Startup pending sync is consumed by authoritative reconciliat
 			excludePatterns: [],
 		}) as any,
 		getVaultSync: () => sync,
-		getDiskMirror: () => ({}) as any,
+		getDiskMirror: () => ({ hasPendingWrite: () => false, getLastDiskWriteOkHash: () => null }) as any,
 		getBlobSync: () => null,
 		getEditorBindings: () => null,
 		getDiskIndex: () => diskIndex,

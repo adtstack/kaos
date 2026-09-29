@@ -34,6 +34,8 @@ const manifest = {
 	manifestHash: "manifest",
 };
 
+let createCalls = 0;
+
 const server = createServer(async (req, res) => {
 	const url = new URL(req.url ?? "/", "http://localhost");
 	if (url.pathname === "/api/auth/challenge" && req.method === "POST") {
@@ -82,6 +84,27 @@ const server = createServer(async (req, res) => {
 		res.end(gzipSync(after));
 		return;
 	}
+	if (url.pathname === "/vault/vault-history/recovery-snapshots/maybe" && req.method === "POST") {
+		const chunks = [];
+		for await (const chunk of req) chunks.push(chunk);
+		const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+		createCalls++;
+		if (createCalls === 1) {
+			res.writeHead(200, { "Content-Type": "application/json" });
+			res.end(JSON.stringify({
+				status: "pending",
+				pending: { uploadedContentCount: 50, totalContentCount: 100, remainingContentCount: 50 },
+			}));
+			return;
+		}
+		res.writeHead(200, { "Content-Type": "application/json" });
+		res.end(JSON.stringify({
+			status: "created",
+			manifestId: "rec-01KTESTM4N1F3ST000000000",
+			index: { changedCount: 2 },
+		}));
+		return;
+	}
 	res.writeHead(404, { "Content-Type": "application/json" });
 	res.end(JSON.stringify({ error: "not found" }));
 });
@@ -126,7 +149,13 @@ try {
 	assert.match(diff.stdout, /--- before:notes\/plan\.md/);
 	assert.match(diff.stdout, /\+after line/);
 	assert.match(diff.stdout, /-before line/);
-	console.log("  PASS  CLI reads paged history, event details, and verified content diffs");
+
+	const created = await run(["history", "create", "--force", ...baseArgs]);
+	assert.equal(created.status, 0, created.stderr || created.stdout);
+	assert.match(created.stdout, /File history point created: rec-01KTESTM4N1F3ST000000000 \(2 changed file\(s\)\)/);
+	assert.equal(createCalls, 2, "history create loops until pending upload is completed");
+
+	console.log("  PASS  CLI reads paged history, event details, verified content diffs, and creates history points");
 
 	const legacyFlag = await run(["history", "list", "--token", "old-shared-token", ...baseArgs]);
 	assert.notEqual(legacyFlag.status, 0, "history CLI rejects a shared-token flag");

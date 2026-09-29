@@ -213,3 +213,136 @@ console.log("\n--- Test 3: user edited while KAOS inactive (mtime evidence) → 
 	);
 	assertPolicy(decision, "disk-mtime-after-last-index-save", "disk-wins policy field present");
 }
+
+console.log("\n--- Test 4: per-file settledAtMs evidence outranks the global save timestamp ---");
+{
+	// Regression: an unrelated file's disk-index save AFTER this file's
+	// offline edit used to mask the edit (global timestamp newer than
+	// diskMtime) and CRDT won, reverting the user's offline edits. The
+	// per-file settlement timestamp proves this file was edited after KAOS
+	// last settled it, regardless of other files' saves.
+	const maskedEdit = decideClosedFileConflict({
+		baselineHash: null,
+		diskHash: "B",
+		crdtHash: "C",
+		diskMtime: 1500,
+		lastDiskIndexPersistedAt: 2000, // unrelated save masked the edit
+		lastFileSettledAtMs: 1000,      // THIS file settled before the edit
+	});
+	assert.deepEqual(
+		stripPolicy(maskedEdit),
+		{ ...diskWinsPreserveCrdt },
+		"per-file evidence recovers the masked offline edit → disk wins",
+	);
+	assertPolicy(maskedEdit, "disk-mtime-after-last-file-settlement", "per-file policy recorded");
+
+	// Per-file evidence also correctly rejects a stale disk: the file was
+	// settled AFTER its mtime, so the disk copy is not newer.
+	const perFileStale = decideClosedFileConflict({
+		baselineHash: null,
+		diskHash: "B",
+		crdtHash: "C",
+		diskMtime: 1000,
+		lastDiskIndexPersistedAt: 2000,
+		lastFileSettledAtMs: 1500,
+	});
+	assert.deepEqual(
+		stripPolicy(perFileStale),
+		{ ...crdtWinsPreserveDisk },
+		"per-file evidence: disk older than its own settlement → CRDT wins",
+	);
+	assertPolicy(perFileStale, "crdt-default-disk-not-newer", "per-file not-newer policy recorded");
+
+	// Per-file evidence alone (no global timestamp) is sufficient.
+	const perFileOnly = decideClosedFileConflict({
+		baselineHash: null,
+		diskHash: "B",
+		crdtHash: "C",
+		diskMtime: 3000,
+		lastFileSettledAtMs: 1000,
+	});
+	assert.deepEqual(
+		stripPolicy(perFileOnly),
+		{ ...diskWinsPreserveCrdt },
+		"per-file evidence works without the global timestamp",
+	);
+	assertPolicy(perFileOnly, "disk-mtime-after-last-file-settlement", "per-file-only policy recorded");
+
+	// Without diskMtime the per-file timestamp alone is not evidence.
+	const noMtime = decideClosedFileConflict({
+		baselineHash: null,
+		diskHash: "B",
+		crdtHash: "C",
+		lastFileSettledAtMs: 1000,
+	});
+	assert.deepEqual(
+		stripPolicy(noMtime),
+		{ ...crdtWinsPreserveDisk },
+		"lastFileSettledAtMs without diskMtime → no evidence → CRDT wins",
+	);
+	assertPolicy(noMtime, "crdt-default-no-evidence", "no-mtime policy recorded");
+}
+
+
+// ---------------------------------------------------------------------------
+// Self-mirror evidence: disk bytes provably written by our own DiskMirror
+// must never win a tie-break (multi-device live-typing rollback guard).
+// ---------------------------------------------------------------------------
+
+console.log("\n--- Test: diskChangeIsSelfMirror overrides tie-breaks ---");
+
+// both-changed with self-mirror disk → CRDT wins via apply-remote-to-disk,
+// not the legacy unconditional disk-wins preserve-conflict.
+assert.deepEqual(
+	decideClosedFileConflict({
+		baselineHash: "A",
+		diskHash: "B",
+		crdtHash: "C",
+		diskChangeIsSelfMirror: true,
+	}),
+	{ kind: "apply-remote-to-disk", reason: "self-mirror-lag" },
+	"self-mirror both-changed → apply-remote-to-disk (mirror catches up)",
+);
+
+// missing-baseline with fresh self-written mtime → still CRDT wins: the mtime
+// is an echo of our own write, not evidence of an offline external edit.
+assert.deepEqual(
+	decideClosedFileConflict({
+		baselineHash: null,
+		diskHash: "B",
+		crdtHash: "C",
+		diskChangeIsSelfMirror: true,
+		diskMtime: 9000,
+		lastFileSettledAtMs: 1000,
+		lastDiskIndexPersistedAt: 1000,
+	}),
+	{ kind: "apply-remote-to-disk", reason: "self-mirror-lag" },
+	"self-mirror missing-baseline ignores self-written mtime evidence",
+);
+
+// self-mirror flag with identical hashes → still no-op.
+assert.deepEqual(
+	decideClosedFileConflict({
+		baselineHash: "A",
+		diskHash: "B",
+		crdtHash: "B",
+		diskChangeIsSelfMirror: true,
+	}),
+	{ kind: "no-op" },
+	"self-mirror with disk=crdt remains no-op",
+);
+
+// Without the flag, legacy behavior is byte-for-byte unchanged.
+assert.deepEqual(
+	stripPolicy(decideClosedFileConflict({
+		baselineHash: null,
+		diskHash: "B",
+		crdtHash: "C",
+		diskMtime: 3000,
+		lastFileSettledAtMs: 1000,
+	})),
+	{ ...diskWinsPreserveCrdt },
+	"missing-baseline mtime disk-wins preserved without self-mirror flag",
+);
+
+console.log("closed-file-conflict tests complete");

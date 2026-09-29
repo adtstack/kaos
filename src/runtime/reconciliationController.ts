@@ -14,6 +14,7 @@ import {
 	contentBaselineHash,
 	contentFingerprint,
 	filterChangedFiles,
+	hasChanged,
 	updateIndex,
 } from "../sync/diskIndex";
 import type { ReconcileMode, VaultSync } from "../sync/vaultSync";
@@ -42,7 +43,7 @@ import {
 	type DiffPostconditionResult,
 	type ExactDiffResult,
 } from "../sync/diff";
-import { yTextToString } from "../utils/format";
+import { formatUnknown, yTextToString } from "../utils/format";
 import { mergeTexts3 } from "../utils/threeWayMerge";
 import {
 	ORIGIN_DISK_SYNC,
@@ -58,6 +59,8 @@ import {
 import { planOpenExternalEdit } from "./reconcile/openExternalEditPlanner";
 import { planBaselineAdvancement, type BaselineActionKind } from "./reconcile/baselineAdvancementPolicy";
 import { evaluateSafetyBrake } from "./reconcile/safetyBrakePolicy";
+import { shouldSkipDiskRead } from "./reconcile/readSkipPolicy";
+import { mapWithConcurrency } from "../utils/concurrency";
 import {
 	computeRecoveryFingerprint,
 	evaluateFingerprintQuarantine,
@@ -98,6 +101,12 @@ export interface ReconciliationStats {
 	flushedUpdates: number;
 	safetyBrakeTriggered: boolean;
 	safetyBrakeReason: string | null;
+	/** Wall-clock duration of this reconcile pass (mobile cold-start signal). */
+	durationMs: number;
+	/** Files actually read from disk this pass (read-skip keeps this near zero). */
+	filesRead: number;
+	/** Files proven equal and skipped without reading (authoritative read-skip). */
+	filesSkippedByIndex: number;
 }
 
 export interface ReconciliationState {
@@ -427,6 +436,12 @@ interface ReconciliationControllerDeps {
 	getAwaitingFirstProviderSyncAfterStartup(): boolean;
 	setAwaitingFirstProviderSyncAfterStartup(value: boolean): void;
 	saveDiskIndex(): Promise<void>;
+	/**
+	 * Debounced saveDiskIndex for high-frequency settlement paths. Production
+	 * supplies the plugin's 500ms debounced save; when absent, callers fall
+	 * back to awaiting saveDiskIndex() directly.
+	 */
+	scheduleDiskIndexSave?(reason: string): void;
 	refreshStatusBar(): void;
 	/**
 	 * Returns the Unix ms timestamp of the last successful saveDiskIndex() call.
@@ -469,6 +484,8 @@ const RECONCILE_COOLDOWN_MS = 10_000;
 const MARKDOWN_DIRTY_SETTLE_MS = 350;
 const MARKDOWN_STABLE_READ_MAX_RETRIES = 3;
 const OPEN_FILE_EXTERNAL_EDIT_IDLE_GRACE_MS = 1200;
+/** Hashing concurrency for the authoritative read-skip check (see readSkipPolicy.ts). */
+const AUTHORITATIVE_READ_HASH_CONCURRENCY = 8;
 /**
  * Idle window for the bound-file-local-only-divergence branch.
  *
@@ -614,6 +631,8 @@ export class ReconciliationController {
 	private lastReconcileTime = 0;
 	private reconcileCooldownTimer: ReturnType<typeof setTimeout> | null = null;
 	private lastReconcileStats: ReconciliationStats | null = null;
+	/** Session flag so the unhydrated-local downgrade warns the user once. */
+	private unhydratedDowngradeNoticeShown = false;
 	private dirtyMarkdownPaths = new Map<string, MarkdownDirtyEntry>();
 	private activeMarkdownIngests = new Map<string, ActiveMarkdownIngest>();
 	/**
@@ -1205,8 +1224,13 @@ export class ReconciliationController {
 			// it updateIndex intentionally drops the old baseline and a later provider
 			// transaction can recreate oldPath while the independently moved newPath
 			// still holds the user's bytes.
-			for (const affectedPath of [...change.oldPaths, ...change.newPaths]) {
-				diskMirror?.recordPreservedUnresolved?.(affectedPath, "path-collision");
+			const primaryOld = change.oldPaths[0];
+			const primaryNew = change.newPaths[0];
+			for (const oldPath of change.oldPaths) {
+				diskMirror?.recordPreservedUnresolved?.(oldPath, "path-collision", primaryNew);
+			}
+			for (const newPath of change.newPaths) {
+				diskMirror?.recordPreservedUnresolved?.(newPath, "path-collision", primaryOld);
 			}
 			const path = change.newPaths[0] ?? change.oldPaths[0] ?? "(unknown)";
 			this.deps.recordFlightPathEvent?.({
@@ -1251,10 +1275,60 @@ export class ReconciliationController {
 		};
 	}
 
-	async runReconciliation(mode: ReconcileMode): Promise<void> {
+	async runReconciliation(
+		mode: ReconcileMode,
+		options?: { forceUnhydrated?: boolean },
+	): Promise<void> {
 		const vaultSync = this.deps.getVaultSync();
 		const diskMirror = this.deps.getDiskMirror();
 		if (!vaultSync || !diskMirror) return;
+		if (
+			mode === "authoritative"
+			&& (vaultSync.localReady === false || vaultSync.idbError === true)
+		) {
+			if (options?.forceUnhydrated) {
+				// Escape hatch for a device whose local cache never hydrates:
+				// the user explicitly accepts projecting a possibly-stale
+				// server-only CRDT over disk. Every downgrade that led here is
+				// observable, so the forced pass is attributable.
+				this.deps.recordFlightEvent?.({
+					priority: "critical",
+					kind: PRODUCT_EVENT_KIND.reconcileForcedUnhydrated,
+					severity: "warn",
+					scope: "vault",
+					source: "reconciliationController",
+					layer: "reconcile",
+					data: {},
+				});
+				this.deps.trace("reconcile", "reconcile-forced-unhydrated", {
+					providerSynced: vaultSync.providerSynced,
+					idbError: vaultSync.idbError,
+				});
+			} else {
+				mode = "conservative";
+				this.deps.recordFlightEvent?.({
+					priority: "critical",
+					kind: PRODUCT_EVENT_KIND.reconcileModeDowngraded,
+					severity: "warn",
+					scope: "vault",
+					source: "reconciliationController",
+					layer: "reconcile",
+					data: { reason: "reconcile-mode-downgraded-unhydrated-local" },
+				});
+				this.deps.trace("reconcile", "reconcile-mode-downgraded-unhydrated-local", {
+					requestedMode: "authoritative",
+					providerSynced: vaultSync.providerSynced,
+					idbError: vaultSync.idbError,
+				});
+				if (!this.unhydratedDowngradeNoticeShown) {
+					this.unhydratedDowngradeNoticeShown = true;
+					new Notice(
+						"KAOS: local cache is still loading — remote changes will apply once it finishes.",
+						8000,
+					);
+				}
+			}
+		}
 		if (this.reconcileInFlight) {
 			this.reconcilePending = true;
 			this.deps.log("Reconciliation already in flight — queued");
@@ -1356,9 +1430,45 @@ export class ReconciliationController {
 				allStats.delete(path);
 			};
 			if (mode === "authoritative") {
-				changed = eligibleFiles;
 				allStats = await collectFileStats(this.deps.app, eligibleFiles);
-				skippedByIndex = 0;
+				// Read-skip: read only files whose disk==CRDT equality cannot
+				// already be proven. See readSkipPolicy.ts for the safety
+				// argument — a file is skipped when its stat matches the index,
+				// the index carries a clean-settlement baseline hash, and the
+				// live CRDT text still hashes to that baseline (proving
+				// disk == baseline == CRDT, so no authority decision can depend
+				// on the unread bytes). Anything failing a condition is read
+				// (conservative fallback), which keeps first runs and diverged
+				// files exactly on the old full-read path.
+				const indexForSkip = this.deps.getDiskIndex();
+				const skipDecisions = await mapWithConcurrency(
+					eligibleFiles,
+					AUTHORITATIVE_READ_HASH_CONCURRENCY,
+					async (file) => {
+						const stat = allStats.get(file.path);
+						const entry = stat ? indexForSkip[file.path] : undefined;
+						if (!stat || !entry?.contentHash || hasChanged(entry, stat)) {
+							return { file, skip: false };
+						}
+						const ytext = vaultSync.getTextForPath(file.path);
+						const crdtContent = ytext ? yTextToString(ytext) : null;
+						if (crdtContent === null) {
+							return { file, skip: false };
+						}
+						const crdtHash = await contentBaselineHash(crdtContent);
+						return {
+							file,
+							skip: shouldSkipDiskRead({
+								statMatchesIndex: true,
+								baselineHash: entry.contentHash ?? null,
+								crdtHash,
+							}),
+						};
+					},
+				);
+				changed = skipDecisions.filter((decision) => !decision.skip).map((decision) => decision.file);
+				unchanged = skipDecisions.filter((decision) => decision.skip).map((decision) => decision.file);
+				skippedByIndex = unchanged.length;
 			} else {
 				const indexResult = await filterChangedFiles(
 					this.deps.app,
@@ -1749,18 +1859,146 @@ export class ReconciliationController {
 					},
 				});
 			}
-			if (!safetyBrakeTriggered) {
-				// Content hashes for files settled cleanly this reconcile.
-				// Stored in the disk index as the three-way baseline for the
-				// next startup reconcile (after plugin disable/re-enable).
-				const settledHashes = new Map<string, string>();
-				const settledBaselineTexts = new Map<string, string>();
-				const recordSettledBaseline = (path: string, hash: string, text: string) => {
-					settledHashes.set(path, hash);
-					settledBaselineTexts.set(hash, text);
-					this.clearDeferredVisibleAuthorityIfSettled(path, text);
-				};
+			// Declared above the safety-brake guard: additive creates settle
+			// baselines even while the brake blocks destructive overwrites.
+			const settledHashes = new Map<string, string>();
+			const settledBaselineTexts = new Map<string, string>();
+			const recordSettledBaseline = (path: string, hash: string, text: string) => {
+				settledHashes.set(path, hash);
+				settledBaselineTexts.set(hash, text);
+				this.clearDeferredVisibleAuthorityIfSettled(path, text);
+			};
+			const projectionBlockedMissingDiskIndexPaths = new Set<string>();
 
+			// Additive creates run OUTSIDE the safety-brake guard. A create writes a
+			// CRDT file that is missing on disk, so no local data can be lost and the
+			// brake's protective semantics (block destructive overwrites) do not
+			// apply. This matches the brake Notice ("Additive creates will
+			// continue"); before this split, a triggered brake also froze every
+			// pending download, permanently stalling devices whose local divergence
+			// passed the brake thresholds.
+			for (const path of result.createdOnDisk) {
+				// VaultSync filters these already, but keep the controller boundary
+				// closed as well: stale CRDT entries for excluded paths must never
+				// reach DiskMirror, even if a future reconcile implementation changes.
+				if (!this.deps.isMarkdownPathSyncable(path)) {
+					continue;
+				}
+				if (!(this.deps.isRemoteProjectionAllowed?.(path) ?? true)) {
+					projectionBlockedMissingDiskIndexPaths.add(path);
+					continue;
+				}
+				const remoteProjectionAdmission =
+					this.captureRemoteProjectionAdmission(diskMirror, [path]);
+				if (!remoteProjectionAdmission) {
+					projectionBlockedMissingDiskIndexPaths.add(path);
+					continue;
+				}
+				this.deps.recordFlightPathEvent?.({
+					priority: "important",
+					kind: PRODUCT_EVENT_KIND.reconcileFileDecision,
+					severity: "info",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "reconcile",
+					path,
+					data: {
+						decision: "write-crdt-to-disk",
+						reason: "crdt-file-missing-on-disk",
+						conflictRisk: "none",
+					},
+				});
+				const writeResult = await diskMirror.flushWrite(path, false, {
+					requireRemoteProjectionAdmission: true,
+					remoteProjectionAdmission,
+				});
+				if (!this.isDiskWriteSettled(writeResult)) {
+					projectionBlockedMissingDiskIndexPaths.add(path);
+					this.traceDiskWriteNotSettled(path, writeResult, "crdt-file-missing-on-disk");
+					this.requestFollowupForUnsettledDiskWrite(
+						path,
+						writeResult,
+						"crdt-file-missing-on-disk",
+					);
+					continue;
+				}
+				if (writeResult.kind === "written") {
+					flushedCreates++;
+				}
+				// DiskMirror returns the exact snapshot that reached disk. Y.Text may
+				// already have advanced again while its result/hash was being prepared.
+				recordSettledBaseline(path, writeResult.contentHash, writeResult.content);
+			}
+
+			// Additive CRDT seeds: local files not yet in CRDT are recorded into the baseline.
+			for (const path of result.seededToCrdt) {
+				// Spec R2 / Option (b): the `reconcile.file.decision`
+				// emission for seeded paths is now produced by the
+				// admission-opId factory passed into `reconcileVault`
+				// above (BEFORE the `ensureFile` call) so the decision
+				// envelope shares an `opId` with the resulting
+				// `crdt.file.created`. This loop handles only the
+				// settled-baseline bookkeeping.
+				// Record settled baseline hash: disk content was the authority
+				const diskContent = diskFiles.get(path);
+				if (diskContent !== undefined) {
+					const diskHash = await contentBaselineHash(diskContent);
+					const baselineAction = planBaselineAdvancement({
+						actionKind: "disk-seeded-to-crdt",
+						diskHash,
+						crdtHash: null,
+						previousBaselineHash: null,
+					});
+					if (baselineAction.kind === "advance") {
+						recordSettledBaseline(path, baselineAction.hash, diskContent);
+					}
+				}
+			}
+
+			// Preserve verified baselines the disk-write callback recorded during
+			// this reconcile (create/update settlements publish through it). Those
+			// paths can be absent from allStats (missing on disk at scan time), so
+			// updateIndex alone would drop their entries from the rebuilt index.
+			const preserveVerifiedBaselines = (
+				nextDiskIndex: DiskIndex,
+				indexBeforeCommit: DiskIndex,
+			): string[] => {
+				const newerVerifiedBaselinePaths: string[] = [];
+				for (const [path, currentEntry] of Object.entries(indexBeforeCommit)) {
+					const currentHash = currentEntry.contentHash;
+					if (!currentHash) continue;
+					const plannedHash = settledHashes.get(path);
+					const expectedRevision = baselineRevisionsAtStart.get(path) ?? 0;
+					const currentRevision = this.diskBaselineRevisions.get(path) ?? 0;
+					const baselineAdvancedPastScan = currentRevision !== expectedRevision;
+					const newlyCreatedSettledPath =
+						plannedHash === currentHash && !allStats.has(path);
+					if (!baselineAdvancedPastScan && !newlyCreatedSettledPath) continue;
+					// DiskMirror publishes only atomic/verified write settlements. Never
+					// let an older reconcile-local C1 overwrite a callback's newer C2, and
+					// keep newly created paths that were absent from the initial stat scan.
+					nextDiskIndex[path] = { ...currentEntry };
+					newerVerifiedBaselinePaths.push(path);
+				}
+				return newerVerifiedBaselinePaths;
+			};
+			const preserveProjectionBlockedBaselines = (
+				nextDiskIndex: DiskIndex,
+				indexBeforeCommit: DiskIndex,
+			): void => {
+				for (const path of projectionBlockedMissingDiskIndexPaths) {
+					const previousEntry = indexBeforeCommit[path];
+					if (previousEntry) {
+						// Missing disk plus an older clean baseline represents a possible
+						// local deletion. Holding provider projection must not erase that
+						// evidence, or a later open gate could treat the path as a fresh
+						// remote create and resurrect it.
+						nextDiskIndex[path] = { ...previousEntry };
+					}
+				}
+			};
+
+			if (!safetyBrakeTriggered) {
 				// Track paths that need CRDT→disk flush, along with the semantic reason.
 				// This preserves the action kind so planBaselineAdvancement gets the
 				// correct input, not a flattened "defer-to-crdt-flush" for everything.
@@ -1772,87 +2010,11 @@ export class ReconciliationController {
 				}> = [];
 				const deferredOpenEditorIndexPaths = new Set<string>();
 				const staleClosedDecisionIndexPaths = new Set<string>();
-				const projectionBlockedMissingDiskIndexPaths = new Set<string>();
 				const actionPaths = new Set<string>([
 					...result.createdOnDisk,
 					...result.seededToCrdt,
 					...result.updatedOnDisk,
 				]);
-				for (const path of result.createdOnDisk) {
-					// VaultSync filters these already, but keep the controller boundary
-					// closed as well: stale CRDT entries for excluded paths must never
-					// reach DiskMirror, even if a future reconcile implementation changes.
-					if (!this.deps.isMarkdownPathSyncable(path)) {
-						continue;
-					}
-					if (!(this.deps.isRemoteProjectionAllowed?.(path) ?? true)) {
-						projectionBlockedMissingDiskIndexPaths.add(path);
-						continue;
-					}
-					const remoteProjectionAdmission =
-						this.captureRemoteProjectionAdmission(diskMirror, [path]);
-					if (!remoteProjectionAdmission) {
-						projectionBlockedMissingDiskIndexPaths.add(path);
-						continue;
-					}
-					this.deps.recordFlightPathEvent?.({
-						priority: "important",
-						kind: PRODUCT_EVENT_KIND.reconcileFileDecision,
-						severity: "info",
-						scope: "file",
-						source: "reconciliationController",
-						layer: "reconcile",
-						path,
-						data: {
-							decision: "write-crdt-to-disk",
-							reason: "crdt-file-missing-on-disk",
-							conflictRisk: "none",
-						},
-					});
-					const writeResult = await diskMirror.flushWrite(path, false, {
-						requireRemoteProjectionAdmission: true,
-						remoteProjectionAdmission,
-					});
-					if (!this.isDiskWriteSettled(writeResult)) {
-						projectionBlockedMissingDiskIndexPaths.add(path);
-						this.traceDiskWriteNotSettled(path, writeResult, "crdt-file-missing-on-disk");
-						this.requestFollowupForUnsettledDiskWrite(
-							path,
-							writeResult,
-							"crdt-file-missing-on-disk",
-						);
-						continue;
-					}
-					if (writeResult.kind === "written") {
-						flushedCreates++;
-					}
-					// DiskMirror returns the exact snapshot that reached disk. Y.Text may
-					// already have advanced again while its result/hash was being prepared.
-					recordSettledBaseline(path, writeResult.contentHash, writeResult.content);
-				}
-				for (const path of result.seededToCrdt) {
-					// Spec R2 / Option (b): the `reconcile.file.decision`
-					// emission for seeded paths is now produced by the
-					// admission-opId factory passed into `reconcileVault`
-					// above (BEFORE the `ensureFile` call) so the decision
-					// envelope shares an `opId` with the resulting
-					// `crdt.file.created`. This loop handles only the
-					// settled-baseline bookkeeping.
-					// Record settled baseline hash: disk content was the authority
-					const diskContent = diskFiles.get(path);
-					if (diskContent !== undefined) {
-						const diskHash = await contentBaselineHash(diskContent);
-						const baselineAction = planBaselineAdvancement({
-							actionKind: "disk-seeded-to-crdt",
-							diskHash,
-							crdtHash: null,
-							previousBaselineHash: null,
-						});
-						if (baselineAction.kind === "advance") {
-							recordSettledBaseline(path, baselineAction.hash, diskContent);
-						}
-					}
-				}
 				for (const [path, diskContent] of diskFiles) {
 					if (this.isMarkdownPreservedUnresolved(path)) {
 						if (await this.tryHealFencedConflictWinnerFlush(path, diskContent)) {
@@ -2218,6 +2380,31 @@ export class ReconciliationController {
 								? rawLastSave
 								: undefined;
 
+						// Mirror-race guard: while the CRDT→disk mirror still owes
+						// this path a write, the disk copy is a lagging projection
+						// of the CRDT. Any three-way decision made now races our
+						// own write and can import stale bytes over fresher remote
+						// content (the multi-device live-typing rollback). Defer
+						// until the mirror settles; the followup pass re-evaluates
+						// with stable bytes.
+						if (diskMirror.hasPendingWrite(path)) {
+							staleClosedDecisionIndexPaths.add(path);
+							this.requestReconciliationFollowup(
+								path,
+								"closed-file-mirror-write-pending",
+							);
+							this.deps.trace("reconcile", "closed-file-deferred-mirror-write-pending", {
+								path,
+								diskLength: diskContent.length,
+								crdtLength: crdtContent.length,
+							});
+							continue;
+						}
+						// Strict self-mirror evidence: the disk bytes hash-equal
+						// our last successful write, so they carry no independent
+						// edit intent and must not win a tie-break.
+						const diskChangeIsSelfMirror =
+							diskMirror.getLastDiskWriteOkHash(path) === diskHash;
 						// Use pure planner for the decision.
 						let action = planClosedFileReconcile({
 							path,
@@ -2226,8 +2413,10 @@ export class ReconciliationController {
 							diskHash,
 							crdtHash,
 							baselineHash,
+							diskChangeIsSelfMirror,
 							diskMtime: diskMtimeRaw,
 							lastDiskIndexPersistedAt,
+							lastFileSettledAtMs: this.deps.getDiskIndex()[path]?.settledAtMs,
 							hasPendingLocalCreate: this.hasPendingLocalCreate(path),
 							pathBindingStatus: bindingIntegrity.status,
 							pathBindingReason: bindingIntegrity.reason,
@@ -2308,7 +2497,11 @@ export class ReconciliationController {
 									missingBaselinePolicy: action.missingBaselinePolicy ?? null,
 									diskMtime: diskMtimeRaw ?? null,
 									lastDiskIndexPersistedAt: lastDiskIndexPersistedAt ?? null,
-									mtimeEvidence: diskMtimeRaw !== undefined && lastDiskIndexPersistedAt !== undefined,
+									lastFileSettledAtMs: this.deps.getDiskIndex()[path]?.settledAtMs ?? null,
+									mtimeEvidence: diskMtimeRaw !== undefined && (
+										this.deps.getDiskIndex()[path]?.settledAtMs !== undefined
+										|| lastDiskIndexPersistedAt !== undefined
+									),
 								}),
 							},
 						});
@@ -2529,6 +2722,24 @@ export class ReconciliationController {
 						// action.kind === "apply-remote-to-disk", "no-op", or "defer-to-crdt-flush":
 						// CRDT wins or nothing to do. Fall through to flush.
 						// Preserve the semantic action kind for baseline advancement.
+						if (action.kind === "apply-remote-to-disk") {
+							// The decision trusts "CRDT differs from baseline" as
+							// newer; a degenerate CRDT (unhydrated replica, lost
+							// tail operations) is also "different but older".
+							// Durably audit the overwritten disk text only when
+							// it cannot be reproduced from the baseline-text
+							// store, so the projection stays attributable.
+							const baselineTextKnown = baselineHash !== null
+								&& (await this.deps.getBaselineText?.(baselineHash)) != null;
+							if (!baselineTextKnown) {
+								await this.recordDiscardedRevision(
+									path,
+									diskContent,
+									"closed-file-crdt-authoritative-baseline-text-unknown",
+									diskHash,
+								);
+							}
+						}
 						const remoteProjectionAdmission =
 							this.captureRemoteProjectionAdmission(
 								diskMirror,
@@ -2621,45 +2832,29 @@ export class ReconciliationController {
 					excludePaths: blockedIndexPathsInner,
 					settledHashes,
 				});
-				for (const path of projectionBlockedMissingDiskIndexPaths) {
-					const previousEntry = indexBeforeCommit[path];
-					if (previousEntry) {
-						// Missing disk plus an older clean baseline represents a possible
-						// local deletion. Holding provider projection must not erase that
-						// evidence, or a later open gate could treat the path as a fresh
-						// remote create and resurrect it.
-						nextDiskIndex[path] = { ...previousEntry };
-					}
-				}
-				const newerVerifiedBaselinePaths: string[] = [];
-				for (const [path, currentEntry] of Object.entries(indexBeforeCommit)) {
-					const currentHash = currentEntry.contentHash;
-					if (!currentHash) continue;
-					const plannedHash = settledHashes.get(path);
-					const expectedRevision = baselineRevisionsAtStart.get(path) ?? 0;
-					const currentRevision = this.diskBaselineRevisions.get(path) ?? 0;
-					const baselineAdvancedPastScan = currentRevision !== expectedRevision;
-					const newlyCreatedSettledPath =
-						plannedHash === currentHash && !allStats.has(path);
-					if (!baselineAdvancedPastScan && !newlyCreatedSettledPath) continue;
-					// DiskMirror publishes only atomic/verified write settlements. Never
-					// let an older reconcile-local C1 overwrite a callback's newer C2, and
-					// keep newly created paths that were absent from the initial stat scan.
-					nextDiskIndex[path] = { ...currentEntry };
-					newerVerifiedBaselinePaths.push(path);
-				}
+				preserveProjectionBlockedBaselines(nextDiskIndex, indexBeforeCommit);
+				const newerVerifiedBaselinePaths =
+					preserveVerifiedBaselines(nextDiskIndex, indexBeforeCommit);
 				if (newerVerifiedBaselinePaths.length > 0) {
 					this.deps.trace("reconcile", "reconcile-newer-baseline-preserved", {
 						count: newerVerifiedBaselinePaths.length,
 						...tracePathList("preserved", newerVerifiedBaselinePaths),
 					});
 				}
+				for (const [path, hash] of settledHashes) {
+					if (!nextDiskIndex[path] && !blockedIndexPathsInner.includes(path)) {
+						const previous = indexBeforeCommit[path];
+						nextDiskIndex[path] = previous
+							? { ...previous, contentHash: hash }
+							: { mtime: 0, size: 0, contentHash: hash };
+					}
+				}
 				this.deps.setDiskIndex(nextDiskIndex);
 				for (const [hash, text] of settledBaselineTexts) {
 					this.deps.recordBaselineText?.(hash, text);
 				}
 			} else {
-				// Safety brake triggered: exclude all planned updates from index.
+				// Safety brake triggered: exclude all planned updates from index, but record additive creates.
 				const blockedIndexPaths = result.updatedOnDisk;
 				this.blockedDivergenceCount = blockedIndexPaths.length;
 				this.lastBlockedDivergenceAt = new Date().toISOString();
@@ -2668,9 +2863,38 @@ export class ReconciliationController {
 					const ext = dot >= 0 ? p.slice(dot) : "(none)";
 					return { ext, hash: contentFingerprint(`${this.diagnosticPathSalt}:${p}`) };
 				});
-				this.deps.setDiskIndex(updateIndex(this.deps.getDiskIndex(), allStats, {
-					excludePaths: blockedIndexPaths,
-				}));
+				const blockedIndexPathsInner = Array.from(new Set([
+					...blockedIndexPaths,
+					...projectionBlockedMissingDiskIndexPaths,
+					...this.getPreservedUnresolvedMarkdownEntries()
+						.map((entry) => entry.path),
+				]));
+				const indexBeforeCommit = this.deps.getDiskIndex();
+				const nextDiskIndex = updateIndex(indexBeforeCommit, allStats, {
+					excludePaths: blockedIndexPathsInner,
+					settledHashes,
+				});
+				preserveProjectionBlockedBaselines(nextDiskIndex, indexBeforeCommit);
+				const newerVerifiedBaselinePaths =
+					preserveVerifiedBaselines(nextDiskIndex, indexBeforeCommit);
+				if (newerVerifiedBaselinePaths.length > 0) {
+					this.deps.trace("reconcile", "reconcile-newer-baseline-preserved", {
+						count: newerVerifiedBaselinePaths.length,
+						...tracePathList("preserved", newerVerifiedBaselinePaths),
+					});
+				}
+				for (const [path, hash] of settledHashes) {
+					if (!nextDiskIndex[path] && !blockedIndexPathsInner.includes(path)) {
+						const previous = indexBeforeCommit[path];
+						nextDiskIndex[path] = previous
+							? { ...previous, contentHash: hash }
+							: { mtime: 0, size: 0, contentHash: hash };
+					}
+				}
+				this.deps.setDiskIndex(nextDiskIndex);
+				for (const [hash, text] of settledBaselineTexts) {
+					this.deps.recordBaselineText?.(hash, text);
+				}
 				this.deps.trace("reconcile", "reconcile-disk-index-advance-blocked", {
 					mode,
 					blockedCount: blockedIndexPaths.length,
@@ -2687,6 +2911,9 @@ export class ReconciliationController {
 				flushedUpdates,
 				safetyBrakeTriggered,
 				safetyBrakeReason,
+				durationMs: Date.now() - now,
+				filesRead: changed.length,
+				filesSkippedByIndex: skippedByIndex,
 			};
 			this.deps.trace("reconcile", "reconcile-authority-summary", {
 				mode,
@@ -6844,6 +7071,32 @@ export class ReconciliationController {
 		this.requestReconciliationFollowup(input.path, `open-editor-settle:${input.reason}`);
 	}
 
+	/**
+	 * Refresh open editor panes that were proven to be stale renders of the
+	 * settled baseline. The disk bytes are already authoritative, so no vault
+	 * event will reload these panes; writing the editor directly restores the
+	 * invariant (editor == disk == CRDT) that binding attachment requires.
+	 * Equivalent to the host reload the pane missed.
+	 */
+	private refreshStaleEditorPanes(
+		views: MarkdownView[],
+		content: string,
+		path: string,
+	): void {
+		for (const view of views) {
+			try {
+				if (view.editor.getValue() !== content) {
+					view.editor.setValue(content);
+				}
+			} catch (err) {
+				this.deps.trace("editor", "stale-editor-pane-refresh-failed", {
+					path,
+					error: formatUnknown(err),
+				});
+			}
+		}
+	}
+
 	private async handleOpenFileReconcileDivergence(
 		path: string,
 		diskContent: string,
@@ -6997,6 +7250,8 @@ export class ReconciliationController {
 		const baselineHash = baselineAuthority.hash;
 		const editorMatchesDisk = editorAuthority === diskContent;
 		const editorMatchesCrdt = editorAuthority === crdtContent;
+		const editorMatchesBaseline = baselineHash !== null
+			&& (await this.deps.getBaselineText?.(baselineHash)) === editorAuthority;
 		const preflightAction = planOpenBoundFileReconcile({
 			diskHash,
 			crdtHash,
@@ -7012,8 +7267,18 @@ export class ReconciliationController {
 			hasRecentEditorActivity:
 				lastEditorActivity !== null &&
 				(Date.now() - lastEditorActivity) < OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS,
+			editorMatchesBaseline,
+			lastFileSettledAtMs: this.deps.getDiskIndex()[path]?.settledAtMs,
 		});
 		if (preflightAction.kind === "apply-crdt-to-disk") {
+			// "disk at baseline, CRDT differs" assumes the CRDT side is newer,
+			// but a degenerate CRDT (unhydrated replica, lost tail operations,
+			// stale room) also differs from baseline while being OLDER. Record
+			// enough evidence to audit such a projection after the fact, and
+			// durably audit the overwritten disk text only when it cannot be
+			// reproduced from the baseline-text store.
+			const baselineTextKnown = baselineHash !== null
+				&& (await this.deps.getBaselineText?.(baselineHash)) != null;
 			this.deps.recordFlightPathEvent?.({
 				priority: "important",
 				kind: PRODUCT_EVENT_KIND.reconcileFileDecision,
@@ -7028,8 +7293,19 @@ export class ReconciliationController {
 					conflictRisk: "none",
 					editorMatchesDisk,
 					diskMatchesBaseline: baselineHash !== null && diskHash === baselineHash,
+					diskLength: diskContent.length,
+					crdtLength: crdtContent.length,
+					baselineTextKnown,
 				},
 			});
+			if (!baselineTextKnown) {
+				await this.recordDiscardedRevision(
+					path,
+					diskContent,
+					"open-file-crdt-authoritative-baseline-text-unknown",
+					diskHash,
+				);
+			}
 			this.deps.trace("reconcile", "open-file-editor-writeback-skipped-crdt-authoritative", {
 				path,
 				reason: preflightAction.reason,
@@ -7037,8 +7313,91 @@ export class ReconciliationController {
 				diskLength: diskContent.length,
 				crdtLength: crdtContent.length,
 				editorLength: editorAuthority.length,
+				baselineTextKnown,
 			});
 			return false;
+		}
+
+		if (
+			preflightAction.kind === "import-disk-to-crdt"
+			&& editorMatchesBaseline
+			&& editorAuthority !== diskContent
+		) {
+			// The visible editor is a provably stale render of the settled
+			// baseline (exact baseline text, no recent activity, distinct from
+			// both replicas). Letting it win below would roll disk and CRDT
+			// back to that older render. Import the disk side Y.Text-first and
+			// refresh the stale pane directly — the disk bytes are already
+			// authoritative, so no vault event will reload the pane on its own.
+			this.deps.recordFlightPathEvent?.({
+				priority: "critical",
+				kind: PRODUCT_EVENT_KIND.reconcileFileDecision,
+				severity: "warn",
+				scope: "file",
+				source: "reconciliationController",
+				layer: "reconcile",
+				path,
+				data: {
+					decision: "disk-wins-stale-editor-excluded",
+					reason: preflightAction.reason,
+					conflictRisk: "ambiguous",
+					editorLength: editorAuthority.length,
+					diskLength: diskContent.length,
+					crdtLength: crdtContent.length,
+				},
+			});
+			if (
+				preflightAction.preserveCrdt
+				&& crdtContent !== diskContent
+			) {
+				await this.recordDiscardedRevision(
+					path,
+					crdtContent,
+					"open-file-stale-editor-crdt-discarded",
+					crdtHash,
+				);
+			}
+			const staleEditorConvergence = await this.commitOpenEditorDiskMutation({
+				path,
+				file,
+				expectedDiskContent: diskContent,
+				expectedDiskStat: diskFileStat,
+				expectedBaselineHash: baselineAuthority.hash,
+				expectedBaselineRevision: baselineAuthority.revision,
+				expectedLifecycleGeneration: lifecycleGeneration,
+				ticket: mutationTicket,
+				expectedYText: ytext,
+				expectedCrdtContent: crdtContent,
+				expectedDiskRevision: diskMutationRevision,
+				expectedVisibleAuthorityMarker: visibleAuthorityMarker,
+				expectedInterceptedCandidate: interceptedCandidate,
+				expectedCandidateIdentityEpoch: candidateIdentityEpoch,
+				additionalAuthorityStaleReason: getStartupSupplementalStaleReason,
+				stage: "startup-open-stale-editor-disk-convergence",
+				commit: () => {
+					const result = applyDiffToYTextWithPostcondition(
+						ytext,
+						crdtContent,
+						diskContent,
+						ORIGIN_DISK_SYNC_RECOVER_BOUND,
+					);
+					return result.finalMatchesExpected;
+				},
+			});
+			if (staleEditorConvergence.kind === "stale") {
+				queueStartupReplan();
+				return true;
+			}
+			this.refreshStaleEditorPanes(openViews, diskContent, path);
+			this.deps.trace("conflict", "open-file-reconcile-stale-editor-excluded", {
+				path,
+				reason: preflightAction.reason,
+				editorLength: editorAuthority.length,
+				diskLength: diskContent.length,
+				crdtLength: crdtContent.length,
+				convergenceApplied: staleEditorConvergence.value,
+			});
+			return true;
 		}
 
 		this.deps.recordFlightPathEvent?.({
@@ -7852,14 +8211,26 @@ export class ReconciliationController {
 				rawLastSave <= now
 					? rawLastSave
 					: undefined;
+			const plannerEditorContent = distinctEditorContentsForPlanner.length === 1
+				? distinctEditorContentsForPlanner[0]!
+				: null;
+			const editorMatchesBaseline = baselineHash !== null
+				&& plannerEditorContent !== null
+				&& (await this.deps.getBaselineText?.(baselineHash)) === plannerEditorContent;
+			const openBoundMirror = this.deps.getDiskMirror();
+			const openBoundDiskChangeIsSelfMirror =
+				openBoundMirror?.getLastDiskWriteOkHash(file.path) === diskHash;
 			openBoundAction = planOpenBoundFileReconcile({
 				diskHash,
 				crdtHash,
 				baselineHash,
 				editorAuthority: plannerEditorAuthority,
 				hasRecentEditorActivity: hasRecentEditorActivityForPlanner,
+				diskChangeIsSelfMirror: openBoundDiskChangeIsSelfMirror,
 				diskMtime: stableStat?.mtime,
 				lastDiskIndexPersistedAt,
+				lastFileSettledAtMs: this.deps.getDiskIndex()[file.path]?.settledAtMs,
+				editorMatchesBaseline,
 			});
 			this.deps.trace("reconcile", "bound-file-open-planner-decision", {
 				path: file.path,
@@ -7870,6 +8241,7 @@ export class ReconciliationController {
 				baselineHash,
 				editorAuthority: plannerEditorAuthority,
 				hasRecentEditorActivity: hasRecentEditorActivityForPlanner,
+				editorMatchesBaseline,
 				diskMtime: stableStat?.mtime ?? null,
 				lastDiskIndexPersistedAt: lastDiskIndexPersistedAt ?? null,
 			});
@@ -8639,6 +9011,105 @@ export class ReconciliationController {
 			? distinctEditorContents[0]!
 			: null;
 
+		const editorMatchesBaseline = baselineAuthority.hash !== null
+			&& editorAuthority !== null
+			&& (await this.deps.getBaselineText?.(baselineAuthority.hash)) === editorAuthority;
+		if (editorMatchesBaseline && editorAuthority !== null && existingText) {
+			// Provably stale visible editor: it renders the settled baseline
+			// exactly and shows no recent activity, so converging CRDT to it
+			// (below) would roll both converged sides back to the older
+			// render. Follow the planner's stale-editor mapping instead:
+			// CRDT-wins flushes to disk (the resulting vault event reloads
+			// these panes); disk-wins imports disk Y.Text-first and refreshes
+			// the panes directly (no vault event fires for identical bytes).
+			this.deps.recordFlightPathEvent?.({
+				priority: "critical",
+				kind: PRODUCT_EVENT_KIND.reconcileFileDecision,
+				severity: "warn",
+				scope: "file",
+				source: "reconciliationController",
+				layer: "reconcile",
+				path: file.path,
+				data: {
+					decision: openBoundAction?.kind === "apply-crdt-to-disk"
+						? "crdt-wins-stale-editor-excluded"
+						: "disk-wins-stale-editor-excluded",
+					reason: openBoundAction?.reason ?? "bound-file-ambiguous-divergence",
+					conflictRisk: "ambiguous",
+					editorLength: editorAuthority.length,
+					diskLength: content.length,
+					crdtLength: crdtContent?.length ?? null,
+				},
+			});
+			if (openBoundAction?.kind === "apply-crdt-to-disk" && crdtContent != null) {
+				let staleEditorPreserved = false;
+				if (openBoundAction.preserveDisk) {
+					const preserved = await this.preserveOpenBoundPlannerConflict({
+						file,
+						diskContent: content,
+						crdtContent,
+						expectedYText: existingText,
+						targetContent: undefined,
+						reason: `bound-file-${openBoundAction.reason}`,
+						preserveDisk: true,
+						preserveCrdt: false,
+						editorViewCount: viewStates.length,
+						distinctEditorContentCount: distinctEditorContents.length,
+						chosenSource: "crdt",
+					});
+					if (!preserved) {
+						return { kind: "handled" };
+					}
+					staleEditorPreserved = true;
+				}
+				this.deps.scheduleTraceStateSnapshot("bound-file-stale-editor-crdt-flush");
+				return admitOpenFlush({
+					stage: "bound-file-stale-editor-crdt-flush",
+					provisionalBaseline: staleEditorPreserved,
+					reason: `bound-file-${openBoundAction.reason}`,
+					expectedCrdtContent: crdtContent,
+				});
+			}
+			if (
+				openBoundAction?.kind === "import-disk-to-crdt"
+				&& openBoundAction.preserveCrdt
+				&& crdtContent != null
+				&& crdtContent !== content
+			) {
+				await this.recordDiscardedRevision(
+					file.path,
+					crdtContent,
+					"bound-file-stale-editor-crdt-discarded",
+				);
+			}
+			const staleEditorConvergence = await commitMutation(
+				"bound-file-stale-editor-disk-convergence",
+				crdtContent,
+				() => {
+					const result = applyDiffToYTextWithPostcondition(
+						existingText,
+						crdtContent ?? "",
+						content,
+						ORIGIN_DISK_SYNC_RECOVER_BOUND,
+					);
+					return result.finalMatchesExpected;
+				},
+			);
+			if (staleEditorConvergence.kind === "stale") {
+				return this.deferStaleOpenEditorMutation("bound-file-stale-editor-disk-convergence");
+			}
+			this.refreshStaleEditorPanes(openViews, content, file.path);
+			this.deps.trace("conflict", "bound-file-stale-editor-excluded", {
+				path: file.path,
+				reason: openBoundAction?.reason ?? "bound-file-ambiguous-divergence",
+				editorLength: editorAuthority.length,
+				diskLength: content.length,
+				crdtLength: crdtContent?.length ?? null,
+				convergenceApplied: staleEditorConvergence.value,
+			});
+			return { kind: "handled" };
+		}
+
 		// With conflict-artifact preservation abolished, the losing sides of an
 		// ambiguous divergence are recorded (trace + durable server audit)
 		// instead of written as artifacts. crdtContent remains recoverable from
@@ -9040,9 +9511,19 @@ export class ReconciliationController {
 					// Advance the baseline hash if settled content is provided.
 					// This covers disk→CRDT imports (external edits while KAOS is running).
 					contentHash: settledHash ?? existing?.contentHash,
+					// Stamp the per-file settlement time only when this call
+					// actually settled new content; carry the previous stamp
+					// otherwise so the missing-baseline mtime tie-break keeps
+					// using the time THIS file was last known-settled.
+					settledAtMs: settledHash !== undefined
+						? Date.now()
+						: existing?.settledAtMs,
 				};
 				if (nextEntry.contentHash === undefined) {
 					delete nextEntry.contentHash;
+				}
+				if (nextEntry.settledAtMs === undefined) {
+					delete nextEntry.settledAtMs;
 				}
 				if (settledHash !== undefined && settledContent !== undefined) {
 					this.deps.recordBaselineText?.(settledHash, settledContent);
@@ -9056,9 +9537,18 @@ export class ReconciliationController {
 					this.clearDeferredVisibleAuthorityIfSettled(path, settledContent);
 				}
 				// Live dirty-ingest settlements do not pass through the full reconcile
-				// save at the end. Persist before returning so a crash/reload cannot
-				// resurrect the previous baseline.
-				await this.deps.saveDiskIndex();
+				// save at the end, so they must reach durable storage on their own.
+				// Use the debounced save: this path settles one file at a time, and
+				// an immediate per-file save re-serializes the whole persisted state
+				// per settled file (hundreds of full writes during a bulk ingest on
+				// mobile). The ≤500ms crash window degrades to a missing baseline on
+				// the affected path — the conservative preserve-conflict fallback —
+				// never to a silent overwrite.
+				if (this.deps.scheduleDiskIndexSave) {
+					this.deps.scheduleDiskIndexSave("dirty-ingest-settlement");
+				} else {
+					await this.deps.saveDiskIndex();
+				}
 				return true;
 			}
 			return false;

@@ -63,8 +63,13 @@ try {
 	const sidecarRoot = join(`${dataFile}.d`, "baseline-text-v1", vaultId);
 	assert.equal(await readFile(join(sidecarRoot, validHash), "utf8"), validText);
 	assert.equal(existsSync(join(sidecarRoot, invalidHash)), false);
-	assert.equal(migrated._diskIndex["notes/valid.md"].contentHash, validHash);
-	assert.equal(migrated._diskIndex["notes/invalid.md"].contentHash, invalidHash);
+	if (migrated._auxStateStoreVersion === 1) {
+		assert.equal("_diskIndex" in migrated, false);
+		assert.equal("_blobHashCache" in migrated, false);
+	} else if (migrated._diskIndex) {
+		assert.equal(migrated._diskIndex["notes/valid.md"].contentHash, validHash);
+		assert.equal(migrated._diskIndex["notes/invalid.md"].contentHash, invalidHash);
+	}
 	console.log("  PASS  data.json keeps hashes only and corrupt legacy bodies fail closed");
 } finally {
 	await rm(root, { recursive: true, force: true });

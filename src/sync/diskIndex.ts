@@ -74,6 +74,14 @@ export interface DiskIndexEntry {
 	 * reconciliation falls back to the safe preserve-conflict/missing-baseline path.
 	 */
 	contentHash?: string;
+	/**
+	 * Wall-clock time (Unix ms) KAOS last durably settled THIS file's
+	 * content hash. Unlike the global lastDiskIndexPersistedAt timestamp,
+	 * an unrelated file's index save cannot mask a per-file offline edit in
+	 * the missing-baseline mtime tie-break. Absent on entries written before
+	 * this field existed — callers fall back to the global timestamp.
+	 */
+	settledAtMs?: number;
 }
 
 export type DiskIndex = Record<string, DiskIndexEntry>;
@@ -205,10 +213,16 @@ export async function collectFileStats(
 export function updateIndex(
 	index: DiskIndex,
 	allStats: Map<string, { mtime: number; size: number }>,
-	options: { excludePaths?: Iterable<string>; settledHashes?: Map<string, string> } = {},
+	options: {
+		excludePaths?: Iterable<string>;
+		settledHashes?: Map<string, string>;
+		/** Injection point for deterministic tests; defaults to Date.now(). */
+		settledAtMs?: number;
+	} = {},
 ): DiskIndex {
 	const excluded = new Set(options.excludePaths ?? []);
 	const newIndex: DiskIndex = {};
+	const settledNow = options.settledAtMs ?? Date.now();
 
 	for (const [path, stat] of allStats) {
 		if (excluded.has(path)) {
@@ -235,10 +249,19 @@ export function updateIndex(
 		//    whenever content actually changes in a known direction.
 		const contentHash: string | undefined = settledHash ?? oldEntry?.contentHash;
 
+		// Per-file settlement time: stamped when THIS reconcile settled the
+		// hash, carried forward otherwise. The per-file timestamp is what the
+		// missing-baseline mtime tie-break needs — a global save timestamp
+		// lets an unrelated file's save mask this file's offline edit.
+		const settledAtMs = settledHash !== undefined
+			? settledNow
+			: oldEntry?.settledAtMs;
+
 		newIndex[path] = {
 			mtime: stat.mtime,
 			size: stat.size,
 			...(contentHash !== undefined && { contentHash }),
+			...(settledAtMs !== undefined && { settledAtMs }),
 		};
 	}
 

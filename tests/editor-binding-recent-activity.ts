@@ -1,6 +1,7 @@
 import * as Y from "yjs";
 import { Annotation, EditorState, Transaction, type TransactionSpec } from "@codemirror/state";
 import { YSyncConfig, ySyncFacet } from "y-codemirror.next";
+import { Notice } from "obsidian";
 import {
 	EditorBindingManager,
 	type InterceptedExternalDiskMutation,
@@ -5247,6 +5248,45 @@ console.log("\n--- Test 31: shield preservation rejects mid-word interleaving --
 		true,
 		"empty editor content is trivially preserved",
 	);
+}
+
+console.log("\n--- Test: editor divergence shows a cooldown-bounded sync-paused Notice ---");
+{
+	Notice.resetCalls();
+	const { manager, binding, traceRecords } = buildManagerFixture({
+		lastEditorChangeAgeMs: 1000,
+	});
+	const resolve = (manager as unknown as {
+		resolveBindingTarget: (
+			view: unknown,
+			deviceName: string,
+			reason: string,
+		) => { ytext: Y.Text } | null;
+	}).resolveBindingTarget;
+
+	// The fixture's editor content ("typing now") diverges from the CRDT
+	// text ("server text") — the stale-open-tab shape.
+	const first = resolve.call(manager, binding.view, "qa", "bind");
+	assertEq(first, null, "diverged editor resolves to no binding target");
+	const noticesAfterFirst = Notice.calls.filter((c) => c.message.includes("sync is paused"));
+	assertEq(noticesAfterFirst.length, 1, "divergence notice shown exactly once on first skip");
+	assertEq(
+		noticesAfterFirst[0]?.message.includes("Notes/typing.md".split("/").pop()!),
+		true,
+		"notice names the note",
+	);
+
+	// A retry within the cooldown must stay silent.
+	const second = resolve.call(manager, binding.view, "qa", "bind");
+	assertEq(second, null, "retry still resolves to null");
+	const noticesAfterSecond = Notice.calls.filter((c) => c.message.includes("sync is paused"));
+	assertEq(noticesAfterSecond.length, 1, "cooldown suppresses repeated notices");
+	assertEq(
+		traceRecords.some((t) => t.msg === "binding-divergence-notice-shown"),
+		true,
+		"notice trace recorded for observability",
+	);
+	Notice.resetCalls();
 }
 
 console.log("\n──────────────────────────────────────────────────");

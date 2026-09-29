@@ -152,6 +152,68 @@ console.log("\n--- Test 9: recent editor activity defers any authority choice --
 	assert(action.kind === "defer-recent-editor", "recent editor activity defers");
 }
 
+console.log("\n--- Test 10: provably stale distinct editor is excluded from authority ---");
+{
+	// Editor renders the settled baseline exactly (editorMatchesBaseline).
+	// disk-at-baseline + CRDT changed must resolve CRDT-wins, NOT editor-wins.
+	const crdtNewer = planOpenBoundFileReconcile(input({
+		diskHash: HASH_BASE,
+		crdtHash: HASH_CRDT,
+		baselineHash: HASH_BASE,
+		editorAuthority: { kind: "single", relation: "distinct" },
+		editorMatchesBaseline: true,
+	}));
+	assert(crdtNewer.kind === "apply-crdt-to-disk", "stale editor excluded: CRDT-only change applies CRDT to disk");
+	assert(crdtNewer.kind === "apply-crdt-to-disk" && crdtNewer.reason === "disk-at-baseline", "reason is disk-at-baseline");
+
+	// crdt-at-baseline + disk changed must resolve disk-wins.
+	const diskNewer = planOpenBoundFileReconcile(input({
+		diskHash: HASH_DISK,
+		crdtHash: HASH_BASE,
+		baselineHash: HASH_BASE,
+		editorAuthority: { kind: "single", relation: "distinct" },
+		editorMatchesBaseline: true,
+	}));
+	assert(diskNewer.kind === "import-disk-to-crdt", "stale editor excluded: disk-only change imports disk");
+	assert(diskNewer.kind === "import-disk-to-crdt" && diskNewer.reason === "crdt-at-baseline", "reason is crdt-at-baseline");
+
+	// Both changed: preserve-conflict winner disk maps to import-disk-to-crdt
+	// with CRDT preserved.
+	const bothChanged = planOpenBoundFileReconcile(input({
+		editorAuthority: { kind: "single", relation: "distinct" },
+		editorMatchesBaseline: true,
+	}));
+	assert(bothChanged.kind === "import-disk-to-crdt", "stale editor excluded: both-changed resolves disk-wins");
+	assert(bothChanged.kind === "import-disk-to-crdt" && bothChanged.preserveCrdt === true, "CRDT side is preserved");
+}
+
+console.log("\n--- Test 11: stale-editor exclusion requires durable baseline evidence ---");
+{
+	// Without a baseline hash the editor cannot be proven stale, so the
+	// visible authority must keep winning (unchanged legacy behavior).
+	const noBaseline = planOpenBoundFileReconcile(input({
+		baselineHash: null,
+		editorAuthority: { kind: "single", relation: "distinct" },
+		editorMatchesBaseline: true,
+	}));
+	assert(noBaseline.kind === "editor-wins-preserve", "missing baseline keeps distinct editor authority");
+
+	// editorMatchesBaseline omitted (baseline text not stored / lookup miss)
+	// must also keep the legacy editor-wins behavior.
+	const lookupMiss = planOpenBoundFileReconcile(input({
+		editorAuthority: { kind: "single", relation: "distinct" },
+	}));
+	assert(lookupMiss.kind === "editor-wins-preserve", "editorMatchesBaseline miss keeps distinct editor authority");
+
+	// Recent activity always outranks the staleness proof.
+	const recentActivity = planOpenBoundFileReconcile(input({
+		hasRecentEditorActivity: true,
+		editorAuthority: { kind: "single", relation: "distinct" },
+		editorMatchesBaseline: true,
+	}));
+	assert(recentActivity.kind === "defer-recent-editor", "recent activity defers before the staleness proof applies");
+}
+
 console.log(`\n${"-".repeat(55)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log(`${"-".repeat(55)}\n`);

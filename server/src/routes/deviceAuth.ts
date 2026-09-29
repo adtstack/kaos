@@ -220,14 +220,29 @@ export async function handleOwnerDeviceRoute(
 	req: Request,
 	env: Env,
 	vaultId: string,
-	action: "list" | "pair-create" | "role" | "revoke",
+	action: "list" | "pair-create" | "role" | "revoke" | "rename",
 ): Promise<Response> {
-	const auth = await requireOwner(req, env, vaultId);
-	if (!auth.ok) return auth.response;
 	let body: Record<string, unknown> = {};
 	if (action !== "list") {
 		try { body = asRecord(await req.json()) ?? {}; } catch { return json({ error: "invalid json" }, 400); }
 	}
+
+	if (action === "rename") {
+		const auth = await authorizeDeviceRequest(req, env, vaultId);
+		if (!auth.ok) return auth.response;
+		const targetDeviceId = typeof body.targetDeviceId === "string" && body.targetDeviceId.trim()
+			? body.targetDeviceId.trim()
+			: auth.principal.deviceId;
+		body.targetDeviceId = targetDeviceId;
+		if (auth.principal.role !== "owner" && auth.principal.deviceId !== targetDeviceId) {
+			return json({ error: "owner_required" }, 403);
+		}
+		const response = await configPost(env, "/__kaos/devices/rename", { ...body, session: auth.session, vaultId });
+		return proxyResponse(response);
+	}
+
+	const auth = await requireOwner(req, env, vaultId);
+	if (!auth.ok) return auth.response;
 	const path = action === "list"
 		? "/__kaos/devices/list"
 		: action === "pair-create"

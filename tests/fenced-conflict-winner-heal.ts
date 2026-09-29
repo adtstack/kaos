@@ -213,6 +213,8 @@ function makeHealFixture(init: {
 	};
 
 	const diskMirror = {
+	hasPendingWrite: () => false,
+	getLastDiskWriteOkHash: () => null,
 		getPreservedUnresolvedEntries: () => entry ? [{ ...entry }] : [],
 		isPreservedUnresolved: (candidate: string) => candidate === path && entry !== null,
 		clearPreservedUnresolved: (candidate: string) => {

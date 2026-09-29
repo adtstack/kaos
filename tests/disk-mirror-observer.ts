@@ -667,6 +667,63 @@ console.log("\n--- Test 2d: provider delete and rename are fenced by the same ga
 	renameFixture.doc.destroy();
 }
 
+// ── Test 2e: mirror pending-write predicate + self-mirror hash evidence ──────
+
+console.log("\n--- Test 2e: hasPendingWrite / getLastDiskWriteOkHash self-mirror evidence ---");
+{
+	const fixture = makeHarness({ initialDiskContent: "settled baseline\n" });
+	fixture.ytext.insert(0, "settled baseline\n");
+	const { mirror, ytext, doc, fakeProvider, diskFiles } = fixture;
+	mirror.startMapObservers();
+
+	assert(
+		mirror.hasPendingWrite(FILE_PATH) === false,
+		"no pending write before any mirror activity",
+	);
+	assert(
+		mirror.getLastDiskWriteOkHash(FILE_PATH) === null,
+		"no self-mirror hash before a successful write",
+	);
+
+	// Remote change arrives → scheduling starts (debounce stage) → pending.
+	doc.transact(() => { ytext.insert(0, "remote line\n"); }, fakeProvider);
+	assert(
+		mirror.hasPendingWrite(FILE_PATH) === true,
+		"debounced remote mirror write counts as pending",
+	);
+
+	// Let the debounce (300ms) + drain flush the write to disk.
+	await new Promise((resolve) => setTimeout(resolve, 700));
+	assert(
+		mirror.hasPendingWrite(FILE_PATH) === false,
+		"pending clears after the mirror write settles",
+	);
+
+	// The disk bytes are now provably our own mirror output: the controller's
+	// self-mirror evidence (hash equality) must hold for a fresh disk read.
+	const diskBytes = diskFiles.get(FILE_PATH) ?? "";
+	const diskHash = await contentBaselineHash(diskBytes);
+	assert(
+		mirror.getLastDiskWriteOkHash(FILE_PATH) === diskHash,
+		"last-write-ok hash equals the on-disk content hash (self-mirror evidence)",
+	);
+	assert(
+		diskBytes.includes("remote line\n".replace("\n", "\n")),
+		"mirror wrote the remote content",
+	);
+
+	// An external edit breaks hash equality → evidence must fail closed to
+	// "not self-mirror" so ordinary conflict semantics resume.
+	diskFiles.set(FILE_PATH, diskBytes + "external edit\n");
+	const editedHash = await contentBaselineHash(diskFiles.get(FILE_PATH) ?? "");
+	assert(
+		mirror.getLastDiskWriteOkHash(FILE_PATH) !== editedHash,
+		"external disk edit no longer matches the self-mirror hash",
+	);
+
+	doc.destroy();
+}
+
 // ── Test 2b: excluded remote paths never enter the write queue ───────────────
 
 console.log("\n--- Test 2b: excluded remote path is never scheduled or written ---");

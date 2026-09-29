@@ -48,6 +48,7 @@ export function buildKaosDashboardData(input: KaosDashboardCollectorInput): Kaos
 		attention: collectDashboardAttention(input),
 		attentionTotalCount: getDashboardAttentionTotalCount(input),
 		attentionAudit: input.attentionAudit ?? null,
+		resolvedAttentionHistory: input.resolvedAttentionHistory ?? [],
 		actions: {
 			syncInitialized: input.vaultSync !== null,
 			untrackedFileCount: input.reconciliationState.untrackedFileCount,
@@ -112,6 +113,7 @@ export function collectDashboardAttention(
 		| "reconciliationState"
 		| "remoteDeleteResolutionState"
 		| "remoteProjectionPolicyError"
+		| "roomDivergence"
 	>,
 ): DashboardAttentionItem[] {
 	const items: DashboardAttentionItem[] = [];
@@ -127,6 +129,22 @@ export function collectDashboardAttention(
 			firstSeenAt: null,
 			lastSeenAt: null,
 			tone: "error",
+			resolution: null,
+		});
+	}
+	const roomDivergence = input.roomDivergence;
+	if (roomDivergence && roomDivergence.kind !== "ok") {
+		items.push({
+			kind: "room-divergence",
+			title: roomDivergence.kind === "stale-room-suspected"
+				? "This device may be syncing a different room"
+				: "Remote downloads may be frozen by a paused projection gate",
+			path: null,
+			detail: `After a completed sync, ${roomDivergence.reason}. Run "Run sync check" from the command palette to diagnose.`,
+			structuralChange: null,
+			firstSeenAt: null,
+			lastSeenAt: null,
+			tone: "warn",
 			resolution: null,
 		});
 	}
@@ -334,6 +352,7 @@ export function getDashboardAttentionTotalCount(
 		| "frontmatterQuarantineEntries"
 		| "reconciliationState"
 		| "remoteProjectionPolicyError"
+		| "roomDivergence"
 	> & {
 		attentionAudit?: KaosDashboardCollectorInput["attentionAudit"];
 	},
@@ -355,7 +374,8 @@ export function getDashboardAttentionTotalCount(
 		+ input.frontmatterQuarantineEntries.length
 		+ input.reconciliationState.unresolvedStructuralChangeGroupCount
 		+ input.reconciliationState.blockedDivergenceCount
-		+ (input.remoteProjectionPolicyError ? 1 : 0);
+		+ (input.remoteProjectionPolicyError ? 1 : 0)
+		+ (input.roomDivergence && input.roomDivergence.kind !== "ok" ? 1 : 0);
 }
 
 function getDashboardLocalFileIdentity(
@@ -552,8 +572,15 @@ function buildOverview(input: KaosDashboardCollectorInput): DashboardMetric[] {
 		{ label: "Blob transfers", value: `${blob?.pendingUploads ?? 0} up / ${blob?.pendingDownloads ?? 0} down`, tone: hasBlobWork(blob) ? "busy" : "ok" },
 		{ label: "Reconciled", value: yesNo(reconcile.reconciled), tone: toneForBoolean(reconcile.reconciled) },
 		{ label: "Untracked", value: String(reconcile.untrackedFileCount), tone: reconcile.untrackedFileCount > 0 ? "warn" : "ok" },
-		{ label: "Safety brake", value: reconcile.lastReconcileStats?.safetyBrakeTriggered ? "active" : "clear", tone: reconcile.lastReconcileStats?.safetyBrakeTriggered ? "error" : "ok" },
-		{ label: "Last reconcile", value: reconcile.lastReconcileStats?.at ?? "never", tone: reconcile.lastReconcileStats ? undefined : "muted" },
+			{ label: "Safety brake", value: reconcile.lastReconcileStats?.safetyBrakeTriggered ? "active" : "clear", tone: reconcile.lastReconcileStats?.safetyBrakeTriggered ? "error" : "ok" },
+			{ label: "Last reconcile", value: reconcile.lastReconcileStats?.at ?? "never", tone: reconcile.lastReconcileStats ? undefined : "muted" },
+			{
+				label: "Reconcile cost",
+				value: reconcile.lastReconcileStats
+					? `${(reconcile.lastReconcileStats.durationMs / 1000).toFixed(1)}s · ${reconcile.lastReconcileStats.filesRead} read${reconcile.lastReconcileStats.filesSkippedByIndex > 0 ? ` · ${reconcile.lastReconcileStats.filesSkippedByIndex} skipped` : ""}`
+					: "never",
+				tone: "muted",
+			},
 		{ label: "Server receipt", value: receiptLabel(serverReceipt), tone: receiptTone(serverReceipt) },
 	];
 	if ((blob?.permanentUploadFailures ?? 0) > 0 || (blob?.permanentDownloadFailures ?? 0) > 0) {

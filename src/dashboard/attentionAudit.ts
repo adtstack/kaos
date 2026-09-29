@@ -56,7 +56,11 @@ export function isArchivePath(path: string): boolean {
 		|| normalized.startsWith("archives/")
 		|| normalized.includes("/archives/")
 		|| normalized.includes("/_archives/")
-		|| normalized.startsWith("_archives/");
+		|| normalized.startsWith("_archives/")
+		|| normalized.startsWith("old/")
+		|| normalized.includes("/old/")
+		|| normalized.includes("/_old/")
+		|| normalized.startsWith("_old/");
 }
 
 export interface MarkdownRetirementSettlementInput {
@@ -175,12 +179,21 @@ export function auditAttentionEntries(
 
 			// Single path collision not part of a detected pair
 			if (localState.kind === "file") {
-				items.push({
-					entry,
-					classification: "active",
-					rationale: "Path collision marker on existing local file. Resolve collision manually or via reconcile.",
-					episodeId,
-				});
+				if (isArchivePath(entry.path)) {
+					items.push({
+						entry,
+						classification: "retirable",
+						rationale: "Path collision file is settled in an archive directory.",
+						episodeId,
+					});
+				} else {
+					items.push({
+						entry,
+						classification: "active",
+						rationale: "Path collision marker on existing local file. Resolve collision manually or via reconcile.",
+						episodeId,
+					});
+				}
 			} else if (localState.kind === "missing") {
 				const engineAvailable = entry.kind === "markdown"
 					? input.remoteDeleteResolutionState?.markdownAvailable === true
@@ -293,8 +306,8 @@ export function auditAttentionEntries(
 			if (localState.kind === "file") {
 				items.push({
 					entry,
-					classification: "active",
-					rationale: "Local attachment now exists. Run reconcile to settle.",
+					classification: "retirable",
+					rationale: "Local attachment now exists and is settled.",
 					episodeId,
 				});
 			} else if (!engineAvailable) {
@@ -429,9 +442,39 @@ function findPathCollisionPairs(
 	vault: Pick<import("obsidian").Vault, "getAbstractFileByPath">,
 ): Map<string, CollisionPairResolution> {
 	const map = new Map<string, CollisionPairResolution>();
+
+	// 1. Direct pairing if pairPath is explicitly recorded on the entry
+	for (const entry of collisions) {
+		if (entry.pairPath) {
+			const normSource = normalizePath(entry.path);
+			const normTarget = normalizePath(entry.pairPath);
+			const sourceState = checkLocalFile(vault, entry.path);
+			const targetState = checkLocalFile(vault, entry.pairPath);
+			if (
+				(sourceState.kind === "missing" && targetState.kind === "file")
+				|| (sourceState.kind === "file" && targetState.kind === "missing")
+			) {
+				const missingPath = sourceState.kind === "missing" ? normSource : normTarget;
+				const filePath = sourceState.kind === "file" ? normSource : normTarget;
+				map.set(missingPath, {
+					status: "retirable-archive-pair",
+					pairPath: filePath,
+					reason: `Source "${missingPath}" is missing and target "${filePath}" exists.`,
+				});
+				map.set(filePath, {
+					status: "retirable-archive-pair",
+					pairPath: missingPath,
+					reason: `Target "${filePath}" exists and source "${missingPath}" is missing.`,
+				});
+			}
+		}
+	}
+
+	// 2. Basename matching for entries not yet mapped
 	const byBasename = new Map<string, PreservedUnresolvedEntry[]>();
 
 	for (const entry of collisions) {
+		if (map.has(normalizePath(entry.path))) continue;
 		const base = extractBasename(entry.path);
 		const list = byBasename.get(base) ?? [];
 		list.push(entry);
@@ -483,14 +526,64 @@ function findPathCollisionPairs(
 			continue;
 		}
 
-		// If more than 2 or ambiguous pairings
+		// If more than 2 files share the basename: perform suffix matching between missing & existing files
+		const missingEntries = group.filter((e) => checkLocalFile(vault, e.path).kind === "missing");
+		const existingEntries = group.filter((e) => checkLocalFile(vault, e.path).kind === "file");
+
+		if (missingEntries.length > 0 && existingEntries.length > 0) {
+			const usedTargets = new Set<string>();
+			for (const missing of missingEntries) {
+				let bestTarget: PreservedUnresolvedEntry | null = null;
+				let bestScore = -1;
+				const normM = normalizePath(missing.path);
+				const partsM = normM.split("/");
+
+				for (const existing of existingEntries) {
+					if (usedTargets.has(existing.path)) continue;
+					const normE = normalizePath(existing.path);
+					const partsE = normE.split("/");
+					let commonSuffix = 0;
+					while (
+						commonSuffix < partsM.length
+						&& commonSuffix < partsE.length
+						&& partsM[partsM.length - 1 - commonSuffix] === partsE[partsE.length - 1 - commonSuffix]
+					) {
+						commonSuffix++;
+					}
+					if (commonSuffix > bestScore) {
+						bestScore = commonSuffix;
+						bestTarget = existing;
+					}
+				}
+
+				if (bestTarget && bestScore >= 1) {
+					usedTargets.add(bestTarget.path);
+					const normSource = normalizePath(missing.path);
+					const normTarget = normalizePath(bestTarget.path);
+					map.set(normSource, {
+						status: "retirable-archive-pair",
+						pairPath: normTarget,
+						reason: `Source "${missing.path}" is missing and target "${bestTarget.path}" exists.`,
+					});
+					map.set(normTarget, {
+						status: "retirable-archive-pair",
+						pairPath: normSource,
+						reason: `Target "${bestTarget.path}" exists and source "${missing.path}" is missing.`,
+					});
+				}
+			}
+		}
+
+		// Any remainder still unmapped
 		for (const entry of group) {
 			const norm = normalizePath(entry.path);
-			map.set(norm, {
-				status: "needs-review",
-				pairPath: "",
-				reason: `Multiple (${group.length}) collision markers found for filename "${basename}". Manual review required.`,
-			});
+			if (!map.has(norm)) {
+				map.set(norm, {
+					status: "needs-review",
+					pairPath: "",
+					reason: `Multiple (${group.length}) collision markers found for filename "${basename}". Manual review required.`,
+				});
+			}
 		}
 	}
 

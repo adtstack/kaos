@@ -576,6 +576,8 @@ function buildFixture(initial: {
 		}) as never,
 		getVaultSync: () => vaultSync as never,
 		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			shouldSuppressCreate: async () => false,
 			shouldSuppressModify: async () => false,
 			matchesRecentWriteFingerprint: async () => {
@@ -1092,6 +1094,8 @@ function buildUnboundIngestFixture(initial: {
 	};
 
 	const diskMirror = {
+		hasPendingWrite: () => false,
+		getLastDiskWriteOkHash: () => null,
 		shouldSuppressCreate: async () => false,
 		shouldSuppressModify: async () => false,
 		isPreservedUnresolved: (candidatePath: string) => preservedPath === candidatePath,

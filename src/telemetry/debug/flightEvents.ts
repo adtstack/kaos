@@ -100,6 +100,10 @@ export const FLIGHT_KIND = {
 	reconcileFileDecision: "reconcile.file.decision",      // priority: critical when conflictRisk=ambiguous
 	reconcileSafetyBrakeTriggered: "reconcile.safety_brake.triggered", // priority: critical
 	reconcileComplete: "reconcile.complete",
+	/** An authoritative reconcile was clamped to conservative: the local Yjs replica has not finished hydrating. */
+	reconcileModeDowngraded: "reconcile.mode.downgraded",  // priority: critical
+	/** Emergency override ran an authoritative reconcile without the hydration gate (user-commanded). */
+	reconcileForcedUnhydrated: "reconcile.forced_unhydrated", // priority: critical
 
 	// Recovery — all now emitted from reconciliationController
 	recoveryDecision: "recovery.decision",
@@ -145,6 +149,7 @@ export const FLIGHT_KIND = {
 	editorRepairApplied: "editor.repair.applied",
 	editorHealApplied: "editor.heal.applied",
 	editorAuthorityShieldApplied: "editor.authority_shield.applied",
+	providerRegressiveDeleteSuspected: "editor.provider_regressive_delete.suspected",
 } as const;
 
 export type FlightKind = typeof FLIGHT_KIND[keyof typeof FLIGHT_KIND];

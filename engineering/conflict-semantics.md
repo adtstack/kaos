@@ -47,6 +47,39 @@ not by a filter-bypass Y.Text projection. A disk change on an open note is
 ingested only by the open-external-edit merge lane (editor idle >= 3s, editor
 == CRDT, baseline-based 3-way merge) or after the note closes.
 
+### Authority preconditions (anti-revert gates)
+
+Three preconditions keep the authority rules above from being fed a
+degenerate side (`decideSafeReconcileMode`, `planOpenBoundFileReconcile`):
+
+- **Hydrated local replica.** An authoritative reconcile requires
+  `vaultSync.localReady` and no latched `idbError`. Provider sync alone is
+  not authority: while the local IndexedDB-backed Y.Doc is still hydrating,
+  the doc holds only server state, and a server room behind this device's
+  newest operations would be projected onto disk as if it were newer.
+  Requests for an authoritative pass while unhydrated (or after an IDB
+  error, even one latched after an earlier successful sync) are clamped to
+  conservative (flight event `reconcile-mode-downgraded-unhydrated-local`);
+  the pass is re-derived the moment hydration completes. An emergency
+  command (`force-reconcile-unhydrated`) bypasses the gate with an explicit
+  warning and its own flight event.
+- **Provably stale editors lose authority.** A visible editor that renders
+  the durable baseline text exactly, shows no recent activity, and differs
+  from both disk and CRDT is a stale render, not the user's intent. It is
+  excluded from authority and disk-vs-CRDT is decided by the ordinary
+  three-way rule (decisions `disk-wins-stale-editor-excluded` /
+  `crdt-wins-stale-editor-excluded`). A baseline-text lookup miss keeps the
+  legacy visible-editor-wins behavior.
+- **Per-file settlement evidence.** The missing-baseline mtime tie-break
+  prefers `DiskIndexEntry.settledAtMs` (when THIS file was last durably
+  settled) over the global last-index-save timestamp, so an unrelated file's
+  index save can no longer mask a file's offline edit. Policy string:
+  `disk-mtime-after-last-file-settlement`.
+
+Disk-at-baseline CRDT-authoritative projections additionally record
+`baselineTextKnown`, and the overwritten disk text is durably audited when it
+cannot be reproduced from the baseline-text store.
+
 ### Open external-edit reconciliation
 
 An external disk write to an open Markdown note is not a separate conflict
@@ -84,20 +117,24 @@ but the drain only records and retires.
   (`existing-changed-during-download`)
 - A create race: file was created locally while download was in flight
   and content differs (`create-race-mismatch`)
+- A true divergence / non-causal conflict: local file content differs from
+  the remote blob and local is not a causal predecessor (`causalPrior` is false),
+  such as when the file was modified offline or concurrently on both sides.
 
 **Policy:**
 
-1. Write the remote bytes as a local-only conflict artifact:
+1. The local version is **always preserved at the canonical path**. Remote bytes
+   **never** silently overwrite local changes.
+2. Write the remote bytes as a local-only conflict artifact:
    `<base> (KAOS remote conflict <timestamp>).<ext>`
-2. Preserve the local version at the original path.
-3. Mark the conflict artifact as local-only and suppress the immediate
-   vault event from upload.
-4. Show a Notice to the user.
+3. Mark the conflict path as quarantined under `preservedUnresolved` and mark
+   the conflict artifact as local-only, suppressing immediate upload loops.
+4. Show a Notice to the user and surface in Dashboard → Conflicts.
 5. Increment `_blobConflictArtifacts` counter (visible in debug snapshot).
 
 **Who wins:** Neither side is selected automatically. The local version stays
-at the original path and the remote version remains a local-only artifact until
-the user makes an explicit choice in Dashboard → Conflicts.
+at the canonical path and the remote version remains a local-only conflict artifact
+until the user makes an explicit choice in Dashboard → Conflicts.
 
 **Manual resolution:** Every active blob conflict row shows two distinct
 actions:
@@ -122,20 +159,23 @@ survives plugin restart. Markdown conflict artifacts follow the same
 local-only policy through create-event suppression and their durable filename
 marker.
 
-**Rationale:** Binary conflict artifacts may be large (images, PDFs) and
-uploading them could create confusion on other devices. The local device
-that experienced the conflict is responsible for resolving it.
+**Rationale:** Binary files (images, scripts, attachments) have no CRDT merge
+semantics. Silently overwriting local files with remote bytes (formerly
+`authoritative-remote-wins`) causes silent data loss when files are modified
+offline or outside Obsidian. Preserving local files at canonical paths while
+saving remote candidates to conflict artifacts ensures safety and puts the
+user in control.
 
 ### Attachment rollback safety copies are not conflicts
 
-A causally proven clean remote replacement or remote deletion may move the
-exact previous `TFile` to
+Only a causally proven clean remote replacement (where local hash is verified to
+be an ancestor in the remote ref's prior hashes) or a clean remote deletion moves
+the exact previous `TFile` to
 `<base> (KAOS local backup <timestamp> <operation-id>).<ext>` before changing
-the canonical path. This is a no-clobber rollback copy required because the
-Vault API does not provide an atomic binary replace operation. It remains
-local-only and visible for manual review, but it is tracked and displayed
-separately from true `KAOS remote conflict` artifacts and does not increment
-the blob conflict counter.
+the canonical path. This is a rollback safety copy required because the Vault API
+does not provide an atomic binary replace operation. It remains local-only and
+visible for manual review, but it is tracked and displayed separately from true
+`KAOS remote conflict` artifacts and does not increment the blob conflict counter.
 
 ## 3. Remote delete conflict (local-dirty preservation)
 
