@@ -17,6 +17,9 @@ import {
 	auditRecoveryStorage,
 	createIndexedRecoverySnapshot,
 	decodeRecoveryFileMeta,
+	deletePendingRecoveryUpload,
+	persistPendingRecoveryUpload,
+	readPendingRecoveryUpload,
 	type PreparedFileHistoryPendingUpload,
 	type RecoveryIndexSnapshot,
 	type RecoveryStateEntry,
@@ -238,6 +241,7 @@ export class VaultSyncServer extends YServer {
 	/** Load-time health fields not owned by PersistenceCoordinator. */
 	private loadedStateVectorHash: string | null = null;
 	private legacyDocumentMigrated = false;
+	private pendingRecoveryUpload: PreparedFileHistoryPendingUpload | null = null;
 
 	async onLoad(): Promise<void> {
 		await this.ensureDocumentLoaded();
@@ -1144,10 +1148,26 @@ export class VaultSyncServer extends YServer {
 					this.ensureRecoveryDirtyLoaded(),
 				]);
 
-				const pendingRaw = await this.ctx.storage.get<unknown>(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY);
-				const pendingUpload = isPreparedFileHistoryPendingUpload(pendingRaw) ? pendingRaw : null;
-				if (pendingRaw !== undefined && !pendingUpload) {
-					await this.ctx.storage.delete(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY);
+				let pendingUpload = this.pendingRecoveryUpload;
+				if (!pendingUpload) {
+					const pendingRaw = await this.ctx.storage.get<unknown>(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY);
+					pendingUpload = isPreparedFileHistoryPendingUpload(pendingRaw) ? pendingRaw : null;
+					if (pendingRaw !== undefined && !pendingUpload) {
+						await this.ctx.storage.delete(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY);
+					}
+					if (!pendingUpload) {
+						try {
+							const r2Pending = await readPendingRecoveryUpload(bucket, vaultId);
+							if (isPreparedFileHistoryPendingUpload(r2Pending)) {
+								pendingUpload = r2Pending;
+							}
+						} catch (r2Err) {
+							console.warn(`${LOG_PREFIX} failed to load pending upload from R2:`, r2Err);
+						}
+					}
+					if (pendingUpload) {
+						this.pendingRecoveryUpload = pendingUpload;
+					}
 				}
 				let auditStatus: RecoveryStorageAuditStatus | null = null;
 				if (!pendingUpload) {
@@ -1259,7 +1279,18 @@ export class VaultSyncServer extends YServer {
 						} satisfies PreparedFileHistoryPendingUpload
 						: null;
 					if (prepared) {
-						await this.ctx.storage.put(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY, prepared);
+						this.pendingRecoveryUpload = prepared;
+						try {
+							await this.ctx.storage.put(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY, prepared);
+						} catch {
+							// Large vault payload exceeds Cloudflare DO 2MB limit: persist to R2
+							try {
+								await persistPendingRecoveryUpload(bucket, vaultId, prepared);
+								await this.ctx.storage.delete(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY);
+							} catch (r2Err) {
+								console.warn(`${LOG_PREFIX} failed to persist pending upload to R2:`, r2Err);
+							}
+						}
 					}
 					await this.recordTrace("recovery-snapshot-upload-pending", {
 						manifestId: result.manifestId,
@@ -1269,7 +1300,11 @@ export class VaultSyncServer extends YServer {
 					});
 					return result;
 				}
-				await this.ctx.storage.delete(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY);
+				this.pendingRecoveryUpload = null;
+				await Promise.allSettled([
+					this.ctx.storage.delete(RECOVERY_SNAPSHOT_PENDING_UPLOAD_KEY),
+					deletePendingRecoveryUpload(bucket, vaultId),
+				]);
 				if (indexed.nextIndexSnapshot) {
 					await this.writeRecoveryIndexSnapshot(indexed.nextIndexSnapshot);
 				}

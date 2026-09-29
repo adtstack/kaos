@@ -41,7 +41,7 @@ console.log("\n--- Test 1: dangerous transitions have typed trace events ---");
 	assert(fmCoordinator.includes('"frontmatter-quarantine-cleared"'), "frontmatter quarantine clear uses quarantine trace source");
 	assert(blobSync.includes('"download-overwrite-decision"'), "attachment download overwrite decisions are traced");
 	assert(blobSync.includes('"authoritative-remote-retry"'), "attachment authority races are retried and traced");
-	assert(blobSync.includes('"authoritative-remote-wins"'), "authoritative remote blob convergence is traced");
+	assert(blobSync.includes('"download-conflict-quarantined"'), "blob download conflict quarantine is traced");
 	assert(serverAck.includes('"receipt-candidate-captured"'), "receipt candidate capture is traced");
 	assert(serverAck.includes('"receipt-server-echo"'), "server receipt echo transitions are traced");
 	assert(diskMirror.includes('"suppression-acknowledged"'), "suppression acknowledgements are traced");

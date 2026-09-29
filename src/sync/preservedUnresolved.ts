@@ -87,6 +87,8 @@ export interface PreservedUnresolvedEntry {
 	knownRemoteRefFingerprint?: string | null;
 	/** Exact CRDT item episode captured when the conflict was quarantined. */
 	knownRemoteSourceVersion?: string | null;
+	/** Inferred or explicit rename partner path when available. */
+	pairPath?: string | null;
 }
 
 export interface PreservedUnresolvedSample {
@@ -227,6 +229,15 @@ export class PreservedUnresolvedRegistry {
 						entry.knownRemoteSourceVersion !== undefined
 							? entry.knownRemoteSourceVersion
 							: previousInEpisode?.knownRemoteSourceVersion ?? null,
+				}
+				: {}),
+			...(entry.pairPath !== undefined
+				|| previousInEpisode?.pairPath !== undefined
+				? {
+					pairPath:
+						entry.pairPath !== undefined
+							? entry.pairPath
+							: previousInEpisode?.pairPath ?? null,
 				}
 				: {}),
 		});
@@ -391,3 +402,16 @@ export interface AttentionRetirementSummary {
 	retiredPaths: string[];
 	failedPaths: string[];
 }
+
+export interface ResolvedAttentionItem {
+	id: string;
+	path: string;
+	kind: PreservedUnresolvedKind;
+	reason: PreservedUnresolvedReason;
+	resolution: string;
+	pairPath?: string | null;
+	resolvedAt: number;
+	summary: string;
+}
+
+export const MAX_RESOLVED_ATTENTION_HISTORY = 100;

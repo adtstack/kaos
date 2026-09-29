@@ -8,11 +8,15 @@ import {
 	type TransactionSpec,
 } from "@codemirror/state";
 import { EditorView, ViewPlugin, type ViewUpdate } from "@codemirror/view";
-import { yCollab, ySyncFacet } from "y-codemirror.next";
+import { ySyncFacet } from "y-codemirror.next";
 import * as Y from "yjs";
 import { Notice, type MarkdownView } from "obsidian";
 import type { VaultSync } from "./vaultSync";
 import { applyDiffToYText } from "./diff";
+import {
+	buildCompositionAwareCollab,
+	isCompositionHoldActive,
+} from "./compositionAwareYSync";
 import type { TraceRecord } from "../observability/traceContext";
 import type { ProductFlightPathEventInput } from "../observability/traceSink";
 import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
@@ -59,6 +63,17 @@ const RECENT_EDITOR_REPAIR_DEFER_MS = 1200;
 const RECENT_EDITOR_PATCH_SHIELD_MS = 5000;
 const EXTERNAL_DISK_RELOAD_CORRELATION_MS = 5000;
 /**
+ * Freshness window for host-projection PROOFS (and their held-projection
+ * promotions) only. These paths additionally require exact snapshot lineage
+ * — the same binding/view/cm identity, a provable editor-authority successor
+ * preimage, and a TextFileView lastSavedData transition — so a longer window
+ * adds safety without loosening the generic pending-mutation correlation:
+ * mobile hosts can take well over 5s between a disk modify event and the
+ * editor reload/3-way merge, and expiring the proof let that merge bypass
+ * the baseline/conflict policy entirely (R5).
+ */
+const EXTERNAL_DISK_HOST_PROJECTION_PROOF_MS = 15_000;
+/**
  * Maximum fresh own-origin snapshots retained per path for disk-write
  * correlation. A multi-step own edit (e.g. checkbox toggle followed by a
  * tasks-plugin completion-date append) journals several snapshots, and an
@@ -67,6 +82,12 @@ const EXTERNAL_DISK_RELOAD_CORRELATION_MS = 5000;
 const RECENT_EDITOR_ORIGIN_CHANGE_LIMIT = 4;
 const TYPING_AWARENESS_MIN_INTERVAL_MS = 750;
 const CONCURRENT_TYPING_NOTICE_COOLDOWN_MS = 8_000;
+/**
+ * A binding-target editor divergence is a persistent condition (the open tab
+ * loaded stale bytes, typically after a remote delete/recreate raced the
+ * local mirror), and bind retries recur — notify at most once per minute.
+ */
+const EDITOR_DIVERGENCE_NOTICE_COOLDOWN_MS = 60_000;
 const EDITOR_AUTHORITY_SHIELD_ORIGINS = new Set<string>([
 	ORIGIN_DISK_SYNC,
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
@@ -395,6 +416,8 @@ export class EditorBindingManager {
 	private pendingReplacementCmToLeafId = new WeakMap<EditorView, string>();
 	private lastTypingAwarenessAtByLeaf = new Map<string, number>();
 	private concurrentTypingNoticeAtByPath = new Map<string, number>();
+	private providerRegressiveNoticeAtByPath = new Map<string, number>();
+	private bindingDivergenceNoticeAtByPath = new Map<string, number>();
 	private pendingExternalDiskMutations = new Map<string, PendingExternalDiskMutation>();
 	private pendingExternalDiskMutationStarts = new Map<string, PendingExternalDiskMutationStart>();
 	private pendingExternalDiskHostProjectionFences =
@@ -1796,6 +1819,31 @@ export class EditorBindingManager {
 	}
 
 	/**
+	 * User-visible warning for the stale-open-tab failure mode: a tab whose
+	 * content diverged from the CRDT (usually it loaded pre-mirror bytes while
+	 * another device deleted and recreated the note) stays unbound, so edits
+	 * in it do not sync. Tell the user instead of failing silently; reopening
+	 * the note reloads fresh bytes and restores syncing.
+	 */
+	private notifyBindingEditorDivergence(path: string): void {
+		const now = Date.now();
+		const lastNoticedAt = this.bindingDivergenceNoticeAtByPath.get(path) ?? 0;
+		if (now - lastNoticedAt < EDITOR_DIVERGENCE_NOTICE_COOLDOWN_MS) return;
+		this.bindingDivergenceNoticeAtByPath.set(path, now);
+		const noteName = path.split("/").pop() ?? path;
+		new Notice(
+			`KAOS: this tab of "${noteName}" shows an older copy than the synced version, ` +
+				"so sync is paused for it and edits here will not sync. " +
+				"Close and reopen the note to resume syncing.",
+			10000,
+		);
+		this.trace?.("editor", "binding-divergence-notice-shown", {
+			path,
+			cooldownMs: EDITOR_DIVERGENCE_NOTICE_COOLDOWN_MS,
+		});
+	}
+
+	/**
 	 * Get the CM6 EditorView from a MarkdownView.
 	 * Resolution is based on DOM containment over a set of known CM6 views
 	 * registered by our global ViewPlugin. This avoids private Obsidian APIs.
@@ -2087,6 +2135,12 @@ export class EditorBindingManager {
 			Date.now() - pendingPatch.at <= 1000
 				? pendingPatch
 				: null;
+		this.detectSuspectedProviderRegressiveDelete(
+			binding,
+			pendingPatch?.origin ?? null,
+			editorContent,
+			incomingContent,
+		);
 		if (currentYTextContent === incomingContent) {
 			// Y.Text changed first: this is a normal Yjs/provider/local-repair patch,
 			// not an Obsidian disk reload originating in the editor document.
@@ -2204,6 +2258,21 @@ export class EditorBindingManager {
 					transaction.startState,
 				);
 			}
+			if (currentYTextContent !== incomingContent) {
+				// A `set` with no correlable disk mutation whose content differs
+				// from Y.Text: past every correlation/proof window this is the
+				// shape of a late host 3-way merge from an external disk write.
+				// Host provenance cannot be proven, so the transaction passes —
+				// but leave the breadcrumb for the policy-bypass audit (R5).
+				this.trace?.("editor", "external-disk-host-set-uncorrelated-pass", {
+					path: binding.path,
+					leafId,
+					cmId: binding.cmId,
+					editorLength: editorContent.length,
+					incomingLength: incomingContent.length,
+					yTextLength: currentYTextContent.length,
+				});
+			}
 		} else if (currentYTextContent === editorContent) {
 			// A non-user CodeMirror/API edit starts in the editor and is then copied
 			// into Y.Text by y-codemirror. It is a real successor of the visible
@@ -2296,7 +2365,7 @@ export class EditorBindingManager {
 		incomingText: string;
 	}): ExternalDiskHostProjectionProof | null {
 		const start = this.pendingExternalDiskMutationStarts.get(input.binding.path);
-		if (!start || Date.now() - start.at > EXTERNAL_DISK_RELOAD_CORRELATION_MS) {
+		if (!start || Date.now() - start.at > EXTERNAL_DISK_HOST_PROJECTION_PROOF_MS) {
 			if (start) {
 				this.pendingExternalDiskMutationStarts.delete(input.binding.path);
 			}
@@ -2665,9 +2734,11 @@ export class EditorBindingManager {
 				binding.path,
 				leafId,
 			),
-			yCollab(binding.ytext, this.vaultSync.provider.awareness, {
-				undoManager: binding.undoManager,
-			}),
+			buildCompositionAwareCollab(
+				binding.ytext,
+				this.vaultSync.provider.awareness,
+				{ undoManager: binding.undoManager },
+			),
 		];
 	}
 
@@ -2761,7 +2832,7 @@ export class EditorBindingManager {
 		if (
 			!start ||
 			start.sequence !== notice.sequence ||
-			now - start.at > EXTERNAL_DISK_RELOAD_CORRELATION_MS
+			now - start.at > EXTERNAL_DISK_HOST_PROJECTION_PROOF_MS
 		) {
 			return false;
 		}
@@ -3241,6 +3312,48 @@ export class EditorBindingManager {
 		return lastDocChangeAt != null && Date.now() - lastDocChangeAt < windowMs;
 	}
 
+	/**
+	 * Telemetry-only tripwire for the multi-device mirror-race failure mode:
+	 * a remote (provider/non-string-origin) projection whose net effect is a
+	 * deletion while this device's user typed very recently. A legitimate
+	 * concurrent remote delete can match this shape, so this NEVER mutates or
+	 * blocks anything — it only emits a flight event so the regression is
+	 * observable in production traces (and correlated with closed-file
+	 * reconcile decisions on the peers).
+	 */
+	private detectSuspectedProviderRegressiveDelete(
+		binding: EditorBinding,
+		yTextOrigin: unknown,
+		editorContent: string,
+		incomingContent: string,
+	): void {
+		if (typeof yTextOrigin === "string") return;
+		if (incomingContent.length >= editorContent.length) return;
+		if (!this.hasRecentUserDocumentEdit(binding, 10_000)) return;
+		const now = Date.now();
+		const lastNoticedAt = this.providerRegressiveNoticeAtByPath.get(binding.path) ?? 0;
+		if (now - lastNoticedAt < CONCURRENT_TYPING_NOTICE_COOLDOWN_MS) return;
+		this.providerRegressiveNoticeAtByPath.set(binding.path, now);
+		this.recordFlightPathEvent?.({
+			priority: "important",
+			kind: PRODUCT_EVENT_KIND.providerRegressiveDeleteSuspected,
+			severity: "warn",
+			scope: "file",
+			source: "editorBinding",
+			layer: "editor",
+			path: binding.path,
+			data: {
+				editorLength: editorContent.length,
+				incomingLength: incomingContent.length,
+				deletedChars: editorContent.length - incomingContent.length,
+				idleMs: binding.lastEditorDocChangeAtMs == null
+					? null
+					: now - binding.lastEditorDocChangeAtMs,
+				remoteTypers: this.getActiveRemoteTypersForPath(binding.path, now).length,
+			},
+		});
+	}
+
 	private recordYTextPatch(
 		ytext: Y.Text,
 		path: string,
@@ -3577,6 +3690,10 @@ export class EditorBindingManager {
 	): void {
 		if (update.transactions.length < 2 || !update.docChanged) return;
 		if (this.editorAuthorityShieldLeafIds.has(leafId)) return;
+		// A composition hold deliberately keeps editor≠ytext (the projection is
+		// withheld and pushes paused). Converging here would evict the held
+		// remote change from Y.Text; the hold's own flush merges both sides.
+		if (isCompositionHoldActive(update.view)) return;
 		let docChangedCount = 0;
 		let nonUserDocChanged = false;
 		for (const transaction of update.transactions) {
@@ -3994,9 +4111,36 @@ export class EditorBindingManager {
 			colorLight: "#30bced33",
 		});
 
-		const collabExtension = yCollab(ytext, this.vaultSync.provider.awareness, {
-			undoManager,
-		});
+		const collabExtension = buildCompositionAwareCollab(
+			ytext,
+			this.vaultSync.provider.awareness,
+			{
+				undoManager,
+				telemetry: {
+					onHold: (info) => {
+						this.trace?.("editor", "composition-hold-started", {
+							path: filePath,
+							leafId,
+							heldEvents: info.heldEvents,
+							baseLength: info.baseLength,
+						});
+					},
+					onFlush: (info) => {
+						this.trace?.("editor", "composition-hold-flushed", {
+							path: filePath,
+							leafId,
+							reason: info.reason,
+							kind: info.kind,
+							heldEvents: info.heldEvents,
+							baseLength: info.baseLength,
+							editorLength: info.editorLength,
+							ytextLength: info.ytextLength,
+							mergedLength: info.mergedLength,
+						});
+					},
+				},
+			},
+		);
 		const guardedCollabExtension = [
 			this.createYTextOriginCaptureExtension(ytext, filePath, leafId),
 			collabExtension,
@@ -4354,6 +4498,7 @@ export class EditorBindingManager {
 					`resolveBindingTarget: skipped binding for "${file.path}" ` +
 					`because open editor differs from CRDT (reason=${reason})`,
 				);
+				this.notifyBindingEditorDivergence(file.path);
 				return null;
 			}
 			return {

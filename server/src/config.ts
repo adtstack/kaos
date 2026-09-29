@@ -84,7 +84,7 @@ interface StoredTicket {
 
 interface AuditEvent {
 	at: number;
-	action: "claimed" | "recovery" | "pairing_created" | "device_paired" | "device_role_changed" | "device_revoked";
+	action: "claimed" | "recovery" | "pairing_created" | "device_paired" | "device_role_changed" | "device_revoked" | "device_renamed";
 	actorDeviceId: string | null;
 	targetDeviceId: string | null;
 	fingerprint: string | null;
@@ -319,6 +319,7 @@ export class ServerConfig {
 			case "/__kaos/devices/pair/create": return this.createPairing(body);
 			case "/__kaos/devices/role": return this.changeDeviceRole(body);
 			case "/__kaos/devices/revoke": return this.revokeDevice(body);
+			case "/__kaos/devices/rename": return this.renameDevice(body);
 			default: return json({ error: "not found" }, 404);
 		}
 	}
@@ -503,8 +504,14 @@ export class ServerConfig {
 			const existing = values.devices.find((device) => device.id === candidate.id);
 			if (existing?.status === "active") {
 				if (!samePublicKey(existing.publicKey, candidate.publicKey)) return json({ error: "active_device_key_mismatch" }, 409);
+				const updatedDevices = candidate.name && candidate.name !== existing.name
+					? values.devices.map((d) => d.id === candidate.id ? { ...d, name: candidate.name } : d)
+					: values.devices;
 				// Consume pairing
-				await txn.put({ [PAIRINGS_KEY]: activePairings.filter((p) => p !== matchedPairing) });
+				await txn.put({
+					[DEVICES_KEY]: updatedDevices,
+					[PAIRINGS_KEY]: activePairings.filter((p) => p !== matchedPairing),
+				});
 				return json({ ok: true, status: "active", deviceId: existing.id, fingerprint: existing.fingerprint, vaultId: values.vaultId });
 			}
 			if (!existing && values.devices.filter((device) => device.status === "active").length >= MAX_DEVICES) return json({ error: "device_limit_reached" }, 429);
@@ -667,6 +674,37 @@ export class ServerConfig {
 			const devices = values.devices.map((device) => device.id === target.id ? { ...device, status: "revoked" as const, revokedAt: now } : device);
 			await txn.put({ [DEVICES_KEY]: devices, [AUTH_GENERATION_KEY]: generation, [SESSIONS_KEY]: [], [TICKETS_KEY]: [], [CHALLENGES_KEY]: [], [AUDIT_KEY]: addAudit(values.audit, { at: now, action: "device_revoked", actorDeviceId: principal.deviceId, targetDeviceId: target.id, fingerprint: target.fingerprint }) });
 			return json({ ok: true, targetDeviceId: target.id, authGeneration: generation });
+		});
+	}
+
+	private async renameDevice(body: Record<string, unknown>): Promise<Response> {
+		if (!validId(body.targetDeviceId) || typeof body.deviceName !== "string") return json({ error: "invalid device rename" }, 400);
+		const deviceName = body.deviceName.trim();
+		if (!deviceName || deviceName.length > 64) return json({ error: "invalid device name" }, 400);
+		return this.state.storage.transaction(async (txn) => {
+			if (typeof body.session !== "string" || !validVaultId(body.vaultId)) return json({ error: "unauthorized" }, 401);
+			const principal = await this.principalForSession(txn, body.session, body.vaultId);
+			if (!principal) return json({ error: "unauthorized" }, 401);
+			if (principal.role !== "owner" && principal.deviceId !== body.targetDeviceId) {
+				return json({ error: "owner_required" }, 403);
+			}
+			const values = await this.readAuthValues(txn);
+			const target = values.devices.find((device) => device.id === body.targetDeviceId && device.status === "active");
+			if (!target) return json({ error: "active_device_not_found" }, 404);
+			if (target.name === deviceName) return json({ ok: true, targetDeviceId: target.id, deviceName });
+			const now = Date.now();
+			const devices = values.devices.map((device) => device.id === target.id ? { ...device, name: deviceName } : device);
+			await txn.put({
+				[DEVICES_KEY]: devices,
+				[AUDIT_KEY]: addAudit(values.audit, {
+					at: now,
+					action: "device_renamed",
+					actorDeviceId: principal.deviceId,
+					targetDeviceId: target.id,
+					fingerprint: target.fingerprint,
+				}),
+			});
+			return json({ ok: true, targetDeviceId: target.id, deviceName });
 		});
 	}
 

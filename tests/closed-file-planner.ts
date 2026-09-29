@@ -241,6 +241,63 @@ console.log("\n--- Test 12: non-ok path binding preserves CRDT as artifact ---")
 	assert(action.kind === "create-conflict-artifact" && action.pathBindingStatus === "duplicate-active-path", "status is carried");
 }
 
+console.log("\n--- Test 13: per-file settledAtMs evidence forwards to the conflict decision ---");
+{
+	// Missing baseline + a global save timestamp that would mask the offline
+	// edit + per-file settlement proving the edit happened after this file
+	// was last settled → disk wins with the per-file policy.
+	const action = planClosedFileReconcile(makeInput({
+		baselineHash: null,
+		diskMtime: 1500,
+		lastDiskIndexPersistedAt: 2000,
+		lastFileSettledAtMs: 1000,
+	}));
+	assert(action.kind === "create-conflict-artifact", "missing-baseline resolves via conflict artifact");
+	assert(action.kind === "create-conflict-artifact" && action.winner === "disk", "per-file evidence lets disk win");
+	assert(
+		action.kind === "create-conflict-artifact"
+			&& action.missingBaselinePolicy === "disk-mtime-after-last-file-settlement",
+		"per-file policy is surfaced",
+	);
+}
+
+// -----------------------------------------------------------------------
+// Self-mirror evidence threading
+// -----------------------------------------------------------------------
+
+console.log("\n--- Test 14: self-mirror disk never wins the tie-break ---");
+{
+	// both-changed with strict self-mirror evidence → CRDT wins, mirror
+	// catches up (no conflict artifact, no disk import).
+	const action = planClosedFileReconcile(makeInput({
+		diskHash: HASH_B,
+		crdtHash: HASH_C,
+		baselineHash: HASH_A,
+		diskChangeIsSelfMirror: true,
+	}));
+	assert(action.kind === "apply-remote-to-disk", "self-mirror both-changed applies remote");
+	assert(action.reason === "self-mirror-lag", "reason is self-mirror-lag");
+
+	// missing-baseline with self-written mtime evidence → still CRDT wins.
+	const missing = planClosedFileReconcile(makeInput({
+		baselineHash: null,
+		diskChangeIsSelfMirror: true,
+		diskMtime: 9000,
+		lastFileSettledAtMs: 1000,
+	}));
+	assert(missing.kind === "apply-remote-to-disk", "self-mirror missing-baseline applies remote");
+	assert(missing.reason === "self-mirror-lag", "missing-baseline self-mirror reason");
+
+	// Without the flag, legacy decisions are unchanged.
+	const legacy = planClosedFileReconcile(makeInput({
+		diskHash: HASH_B,
+		crdtHash: HASH_C,
+		baselineHash: HASH_A,
+	}));
+	assert(legacy.kind === "create-conflict-artifact", "legacy both-changed still preserves conflict");
+	assert(legacy.kind === "create-conflict-artifact" && legacy.winner === "disk", "legacy both-changed still disk-wins");
+}
+
 console.log(`\n${"─".repeat(55)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log(`${"─".repeat(55)}\n`);

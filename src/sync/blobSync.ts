@@ -425,18 +425,13 @@ interface DownloadItem {
 	rerunResets: number;
 }
 
-type ExistingDownloadOverwriteAuthority =
-	| {
-		kind: "causal-prior";
-		expectedLocalHash: string;
-		acceptableLocalHashes: ReadonlySet<string>;
-		settledRefAtStart: BlobRef | undefined;
-		settledSourceVersionAtStart: string | undefined;
-	}
-	| {
-		kind: "authoritative-remote";
-		expectedLocalHash: string;
-	};
+type ExistingDownloadOverwriteAuthority = {
+	kind: "causal-prior";
+	expectedLocalHash: string;
+	acceptableLocalHashes: ReadonlySet<string>;
+	settledRefAtStart: BlobRef | undefined;
+	settledSourceVersionAtStart: string | undefined;
+};
 
 interface ExactBlobFileSnapshot {
 	current: boolean;
@@ -4506,6 +4501,8 @@ export class BlobSyncManager {
 					this.discardDownloadItem(item);
 					return;
 				}
+
+
 			}
 
 			const downloadTimeoutMs = transferTimeoutMs(attemptSizeBytes);
@@ -4592,78 +4589,84 @@ export class BlobSyncManager {
 						settledSourceVersionAtStart,
 						downloadSettlementStage,
 					);
-				const overwriteAuthority: ExistingDownloadOverwriteAuthority = causalPrior
-					? {
+				if (causalPrior) {
+					const overwriteAuthority: ExistingDownloadOverwriteAuthority = {
 						kind: "causal-prior",
 						expectedLocalHash: diskHashBefore,
 						acceptableLocalHashes,
 						settledRefAtStart,
 						settledSourceVersionAtStart,
-					}
-					: {
-						kind: "authoritative-remote",
-						expectedLocalHash: diskHashBefore,
 					};
-				const overwriteResult = await this.replaceExistingDownloadNoClobber(
-					item,
-					existing,
-					normalized,
-					data,
-					attemptHash,
-					diskStatBefore,
-					generation,
-					overwriteAuthority,
-					downloadSettlementStage,
-				);
-
-				if (overwriteResult === "superseded") {
-					await this.abortSettlementStage(normalized, downloadSettlementStage);
-					const deferred = this.deferSupersededDownload(
+					const overwriteResult = await this.replaceExistingDownloadNoClobber(
 						item,
+						existing,
+						normalized,
+						data,
 						attemptHash,
-						"existing-no-clobber-swap-superseded",
-					);
-					if (!deferred) {
-						item.status = "pending";
-						item.readyAt = 0;
-						this.kickDownloadDrain();
-					}
-					return;
-				}
-				if (overwriteResult === "applied") {
-					if (!await this.recordAuthoritativeDownloadSettlement(
-						item,
-						attemptHash,
+						diskStatBefore,
+						generation,
+						overwriteAuthority,
 						downloadSettlementStage,
-					)) {
-						await this.abortSettlementStage(
-							normalized,
-							downloadSettlementStage,
-						);
-						if (this.deferSupersededDownload(
+					);
+
+					if (overwriteResult === "superseded") {
+						await this.abortSettlementStage(normalized, downloadSettlementStage);
+						const deferred = this.deferSupersededDownload(
 							item,
 							attemptHash,
-							"existing-overwrite-settlement-changed",
-						)) return;
-						throw new RetryableBlobOperationError(
-							`Download authority changed before settlement for "${normalized}"`,
-							undefined,
+							"existing-no-clobber-swap-superseded",
 						);
+						if (!deferred) {
+							item.status = "pending";
+							item.readyAt = 0;
+							this.kickDownloadDrain();
+						}
+						return;
 					}
-					this.trace?.("blob", "download-overwrite-decision", {
-						path: item.path,
-						hashPrefix: hashPrefix(attemptHash),
-						diskHashBeforePrefix: hashPrefix(diskHashBefore),
-						action: overwriteAuthority.kind === "causal-prior"
-							? "swap-clean-prior-ref-no-clobber"
-							: "authoritative-remote-wins",
-						sizeBytes: data.byteLength,
-					});
-					this.log(
-						`download: installed authoritative remote bytes for "${item.path}" ` +
-							`(${data.byteLength} bytes) in ${Date.now() - start}ms`,
-					);
-				} else {
+					if (overwriteResult === "applied") {
+						if (!await this.recordAuthoritativeDownloadSettlement(
+							item,
+							attemptHash,
+							downloadSettlementStage,
+						)) {
+							await this.abortSettlementStage(
+								normalized,
+								downloadSettlementStage,
+							);
+							if (this.deferSupersededDownload(
+								item,
+								attemptHash,
+								"existing-overwrite-settlement-changed",
+							)) return;
+							throw new RetryableBlobOperationError(
+								`Download authority changed before settlement for "${normalized}"`,
+								undefined,
+							);
+						}
+						this.trace?.("blob", "download-overwrite-decision", {
+							path: item.path,
+							hashPrefix: hashPrefix(attemptHash),
+							diskHashBeforePrefix: hashPrefix(diskHashBefore),
+							action: "swap-clean-prior-ref-no-clobber",
+							sizeBytes: data.byteLength,
+						});
+						this.log(
+							`download: installed authoritative remote bytes for "${item.path}" ` +
+								`(${data.byteLength} bytes) in ${Date.now() - start}ms`,
+						);
+						this._completedDownloads++;
+						if (item.needsRerun) {
+							this.prepareDownloadRerun(item);
+							this.log(
+								`download: success "${item.path}" in ${Date.now() - start}ms (queued rerun)`,
+							);
+							this.kickDownloadDrain();
+						} else {
+							this.discardDownloadItem(item);
+						}
+						return;
+					}
+
 					await this.abortSettlementStage(normalized, downloadSettlementStage);
 					if (this.deferSupersededDownload(
 						item,
@@ -4681,6 +4684,51 @@ export class BlobSyncManager {
 						undefined,
 					);
 				}
+
+				await this.abortSettlementStage(normalized, downloadSettlementStage);
+				if (this.deferSupersededDownload(
+					item,
+					attemptHash,
+					"conflict-artifact-write",
+				)) return;
+				if (this.cancelDownloadIfFenced(
+					item,
+					generation,
+					"conflict-artifact-write",
+				)) return;
+				const conflictPath = await this.writeDownloadConflictArtifact(
+					normalized,
+					data,
+					attemptHash,
+					"existing-changed-during-download",
+					{ path: normalized, generation },
+				);
+				if (this.deferSupersededDownload(
+					item,
+					attemptHash,
+					"after-conflict-artifact-write",
+				)) return;
+				this.quarantineDownloadConflict(
+					normalized,
+					diskHashBefore,
+					attemptHash,
+					conflictPath,
+				);
+				this.trace?.("blob", "download-conflict-quarantined", {
+					path: item.path,
+					conflictPath,
+					hashPrefix: hashPrefix(attemptHash),
+					diskHashBeforePrefix: hashPrefix(diskHashBefore),
+					reason: "existing-changed-during-download",
+					action: "preserve-local-and-remote-artifact",
+					sizeBytes: data.byteLength,
+				});
+				this.log(
+					`download: conflict artifact "${conflictPath}" for "${item.path}" ` +
+						`(${data.byteLength} bytes) in ${Date.now() - start}ms`,
+				);
+				this.discardDownloadItem(item);
+				return;
 			} else {
 				this.trace?.("blob", "download-overwrite-decision", {
 					path: item.path,
@@ -4803,7 +4851,7 @@ export class BlobSyncManager {
 								undefined,
 							);
 						}
-					} else if (!await this.resolveAuthoritativeCreateRace(
+					} else if (!await this.resolveCreateRaceConflict(
 						item,
 						normalized,
 						data,
@@ -4815,13 +4863,21 @@ export class BlobSyncManager {
 					}
 				} catch (err) {
 					if (createCallCompleted) throw err;
+					const resolved = this.app.vault.getAbstractFileByPath(normalized);
+					if (!(resolved instanceof TFile)) {
+						await this.abortSettlementStage(normalized, downloadSettlementStage);
+						throw new RetryableBlobOperationError(
+							`Attachment creation temporarily unavailable for "${normalized}"`,
+							err,
+						);
+					}
 					if (!isAlreadyExistsError(err)) {
 						this.trace?.("blob", "download-create-rejected-after-materialization", {
 							path: normalized,
 							error: err instanceof Error ? err.message : String(err),
 						});
 					}
-					if (!await this.resolveAuthoritativeCreateRace(
+					if (!await this.resolveCreateRaceConflict(
 						item,
 						normalized,
 						data,
@@ -5621,13 +5677,6 @@ export class BlobSyncManager {
 						|| this.downloadQueue.get(item.path) !== item
 						|| item.generation !== generation
 					) return false;
-					if (authority.kind === "authoritative-remote") {
-						return this.isDownloadStageAuthoritative(
-							item,
-							attemptHash,
-							stage,
-						);
-					}
 					return authority.acceptableLocalHashes.has(hash)
 						&& this.isDownloadPredecessorAuthoritative(
 							item,
@@ -5639,9 +5688,7 @@ export class BlobSyncManager {
 						);
 				},
 				generation,
-				authority.kind === "causal-prior"
-					? "remote-existing-file-advance"
-					: "authoritative-remote-wins",
+				"remote-existing-file-advance",
 				false,
 				true,
 			);
@@ -5742,27 +5789,18 @@ export class BlobSyncManager {
 		return "applied";
 	}
 
-	private async settleAuthoritativeCreateRace(
+	private async resolveCreateRaceConflict(
 		item: DownloadItem,
 		normalized: string,
 		data: ArrayBuffer,
 		attemptHash: string,
 		generation: number,
 		stage: BlobSettlementStage,
-	): Promise<{
-		result: "applied" | "conflict" | "superseded";
-		diskHash: string | null;
-		overwrote: boolean;
-	}> {
+	): Promise<boolean> {
 		const occupant = this.app.vault.getAbstractFileByPath(normalized);
 		if (!(occupant instanceof TFile)) {
-			return {
-				result: this.isDownloadStageAuthoritative(item, attemptHash, stage)
-					? "conflict"
-					: "superseded",
-				diskHash: null,
-				overwrote: false,
-			};
+			await this.abortSettlementStage(normalized, stage);
+			return false;
 		}
 		const diskStat = {
 			mtime: occupant.stat.mtime,
@@ -5774,109 +5812,68 @@ export class BlobSyncManager {
 			diskStat,
 		);
 		if (!snapshot.current || snapshot.hash === null) {
-			return {
-				result: this.isDownloadStageAuthoritative(item, attemptHash, stage)
-					? "conflict"
-					: "superseded",
-				diskHash: snapshot.hash,
-				overwrote: false,
-			};
+			await this.abortSettlementStage(normalized, stage);
+			throw new RetryableBlobOperationError(
+				`Attachment changed during create race for "${normalized}"`,
+				undefined,
+			);
 		}
 		if (snapshot.hash === attemptHash) {
-			return {
-				result: this.isDownloadStageAuthoritative(item, attemptHash, stage)
-					? "applied"
-					: "superseded",
-				diskHash: snapshot.hash,
-				overwrote: false,
-			};
-		}
-		const result = await this.replaceExistingDownloadNoClobber(
-			item,
-			occupant,
-			normalized,
-			data,
-			attemptHash,
-			diskStat,
-			generation,
-			{
-				kind: "authoritative-remote",
-				expectedLocalHash: snapshot.hash,
-			},
-			stage,
-		);
-		return {
-			result,
-			diskHash: snapshot.hash,
-			overwrote: result === "applied",
-		};
-	}
-
-	private async resolveAuthoritativeCreateRace(
-		item: DownloadItem,
-		normalized: string,
-		data: ArrayBuffer,
-		attemptHash: string,
-		generation: number,
-		stage: BlobSettlementStage,
-	): Promise<boolean> {
-		const race = await this.settleAuthoritativeCreateRace(
-			item,
-			normalized,
-			data,
-			attemptHash,
-			generation,
-			stage,
-		);
-		if (race.result === "superseded") {
-			await this.abortSettlementStage(normalized, stage);
-			const deferred = this.deferSupersededDownload(
-				item,
-				attemptHash,
-				"authoritative-create-race-superseded",
-			);
-			if (!deferred) {
-				item.status = "pending";
-				item.readyAt = 0;
-				this.kickDownloadDrain();
+			if (!this.isDownloadStageAuthoritative(item, attemptHash, stage)) {
+				await this.abortSettlementStage(normalized, stage);
+				return false;
 			}
-			return false;
-		}
-		if (race.result === "conflict") {
-			await this.abortSettlementStage(normalized, stage);
-			this.trace?.("blob", "authoritative-remote-retry", {
+			if (!await this.recordAuthoritativeDownloadSettlement(item, attemptHash, stage)) {
+				await this.abortSettlementStage(normalized, stage);
+				return false;
+			}
+			this.trace?.("blob", "download-overwrite-decision", {
 				path: normalized,
 				hashPrefix: hashPrefix(attemptHash),
-				diskHashBeforePrefix: hashPrefix(race.diskHash),
-				reason: "create-race-local-epoch-changed",
+				diskHashBeforePrefix: hashPrefix(snapshot.hash),
+				action: "skip-create-race-match",
+				sizeBytes: data.byteLength,
 			});
-			throw new RetryableBlobOperationError(
-				`Attachment changed during authoritative create race for "${normalized}"`,
-				undefined,
-			);
+			return true;
 		}
-		if (!await this.recordAuthoritativeDownloadSettlement(item, attemptHash, stage)) {
-			await this.abortSettlementStage(normalized, stage);
-			if (this.deferSupersededDownload(
-				item,
-				attemptHash,
-				"authoritative-create-race-settlement-changed",
-			)) return false;
-			throw new RetryableBlobOperationError(
-				`Create-race authority changed before settlement for "${normalized}"`,
-				undefined,
-			);
+
+		await this.abortSettlementStage(normalized, stage);
+		if (this.deferSupersededDownload(item, attemptHash, "create-race-conflict-artifact")) {
+			return false;
 		}
-		this.trace?.("blob", "download-overwrite-decision", {
-			path: normalized,
+		if (this.cancelDownloadIfFenced(item, generation, "create-race-conflict-artifact")) {
+			return false;
+		}
+		const conflictPath = await this.writeDownloadConflictArtifact(
+			normalized,
+			data,
+			attemptHash,
+			"create-race-mismatch",
+			{ path: normalized, generation },
+		);
+		if (this.deferSupersededDownload(item, attemptHash, "after-create-race-conflict-artifact")) {
+			return false;
+		}
+		this.quarantineDownloadConflict(
+			normalized,
+			snapshot.hash,
+			attemptHash,
+			conflictPath,
+		);
+		this.trace?.("blob", "download-conflict-quarantined", {
+			path: item.path,
+			conflictPath,
 			hashPrefix: hashPrefix(attemptHash),
-			diskHashBeforePrefix: hashPrefix(race.diskHash),
-			action: race.overwrote
-				? "authoritative-remote-wins"
-				: "skip-create-race-match",
+			diskHashBeforePrefix: hashPrefix(snapshot.hash),
+			reason: "create-race-mismatch",
+			action: "preserve-local-and-remote-artifact",
 			sizeBytes: data.byteLength,
 		});
-		return true;
+		this.log(
+			`download: conflict artifact "${conflictPath}" after create race for "${item.path}" (${data.byteLength} bytes)`,
+		);
+		this.discardDownloadItem(item);
+		return false;
 	}
 
 	// -------------------------------------------------------------------

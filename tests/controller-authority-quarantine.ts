@@ -186,6 +186,8 @@ console.log("\n--- Controller quarantine: persisted markers block every full-rec
 		}) as never,
 		getVaultSync: () => vaultSync,
 		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			getPreservedUnresolvedEntries: () => [...entries.values()].map((entry) => ({ ...entry })),
 			isPreservedUnresolved: (path: string) => entries.has(path),
 			clearPreservedUnresolved: (path: string) => {
@@ -305,6 +307,8 @@ function makeDirtyFixture(options: DirtyFixtureOptions = {}) {
 			},
 		}) as never,
 		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			getPreservedUnresolvedEntries: () => entry ? [{ ...entry }] : [],
 			isPreservedUnresolved: () => entry !== null,
 			clearPreservedUnresolved: () => {
@@ -678,6 +682,8 @@ console.log("\n--- Closed reconcile: same-bytes TFile delete/recreate ABA fails 
 			isMarkdownTombstoned: () => false,
 		}) as never,
 		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			getPreservedUnresolvedEntries: () => [],
 			isPreservedUnresolved: () => false,
 			recordPreservedUnresolved: () => {},
@@ -813,6 +819,8 @@ function makeVisibleWinnerMarkerRace(winner: "disk" | "crdt") {
 		}) as never,
 		getVaultSync: () => vaultSync as never,
 		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			getPreservedUnresolvedEntries: () => entry ? [{ ...entry }] : [],
 			isPreservedUnresolved: (candidate: string) => candidate === path && entry !== null,
 			clearPreservedUnresolved: () => {
@@ -1029,6 +1037,8 @@ console.log("\n--- Open reconcile: programmatic editor successor replaces a defe
 			getFileIdForText: () => "open-file-id",
 		}) as never,
 		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			recordPreservedUnresolved: (candidate: string, reason: string) => {
 				markerRecords.push({ path: candidate, reason });
 				if (candidate === path) activeAttentionReason = reason;

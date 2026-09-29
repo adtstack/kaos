@@ -107,6 +107,9 @@ export class RecoveryHistoryModal extends Modal {
 		this.manifests = manifests.slice();
 		this.nextCursor = nextCursor;
 		this.rebuildHistory();
+		if (options.initialPath) {
+			this.query = options.initialPath;
+		}
 		const initial = resolveRecoveryHistoryFeedState(this.manifests, options);
 		this.historyScope = initial.scope;
 		this.selectedChangeKey = initial.selectedChangeKey;
@@ -213,10 +216,22 @@ export class RecoveryHistoryModal extends Modal {
 	}
 
 	private renderScopeRail(parent: HTMLElement): void {
+		const trimmedQuery = this.query.trim().toLowerCase();
 		for (const snapshot of this.snapshots) {
+			let detail = `${snapshot.changedItems.length} changed`;
+			if (trimmedQuery.length > 0) {
+				const matches = snapshot.changedItems.some((item) => {
+					const p = (item.entry.newPath ?? item.entry.path).toLowerCase();
+					const op = (item.entry.oldPath ?? "").toLowerCase();
+					return p.includes(trimmedQuery) || op.includes(trimmedQuery);
+				});
+				if (matches) {
+					detail = `${snapshot.changedItems.length} changed (match)`;
+				}
+			}
 			this.renderScopeRow(parent, {
 				label: formatDate(snapshot.manifest.createdAt),
-				detail: `${snapshot.changedItems.length} changed`,
+				detail,
 				scope: { kind: "manifest", manifestId: snapshot.manifest.manifestId },
 			});
 		}

@@ -37,6 +37,7 @@ export interface RecoveryHistoryInitialSelection {
 	initialManifestId?: string;
 	initialFileId?: string;
 	autoExpandDiff?: boolean;
+	initialPath?: string;
 }
 
 export interface RecoveryHistoryResolvedSelection {
@@ -145,6 +146,23 @@ export function resolveRecoveryHistoryFeedState(
 	const latestScope: RecoveryHistoryScope = latestManifestId
 		? { kind: "manifest" as const, manifestId: latestManifestId }
 		: { kind: "none" };
+
+	if (options?.initialPath) {
+		const targetPath = options.initialPath.replace(/\\/g, "/");
+		const matchingChange = changes.find((item) =>
+			item.entry.path === targetPath ||
+			item.entry.newPath === targetPath ||
+			item.entry.oldPath === targetPath ||
+			item.displayPath === targetPath,
+		);
+		if (matchingChange) {
+			return {
+				scope: { kind: "manifest", manifestId: matchingChange.manifest.manifestId },
+				selectedChangeKey: matchingChange.key,
+			};
+		}
+	}
+
 	if (!options?.initialManifestId || !options.initialFileId) {
 		return {
 			scope: latestScope,
@@ -187,6 +205,29 @@ export function resolveRecoveryHistoryInitialSelection(
 ): RecoveryHistoryResolvedSelection {
 	const snapshots = buildRecoverySnapshotHistories(manifests);
 	const defaultManifestId = snapshots[0]?.manifest.manifestId ?? null;
+
+	if (options?.initialPath) {
+		const targetPath = options.initialPath.replace(/\\/g, "/");
+		for (const snapshot of snapshots) {
+			const item = snapshot.changedItems.find((candidate) =>
+				candidate.entry.path === targetPath ||
+				candidate.entry.newPath === targetPath ||
+				candidate.entry.oldPath === targetPath ||
+				(candidate.entry.newPath ?? candidate.entry.path) === targetPath,
+			);
+			if (item) {
+				return {
+					selectedManifestId: snapshot.manifest.manifestId,
+					selectedFileId: item.entry.fileId,
+					expandedDiffKey: options.autoExpandDiff !== false &&
+						(item.entry.previousContentHash || item.entry.contentHash)
+						? fileHistoryDiffKey(item)
+						: null,
+				};
+			}
+		}
+	}
+
 	if (!options?.initialManifestId || !options.initialFileId) {
 		return {
 			selectedManifestId: defaultManifestId,

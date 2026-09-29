@@ -31,6 +31,7 @@ import type {
 	DashboardStuckLocalMutationResolutionTarget,
 	DashboardTone,
 	KaosDashboardData,
+	ResolvedAttentionItem,
 } from "./dashboardTypes";
 import {
 	deriveDashboardHealth,
@@ -92,6 +93,7 @@ export interface KaosDashboardActions {
 		target: DashboardBlobConflictResolutionTarget,
 		choice: DashboardBlobConflictResolutionChoice,
 	): Promise<DashboardBlobConflictResolutionResult>;
+	clearResolvedAttentionHistory?(): Promise<void>;
 }
 
 export interface KaosDashboardViewDeps {
@@ -187,7 +189,11 @@ export class KaosDashboardView extends ItemView {
 		if (!this.data) return;
 
 		this.renderHealthSummary(root, this.data);
-		if (this.data.attentionTotalCount > 0) {
+		const hasAttentionContent = this.data.attentionTotalCount > 0
+			|| this.data.attention.length > 0
+			|| (this.data.attentionAudit && (this.data.attentionAudit.summary.retirableCount > 0 || this.data.attentionAudit.summary.needsReviewCount > 0))
+			|| (this.data.resolvedAttentionHistory && this.data.resolvedAttentionHistory.length > 0);
+		if (hasAttentionContent) {
 			this.renderAttention(root, this.data.attention, this.data.attentionTotalCount);
 		}
 		if (this.data.conflicts.length > 0) {
@@ -633,12 +639,15 @@ export class KaosDashboardView extends ItemView {
 		items: DashboardAttentionItem[],
 		totalCount: number,
 	): void {
+		const audit = this.lastAuditResult ?? this.data?.attentionAudit;
+		const retirableCount = audit?.summary.retirableCount ?? 0;
 		const attentionTone = items.some((item) => item.tone === "error") ? "error" : "warn";
-		const section = this.section(root, `Attention (${totalCount})`, `kaos-dashboard-callout is-${attentionTone}`);
-		if (totalCount === 0) {
-			section.createDiv({ text: "No files currently need attention.", cls: "kaos-dashboard-muted" });
-			return;
-		}
+		const displayCount = totalCount > 0
+			? totalCount
+			: retirableCount > 0
+				? `${retirableCount} retirable`
+				: 0;
+		const section = this.section(root, `Attention (${displayCount})`, `kaos-dashboard-callout is-${attentionTone}`);
 
 		const toolbar = section.createDiv({ cls: "kaos-dashboard-row-actions kaos-dashboard-attention-toolbar" });
 		this.button(
@@ -648,7 +657,6 @@ export class KaosDashboardView extends ItemView {
 			this.isAuditingAttention || this.isRetiringAttention,
 		);
 
-		const audit = this.lastAuditResult ?? this.data?.attentionAudit;
 		const auditItemByPath = new Map<string, AttentionAuditItem>();
 		if (audit) {
 			for (const auditItem of audit.items) {
@@ -680,19 +688,22 @@ export class KaosDashboardView extends ItemView {
 			}
 		}
 
-		if (items.length < totalCount) {
+		if (items.length === 0 && retirableCount === 0) {
+			section.createDiv({ text: "No active files currently need attention.", cls: "kaos-dashboard-muted" });
+		} else if (items.length > 0) {
+			if (items.length < totalCount) {
+				section.createDiv({
+					text: `Showing ${items.length} representative row(s) for ${totalCount} attention item(s).`,
+					cls: "kaos-dashboard-muted",
+				});
+			}
 			section.createDiv({
-				text: `Showing ${items.length} representative row(s) for ${totalCount} attention item(s).`,
-				cls: "kaos-dashboard-muted",
+				text: "Remote deletions can be resolved here. Other attention types show the safest available next step.",
+				cls: "kaos-dashboard-muted kaos-dashboard-attention-help",
 			});
-		}
-		section.createDiv({
-			text: "Remote deletions can be resolved here. Other attention types show the safest available next step.",
-			cls: "kaos-dashboard-muted kaos-dashboard-attention-help",
-		});
-		const list = section.createDiv({ cls: "kaos-dashboard-list" });
-		for (const item of items) {
-			const row = list.createDiv({ cls: `kaos-dashboard-row ${toneClass(item.tone)}` });
+			const list = section.createDiv({ cls: "kaos-dashboard-list" });
+			for (const item of items) {
+				const row = list.createDiv({ cls: `kaos-dashboard-row ${toneClass(item.tone)}` });
 			row.createDiv({ text: item.path ?? item.title, cls: "kaos-dashboard-path" });
 			const path = item.path;
 			const normalizedPath = path ? normalizePath(path) : null;
@@ -852,6 +863,11 @@ export class KaosDashboardView extends ItemView {
 				);
 			}
 		}
+		}
+
+		if (this.data?.resolvedAttentionHistory && this.data.resolvedAttentionHistory.length > 0) {
+			this.renderResolvedAttentionHistory(section, this.data.resolvedAttentionHistory);
+		}
 	}
 
 	private renderStructuralChangeDetail(
@@ -881,6 +897,8 @@ export class KaosDashboardView extends ItemView {
 				return "This condition must be reviewed and reconciled before KAOS can choose a safe file operation.";
 			case "remote-projection-policy":
 				return "Correct the shared exclude policy; local and editor changes remain active while remote projection is paused.";
+			case "room-divergence":
+				return "Run the sync check to identify whether this device is paired to the wrong room or frozen by a closed projection gate.";
 		}
 	}
 
@@ -1507,6 +1525,71 @@ export class KaosDashboardView extends ItemView {
 	private async copyPath(path: string): Promise<void> {
 		await navigator.clipboard.writeText(path);
 		new Notice("Path copied.");
+	}
+
+	private renderResolvedAttentionHistory(
+		root: HTMLElement,
+		history: ResolvedAttentionItem[],
+	): void {
+		if (history.length === 0) return;
+		const details = root.createEl("details", {
+			cls: "kaos-dashboard-disclosure kaos-dashboard-attention-history-disclosure",
+		});
+		const summary = details.createEl("summary", { cls: "kaos-dashboard-disclosure-summary" });
+		const copy = summary.createSpan({ cls: "kaos-dashboard-disclosure-copy" });
+		copy.createSpan({ text: `Resolved attention history (${history.length})`, cls: "kaos-dashboard-disclosure-title" });
+		copy.createSpan({ text: "Recently retired and settled attention markers", cls: "kaos-dashboard-disclosure-detail" });
+		const body = details.createDiv({ cls: "kaos-dashboard-disclosure-body" });
+
+		const toolbar = body.createDiv({ cls: "kaos-dashboard-row-actions" });
+		this.button(
+			toolbar,
+			"Clear history",
+			() => {
+				new ConfirmModal(
+					this.app,
+					"Clear resolved attention history?",
+					"This will clear the history of resolved attention markers displayed in the dashboard. Existing files and sync documents are not affected.",
+					async () => {
+						await this.deps.actions.clearResolvedAttentionHistory?.();
+						await this.refresh();
+					},
+					"Clear history",
+					"Cancel",
+					() => {},
+					"mod-warning",
+				).open();
+			},
+			!this.deps.actions.clearResolvedAttentionHistory,
+		);
+
+		const list = body.createDiv({ cls: "kaos-dashboard-list" });
+		for (const entry of history) {
+			const row = list.createDiv({ cls: "kaos-dashboard-row is-muted" });
+			row.createDiv({ text: entry.path, cls: "kaos-dashboard-path" });
+			const metaParts = [
+				entry.kind,
+				entry.reason,
+				entry.resolution,
+				formatDateTime(new Date(entry.resolvedAt).toISOString()),
+			];
+			if (entry.pairPath) {
+				metaParts.push(`pair: ${entry.pairPath}`);
+			}
+			row.createDiv({ text: metaParts.join(" · "), cls: "kaos-dashboard-muted" });
+			if (entry.summary) {
+				row.createDiv({ text: entry.summary, cls: "kaos-dashboard-subpath kaos-dashboard-muted" });
+			}
+			const actions = row.createDiv({ cls: "kaos-dashboard-row-actions" });
+			const exists = this.app.vault.getAbstractFileByPath(normalizePath(entry.path)) !== null;
+			if (exists) {
+				this.button(actions, "Open file", () => this.openPath(entry.path));
+			}
+			if (entry.pairPath && this.app.vault.getAbstractFileByPath(normalizePath(entry.pairPath)) !== null) {
+				this.button(actions, "Open pair", () => this.openPath(entry.pairPath!));
+			}
+			this.button(actions, "Copy path", () => this.copyPath(entry.path));
+		}
 	}
 }
 

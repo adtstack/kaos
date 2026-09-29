@@ -405,6 +405,8 @@ console.log("\n--- Test 2b1: baseline records the disk snapshot C1, never later 
 		getRuntimeConfig: () => ({ maxFileSizeBytes: 0, maxFileSizeKB: 0, excludePatterns: [] }) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			flushWrite: async () => {
 				doc.transact(() => {
 					ytext.delete(0, ytext.length);
@@ -520,6 +522,8 @@ console.log("\n--- Test 2c: fenced disk conflict winner settles its baseline imm
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			flushWrite: async (flushPath: string) => { flushed.push(flushPath); },
 			suppressLocalCreate: async () => {},
 		}) as any,
@@ -632,6 +636,8 @@ console.log("\n--- Test 2c1: closed-file stale decision cannot overwrite a newer
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			flushWrite: async () => { throw new Error("stale disk decision must not flush"); },
 			suppressLocalCreate: async () => {},
 			recordPreservedUnresolved: () => {},
@@ -764,6 +770,8 @@ console.log("\n--- Test 2c2: pending local create wins missing-baseline reconcil
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			flushWrite: async (flushPath: string) => { flushed.push(flushPath); },
 			suppressLocalCreate: async () => {},
 		}) as any,
@@ -895,6 +903,8 @@ console.log("\n--- Test 2d: startup open editor content wins before binding can 
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			flushWrite: async (flushPath: string) => { flushed.push(flushPath); },
 			suppressLocalCreate: async () => {},
 		}) as any,
@@ -1030,6 +1040,8 @@ console.log("\n--- Test 2d1: remote C2 cannot be reverted by the stale open edit
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			flushWrite: async (
 				flushPath: string,
 				_force?: boolean,
@@ -1209,6 +1221,8 @@ console.log("\n--- Test 2e: recent startup typing defers open editor conflict cr
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			flushWrite: async () => {},
 			suppressLocalCreate: async () => {},
 			clearPreservedUnresolved: () => {},
@@ -1372,6 +1386,8 @@ console.log("\n--- Test 2f: startup editor ahead of disk and CRDT defers without
 		}) as any,
 		getVaultSync: () => vaultSync as any,
 		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			flushWrite: async () => {},
 			suppressLocalCreate: async () => {},
 			clearPreservedUnresolved: () => {},
@@ -1544,6 +1560,139 @@ console.log("\n--- Test 3: reconciliation safety brake leaves blocked overwrites
 		),
 		"blocked disk-index advancement is traced",
 	);
+}
+
+console.log("\n--- Test 3b: safety brake still flushes additive creates ---");
+{
+	const updatePaths = Array.from({ length: 30 }, (_, i) => `blocked-${i}.md`);
+	const createPaths = Array.from({ length: 5 }, (_, i) => `download-${i}.md`);
+	const updateFiles = updatePaths.map(makeTFile);
+	let diskIndex: DiskIndex = {};
+	for (const path of updatePaths) {
+		diskIndex[path] = { mtime: 1, size: 1 };
+	}
+
+	const stats = new Map<string, { mtime: number; size: number }>();
+	for (const path of updatePaths) {
+		stats.set(path, { mtime: 2, size: 2 });
+	}
+
+	const reads: string[] = [];
+	const flushed: string[] = [];
+	const baselineTexts = new Map<string, string>();
+	const traces: Array<{ source: string; msg: string; details?: Record<string, unknown> }> = [];
+	let saveDiskIndexCalls = 0;
+
+	const app = {
+		vault: {
+			getMarkdownFiles: () => updateFiles,
+			read: async (file: TFile & { path: string }) => {
+				reads.push(file.path);
+				return `local ${file.path}`;
+			},
+			adapter: {
+				stat: async (path: string) => stats.get(path) ?? null,
+			},
+			getAbstractFileByPath: () => null,
+		},
+		workspace: {
+			iterateAllLeaves: () => {},
+		},
+	};
+
+	const vaultSync = {
+		getTextForPath: (candidate: string) => ({ toJSON: () => `remote ${candidate}` }),
+		getActiveMarkdownPaths: () => [...updatePaths, ...createPaths],
+		reconcileVault: () => ({
+			mode: "authoritative",
+			createdOnDisk: createPaths,
+			updatedOnDisk: updatePaths,
+			seededToCrdt: [],
+			untracked: [],
+			skipped: 0,
+		}),
+		runIntegrityChecks: () => ({ duplicateIds: 0, orphansCleaned: 0 }),
+	};
+
+	const controller = new ReconciliationController({
+		app: app as any,
+		getSettings: () => ({ deviceName: "device" }) as any,
+		getRuntimeConfig: () => ({
+			maxFileSizeBytes: 0,
+			maxFileSizeKB: 0,
+			excludePatterns: [],
+		}) as any,
+		getVaultSync: () => vaultSync as any,
+		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
+			flushWrite: async (flushPath: string) => {
+				flushed.push(flushPath);
+				const content = `remote ${flushPath}`;
+				return {
+					kind: "written" as const,
+					path: flushPath,
+					isCreate: true,
+					content,
+					contentHash: await contentBaselineHash(content),
+					baselineRecorded: true,
+				};
+			},
+		}) as any,
+		getBlobSync: () => null,
+		getEditorBindings: () => null,
+		getDiskIndex: () => diskIndex,
+		setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
+		recordBaselineText: (hash: string, text: string) => { baselineTexts.set(hash, text); },
+		isMarkdownPathSyncable: () => true,
+		shouldBlockFrontmatterIngest: () => false,
+		refreshServerCapabilities: async () => {},
+		validateOpenEditorBindings: () => {},
+		onReconciled: () => {},
+		getAwaitingFirstProviderSyncAfterStartup: () => false,
+		setAwaitingFirstProviderSyncAfterStartup: () => {},
+		saveDiskIndex: async () => { saveDiskIndexCalls++; },
+		refreshStatusBar: () => {},
+		trace: (source: string, msg: string, details?: Record<string, unknown>) => {
+			traces.push({ source, msg, details });
+		},
+		scheduleTraceStateSnapshot: () => {},
+		log: () => {},
+	});
+
+	await controller.runReconciliation("authoritative");
+
+	assert(
+		traces.some((event) => event.msg === "reconcile-safety-brake-blocked"),
+		"brake triggers for the divergent update batch",
+	);
+	assert(flushed.length === 5, "brake does not block additive creates");
+	for (const path of createPaths) {
+		assert(flushed.includes(path), `additive create reaches DiskMirror under brake: ${path}`);
+		assert(path in diskIndex, `created path ${path} is indexed in diskIndex`);
+	}
+	for (const path of updatePaths) {
+		assert(!flushed.includes(path), `destructive update stays blocked: ${path}`);
+	}
+	assert(reads.length === 30, "only disk-present files are read");
+	for (const path of createPaths) {
+		const hash = await contentBaselineHash(`remote ${path}`);
+		assert(
+			baselineTexts.get(hash) === `remote ${path}`,
+			`create baseline text is recorded under brake: ${path}`,
+		);
+	}
+	const lastStats = controller.getState().lastReconcileStats;
+	assert(lastStats?.flushedCreates === 5, "flushedCreates is counted in brake mode");
+	assert(lastStats?.flushedUpdates === 0, "flushedUpdates is 0 in brake mode");
+	assert(lastStats?.safetyBrakeTriggered === true, "reconcile stats report the brake");
+	for (const path of updatePaths) {
+		assert(
+			path in diskIndex && diskIndex[path]?.mtime === 1,
+			`blocked path keeps its previous durable baseline entry: ${path}`,
+		);
+	}
+	assert(saveDiskIndexCalls >= 1, "disk index save was called");
 }
 
 console.log("\n--- Test 4: second reconcile reads blocked paths again ---");

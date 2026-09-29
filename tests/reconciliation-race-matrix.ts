@@ -177,6 +177,8 @@ for (const transition of ["save", "rename"] as const) {
 		app,
 		vaultSync,
 		diskMirror: {
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			flushWrite: async () => { throw new Error("stale disk-only snapshot must not flush"); },
 		},
 		getDiskIndex: () => diskIndex,
@@ -267,6 +269,8 @@ console.log("\n--- Race 2: opening/binding during artifact I/O aborts closed mut
 			app,
 			vaultSync,
 			diskMirror: {
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 				suppressLocalCreate: async () => {},
 				flushWrite: async () => {
 					flushCount++;
@@ -370,6 +374,8 @@ console.log("\n--- Race 3: newer C2 baseline callback wins older C1 final commit
 	};
 
 	const diskMirror = {
+	hasPendingWrite: () => false,
+	getLastDiskWriteOkHash: () => null,
 		clearPreservedUnresolved: () => {},
 		flushWrite: async (path: string) => {
 			flushOrder.push(path);
@@ -532,6 +538,8 @@ console.log("\n--- Race 4: full reconcile equality cannot publish after provider
 			vaultSync,
 			editorBindings,
 			diskMirror: {
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 				flushWrite: async () => {
 					throw new Error("stale full settlement must not flush");
 				},
@@ -713,6 +721,8 @@ for (const [advance, expectedReason] of Object.entries(
 			vaultSync,
 			editorBindings,
 			diskMirror: {
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 				flushWrite: async () => {
 					throw new Error("stale full editor settlement must not flush");
 				},

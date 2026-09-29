@@ -13,6 +13,7 @@ import type {
 	PreservedUnresolvedKind,
 	PreservedUnresolvedReason,
 	RemoteDeletePreservedUnresolvedReason,
+	ResolvedAttentionItem,
 } from "../sync/preservedUnresolved";
 import type { BlobRef } from "../types";
 
@@ -39,9 +40,10 @@ export interface DashboardFileHistoryAttempt {
 }
 
 export interface DashboardRecoveryHistoryTarget {
-	initialManifestId: string;
-	initialFileId: string;
-	autoExpandDiff: boolean;
+	initialManifestId?: string;
+	initialFileId?: string;
+	initialPath?: string;
+	autoExpandDiff?: boolean;
 }
 
 export interface DashboardConflictArtifact {
@@ -101,7 +103,8 @@ export interface DashboardAttentionItem {
 		| "structural-change"
 		| "blocked-divergence"
 		| "frontmatter-quarantine"
-		| "remote-projection-policy";
+		| "remote-projection-policy"
+		| "room-divergence";
 	title: string;
 	path: string | null;
 	detail: string;
@@ -296,6 +299,7 @@ export interface KaosDashboardData {
 	attention: DashboardAttentionItem[];
 	attentionTotalCount: number;
 	attentionAudit?: AttentionAuditResult | null;
+	resolvedAttentionHistory?: ResolvedAttentionItem[];
 	actions: DashboardActionState;
 }
 
@@ -308,6 +312,10 @@ export interface DashboardVaultSyncDebug {
 	tombstonedPathCount: number;
 	pathBindingCollisionCount?: number;
 	blobPathCount: number;
+	/** ms from VaultSync construction until the local IDB cache loaded. */
+	localPersistenceReadyMs?: number | null;
+	/** ms from VaultSync construction until the provider's initial sync. */
+	providerSyncReadyMs?: number | null;
 	serverReceipt: {
 		serverAppliedLocalState: boolean | null;
 		lastServerReceiptEchoAt: number | null;
@@ -351,6 +359,7 @@ export interface KaosDashboardCollectorInput {
 	blobSync: DashboardBlobSyncDebug | null;
 	preservedUnresolvedEntries: PreservedUnresolvedEntry[];
 	remoteProjectionPolicyError?: string | null;
+	roomDivergence?: import("../runtime/roomDivergencePolicy").RoomDivergenceDecision | null;
 	remoteDeleteResolutionState?: {
 		markdownAvailable: boolean;
 		blobAvailable: boolean;
@@ -378,6 +387,7 @@ export interface KaosDashboardCollectorInput {
 	openFileCount: number;
 	snapshotsAvailable: boolean;
 	attentionAudit?: AttentionAuditResult | null;
+	resolvedAttentionHistory?: ResolvedAttentionItem[];
 }
 
 export type {
@@ -387,4 +397,5 @@ export type {
 	AttentionAuditSummary,
 	AttentionRetirementSummary,
 	AttentionRetirementTarget,
+	ResolvedAttentionItem,
 };

@@ -1,4 +1,4 @@
-import { Notice, type Plugin } from "obsidian";
+import { Notice, type Plugin, type TFile } from "obsidian";
 import type { DiagnosticsService } from "./telemetry/diagnostics/diagnosticsService";
 import type { ConnectionController } from "./runtime/connectionController";
 import type { SnapshotService } from "./snapshots/snapshotService";
@@ -9,15 +9,23 @@ export interface CommandsRuntimeHost {
 	getConnectionController(): ConnectionController | null;
 	getDiagnosticsService(): DiagnosticsService | null;
 	getSnapshotService(): SnapshotService | null;
+	getActiveFile?(): TFile | null;
 	getFilesNeedingAttentionText(): string;
 	getUntrackedFileCount(): number;
 	openDashboard(): Promise<void>;
 	runReconciliation(mode: ReconcileMode): Promise<void>;
+	runReconciliation(
+		mode: ReconcileMode,
+		options: { forceUnhydrated?: boolean },
+	): Promise<void>;
+	runSyncCheck(): Promise<void>;
 	runSchemaMigrationToV2(): void;
 	importUntrackedFiles(): Promise<void>;
 	clearLocalServerReceiptState(): Promise<"cleared_persistent" | "cleared_memory_only" | "failed" | undefined>;
 	resetLocalCache(): void;
 	nuclearReset(): void;
+	prunePhantomRemotePaths(): Promise<void>;
+	resolveSettledCollisionMarkers(): Promise<void>;
 }
 
 export function registerCommands(
@@ -59,6 +67,34 @@ export function registerCommands(
 			if (!vaultSync) return;
 			const mode = vaultSync.getSafeReconcileMode();
 			void host.runReconciliation(mode);
+		},
+	});
+
+	registrar.addCommand({
+		id: "force-reconcile-unhydrated",
+		name: "Force authoritative reconcile without the local cache gate (emergency)",
+		callback: () => {
+			const vaultSync = host.getVaultSync();
+			if (!vaultSync) return;
+			if (vaultSync.localReady) {
+				new Notice("Local cache is already loaded — running a normal authoritative reconcile.");
+				void host.runReconciliation("authoritative");
+				return;
+			}
+			new Notice(
+				"KAOS: forcing an authoritative reconcile while the local cache is not loaded. " +
+				"If the server is behind this device, notes may visibly revert to older server state.",
+				10000,
+			);
+			void host.runReconciliation("authoritative", { forceUnhydrated: true });
+		},
+	});
+
+	registrar.addCommand({
+		id: "run-sync-check",
+		name: "Run sync check",
+		callback: () => {
+			void host.runSyncCheck();
 		},
 	});
 
@@ -212,6 +248,18 @@ export function registerCommands(
 	});
 
 	registrar.addCommand({
+		id: "review-file-history-active-file",
+		name: "Review file history for active file",
+		checkCallback: (checking: boolean) => {
+			const activeFile = host.getActiveFile?.();
+			if (!activeFile) return false;
+			if (checking) return true;
+			void host.getSnapshotService()?.showFileHistoryForPath(activeFile.path);
+			return true;
+		},
+	});
+
+	registrar.addCommand({
 		id: "reset-file-history-baseline",
 		name: "Reset file history baseline",
 		callback: async () => {
@@ -248,6 +296,22 @@ export function registerCommands(
 		name: "Nuclear reset (wipe sync state and reseed from disk)",
 		callback: () => {
 			host.nuclearReset();
+		},
+	});
+
+	registrar.addCommand({
+		id: "prune-phantom-paths",
+		name: "Prune phantom remote paths (clean up deleted/moved paths on server)",
+		callback: () => {
+			void host.prunePhantomRemotePaths();
+		},
+	});
+
+	registrar.addCommand({
+		id: "resolve-settled-collision-markers",
+		name: "Resolve settled move & collision markers (clear old archive attention items)",
+		callback: () => {
+			void host.resolveSettledCollisionMarkers();
 		},
 	});
 }

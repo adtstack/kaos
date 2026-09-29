@@ -122,6 +122,31 @@ console.log("\n--- Test 5: flushNow drains the queue and clears the pending time
 	assert(posts.length === 1, "the cancelled timer does not double-post after flushNow");
 }
 
+console.log("\n--- Test 6: queue drains completely in sequential batches during a burst ---");
+{
+	const { deps, posts } = makeDeps({
+		postJson: async (url, body) => {
+			await wait(10);
+			posts.push({ url, body });
+			return { ok: true };
+		},
+	});
+	const audit = new DiscardedRevisionAudit(deps, { flushDelayMs: 50 });
+	// Post 45 items (2 full batches of 20, 1 partial batch of 5)
+	for (let i = 0; i < 45; i++) {
+		audit.record(`NOTES/note-${i}.md`, `hash-${i}`, "superseded-external-revision");
+	}
+	// Wait for the batches to finish draining
+	await wait(100);
+	assert(posts.length === 3, "45 items drain into exactly 3 POST batches (20 + 20 + 5)");
+	const b0 = posts[0]!.body as { data?: { records?: DiscardedRevisionRecord[] } };
+	const b1 = posts[1]!.body as { data?: { records?: DiscardedRevisionRecord[] } };
+	const b2 = posts[2]!.body as { data?: { records?: DiscardedRevisionRecord[] } };
+	assert(b0.data?.records?.length === 20, "first batch has 20 items");
+	assert(b1.data?.records?.length === 20, "second batch has 20 items");
+	assert(b2.data?.records?.length === 5, "third batch has 5 items");
+}
+
 console.log("\n──────────────────────────────────────────────────");
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log("──────────────────────────────────────────────────");

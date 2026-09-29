@@ -23,9 +23,17 @@ export class MarkdownView {}
 export class TFile {}
 export class TFolder {}
 
-/** Notice constructor used by runtime controllers. */
+/** Notice constructor used by runtime controllers. Records calls for assertions. */
 export class Notice {
-	constructor(_message: string, _timeout?: number) {}
+	static readonly calls: Array<{ message: string; timeout?: number }> = [];
+
+	static resetCalls(): void {
+		Notice.calls.length = 0;
+	}
+
+	constructor(message: string, timeout?: number) {
+		Notice.calls.push({ message, timeout });
+	}
 }
 
 /** Stub class. Type-only in DiskMirror but exported for completeness. */

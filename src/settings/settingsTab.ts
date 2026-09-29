@@ -1,6 +1,7 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
 import { PairDeviceModal, type PairingModalOptions } from "./PairDeviceModal";
 import { RecoveryKitModal } from "./RecoveryKitModal";
+import { RenameDeviceModal } from "./RenameDeviceModal";
 import { ConfirmModal } from "../ui/ConfirmModal";
 import {
 	attachmentSizeCapKB,
@@ -70,6 +71,7 @@ export interface VaultSyncSettingsHost {
 	listManagedDevices(): Promise<ManagedDevice[]>;
 	changeManagedDeviceRole(deviceId: string, role: "owner" | "member"): Promise<void>;
 	revokeManagedDevice(deviceId: string): Promise<void>;
+	renameManagedDevice?(deviceId: string, deviceName: string): Promise<void>;
 	hasSyncRuntime(): boolean;
 	initSync(): Promise<void> | void;
 	buildRecoveryKitText(): string | null;
@@ -523,9 +525,17 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 					.setPlaceholder("My laptop")
 					.setValue(this.host.settings.deviceName)
 					.onChange(async (value) => {
+						const trimmed = value.trim();
 						await this.host.updateSettings((settings) => {
-							settings.deviceName = value.trim();
+							settings.deviceName = trimmed;
 						}, "settings:device-name");
+						if (this.host.settings.deviceId && trimmed && this.host.renameManagedDevice) {
+							try {
+								await this.host.renameManagedDevice(this.host.settings.deviceId, trimmed);
+							} catch {
+								// Non-fatal if offline or not paired yet
+							}
+						}
 					}),
 			);
 
@@ -923,10 +933,33 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 		const currentRole = currentDevice ? ` (${currentDevice.role.toUpperCase()})` : "";
 		const currentFingerprint = currentDevice?.fingerprint ? ` — ${currentDevice.fingerprint}` : "";
 
+		if (currentDevice && this.host.settings.deviceName && currentDevice.name !== this.host.settings.deviceName && this.host.renameManagedDevice) {
+			void this.host.renameManagedDevice(currentDevice.id, this.host.settings.deviceName).catch(() => {});
+		}
+
 		const currentDiv = containerEl.createDiv({ cls: "kaos-settings-device-current" });
 		currentDiv.createEl("p", {
 			text: `Current device: ${currentName}${currentRole}${currentFingerprint} (this device)`,
 		});
+		new Setting(currentDiv)
+			.setName("Rename this device")
+			.setDesc("Update the display name of this device across all connected devices.")
+			.addButton((button) => button.setButtonText("Rename").onClick(() => {
+				new RenameDeviceModal(this.app, this.host.settings.deviceName, async (newName) => {
+					try {
+						await this.host.updateSettings((settings) => {
+							settings.deviceName = newName;
+						}, "settings:device-name");
+						if (this.host.settings.deviceId && this.host.renameManagedDevice) {
+							await this.host.renameManagedDevice(this.host.settings.deviceId, newName);
+						}
+						new Notice(`Device renamed to "${newName}".`);
+						this.renderManagedDevices(containerEl, await this.host.listManagedDevices());
+					} catch (error) {
+						new Notice(`Device rename failed: ${error instanceof Error ? error.message : "unknown error"}`);
+					}
+				}).open();
+			}));
 
 		const active = devices.filter((device) => device.status === "active" && device.id !== this.host.settings.deviceId);
 		if (active.length === 0) {
@@ -938,6 +971,22 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			const row = containerEl.createDiv({ cls: "kaos-settings-device-request" });
 			row.createEl("p", { text: `${device.name} (${device.role.toUpperCase()}) — ${device.fingerprint}` });
 			const nextRole = device.role === "owner" ? "member" : "owner";
+			new Setting(row)
+				.setName("Rename device")
+				.setDesc("Change the display name of this device.")
+				.addButton((button) => button.setButtonText("Rename").onClick(() => {
+					new RenameDeviceModal(this.app, device.name, async (newName) => {
+						try {
+							if (this.host.renameManagedDevice) {
+								await this.host.renameManagedDevice(device.id, newName);
+								new Notice(`Device renamed to "${newName}".`);
+								this.renderManagedDevices(containerEl, await this.host.listManagedDevices());
+							}
+						} catch (error) {
+							new Notice(`Device rename failed: ${error instanceof Error ? error.message : "unknown error"}`);
+						}
+					}).open();
+				}));
 			new Setting(row)
 				.setName(nextRole === "owner" ? "Make Owner" : "Make Member")
 				.setDesc(nextRole === "owner"

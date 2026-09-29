@@ -95,16 +95,21 @@ export class DiscardedRevisionAudit {
 		if (!settings.host || !settings.authorizationHeader || !settings.vaultId) return;
 
 		this.flushing = true;
-		const batch = this.queue.splice(0, AUDIT_MAX_BATCH);
 		try {
-			const url = `${settings.host.replace(/\/$/, "")}/vault/${encodeURIComponent(settings.vaultId)}/trace`;
-			await this.deps.postJson?.(url, {
-				event: "revision.discarded",
-				data: { records: batch },
-			});
-		} catch {
-			// Best-effort audit: transport failures are silent and the batch is
-			// dropped rather than retried (discard records are advisory).
+			while (this.queue.length > 0) {
+				const batch = this.queue.splice(0, AUDIT_MAX_BATCH);
+				const url = `${settings.host.replace(/\/$/, "")}/vault/${encodeURIComponent(settings.vaultId)}/trace`;
+				try {
+					await this.deps.postJson?.(url, {
+						event: "revision.discarded",
+						data: { records: batch },
+					});
+				} catch {
+					// Best-effort audit: transport failures are silent and the batch is
+					// dropped rather than retried (discard records are advisory).
+					break;
+				}
+			}
 		} finally {
 			this.flushing = false;
 		}

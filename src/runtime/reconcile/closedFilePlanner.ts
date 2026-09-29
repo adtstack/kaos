@@ -44,7 +44,16 @@ export interface ClosedFileReconcileInput {
 
 	// Mtime evidence for missing-baseline tiebreak
 	readonly diskMtime?: number;
+	/**
+	 * Strict proof (hash equality with the last successful DiskMirror write)
+	 * that the disk change is KAOS's own lagging mirror output. Overrides the
+	 * conflict decision to CRDT-wins so a mirror race can never import stale
+	 * disk bytes over fresher remote CRDT content.
+	 */
+	readonly diskChangeIsSelfMirror?: boolean;
 	readonly lastDiskIndexPersistedAt?: number;
+	/** Per-file settlement time (DiskIndexEntry.settledAtMs); preferred evidence. */
+	readonly lastFileSettledAtMs?: number;
 	readonly hasPendingLocalCreate?: boolean;
 
 	// Optional path binding guard. Callers omit this when no integrity signal
@@ -91,6 +100,7 @@ export function planClosedFileReconcile(input: ClosedFileReconcileInput): Closed
 		baselineHash,
 		diskMtime,
 		lastDiskIndexPersistedAt,
+		lastFileSettledAtMs,
 		hasPendingLocalCreate,
 		pathBindingStatus,
 		pathBindingReason,
@@ -139,8 +149,10 @@ export function planClosedFileReconcile(input: ClosedFileReconcileInput): Closed
 		baselineHash,
 		diskHash,
 		crdtHash,
+		diskChangeIsSelfMirror: input.diskChangeIsSelfMirror,
 		diskMtime,
 		lastDiskIndexPersistedAt,
+		lastFileSettledAtMs,
 	};
 
 	const decision = decideClosedFileConflict(conflictInput);

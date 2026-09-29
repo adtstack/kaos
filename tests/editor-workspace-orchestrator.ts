@@ -68,6 +68,8 @@ function makeFixture(
 		getSettings: () => ({ deviceName: "test-device" }) as never,
 		getEditorBindings: () => editorBindings as never,
 		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			notifyFileOpened: (path: string) => openedPaths.push(path),
 			notifyFileClosed: () => {},
 		}) as never,

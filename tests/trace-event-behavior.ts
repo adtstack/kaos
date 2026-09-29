@@ -1407,6 +1407,8 @@ function buildOpenExternalTraceFixture(
 		}) as never,
 		getVaultSync: () => vaultSync as never,
 		getDiskMirror: () => ({
+			hasPendingWrite: () => false,
+			getLastDiskWriteOkHash: () => null,
 			shouldSuppressCreate: async () => false,
 			shouldSuppressModify: async () => false,
 			suppressLocalCreate: async () => {},

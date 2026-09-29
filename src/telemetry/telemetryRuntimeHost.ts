@@ -52,6 +52,9 @@ export interface RuntimeDiagnosticsState {
 		flushedUpdates: number;
 		safetyBrakeTriggered: boolean;
 		safetyBrakeReason: string | null;
+		durationMs: number;
+		filesRead: number;
+		filesSkippedByIndex: number;
 	} | null;
 	awaitingFirstProviderSyncAfterStartup: boolean;
 	lastReconciledGeneration: number;
@@ -64,6 +67,13 @@ export interface RuntimeDiagnosticsState {
 		contentHashPrefix: string;
 	}>;
 	openFileCount: number;
+	/** Latest "Run sync check" verdict, when the command has run this session. */
+	syncCheck?: {
+		at: string;
+		tone: string;
+		summary: string;
+		findings: Array<{ code: string; tone: string; summary: string }>;
+	} | null;
 }
 
 export interface TelemetryRuntimeHost {

@@ -34,8 +34,13 @@ import {
 	type BlobSyncManager,
 } from "./sync/blobSync";
 import {
+	fetchServerCapabilities,
 	type ServerCapabilities,
 } from "./sync/serverCapabilities";
+import {
+	buildSyncCheckReport,
+	type SyncCheckServerFacts,
+} from "./runtime/syncCheckReport";
 import {
 	cloneBlobRef,
 	isBlobSyncable,
@@ -78,6 +83,11 @@ import {
 	removeCachedHash,
 } from "./sync/blobHashCache";
 import {
+	AUX_STATE_STORE_VERSION,
+	IndexedDbAuxStateStore,
+	readAuxStateMigrationInput,
+} from "./sync/indexedDbAuxStateStore";
+import {
 	BASELINE_TEXT_STORE_VERSION,
 	applyPersistedBaselineTextFields,
 	collectReferencedBaselineHashes,
@@ -109,9 +119,11 @@ import {
 import {
 	getPreservedUnresolvedEpisodeId,
 	isRemoteDeletePreservedUnresolvedEntry,
+	MAX_RESOLVED_ATTENTION_HISTORY,
 	PreservedUnresolvedRegistry,
 	type PreservedUnresolvedEntry,
 	type PreservedUnresolvedReason,
+	type ResolvedAttentionItem,
 } from "./sync/preservedUnresolved";
 import {
 	PendingBlobIntentJournal,
@@ -180,6 +192,14 @@ import {
 	readKaosExcludeFileFromCrdt,
 	type KaosExcludeFileSnapshot,
 } from "./runtime/excludeFile";
+import {
+	evaluateRoomIdentityTransition,
+	type RoomTransitionDecision,
+} from "./runtime/roomTransitionPolicy";
+import {
+	evaluateRoomDivergence,
+	type RoomDivergenceDecision,
+} from "./runtime/roomDivergencePolicy";
 import {
 	RemoteProjectionPolicyGate,
 } from "./runtime/remoteProjectionPolicyGate";
@@ -269,6 +289,7 @@ declare const __KAOS_QA_HARNESS_ENABLED__: boolean;
 const RECOVERY_SNAPSHOT_INTERVAL_MS = 60 * 60 * 1000;
 const CRDT_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const DISK_INDEX_SAVE_DEBOUNCE_MS = 500;
+const PRESERVED_UNRESOLVED_SAVE_DEBOUNCE_MS = 500;
 
 type PendingBlobReplayPrecondition = {
 	kind: "precondition-changed";
@@ -304,10 +325,18 @@ function isIntentEpisodeConflictReason(
 }
 
 type PersistedPluginState = Partial<VaultSyncSettings> & ExternalEditPolicyCompatibilityFields & {
+	/**
+	 * Legacy data.json residency of the disk index. Once
+	 * _auxStateStoreVersion marks externalization, the vault-scoped IndexedDB
+	 * store owns the index and this key must be scrubbed — filesystem facts
+	 * are device-local and data.json is the file users copy cross-device.
+	 */
 	_diskIndex?: DiskIndex;
+	_auxStateStoreVersion?: number;
 	_baselineTexts?: BaselineTextStore;
 	_conflictMergeBases?: ConflictMergeBaseStore;
 	_baselineTextStoreVersion?: number;
+	/** Legacy data.json residency of the blob hash cache; see _diskIndex. */
 	_blobHashCache?: BlobHashCache;
 	/** Legacy unscoped cache; ignored because data.json may be copied cross-device. */
 	_blobSettledRefs?: BlobSettledRefCache;
@@ -328,6 +357,7 @@ type PersistedPluginState = Partial<VaultSyncSettings> & ExternalEditPolicyCompa
 	_guidedServerUpdate?: PersistedGuidedServerUpdateState;
 	_frontmatterQuarantine?: FrontmatterQuarantineEntry[];
 	_preservedUnresolved?: PreservedUnresolvedEntry[];
+	_resolvedAttentionHistory?: ResolvedAttentionItem[];
 	_pendingBlobIntents?: PendingBlobIntent[];
 };
 
@@ -401,6 +431,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private markdownAttentionGeneration = 0;
 	private markdownSyncScopeGeneration = 0;
 	private markdownSyncScopeFingerprint: string | null = null;
+	/** In-flight initSync deduplication (see initSync). */
+	private initSyncInFlight: Promise<void> | null = null;
 	/** undefined = not read yet, null = confirmed absent, string = exact file body. */
 	private excludeFileRaw: string | null | undefined;
 	private excludeFileRefreshInFlight: Promise<void> | null = null;
@@ -424,6 +456,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	/** Persisted blob hash cache: {path -> {mtime, size, hash}}. */
 	private blobHashCache: BlobHashCache = {};
+	/**
+	 * Vault-scoped IndexedDB home for the disk index and blob hash cache.
+	 * Non-null once initializeAuxStatePersistence externalizes them out of
+	 * data.json; null keeps the legacy data.json embedding.
+	 */
+	private auxStateStore: IndexedDbAuxStateStore | null = null;
+	/** True once the aux state store owns disk-index/blob-hash persistence. */
+	private auxStateExternalized = false;
+	/** Latest post-reconcile room divergence verdict (see roomDivergencePolicy.ts). */
+	private roomDivergence: RoomDivergenceDecision = { kind: "ok" };
+	/** Dedupe key for the room divergence Notice (one per suspicion episode). */
+	private roomDivergenceNoticeState: string | null = null;
+	/** Last "Run sync check" result, surfaced in diagnostics exports. */
+	private lastSyncCheckReport: {
+		at: string;
+		tone: string;
+		summary: string;
+		findings: Array<{ code: string; tone: string; summary: string }>;
+	} | null = null;
 	/** Last exact disk/ref settlement per attachment path. */
 	private blobSettledRefs: BlobSettledRefCache = {};
 	/** Exact CRDT item episode paired with each settled attachment ref. */
@@ -463,6 +514,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	/** Exact in-session destination identity for pending rename postconditions. */
 	private readonly pendingBlobRenameFiles = new Map<string, TFile>();
 	private preservedUnresolvedEntries: PreservedUnresolvedEntry[] = [];
+	public resolvedAttentionHistory: ResolvedAttentionItem[] = [];
 	/** Canonical kind:path locks spanning the full dashboard resolution action. */
 	private attentionResolutionInFlight = new Set<string>();
 	/** Markdown trash events owned by Accept must not publish a second delete. */
@@ -475,6 +527,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private deviceAuth: DeviceAuthClient | null = null;
 	private deviceAuthScope = "";
 	private diskIndexSaveTimer: ReturnType<typeof setTimeout> | null = null;
+	private preservedUnresolvedSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
 	/** Pending stability checks for newly created/dropped files. */
 	private pendingStabilityChecks = new Set<string>();
@@ -557,6 +610,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				if (reason === "reconcile-authoritative") {
 					void this.settleProviderExcludePolicyOverlay(reason);
 				}
+				this.evaluateRoomDivergenceAfterReconcile(reason);
 			},
 			onBlobReconciled: (mode, reconciledVaultSync) => {
 				if (
@@ -580,6 +634,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.awaitingFirstProviderSyncAfterStartup = value;
 			},
 			saveDiskIndex: () => this.saveDiskIndex(),
+			scheduleDiskIndexSave: (reason) => this.scheduleDiskIndexSave(reason),
 			refreshStatusBar: () => this.refreshStatusBar(),
 			getLastSaveDiskIndexAt: () => this.lastDiskIndexPersistedAt,
 			trace: (source, msg, details) => this.trace(source, msg, details),
@@ -747,6 +802,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	async revokeManagedDevice(deviceId: string): Promise<void> {
 		await this.getDeviceAuthClient().revokeDevice(deviceId);
+	}
+
+	async renameManagedDevice(deviceId: string, deviceName: string): Promise<void> {
+		await this.getDeviceAuthClient().renameDevice(deviceId, deviceName);
 	}
 
 	async claimServerAsOwner(host: string, claimSecret: string): Promise<{ recoverySecret: string }> {
@@ -3341,6 +3400,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				},
 				auditAttention: () => this.auditAttention(),
 				retireVerifiedAttention: (targets) => this.retireVerifiedAttention(targets),
+				clearResolvedAttentionHistory: () => this.clearResolvedAttentionHistory(),
 				resolveRemoteDeleteAttention: (target, choice) =>
 					this.resolveRemoteDeleteAttention(target, choice),
 				resolveMarkdownConflictAttention: (target, choice) =>
@@ -3454,6 +3514,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		await this.ensureBlobSettledRefPersistence();
 
 		await this.initializeBaselineTextPersistence();
+		await this.initializeAuxStatePersistence();
 
 		// Install telemetry runtime when debug or qaDebugMode is enabled.
 		// Dynamic load keeps telemetry code out of the product bundle on normal startup.
@@ -3520,6 +3581,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					unresolvedStructuralChangeCount: this.reconciliationController.getState().unresolvedStructuralChangeCount,
 					unresolvedStructuralChangeSample: this.reconciliationController.getState().unresolvedStructuralChangeSample,
 					openFileCount: this.editorWorkspace?.openFileCount ?? 0,
+					syncCheck: this.lastSyncCheckReport,
 				}),
 				collectOpenFileTraceState: () => this.collectOpenFileTraceState(),
 				sha256Hex: (text) => this.sha256Hex(text),
@@ -3657,6 +3719,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	async initSync(): Promise<void> {
+		// Concurrent callers (a room-transition restart racing a pairing flow's
+		// own initSync) must not build two VaultSync runtimes against one vault;
+		// deduplicate to the in-flight initialization.
+		if (this.initSyncInFlight) return this.initSyncInFlight;
+		this.initSyncInFlight = this.initSyncInner().finally(() => {
+			this.initSyncInFlight = null;
+		});
+		return this.initSyncInFlight;
+	}
+
+	private async initSyncInner(): Promise<void> {
 		const initSyncStartedAt = Date.now();
 		const initEntryAuthority = this.blobAuthorityScopeGuard.capture();
 		let initBlobRuntimeAuthority: {
@@ -3787,6 +3860,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				vaultSync,
 				vaultSync.connectionGeneration,
 			);
+			// Promote the next reconcile as soon as the local replica finishes
+			// hydrating. Startup may have already run a pass downgraded to
+			// conservative (waitForLocalPersistence timed out); without this the
+			// authoritative re-run would wait for the next status tick. Skipped
+			// when no pass has completed yet — startup derives its own mode after
+			// the local-persistence gate.
+			vaultSync.onLocalPersistenceReady(() => {
+				if (!isCurrentInitBlobAuthority()) return;
+				if (!vaultSync.idbError) {
+					this.blobLocalPersistenceReady = true;
+				}
+				if (!this.reconciliationController?.isReconciled) return;
+				this.trace("reconcile", "local-persistence-ready-reconcile-promotion");
+				void this.runReconciliation(vaultSync.getSafeReconcileMode());
+			});
 
 			// 2. EditorBindingManager
 			const bindingPropagationGate: BindingPropagationGate = {
@@ -3890,8 +3978,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				const previousHash = existing?.contentHash;
 				if (existing) {
 					existing.contentHash = contentHash;
+					existing.settledAtMs = Date.now();
 				} else {
-					this.diskIndex[path] = { mtime: 0, size: 0, contentHash };
+					this.diskIndex[path] = { mtime: 0, size: 0, contentHash, settledAtMs: Date.now() };
 				}
 				if (previousHash && previousHash !== contentHash) {
 					this.baselineTextDeleteCandidates.add(previousHash);
@@ -4017,11 +4106,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				) {
 					this.blobLocalPersistenceReady = true;
 					this.log("IndexedDB became ready after the startup wait");
-					if (this.blobProviderReady) {
-						// The first authoritative pass may have run without local IDB.
-						// Re-run once with both authority sources before opening uploads.
-						void this.runReconciliation("authoritative");
-					}
+					// The first pass may have run downgraded to conservative
+					// without local IDB. Re-derive the mode (authoritative once
+					// the local replica is hydrated) before opening uploads —
+					// markdown projection correctness needs this just as much
+					// as blob upload authority does.
+					void this.runReconciliation(vaultSync.getSafeReconcileMode());
 				}
 				this.refreshStatusBar();
 				this.schedulePendingBlobIntentReplay("status-tick");
@@ -4054,15 +4144,19 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					getConnectionController: () => this.connectionController,
 					getDiagnosticsService: () => this.lab?.diagnosticsService as import("./telemetry/diagnostics/diagnosticsService").DiagnosticsService ?? null,
 					getSnapshotService: () => this.snapshotService,
+					getActiveFile: () => this.app.workspace.getActiveFile(),
 					getFilesNeedingAttentionText: () => this.buildFilesNeedingAttentionText(),
 					getUntrackedFileCount: () => this.reconciliationController.untrackedFileCount,
 					openDashboard: () => this.openDashboard(),
 					runReconciliation: (mode) => this.runReconciliation(mode),
+					runSyncCheck: () => this.runSyncCheck(),
 					runSchemaMigrationToV2: () => this.runSchemaMigrationToV2(),
 					importUntrackedFiles: () => this.importUntrackedFiles(),
 					clearLocalServerReceiptState: () => this.clearLocalServerReceiptState(),
 					resetLocalCache: () => this.resetLocalCache(),
 					nuclearReset: () => this.nuclearReset(),
+					prunePhantomRemotePaths: () => this.prunePhantomRemotePaths(),
+					resolveSettledCollisionMarkers: () => this.resolveSettledCollisionMarkers(),
 				});
 				// Lab/QA commands are registered separately by the lab runtime.
 				this.lab?.registerCommands(this);
@@ -4215,6 +4309,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.log(`Reconciliation mode: ${mode}`);
 
 			await this.runReconciliation(mode);
+			this.evaluateRoomDivergenceAfterReconcile("startup");
 			if (!isCurrentInitBlobAuthority()) return;
 			if (!providerSynced || providerPolicyReady) {
 				this.reconciliationController.lastGeneration =
@@ -4247,8 +4342,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 	}
 
-	private async runReconciliation(mode: ReconcileMode): Promise<void> {
-		await this.reconciliationController.runReconciliation(mode);
+	private async runReconciliation(
+		mode: ReconcileMode,
+		options?: { forceUnhydrated?: boolean },
+	): Promise<void> {
+		await this.reconciliationController.runReconciliation(mode, options);
 	}
 
 	private async readStableMarkdownFile(
@@ -4382,6 +4480,37 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				// Prefetch embedded attachments for the opened note
 				if (file.path.endsWith(".md") && this.getBlobSync()) {
 					this.prefetchEmbeddedAttachments(file);
+				}
+			}),
+		);
+
+		this.registerEvent(
+			this.app.workspace.on("file-menu", (menu, file) => {
+				if (file instanceof TFile) {
+					menu.addItem((item) => {
+						item
+							.setTitle("KAOS: Review file history")
+							.setIcon("history")
+							.onClick(() => {
+								void this.snapshotService?.showFileHistoryForPath(file.path);
+							});
+					});
+				}
+			}),
+		);
+
+		this.registerEvent(
+			this.app.workspace.on("editor-menu", (menu, _editor, info) => {
+				const file = (info as { file?: TFile | null } | undefined)?.file;
+				if (file instanceof TFile) {
+					menu.addItem((item) => {
+						item
+							.setTitle("KAOS: Review file history")
+							.setIcon("history")
+							.onClick(() => {
+								void this.snapshotService?.showFileHistoryForPath(file.path);
+							});
+					});
 				}
 			}),
 		);
@@ -4960,6 +5089,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (this.diskMirror) {
 			await this.diskMirror.flushAllPendingWrites();
 		}
+		this.clearScheduledPreservedUnresolvedSave();
 		await this.saveDiskIndex();
 
 		this.editorBindings?.unbindAll();
@@ -5098,6 +5228,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						await new IndexedDbBlobSettledRefStore(resetScope).clear();
 					}
 					if (!this.isCurrentBlobAuthority(resetActivation.token)) return;
+					if (this.auxStateStore) {
+						await this.auxStateStore.clear();
+					}
 
 					if (pendingIntentStoreKey) {
 						this.corruptPendingBlobIntentStoreKeys.delete(pendingIntentStoreKey);
@@ -5145,6 +5278,148 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					`Re-seeded ${this.vaultSync?.getActiveMarkdownPaths().length ?? 0} files from disk.`,
 				);
 			},
+		).open();
+	}
+
+	private async prunePhantomRemotePaths(): Promise<void> {
+		if (!this.vaultSync) {
+			new Notice("Sync not initialized");
+			return;
+		}
+
+		// Find remote CRDT paths that are not on local disk
+		const activeCrdtPaths = this.vaultSync.getActiveMarkdownPaths();
+		const phantomPaths: string[] = [];
+
+		for (const path of activeCrdtPaths) {
+			if (!this.isMarkdownPathSyncable(path)) continue;
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (!file) {
+				phantomPaths.push(path);
+			}
+		}
+
+		if (phantomPaths.length === 0) {
+			new Notice("KAOS: No phantom remote paths found. Server matches local disk.", 5000);
+			return;
+		}
+
+		const sample = phantomPaths.slice(0, 5).join("\n- ");
+		const moreText = phantomPaths.length > 5 ? `\n...and ${phantomPaths.length - 5} more` : "";
+
+		new ConfirmModal(
+			this.app,
+			"Prune phantom remote paths",
+			`Found ${phantomPaths.length} path(s) on the server that do not exist on local disk:\n- ${sample}${moreText}\n\n` +
+			`This will delete these phantom path markers from the sync server so they no longer cause path collisions or phantom conflicts. Local files will NOT be modified. Continue?`,
+			async () => {
+				new Notice(`KAOS: Pruning ${phantomPaths.length} phantom path(s)...`);
+				this.log(`Prune phantom paths: starting for ${phantomPaths.length} paths`);
+
+				const deviceName = this.settings.deviceName;
+				let pruned = 0;
+
+				for (const path of phantomPaths) {
+					try {
+						this.vaultSync?.handleDelete(path, deviceName);
+						pruned++;
+					} catch (err) {
+						console.error(`[kaos] Failed to prune phantom path "${path}":`, err);
+					}
+				}
+
+				// Also retire any preserved unresolved entries matching these pruned paths
+				const prunedSet = new Set(phantomPaths.map((p) => normalizePath(p)));
+				this.preservedUnresolvedEntries = this.preservedUnresolvedEntries.filter(
+					(e) => !prunedSet.has(normalizePath(e.path)),
+				);
+				for (const path of phantomPaths) {
+					this.diskMirror?.resolvePreservedUnresolved(path);
+				}
+				await this.persistPreservedUnresolvedStateDurably();
+
+				this.log(`Prune phantom paths: completed, pruned ${pruned} paths`);
+				new Notice(`KAOS: Successfully pruned ${pruned} phantom path(s) from server.`, 8000);
+				const mode = this.vaultSync?.getSafeReconcileMode();
+				if (mode) {
+					await this.runReconciliation(mode);
+				}
+			},
+			`Prune ${phantomPaths.length} path(s)`,
+			"Cancel",
+			() => {},
+			"mod-warning",
+		).open();
+	}
+
+	private async resolveSettledCollisionMarkers(): Promise<void> {
+		const currentEntries = this.collectPreservedUnresolvedEntries();
+		const resolvedPaths: string[] = [];
+
+		const existingFiles = new Set<string>();
+		const existingBasenames = new Set<string>();
+		for (const file of this.app.vault.getFiles()) {
+			const norm = normalizePath(file.path);
+			existingFiles.add(norm);
+			existingBasenames.add(file.name);
+		}
+
+		for (const entry of currentEntries) {
+			const normalized = normalizePath(entry.path);
+			const existsLocally = existingFiles.has(normalized);
+
+			if (entry.reason === "path-collision") {
+				if (existsLocally) {
+					resolvedPaths.push(normalized);
+				} else {
+					const basename = normalized.split("/").pop() ?? "";
+					if (
+						existingBasenames.has(basename)
+						|| (entry.pairPath && existingFiles.has(normalizePath(entry.pairPath)))
+					) {
+						resolvedPaths.push(normalized);
+					}
+				}
+			} else if (entry.reason === "legacy-upgrade-missing-local-blob") {
+				if (existsLocally) {
+					resolvedPaths.push(normalized);
+				}
+			}
+		}
+
+		if (resolvedPaths.length === 0) {
+			new Notice("KAOS: No settled move or collision markers found.");
+			return;
+		}
+
+		new ConfirmModal(
+			this.app,
+			"Resolve settled move & collision markers",
+			`Found ${resolvedPaths.length} attention marker(s) for files that are already settled (e.g. OLD/ archive files and completed moves).\n\n` +
+			`This will retire these collision markers from Attention without modifying any local files. Continue?`,
+			async () => {
+				new Notice(`KAOS: Resolving ${resolvedPaths.length} settled attention marker(s)...`);
+				this.log(`Resolve settled collision markers: starting for ${resolvedPaths.length} paths`);
+
+				const resolvedSet = new Set(resolvedPaths);
+				this.preservedUnresolvedEntries = this.preservedUnresolvedEntries.filter(
+					(e) => !resolvedSet.has(normalizePath(e.path)),
+				);
+				for (const path of resolvedPaths) {
+					this.diskMirror?.clearPreservedUnresolved(path);
+					this.getBlobSync()?.clearPreservedUnresolved(path);
+				}
+
+				await this.persistPreservedUnresolvedStateDurably();
+				this.refreshStatusBar();
+
+				this.log(`Resolve settled collision markers: completed for ${resolvedPaths.length} paths`);
+				new Notice(`KAOS: Successfully resolved ${resolvedPaths.length} settled attention marker(s).`, 8000);
+			},
+			`Resolve ${resolvedPaths.length} marker(s)`,
+			"Cancel",
+			() => {},
+			"mod-warning",
 		).open();
 	}
 
@@ -5376,6 +5651,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			preservedUnresolvedEntries,
 			attentionAudit,
 			remoteProjectionPolicyError: this.providerExcludeFileLastError,
+			roomDivergence: this.roomDivergence,
 			remoteDeleteResolutionState: {
 				markdownAvailable: vaultSync !== null && this.diskMirror !== null,
 				blobAvailable: vaultSync !== null && blobSync !== null,
@@ -5409,6 +5685,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			recentChanges,
 			openFileCount: this.editorWorkspace?.openFileCount ?? 0,
 			snapshotsAvailable: this.serverSupportsSnapshots,
+			resolvedAttentionHistory: this.resolvedAttentionHistory,
 		});
 	}
 
@@ -5943,6 +6220,19 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 						episodeId: target.episodeId,
 						pairPath: target.pairPath ?? null,
 					});
+
+					this.recordResolvedAttention({
+						id: target.episodeId || `${target.kind}:${normalizedPath}:${Date.now()}`,
+						path: normalizedPath,
+						kind: target.kind,
+						reason: target.reason,
+						resolution: target.pairPath ? "retired-move-pair" : "retired-verified",
+						pairPath: target.pairPath ?? null,
+						resolvedAt: Date.now(),
+						summary: target.pairPath
+							? `Verified move pair with "${target.pairPath}". Source absent and target settled.`
+							: "Verified absent locally and settled remotely. Retired safely.",
+					});
 				},
 			);
 		}
@@ -5959,6 +6249,27 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			retiredPaths,
 			failedPaths,
 		};
+	}
+
+	public recordResolvedAttention(item: ResolvedAttentionItem): void {
+		this.resolvedAttentionHistory = [
+			item,
+			...this.resolvedAttentionHistory.filter(
+				(h) => h.id !== item.id && !(h.path === item.path && h.resolvedAt === item.resolvedAt),
+			),
+		].slice(0, MAX_RESOLVED_ATTENTION_HISTORY);
+		this.trace("attention", "attention-resolved-recorded", {
+			path: item.path,
+			kind: item.kind,
+			reason: item.reason,
+			resolution: item.resolution,
+			pairPath: item.pairPath ?? null,
+		});
+	}
+
+	public async clearResolvedAttentionHistory(): Promise<void> {
+		this.resolvedAttentionHistory = [];
+		await this.persistPluginState();
 	}
 
 	/**
@@ -6482,6 +6793,18 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.preservedUnresolvedEntries = this.preservedUnresolvedEntries.filter(
 			(e) => !(e.kind === current.kind && normalizePath(e.path) === normalized),
 		);
+		this.recordResolvedAttention({
+			id: getPreservedUnresolvedEpisodeId(current),
+			path: normalized,
+			kind: current.kind,
+			reason: current.reason,
+			resolution: action === "accept-delete" ? "accept-delete" : "keep-local",
+			pairPath: null,
+			resolvedAt: Date.now(),
+			summary: action === "accept-delete"
+				? "Accepted remote delete and moved local copy to trash."
+				: "Kept local file copy.",
+		});
 		await this.saveSettings();
 	}
 
@@ -6783,6 +7106,60 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return new IndexedDbBaselineTextRepository(this.settings.vaultId);
 	}
 
+	/**
+	 * Move the disk index and blob hash cache out of data.json into a
+	 * vault-scoped IndexedDB store, following the baseline-text migration
+	 * precedent. Rationale: data.json is the one KAOS file users copy between
+	 * devices (mobile setup practice), and filesystem facts (mtime/size/hash
+	 * per path) are device-local — copying them cross-device is exactly the
+	 * stale-ledger hazard behind the mobile sync-freeze incident class.
+	 *
+	 * Crash-safe order: write the store record first, adopt it in memory,
+	 * then flip the marker and strip the legacy keys from data.json. A crash
+	 * at any point leaves exactly one authoritative copy.
+	 *
+	 * Failure keeps the legacy data.json embedding (auxStateExternalized stays
+	 * false) so a broken IndexedDB degrades to today's behavior.
+	 */
+	private async initializeAuxStatePersistence(): Promise<void> {
+		const vaultId = this.settings.vaultId;
+		if (!vaultId) return;
+		try {
+			const store = new IndexedDbAuxStateStore(vaultId);
+			// A record from a previous boot (or a migration interrupted between
+			// store-write and marker-write) is authoritative: adopt it so the
+			// legacy keys in data.json can never roll it back.
+			const stored = await store.load();
+			if (stored) {
+				this.replaceDiskIndex(stored.diskIndex);
+				this.blobHashCache = stored.blobHashCache;
+				if (Array.isArray(stored.preservedUnresolved)) {
+					this.preservedUnresolvedEntries = stored.preservedUnresolved;
+				}
+			}
+			await store.save({
+				diskIndex: this.diskIndex,
+				blobHashCache: this.blobHashCache,
+				preservedUnresolved: this.collectPreservedUnresolvedEntries(),
+				savedAt: Date.now(),
+			});
+			this.auxStateStore = store;
+			this.auxStateExternalized = true;
+			await this.persistPluginState((state) => {
+				state._auxStateStoreVersion = AUX_STATE_STORE_VERSION;
+				delete state._diskIndex;
+				delete state._blobHashCache;
+				delete state._preservedUnresolved;
+			});
+			this.log("Disk index, blob hash cache, and preserved unresolved entries externalized to the vault-scoped IndexedDB store.");
+		} catch (err) {
+			this.auxStateStore = null;
+			this.auxStateExternalized = false;
+			console.warn("[kaos] Aux state store unavailable; keeping data.json persistence:", err);
+			this.log(`Aux state store unavailable: ${formatUnknown(err)}`);
+		}
+	}
+
 	private async initializeBaselineTextPersistence(): Promise<void> {
 		const legacyTexts = { ...this.baselineTexts };
 		const wasExternalized = this.persistedState._baselineTextStoreVersion === BASELINE_TEXT_STORE_VERSION;
@@ -6924,9 +7301,24 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// same-scope transfer queue that was just restored from data.json.
 		this.runtimeConfig = this.buildEffectiveRuntimeConfig();
 		this.blobAuthorityScopeGuard.activate(this.getBlobIntentScope());
-		// Load disk index from plugin data (stored under _diskIndex key)
-		if (data && typeof data._diskIndex === "object" && data._diskIndex !== null) {
-			this.diskIndex = data._diskIndex;
+		// Disk index + blob hash cache live in the vault-scoped IndexedDB aux
+		// store once externalized (see initializeAuxStatePersistence); a copied
+		// data.json must never resurrect device-local filesystem facts. Legacy
+		// keys are only a pre-migration source for the same boot.
+		const auxMigration = readAuxStateMigrationInput({
+			_auxStateStoreVersion: data?._auxStateStoreVersion,
+			_diskIndex: data?._diskIndex,
+			_blobHashCache: data?._blobHashCache,
+			_preservedUnresolved: data?._preservedUnresolved,
+		});
+		this.auxStateExternalized = auxMigration.externalized;
+		if (!this.auxStateExternalized) {
+			if (auxMigration.legacyDiskIndex) {
+				this.diskIndex = auxMigration.legacyDiskIndex;
+			}
+			if (auxMigration.legacyBlobHashCache) {
+				this.blobHashCache = auxMigration.legacyBlobHashCache;
+			}
 		}
 		this.baselineTexts = readBaselineTextStore(data?._baselineTexts);
 		this.conflictMergeBases = readConflictMergeBaseStore(data?._conflictMergeBases);
@@ -6936,10 +7328,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// Load lastDiskIndexPersistedAt for missing-baseline conflict tie-breaking
 		if (data && typeof data._lastDiskIndexPersistedAt === "number" && data._lastDiskIndexPersistedAt > 0) {
 			this.lastDiskIndexPersistedAt = data._lastDiskIndexPersistedAt;
-		}
-		// Load blob hash cache
-		if (data && typeof data._blobHashCache === "object" && data._blobHashCache !== null) {
-			this.blobHashCache = data._blobHashCache;
 		}
 		// Settled attachment refs are causal authority and therefore live only in
 		// device-local IndexedDB. Ignore every legacy data.json representation.
@@ -6965,7 +7353,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// Never hydrate this legacy data.json field because external settings sync
 		// can copy or roll it back across devices.
 		if (Array.isArray(data?._preservedUnresolved)) {
-			this.preservedUnresolvedEntries = data._preservedUnresolved.filter(
+			const legacyFiltered = data._preservedUnresolved.filter(
 				(entry): entry is PreservedUnresolvedEntry => {
 					if (typeof entry !== "object" || entry === null) return false;
 					const candidate = entry as unknown as Record<string, unknown>;
@@ -7003,6 +7391,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					return true;
 				},
 			);
+			if (!this.auxStateExternalized) {
+				this.preservedUnresolvedEntries = legacyFiltered;
+			}
+		}
+		if (Array.isArray(data?._resolvedAttentionHistory)) {
+			this.resolvedAttentionHistory = data._resolvedAttentionHistory
+				.filter((entry): entry is ResolvedAttentionItem => {
+					if (typeof entry !== "object" || entry === null) return false;
+					const candidate = entry as unknown as Record<string, unknown>;
+					return typeof candidate.path === "string"
+						&& (candidate.kind === "markdown" || candidate.kind === "blob")
+						&& typeof candidate.reason === "string"
+						&& typeof candidate.resolvedAt === "number";
+				})
+				.slice(0, MAX_RESOLVED_ATTENTION_HISTORY);
 		}
 		const cachedCapabilities = readPersistedServerCapabilitiesCache(data?._serverCapabilitiesCache);
 		const cachedUpdateManifest = readPersistedUpdateManifestCache(data?._updateManifestCache);
@@ -7030,10 +7433,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		mutator: (settings: VaultSyncSettings) => void,
 		reason = "settings-update",
 	): Promise<void> {
+		const identityBefore: { value: { host: string; vaultId: string } | null } = { value: null };
 		await this.settingsMutationQueue.run(async () => {
 			// Snapshot only after this transaction reaches the head of the queue.
 			// Earlier saves may have committed or rolled back while this edit waited.
 			const previousPersistedState = { ...this.persistedState };
+			const identityAtHead = { host: this.settings.host, vaultId: this.settings.vaultId };
 			await persistSettingsMutation(
 				this.settings,
 				mutator,
@@ -7044,7 +7449,268 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.persistedState = previousPersistedState;
 				},
 			);
+			identityBefore.value = identityAtHead;
 		});
+		// Room-identity transitions restart the sync runtime and persist plugin
+		// state; both go through queues of their own, so they must run after this
+		// mutation transaction (not inside it) to avoid serializing behind it.
+		const before = identityBefore.value;
+		if (
+			before &&
+			(before.host !== this.settings.host || before.vaultId !== this.settings.vaultId)
+		) {
+			await this.handleRoomIdentityTransition(
+				evaluateRoomIdentityTransition({
+					previousHost: before.host,
+					previousVaultId: before.vaultId,
+					nextHost: this.settings.host,
+					nextVaultId: this.settings.vaultId,
+				}),
+			);
+		}
+	}
+
+	/**
+	 * A room identity change (pairing link, direct claim, manual host/vaultId
+	 * edit) invalidates the running sync runtime, which was constructed for the
+	 * previous room id. When the vaultId itself changed, room-scoped device
+	 * state is void too: the disk index and blob hash cache record what the
+	 * PREVIOUS room last settled, and applying those baselines against a
+	 * different room misclassifies every three-way decision. Reset them so the
+	 * new room starts from a clean, conservative first reconcile.
+	 *
+	 * Identity that is NOT room-scoped is deliberately preserved: device name,
+	 * debug preferences, the device auth identity, and content-addressed
+	 * baseline texts.
+	 */
+	private async handleRoomIdentityTransition(
+		decision: RoomTransitionDecision,
+	): Promise<void> {
+		if (decision.kind === "none") return;
+		this.trace("settings", "room-identity-transition", {
+			kind: decision.kind,
+			hostChanged: decision.kind === "host-only" ? true : decision.hostChanged,
+		});
+		this.log(
+			`Room identity changed (${decision.kind}); ` +
+			`${decision.kind === "room-change" ? "resetting room-scoped state and " : ""}` +
+			`restarting sync.`,
+		);
+		const hadRuntime = this.vaultSync !== null;
+		if (hadRuntime) {
+			// Let the old runtime flush pending writes and persist its final
+			// baselines first; the reset below then wipes room-scoped state only.
+			await this.teardownSync();
+		}
+		if (decision.kind === "room-change") {
+			if (this.diskIndexSaveTimer) {
+				clearTimeout(this.diskIndexSaveTimer);
+				this.diskIndexSaveTimer = null;
+			}
+			this.clearScheduledPreservedUnresolvedSave();
+			this.replaceDiskIndex({});
+			this.blobHashCache = {};
+			this.lastDiskIndexPersistedAt = 0;
+			if (this.auxStateExternalized) {
+				// Re-scope the aux store to the new room and clear any record left
+				// under it — an A→B→A switch must not resurrect A's baselines
+				// after this explicit reset.
+				try {
+					this.auxStateStore = new IndexedDbAuxStateStore(decision.nextVaultId);
+					await this.auxStateStore.clear();
+				} catch (err) {
+					this.log(`Aux state re-scope failed: ${formatUnknown(err)}`);
+				}
+			}
+			await this.persistPluginState();
+		}
+		if (hadRuntime) {
+			void this.initSync();
+		}
+	}
+
+	/**
+	 * Post-reconcile health check for silent-freeze failure modes that all
+	 * look like "sync does nothing" (see roomDivergencePolicy.ts). Evaluated
+	 * only after a completed reconcile against converged state; never during
+	 * an in-flight download, where partial counts would false-positive.
+	 */
+	private evaluateRoomDivergenceAfterReconcile(reason: string): void {
+		const vaultSync = this.vaultSync;
+		if (!vaultSync) return;
+		const snapshot = vaultSync.getDebugSnapshot();
+		const localSyncableFileCount = this.countSyncableMarkdownFiles();
+		const gate = this.remoteProjectionPolicyGate;
+		const decision = evaluateRoomDivergence({
+			providerSynced: snapshot.providerSynced,
+			crdtActivePathCount: snapshot.activePathCount,
+			localSyncableFileCount,
+			projectionGateReady: gate.readyGeneration !== null
+				&& gate.readyGeneration === gate.currentGeneration,
+		});
+		const previous = this.roomDivergence;
+		this.roomDivergence = decision;
+		if (decision.kind === previous.kind) return;
+		this.trace("reconcile", "room-divergence-evaluated", {
+			reason,
+			kind: decision.kind,
+			crdtActivePathCount: snapshot.activePathCount,
+			localSyncableFileCount,
+		});
+		if (decision.kind !== "ok") {
+			if (this.roomDivergenceNoticeState !== decision.kind) {
+				this.roomDivergenceNoticeState = decision.kind;
+				new Notice(
+					`KAOS: ${decision.reason}. Run "KAOS: Run sync check" for details.`,
+					10000,
+				);
+			}
+		} else {
+			this.roomDivergenceNoticeState = null;
+		}
+			this.refreshStatusBar();
+	}
+
+	private countSyncableMarkdownFiles(): number {
+		const files = typeof this.app.vault.getFiles === "function"
+			? this.app.vault.getFiles()
+			: this.app.vault.getMarkdownFiles();
+		let count = 0;
+		for (const file of files) {
+			if (this.isMarkdownPathSyncable(file.path)) count++;
+		}
+		return count;
+	}
+
+	/**
+	 * One-shot diagnostic ("KAOS: Run sync check"): gather local facts, fetch
+	 * authenticated server facts, and classify the four silent-freeze causes
+	 * (wrong room, schema refusal, closed projection gate, safety brake).
+	 */
+	async runSyncCheck(): Promise<void> {
+		new Notice("KAOS: running sync check…", 4000);
+		const local = this.collectSyncCheckLocalFacts();
+		const server = await this.fetchSyncCheckServerFacts();
+		const report = buildSyncCheckReport(local, server);
+		this.lastSyncCheckReport = {
+			at: new Date().toISOString(),
+			tone: report.tone,
+			summary: report.summary,
+			findings: report.findings.map((finding) => ({
+				code: finding.code,
+				tone: finding.tone,
+				summary: finding.summary,
+			})),
+		};
+		this.trace("sync-check", "sync-check-complete", {
+			tone: report.tone,
+			findingCount: report.findings.length,
+			codes: report.findings.map((finding) => finding.code),
+		});
+		for (const finding of report.findings) {
+			console.debug(`[kaos] sync-check [${finding.tone}] ${finding.code}: ${finding.summary}`);
+		}
+		this.log(`Sync check (${report.tone}): ${report.summary}`);
+		new Notice(`KAOS sync check (${report.tone}): ${report.summary}`, 10000);
+	}
+
+	private collectSyncCheckLocalFacts() {
+		const snapshot = this.vaultSync?.getDebugSnapshot();
+		const gate = this.remoteProjectionPolicyGate;
+		return {
+			pluginVersion: this.manifest.version,
+			clientSchemaVersion: SCHEMA_VERSION,
+			storedSchemaVersion: snapshot?.storedSchemaVersion ?? null,
+			schemaError: this.vaultSync?.checkSchemaVersion() ?? null,
+			connected: snapshot?.connected ?? false,
+			providerSynced: snapshot?.providerSynced ?? false,
+			connectionStateKind: this.connectionController?.getState().kind ?? "unknown",
+			activePathCount: snapshot?.activePathCount ?? 0,
+			tombstonedPathCount: snapshot?.tombstonedPathCount ?? 0,
+			localSyncableFileCount: this.countSyncableMarkdownFiles(),
+			projectionGateReady: gate.readyGeneration !== null
+				&& gate.readyGeneration === gate.currentGeneration,
+			projectionGateGeneration: gate.currentGeneration,
+			safetyBrakeTriggered: this.reconciliationController.getState().lastReconcileStats
+				?.safetyBrakeTriggered ?? null,
+			blockedDivergenceCount: this.reconciliationController.getState()
+				.blockedDivergenceCount,
+			idbError: snapshot?.idbError ?? false,
+			excludePatternCount: this.excludePatterns.length,
+			docBytes: this.vaultSync?.getApproximateDocBytes() ?? 0,
+			roomDivergenceKind: this.roomDivergence.kind,
+		};
+	}
+
+	private async fetchSyncCheckServerFacts(): Promise<SyncCheckServerFacts> {
+		const settings = this.settings;
+		if (!settings.host) {
+			return { capabilities: null, debug: null, error: "no host configured" };
+		}
+		const host = settings.host.replace(/\/$/, "");
+		let capabilities: SyncCheckServerFacts["capabilities"] = null;
+		let error: string | null = null;
+		try {
+			const fetched = await fetchServerCapabilities(host);
+			capabilities = {
+				serverVersion: fetched.serverVersion,
+				minSchemaVersion: fetched.minSchemaVersion,
+				maxSchemaVersion: fetched.maxSchemaVersion,
+				minPluginVersion: fetched.minPluginVersion,
+			};
+		} catch (err) {
+			error = `capabilities fetch failed (${formatUnknown(err)})`;
+		}
+		let debug: SyncCheckServerFacts["debug"] = null;
+		if (settings.vaultId && settings.authorizationHeader) {
+			try {
+				const res = await obsidianRequest({
+					url: `${host}/vault/${encodeURIComponent(settings.vaultId)}/debug/recent`,
+					method: "GET",
+					headers: {
+						Authorization: await getDeviceAuthorizationHeader(settings),
+					},
+				});
+				if (res.status !== 200) {
+					error = error ?? `room debug fetch failed (${res.status})`;
+				} else {
+					const payload = res.json as {
+						roomId?: unknown;
+						documentSummary?: {
+							activePathCount?: unknown;
+							schemaVersion?: unknown;
+						} | null;
+						documentLoaded?: unknown;
+						persistence?: { status?: unknown };
+					};
+					const roomId = typeof payload.roomId === "string" ? payload.roomId : null;
+					const summary = payload.documentSummary ?? null;
+					const persistenceStatus = payload.persistence?.status;
+					debug = {
+						roomId,
+						roomEchoMatches: roomId === null ? null : roomId === settings.vaultId,
+						documentLoaded: typeof payload.documentLoaded === "boolean"
+							? payload.documentLoaded
+							: null,
+						activePathCount: typeof summary?.activePathCount === "number"
+							? summary.activePathCount
+							: null,
+						schemaVersion: typeof summary?.schemaVersion === "number"
+							? summary.schemaVersion
+							: null,
+						persistenceHealthy: typeof persistenceStatus === "string"
+							? persistenceStatus === "ok"
+							: null,
+					};
+					if (debug.roomEchoMatches === false) {
+						error = error ?? `server answered for a different room (${roomId})`;
+					}
+				}
+			} catch (err) {
+				error = error ?? `room debug fetch failed (${formatUnknown(err)})`;
+			}
+		}
+		return { capabilities, debug, error };
 	}
 
 	private applyRuntimeSettings(reason: string): void {
@@ -7643,6 +8309,23 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	private async saveDiskIndex(): Promise<void> {
 		this.clearScheduledDiskIndexSave();
 		const persistedAt = Date.now();
+		if (this.auxStateExternalized && this.auxStateStore) {
+			try {
+				await this.auxStateStore.save({
+					diskIndex: this.diskIndex,
+					blobHashCache: this.blobHashCache,
+					preservedUnresolved: this.collectPreservedUnresolvedEntries(),
+					savedAt: persistedAt,
+				});
+			} catch (err) {
+				// A failed snapshot write degrades like the bounded crash window:
+				// the next boot re-reads the last persisted baselines and falls
+				// back to conservative missing-baseline handling. Never block
+				// reconcile teardown on it.
+				console.error("[kaos] Failed to persist aux state snapshot:", err);
+				this.log(`saveDiskIndex (aux store) failed: ${formatUnknown(err)}`);
+			}
+		}
 		await this.persistPluginState((state) => {
 			state._lastDiskIndexPersistedAt = persistedAt;
 		});
@@ -7718,10 +8401,20 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 		const nextState: PersistedPluginState = {
 			...this.settingsStore.withSettings(this.persistedState, this.settings),
-			_diskIndex: this.diskIndex,
-			_blobHashCache: this.blobHashCache,
 			...(this.lastDiskIndexPersistedAt > 0 && { _lastDiskIndexPersistedAt: this.lastDiskIndexPersistedAt }),
 		};
+		if (this.auxStateExternalized) {
+			// The vault-scoped IndexedDB store owns the disk index, blob hash
+			// cache, and preserved unresolved entries; scrub any legacy/copied-in keys so data.json can never carry
+			// device-local filesystem facts or collision state.
+			nextState._auxStateStoreVersion = AUX_STATE_STORE_VERSION;
+			delete nextState._diskIndex;
+			delete nextState._blobHashCache;
+			delete nextState._preservedUnresolved;
+		} else {
+			nextState._diskIndex = this.diskIndex;
+			nextState._blobHashCache = this.blobHashCache;
+		}
 		// New installs use the shared vault file. Keep reading a non-empty legacy
 		// value for compatibility, but do not persist an empty device-local field.
 		if (!this.settings.excludePatterns.trim()) delete nextState.excludePatterns;
@@ -7756,11 +8449,20 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		} else {
 			delete nextState._frontmatterQuarantine;
 		}
-		const preserved = this.collectPreservedUnresolvedEntries();
-		if (preserved.length > 0) {
-			nextState._preservedUnresolved = preserved;
-		} else {
+		if (this.auxStateExternalized) {
 			delete nextState._preservedUnresolved;
+		} else {
+			const preserved = this.collectPreservedUnresolvedEntries();
+			if (preserved.length > 0) {
+				nextState._preservedUnresolved = preserved;
+			} else {
+				delete nextState._preservedUnresolved;
+			}
+		}
+		if (this.resolvedAttentionHistory.length > 0) {
+			nextState._resolvedAttentionHistory = this.resolvedAttentionHistory.slice(0, MAX_RESOLVED_ATTENTION_HISTORY);
+		} else {
+			delete nextState._resolvedAttentionHistory;
 		}
 		delete nextState._pendingBlobIntents;
 		this.persistedState = nextState;
@@ -7785,8 +8487,25 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		return this.preservedUnresolvedEntries;
 	}
 
+	private schedulePreservedUnresolvedSave(): void {
+		if (this.preservedUnresolvedSaveTimer !== null) return;
+		this.preservedUnresolvedSaveTimer = setTimeout(() => {
+			this.preservedUnresolvedSaveTimer = null;
+			void this.persistPreservedUnresolvedStateDurably().catch((err) => {
+				console.error("[kaos] Failed to persist preserved unresolved state:", err);
+				this.log(`persistPreservedUnresolvedStateDurably failed: ${formatUnknown(err)}`);
+			});
+		}, PRESERVED_UNRESOLVED_SAVE_DEBOUNCE_MS);
+	}
+
+	private clearScheduledPreservedUnresolvedSave(): void {
+		if (this.preservedUnresolvedSaveTimer === null) return;
+		clearTimeout(this.preservedUnresolvedSaveTimer);
+		this.preservedUnresolvedSaveTimer = null;
+	}
+
 	private persistPreservedUnresolvedState(): void {
-		void this.persistPreservedUnresolvedStateDurably();
+		this.schedulePreservedUnresolvedSave();
 	}
 
 	private handleMarkdownAttentionStateChanged(): void {
@@ -7795,8 +8514,23 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private async persistPreservedUnresolvedStateDurably(): Promise<void> {
+		this.clearScheduledPreservedUnresolvedSave();
 		this.refreshStatusBar();
-		await this.persistPluginState();
+		if (this.auxStateExternalized && this.auxStateStore) {
+			try {
+				await this.auxStateStore.save({
+					diskIndex: this.diskIndex,
+					blobHashCache: this.blobHashCache,
+					preservedUnresolved: this.collectPreservedUnresolvedEntries(),
+					savedAt: Date.now(),
+				});
+			} catch (err) {
+				console.error("[kaos] Failed to persist aux state snapshot for preserved unresolved:", err);
+				this.log(`persistPreservedUnresolvedStateDurably (aux store) failed: ${formatUnknown(err)}`);
+			}
+		} else {
+			await this.persistPluginState();
+		}
 	}
 
 	private async persistPluginState(
@@ -7858,7 +8592,6 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			// In this product build, no mutation API is available — log explicitly
 			// so developers know what happened instead of silently finding no API.
 			this.log("qaDebugMode enabled, but window.__KAOS_DEBUG__ is not mounted by this build. Load the Puppeteer harness from qa/harness/ to get the QA debug API.");
-			// eslint-disable-next-line obsidianmd/ui/sentence-case -- QA/API are product acronyms.
 			new Notice("KAOS: QA debug mode is active; QA debug API is not available in this build. See qa/harness/.", 8000);
 		}
 

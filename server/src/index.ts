@@ -50,7 +50,7 @@ type WorkerRoute =
 	| { kind: "claim" }
 	| { kind: "update-metadata" }
 	| { kind: "device-auth"; action: "recover" | "pair" | "challenge" | "session" }
-	| { kind: "device-management"; vaultId: string; action: "list" | "pair-create" | "role" | "revoke" }
+	| { kind: "device-management"; vaultId: string; action: "list" | "pair-create" | "role" | "revoke" | "rename" }
 	| { kind: "sync-socket"; vaultId: string }
 	| { kind: "vault"; vaultId: string; resource: string; rest: string[] }
 	| { kind: "not-found" };
@@ -241,7 +241,7 @@ function classifyWorkerRoute(req: Request, url: URL): WorkerRoute {
 				}
 				if (vaultRoute.rest.length === 1) {
 					const action = vaultRoute.rest[0];
-					if (action === "role" || action === "revoke") {
+					if (action === "role" || action === "revoke" || action === "rename") {
 						return { kind: "device-management", vaultId: vaultRoute.vaultId, action };
 					}
 				}

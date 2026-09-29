@@ -414,6 +414,19 @@ export class DiskMirror {
 	 */
 	private lastDiskWriteOkAt = new Map<string, number>();
 	/**
+	 * Content hash of the last successful flushWrite per path. Strict
+	 * self-mirror evidence for reconciliation: a disk read whose hash equals
+	 * this value is KAOS's own (possibly lagging) CRDT projection, not an
+	 * independent editor's bytes.
+	 */
+	private lastDiskWriteOkHash = new Map<string, string>();
+	/**
+	 * Last time a remote CRDT text change scheduled a mirror write per path.
+	 * Compared against lastDiskWriteOkAt to detect a mirror that still owes
+	 * the disk a write (debounce/queue/in-flight inclusive, by timestamp).
+	 */
+	private lastRemoteTextChangeAt = new Map<string, number>();
+	/**
 	 * Short-lived, non-consuming proof of the content KAOS most recently meant
 	 * to write. The editor reload guard uses this only to disambiguate a real
 	 * external write that lands inside the normal self-write suppression window.
@@ -732,6 +745,7 @@ export class DiskMirror {
 
 	private scheduleRemoteWrite(path: string): void {
 		path = normalizePath(path);
+		this.lastRemoteTextChangeAt.set(path, Date.now());
 		const admission = this.captureRemoteProjectionAdmission([path]);
 		if (!admission) {
 			this.log(`scheduleRemoteWrite: policy not ready for "${path}"`);
@@ -1227,6 +1241,7 @@ export class DiskMirror {
 							return this.deferCallerAuthorityStale(path, "pre-written-settlement", options);
 						}
 						this.lastDiskWriteOkAt.set(normalized, Date.now());
+						this.lastDiskWriteOkHash.set(normalized, contentHash);
 						const baselineRecorded = options.recordBaseline !== false;
 						if (baselineRecorded) {
 							this._onDiskWriteCallback?.(normalized, contentHash, content);
@@ -1469,6 +1484,7 @@ export class DiskMirror {
 						return this.deferCallerAuthorityStale(path, "pre-create-settlement", options);
 					}
 					this.lastDiskWriteOkAt.set(normalized, Date.now());
+					this.lastDiskWriteOkHash.set(normalized, contentHash);
 					const baselineRecorded = options.recordBaseline !== false;
 					if (baselineRecorded) {
 						this._onDiskWriteCallback?.(normalized, contentHash, content);
@@ -2341,6 +2357,8 @@ export class DiskMirror {
 						this.writeQueue.delete(normalized);
 						this.forcedWritePaths.delete(normalized);
 						this.remoteProjectionWriteAdmissions.delete(normalized);
+						this.lastRemoteTextChangeAt.delete(normalized);
+						this.lastDiskWriteOkHash.delete(normalized);
 						for (const timers of [this.debounceTimers, this.openWriteTimers]) {
 							const timer = timers.get(normalized);
 							if (timer) clearTimeout(timer);
@@ -2496,6 +2514,10 @@ export class DiskMirror {
 						this.writeQueue.delete(normalized);
 						this.forcedWritePaths.delete(normalized);
 						this.remoteProjectionWriteAdmissions.delete(normalized);
+						this.lastRemoteTextChangeAt.delete(normalized);
+						this.lastDiskWriteOkHash.delete(normalized);
+						this.lastRemoteTextChangeAt.delete(normalized);
+						this.lastDiskWriteOkHash.delete(normalized);
 						const pending = this.debounceTimers.get(normalized);
 						if (pending) {
 							clearTimeout(pending);
@@ -2793,6 +2815,8 @@ export class DiskMirror {
 		this.writeQueue.delete(oldPath);
 		this.forcedWritePaths.delete(oldPath);
 		this.remoteProjectionWriteAdmissions.delete(oldPath);
+		this.lastRemoteTextChangeAt.delete(oldPath);
+		this.lastDiskWriteOkHash.delete(oldPath);
 		this.remoteCreateAuthorizations.delete(oldPath);
 		this.unobserveText(oldPath);
 		this.editorBindings.updatePathsAfterRename(new Map([[oldPath, newPath]]));
@@ -2811,6 +2835,15 @@ export class DiskMirror {
 		if (expectedEpisodeId === null) return false;
 		const normalized = normalizePath(path);
 		if (this.preservedUnresolved.resolveEpisode(normalized, expectedEpisodeId)) {
+			this.onPreservedUnresolvedChanged?.();
+			return true;
+		}
+		return false;
+	}
+
+	resolvePreservedUnresolved(path: string): boolean {
+		const normalized = normalizePath(path);
+		if (this.preservedUnresolved.resolve(normalized)) {
 			this.onPreservedUnresolvedChanged?.();
 			return true;
 		}
@@ -2924,6 +2957,43 @@ export class DiskMirror {
 	getLastDiskWriteOkAt(path: string): number | null {
 		const v = this.lastDiskWriteOkAt.get(normalizePath(path));
 		return v === undefined ? null : v;
+	}
+
+	/**
+	 * Content hash of the most recent successful KAOS-issued `flushWrite` for
+	 * this path (null when KAOS has never written it this session). When a
+	 * reconciliation-time disk read hashes to exactly this value, the disk
+	 * copy is provably our own mirror output — self-mirror evidence that must
+	 * not win a both-changed/missing-baseline tie-break.
+	 */
+	getLastDiskWriteOkHash(path: string): string | null {
+		const v = this.lastDiskWriteOkHash.get(normalizePath(path));
+		return v === undefined ? null : v;
+	}
+
+	/**
+	 * True when the CRDT→disk mirror still owes this path work: a write is
+	 * debounced, queued, or in flight, or a remote text change was scheduled
+	 * more recently than the last successful flush. Reconciliation must defer
+	 * such files: the disk is a lagging projection of the CRDT, so any
+	 * three-way decision made now would race our own write and could import
+	 * stale bytes over fresher remote content.
+	 */
+	hasPendingWrite(path: string): boolean {
+		const normalized = normalizePath(path);
+		if (
+			this.debounceTimers.has(normalized)
+			|| this.openWriteTimers.has(normalized)
+			|| this.pendingOpenWrites.has(normalized)
+			|| this.writeQueue.has(normalized)
+			|| this.pathWriteLocks.has(normalized)
+		) {
+			return true;
+		}
+		const changedAt = this.lastRemoteTextChangeAt.get(normalized);
+		if (changedAt === undefined) return false;
+		const writtenAt = this.lastDiskWriteOkAt.get(normalized);
+		return writtenAt === undefined || changedAt > writtenAt;
 	}
 
 	/**
@@ -3165,6 +3235,7 @@ export class DiskMirror {
 	recordPreservedUnresolved(
 		path: string,
 		reason: PreservedUnresolvedReason,
+		pairPath?: string | null,
 	): void {
 		const normalized = normalizePath(path);
 		const remoteDeleteEntry = isRemoteDeletePreservedUnresolvedEntry({
@@ -3183,6 +3254,7 @@ export class DiskMirror {
 			path: normalized,
 			kind: "markdown",
 			reason,
+			pairPath: pairPath ? normalizePath(pairPath) : undefined,
 			episodeId: deleteFingerprint
 				? getRemoteDeleteEpisodeId("markdown", deleteFingerprint)
 				: undefined,

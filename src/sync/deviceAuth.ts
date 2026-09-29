@@ -281,6 +281,14 @@ export class DeviceAuthClient {
 		this.invalidateSession();
 	}
 
+	async renameDevice(targetDeviceId: string, deviceName: string): Promise<void> {
+		const response = await this.authenticatedPost(`/vault/${encodeURIComponent(this.config.vaultId)}/devices/rename`, {
+			targetDeviceId,
+			deviceName: deviceName.trim(),
+		});
+		if (response.status !== 200) throw responseError(response);
+	}
+
 	private async createSession(): Promise<DeviceSession> {
 		const identity = await this.getIdentity();
 		const challenge = await this.post("/api/auth/challenge", { vaultId: this.config.vaultId, deviceId: identity.deviceId });
