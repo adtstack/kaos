@@ -71,6 +71,7 @@ export type ProductFlightSource =
 	| "reconciliationController"
 	| "connectionController"
 	| "blobSync"
+	| "snapshotService"
 	| "serverAckTracker";
 
 /**
@@ -94,4 +95,14 @@ export interface ProductFlightEventInput {
 export interface ProductFlightPathEventInput extends ProductFlightEventInput {
 	readonly scope: "file" | "folder";
 	readonly path: string;
+}
+
+/** Raw samples travel only to the passive hasher, never in event.data. */
+export type ContentTraceSamples = Partial<Record<
+	"editorBefore" | "editorAfter" | "crdt" | "disk" | "diskEditorNormalized", string | null
+>>;
+
+export interface ContentTraceObserver {
+	isEnabled(): boolean;
+	record(event: ProductFlightPathEventInput, samples: ContentTraceSamples): void;
 }

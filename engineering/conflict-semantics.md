@@ -47,6 +47,22 @@ not by a filter-bypass Y.Text projection. A disk change on an open note is
 ingested only by the open-external-edit merge lane (editor idle >= 3s, editor
 == CRDT, baseline-based 3-way merge) or after the note closes.
 
+### Manual conflict review
+
+Fenced Markdown conflicts in Dashboard → Attention offer **Review diff & merge**.
+The review shows Local (disk) and Remote (sync) side by side. A stored baseline
+supports three-way merge with per-hunk choices; without one, a two-way manual
+merge remains available. **Apply merged** publishes a targeted Y.Text diff,
+settles the disk file and baseline, clears the exact conflict episode, and audits
+both superseded versions (`manual-conflict-use-merged-crdt-discarded` and
+`manual-conflict-use-merged-disk-discarded`). It does not create Markdown
+conflict artifacts.
+
+Idle open notes receive the change through their existing editor binding. Recent
+local typing defers the operation until typing settles. Changed review contents,
+stale episodes, frontmatter quarantine, and size limits reject the operation;
+reopen the review after resolving the cause.
+
 ### Authority preconditions (anti-revert gates)
 
 Three preconditions keep the authority rules above from being fed a
@@ -314,12 +330,30 @@ vault. This indicates a possible bulk corruption from a remote device.
 
 **Resolution:** The blocked state resolves when either:
 - A subsequent reconcile is below the safety threshold, OR
-- The user manually triggers a full reconcile, OR
-- The user exports diagnostics and inspects the divergence.
+- The user reviews diagnostics and resolves the divergent files, then retries reconcile.
+
+**Force reconcile** (or `kaos:force-reconcile`) requests another reconcile pass.
+It uses the same safety-brake policy; it does not authorize a bulk overwrite or
+bypass the threshold.
 
 `lastBlockedDivergenceAt` is historical and persists even when count
 resets to 0. UI/status must treat count as current and timestamp as
 "last time this happened."
+
+### Full snapshot restore on other devices
+
+Connected devices project live CRDT updates through DiskMirror's write queue;
+that projection does not run the reconciliation safety brake. A device that
+reconnects, starts, or manually reconciles after a bulk restore still evaluates
+the existing brake: more than 20 destructive writes **and** more than 25% of
+local files blocks that pass. Review the reported divergence and export
+diagnostics before accepting individual changes or retrying **Force reconcile**.
+If the same thresholds still apply, the retry remains blocked. This release
+adds no replicated bypass marker and no safety-brake override.
+
+Deletion retains the existing local-dirty policy: remote work changed since the
+snapshot may be preserved and revived on another device. A full restore is a
+client-driven soft CRDT restore, not an exclusive vault lock across devices.
 
 ## Naming conventions
 

@@ -17,6 +17,7 @@ import type {
 	DashboardLegacyMissingBlobResolutionChoice,
 	DashboardLegacyMissingBlobResolutionTarget,
 	DashboardMarkdownConflictResolution,
+	DashboardMarkdownConflictReviewSides,
 	DashboardMarkdownConflictResolutionChoice,
 	DashboardMarkdownConflictResolutionResult,
 	DashboardMarkdownConflictResolutionTarget,
@@ -29,6 +30,7 @@ import type {
 	DashboardStuckLocalMutationResolution,
 	DashboardStuckLocalMutationResolutionResult,
 	DashboardStuckLocalMutationResolutionTarget,
+	DashboardTombstoneDiskConflictResolution,
 	DashboardTone,
 	KaosDashboardData,
 	ResolvedAttentionItem,
@@ -61,7 +63,7 @@ export const KAOS_DASHBOARD_VIEW_TYPE = "kaos-dashboard";
 
 export interface KaosDashboardActions {
 	reconnect(): void;
-	forceReconcile(): void;
+	forceReconcile(): Promise<void>;
 	importUntracked(): Promise<void>;
 	takeSnapshotNow(): Promise<void>;
 	showSnapshotList(): Promise<void>;
@@ -93,12 +95,34 @@ export interface KaosDashboardActions {
 		target: DashboardBlobConflictResolutionTarget,
 		choice: DashboardBlobConflictResolutionChoice,
 	): Promise<DashboardBlobConflictResolutionResult>;
+	resolveTombstoneConflict(
+		path: string,
+		choice: "keep-local" | "accept-delete",
+		target?: DashboardTombstoneDiskConflictResolution,
+	): Promise<void>;
 	clearResolvedAttentionHistory?(): Promise<void>;
+	dismissAttentionEntry?(path: string): Promise<void>;
+	adoptStructuralRename?(oldPath: string, newPath: string): Promise<void>;
+	resetLocalCache?(): void;
+	nuclearReset?(): void;
+	forceReconcileUnhydrated?(): Promise<void>;
+	prunePhantomRemotePaths?(): Promise<void>;
+	resolveSettledCollisionMarkers?(): Promise<void>;
+	clearLocalServerReceiptState?(): Promise<void>;
+	runSyncCheck?(): Promise<void>;
+	openRecoveryHoldResolution?(): void;
+	repairFileHistoryStorage?(): Promise<void>;
+	cleanupFileHistory?(): Promise<void>;
+	pruneSnapshots?(): Promise<void>;
+	copyDebugInfo?(): void;
+	restoreAllFilesFromServer?(): Promise<void>;
+	openDivergenceResolutionForPath?(path: string): void;
 }
 
 export interface KaosDashboardViewDeps {
 	collectData(): Promise<KaosDashboardData>;
 	getBaselineText?(contentHash: string): Promise<string | null> | string | null;
+	getMarkdownConflictReviewSides?(path: string): Promise<DashboardMarkdownConflictReviewSides | null>;
 	getConflictMergeBaseHash?(artifactPath: string): string | null;
 	clearConflictMergeBase?(artifactPath: string): void;
 	actions: KaosDashboardActions;
@@ -205,6 +229,7 @@ export class KaosDashboardView extends ItemView {
 			this.renderBlobSafetyCopies(root, this.data.blobSafetyCopies);
 		}
 		this.renderOperations(root, this.data);
+		this.renderEmergency(root, this.data);
 		this.renderAdvanced(root, this.data.overview);
 	}
 
@@ -291,7 +316,31 @@ export class KaosDashboardView extends ItemView {
 		);
 		const syncActions = this.actionGroup(body, "Sync operations");
 		this.button(syncActions, "Reconnect", async () => this.deps.actions.reconnect(), !data.actions.syncInitialized);
-		this.button(syncActions, "Force reconcile", async () => this.deps.actions.forceReconcile(), !data.actions.syncInitialized);
+		this.button(
+			syncActions,
+			"Force reconcile",
+			async () => {
+				await this.deps.actions.forceReconcile();
+				await this.refresh(true);
+			},
+			!data.actions.syncInitialized,
+		);
+		const pathCollisionMetric = data.overview.find(
+			(m) => m.label === "Path collisions" && m.tone === "error",
+		);
+		if (pathCollisionMetric) {
+			const resolveBtn = this.button(
+				syncActions,
+				`Resolve path collisions (${pathCollisionMetric.value})`,
+				async () => {
+					await this.deps.actions.forceReconcile();
+					await this.refresh(true);
+				},
+				!data.actions.syncInitialized,
+				"Resolve active CRDT path collisions for files settled on disk.",
+			);
+			resolveBtn.classList.add("mod-warning");
+		}
 		this.button(
 			syncActions,
 			`Import untracked${data.actions.untrackedFileCount > 0 ? ` (${data.actions.untrackedFileCount})` : ""}`,
@@ -308,6 +357,187 @@ export class KaosDashboardView extends ItemView {
 		this.button(recoveryActions, "Create file history point", () => this.deps.actions.createFileHistoryPoint(), recoveryDisabled);
 		this.button(recoveryActions, "Reset file history baseline", () => this.deps.actions.resetFileHistoryBaseline(), recoveryDisabled);
 		this.button(recoveryActions, "Review file history", () => this.deps.actions.showRecoveryHistory(), recoveryDisabled);
+	}
+
+	private renderEmergency(root: HTMLElement, data: KaosDashboardData): void {
+		const body = this.disclosure(
+			root,
+			"Emergency actions (긴급 조치)",
+			"Destructive resets, state cleaning, and storage repair",
+			"kaos-dashboard-emergency",
+		);
+
+		const storageDisabled = !data.actions.syncInitialized
+			|| !data.actions.snapshotsAvailable
+			|| !data.actions.connected;
+
+		// 1. Sync resets & cache recovery
+		const resetsGroup = body.createDiv({ cls: "kaos-dashboard-action-group" });
+		resetsGroup.createEl("h4", { text: "동기화 리셋 및 캐시 복구 (sync resets & cache)" });
+		const resetsList = resetsGroup.createDiv({ cls: "kaos-dashboard-emergency-list" });
+
+		this.renderEmergencyItem(
+			resetsList,
+			"로컬 캐시 초기화 (Reset local cache)",
+			"IndexedDB 로컬 캐시를 삭제하고 서버에서 다시 동기화합니다. 로컬 디스크 파일과 원격 서버 데이터는 안전하게 보존됩니다. (캐시가 손상되었거나 로컬-서버 상태가 꼬였을 때 1차 해결책)",
+			"Reset local cache",
+			() => this.deps.actions.resetLocalCache?.(),
+			{ disabled: !data.actions.syncInitialized },
+		);
+
+		this.renderEmergencyItem(
+			resetsList,
+			"캐시 미로딩 강제 동기화 (Force unhydrated reconcile)",
+			"로컬 캐시 로딩 완료 게이트를 건너뛰고 서버 상태 기준으로 강제 권한 동기화를 수행합니다. (캐시 로딩이 멈췄거나 오류로 인해 정상 동기화 진행이 막혔을 때 비상 탈출구)",
+			"Force unhydrated reconcile",
+			() => this.deps.actions.forceReconcileUnhydrated?.(),
+			{ disabled: !data.actions.syncInitialized },
+		);
+
+		this.renderEmergencyItem(
+			resetsList,
+			"전체 파일 서버 복원 (Restore all files from server)",
+			"서버와 내용이 다른 로컬 파일 및 누락된 파일을 서버의 최신 상태로 일괄 복원합니다. (기존 로컬 파일은 restore-backups에 자동 백업되며, 서버에 없는 로컬 전용 파일은 유지됨)",
+			"Restore all from server",
+			() => this.deps.actions.restoreAllFilesFromServer?.(),
+			{ isWarning: true, disabled: !data.actions.syncInitialized },
+		);
+
+		this.renderEmergencyItem(
+			resetsList,
+			"Nuclear reset (완전 초기화 & 디스크 재시딩)",
+			"서버와 로컬의 모든 CRDT 상태를 완전히 지우고, 현재 디스크의 실제 파일들을 기준으로 동기화 룸을 완전히 재시딩합니다. (동기화가 완전히 파탄나서 어떤 복구로도 해결되지 않을 때 최후의 수단)",
+			"Nuclear reset",
+			() => this.deps.actions.nuclearReset?.(),
+			{ isWarning: true, disabled: !data.actions.syncInitialized },
+		);
+
+		// 2. Ghost paths & marker cleanup
+		const cleanupGroup = body.createDiv({ cls: "kaos-dashboard-action-group" });
+		cleanupGroup.createEl("h4", { text: "유령 경로 및 마커 정리 (ghost paths & markers)" });
+		const cleanupList = cleanupGroup.createDiv({ cls: "kaos-dashboard-emergency-list" });
+
+		this.renderEmergencyItem(
+			cleanupList,
+			"원격 유령 경로 정리 (Prune phantom paths)",
+			"로컬 디스크에는 없는데 서버 CRDT에 남아있는 유령 경로 마커를 청소합니다. (삭제/이동된 파일이 서버에 남아 계속해서 경로 충돌이나 유령 충돌 복사본을 유발할 때)",
+			"Prune phantom paths",
+			() => this.deps.actions.prunePhantomRemotePaths?.(),
+			{ disabled: !data.actions.syncInitialized },
+		);
+
+		this.renderEmergencyItem(
+			cleanupList,
+			"정리 완료된 마커 일괄 해제 (Resolve settled markers)",
+			"이미 이동이 끝났거나 아카이브(OLD/)된 파일의 오래된 충돌/주의 마커를 일괄 정리합니다. (Attention 탭이 이미 처리 끝난 파일들의 과거 충돌 찌꺼기로 가득 찼을 때)",
+			"Resolve settled markers",
+			() => this.deps.actions.resolveSettledCollisionMarkers?.(),
+			{ disabled: !data.actions.syncInitialized },
+		);
+
+		this.renderEmergencyItem(
+			cleanupList,
+			"서버 수신 영수증 초기화 (Clear server receipts)",
+			"서버와 주고받은 동기화 확인 영수증(ACK echo) 상태를 초기화합니다. (영수증 불일치 경고가 뜨거나 수신 확인 실패로 인해 파일 수정 전송 대기열이 멈춰있을 때)",
+			"Clear server receipts",
+			() => this.deps.actions.clearLocalServerReceiptState?.(),
+			{ disabled: !data.actions.syncInitialized },
+		);
+
+		// 3. Troubleshooting & lock resolution
+		const diagGroup = body.createDiv({ cls: "kaos-dashboard-action-group" });
+		diagGroup.createEl("h4", { text: "동기화 정지 진단 및 락 해제 (troubleshooting & locks)" });
+		const diagList = diagGroup.createDiv({ cls: "kaos-dashboard-emergency-list" });
+
+		this.renderEmergencyItem(
+			diagList,
+			"동기화 정지 종합 진단 (Run sync check)",
+			"서버와 로컬 상태를 점검하여 4대 침묵 정지 원인(잘못된 룸, 스키마 버전 불일치, 프로젝션 게이트 닫힘, 세이프티 브레이크)을 진단하고 리포트를 알림으로 띄웁니다. (에러 메시지는 없는데 동기화가 조용히 멈췄을 때)",
+			"Run sync check",
+			() => this.deps.actions.runSyncCheck?.(),
+			{ disabled: !data.actions.syncInitialized },
+		);
+
+		this.renderEmergencyItem(
+			diagList,
+			"일시정지된 복구 상태 해결 (Resolve paused recovery)",
+			"안전 잠금(Safety Hold)으로 인해 자동 복구가 일시 중지된 파일 목록을 열어 직접 수락/거절할 수 있는 모달 창을 엽니다. (안전상의 이유로 복구가 홀드되어 있다는 알림이 떴을 때)",
+			"Resolve paused recovery",
+			() => this.deps.actions.openRecoveryHoldResolution?.(),
+			{ disabled: !data.actions.syncInitialized, refreshAfterAction: false },
+		);
+
+		this.renderEmergencyItem(
+			diagList,
+			"동기화 디버그 정보 복사 (Copy debug info)",
+			"현재 동기화 상태, 에러, 메트릭이 포함된 진단 정보를 클립보드에 즉시 복사합니다. (문제 분석 및 공유용)",
+			"Copy debug info",
+			() => this.deps.actions.copyDebugInfo?.(),
+			{ refreshAfterAction: false },
+		);
+
+		// 4. Storage maintenance
+		const storageGroup = body.createDiv({ cls: "kaos-dashboard-action-group" });
+		storageGroup.createEl("h4", { text: "R2 스토리지 점검 및 정리 (storage maintenance)" });
+		const storageList = storageGroup.createDiv({ cls: "kaos-dashboard-emergency-list" });
+
+		this.renderEmergencyItem(
+			storageList,
+			"스토리지 점검 및 수리 (Check & repair storage)",
+			"R2 클라우드 스토리지의 파일 히스토리 매니페스트와 데이터 청크 상태를 점검하고 손상된 참조를 자동 수리합니다. (R2 스냅샷 상태가 Degraded/Error로 뜨거나 백업이 누락될 때)",
+			"Check & repair storage",
+			() => this.deps.actions.repairFileHistoryStorage?.(),
+			{ disabled: storageDisabled },
+		);
+
+		this.renderEmergencyItem(
+			storageList,
+			"파일 이력 청크 정리 (Cleanup file history)",
+			"R2 스토리지의 불필요한 고아(orphan) 파일 히스토리 청크를 삭제하여 저장소 공간을 절약합니다.",
+			"Cleanup file history",
+			() => this.deps.actions.cleanupFileHistory?.(),
+			{ disabled: storageDisabled },
+		);
+
+		this.renderEmergencyItem(
+			storageList,
+			"오래된 스냅샷 정리 (Prune snapshots)",
+			"보존 기간이 지난 오래된 볼트 스냅샷을 정리하여 용량을 확보합니다.",
+			"Prune snapshots",
+			() => this.deps.actions.pruneSnapshots?.(),
+			{ disabled: storageDisabled },
+		);
+	}
+
+	private renderEmergencyItem(
+		parent: HTMLElement,
+		title: string,
+		description: string,
+		buttonLabel: string,
+		action: () => void | Promise<void>,
+		options?: {
+			isWarning?: boolean;
+			disabled?: boolean;
+			disabledReason?: string;
+			refreshAfterAction?: boolean;
+		},
+	): void {
+		const item = parent.createDiv({ cls: "kaos-dashboard-emergency-item" });
+		const info = item.createDiv({ cls: "kaos-dashboard-emergency-item-info" });
+		info.createDiv({ cls: "kaos-dashboard-emergency-item-title", text: title });
+		info.createDiv({ cls: "kaos-dashboard-emergency-item-desc", text: description });
+		const actionContainer = item.createDiv({ cls: "kaos-dashboard-emergency-item-action" });
+		const btn = this.button(
+			actionContainer,
+			buttonLabel,
+			action,
+			options?.disabled ?? false,
+			options?.disabledReason,
+			options?.refreshAfterAction ?? true,
+		);
+		if (options?.isWarning) {
+			btn.classList.add("mod-warning");
+		}
 	}
 
 	private renderAdvanced(root: HTMLElement, metrics: DashboardMetric[]): void {
@@ -631,6 +861,14 @@ export class KaosDashboardView extends ItemView {
 					: undefined,
 			);
 			this.button(actions, "Copy path", () => this.copyPath(copy.artifactPath));
+			const deleteBtn = this.button(
+				actions,
+				"Delete backup",
+				() => this.confirmDeleteSafetyCopy(copy),
+				false,
+				"Move this safety backup file to Obsidian trash after confirming the current file is normal.",
+			);
+			deleteBtn.classList.add("mod-warning");
 		}
 	}
 
@@ -813,6 +1051,9 @@ export class KaosDashboardView extends ItemView {
 					const pending = this.pendingAttentionEpisodes.has(
 						attentionEpisodeKey(path, resolution),
 					);
+					this.button(actions, "Review diff & merge", () => this.openMarkdownConflictReview(path, resolution),
+						pending || !this.deps.getMarkdownConflictReviewSides,
+						"Review local and remote content and apply a merged result.");
 					this.button(
 						actions,
 						pending ? "Resolving…" : "Keep local version",
@@ -836,6 +1077,33 @@ export class KaosDashboardView extends ItemView {
 						resolution.useRemoteUnavailableReason ?? undefined,
 					);
 					useRemoteButton.classList.add("mod-warning");
+				} else if (resolution?.kind === "tombstone-disk-conflict") {
+					const pending = this.pendingAttentionEpisodes.has(
+						attentionEpisodeKey(path, resolution),
+					);
+					this.button(
+						actions,
+						pending ? "Resolving…" : "Keep local version",
+						() => this.confirmTombstoneConflictResolution(
+							path,
+							resolution,
+							"keep-local",
+						),
+						pending || !resolution.canKeepLocal,
+						resolution.keepLocalUnavailableReason ?? undefined,
+					);
+					const acceptDeleteButton = this.button(
+						actions,
+						pending ? "Resolving…" : "Accept delete",
+						() => this.confirmTombstoneConflictResolution(
+							path,
+							resolution,
+							"accept-delete",
+						),
+						pending || !resolution.canAcceptDelete,
+						resolution.acceptDeleteUnavailableReason ?? undefined,
+					);
+					acceptDeleteButton.classList.add("mod-warning");
 				} else {
 					if (!auditItem || auditItem.classification !== "retirable") {
 						this.button(
@@ -846,6 +1114,27 @@ export class KaosDashboardView extends ItemView {
 							auditItem ? auditItem.rationale : this.getManualAttentionReason(item),
 						);
 					}
+					if (path) {
+						if (item.kind === "blocked-divergence" && this.deps.actions.openDivergenceResolutionForPath) {
+							const diffBtn = this.button(
+								actions,
+								"Review diff & resolve",
+								() => this.deps.actions.openDivergenceResolutionForPath!(path),
+								false,
+								"Open side-by-side diff to compare local and server versions and resolve divergence.",
+								false,
+							);
+							diffBtn.classList.add("mod-cta");
+						}
+						const ackBtn = this.button(
+							actions,
+							"Acknowledge & clear",
+							() => this.confirmAcknowledgeAttention(item),
+							false,
+							"Clear this attention marker after confirming the file state is normal.",
+						);
+						ackBtn.classList.add("mod-cta");
+					}
 				}
 			} else {
 				const actions = row.createDiv({ cls: "kaos-dashboard-row-actions kaos-dashboard-attention-actions" });
@@ -854,13 +1143,41 @@ export class KaosDashboardView extends ItemView {
 					"Run reconcile again",
 					async () => this.deps.actions.forceReconcile(),
 				);
-				this.button(
-					actions,
-					"No direct file action",
-					async () => undefined,
-					true,
-					"This attention item describes a structural or vault-wide condition, not one file.",
-				);
+				if (item.structuralChange) {
+					const oldPath = item.structuralChange.oldPaths[0];
+					const newPath = item.structuralChange.newPaths[0];
+					const isSinglePair =
+						item.structuralChange.oldPaths.length === 1
+						&& item.structuralChange.newPaths.length === 1
+						&& typeof oldPath === "string"
+						&& typeof newPath === "string";
+					if (isSinglePair) {
+						const adoptBtn = this.button(
+							actions,
+							"Adopt rename",
+							() => this.confirmAdoptStructuralRename(oldPath, newPath),
+							false,
+							`Adopt rename: "${oldPath}" → "${newPath}". Links file identity in sync and clears conflict markers.`,
+						);
+						adoptBtn.classList.add("mod-cta");
+					} else {
+						this.button(
+							actions,
+							"No direct file action",
+							async () => undefined,
+							true,
+							"This structural change involves multiple paths or count mismatch. Resolve manually or via reconcile.",
+						);
+					}
+				} else {
+					this.button(
+						actions,
+						"No direct file action",
+						async () => undefined,
+						true,
+						"This attention item describes a structural or vault-wide condition, not one file.",
+					);
+				}
 			}
 		}
 		}
@@ -899,6 +1216,10 @@ export class KaosDashboardView extends ItemView {
 				return "Correct the shared exclude policy; local and editor changes remain active while remote projection is paused.";
 			case "room-divergence":
 				return "Run the sync check to identify whether this device is paired to the wrong room or frozen by a closed projection gate.";
+			case "tombstone-disk-conflict":
+				return "Note exists at a deleted path and is not syncing. Choose Keep local version or Accept delete.";
+			default:
+				return "This condition must be reviewed before resolving.";
 		}
 	}
 
@@ -1127,6 +1448,53 @@ export class KaosDashboardView extends ItemView {
 		});
 	}
 
+	private confirmTombstoneConflictResolution(
+		path: string,
+		resolution: DashboardTombstoneDiskConflictResolution,
+		choice: "keep-local" | "accept-delete",
+	): Promise<void> {
+		const episodeKey = attentionEpisodeKey(path, resolution);
+		if (this.pendingAttentionEpisodes.has(episodeKey)) {
+			return Promise.reject(new Error(`A resolution is already pending for "${path}".`));
+		}
+		this.pendingAttentionEpisodes.add(episodeKey);
+		this.render();
+		const keepingLocal = choice === "keep-local";
+		return new Promise((resolve, reject) => {
+			new ConfirmModal(
+				this.app,
+				keepingLocal ? "Keep local note version?" : "Accept delete?",
+				keepingLocal
+					? `Revive "${path}" and publish this local note to sync? The CRDT deletion tombstone will be cleared.`
+					: `Move the local file "${path}" to trash? The sync deletion will be confirmed.`,
+				async () => {
+					try {
+						await this.deps.actions.resolveTombstoneConflict(path, choice, resolution);
+						new Notice(
+							keepingLocal
+								? `Local note revived and kept: ${path}`
+								: `Local file moved to trash: ${path}`,
+						);
+						resolve();
+					} catch (err) {
+						reject(err instanceof Error ? err : new Error(String(err)));
+					} finally {
+						this.pendingAttentionEpisodes.delete(episodeKey);
+						this.render();
+					}
+				},
+				keepingLocal ? "Keep local version" : "Accept delete",
+				"Cancel",
+				() => {
+					this.pendingAttentionEpisodes.delete(episodeKey);
+					this.render();
+					resolve();
+				},
+				keepingLocal ? "mod-cta" : "mod-warning",
+			).open();
+		});
+	}
+
 	private removeResolvedMarkdownConflictEpisode(
 		path: string,
 		resolution: DashboardMarkdownConflictResolution,
@@ -1296,6 +1664,121 @@ export class KaosDashboardView extends ItemView {
 		).open();
 	}
 
+	private async confirmDeleteSafetyCopy(copy: DashboardConflictArtifact): Promise<void> {
+		const normalized = normalizePath(copy.artifactPath);
+		const file = this.app.vault.getAbstractFileByPath(normalized);
+		if (!file || !(file instanceof TFile)) {
+			new Notice(`Backup file not found on disk: ${copy.artifactPath}`);
+			await this.refresh(true);
+			return;
+		}
+
+		new ConfirmModal(
+			this.app,
+			"Delete safety backup file?",
+			`Are you sure you want to delete this local backup file?\n\n` +
+			`Path: ${copy.artifactPath}\n` +
+			(copy.originalExists ? `Current file: ${copy.inferredOriginalPath}\n\n` : `\n`) +
+			`The backup file will be moved to the Obsidian trash.`,
+			async () => {
+				try {
+					if (this.app.fileManager?.trashFile) {
+						await this.app.fileManager.trashFile(file);
+					} else {
+						// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
+						await this.app.vault.trash(file, true);
+					}
+					new Notice(`Moved backup to trash: ${copy.artifactPath}`);
+					await this.refresh(true);
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					new Notice(`Failed to delete backup: ${message}`);
+				}
+			},
+			"Delete backup",
+			"Cancel",
+			() => {},
+			"mod-warning",
+		).open();
+	}
+
+	private async confirmAcknowledgeAttention(item: DashboardAttentionItem): Promise<void> {
+		const targetPath = item.path;
+		if (!targetPath) return;
+
+		new ConfirmModal(
+			this.app,
+			`Acknowledge attention marker for "${targetPath}"?`,
+			`This confirms that you have reviewed this file and verified its state is normal.\n\n` +
+			`Path: ${targetPath}\n` +
+			`Reason: ${item.detail || item.title}\n\n` +
+			`This will clear the attention marker from KAOS without modifying or deleting any local files. Continue?`,
+			async () => {
+				try {
+					if (this.deps.actions.dismissAttentionEntry) {
+						await this.deps.actions.dismissAttentionEntry(targetPath);
+					}
+					if (this.lastAuditResult) {
+						const normTarget = normalizePath(targetPath);
+						this.lastAuditResult.items = this.lastAuditResult.items.filter(
+							(i) => normalizePath(i.entry.path) !== normTarget,
+						);
+						this.lastAuditResult.summary = buildSummary(this.lastAuditResult.items);
+					}
+					new Notice(`Cleared attention marker: ${targetPath}`);
+					await this.refresh(true);
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					new Notice(`Failed to clear attention marker: ${message}`);
+				}
+			},
+			"Acknowledge & clear",
+			"Cancel",
+			() => {},
+			"mod-cta",
+		).open();
+	}
+
+	private async confirmAdoptStructuralRename(oldPath: string, newPath: string): Promise<void> {
+		new ConfirmModal(
+			this.app,
+			"Adopt rename?",
+			`Adopt structural rename:\n\n"${oldPath}" → "${newPath}"\n\n` +
+			`This confirms that this file was moved or renamed.\n` +
+			`KAOS will link the file identity in sync and clear conflict markers.\n\n` +
+			`No local file content will be modified. Continue?`,
+			async () => {
+				try {
+					if (this.deps.actions.adoptStructuralRename) {
+						await this.deps.actions.adoptStructuralRename(oldPath, newPath);
+					}
+					if (this.lastAuditResult) {
+						const normTargetOld = normalizePath(oldPath);
+						const normTargetNew = normalizePath(newPath);
+						this.lastAuditResult.items = this.lastAuditResult.items.filter(
+							(i) => {
+								const p = normalizePath(i.entry.path);
+								return p !== normTargetOld && p !== normTargetNew;
+							},
+						);
+						this.lastAuditResult.summary = buildSummary(this.lastAuditResult.items);
+					}
+					new Notice(`Adopted rename: "${oldPath}" → "${newPath}"`);
+					await this.refresh(true);
+					await this.deps.actions.forceReconcile();
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					new Notice(`Failed to adopt rename: ${message}`);
+					await this.refresh(true);
+				}
+			},
+			"Adopt rename",
+			"Cancel",
+			() => {},
+			"mod-cta",
+		).open();
+	}
+
 	private markAttentionEpisodePending(
 		path: string,
 		resolution: DashboardRemoteDeleteResolution,
@@ -1371,6 +1854,42 @@ export class KaosDashboardView extends ItemView {
 		const leaf = this.app.workspace.getLeaf("tab");
 		await leaf.openFile(file, { active: true });
 		await this.app.workspace.revealLeaf(leaf);
+	}
+
+	private async openMarkdownConflictReview(path: string, resolution: DashboardMarkdownConflictResolution): Promise<void> {
+		const sides = await this.deps.getMarkdownConflictReviewSides?.(path);
+		if (!sides || (sides.localText === null && sides.remoteText === null)) {
+			throw new Error("Local and remote note content are required. Refresh the dashboard and try again.");
+		}
+		const baseText = sides.baseHash ? await this.deps.getBaselineText?.(sides.baseHash) ?? null : null;
+		new ConflictDiffModal(this.app, {
+			artifactPath: path, originalPath: path,
+			originalText: sides.localText ?? "", artifactText: sides.remoteText ?? "",
+			baseHash: sides.baseHash, baseText,
+			labels: { original: "Local (disk)", artifact: "Remote (sync)" }, context: "attention",
+			onResolve: async (choice) => {
+				const episodeKey = attentionEpisodeKey(path, resolution);
+				if (this.pendingAttentionEpisodes.has(episodeKey)) throw new Error("A resolution is already pending.");
+				this.pendingAttentionEpisodes.add(episodeKey);
+				this.render();
+				try {
+					const current = await this.deps.getMarkdownConflictReviewSides?.(path);
+					if (!current || current.localText !== sides.localText || current.remoteText !== sides.remoteText) {
+						throw new Error("Note content changed. Reopen the conflict review and try again.");
+					}
+					const dashboardChoice: DashboardMarkdownConflictResolutionChoice = choice.kind === "original" ? "keep-local"
+						: choice.kind === "artifact" ? "use-remote"
+						: { kind: "use-merged", mergedText: choice.mergedText, expectedLocalText: sides.localText ?? "", expectedRemoteText: sides.remoteText ?? "" };
+					const result = await this.deps.actions.resolveMarkdownConflictAttention({ path, ...resolution }, dashboardChoice);
+					if (result.status !== "completed") throw new Error(result.message);
+					this.removeResolvedMarkdownConflictEpisode(path, resolution);
+					await this.refresh(true);
+				} finally {
+					this.pendingAttentionEpisodes.delete(episodeKey);
+					this.render();
+				}
+			},
+		}).open();
 	}
 
 	private async openConflictDiff(artifact: DashboardConflictArtifact): Promise<void> {
@@ -1600,6 +2119,8 @@ interface ConflictDiffModalData {
 	artifactText: string;
 	baseHash: string | null;
 	baseText: string | null;
+	labels?: { original: string; artifact: string };
+	context?: "artifact-cas" | "attention";
 	onResolve(choice: ConflictResolutionChoice): Promise<void>;
 }
 
@@ -1630,15 +2151,15 @@ class ConflictDiffModal extends Modal {
 		contentEl.createEl("h3", { text: "Conflict diff" });
 
 		const pathGrid = contentEl.createDiv({ cls: "kaos-conflict-diff-paths" });
-		this.renderPath(pathGrid, "Original", this.data.originalPath);
-		this.renderPath(pathGrid, "Conflict artifact", this.data.artifactPath);
+		this.renderPath(pathGrid, this.data.labels?.original ?? "Original", this.data.originalPath);
+		this.renderPath(pathGrid, this.data.labels?.artifact ?? "Conflict artifact", this.data.artifactPath);
 		this.renderPath(pathGrid, "Base", this.data.baseHash ? `available (${this.data.baseHash.slice(0, 12)})` : "not available");
 
 		const actions = contentEl.createDiv({ cls: "modal-button-container kaos-conflict-diff-actions" });
-		actions.createEl("button", { text: "Use original" }).addEventListener("click", () => {
+		actions.createEl("button", { text: this.data.context === "attention" ? "Keep local version" : "Use original" }).addEventListener("click", () => {
 			this.confirmResolution({ kind: "original" });
 		});
-		actions.createEl("button", { text: "Use artifact", cls: "mod-cta" }).addEventListener("click", () => {
+		actions.createEl("button", { text: this.data.context === "attention" ? "Use remote copy" : "Use artifact", cls: "mod-cta" }).addEventListener("click", () => {
 			this.confirmResolution({ kind: "artifact" });
 		});
 		actions.createEl("button", { text: "Apply merged", cls: "mod-cta" }).addEventListener("click", () => {
@@ -1646,12 +2167,21 @@ class ConflictDiffModal extends Modal {
 		});
 		actions.createEl("button", { text: "Close" }).addEventListener("click", () => this.close());
 
+		if (this.data.context === "attention") {
+			const sides = contentEl.createDiv({ cls: "kaos-conflict-review-sides" });
+			for (const [label, text] of [[this.data.labels?.original ?? "Local", this.data.originalText], [this.data.labels?.artifact ?? "Remote", this.data.artifactText]]) {
+				const pane = sides.createDiv({ cls: "kaos-conflict-merge-pane" });
+				pane.createDiv({ text: label, cls: "kaos-conflict-merge-pane-label" });
+				this.renderMergePlainText(pane.createDiv({ cls: "kaos-conflict-merge-pane-body" }), text!, "Empty or missing note");
+			}
+		}
+
 		this.renderManualMerge(contentEl);
 
-		contentEl.createEl("h4", { text: "Original vs artifact diff", cls: "kaos-conflict-diff-heading" });
+		contentEl.createEl("h4", { text: this.data.context === "attention" ? "Local vs remote diff" : "Original vs artifact diff", cls: "kaos-conflict-diff-heading" });
 		const legend = contentEl.createDiv({ cls: "kaos-conflict-diff-legend" });
-		legend.createEl("span", { text: "- original", cls: "kaos-conflict-diff-delete" });
-		legend.createEl("span", { text: "+ artifact", cls: "kaos-conflict-diff-insert" });
+		legend.createEl("span", { text: `- ${this.data.labels?.original ?? "original"}`, cls: "kaos-conflict-diff-delete" });
+		legend.createEl("span", { text: `+ ${this.data.labels?.artifact ?? "artifact"}`, cls: "kaos-conflict-diff-insert" });
 
 		const diffBody = contentEl.createDiv({ cls: "kaos-conflict-diff-body" });
 		this.renderDiffLines(
@@ -1746,13 +2276,13 @@ class ConflictDiffModal extends Modal {
 			diffAgainstBase: false,
 			unavailable: mode === "two-way",
 		});
-		this.renderMergeSourcePane(paneGrid, "Original", hunk.leftText, {
+		this.renderMergeSourcePane(paneGrid, this.data.labels?.original ?? "Original", hunk.leftText, {
 			kind: "original",
 			baseText: hunk.baseText,
 			diffAgainstBase: mode !== "two-way",
 			unavailable: false,
 		});
-		this.renderMergeSourcePane(paneGrid, "Artifact", hunk.rightText, {
+		this.renderMergeSourcePane(paneGrid, this.data.labels?.artifact ?? "Artifact", hunk.rightText, {
 			kind: "artifact",
 			baseText: hunk.baseText,
 			diffAgainstBase: mode !== "two-way",
@@ -1773,8 +2303,8 @@ class ConflictDiffModal extends Modal {
 			this.hunkEdits.set(hunk.index, text);
 			this.updateMergePreview();
 		};
-		buttons.createEl("button", { text: "Use original" }).addEventListener("click", () => setText(hunk.leftText));
-		buttons.createEl("button", { text: "Use artifact" }).addEventListener("click", () => setText(hunk.rightText));
+		buttons.createEl("button", { text: this.data.context === "attention" ? "Use local" : "Use original" }).addEventListener("click", () => setText(hunk.leftText));
+		buttons.createEl("button", { text: this.data.context === "attention" ? "Use remote" : "Use artifact" }).addEventListener("click", () => setText(hunk.rightText));
 		buttons.createEl("button", { text: "Use both" }).addEventListener("click", () => setText(combineBoth(hunk.leftText, hunk.rightText)));
 		buttons.createEl("button", { text: "Edit merged" }).addEventListener("click", () => textarea.focus());
 	}
@@ -1882,6 +2412,16 @@ class ConflictDiffModal extends Modal {
 	}
 
 	private confirmResolution(choice: ConflictResolutionChoice): void {
+		if (this.data.context === "attention") {
+			const merged = choice.kind === "merged";
+			const remote = choice.kind === "artifact";
+			const title = merged ? "Apply merged result?" : remote ? "Use remote copy?" : "Keep local version?";
+			const message = merged ? "Apply the merged result to this note?" : remote ? "Use the remote copy?" : "Keep the local version?";
+			const confirm = merged ? "Apply merged" : remote ? "Use remote copy" : "Keep local version";
+			new ConfirmModal(this.app, title, message, () => this.applyResolution(choice), confirm, "Cancel").open();
+			return;
+		}
+
 		const useArtifact = choice.kind === "artifact";
 		const useMerged = choice.kind === "merged";
 		new ConfirmModal(
@@ -1902,7 +2442,7 @@ class ConflictDiffModal extends Modal {
 		try {
 			await this.data.onResolve(choice);
 			new Notice(
-				choice.kind === "merged"
+				this.data.context === "attention" ? "Note conflict resolved." : choice.kind === "merged"
 					? "Conflict resolved using merged result. Conflict artifact moved to trash."
 					: choice.kind === "artifact"
 						? "Conflict resolved using artifact. Conflict artifact moved to trash."
@@ -2042,7 +2582,12 @@ function formatUnknown(err: unknown): string {
 
 function attentionEpisodeKey(
 	path: string,
-	resolution: Pick<DashboardRemoteDeleteResolution, "fileKind" | "episodeId">,
+	resolution:
+		| Pick<DashboardRemoteDeleteResolution, "fileKind" | "episodeId">
+		| DashboardTombstoneDiskConflictResolution,
 ): string {
-	return `${resolution.fileKind}:${path}:${resolution.episodeId}`;
+	if ("fileKind" in resolution && "episodeId" in resolution) {
+		return `${resolution.fileKind}:${path}:${resolution.episodeId}`;
+	}
+	return `tombstone:${path}`;
 }

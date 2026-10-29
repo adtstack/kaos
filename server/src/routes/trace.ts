@@ -12,7 +12,7 @@ const LOG_PREFIX = "[kaos-sync:worker]";
  * can hydrate the entire CRDT document. Cheap endpoints only need a stable DO
  * id and a room-id hint for their response payload.
  */
-function fetchVaultRoomCheap(
+export function fetchVaultRoomCheap(
 	env: Env,
 	vaultId: string,
 	pathname: string,

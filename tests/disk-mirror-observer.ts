@@ -245,6 +245,9 @@ function makeHarness(options: {
 					: content;
 			},
 			adapter: {
+				exists: async (path: string) => path === ".kaos-safety-backup" || diskFiles.has(path),
+				mkdir: async () => {},
+				write: async (path: string, content: string) => { diskFiles.set(path, content); },
 				read: async (path: string) => diskFiles.get(path) ?? "",
 			},
 			modify: async (file: { path: string }, content: string) => {
@@ -400,6 +403,10 @@ console.log("\n--- Test 2c: provider projection is fenced without blocking local
 		debounceTimerCount(fixture.mirror) === 0,
 		"closed policy gate blocks provider Y.Text projection before queue admission",
 	);
+	assert(
+		!fixture.mirror.hasPendingWrite(FILE_PATH),
+		"a policy-rejected text update leaves no phantom write blocking startup reconciliation",
+	);
 
 	fixture.emitMetaChanges({
 		origin: fixture.fakeProvider,
@@ -413,6 +420,10 @@ console.log("\n--- Test 2c: provider projection is fenced without blocking local
 	assert(
 		debounceTimerCount(fixture.mirror) === 0,
 		"closed policy gate blocks provider metadata projection before queue admission",
+	);
+	assert(
+		!fixture.mirror.hasPendingWrite(FILE_PATH),
+		"a policy-rejected metadata update leaves reconciliation free to establish the first baseline",
 	);
 
 	const blocked = await fixture.mirror.flushWrite(FILE_PATH, true, {
@@ -1605,7 +1616,7 @@ console.log("\n--- Test 13f: successful trash resolves marker only after trash s
 	fixture.doc.destroy();
 }
 
-console.log("\n--- Test 13g: failed dirty revival keeps the exact prior marker ---");
+console.log("\n--- Test 13g: dirty preservation keeps the exact prior marker ---");
 
 for (const ensureFileBehavior of ["throw", "replan", "blocked"] as const) {
 	const baseline = "REVIVE_BASELINE\n";
@@ -1629,7 +1640,7 @@ for (const ensureFileBehavior of ["throw", "replan", "blocked"] as const) {
 	).handleRemoteDelete(FILE_PATH, { baselineText: baseline });
 
 	const after = fixture.mirror.getPreservedUnresolvedEntries()[0];
-	assert(fixture.getEnsureFileCalls() === 1, `${ensureFileBehavior}: dirty preservation attempts one tombstone revival`);
+	assert(fixture.getEnsureFileCalls() === 0, `${ensureFileBehavior}: dirty preservation never attempts automatic revival`);
 	assert(fixture.diskFiles.get(FILE_PATH) === localDirty, `${ensureFileBehavior}: revive failure preserves local disk authority`);
 	assert(fixture.mirror.isPreservedUnresolved(FILE_PATH), `${ensureFileBehavior}: revive failure keeps the path quarantined`);
 	assert(
@@ -1640,7 +1651,7 @@ for (const ensureFileBehavior of ["throw", "replan", "blocked"] as const) {
 	fixture.doc.destroy();
 }
 
-console.log("\n--- Test 13g2: dirty revival rejects a disk authority that changed after inspection ---");
+console.log("\n--- Test 13g2: disk changes during inspection remain local without revival ---");
 {
 	const baseline = "REVIVE_STALE_BASELINE\n";
 	const firstLocalDirty = "LOCAL_DIRTY_FIRST_READ\n";
@@ -1666,7 +1677,7 @@ console.log("\n--- Test 13g2: dirty revival rejects a disk authority that change
 		}
 	).handleRemoteDelete(FILE_PATH, { baselineText: baseline });
 
-	assert(readCount === 2, "dirty preservation re-reads disk immediately before revival");
+	assert(readCount >= 1, "dirty preservation inspects disk without mutating it");
 	assert(fixture.getEnsureFileCalls() === 0, "stale dirty snapshot never reaches ensureFile");
 	assert(fixture.diskFiles.get(FILE_PATH) === newerLocalDirty, "newer local disk edit remains authoritative");
 	assert(fixture.ytext.toString() === baseline, "stale first-read content is not revived into CRDT");
@@ -1675,7 +1686,7 @@ console.log("\n--- Test 13g2: dirty revival rejects a disk authority that change
 	fixture.doc.destroy();
 }
 
-console.log("\n--- Test 13h: exact dirty revival clears marker only after CRDT settles ---");
+console.log("\n--- Test 13h: dirty preservation leaves the CRDT removal and marker intact ---");
 {
 	const baseline = "REVIVE_EXACT_BASELINE\n";
 	const localDirty = "LOCAL_DIRTY_EXACT_WINNER\n";
@@ -1700,10 +1711,13 @@ console.log("\n--- Test 13h: exact dirty revival clears marker only after CRDT s
 		}
 	).handleRemoteDelete(FILE_PATH, { baselineText: baseline });
 
-	assert(markerPresentDuringEnsure, "marker remains present while ensureFile settles active CRDT state");
-	assert(fixture.ytext.toString() === localDirty, "active Y.Text exposes the exact preserved disk bytes");
-	assert(!fixture.mirror.isPreservedUnresolved(FILE_PATH), "exact active revival clears the prior marker last");
-	assert(fixture.diskFiles.get(FILE_PATH) === localDirty, "exact revival leaves local disk bytes untouched");
+	assert(!markerPresentDuringEnsure && fixture.getEnsureFileCalls() === 0, "dirty preservation never enters ensureFile");
+	assert(fixture.ytext.toString() === baseline, "dirty preservation does not publish local bytes into the removed document");
+	assert(fixture.mirror.isPreservedUnresolved(FILE_PATH), "dirty preservation retains the unresolved marker");
+	assert(fixture.diskFiles.get(FILE_PATH) === localDirty, "dirty preservation leaves local disk bytes untouched");
+	const localBackup = fixture.mirror.getPreservedUnresolvedEntries()[0]?.artifactPath;
+	assert(typeof localBackup === "string" && fixture.diskFiles.get(localBackup) === localDirty,
+		"unsent disk content also has a durable backup independent of later editor saves");
 
 	fixture.doc.destroy();
 }
@@ -3041,6 +3055,23 @@ console.log("\n--- Test 18: exact local-create suppression handles roll back wit
 		}
 	}
 
+	fixture.doc.destroy();
+}
+
+console.log("\n--- Unsaved editor work is backed up locally without cancelling remote delete ---");
+for (const hasBaseline of [true, false]) {
+	const baseline = "saved before remote deletion\n";
+	const unsaved = "local editor has unsent work\n";
+	const fixture = makeHarness({initialDiskContent: baseline, openEditorContent: unsaved});
+	fixture.ytext.insert(0, baseline);
+	fixture.setAuthoritativeDeleteFingerprint("editor-conflict-removal");
+	await (fixture.mirror as any).handleRemoteDelete(FILE_PATH, {baselineText: hasBaseline ? baseline : null});
+	const marker = fixture.mirror.getPreservedUnresolvedEntries().find(entry => entry.path === FILE_PATH);
+	assert(fixture.getEnsureFileCalls() === 0 && fixture.deleteCalls.length === 0, "unsaved work neither revives nor trashes the original path");
+	assert(marker?.reason === (hasBaseline ? "remote-delete-local-conflict" : "remote-delete-missing-baseline"), "unsaved work gets an actionable remote-delete conflict");
+	assert(typeof marker?.artifactPath === "string" && marker.artifactPath.startsWith(".kaos-safety-backup/"), "editor backup is outside the synchronized namespace");
+	assert(fixture.diskFiles.get(marker?.artifactPath ?? "") === unsaved, "durable local backup contains the unsaved editor bytes exactly");
+	assert(fixture.diskFiles.get(FILE_PATH) === baseline, "backing up unsaved editor text does not replace the on-disk original");
 	fixture.doc.destroy();
 }
 

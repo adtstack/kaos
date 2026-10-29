@@ -13,7 +13,7 @@ import {
 	type FlightPathEventInput,
 	type TraceContext,
 } from "./flightEvents";
-import type { ProductFlightPathEventInput } from "../../observability/traceSink";
+import type { ProductFlightPathEventInput, ContentTraceSamples } from "../../observability/traceSink";
 import { PathIdentityResolver } from "./pathIdentity";
 import { sha256Hex, getOrCreateLocalDeviceId } from "../../sync/indexedDbCandidateStore";
 
@@ -75,11 +75,19 @@ export class FlightTraceController {
 
 	/** Pending recordPath() promises — flush() drains these before reading. */
 	private pendingPathPromises = new Set<Promise<void>>();
+	private contentSecret = "";
+	private pendingContentChars = 0;
+	private pendingContentCount = 0;
+	private acceptingContent = false;
 
 	constructor(private readonly deps: FlightTraceDeps) {}
 
 	get isEnabled(): boolean {
 		return this.state.enabled;
+	}
+
+	get canRecordContent(): boolean {
+		return this.isEnabled && this.acceptingContent;
 	}
 
 	get currentRecorder(): FlightRecorder | null {
@@ -122,6 +130,8 @@ export class FlightTraceController {
 			docSchemaVersion: this.deps.getDocSchemaVersion() ?? undefined,
 		};
 		this.recorder = new FlightRecorder(this.deps.app, recorderOptions);
+		this.contentSecret = qaTraceSecret || randomBase64Url(24);
+		this.acceptingContent = true;
 		this.pathIdentity = new PathIdentityResolver(sha256Hex, {
 			mode,
 			pathSecret: randomBase64Url(16),
@@ -182,6 +192,7 @@ export class FlightTraceController {
 
 	async stop(): Promise<void> {
 		if (!this.state.enabled) return;
+		this.acceptingContent = false;
 		this.record({
 			priority: "important",
 			kind: FLIGHT_KIND.qaTraceStopped,
@@ -192,8 +203,13 @@ export class FlightTraceController {
 			data: { mode: this.state.mode },
 		});
 		this.stopCheckpointLoop();
-		await this.flush();
-		await this.recorder?.shutdown();
+		try {
+			await this.flush();
+			await this.recorder?.shutdown();
+		} catch (error) {
+			this.acceptingContent = true;
+			throw error;
+		}
 		this.recorder = null;
 		this.pathIdentity = null;
 		this.state = { enabled: false, mode: "safe", qaTraceSecret: null, manualStart: false };
@@ -229,6 +245,73 @@ export class FlightTraceController {
 		return seq;
 	}
 
+	/** Capture order is reserved before hashing. Stop/export drains this work. */
+	recordContentPath(event: ProductFlightPathEventInput, samples: ContentTraceSamples): void {
+		const recorder = this.recorder;
+		const resolver = this.pathIdentity;
+		if (!this.canRecordContent || !recorder || !resolver) return;
+		const seq = recorder.reserveSeq();
+		const observedAt = Date.now();
+		const observedMono = typeof performance !== "undefined" ? performance.now() : null;
+		const secret = this.contentSecret;
+		const capturedData = { ...event.data };
+		const hashDomain = this.state.qaTraceSecret ? "shared-secret-exact-v1" : "trace-local-exact-v1";
+		let entries = Object.entries(samples).filter(([key]) =>
+			["editorBefore", "editorAfter", "crdt", "disk", "diskEditorNormalized"].includes(key),
+		);
+		const chars = entries.reduce((sum, [, value]) => sum + (value?.length ?? 0), 0);
+		// Bound both concurrent hashing and retained UTF-16 snapshots. Report gaps.
+		const admitted = this.pendingContentCount < 64 && this.pendingContentChars + chars <= 4_000_000;
+		const lengths = Object.fromEntries(entries.map(([key, value]) => [`${key}Length`, value?.length ?? null]));
+		if (!admitted) entries = entries.map(([key]) => [key, null]);
+		if (admitted) {
+			this.pendingContentCount++;
+			this.pendingContentChars += chars;
+		}
+		const hashes = admitted ? Promise.all(entries.map(async ([key, value]) => {
+			if (value == null) return [`${key}Hash`, null] as const;
+			try {
+				const bytes = new TextEncoder().encode(`${secret}\0kaos-editor-exact-v1\0${value}`);
+				const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+				const hex = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, "0")).join("");
+				return [`${key}Hash`, `eh:${hex}`] as const;
+			} catch {
+				return [`${key}Hash`, null] as const;
+			}
+		})) : Promise.resolve(entries.map(([key]) => [`${key}Hash`, null] as const));
+		const p = (async () => {
+			const [identity, results] = await Promise.all([resolver.getPathIdentity(event.path), hashes]);
+			const failed = entries.some(([, value], index) => value != null && results[index]?.[1] === null);
+			const rest = { ...event, path: undefined };
+			recorder.record({
+				...rest,
+				kind: event.kind as FlightEventInput["kind"],
+				priority: event.priority ?? "important",
+				pathId: identity.pathId,
+				...(identity.path !== undefined ? { path: identity.path } : {}),
+				data: {
+					...capturedData, ...lengths, ...Object.fromEntries(results),
+					observedAt, observedMono, contentHashDomain: hashDomain,
+					captureStatus: !admitted ? "capacity-exceeded" : failed ? "hash-unavailable" : "ok",
+				},
+			}, { reservedSeq: seq });
+			if (resolver.hasDegraded) recorder.markPathIdentityDegraded();
+		})().catch(() => {
+			recorder.record({
+				kind: FLIGHT_KIND.flightEventsDropped, priority: "critical", severity: "error",
+				scope: "diagnostics", source: "traceRuntime", layer: "diagnostics",
+				data: { reason: "content-observation-failed", failedSeq: seq },
+			});
+		}).finally(() => {
+			if (admitted) {
+				this.pendingContentCount--;
+				this.pendingContentChars -= chars;
+			}
+			this.pendingPathPromises.delete(p);
+		});
+		this.pendingPathPromises.add(p);
+	}
+
 	/** @deprecated Use recordPath(). Kept for backward compatibility. */
 	recordPathEvent(event: FlightPathEventInput): void {
 		void this.recordPath(event);
@@ -241,7 +324,6 @@ export class FlightTraceController {
 	async flush(): Promise<void> {
 		if (this.pendingPathPromises.size > 0) {
 			await Promise.allSettled([...this.pendingPathPromises]);
-			this.pendingPathPromises.clear();
 		}
 		await this.recorder?.flushNow();
 		// Drain the write chain too.

@@ -818,6 +818,31 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(advancedBody)
+			.setName("Reconcile safety brake")
+			.setDesc("Block reconciliation when bulk changes exceed 20 files and 25% of the vault. Keep disabled if your vault is tracked with Git or external backups.")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.host.settings.enableSafetyBrake)
+					.onChange(async (value) => {
+						await this.host.updateSettings((settings) => {
+							settings.enableSafetyBrake = value;
+						}, "settings:safety-brake");
+					}),
+			);
+
+		new Setting(advancedBody)
+			.setName("Automatic recovery")
+			.setDesc("Keep recovery guarded, or pause automatic version takeovers while troubleshooting. Normal editing, remote sync and manual choices continue.")
+			.addDropdown(dropdown => dropdown
+				.addOption("guarded", "Guarded")
+				.addOption("pause-automatic-recovery", "Pause automatic recovery")
+				.setValue(this.host.settings.automaticRecoveryMode)
+				.onChange(async value => {
+					if (value !== "guarded" && value !== "pause-automatic-recovery") return;
+					await this.host.updateSettings(settings => { settings.automaticRecoveryMode = value; }, "settings:automatic-recovery");
+				}));
+
+		new Setting(advancedBody)
 			.setName("Debug logging")
 			.setDesc("Enable verbose console logs for troubleshooting.")
 			.addToggle((toggle) =>

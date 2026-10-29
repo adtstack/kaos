@@ -19,6 +19,7 @@ export const PRODUCT_EVENT_KIND = {
 
 	// Disk observations
 	diskWriteOk: "disk.write.ok",
+	diskWriteCommitted: "disk.write.committed",
 	diskWriteFailed: "disk.write.failed",
 	diskEventNotSuppressed: "disk.event.not_suppressed",
 
@@ -35,6 +36,9 @@ export const PRODUCT_EVENT_KIND = {
 	recoveryApplyStart: "recovery.apply.start",
 	recoveryApplyDone: "recovery.apply.done",
 	recoverySkipped: "recovery.skipped",
+	recoveryRestoreFullStarted: "recovery.restore.full.started",
+	recoveryRestoreFullCompleted: "recovery.restore.full.completed",
+	recoveryRestoreFullFailed: "recovery.restore.full.failed",
 	recoveryPostconditionFailed: "recovery.postcondition.failed",
 	recoveryQuarantined: "recovery.quarantined",
 	recoveryLoopDetected: "recovery.loop.detected",
@@ -45,6 +49,9 @@ export const PRODUCT_EVENT_KIND = {
 	editorRepairApplied: "editor.repair.applied",
 	editorAuthorityShieldApplied: "editor.authority_shield.applied",
 	providerRegressiveDeleteSuspected: "editor.provider_regressive_delete.suspected",
+	editorCausalityObserved: "editor.causality.observed",
+	diskModifyClassified: "disk.modify.classified",
+	bindingDivergenceObserved: "binding.divergence.observed",
 } as const;
 
 export type ProductEventKind =

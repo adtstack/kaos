@@ -192,6 +192,7 @@ console.log("\n--- Reconciliation keeps local ingress separate from remote proje
 			path === KAOS_EXCLUDE_FILE_PATH ? controlText : ordinaryText
 		),
 		isMarkdownTombstoned: () => false,
+		getMarkdownPathRetirement: () => null,
 		markInitialized: () => {},
 		ensureFile: () => {
 			throw new Error("an empty disk must not seed CRDT");

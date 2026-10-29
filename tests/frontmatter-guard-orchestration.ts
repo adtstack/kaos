@@ -1,3 +1,4 @@
+import { createCertifiedLocalRecoveryFixture } from "./helpers/certified-local-recovery";
 /**
  * Frontmatter-guard orchestration regression test.
  *
@@ -250,7 +251,9 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 		captured.push(asAnyEvent(event));
 	};
 
+	const recoveryProof = createCertifiedLocalRecoveryFixture(() => ytext);
 	const editorBindings = {
+		getLocalOnlyRecoveryEvidenceForView: recoveryProof.pane,
 		isBound: () => true,
 		getBindingDebugInfoForView: () => ({
 			leafId: "stub-leaf-1",
@@ -317,6 +320,7 @@ function buildFrontmatterFixture(options: FixtureOptions): FrontmatterFixture {
 	};
 
 	const vaultSync = {
+		getRemoteTextRevisionForPath: recoveryProof.revision,
 		getTextForPath: (p: string) => (p === path ? ytext : null),
 		serverAckTracker: {
 			withActiveOpId: (_opId: string | undefined, fn: () => void) => fn(),

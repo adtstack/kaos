@@ -414,6 +414,108 @@ console.log("\n--- Test 12: excluded Markdown is fenced before editor binding an
 	);
 }
 
+console.log("\n--- Test 13: degraded notice is time-floored with no flag resets ---");
+{
+	const bindEntrySection = sliceBetween(
+		bindingSource,
+		'if (!transition) {',
+		'const cmId = this.getCmId(cm);',
+	);
+	assert(bindEntrySection !== null, "bind entry section found");
+	assert(
+		!bindEntrySection?.includes("cmDegraded"),
+		"bind entry has no degraded-notice handling",
+	);
+	const repairEntrySection = sliceBetween(
+		bindingSource,
+		'repair: waiting for Obsidian editor view',
+		'const existing = this.bindings.get(leafId);',
+	);
+	assert(repairEntrySection !== null, "repair entry section found");
+	assert(
+		!repairEntrySection?.includes("cmDegraded"),
+		"repair entry has no degraded-notice handling",
+	);
+	const appliedSection = sliceBetween(
+		bindingSource,
+		'this.finishFileTransition(view, filePath, "target-bound");',
+		'this.trace?.("editor", "binding-applied", {',
+	);
+	assert(appliedSection !== null, "binding-applied section found");
+	assert(
+		!appliedSection?.includes("cmDegraded"),
+		"binding application does not touch the degraded notice",
+	);
+	const warnSection = sliceBetween(
+		bindingSource,
+		"private warnCmDegraded(",
+		"private getCmId(",
+	);
+	assert(warnSection !== null, "warnCmDegraded section found");
+	assert(
+		warnSection?.includes("CM_DEGRADED_NOTICE_MIN_INTERVAL_MS"),
+		"degraded notice is time-floored",
+	);
+}
+
+console.log("\n--- Test 14: divergence notice carries a vault-wide cap ---");
+{
+	const divergenceSection = sliceBetween(
+		bindingSource,
+		"private notifyBindingEditorDivergence(path: string): void {",
+		"private getCmView(view: MarkdownView): EditorView | null {",
+	);
+	assert(divergenceSection !== null, "notifyBindingEditorDivergence section found");
+	assert(
+		divergenceSection?.includes("EDITOR_DIVERGENCE_NOTICE_GLOBAL_COOLDOWN_MS"),
+		"divergence notice checks the global cooldown",
+	);
+	assert(
+		divergenceSection?.includes("binding-divergence-notice-suppressed"),
+		"suppressed paths are traced",
+	);
+}
+
+console.log("\n--- Test 15: divergence origin classifier detects composition, remote projection, reconnect, and disk changes ---");
+{
+	const classifySection = sliceBetween(
+		bindingSource,
+		"private classifyDivergenceOrigin(",
+		"private getCmView(view: MarkdownView): EditorView | null {",
+	);
+	assert(classifySection !== null, "classifyDivergenceOrigin section found");
+	assert(
+		classifySection?.includes("composition-active"),
+		"classifier handles composition-active",
+	);
+	assert(
+		classifySection?.includes("pending-remote-projection"),
+		"classifier handles pending-remote-projection via getLastRemoteAdvancedAt",
+	);
+	assert(
+		classifySection?.includes("recent-reconnect"),
+		"classifier handles recent-reconnect",
+	);
+	assert(
+		classifySection?.includes("recent-disk-modify"),
+		"classifier handles recent-disk-modify",
+	);
+	const targetSection = sliceBetween(
+		bindingSource,
+		"if (contentDiverged && !reason.startsWith(\"heal\")) {",
+		"return null;\n\t\t\t}",
+	);
+	assert(targetSection !== null, "resolveBindingTarget divergence section found");
+	assert(
+		targetSection?.includes("PRODUCT_EVENT_KIND.bindingDivergenceObserved"),
+		"divergence branch emits bindingDivergenceObserved event",
+	);
+	assert(
+		targetSection?.includes("this.trace?.(\"editor\", \"binding-divergence-first-observed\""),
+		"divergence branch emits first-observed trace",
+	);
+}
+
 console.log(`\n${"-".repeat(50)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log(`${"-".repeat(50)}\n`);

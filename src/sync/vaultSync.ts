@@ -1,3 +1,5 @@
+import { RemoteTextRevisionTracker, type RemoteTextRevision } from "./remoteTextRevisionTracker";
+import { MarkdownCreationHistoryGate, type MarkdownCreationHistoryLoader } from "./markdownCreationHistory";
 import * as Y from "yjs";
 import YSyncProvider from "y-partyserver/provider";
 import { IndexeddbPersistence } from "y-indexeddb";
@@ -15,6 +17,7 @@ import {
 import {
 	decodeFileMeta,
 	getMetaPath,
+	getMetaDeletedAt,
 	isFileMetaDeletedValue,
 	ensureNestedMetaEntry,
 	createNestedActiveMeta,
@@ -169,9 +172,11 @@ type ActivePathClassification =
 	| { kind: "collision"; fileIds: readonly string[] };
 
 interface EnsureFileOptions {
+	/** Only an explicit restore/Keep local action may cancel a recorded removal. */
 	reviveTombstone?: boolean;
 	reviveReason?: string;
 	opId?: string;
+	expectedRemovalFingerprint?: string;
 	/** Final caller-owned creation policy, evaluated without VaultSync mutation. */
 	canCreate?: () => boolean;
 }
@@ -195,7 +200,18 @@ export interface MarkdownRemoteDeleteSnapshot {
 	readonly kind: "markdown";
 	readonly path: string;
 	readonly tombstones: readonly MarkdownRemoteDeleteTombstoneSnapshot[];
+	readonly retirement?: MarkdownPathRetirement;
+	readonly history?: readonly { readonly fileId: string; readonly historyId: string }[];
 	readonly fingerprint: string;
+}
+
+/** Shared, persistent evidence that a Markdown path was vacated by a move. */
+export interface MarkdownPathRetirement {
+	readonly fileId: string;
+	readonly oldPath: string;
+	readonly operationId: string;
+	readonly movedTo: string;
+	readonly movedAt: number;
 }
 
 /** A point-in-time, authoritative view of a remotely deleted blob path. */
@@ -283,6 +299,7 @@ type ServerReceiptStartupValidation =
  *   pathToBlob:      Y.Map<BlobRef>        — vault-relative path -> { hash, size }
  *   blobMeta:        Y.Map<BlobMeta>       — sha256 hex -> { size, mime, createdAt }
  *   blobTombstones:  Y.Map<BlobTombstone>  — vault-relative path -> { deletedAt, device? }
+ *   markdownPathRetirements: Y.Map<MarkdownPathRetirement> — fileId -> last move
  */
 export class VaultSync {
 	readonly ydoc: Y.Doc;
@@ -290,6 +307,7 @@ export class VaultSync {
 	readonly persistence: IndexeddbPersistence;
 	readonly updateTracker: UpdateTracker;
 	readonly serverAckTracker: ServerAckTracker;
+	readonly remoteTextRevisions: RemoteTextRevisionTracker;
 
 	readonly pathToId: Y.Map<string>;
 	readonly idToText: Y.Map<Y.Text>;
@@ -312,6 +330,9 @@ export class VaultSync {
 	private _deletedPathIndex = new Set<string>(); // tombstoned paths
 	private _activePathCollisions = new Map<string, string[]>(); // active path -> all competing fileIds
 	private _pathIndexesDirty = true;
+	private markdownCreationHistory?: MarkdownCreationHistoryGate;
+	private markdownRetirementIndex?: Map<string, MarkdownPathRetirement>;
+	private observedMarkdownRetirements?: Y.Map<unknown>;
 
 	/**
 	 * Snapshot of decoded metadata used by the semantic observer.
@@ -401,6 +422,12 @@ export class VaultSync {
 		reason: string | null;
 	} | null = null;
 
+	private _lastConnectedAt = 0;
+
+	get lastConnectedAt(): number {
+		return this._lastConnectedAt;
+	}
+
 	/** True if IndexedDB encountered an error (unavailable, quota, etc). */
 	private _idbError = false;
 	private _idbErrorDetails: IndexedDbErrorDetails | null = null;
@@ -470,10 +497,17 @@ export class VaultSync {
 	/** Socket-open is not success: only sync(true) re-arms one immediate reconnect. */
 	private _socketTicketReconnectAttemptedSinceSync = false;
 	private _destroyed = false;
+	private _isConnectionAllowed: (() => boolean) | undefined;
+
+	get connectionWanted(): boolean { return this._socketTicketConnectionWanted; }
 
 	constructor(
 		settings: VaultSyncSettings,
 		options?: {
+			loadMarkdownCreationHistory?: MarkdownCreationHistoryLoader;
+			canSeedExplicitly?: (path: string) => boolean;
+			/** Stops all connection/ticket paths while an explicit repair is unresolved. */
+			isConnectionAllowed?: () => boolean;
 			traceContext?: TraceHttpContext;
 			trace?: TraceRecord;
 			onFlightEvent?: (event: Record<string, unknown>) => void;
@@ -493,6 +527,7 @@ export class VaultSync {
 		},
 	) {
 		this.debug = settings.debug;
+		this._isConnectionAllowed = options?.isConnectionAllowed;
 		this._device = settings.deviceName || undefined;
 		this.trace = options?.trace;
 		this.onFlightEvent = options?.onFlightEvent;
@@ -503,6 +538,10 @@ export class VaultSync {
 		this.idToText = this.ydoc.getMap<Y.Text>("idToText");
 		this.meta = this.ydoc.getMap("meta");
 		this.sys = this.ydoc.getMap("sys");
+		if (options?.loadMarkdownCreationHistory) this.configureMarkdownCreationHistory(options.loadMarkdownCreationHistory, options.canSeedExplicitly);
+		this.remoteTextRevisions = new RemoteTextRevisionTracker(
+			this.ydoc, this.idToText, () => this.provider, () => this.persistence,
+		);
 
 		this.pathToBlob = this.ydoc.getMap<BlobRef>("pathToBlob");
 		this.blobMeta = this.ydoc.getMap<BlobMeta>("blobMeta");
@@ -559,8 +598,7 @@ export class VaultSync {
 			params: async () => {
 				const paramsIntentEpoch = this._socketTicketConnectionIntentEpoch;
 				if (
-					this._destroyed
-					|| this._fatalAuthError
+					this.shouldStopVaultSyncConnection()
 					|| !this._socketTicketConnectionWanted
 					|| this.isSocketTicketNetworkOffline()
 				) {
@@ -585,8 +623,7 @@ export class VaultSync {
 				// compromises".
 				const ticketResult = await this.requestSocketTicket();
 				if (
-					this._destroyed
-					|| this._fatalAuthError
+					this.shouldStopVaultSyncConnection()
 					|| !this._socketTicketConnectionWanted
 					|| this._socketTicketConnectionIntentEpoch !== paramsIntentEpoch
 				) {
@@ -640,6 +677,7 @@ export class VaultSync {
 				`(wsconnected=${this.provider.wsconnected}, synced=${this.provider.synced})`,
 			);
 			if (event.status === "connected") {
+				this._lastConnectedAt = Date.now();
 				this._socketTicketDisconnectRecoveryPending = false;
 				if (this._socketAuthRecoveryAttempted) {
 					this._socketAuthRecoveryReconnectStarted = true;
@@ -875,15 +913,13 @@ export class VaultSync {
 	}
 
 	markInitialized(): void {
-		const alreadyInitialized = this.isInitialized;
+		if (this.isInitialized) return;
 		this.sys.set("initialized", true);
 		if (this.storedSchemaVersion === null) {
 			this.sys.set("schemaVersion", SCHEMA_VERSION);
 		}
-		if (!alreadyInitialized) {
-			this.sys.set("lastSync", Date.now());
-			this.log("Marked Y.Doc as initialized (sentinel set)");
-		}
+		this.sys.set("lastSync", Date.now());
+		this.log("Marked Y.Doc as initialized (sentinel set)");
 	}
 
 	/**
@@ -1516,7 +1552,8 @@ export class VaultSync {
 			const classification = classifyDiskPathForReconcile(
 				path,
 				crdtPaths.has(path),
-				this._deletedPathIndex.has(path),
+				this._deletedPathIndex.has(path) || this.getMarkdownPathRetirement(path) !== null
+					|| (this.markdownCreationHistory?.entries(path).length ?? 0) > 0,
 				mode,
 			);
 
@@ -1528,7 +1565,12 @@ export class VaultSync {
 				case "tombstone-conflict":
 					// Disk file exists at a tombstoned path — zombie prevention
 					this.log(`reconcile: "${path}" exists on disk but is tombstoned in CRDT — conflict preserved`);
-					tombstonedDiskConflicts.push(classification.conflict!);
+					tombstonedDiskConflicts.push({
+						...classification.conflict!,
+						deletedAt: this.getMarkdownTombstoneDeletedAt(path),
+						removalFingerprint: this.getAuthoritativeMarkdownDeleteSnapshot(path)?.fingerprint,
+						movedTo: this.getAuthoritativeMarkdownDeleteSnapshot(path)?.retirement?.movedTo,
+					});
 					skipped++;
 					continue;
 
@@ -1562,7 +1604,9 @@ export class VaultSync {
 						path,
 						content,
 						device,
-						minted ? { opId: minted.opId } : undefined,
+						{
+							...(minted ? { opId: minted.opId } : {}),
+						},
 					);
 					switch (ensureResult.kind) {
 						case "created":
@@ -1734,7 +1778,9 @@ export class VaultSync {
 		// Check tombstones — never resurrect a deleted path unless it is already
 		// backed by a healthy active metadata entry handled above.
 		const tombstoneIds = this.getMarkdownTombstoneIds(path);
-		if (tombstoneIds.length > 0 && !reviveTombstone) {
+		const retirement = this.getMarkdownPathRetirement(path);
+		const removal = this.getAuthoritativeMarkdownDeleteSnapshot(path);
+		if (removal && !reviveTombstone) {
 			this.trace?.("sync", "ensureFile-tombstone-blocked", {
 				path,
 				tombstoneIds,
@@ -1742,6 +1788,11 @@ export class VaultSync {
 			});
 			this.log(`ensureFile: "${path}" is tombstoned, refusing to create`);
 			return { kind: "blocked", reason: "tombstone" };
+		}
+		if (!reviveTombstone && this.markdownCreationHistory
+			&& (!this.connected || !this.providerSynced || this.provider.synced === false || !this.markdownCreationHistory.canCreate(path))) {
+			this.log(`ensureFile: "${path}" history is not verified, keeping the disk file local`);
+			return { kind: "blocked", reason: "policy" };
 		}
 
 		if (options?.canCreate && !options.canCreate()) {
@@ -1751,6 +1802,10 @@ export class VaultSync {
 
 		if (this.classifyActivePath(path).kind !== "empty") {
 			this.log(`ensureFile: "${path}" active set changed before commit, replanning`);
+			return { kind: "replan", reason: "active-set-changed" };
+		}
+		if (options?.expectedRemovalFingerprint !== undefined
+			&& this.getAuthoritativeMarkdownDeleteSnapshot(path)?.fingerprint !== options.expectedRemovalFingerprint) {
 			return { kind: "replan", reason: "active-set-changed" };
 		}
 
@@ -1767,15 +1822,17 @@ export class VaultSync {
 			for (const tombstoneId of tombstoneIds) {
 				this.meta.delete(tombstoneId);
 			}
+			if (retirement) this.markdownPathRetirements.delete(retirement.fileId);
 		}, ORIGIN_SEED);
 
 		this._pathIndexesDirty = true;
-		if (tombstoneIds.length > 0) {
+		if (removal) {
 			this.trace?.("sync", "ensureFile-tombstone-revived", {
 				path,
 				tombstoneIds,
 				device: device ?? null,
 				reason: reviveReason,
+				movedFrom: retirement ?? null,
 			});
 			this.onFlightPathEvent?.({
 				priority: "critical",
@@ -1809,7 +1866,55 @@ export class VaultSync {
 	}
 
 	isMarkdownTombstoned(path: string): boolean {
-		return this.isPathTombstoned(path) || this.getMarkdownTombstoneIds(path).length > 0;
+		return this.isPathTombstoned(path) || this.getAuthoritativeMarkdownDeleteSnapshot(path) !== null;
+	}
+
+	configureMarkdownCreationHistory(load: MarkdownCreationHistoryLoader, canSeedExplicitly?: (path: string) => boolean): void {
+		this.markdownCreationHistory?.destroy();
+		this.markdownCreationHistory = new MarkdownCreationHistoryGate(this.meta, load, () => this.connectionGeneration, canSeedExplicitly);
+	}
+
+	async prepareMarkdownCreationHistory(paths: readonly string[]): Promise<boolean> {
+		if (!this.markdownCreationHistory) return true;
+		const pending = paths.filter(path => !this.getTextForPath(path) && !this.getAuthoritativeMarkdownDeleteSnapshot(path));
+		if (pending.length === 0) return true;
+		if (!this.connected || !this.providerSynced || this.provider.synced === false) return false;
+		try {
+			await this.markdownCreationHistory.prepare(pending);
+			return true;
+		} catch (error) {
+			this.log(`New-file upload deferred: file history could not be verified (${formatUnknown(error)})`);
+			this.trace?.("sync", "markdown-creation-history-unavailable", { count: pending.length });
+			return false;
+		}
+	}
+
+	/** One last move per file ID, shared through normal Yjs persistence. */
+	private get markdownPathRetirements(): Y.Map<unknown> {
+		return this.ydoc.getMap("markdownPathRetirements");
+	}
+
+	getMarkdownPathRetirement(path: string): MarkdownPathRetirement | null {
+		const moves = this.markdownPathRetirements;
+		if (this.observedMarkdownRetirements !== moves) {
+			moves.observe(() => { this.markdownRetirementIndex = undefined; });
+			this.observedMarkdownRetirements = moves;
+		}
+		if (!this.markdownRetirementIndex) {
+			this.markdownRetirementIndex = new Map();
+			moves.forEach((raw, fileId) => {
+				if (!raw || typeof raw !== "object") return;
+				const entry = raw as Partial<MarkdownPathRetirement>;
+				if (entry.fileId !== fileId || typeof entry.oldPath !== "string" || typeof entry.operationId !== "string"
+					|| typeof entry.movedTo !== "string" || typeof entry.movedAt !== "number" || !Number.isFinite(entry.movedAt)) return;
+				const oldPath = this.normPath(entry.oldPath);
+				const existing = this.markdownRetirementIndex!.get(oldPath);
+				if (!existing || existing.fileId < fileId) {
+					this.markdownRetirementIndex!.set(oldPath, { fileId, oldPath, operationId: entry.operationId, movedTo: this.normPath(entry.movedTo), movedAt: entry.movedAt });
+				}
+			});
+		}
+		return this.markdownRetirementIndex.get(this.normPath(path)) ?? null;
 	}
 
 	/**
@@ -1843,7 +1948,19 @@ export class VaultSync {
 			});
 		});
 
-		if (hasActiveEntry || tombstones.length === 0) return null;
+		let retirement = this.getMarkdownPathRetirement(normalizedPath);
+		const history = this.markdownCreationHistory?.entries(normalizedPath) ?? [];
+		if (hasActiveEntry || (tombstones.length === 0 && !retirement && history.length === 0)) return null;
+		if (!retirement) {
+			for (const entry of history) {
+				const current = decodeFileMeta(this.meta.get(entry.fileId));
+				if (current && !isFileMetaDeletedValue(this.meta.get(entry.fileId)) && this.normPath(current.path) !== normalizedPath) {
+					retirement = { fileId: entry.fileId, oldPath: normalizedPath, operationId: entry.historyId,
+						movedTo: this.normPath(current.path), movedAt: current.mtime ?? 0 };
+					break;
+				}
+			}
+		}
 
 		tombstones.sort((a, b) => {
 			if (a.fileId < b.fileId) return -1;
@@ -1855,12 +1972,16 @@ export class VaultSync {
 			"markdown",
 			normalizedPath,
 			tombstones.map(({ fileId, deletedAt, device }) => [fileId, deletedAt, device]),
+			...(retirement ? [[retirement.fileId, retirement.operationId, retirement.movedTo, retirement.movedAt]] : []),
+			...(history.length > 0 ? [history.map(entry => [entry.fileId, entry.historyId]).sort()] : []),
 		]);
 
 		return {
 			kind: "markdown",
 			path: normalizedPath,
 			tombstones,
+			...(retirement ? { retirement } : {}),
+			...(history.length > 0 ? { history } : {}),
 			fingerprint,
 		};
 	}
@@ -1986,9 +2107,63 @@ export class VaultSync {
 		return this._activePathCollisions.size;
 	}
 
+	getActivePathCollisionPaths(): string[] {
+		this.ensurePathIndexes();
+		return [...this._activePathCollisions.keys()];
+	}
+
+	resolveActivePathCollision(path: string, preferredDiskContent?: string | null): boolean {
+		const normalizedPath = this.normPath(path);
+		this.ensurePathIndexes();
+		const fileIds = this._activePathCollisions.get(normalizedPath);
+		if (!fileIds || fileIds.length <= 1) return false;
+
+		let bestId = fileIds[0]!;
+		let bestScore = -1;
+
+		for (const id of fileIds) {
+			const ytext = this.idToText.get(id);
+			const textContent = ytext instanceof Y.Text ? ytext.toJSON() : null;
+			const meta = decodeFileMeta(this.meta.get(id));
+			const mtime = meta?.mtime ?? 0;
+
+			let score = mtime;
+			if (textContent !== null && textContent.length > 0) {
+				score += 100_000_000_000;
+			}
+			if (preferredDiskContent !== undefined && preferredDiskContent !== null && textContent === preferredDiskContent) {
+				score += 1_000_000_000_000;
+			}
+
+			if (score > bestScore) {
+				bestScore = score;
+				bestId = id;
+			}
+		}
+
+		this.ydoc.transact(() => {
+			for (const id of fileIds) {
+				if (id === bestId) continue;
+				this.meta.delete(id);
+				this.idToText.delete(id);
+			}
+		}, ORIGIN_SEED);
+
+		this._pathIndexesDirty = true;
+		this.ensurePathIndexes();
+		this.log(
+			`resolveActivePathCollision: resolved "${normalizedPath}" keeping id=${bestId}, removed ${fileIds.length - 1} competing duplicate(s)`,
+		);
+		return true;
+	}
+
 	isPathTombstoned(path: string): boolean {
 		this.ensurePathIndexes();
-		return this._deletedPathIndex.has(this.normPath(path));
+		const normalized = this.normPath(path);
+		return this._deletedPathIndex.has(normalized)
+			|| ((this.getMarkdownPathRetirement(normalized) !== null
+				|| (this.markdownCreationHistory?.entries(normalized).length ?? 0) > 0)
+				&& this.getActiveFileIdsForPath(normalized).length === 0);
 	}
 
 	// -------------------------------------------------------------------
@@ -2429,6 +2604,7 @@ export class VaultSync {
 	handleRename(oldPath: string, newPath: string, device?: string): void {
 		oldPath = this.normPath(oldPath);
 		newPath = this.normPath(newPath);
+		if (oldPath === newPath) return;
 
 		const fileId = this.getFileId(oldPath);
 		if (!fileId) {
@@ -2441,6 +2617,7 @@ export class VaultSync {
 				this.pathToId.delete(oldPath);
 				this.pathToId.set(newPath, fileId);
 			}
+			this.markdownPathRetirements.set(fileId, { fileId, oldPath, operationId: this.generateFileId(), movedTo: newPath, movedAt: Date.now() });
 			this.clearMarkdownTombstonesForPath(newPath, fileId);
 			this.setMetaActive(fileId, newPath, device);
 		}, ORIGIN_SEED);
@@ -2486,6 +2663,9 @@ export class VaultSync {
 			for (const [oldPath, newPath] of batch) {
 				const fileId = this.getFileId(oldPath);
 				if (fileId) {
+					if (oldPath !== newPath) {
+						this.markdownPathRetirements.set(fileId, { fileId, oldPath, operationId: this.generateFileId(), movedTo: newPath, movedAt: Date.now() });
+					}
 					if (this.shouldWriteLegacyPathMap()) {
 						this.pathToId.delete(oldPath);
 						this.pathToId.set(newPath, fileId);
@@ -2544,6 +2724,11 @@ export class VaultSync {
 
 	private clearMarkdownTombstonesForPath(path: string, keepFileId?: string): number {
 		const normalizedPath = this.normPath(path);
+		this.markdownPathRetirements.forEach((raw, fileId) => {
+			if (raw && typeof raw === "object" && (raw as MarkdownPathRetirement).oldPath === normalizedPath) {
+				this.markdownPathRetirements.delete(fileId);
+			}
+		});
 		const tombstonedIds: string[] = [];
 		this.meta.forEach((value: unknown, fileId: string) => {
 			const metaPath = getMetaPath(value);
@@ -2562,6 +2747,27 @@ export class VaultSync {
 		}
 
 		return tombstonedIds.length;
+	}
+
+	getMarkdownTombstoneDeletedAt(path: string): number | null {
+		const normalizedPath = this.normPath(path);
+		let maxDeletedAt: number | null = this.getMarkdownPathRetirement(path)?.movedAt ?? null;
+		this.meta.forEach((value: unknown) => {
+			const metaPath = getMetaPath(value);
+			if (
+				metaPath
+				&& this.normPath(metaPath) === normalizedPath
+				&& isFileMetaDeletedValue(value)
+			) {
+				const deletedAt = getMetaDeletedAt(value);
+				if (deletedAt !== null) {
+					if (maxDeletedAt === null || deletedAt > maxDeletedAt) {
+						maxDeletedAt = deletedAt;
+					}
+				}
+			}
+		});
+		return maxDeletedAt;
 	}
 
 	private getMarkdownTombstoneIds(path: string): string[] {
@@ -2762,6 +2968,7 @@ export class VaultSync {
 		const blobPathKeys = Array.from(this.pathToBlob.keys());
 		const blobMetaKeys = Array.from(this.blobMeta.keys());
 		const blobTombKeys = Array.from(this.blobTombstones.keys());
+		const moveKeys = Array.from(this.markdownPathRetirements.keys());
 
 		this.ydoc.transact(() => {
 			for (const k of pathKeys) this.pathToId.delete(k);
@@ -2771,6 +2978,7 @@ export class VaultSync {
 			for (const k of blobPathKeys) this.pathToBlob.delete(k);
 			for (const k of blobMetaKeys) this.blobMeta.delete(k);
 			for (const k of blobTombKeys) this.blobTombstones.delete(k);
+			for (const k of moveKeys) this.markdownPathRetirements.delete(k);
 		}, ORIGIN_SEED);
 		this._pathIndexesDirty = true;
 
@@ -2984,7 +3192,7 @@ export class VaultSync {
 	}
 
 	private shouldStopVaultSyncConnection(): boolean {
-		return this._destroyed || this._fatalAuthError;
+		return this._destroyed || this._fatalAuthError || this._isConnectionAllowed?.() === false;
 	}
 
 	private socketTicketProviderWantsConnection(): boolean {
@@ -3061,7 +3269,7 @@ export class VaultSync {
 		this._socketTicketRawDisconnect = disconnect;
 
 		provider.connect = (): Promise<void> => {
-			if (this._destroyed || this._fatalAuthError) return Promise.resolve();
+			if (this.shouldStopVaultSyncConnection()) return Promise.resolve();
 			// An idempotent duplicate joins the current async params/connect attempt
 			// without invalidating its epoch. If disconnect() revoked intent while an
 			// old attempt is still settling, a new connect intent must advance the
@@ -3180,6 +3388,13 @@ export class VaultSync {
 		this._socketTicketRetryKind = effectiveKind;
 		this._socketTicketRefreshPendingForOnline = true;
 		this.log("socket ticket request deferred while network is offline");
+		// Fallback watchdog: if OS/browser misses the online event, probe after 60s
+		this._socketTicketRefreshTimer = setTimeout(() => {
+			if (this._socketTicketRefreshPendingForOnline) {
+				this.log("Offline deferral watchdog timeout; probing socket ticket reconnect");
+				this.resumeDeferredSocketTicketRefresh();
+			}
+		}, 60_000);
 	}
 
 	private scheduleSocketTicketRetry(kind: SocketTicketRetryKind): void {
@@ -3439,9 +3654,29 @@ export class VaultSync {
 		}
 	}
 
+	isActiveTrackedText(text: Y.Text): boolean {
+		const id = this.remoteTextRevisions.getFileId(text);
+		return id !== null && !isFileMetaDeletedValue(this.meta.get(id));
+	}
+
+	getActivePathForTrackedText(text: Y.Text): string | null {
+		const id = this.remoteTextRevisions.getFileId(text);
+		const value = id ? this.meta.get(id) : null;
+		const path = getMetaPath(value);
+		return path && !isFileMetaDeletedValue(value) ? this.normPath(path) : null;
+	}
+
+	getRemoteTextRevisionForPath(path: string): RemoteTextRevision | null {
+		const fileId = this.getFileId(path);
+		const text = fileId ? this.idToText.get(fileId) : null;
+		return fileId && text ? this.remoteTextRevisions.get(text, fileId) : null;
+	}
+
 	async destroy(): Promise<void> {
+		this.markdownCreationHistory?.destroy();
 		this.log("Destroying VaultSync");
 		this._destroyed = true;
+		this.remoteTextRevisions.destroy();
 		this._socketTicketRefreshPendingForOnline = false;
 		if (this._socketTicketOnlineHandler && typeof window !== "undefined") {
 			window.removeEventListener("online", this._socketTicketOnlineHandler);
@@ -3647,6 +3882,12 @@ export interface TombstonedDiskConflict {
 	path: string;
 	action: "preserved-local-only";
 	reason: "disk-present-at-tombstoned-path";
+	deletedAt?: number | null;
+	ctime?: number | null;
+	hasOpenViews?: boolean;
+	removalFingerprint?: string;
+	localFileToken?: string;
+	movedTo?: string;
 }
 
 export interface ReconcileResult {
@@ -3658,7 +3899,7 @@ export interface ReconcileResult {
 	/**
 	 * Disk files that exist at tombstoned paths.
 	 * These are preserved locally but not synced.
-	 * User should resolve manually or via explicit create action.
+	 * Only an explicit restore/Keep local action can cancel the removal.
 	 */
 	tombstonedDiskConflicts: TombstonedDiskConflict[];
 	/**
@@ -3693,7 +3934,7 @@ export function classifyDiskPathForReconcile(
 		return { action: "skip-in-crdt" };
 	}
 
-	// Tombstoned in CRDT — do NOT revive (zombie prevention)
+	// A disk observation cannot cancel a recorded delete or move.
 	if (isTombstoned) {
 		return {
 			action: "tombstone-conflict",

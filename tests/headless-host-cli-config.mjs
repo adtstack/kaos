@@ -284,7 +284,16 @@ try {
 	console.log("\n--- headless host cli: fatal runtime errors release lock before restart ---");
 	const fatalHarness = join(root, "fatal-runtime.mjs");
 	await writeFile(fatalHarness, `import { runHeadlessHostCli } from ${JSON.stringify(pathToFileURL(resolve("dist/kaos-headless-host.mjs")).href)};
-setTimeout(() => { throw new Error("fatal-cleanup-test"); }, 250);
+const originalWrite = process.stdout.write.bind(process.stdout);
+let fatalScheduled = false;
+process.stdout.write = (...args) => {
+ const result = originalWrite(...args);
+ if (!fatalScheduled && String(args[0]).includes('"kind":"poller-started"')) {
+  fatalScheduled = true;
+  setTimeout(() => { throw new Error("fatal-cleanup-test"); }, 250);
+ }
+ return result;
+};
 await runHeadlessHostCli();
 `, "utf8");
 	const fatal = spawn(process.execPath, [

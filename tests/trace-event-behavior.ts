@@ -765,7 +765,7 @@ console.log("\n--- Test 11: diskMirror preserves when all recoverable trash mech
 	);
 }
 
-console.log("\n--- Test 12: known-dirty remote delete revives tombstone (no loop) ---");
+console.log("\n--- Test 12: known-dirty remote delete preserves local work without revival ---");
 {
 	const events: CapturedTrace[] = [];
 	let ensureFileCalled = false;
@@ -830,10 +830,10 @@ console.log("\n--- Test 12: known-dirty remote delete revives tombstone (no loop
 	const revived = findEvent(events, "disk", "remote-delete-preserved-revived");
 	assert(!!preserved, "known-dirty file is preserved");
 	assert(preserved?.details?.reason === "local-file-modified-since-last-sync", "reason is known-dirty");
-	assert(!!revived, "tombstone is revived for known-dirty file");
-	assert(ensureFileCalled, "ensureFile was called to revive");
-	assert(ensureFileArgs?.reviveTombstone === true, "reviveTombstone: true passed");
-	assert(ensureFileArgs?.content === diskContent, "disk content used for revive");
+	assert(!revived, "known-dirty file does not cancel the remote deletion");
+	assert(!ensureFileCalled, "dirty preservation never calls ensureFile");
+	assert(ensureFileArgs === null, "dirty preservation grants no undelete authority");
+	assert(mirror.getPreservedUnresolvedEntries()[0]?.reason === "remote-delete-local-conflict", "dirty local file stays in an actionable removal conflict");
 }
 
 console.log("\n--- Test 12b: remote delete preserves unsaved open editor content ---");
@@ -914,13 +914,13 @@ console.log("\n--- Test 12b: remote delete preserves unsaved open editor content
 		preserved?.details?.reason === "local-open-editor-modified-since-last-sync",
 		"reason is open-editor-known-dirty",
 	);
-	assert(!!revived, "tombstone is revived for open editor dirty content");
+	assert(!revived, "unsaved editor work does not cancel the remote deletion");
 	assert(!deleted, "remote delete is not applied while open editor has unsaved content");
 	assert(trashedPaths.length === 0, "trashFile is not called for unsaved open editor");
 	assert(deletedPaths.length === 0, "vault.delete is not called for unsaved open editor");
-	assert(ensureFileCalled, "ensureFile is called to revive open editor content");
-	assert(ensureFileArgs?.reviveTombstone === true, "open editor preserve uses reviveTombstone: true");
-	assert(ensureFileArgs?.content === editorContent, "editor content is used for revive");
+	assert(!ensureFileCalled, "open editor preservation never calls ensureFile");
+	assert(ensureFileArgs === null, "open editor preservation grants no undelete authority");
+	assert(mirror.isPreservedUnresolved(path), "open editor conflict remains available for explicit recovery");
 }
 
 console.log("\n--- Test 13: unknown-baseline remote delete does NOT revive tombstone ---");
@@ -1115,17 +1115,17 @@ console.log("\n--- Test 5: Multi-pass: unknown-baseline preserved file is NOT re
 	);
 	assert(!!skipTrace, "trace emitted for skipped preserved-unresolved import");
 
-	// Step 6: Simulate user explicitly modifying the file → clears the guard
+	// Step 6: Even clearing a local marker cannot override the shared deletion
 	mirror.clearPreservedUnresolved("Notes/unknown-baseline.md");
 	assert(
 		!mirror.preservedUnresolvedPaths.has("Notes/unknown-baseline.md"),
 		"path cleared from preservedUnresolvedPaths after user action",
 	);
 
-	// Now importUntrackedFiles WOULD call ensureFile (proving the guard was the only blocker)
+	// Import still respects the deletion after the local marker was cleared.
 	(controller as any).untrackedFiles = ["Notes/unknown-baseline.md"];
 	await (controller as any).importUntrackedFiles();
-	assert(ensureFileCalled, "ensureFile IS called after preserved-unresolved guard is cleared");
+	assert(!ensureFileCalled, "clearing a local marker does not cancel the shared deletion");
 }
 
 console.log("\n--- Test 6: Multi-pass: read-failure during remote-delete becomes preserve-unresolved (not apply-delete) ---");

@@ -21,6 +21,8 @@ let pollerPollCount = 0;
 let manualSyncCount = 0;
 let resolvedConflictPath = null;
 let resolvedConflictAction = null;
+let divergedReviewPath = null;
+let divergenceResolution = null;
 
 const fakePlugin = {
 	manifest: { version: "1.13.1" },
@@ -69,6 +71,18 @@ const fakePlugin = {
 	async resolvePreservedUnresolvedEntry(path, action) {
 		resolvedConflictPath = path;
 		resolvedConflictAction = action;
+		return { status: "completed" as const };
+	},
+	async loadDivergenceVersionsForPath(path) {
+		divergedReviewPath = path;
+		return { local: "local draft", remote: "synced server text" };
+	},
+	async resolveAttentionDivergence(path, choice) {
+		divergenceResolution = { path, choice };
+		if (choice === "copy") {
+			return { ok: true, conflictPath: `${path} (Local conflict copy).md` };
+		}
+		return { ok: true };
 	},
 };
 
@@ -175,7 +189,38 @@ try {
 	assert.equal(resolvedConflictPath, "notes/sample.md");
 	assert.equal(resolvedConflictAction, "keep-local");
 
-	console.log("  PASS DaemonIpcServer handles ping, status, sync, and conflict resolution");
+	// 5. Attention diff — local vs synced text for review
+	const diffResp = await sendIpc({ command: "attention.diff", params: { path: "notes/sample.md" } });
+	assert.equal(diffResp?.ok, true);
+	assert.equal(diffResp?.result?.local, "local draft");
+	assert.equal(diffResp?.result?.remote, "synced server text");
+	assert.equal(divergedReviewPath, "notes/sample.md");
+
+	// 6. Attention resolve — divergence verbs route to the divergence lane
+	const resolveResp = await sendIpc({
+		command: "attention.resolve",
+		params: { path: "notes/sample.md", choice: "server" },
+	});
+	assert.equal(resolveResp?.ok, true);
+	assert.deepEqual(divergenceResolution, { path: "notes/sample.md", choice: "server" });
+
+	// 7. Attention resolve — preserved-entry verbs share guarded engine resolution
+	const keepLocalResp = await sendIpc({
+		command: "attention.resolve",
+		params: { path: "notes/sample.md", choice: "keep-local" },
+	});
+	assert.equal(keepLocalResp?.ok, true);
+	assert.equal(resolvedConflictAction, "keep-local");
+
+	// 8. Invalid choice rejected with guidance
+	const invalidResp = await sendIpc({
+		command: "attention.resolve",
+		params: { path: "notes/sample.md", choice: "bogus" },
+	});
+	assert.equal(invalidResp?.ok, false);
+	assert.match(invalidResp?.error ?? "", /choice/);
+
+	console.log("  PASS DaemonIpcServer handles ping, status, sync, conflict resolution, and attention diff/resolve");
 
 	console.log("--- Headless Host CLI: kaos status and kaos sync ---");
 	await writeFile(
@@ -228,7 +273,19 @@ try {
 	assert.match(syncCli.stdout, /Sync completed successfully/);
 	assert.equal(manualSyncCount, 2);
 
-	console.log("  PASS kaosctl status and sync integrate seamlessly with live daemon");
+	// Test kaos fix CLI — non-interactive list
+	const fixListCli = await runCli(["fix", "--list", "--config", installConfig]);
+	assert.equal(fixListCli.status, 0);
+	assert.match(fixListCli.stdout, /Notes needing attention: 1/);
+	assert.match(fixListCli.stdout, /notes\/sample\.md/);
+
+	// Test kaos fix CLI — one-shot resolve via the divergence lane
+	const fixResolveCli = await runCli(["fix", "--config", installConfig, "--path", "notes/sample.md", "--choice", "copy"]);
+	assert.equal(fixResolveCli.status, 0);
+	assert.match(fixResolveCli.stdout, /Resolved\./);
+	assert.deepEqual(divergenceResolution, { path: "notes/sample.md", choice: "copy" });
+
+	console.log("  PASS kaosctl status, sync, and fix integrate seamlessly with live daemon");
 
 	// Stop and cleanup
 	await ipcServer.stop();

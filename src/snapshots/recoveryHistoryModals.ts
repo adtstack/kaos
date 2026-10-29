@@ -14,6 +14,7 @@ import {
 	filterRecoveryHistoryChanges,
 	resolveRecoveryHistoryFeedState,
 	resolveVisibleRecoveryHistorySelection,
+	searchableRecoveryHistoryText,
 	type RecoveryHistoryChangeItem,
 	type RecoveryHistoryFileHistoryItem as FileHistoryItem,
 	type RecoveryHistoryInitialSelection,
@@ -67,7 +68,7 @@ function formatBytes(bytes: number): string {
 }
 
 function sameScope(left: RecoveryHistoryScope, right: RecoveryHistoryScope): boolean {
-	if (left.kind === "none" || right.kind === "none") {
+	if (left.kind === "none" || right.kind === "none" || left.kind === "all" || right.kind === "all") {
 		return left.kind === right.kind;
 	}
 	return left.manifestId === right.manifestId;
@@ -168,7 +169,19 @@ export class RecoveryHistoryModal extends Modal {
 		});
 		search.value = this.query;
 		search.addEventListener("input", () => {
+			const prevQuery = this.query;
 			this.query = search.value;
+			if (this.query.trim().length > 0 && prevQuery.trim().length === 0 && this.historyScope.kind === "manifest") {
+				this.historyScope = { kind: "all" };
+			} else if (this.query.trim().length === 0 && this.historyScope.kind === "all") {
+				const latestManifestId = this.manifests
+					.slice()
+					.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0]
+					?.manifestId;
+				if (latestManifestId) {
+					this.historyScope = { kind: "manifest", manifestId: latestManifestId };
+				}
+			}
 			this.renderResultsAndLoadDiff();
 		});
 
@@ -217,6 +230,20 @@ export class RecoveryHistoryModal extends Modal {
 
 	private renderScopeRail(parent: HTMLElement): void {
 		const trimmedQuery = this.query.trim().toLowerCase();
+		const totalEvents = this.changes.length;
+		let allDetail = `${totalEvents} event(s)`;
+		if (trimmedQuery.length > 0) {
+			const matching = this.changes.filter((item) =>
+				searchableRecoveryHistoryText(item).includes(trimmedQuery)
+			).length;
+			allDetail = `${matching} match(es)`;
+		}
+		this.renderScopeRow(parent, {
+			label: "All history",
+			detail: allDetail,
+			scope: { kind: "all" },
+		});
+
 		for (const snapshot of this.snapshots) {
 			let detail = `${snapshot.changedItems.length} changed`;
 			if (trimmedQuery.length > 0) {
@@ -306,8 +333,11 @@ export class RecoveryHistoryModal extends Modal {
 		});
 
 		if (changes.length === 0) {
+			const emptyMsg = this.query.trim().length > 0 && this.nextCursor
+				? "No changes match the current filters in recent history points. Scroll down in the sidebar to load older history."
+				: "No changes match the current filters.";
 			parent.createDiv({
-				text: "No changes match the current filters.",
+				text: emptyMsg,
 				cls: "setting-item-description recovery-history-empty",
 			});
 			return;

@@ -60,6 +60,10 @@ async function main() {
 		await runSyncCommand(parseArgs(args));
 		return;
 	}
+	if (command === "fix") {
+		await runFixCommand(parseArgs(args));
+		return;
+	}
 	if (command === "doctor") {
 		await runDoctorCommand(parseArgs(args));
 		return;
@@ -83,7 +87,7 @@ function parseArgs(argv) {
 	const out = {};
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
-		if (["--startup", "--json", "--full", "--force", "--yes", "-y", "--non-interactive", "--enable-attachments", "--disable-attachments"].includes(arg)) {
+		if (["--startup", "--json", "--full", "--force", "--yes", "-y", "--non-interactive", "--enable-attachments", "--disable-attachments", "--list"].includes(arg)) {
 			out[arg.replace(/^-+/, "")] = "true";
 			continue;
 		}
@@ -559,6 +563,197 @@ async function sendDaemonIpc(socketPath, request, timeoutMs = 4000) {
 			finish(null);
 		});
 	});
+}
+
+const FIX_CHOICES = ["server", "local", "copy", "keep-local", "accept-delete"];
+
+function formatFixChoiceLabel(choice) {
+	switch (choice) {
+		case "server": return "keep server version";
+		case "local": return "keep local version";
+		case "copy": return "save local as a copy, keep server";
+		case "keep-local": return "keep local file";
+		case "accept-delete": return "accept delete";
+		default: return choice;
+	}
+}
+
+function formatFixResolutionResult(result) {
+	if (result?.status === "pending") {
+		return result.message || "The requested action is still pending. Attention has not been cleared.";
+	}
+	return result?.conflictPath
+		? `Resolved. Local copy saved as "${result.conflictPath}".`
+		: "Resolved.";
+}
+
+function renderSimpleLineDiff(previous, current, maxLines = 120) {
+	const a = previous.split("\n");
+	const b = current.split("\n");
+	if (a.length * b.length > 4_000_000) {
+		return `(${a.length} lines → ${b.length} lines; diff too large to display)`;
+	}
+	const dp = Array.from({ length: a.length + 1 }, () => new Uint32Array(b.length + 1));
+	for (let i = a.length - 1; i >= 0; i--) {
+		for (let j = b.length - 1; j >= 0; j--) {
+			dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+		}
+	}
+	const out = [];
+	let i = 0;
+	let j = 0;
+	while (i < a.length && j < b.length) {
+		if (a[i] === b[j]) { i++; j++; continue; }
+		if (dp[i + 1][j] >= dp[i][j + 1]) { out.push(`- ${a[i]}`); i++; }
+		else { out.push(`+ ${b[j]}`); j++; }
+	}
+	while (i < a.length) { out.push(`- ${a[i]}`); i++; }
+	while (j < b.length) { out.push(`+ ${b[j]}`); j++; }
+	if (out.length === 0) return "(no line-level differences)";
+	if (out.length > maxLines) {
+		out.length = maxLines;
+		out.push(`… more changed lines not shown`);
+	}
+	return out.join("\n");
+}
+
+async function runFixCommand(raw) {
+	if (raw.help === "true") {
+		printUsage();
+		return;
+	}
+	const config = await readJsonFile(resolve(raw.config ?? defaultUserPaths().installConfig)).catch(() => null);
+	const paths = config ? pathsFromConfig(config) : defaultUserPaths();
+	const socketPath = findDaemonSocket(config, paths);
+	if (!socketPath || !existsSync(socketPath)) {
+		throw new Error("Headless daemon is not running or IPC socket is unreachable. Start the service with `kaos start` first.");
+	}
+
+	const listing = await sendDaemonIpc(socketPath, { command: "conflicts.list" }, 8000);
+	if (!listing?.ok) {
+		throw new Error(`could not list attention items: ${listing?.error ?? "daemon unreachable"}`);
+	}
+	const items = (listing.result?.items ?? []).filter((item) => typeof item?.path === "string" && item.path.length > 0);
+
+	if (items.length === 0) {
+		console.log(raw.json === "true" ? JSON.stringify({ totalCount: 0, items: [] }) : "Nothing needs attention.");
+		return;
+	}
+
+	if (raw.list === "true" || raw.json === "true") {
+		if (raw.json === "true") {
+			console.log(JSON.stringify({ totalCount: items.length, items }, null, 2));
+		} else {
+			console.log(`Notes needing attention: ${items.length}`);
+			for (const item of items) {
+				console.log(`  - ${item.path}  [${item.type ?? item.kind ?? "attention"}] ${item.reason ?? ""}`.trimEnd());
+			}
+		}
+		return;
+	}
+
+	if (raw.path) {
+		if (!raw.choice || !FIX_CHOICES.includes(raw.choice)) {
+			throw new Error(`--path requires --choice (${FIX_CHOICES.join(" | ")})`);
+		}
+		console.log(`Resolving "${raw.path}" → ${formatFixChoiceLabel(raw.choice)} ...`);
+		const result = await sendDaemonIpc(socketPath, {
+			command: "attention.resolve",
+			params: { path: raw.path, choice: raw.choice },
+		}, 30000);
+		if (!result?.ok) {
+			throw new Error(`could not resolve: ${result?.error ?? "daemon unreachable"}`);
+		}
+		console.log(formatFixResolutionResult(result.result));
+		return;
+	}
+
+	if (!process.stdin.isTTY || !process.stdout.isTTY) {
+		console.log("Non-interactive terminal: run `kaos fix --list` to review, then `kaos fix --path <path> --choice <choice>` to resolve.");
+		process.exitCode = 1;
+		return;
+	}
+
+	const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+	try {
+		let queue = [...items];
+		while (queue.length > 0) {
+			console.log(`\nNotes needing attention: ${queue.length}`);
+			queue.forEach((item, index) => {
+				console.log(`  ${index + 1}. ${item.path}  [${item.type ?? item.kind ?? "attention"}] ${item.reason ?? ""}`.trimEnd());
+			});
+			const pick = (await rl.question("\nPick a number to review (q to quit): ")).trim().toLowerCase();
+			if (pick === "" || pick === "q") break;
+			const index = Number(pick) - 1;
+			const item = queue[index];
+			if (!Number.isInteger(index) || index < 0 || index >= queue.length || !item?.path) {
+				console.log("Invalid selection.");
+				continue;
+			}
+			const diffResp = await sendDaemonIpc(socketPath, {
+				command: "attention.diff",
+				params: { path: item.path },
+			}, 15000);
+			console.log(`\n--- ${item.path} ---`);
+			const removedRemote = item.type === "preserved-unresolved"
+				&& diffResp?.ok && diffResp.result?.local != null && diffResp.result.remote === null;
+			if (!diffResp?.ok || diffResp.result?.local == null || (diffResp.result?.remote == null && !removedRemote)) {
+				console.log(`Could not read both versions (${diffResp?.error ?? "unknown"}). Try again, or resolve with --path and --choice.`);
+				continue;
+			}
+			const localText = diffResp.result.local;
+			const remoteText = diffResp.result.remote;
+			if (removedRemote) {
+				console.log(`The synced file was removed. A local copy remains (${localText.length.toLocaleString()} chars).`);
+			} else if (localText === remoteText) {
+				console.log("Local and synced versions are already identical (the attention entry may have raced a settle).");
+			} else {
+				console.log(`local ${localText.length.toLocaleString()} chars · synced ${remoteText.length.toLocaleString()} chars · diff (synced → local):`);
+				console.log(renderSimpleLineDiff(remoteText, localText));
+			}
+			const allowed = new Map(removedRemote ? [] : [
+				["s", "server"],
+				["l", "local"],
+				["c", "copy"],
+			]);
+			if (item.type === "preserved-unresolved") {
+				allowed.set("k", "keep-local");
+				allowed.set("d", "accept-delete");
+			}
+			const choiceList = [...allowed.entries()]
+				.map(([letter, choice]) => `[${letter}] ${formatFixChoiceLabel(choice)}`)
+				.join("  ");
+			const answer = (await rl.question(`Choose ${choiceList} (q to cancel): `)).trim().toLowerCase();
+			if (answer === "q") continue;
+			const choice = allowed.get(answer);
+			if (!choice) {
+				console.log("Invalid choice.");
+				continue;
+			}
+			const confirm = (await rl.question(`Apply "${formatFixChoiceLabel(choice)}" to "${item.path}"? [y/N] `)).trim().toLowerCase();
+			if (confirm !== "y" && confirm !== "yes") {
+				console.log("Skipped.");
+				continue;
+			}
+			const result = await sendDaemonIpc(socketPath, {
+				command: "attention.resolve",
+				params: { path: item.path, choice },
+			}, 30000);
+			if (!result?.ok) {
+				console.log(`Could not resolve: ${result?.error ?? "daemon unreachable"}`);
+				continue;
+			}
+			console.log(formatFixResolutionResult(result.result));
+			if (result.result?.status !== "pending") {
+				queue = queue.filter((candidate) => candidate !== item);
+			}
+		}
+		console.log(queue.length === 0
+			? "\nAll attention items resolved."
+			: `\n${queue.length} item(s) still need attention.`);
+	} finally {
+		rl.close();
+	}
 }
 
 async function runSyncCommand(raw) {
@@ -1596,7 +1791,9 @@ async function runConflictUi(raw) {
 			}
 			try {
 				const result = await applyConflictAction({ ...raw, _context: context }, item.id, action);
-				message = `${action} applied. Backup: ${result.backupDir}`;
+				message = result.status === "pending"
+					? result.message
+					: result.online ? `${action} completed online.` : `${action} applied. Backup: ${result.backupDir}`;
 				inventory = await scanConflictInventory({ ...raw, _context: context });
 				selected = Math.min(selected, Math.max(0, inventory.items.length - 1));
 				mode = "list";
@@ -1944,16 +2141,17 @@ async function applyConflictAction(raw, id, action) {
 				command: "conflicts.resolve",
 				params: { path: item.path, action },
 			}, 10000);
-			if (ipcResp?.ok) {
-				return {
-					kind: "kaos-conflict-resolution",
-					ok: true,
-					action,
-					id,
-					path: item.path,
-					online: true,
-				};
-			}
+			if (!ipcResp?.ok) throw new Error(ipcResp?.error ?? "Daemon could not resolve this conflict.");
+			return {
+				kind: "kaos-conflict-resolution",
+				ok: true,
+				action,
+				id,
+				path: item.path,
+				online: true,
+				status: ipcResp.result.status,
+				...(ipcResp.result.status === "pending" ? { message: ipcResp.result.message } : {}),
+			};
 		}
 		await assertNoHeadlessLock(context);
 	}
@@ -2878,6 +3076,9 @@ function printUsage() {
   kaos uninstall [--dry-run] [--yes] [--purge-vault --vault <path>]
   kaos status [--json]
   kaos sync [--json]
+  kaos fix                     (interactive: review and resolve diverged notes)
+  kaos fix --list [--json]     (list notes needing attention)
+  kaos fix --path <path> --choice server|local|copy|keep-local|accept-delete
   kaos doctor [--json]
   kaos ui [--vault <path>]
   kaos conflicts <command> [options]

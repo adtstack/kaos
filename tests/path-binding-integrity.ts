@@ -830,6 +830,30 @@ console.log("\n--- VaultSync cleanup: intrinsic exclusions tombstone remote entr
 	assert(vs.pathToBlob.has("attachments/keep.png"), "ordinary blob ref is retained");
 }
 
+console.log("\n--- VaultSync resolution: resolveActivePathCollision resolves duplicate fileIds ---");
+{
+	const vs = makeVaultSync();
+	const textOld = new Y.Text();
+	const textNew = new Y.Text();
+	textOld.insert(0, "old content");
+	textNew.insert(0, "current disk content");
+	vs.idToText.set("id-old", textOld);
+	vs.idToText.set("id-new", textNew);
+	vs.meta.set("id-old", createNestedActiveMeta("notes/collided.md", 100, "DeviceA"));
+	vs.meta.set("id-new", createNestedActiveMeta("notes/collided.md", 200, "DeviceB"));
+
+	assertEq(vs.getPathBindingCollisionCount(), 1, "path collision detected initially");
+	assertEq(vs.getActivePathCollisionPaths().join(","), "notes/collided.md", "collision path listed");
+
+	const resolved = vs.resolveActivePathCollision("notes/collided.md", "current disk content");
+	assertEq(resolved, true, "collision resolved successfully");
+	assertEq(vs.getPathBindingCollisionCount(), 0, "path collision count drops to 0");
+	assertEq(vs.getFileId("notes/collided.md"), "id-new", "winning fileId matches disk content");
+	assertEq(vs.getTextForPath("notes/collided.md")?.toString(), "current disk content", "winner text accessible via path");
+	assertEq(vs.meta.has("id-old"), false, "losing duplicate removed from meta");
+	assertEq(vs.idToText.has("id-old"), false, "losing duplicate removed from idToText");
+}
+
 console.log(`\npath-binding-integrity: ${passed} passed, ${failed} failed`);
 if (failed > 0) {
 	process.exit(1);

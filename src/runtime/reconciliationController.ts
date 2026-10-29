@@ -1,3 +1,6 @@
+import { localOnlyRecoveryBlockReason, type LocalOnlyPaneEvidence } from "../sync/localOnlyRecoveryEvidence";
+import type { RemoteTextRevision } from "../sync/remoteTextRevisionTracker";
+import type { LocalOnlyRecoveryBlockDetail, RecoverySkippedLocalOnlyData } from "../observability/recoveryEventTypes";
 import { App, MarkdownView, Notice, TFile, normalizePath } from "obsidian";
 import type { BlobSyncManager } from "../sync/blobSync";
 import type {
@@ -17,7 +20,7 @@ import {
 	hasChanged,
 	updateIndex,
 } from "../sync/diskIndex";
-import type { ReconcileMode, VaultSync } from "../sync/vaultSync";
+import type { MarkdownRemoteDeleteSnapshot, ReconcileMode, TombstonedDiskConflict, VaultSync } from "../sync/vaultSync";
 import type { VaultSyncSettings } from "../settings";
 import type { RuntimeConfig } from "./runtimeConfig";
 import type {
@@ -48,6 +51,7 @@ import { mergeTexts3 } from "../utils/threeWayMerge";
 import {
 	ORIGIN_DISK_SYNC,
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
+	ORIGIN_MANUAL_RECOVERY_CHOICE,
 	ORIGIN_OPEN_EXTERNAL_EDIT_MERGE,
 } from "../sync/origins";
 import { planClosedFileReconcile } from "./reconcile/closedFilePlanner";
@@ -117,6 +121,7 @@ export interface ReconciliationState {
 	lastReconciledGeneration: number;
 	untrackedFileCount: number;
 	blockedDivergenceCount: number;
+	automaticRecoveryHeldCount?: number;
 	lastBlockedDivergenceAt: string | null;
 	/** Safe sample of blocked paths: extensions + fingerprint hashes (no raw filenames). */
 	blockedDivergenceSample: Array<{ ext: string; hash: string }>;
@@ -131,6 +136,8 @@ export interface ReconciliationState {
 		reason: UnresolvedStructuralChange["reason"];
 		contentHashPrefix: string;
 	}>;
+	tombstonedDiskConflicts?: TombstonedDiskConflict[];
+	tombstonedDiskConflictCount?: number;
 }
 
 import { type DiskIngestPort } from "./engineControlPort";
@@ -154,7 +161,7 @@ interface MarkdownDirtyEntry {
 }
 
 export type StableMarkdownReadResult =
-	| { kind: "ready"; file: TFile; content: string; stat: { mtime: number; size: number } | null }
+	| { kind: "ready"; file: TFile; content: string; stat: { ctime?: number; mtime: number; size: number } | null }
 	| { kind: "missing" }
 	| { kind: "unstable" };
 
@@ -190,6 +197,12 @@ export interface MarkdownRemoteDeleteEntryIdentity {
 		mtime: number | null;
 		size: number | null;
 	};
+}
+
+export interface MarkdownRemovalResolutionTarget {
+	remoteDeleteFingerprint?: string | null;
+	localFileToken?: string;
+	localFile?: MarkdownRemoteDeleteEntryIdentity["localFile"];
 }
 
 export interface MarkdownConflictEntryIdentity {
@@ -391,6 +404,8 @@ type ClosedFileReconcileMutationCommit<T> =
 
 interface ReconciliationControllerDeps {
 	app: App;
+	/** Trash a confirmed removal while suppressing its echo as a new local delete. */
+	trashRemovedMarkdownFile?(file: TFile): Promise<void>;
 	getSettings(): VaultSyncSettings;
 	getRuntimeConfig(): RuntimeConfig;
 	getVaultSync(): VaultSync | null;
@@ -627,6 +642,8 @@ export class ReconciliationController {
 	private reconcileInFlight = false;
 	private reconcilePending = false;
 	private untrackedFiles: string[] = [];
+	private removalFileIds = new WeakMap<TFile, number>();
+	private removalFileSequence = 0;
 	private lastReconciledGeneration = 0;
 	private lastReconcileTime = 0;
 	private reconcileCooldownTimer: ReturnType<typeof setTimeout> | null = null;
@@ -668,9 +685,26 @@ export class ReconciliationController {
 	private lifecycleGeneration = 0;
 	/** At most one Keep/Accept resolution may own a Markdown path. */
 	private markdownRemoteDeleteResolutions = new Map<string, InternalMarkdownResolutionLease>();
+	private lastTombstonedDiskConflicts: TombstonedDiskConflict[] = [];
 	private markdownDrainPromise: Promise<void> | null = null;
 	private markdownDrainTimer: ReturnType<typeof setTimeout> | null = null;
 	private lastMarkdownDirtyAt = 0;
+	private readonly automaticRecoveryHolds = new Map<NonNullable<ReturnType<VaultSync["getTextForPath"]>>, {
+		path: string; detail: LocalOnlyRecoveryBlockDetail; episode: number;
+	}>();
+	private automaticRecoveryEpisode = 0;
+	/**
+	 * Pending explicit user decisions from `resolveAutomaticRecoveryHold`.
+	 * Keyed by path and bound to the hold episode that was current when the
+	 * user chose; a replaced hold (new episode) expires the choice so a stale
+	 * decision can never authorize a later divergence.
+	 */
+	private readonly manualRecoveryChoices = new Map<string, {
+		choice: "keep-local" | "keep-remote"; episode: number; requestedAt: number;
+	}>();
+	private recoveryEvidenceUnsubscribe: (() => void) | null = null;
+	private recoveryTextUnsubscribe: (() => void) | null = null;
+	private readonly pendingRecoveryRechecks = new Set<string>();
 	private boundRecoveryLocks = new Map<string, number>();
 	private recoveryFingerprints = new Map<string, FingerprintEntry>();
 	/**
@@ -750,7 +784,462 @@ export class ReconciliationController {
 		return this.untrackedFiles.length;
 	}
 
+	notifyAutomaticRecoveryPolicyChanged(): void {
+		this.pruneAutomaticRecoveryHolds();
+		for (const entry of this.automaticRecoveryHolds.values()) this.queueRecoveryRecheck(entry.path);
+	}
+
+	getAutomaticRecoveryHolds(): ReadonlyArray<{ path: string; detail: LocalOnlyRecoveryBlockDetail; episode: number }> {
+		this.pruneAutomaticRecoveryHolds();
+		return Array.from(this.automaticRecoveryHolds.values(), entry => ({ ...entry }));
+	}
+
+	/**
+	 * Explicit user decision for a held automatic recovery. The choice is
+	 * recorded against the current hold episode and applied by the ordinary
+	 * reconciliation drain — keep-local re-runs the local→CRDT recovery with
+	 * a manual origin (bypassing the automatic admission gate, which by
+	 * contract never judges manual choices), keep-remote flushes the CRDT to
+	 * disk and refreshes the diverged panes. Never resolves anything implicitly:
+	 * if the hold was replaced before the drain, the choice expires.
+	 */
+	async resolveAutomaticRecoveryHold(
+		path: string,
+		choice: "keep-local" | "keep-remote",
+	): Promise<{ ok: boolean; reason?: string }> {
+		const hold = this.getAutomaticRecoveryHolds().find(entry => entry.path === path);
+		if (!hold) return { ok: false, reason: "no-hold" };
+		const lastActivity =
+			this.deps.getEditorBindings()?.getLastEditorActivityForPath?.(path) ?? null;
+		if (
+			lastActivity !== null &&
+			Date.now() - lastActivity < OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS
+		) {
+			return { ok: false, reason: "editor-active" };
+		}
+		const abstractFile = this.deps.app.vault.getAbstractFileByPath(path);
+		if (!(abstractFile instanceof TFile)) return { ok: false, reason: "file-missing" };
+		this.manualRecoveryChoices.set(path, { choice, episode: hold.episode, requestedAt: Date.now() });
+		this.deps.trace("recovery", "recovery-hold-resolution-requested", {
+			path,
+			choice,
+			episode: hold.episode,
+			detail: hold.detail,
+		});
+		// The ordinary dirty drain owns the application so the same leases,
+		// CAS postconditions, and settlement paths guard a manual choice.
+		this.mergeDirtyEntryIntoPath(path, {
+			reason: "modify",
+			primaryOpId: undefined,
+			coalescedOpIds: [],
+			retryCount: 0,
+		});
+		return { ok: true };
+	}
+
+	/** Episode-validated read of a pending manual decision; expired choices are dropped. */
+	private peekManualRecoveryChoice(path: string): "keep-local" | "keep-remote" | null {
+		const pending = this.manualRecoveryChoices.get(path);
+		if (!pending) return null;
+		const hold = this.getAutomaticRecoveryHolds().find(entry => entry.path === path);
+		if (!hold || hold.episode !== pending.episode) {
+			this.manualRecoveryChoices.delete(path);
+			return null;
+		}
+		return pending.choice;
+	}
+
+	private finishManualRecoveryResolution(
+		path: string,
+		choice: "keep-local" | "keep-remote",
+		lengths: { local: number | null; remote: number | null },
+	): void {
+		this.manualRecoveryChoices.delete(path);
+		const text = this.deps.getVaultSync()?.getTextForPath(path);
+		if (text && this.automaticRecoveryHolds.delete(text)) this.deps.refreshStatusBar();
+		this.deps.trace("recovery", "recovery-hold-resolved", {
+			path,
+			choice,
+			localLength: lengths.local,
+			remoteLength: lengths.remote,
+		});
+		this.deps.recordFlightPathEvent?.({
+			priority: "important",
+			kind: PRODUCT_EVENT_KIND.recoveryDecision,
+			severity: "info",
+			scope: "file",
+			source: "reconciliationController",
+			layer: "recovery",
+			path,
+			data: {
+				reason: "manual-recovery-choice",
+				action: choice,
+				localLength: lengths.local,
+				remoteLength: lengths.remote,
+			},
+		});
+		this.deps.scheduleTraceStateSnapshot("manual-recovery-resolved");
+		new Notice(
+			`KAOS: kept the ${choice === "keep-local" ? "local" : "remote"} version of "${path}".`,
+		);
+	}
+
+	/**
+	 * Direct per-file escape hatch: replace this device's copy of `path` (disk
+	 * and every open editor pane) with the current synced (CRDT) text. Uses the
+	 * same mechanics as the keep-remote hold lane — the discarded local text is
+	 * audited, the disk write is a CAS against the exact bytes observed when
+	 * the command started, and panes are refreshed so the editor==disk==CRDT
+	 * invariant that binding attachment requires is restored. Unlike the hold
+	 * lane it requires no active recovery hold: it exists for stale-tab
+	 * divergence (and any other local divergence) the user settles by hand.
+	 *
+	 * Panes are refreshed *before* the disk flush because an open pane that
+	 * still differs from the CRDT defers every flushWrite (open-editor-mismatch)
+	 * — the exact deadlock this command resolves.
+	 */
+	async restoreFileFromServerState(path: string, repair?: {
+		expectedFile: TFile;
+		expectedDiskContent: string;
+		expectedServerContent: string;
+		isCurrent(): boolean;
+	}): Promise<{ ok: boolean; reason?: string }> {
+		this.deps.trace("recovery", "restore-from-server-requested", { path });
+		const vaultSync = this.deps.getVaultSync();
+		if (!vaultSync) return { ok: false, reason: "sync-not-ready" };
+		const abstractFile = this.deps.app.vault.getAbstractFileByPath(path);
+		if (!(abstractFile instanceof TFile)) return { ok: false, reason: "file-missing" };
+		if (!this.deps.isMarkdownPathSyncable(path)) return { ok: false, reason: "path-excluded" };
+		const ytext = vaultSync.getTextForPath(path);
+		if (!ytext) return { ok: false, reason: "no-server-content" };
+		const crdtContent = yTextToString(ytext) ?? "";
+		if (repair && (abstractFile !== repair.expectedFile || crdtContent !== repair.expectedServerContent || !repair.isCurrent())) {
+			return { ok: false, reason: "repair-authority-changed" };
+		}
+		const lastActivity =
+			this.deps.getEditorBindings()?.getLastEditorActivityForPath?.(path) ?? null;
+		if (
+			lastActivity !== null &&
+			Date.now() - lastActivity < OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS
+		) {
+			return { ok: false, reason: "editor-active" };
+		}
+
+		const openViews = this.getOpenMarkdownViewsForPath(path);
+		const editorContents: string[] = [];
+		for (const view of openViews) {
+			try {
+				editorContents.push(view.editor.getValue());
+			} catch (err) {
+				// An unreadable pane is unaccounted authority; fail closed rather
+				// than overwrite content this command cannot see.
+				this.deps.trace("recovery", "restore-from-server-editor-read-failed", {
+					path,
+					error: formatUnknown(err),
+				});
+				return { ok: false, reason: "editor-read-failed" };
+			}
+		}
+		const diskContent = await this.readFreshMarkdownFile(abstractFile);
+		if (repair && (diskContent !== repair.expectedDiskContent || !repair.isCurrent())) return { ok: false, reason: "disk-changed" };
+		const repairRevision = repair ? { ctime: abstractFile.stat.ctime, mtime: abstractFile.stat.mtime, size: abstractFile.stat.size } : undefined;
+		const divergedPaneContents = [...new Set(editorContents)]
+			.filter((content) => content !== crdtContent);
+		if (diskContent === crdtContent && divergedPaneContents.length === 0) {
+			this.deps.validateOpenEditorBindings("manual-restore-from-server");
+			this.deps.trace("recovery", "restore-from-server-already-current", { path });
+			return { ok: true, reason: "already-current" };
+		}
+
+		if (diskContent !== crdtContent) {
+			await this.recordDiscardedRevision(path, diskContent, "manual-restore-from-server");
+		}
+		for (const content of divergedPaneContents) {
+			if (content !== diskContent) {
+				await this.recordDiscardedRevision(path, content, "manual-restore-from-server");
+			}
+		}
+
+		if (repair && (!repair.isCurrent() || vaultSync.getTextForPath(path) !== ytext || yTextToString(ytext) !== crdtContent
+			|| openViews.some((view, index) => view.editor.getValue() !== editorContents[index]))) return { ok: false, reason: "repair-authority-changed" };
+		this.refreshStaleEditorPanes(openViews, crdtContent, path);
+		const diskMirror = this.deps.getDiskMirror();
+		const repairEpisode = repair ? diskMirror?.getPreservedUnresolvedEntries().find((entry) => entry.path === path) : undefined;
+		const writeResult = diskMirror
+			? await diskMirror.flushWrite(path, true, {
+				recordBaseline: true,
+				expectedDiskContent: diskContent,
+				...(repair ? {
+					expectedDiskFile: repair.expectedFile,
+					expectedDiskRevision: repairRevision,
+					expectedPreservedUnresolvedEpisodeId: repairEpisode ? getPreservedUnresolvedEpisodeId(repairEpisode) : undefined,
+					isAuthorityCurrent: () => repair.isCurrent() && vaultSync.getTextForPath(path) === ytext
+						&& yTextToString(ytext) === crdtContent && openViews.every((view) => view.editor.getValue() === crdtContent),
+				} : {}),
+			})
+			: undefined;
+		if (this.isDiskWriteSettled(writeResult)) {
+			if (repair && repairEpisode) diskMirror?.clearPreservedUnresolved(path);
+			await this.updateDiskIndexForPath(path, writeResult.content);
+			if (this.automaticRecoveryHolds.delete(ytext)) this.deps.refreshStatusBar();
+			this.deps.recordFlightPathEvent?.({
+				priority: "important",
+				kind: PRODUCT_EVENT_KIND.recoveryDecision,
+				severity: "info",
+				scope: "file",
+				source: "reconciliationController",
+				layer: "recovery",
+				path,
+				data: {
+					reason: "manual-restore-from-server",
+					action: "keep-remote",
+					localLength: diskContent.length,
+					remoteLength: crdtContent.length,
+					paneCount: openViews.length,
+				},
+			});
+			this.deps.validateOpenEditorBindings("manual-restore-from-server");
+			this.deps.scheduleTraceStateSnapshot("manual-restore-from-server");
+			this.deps.trace("recovery", "restore-from-server-applied", {
+				path,
+				resultKind: writeResult.kind,
+				diskLength: diskContent.length,
+				remoteLength: crdtContent.length,
+				paneCount: openViews.length,
+			});
+			return { ok: true, reason: writeResult.kind };
+		}
+		this.traceDiskWriteNotSettled(path, writeResult, "manual-restore-from-server");
+		this.requestFollowupForUnsettledDiskWrite(path, writeResult, "manual-restore-from-server");
+		return {
+			ok: false,
+			reason: writeResult == null
+				? "disk-mirror-unavailable"
+				: writeResult.kind === "failed"
+					? writeResult.error
+					: writeResult.reason,
+		};
+	}
+
+	/**
+	 * Direct manual escape hatch for local-wins resolution:
+	 * Overwrite the CRDT ytext with the local content, record discarded remote
+	 * revision for safety, update disk/baseline, and restore editor binding.
+	 */
+	async resolveDivergenceKeepLocal(
+		path: string,
+		localContent: string,
+	): Promise<{ ok: boolean; reason?: string }> {
+		this.deps.trace("recovery", "resolve-divergence-keep-local-requested", {
+			path,
+			localLength: localContent.length,
+		});
+		const vaultSync = this.deps.getVaultSync();
+		if (!vaultSync) return { ok: false, reason: "sync-not-ready" };
+		const abstractFile = this.deps.app.vault.getAbstractFileByPath(path);
+		if (!(abstractFile instanceof TFile)) return { ok: false, reason: "file-missing" };
+		if (!this.deps.isMarkdownPathSyncable(path)) return { ok: false, reason: "path-excluded" };
+		const ytext = vaultSync.getTextForPath(path);
+		if (!ytext) return { ok: false, reason: "no-server-content" };
+
+		const lastActivity =
+			this.deps.getEditorBindings()?.getLastEditorActivityForPath?.(path) ?? null;
+		if (
+			lastActivity !== null &&
+			Date.now() - lastActivity < OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS
+		) {
+			return { ok: false, reason: "editor-active" };
+		}
+
+		const openViews = this.getOpenMarkdownViewsForPath(path);
+		let effectiveLocal = localContent;
+		for (const view of openViews) {
+			try {
+				effectiveLocal = view.editor.getValue();
+				break;
+			} catch (err) {
+				this.deps.trace("recovery", "resolve-keep-local-editor-read-failed", {
+					path,
+					error: formatUnknown(err),
+				});
+				return { ok: false, reason: "editor-read-failed" };
+			}
+		}
+
+		const crdtContent = yTextToString(ytext) ?? "";
+		if (crdtContent !== effectiveLocal) {
+			await this.recordDiscardedRevision(path, crdtContent, "manual-resolve-keep-local");
+		}
+
+		const editorBindings = this.deps.getEditorBindings();
+		editorBindings?.separateUndoCaptureForPath?.(path);
+		try {
+			applyDiffToYText(ytext, crdtContent, effectiveLocal, ORIGIN_MANUAL_RECOVERY_CHOICE);
+		} finally {
+			editorBindings?.separateUndoCaptureForPath?.(path);
+		}
+
+		const currentDisk = await this.readFreshMarkdownFile(abstractFile);
+		const diskMirror = this.deps.getDiskMirror();
+		if (diskMirror && currentDisk !== effectiveLocal) {
+			const writeResult = await diskMirror.flushWrite(path, true, {
+				recordBaseline: true,
+				expectedDiskContent: currentDisk,
+			});
+			if (!this.isDiskWriteSettled(writeResult)) {
+				const reason = writeResult && "reason" in writeResult ? writeResult.reason : (writeResult && "error" in writeResult ? writeResult.error : "disk-write-unsettled");
+				return { ok: false, reason };
+			}
+			await this.updateDiskIndexForPath(path, writeResult.content);
+		} else {
+			if (currentDisk !== effectiveLocal) {
+				await this.deps.app.vault.modify(abstractFile, effectiveLocal);
+			}
+			await this.updateDiskIndexForPath(path, effectiveLocal);
+		}
+		diskMirror?.clearPreservedUnresolved(path);
+
+		if (this.automaticRecoveryHolds.delete(ytext)) {
+			this.deps.refreshStatusBar();
+		}
+		editorBindings?.clearUnboundDivergence?.(path);
+
+		this.deps.validateOpenEditorBindings("manual-resolve-keep-local");
+		this.deps.scheduleTraceStateSnapshot("manual-resolve-keep-local");
+
+		this.deps.recordFlightPathEvent?.({
+			priority: "important",
+			kind: PRODUCT_EVENT_KIND.recoveryDecision,
+			severity: "info",
+			scope: "file",
+			source: "reconciliationController",
+			layer: "recovery",
+			path,
+			data: {
+				reason: "manual-resolve-keep-local",
+				action: "keep-local",
+				localLength: effectiveLocal.length,
+				remoteLength: crdtContent.length,
+			},
+		});
+
+		return { ok: true };
+	}
+
+	/**
+	 * Direct manual escape hatch for keeping both versions:
+	 * Saves the local content into a new conflict copy note, and resets
+	 * the original note to the server synced version.
+	 */
+	async resolveDivergenceKeepBoth(
+		path: string,
+		localContent: string,
+	): Promise<{ ok: boolean; conflictPath?: string; reason?: string }> {
+		this.deps.trace("recovery", "resolve-divergence-keep-both-requested", { path });
+		const vaultSync = this.deps.getVaultSync();
+		if (!vaultSync) return { ok: false, reason: "sync-not-ready" };
+		const abstractFile = this.deps.app.vault.getAbstractFileByPath(path);
+		if (!(abstractFile instanceof TFile)) return { ok: false, reason: "file-missing" };
+		if (!this.deps.isMarkdownPathSyncable(path)) return { ok: false, reason: "path-excluded" };
+		const ytext = vaultSync.getTextForPath(path);
+		if (!ytext) return { ok: false, reason: "no-server-content" };
+
+		const lastActivity =
+			this.deps.getEditorBindings()?.getLastEditorActivityForPath?.(path) ?? null;
+		if (
+			lastActivity !== null &&
+			Date.now() - lastActivity < OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS
+		) {
+			return { ok: false, reason: "editor-active" };
+		}
+
+		const openViews = this.getOpenMarkdownViewsForPath(path);
+		let effectiveLocal = localContent;
+		for (const view of openViews) {
+			try {
+				effectiveLocal = view.editor.getValue();
+				break;
+			} catch (err) {
+				this.deps.trace("recovery", "resolve-keep-both-editor-read-failed", {
+					path,
+					error: formatUnknown(err),
+				});
+				return { ok: false, reason: "editor-read-failed" };
+			}
+		}
+
+		const ext = abstractFile.extension ? `.${abstractFile.extension}` : "";
+		const baseName = abstractFile.basename;
+		const parentPath = abstractFile.parent?.path && abstractFile.parent.path !== "/"
+			? `${abstractFile.parent.path}/`
+			: "";
+		const dateStr = new Date().toISOString().slice(0, 10);
+		let conflictPath = `${parentPath}${baseName} (Local conflict ${dateStr})${ext}`;
+		let counter = 1;
+		while (this.deps.app.vault.getAbstractFileByPath(conflictPath)) {
+			conflictPath = `${parentPath}${baseName} (Local conflict ${dateStr} ${counter})${ext}`;
+			counter++;
+		}
+
+		let conflictFile: TFile;
+		try {
+			conflictFile = await this.deps.app.vault.create(conflictPath, effectiveLocal);
+		} catch (err) {
+			return { ok: false, reason: `Failed to create conflict copy: ${formatUnknown(err)}` };
+		}
+
+		const restoreResult = await this.restoreFileFromServerState(path);
+		if (!restoreResult.ok) {
+			try {
+				// KAOS-origin rollback of its own just-created copy: a hard
+				// delete keeps the vault clean; trashing would leave a
+				// sync-visible .trash residue for a file the user never made.
+				// eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file
+				await this.deps.app.vault.delete(conflictFile);
+			} catch {
+				// Non-fatal if cleanup fails
+			}
+			return { ok: false, reason: restoreResult.reason };
+		}
+
+		return { ok: true, conflictPath };
+	}
+
+	/**
+	 * Converged-cleanup escape for the divergence resolution modal: the editor
+	 * already matches the synced CRDT text (the divergence notice raced a load,
+	 * or the divergence self-healed), so drop the stale unbound-divergence
+	 * evidence, dismiss its notice, and revalidate bindings so sync resumes
+	 * instead of dead-ending behind an "already identical" diff screen.
+	 */
+	async markDivergenceConverged(
+		path: string,
+	): Promise<{ ok: boolean; reason?: string }> {
+		this.deps.trace("recovery", "divergence-converged-cleanup", { path });
+		const ytext = this.deps.getVaultSync()?.getTextForPath(path);
+		if (ytext && this.automaticRecoveryHolds.delete(ytext)) {
+			this.deps.refreshStatusBar();
+		}
+		this.deps.getEditorBindings()?.clearUnboundDivergence?.(path);
+		this.deps.validateOpenEditorBindings("divergence-converged");
+		this.deps.recordFlightPathEvent?.({
+			priority: "important",
+			kind: PRODUCT_EVENT_KIND.recoveryDecision,
+			severity: "info",
+			scope: "file",
+			source: "reconciliationController",
+			layer: "recovery",
+			path,
+			data: {
+				reason: "divergence-converged",
+				action: "converged-cleanup",
+			},
+		});
+		return { ok: true };
+	}
+
 	getState(): ReconciliationState {
+		this.pruneAutomaticRecoveryHolds();
 		return {
 			reconciled: this.reconciled,
 			reconcileInFlight: this.reconcileInFlight,
@@ -759,6 +1248,7 @@ export class ReconciliationController {
 			lastReconciledGeneration: this.lastReconciledGeneration,
 			untrackedFileCount: this.untrackedFiles.length,
 			blockedDivergenceCount: this.blockedDivergenceCount,
+			automaticRecoveryHeldCount: this.automaticRecoveryHolds.size,
 			lastBlockedDivergenceAt: this.lastBlockedDivergenceAt,
 			blockedDivergenceSample: this.blockedDivergenceSample,
 			unresolvedStructuralChangeCount: this.unresolvedStructuralChanges.reduce(
@@ -778,12 +1268,42 @@ export class ReconciliationController {
 				reason: change.reason,
 				contentHashPrefix: change.contentHash.slice(0, 12),
 			})),
+			tombstonedDiskConflicts: [...this.lastTombstonedDiskConflicts],
+			tombstonedDiskConflictCount: this.lastTombstonedDiskConflicts.length,
 		};
 	}
 
 	markPending(): void {
 		this.reconcilePending = true;
 	}
+
+	findUnresolvedStructuralChange(
+		predicate: (change: UnresolvedStructuralChange) => boolean,
+	): UnresolvedStructuralChange | undefined {
+		return this.unresolvedStructuralChanges.find(predicate);
+	}
+
+	removeUnresolvedStructuralChange(oldPath: string, newPath: string): boolean {
+		const normalizedOld = normalizePath(oldPath);
+		const normalizedNew = normalizePath(newPath);
+		const before = this.unresolvedStructuralChanges.length;
+		this.unresolvedStructuralChanges = this.unresolvedStructuralChanges.filter((change) => {
+			const matchesOld = change.oldPaths.some((p) => normalizePath(p) === normalizedOld);
+			const matchesNew = change.newPaths.some((p) => normalizePath(p) === normalizedNew);
+			return !(matchesOld && matchesNew);
+		});
+		return this.unresolvedStructuralChanges.length < before;
+	}
+
+	clearAutomaticRecoveryHoldsForPath(path: string): void {
+		const normalized = normalizePath(path);
+		for (const [text, entry] of this.automaticRecoveryHolds) {
+			if (normalizePath(entry.path) === normalized) {
+				this.automaticRecoveryHolds.delete(text);
+			}
+		}
+	}
+
 
 	/**
 	 * Synchronously invalidate every async authority snapshot owned by this
@@ -837,6 +1357,12 @@ export class ReconciliationController {
 		this.lastAmplificationNoticeAt = 0;
 		this.amplificationNoticeSuppressionCount = 0;
 		this.boundRecoveryLocks.clear();
+		this.automaticRecoveryHolds.clear();
+		this.recoveryEvidenceUnsubscribe?.();
+		this.recoveryTextUnsubscribe?.();
+		this.recoveryEvidenceUnsubscribe = null;
+		this.recoveryTextUnsubscribe = null;
+		this.pendingRecoveryRechecks.clear();
 	}
 
 	/**
@@ -893,7 +1419,12 @@ export class ReconciliationController {
 	}
 
 	private requestReconciliationFollowup(path: string, reason: string): void {
+		const heldText = this.automaticRecoveryHolds.size > 0 ? this.deps.getVaultSync()?.getTextForPath(path) : null;
+		if (heldText && this.automaticRecoveryHolds.has(heldText)) return;
 		this.reconcilePending = true;
+		if (this.deps.getSettings().debug) {
+			this.deps.log(`reconcile: followup requested for "${path}" (${reason})`);
+		}
 		this.deps.trace("reconcile", "reconcile-followup-requested", {
 			path,
 			reason,
@@ -962,6 +1493,168 @@ export class ReconciliationController {
 			this.getPreservedUnresolvedMarkdownEntries().some((entry) => entry.path === path);
 	}
 
+	private pruneAutomaticRecoveryHolds(): void {
+		const vaultSync = this.deps.getVaultSync();
+		if (!vaultSync?.getActivePathForTrackedText) return;
+		for (const [text, entry] of this.automaticRecoveryHolds) {
+			const path = vaultSync.getActivePathForTrackedText(text);
+			if (path === null) {
+				if (vaultSync.isActiveTrackedText?.(text) !== true) this.automaticRecoveryHolds.delete(text);
+			} else entry.path = path;
+		}
+	}
+
+	private getRecoveryRevision(path: string): RemoteTextRevision | null {
+		return this.deps.getVaultSync()?.getRemoteTextRevisionForPath?.(path) ?? null;
+	}
+
+	private getRecoveryPaneEvidence(views: readonly MarkdownView[]): (LocalOnlyPaneEvidence | null)[] {
+		const bindings = this.deps.getEditorBindings();
+		return views.map(view => {
+			try { return bindings?.getLocalOnlyRecoveryEvidenceForView?.(view) ?? null; }
+			catch { return null; }
+		});
+	}
+
+	private queueRecoveryRecheck(path: string): void {
+		if (this.pendingRecoveryRechecks.has(path)) return;
+		this.pendingRecoveryRechecks.add(path);
+		const generation = this.lifecycleGeneration;
+		queueMicrotask(() => {
+			this.pendingRecoveryRechecks.delete(path);
+			if (generation !== this.lifecycleGeneration) return;
+			const text = this.deps.getVaultSync()?.getTextForPath(path);
+			if (!text || !this.automaticRecoveryHolds.has(text)) return;
+			const file = this.deps.app.vault.getAbstractFileByPath(path);
+			if (file instanceof TFile) this.queueDirtyMarkdownPath(path, "modify");
+		});
+	}
+
+	/**
+	 * Idempotently subscribe to recovery evidence and remote-text revision
+	 * notifications.
+	 *
+	 * Contract: these notifications only RE-EVALUATE paths that already have
+	 * an automatic-recovery hold (see queueRecoveryRecheck). They never create
+	 * a hold. A fresh composition conflict reaches admission through the normal
+	 * dirty lane when the editor saves to disk; admission then fails closed
+	 * because the conflict invalidated the evidence chain and the composition
+	 * hold keeps new evidence incomplete. Immediate user visibility comes from
+	 * the status bar (EditorBindingManager.handleCompositionConflict).
+	 */
+	private ensureRecoverySubscriptions(): void {
+		if (!this.recoveryEvidenceUnsubscribe) {
+			this.recoveryEvidenceUnsubscribe = this.deps.getEditorBindings()?.subscribeRecoveryEvidence?.(
+				changedPath => this.queueRecoveryRecheck(changedPath),
+			) ?? null;
+		}
+		if (!this.recoveryTextUnsubscribe) {
+			this.recoveryTextUnsubscribe = this.deps.getVaultSync()?.remoteTextRevisions?.subscribe(changed => {
+				this.pruneAutomaticRecoveryHolds();
+				const held = this.automaticRecoveryHolds.get(changed);
+				if (held) this.queueRecoveryRecheck(held.path);
+			}) ?? null;
+		}
+	}
+
+	private holdAutomaticRecovery(path: string, text: NonNullable<ReturnType<VaultSync["getTextForPath"]>>,
+		detail: LocalOnlyRecoveryBlockDetail, paneCount: number): void {
+		const previous = this.automaticRecoveryHolds.get(text);
+		const entry = previous ?? { path, detail, episode: ++this.automaticRecoveryEpisode };
+		entry.path = path;
+		this.automaticRecoveryHolds.set(text, entry);
+		this.ensureRecoverySubscriptions();
+		if (previous?.detail === detail) return;
+		entry.detail = detail;
+		const revision = this.getRecoveryRevision(path);
+		const data: RecoverySkippedLocalOnlyData = {
+			reason: "local-only-remote-contamination", detail,
+			textRevision: revision?.textRevision ?? null, remoteRevision: revision?.remoteRevision ?? null,
+			paneCount, episode: entry.episode,
+		};
+		this.deps.trace("recovery", "local-only-remote-contamination-blocked", { path, ...data });
+		this.deps.recordFlightPathEvent?.({ priority: "important", kind: PRODUCT_EVENT_KIND.recoverySkipped,
+			severity: "warn", scope: "file", source: "reconciliationController", layer: "recovery", path, data });
+		if (!previous) new Notice(
+			"KAOS: automatic recovery paused for a note. Local and remote versions are retained. " +
+			"Run \"Resolve paused sync recovery\" from the command palette to choose a version.",
+		);
+		this.deps.refreshStatusBar();
+	}
+
+	/** Semantic admission for automatic recovery only, never for manual choices or Yjs projection. */
+	private admitAutomaticRecovery(path: string, text: ReturnType<VaultSync["getTextForPath"]>, disk: string): boolean {
+		if (!text) return true; // New-file seed is a separate lane.
+		const views = this.getOpenMarkdownViewsForPath(path);
+		const contents = views.map(view => { try { return view.editor.getValue(); } catch { return null; } });
+		const crdt = normalizeEditorText(text.toJSON());
+		this.pruneAutomaticRecoveryHolds();
+		const held = this.automaticRecoveryHolds.has(text);
+		if (normalizeEditorText(disk) === crdt && contents.every(content => content !== null && normalizeEditorText(content) === crdt)) {
+			if (this.automaticRecoveryHolds.delete(text)) this.deps.refreshStatusBar();
+			return true;
+		}
+		// Manual lane: the user explicitly chose to keep the local version for
+		// the current hold episode. Per this function's contract, admission is
+		// never judged for manual choices; the choice is consumed by the
+		// recovery that runs under it, not here.
+		if (this.peekManualRecoveryChoice(path) === "keep-local") return true;
+		const localOnly = contents.length > 0 && contents.every(content => content !== null &&
+			normalizeEditorText(content) === normalizeEditorText(disk) && normalizeEditorText(content) !== crdt);
+		if (!held && !localOnly && this.deps.getRuntimeConfig().automaticRecoveryMode !== "pause-automatic-recovery") return true;
+		if (held && !localOnly && contents.some(content => content === null || normalizeEditorText(content) !== normalizeEditorText(disk))) {
+			this.holdAutomaticRecovery(path, text, "source-unverified", views.length);
+			return false;
+		}
+		const paneEvidences = this.getRecoveryPaneEvidence(views);
+		if (
+			paneEvidences.some(p => p?.origin === "unbound-fallback") &&
+			this.deps.getDiskIndex()[path]?.contentHash == null
+		) {
+			this.holdAutomaticRecovery(path, text, "unverified-local-successor", views.length);
+			return false;
+		}
+		const detail = this.deps.getRuntimeConfig().automaticRecoveryMode === "pause-automatic-recovery"
+			? "automatic-recovery-paused"
+			: localOnlyRecoveryBlockReason(this.getRecoveryRevision(path), paneEvidences,
+				contents.map(content => content ?? ""));
+		if (detail !== null) { this.holdAutomaticRecovery(path, text, detail, views.length); return false; }
+		if (this.automaticRecoveryHolds.delete(text)) this.deps.refreshStatusBar();
+		return true;
+	}
+
+	private captureAutomaticRecoveryFence(path: string, text: ReturnType<VaultSync["getTextForPath"]>, disk: string): () => string | null {
+		if (!text) return () => null;
+		const revision = this.getRecoveryRevision(path);
+		const expectedViews = this.getOpenMarkdownViewsForPath(path);
+		const panes = this.getRecoveryPaneEvidence(expectedViews);
+		const initialLocalOnly = expectedViews.length > 0 && expectedViews.every(view => {
+			try { return normalizeEditorText(view.editor.getValue()) === normalizeEditorText(disk) &&
+				normalizeEditorText(view.editor.getValue()) !== normalizeEditorText(text.toJSON()); }
+			catch { return false; }
+		});
+		const initialBlock = initialLocalOnly ? localOnlyRecoveryBlockReason(revision, panes,
+			expectedViews.map(view => view.editor.getValue())) : null;
+		return () => {
+			const views = this.getOpenMarkdownViewsForPath(path);
+			// The existing open/closed CAS diagnoses pane-set changes. It must
+			// reject those before this supplemental source-proof predicate.
+			if (views.length !== expectedViews.length || views.some((view, i) => view !== expectedViews[i])) {
+				const changed = this.getRecoveryRevision(path) !== revision;
+				if (initialBlock !== null || changed) this.holdAutomaticRecovery(path, text, initialBlock ?? "admission-stale", views.length);
+				return null;
+			}
+			if (!this.admitAutomaticRecovery(path, text, disk)) return "automatic-recovery-held";
+			const current = this.getRecoveryRevision(path);
+			const currentPanes = this.getRecoveryPaneEvidence(this.getOpenMarkdownViewsForPath(path));
+			if (current !== revision || currentPanes.length !== panes.length || currentPanes.some((pane, i) => pane !== panes[i])) {
+				if (text) this.holdAutomaticRecovery(path, text, "admission-stale", currentPanes.length);
+				return "automatic-recovery-admission-stale";
+			}
+			return null;
+		};
+	}
+
 	/**
 	 * Compare-and-commit fence for closed-file disk→CRDT decisions.
 	 *
@@ -979,9 +1672,13 @@ export class ReconciliationController {
 		expectedCrdtContent: string | null;
 		expectedDiskRevision: number;
 		expectedPreservedUnresolvedEpisodeId?: string;
+		automaticTextMutation?: boolean;
 		stage: string;
 		commit: () => T;
 	}): Promise<ClosedFileReconcileMutationCommit<T>> {
+		const recoveryFence = input.automaticTextMutation === false ? () => null :
+			this.captureAutomaticRecoveryFence(input.path, input.expectedYText, input.expectedDiskContent);
+		if (recoveryFence() !== null) return { kind: "stale" };
 		let currentDiskContent: string | null = null;
 		let diskReadFailed = false;
 		let diskIdentityChanged = false;
@@ -1049,7 +1746,7 @@ export class ReconciliationController {
 											: preservedUnresolvedMismatch
 												? "preserved-unresolved"
 												: null;
-		if (reason === null) {
+		if (reason === null && recoveryFence() === null) {
 			// Invoke the mutation before this async function resolves. Returning a
 			// boolean and mutating after `await` leaves a microtask seam where a
 			// provider update can advance the exact Y.Text (or replace it with an
@@ -1114,6 +1811,48 @@ export class ReconciliationController {
 	}
 
 	/**
+	 * Physically preserve a pre-overwrite safety backup of local markdown text
+	 * in .kaos-safety-backup before remote projection or conflict resolution
+	 * overwrites a file on disk. The .kaos-safety-backup folder starts with a dot,
+	 * so it is automatically excluded from KAOS sync and Obsidian indexing.
+	 */
+	private async writeSafetyBackupFile(
+		path: string,
+		content: string,
+		reason: string,
+	): Promise<string | null> {
+		try {
+			const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+			const safeFilename = path.replace(/[/\\:]/g, "__");
+			const backupDir = ".kaos-safety-backup";
+			const backupPath = `${backupDir}/${safeFilename}.${timestamp}.${reason}.bak.md`;
+			const adapter = this.deps.app?.vault?.adapter;
+			if (!adapter?.write) return null;
+			if (adapter.exists && !(await adapter.exists(backupDir))) {
+				if (adapter.mkdir) {
+					await adapter.mkdir(backupDir);
+				}
+			}
+			await adapter.write(backupPath, content);
+			this.deps.trace("conflict", "safety-backup-created", {
+				originalPath: path,
+				backupPath,
+				reason,
+				contentLength: content.length,
+			});
+			this.deps.log(`Created safety backup for "${path}" at "${backupPath}" (${reason})`);
+			return backupPath;
+		} catch (err) {
+			this.deps.trace("conflict", "safety-backup-failed", {
+				originalPath: path,
+				reason,
+				error: String(err),
+			});
+			return null;
+		}
+	}
+
+	/**
 	 * Record that a stale closed-file decision superseded a disk snapshot.
 	 * The stale CAS means the decision is retried with a fresh read, so the
 	 * bytes are still on disk; the trace/audit record keeps the event
@@ -1124,6 +1863,8 @@ export class ReconciliationController {
 		diskContent: string,
 		stage: string,
 	): Promise<void> {
+		const text = this.deps.getVaultSync()?.getTextForPath(path);
+		if (text && this.automaticRecoveryHolds.has(text)) return;
 		await this.recordDiscardedRevision(
 			path,
 			diskContent,
@@ -1282,6 +2023,9 @@ export class ReconciliationController {
 		const vaultSync = this.deps.getVaultSync();
 		const diskMirror = this.deps.getDiskMirror();
 		if (!vaultSync || !diskMirror) return;
+		// Subscribe once bindings/vault-sync exist (idempotent; re-attempted
+		// each pass until both are available).
+		this.ensureRecoverySubscriptions();
 		if (
 			mode === "authoritative"
 			&& (vaultSync.localReady === false || vaultSync.idbError === true)
@@ -1683,11 +2427,9 @@ export class ReconciliationController {
 			// before reconcileVault's synchronous seed loop.  In particular, a
 			// partially-written or malformed `.base` file must remain local instead
 			// of becoming the shared CRDT authority.
+			await vaultSync.prepareMarkdownCreationHistory?.([...diskFiles.keys()]);
 			for (const [path, content] of diskFiles) {
-				if (
-					vaultSync.getTextForPath(path) ||
-					vaultSync.isMarkdownTombstoned(path)
-				) {
+				if (vaultSync.getTextForPath(path)) {
 					continue;
 				}
 				if (!this.deps.shouldBlockFrontmatterIngest(
@@ -1729,6 +2471,7 @@ export class ReconciliationController {
 				 * decision emission has already happened here.
 				 */
 				(path) => {
+					const isTombstoned = vaultSync.isMarkdownTombstoned(path);
 					const opId = `op-reconcile-seed-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 					return {
 						opId,
@@ -1744,7 +2487,7 @@ export class ReconciliationController {
 								opId,
 								data: {
 									decision: "seed-disk-to-crdt",
-									reason: "disk-file-not-in-crdt",
+									reason: isTombstoned ? "reconcile-recreated" : "disk-file-not-in-crdt",
 									conflictRisk: "none",
 								},
 							});
@@ -1779,11 +2522,15 @@ export class ReconciliationController {
 			const interceptedCandidatesToClearAfterIndexSave =
 				new Set<InterceptedExternalDiskMutation>();
 
-			// Evaluate safety brake using pure policy function.
-			const safetyBrakeDecision = evaluateSafetyBrake({
-				destructiveCount: result.updatedOnDisk.length,
-				localFileCount: diskPresentPaths.size,
-			});
+			// Evaluate safety brake using pure policy function if explicitly enabled in settings.
+			// When disabled (default), all external changes are admitted directly without stalling.
+			const safetyBrakeEnabled = this.deps.getSettings().enableSafetyBrake === true;
+			const safetyBrakeDecision = safetyBrakeEnabled
+				? evaluateSafetyBrake({
+						destructiveCount: result.updatedOnDisk.length,
+						localFileCount: diskPresentPaths.size,
+				  })
+				: { triggered: false as const, destructiveRatio: 0 };
 			if (safetyBrakeDecision.triggered) {
 				safetyBrakeTriggered = true;
 				safetyBrakeReason = safetyBrakeDecision.reason;
@@ -1801,6 +2548,27 @@ export class ReconciliationController {
 					reason: safetyBrakeReason,
 					...tracePathList("affected", result.updatedOnDisk),
 				});
+			}
+
+			this.lastTombstonedDiskConflicts = (result.tombstonedDiskConflicts ?? []).map((conflict) => {
+				const file = eligibleFileByPath.get(conflict.path);
+				return {
+					...conflict,
+					ctime: typeof file?.stat?.ctime === "number" ? file.stat.ctime : null,
+					hasOpenViews: this.getOpenMarkdownViewsForPath(conflict.path).length > 0,
+					localFileToken: this.getRemovalLocalFileToken(conflict.path),
+				};
+			});
+			// A missed delete event after restart still uses the normal guarded,
+			// baseline-aware cleanup. Unknown or modified bytes remain local only.
+			if (mode === "authoritative") {
+				for (const conflict of [...this.lastTombstonedDiskConflicts]) {
+					await this.deps.getDiskMirror()?.reconcileMarkdownRemoval?.(conflict.path);
+					if (!this.deps.app.vault.getAbstractFileByPath(conflict.path)
+						|| this.isMarkdownPreservedUnresolved(conflict.path)) {
+						this.clearTombstonedDiskConflict(conflict.path);
+					}
+				}
 			}
 
 			// Emit reconcile.file.decision for tombstoned and untracked paths
@@ -2460,6 +3228,13 @@ export class ReconciliationController {
 							};
 						}
 
+						if ((action.kind === "import-disk-to-crdt" ||
+							(action.kind === "create-conflict-artifact" && action.winner === "disk")) &&
+							!this.admitAutomaticRecovery(path, ytext, diskContent)) {
+							staleClosedDecisionIndexPaths.add(path);
+							continue;
+						}
+
 						// Emit flight event for the decision.
 						this.deps.recordFlightPathEvent?.({
 							priority: action.kind === "create-conflict-artifact" ? "critical" : "important",
@@ -2637,6 +3412,11 @@ export class ReconciliationController {
 									continue;
 								}
 								} else {
+									await this.writeSafetyBackupFile(
+										path,
+										diskContent,
+										`conflict-crdt-wins-${action.reason}`,
+									);
 									const remoteProjectionAdmission =
 										this.captureRemoteProjectionAdmission(
 											diskMirror,
@@ -2722,6 +3502,18 @@ export class ReconciliationController {
 						// action.kind === "apply-remote-to-disk", "no-op", or "defer-to-crdt-flush":
 						// CRDT wins or nothing to do. Fall through to flush.
 						// Preserve the semantic action kind for baseline advancement.
+						if (action.kind === "no-op") {
+							if (diskHash !== crdtHash) {
+								staleClosedDecisionIndexPaths.add(path);
+								this.deps.trace("reconcile", "closed-file-conservative-mode-projection-deferred", {
+									path,
+									reason: action.reason,
+									diskHash,
+									crdtHash,
+								});
+								continue;
+							}
+						}
 						if (action.kind === "apply-remote-to-disk") {
 							// The decision trusts "CRDT differs from baseline" as
 							// newer; a degenerate CRDT (unhydrated replica, lost
@@ -2738,6 +3530,13 @@ export class ReconciliationController {
 									"closed-file-crdt-authoritative-baseline-text-unknown",
 									diskHash,
 								);
+								if (diskHash !== baselineHash && !diskChangeIsSelfMirror) {
+									await this.writeSafetyBackupFile(
+										path,
+										diskContent,
+										"closed-file-apply-remote-unknown-baseline",
+									);
+								}
 							}
 						}
 						const remoteProjectionAdmission =
@@ -3018,6 +3817,7 @@ export class ReconciliationController {
 		const toImport = [...this.untrackedFiles];
 		this.untrackedFiles = [];
 		let imported = 0;
+		await vaultSync.prepareMarkdownCreationHistory?.(toImport);
 
 		for (const path of toImport) {
 			if (vaultSync.getTextForPath(path)) {
@@ -3041,7 +3841,17 @@ export class ReconciliationController {
 			if (!(file instanceof TFile)) continue;
 
 			try {
+				const revision = this.getMarkdownDiskRevision(path);
 				const content = await this.readFreshMarkdownFile(file);
+				if (file.path !== path || this.deps.app.vault.getAbstractFileByPath(path) !== file
+					|| revision !== this.getMarkdownDiskRevision(path)
+					|| !this.deps.isMarkdownPathSyncable(path) || this.isMarkdownPreservedUnresolved(path)) {
+					continue;
+				}
+				if (vaultSync.getAuthoritativeMarkdownDeleteSnapshot?.(path)) {
+					this.recordTombstonedDiskConflict(path, vaultSync.getMarkdownTombstoneDeletedAt?.(path), file.stat?.ctime);
+					continue;
+				}
 				if (this.deps.shouldBlockFrontmatterIngest(
 					path,
 					null,
@@ -3066,16 +3876,14 @@ export class ReconciliationController {
 				// mutation so the resulting `crdt.file.created` envelope is
 				// causally linkable to this admission attempt.
 				const opId = `op-import-untracked-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-				// Untracked files exist on disk but have no CRDT entry. If the
-				// path is tombstoned, the user explicitly placed the file after
-				// deletion — that is a deliberate revive, not a stale ghost.
+				// Importing an observed disk file is not an explicit undelete.
+				// ensureFile checks removal authority again at the mutation boundary.
 				const result = vaultSync.ensureFile(
 					path,
 					content,
 					this.deps.getSettings().deviceName,
 					{
-						reviveTombstone: true,
-						reviveReason: "import-untracked-local-file",
+						reviveTombstone: false,
 						opId,
 					},
 				);
@@ -3091,6 +3899,10 @@ export class ReconciliationController {
 						this.deps.log(`importUntracked: "${path}" active set changed, queued for retry`);
 						break;
 					case "blocked":
+						if (result.reason === "tombstone") {
+							this.recordTombstonedDiskConflict(path, vaultSync.getMarkdownTombstoneDeletedAt?.(path), file.stat?.ctime);
+							break;
+						}
 						this.untrackedFiles.push(path);
 						this.deps.log(`importUntracked: "${path}" blocked (${result.reason}), preserving local state`);
 						break;
@@ -4266,9 +5078,251 @@ export class ReconciliationController {
 		}
 	}
 
+	clearTombstonedDiskConflict(path: string): void {
+		const norm = normalizePath(path);
+		this.lastTombstonedDiskConflicts = this.lastTombstonedDiskConflicts.filter(
+			(c) => normalizePath(c.path) !== norm,
+		);
+	}
+
+	recordTombstonedDiskConflict(
+		path: string,
+		deletedAt?: number | null,
+		ctime?: number | null,
+		hasOpenViews = false,
+	): void {
+		const norm = normalizePath(path);
+		const existingIndex = this.lastTombstonedDiskConflicts.findIndex(
+			(c) => normalizePath(c.path) === norm,
+		);
+		const entry: TombstonedDiskConflict = {
+			path: norm,
+			action: "preserved-local-only",
+			reason: "disk-present-at-tombstoned-path",
+			deletedAt: deletedAt ?? undefined,
+			ctime: ctime ?? undefined,
+			hasOpenViews,
+			localFileToken: this.getRemovalLocalFileToken(norm),
+			removalFingerprint: this.deps.getVaultSync()?.getAuthoritativeMarkdownDeleteSnapshot?.(norm)?.fingerprint,
+			movedTo: this.deps.getVaultSync()?.getAuthoritativeMarkdownDeleteSnapshot?.(norm)?.retirement?.movedTo,
+		};
+		if (existingIndex >= 0) {
+			this.lastTombstonedDiskConflicts[existingIndex] = entry;
+		} else {
+			this.lastTombstonedDiskConflicts.push(entry);
+		}
+		this.deps.refreshStatusBar();
+	}
+
+	private getRemovalLocalFileToken(path: string): string {
+		const file = this.deps.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) return JSON.stringify([file ? "other" : "missing", this.getMarkdownDiskRevision(path)]);
+		let identity = this.removalFileIds.get(file);
+		if (identity === undefined) {
+			identity = ++this.removalFileSequence;
+			this.removalFileIds.set(file, identity);
+		}
+		return JSON.stringify([identity, file.stat?.ctime, file.stat?.mtime, file.stat?.size, this.getMarkdownDiskRevision(path)]);
+	}
+
+	private captureMarkdownRemoval(
+		path: string,
+		expected?: MarkdownRemovalResolutionTarget,
+	): MarkdownRemoteDeleteSnapshot {
+		const snapshot = this.deps.getVaultSync()?.getAuthoritativeMarkdownDeleteSnapshot(path);
+		if (!snapshot || (expected?.remoteDeleteFingerprint != null
+			&& snapshot.fingerprint !== expected.remoteDeleteFingerprint)) {
+			throw new Error(`Deletion or move changed for "${path}". Refresh the dashboard.`);
+		}
+		if (expected?.localFileToken !== undefined && expected.localFileToken !== this.getRemovalLocalFileToken(path)) {
+			throw new Error(`Local file changed since this action was opened: ${path}`);
+		}
+		return snapshot;
+	}
+
+	async resolveTombstoneConflictKeepLocal(
+		path: string,
+		expected?: MarkdownRemovalResolutionTarget,
+	): Promise<void> {
+		path = normalizePath(path);
+		const vaultSync = this.deps.getVaultSync();
+		if (!vaultSync) throw new Error("Sync is not initialized.");
+		const removal = this.captureMarkdownRemoval(path, expected);
+		const abstractFile = this.deps.app.vault.getAbstractFileByPath(path);
+		if (!(abstractFile instanceof TFile)) throw new Error(`File not found: ${path}`);
+		this.assertExpectedMarkdownLocalFile(path, expected?.localFile, abstractFile);
+		const lease = this.acquireMarkdownRemoteDeleteResolution(path, "keep-local");
+		try {
+			const stableRead = await this.readStableMarkdownFile(path, "modify", abstractFile);
+			if (stableRead.kind !== "ready" || stableRead.file !== abstractFile) {
+				throw new Error(`Could not read the same stable local file: ${path}`);
+			}
+			this.assertExpectedMarkdownLocalFile(path, expected?.localFile, abstractFile, stableRead.stat);
+			this.assertEditorMatchesStableMarkdown(path, stableRead.content);
+			if (!this.deps.isMarkdownPathSyncable(path)) throw new Error(`File is no longer in sync scope: ${path}`);
+			if (this.deps.shouldBlockFrontmatterIngest(path, null, stableRead.content, "dashboard-keep-local")) {
+				throw new Error(`Local properties are quarantined for "${path}". Review them before keeping this file.`);
+			}
+			this.captureMarkdownRemoval(path, { remoteDeleteFingerprint: removal.fingerprint, localFileToken: expected?.localFileToken });
+			if (this.deps.app.vault.getAbstractFileByPath(path) !== abstractFile) {
+				throw new Error(`Local file changed: ${path}`);
+			}
+			const opId = `op-dashboard-keep-local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+			const result = vaultSync.serverAckTracker.withActiveOpId(opId, () => vaultSync.ensureFile(
+				path, stableRead.content, this.deps.getSettings().deviceName,
+				{ reviveTombstone: true, reviveReason: "dashboard-keep-local", opId, expectedRemovalFingerprint: removal.fingerprint },
+			));
+			if (result.kind !== "created") throw new Error(`Removal changed before local content could be restored: ${path}`);
+			const baselineSettled = await this.updateDiskIndexForPath(path, stableRead.content, stableRead.stat, {
+				expectedDiskFile: abstractFile, expectedYText: result.ytext, expectedCrdtContent: stableRead.content,
+			});
+			if (!baselineSettled || vaultSync.getTextForPath(path) !== result.ytext
+				|| yTextToString(result.ytext) !== stableRead.content) {
+				throw new Error(`Local state changed while restoring "${path}". Refresh the dashboard.`);
+			}
+			this.clearTombstonedDiskConflict(path);
+			this.deps.onReconciled("dashboard-keep-local");
+			this.deps.refreshStatusBar();
+		} finally {
+			this.releaseMarkdownRemoteDeleteResolution(lease);
+		}
+	}
+
+	async resolveTombstoneConflictAcceptDelete(
+		path: string,
+		expected?: MarkdownRemovalResolutionTarget,
+	): Promise<void> {
+		path = normalizePath(path);
+		if (!this.deps.isMarkdownPathSyncable(path)) throw new Error(`File is no longer in sync scope: ${path}`);
+		const removal = this.captureMarkdownRemoval(path, expected);
+		const file = this.deps.app.vault.getAbstractFileByPath(path);
+		if (file && !(file instanceof TFile)) throw new Error(`The path is no longer a file: ${path}`);
+		this.assertExpectedMarkdownLocalFile(path, expected?.localFile, file instanceof TFile ? file : null);
+		this.assertNoOpaqueOpenFileViewForRemoteDelete(path);
+		const lease = this.acquireMarkdownRemoteDeleteResolution(path, "accept-remote-delete");
+		try {
+			if (file instanceof TFile) {
+				const stableRead = await this.readStableMarkdownFile(path, "modify", file);
+				if (stableRead.kind !== "ready" || stableRead.file !== file) {
+					throw new Error(`Local file changed while accepting deletion: ${path}`);
+				}
+				this.assertExpectedMarkdownLocalFile(path, expected?.localFile, file, stableRead.stat);
+				this.assertEditorMatchesStableMarkdown(path, stableRead.content);
+			} else if (this.getOpenMarkdownViewsForPath(path).length > 0) {
+				throw new Error(`Close the open editor before accepting deletion: ${path}`);
+			}
+			// No await between these final checks and entering the trash operation.
+			this.assertNoOpaqueOpenFileViewForRemoteDelete(path);
+			this.captureMarkdownRemoval(path, { remoteDeleteFingerprint: removal.fingerprint, localFileToken: expected?.localFileToken });
+			if (this.deps.app.vault.getAbstractFileByPath(path) !== file) {
+				throw new Error(`Local file changed while accepting deletion: ${path}`);
+			}
+			if (file instanceof TFile) {
+				if (this.deps.trashRemovedMarkdownFile) await this.deps.trashRemovedMarkdownFile(file);
+				else await this.deps.app.fileManager.trashFile(file);
+			}
+			this.captureMarkdownRemoval(path, { remoteDeleteFingerprint: removal.fingerprint });
+			if (this.deps.app.vault.getAbstractFileByPath(path)) throw new Error(`Local file remains or was replaced: ${path}`);
+			this.clearTombstonedDiskConflict(path);
+			this.deps.onReconciled("dashboard-accept-delete");
+			this.deps.refreshStatusBar();
+		} finally {
+			this.releaseMarkdownRemoteDeleteResolution(lease);
+		}
+	}
+
+	private async resolveMarkdownConflictUseMerged(
+		path: string,
+		choice: { mergedText: string; expectedLocalText?: string; expectedRemoteText?: string },
+		entry: PreservedUnresolvedEntry,
+	): Promise<void> {
+		const vaultSync = this.deps.getVaultSync()!;
+		const diskMirror = this.deps.getDiskMirror()!;
+		const expectedEpisodeId = getPreservedUnresolvedEpisodeId(entry);
+		const stale = () => new Error(`State changed for "${path}". Reopen the conflict review and try again.`);
+		const episodeIsCurrent = () => this.getPreservedUnresolvedMarkdownEntries().some(
+			candidate => normalizePath(candidate.path) === path
+				&& getPreservedUnresolvedEpisodeId(candidate) === expectedEpisodeId);
+		const editorBindings = this.deps.getEditorBindings();
+		const assertIdle = () => {
+			if (Date.now() - (editorBindings?.getLastEditorActivityForPath(path) ?? -Infinity) < OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS) {
+				throw new Error("This note is being actively edited. Wait a moment and try again.");
+			}
+		};
+		assertIdle();
+		const previousText = vaultSync.getTextForPath(path);
+		const previousContent = previousText ? yTextToString(previousText) : null;
+		if (!previousText || previousContent === null) throw new Error(`Remote content does not exist for "${path}". Reopen the conflict review.`);
+		const file = this.deps.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile)) throw new Error(`Local file not found: ${path}`);
+		const stableRead = await this.readStableMarkdownFile(path, "modify", file);
+		if (stableRead.kind !== "ready") throw new Error(`Local file is still changing: ${path}. Wait a moment and try again.`);
+		const { mergedText } = choice;
+		const limit = this.deps.getRuntimeConfig().maxFileSizeBytes;
+		if (limit > 0 && mergedText.length > limit) throw new Error(`File exceeds the configured size limit: ${path}`);
+		if (this.deps.shouldBlockFrontmatterIngest(path, previousContent, mergedText, "dashboard-conflict-use-merged")) {
+			throw new Error(`Merged properties are quarantined for "${path}". Review them before applying this merge.`);
+		}
+		if (!episodeIsCurrent() || file.path !== path
+			|| this.deps.app.vault.getAbstractFileByPath(path) !== file
+			|| this.deps.getVaultSync() !== vaultSync || this.deps.getDiskMirror() !== diskMirror
+			|| vaultSync.getTextForPath(path) !== previousText
+			|| (previousText ? yTextToString(previousText) : null) !== previousContent
+			|| (choice.expectedLocalText !== undefined && choice.expectedLocalText !== stableRead.content)
+			|| (choice.expectedRemoteText !== undefined && choice.expectedRemoteText !== previousContent)) throw stale();
+		assertIdle();
+		const admission = this.captureRemoteProjectionAdmission(diskMirror, [path]);
+		if (!admission) throw new Error(`Cannot project merged content for "${path}": projection paused.`);
+		const opId = `op-conflict-use-merged-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+		editorBindings?.separateUndoCaptureForPath(path);
+		let resolvedText: ReturnType<VaultSync["getTextForPath"]> = null;
+		let applied = false;
+		try {
+			applied = vaultSync.serverAckTracker.withActiveOpId(opId, () => {
+				assertIdle();
+				if (!episodeIsCurrent() || vaultSync.getTextForPath(path) !== previousText || yTextToString(previousText) !== previousContent) throw stale();
+				resolvedText = previousText;
+				return applyDiffToYTextWithPostcondition(previousText, previousContent, mergedText, ORIGIN_DISK_SYNC).finalMatchesExpected;
+			});
+		} finally {
+			editorBindings?.separateUndoCaptureForPath(path);
+		}
+		if (!applied || !resolvedText) throw stale();
+		if (previousContent !== null && previousContent !== mergedText) {
+			await this.recordDiscardedRevision(path, previousContent, "manual-conflict-use-merged-crdt-discarded");
+		}
+		if (stableRead.content !== mergedText) {
+			await this.recordDiscardedRevision(path, stableRead.content, "manual-conflict-use-merged-disk-discarded");
+		}
+		if (!episodeIsCurrent() || vaultSync.getTextForPath(path) !== resolvedText || yTextToString(resolvedText) !== mergedText) throw stale();
+		const writeResult = await diskMirror.flushWrite(path, false, {
+			expectedDiskContent: stableRead.content,
+			expectedDiskFile: file,
+			expectedPreservedUnresolvedEpisodeId: expectedEpisodeId,
+			requireRemoteProjectionAdmission: true, remoteProjectionAdmission: admission,
+			recordBaseline: true,
+		});
+		if (!this.isDiskWriteSettled(writeResult) || writeResult.content !== mergedText) {
+			throw new Error(`Failed to settle merged content on disk for "${path}". Reopen the conflict review.`);
+		}
+		const settled = await this.updateDiskIndexForPath(path, mergedText, file.stat, {
+			expectedPreservedUnresolvedEpisodeId: expectedEpisodeId, expectedDiskFile: file,
+			expectedYText: resolvedText, expectedCrdtContent: mergedText,
+		});
+		const finalDisk = await this.readFreshMarkdownFile(file);
+		if (!settled || !episodeIsCurrent() || finalDisk !== mergedText
+			|| file.path !== path || this.deps.app.vault.getAbstractFileByPath(path) !== file
+			|| vaultSync.getTextForPath(path) !== resolvedText || yTextToString(resolvedText) !== mergedText) throw stale();
+		diskMirror.clearPreservedUnresolved(path);
+		this.deps.onReconciled("dashboard-conflict-use-merged");
+		this.requestReconciliationFollowup(path, "dashboard-conflict-use-merged");
+		this.deps.trace("reconcile", "markdown-conflict-resolved-manual-use-merged", { path, reason: entry.reason, episodeId: expectedEpisodeId, opId });
+		this.deps.refreshStatusBar();
+	}
+
 	async resolveMarkdownConflictAttention(
 		path: string,
-		choice: "keep-local" | "use-remote",
+		choice: "keep-local" | "use-remote" | { kind: "use-merged"; mergedText: string; expectedLocalText?: string; expectedRemoteText?: string },
 		expectedEpisode?: MarkdownConflictEntryIdentity,
 	): Promise<void> {
 		const normalizedPath = normalizePath(path);
@@ -4289,6 +5343,11 @@ export class ReconciliationController {
 			|| (expectedEpisode?.reason !== undefined && entry.reason !== expectedEpisode.reason)
 		) {
 			throw new Error(`Attention state changed for "${normalizedPath}". Refresh the dashboard.`);
+		}
+
+		if (typeof choice === "object" && choice.kind === "use-merged") {
+			await this.resolveMarkdownConflictUseMerged(normalizedPath, choice, entry);
+			return;
 		}
 
 		const expectedEpisodeId = getPreservedUnresolvedEpisodeId(entry);
@@ -4654,6 +5713,9 @@ export class ReconciliationController {
 		const unresolvedRedirect =
 			this.deps.getDiskMirror()?.redirectPreservedUnresolved?.(oldPath, newPath)
 			?? { kind: "missing" as const };
+		for (const held of this.automaticRecoveryHolds.values()) {
+			if (held.path === oldPath) held.path = newPath;
+		}
 		const entry = this.dirtyMarkdownPaths.get(oldPath);
 		let redirected = false;
 		const deferredAuthority = this.visibleAuthorityDeferredPaths.get(oldPath);
@@ -4733,6 +5795,7 @@ export class ReconciliationController {
 	dropDirtyPath(path: string): void {
 		this.visibleAuthorityDeferredPaths.delete(path);
 		this.invalidateExternalCandidateIdentity(path);
+		this.clearTombstonedDiskConflict(path);
 		if (this.dirtyMarkdownPaths.delete(path)) {
 			this.deps.log(`dropDirtyPath: dropped excluded dirty entry for "${path}"`);
 		}
@@ -4898,6 +5961,8 @@ export class ReconciliationController {
 		if (!vaultSync) return;
 		if (!this.deps.isMarkdownPathSyncable(originalPath)) return;
 		if (this.shouldAbortActiveMarkdownIngest(active)) return;
+		await vaultSync.prepareMarkdownCreationHistory?.([originalPath]);
+		if (this.shouldAbortActiveMarkdownIngest(active)) return;
 
 		try {
 			const stableRead = await this.readStableMarkdownFile(originalPath, sourceReason, file);
@@ -5019,6 +6084,10 @@ export class ReconciliationController {
 				return;
 			}
 			const existingText = vaultSync.getTextForPath(path);
+			if (existingText && this.automaticRecoveryHolds.has(existingText) &&
+				normalizeEditorText(existingText.toJSON()) === normalizeEditorText(content)) {
+				this.admitAutomaticRecovery(path, existingText, content);
+			}
 			const existingCrdtContent = existingText ? existingText.toJSON() : null;
 
 			const openEditorMismatchDeferUntil = this.getOpenEditorDiskMismatchDeferUntil({
@@ -5202,6 +6271,7 @@ export class ReconciliationController {
 					return;
 				}
 				if (visibleDecision.kind === "disk-wins") {
+					if (!this.admitAutomaticRecovery(path, existingText, content)) return;
 					await this.recordDiscardedRevision(
 						path,
 						crdtContent,
@@ -5258,6 +6328,7 @@ export class ReconciliationController {
 						expectedCrdtContent: crdtContent,
 						expectedDiskRevision: stableDiskRevision,
 						stage: "closed-dirty-visible-authority-crdt-wins",
+						automaticTextMutation: false,
 						commit: () => undefined,
 					});
 					if (crdtWinnerAdmission.kind === "stale") {
@@ -5438,6 +6509,9 @@ export class ReconciliationController {
 					return;
 				}
 				if (this.shouldAbortActiveMarkdownIngest(active)) return;
+				const tombstoneDeletedAt = typeof vaultSync?.getMarkdownTombstoneDeletedAt === "function"
+					? vaultSync.getMarkdownTombstoneDeletedAt(path)
+					: null;
 				const seedCommit = await this.commitClosedFileReconcileMutation({
 					path,
 					file,
@@ -5452,8 +6526,7 @@ export class ReconciliationController {
 							content,
 							this.deps.getSettings().deviceName,
 							{
-								reviveTombstone: sourceReason === "create",
-								reviveReason: sourceReason === "create" ? "local-create-event" : undefined,
+								reviveTombstone: false,
 								opId,
 							},
 						),
@@ -5469,6 +6542,7 @@ export class ReconciliationController {
 				switch (seedCommit.value.kind) {
 					case "created":
 					case "existing":
+						this.clearTombstonedDiskConflict(path);
 						if (yTextToString(seedCommit.value.ytext) !== content) {
 							this.requestReconciliationFollowup(
 								path,
@@ -5481,6 +6555,15 @@ export class ReconciliationController {
 						this.requestReconciliationFollowup(path, "closed-dirty-disk-seed-replan");
 						return;
 					case "blocked":
+						if (seedCommit.value.reason === "tombstone") {
+							this.recordTombstonedDiskConflict(
+								path,
+								tombstoneDeletedAt,
+								file.stat?.ctime,
+								this.getOpenMarkdownViewsForPath(path).length > 0,
+							);
+							return;
+						}
 						this.requestReconciliationFollowup(
 							path,
 							`closed-dirty-disk-seed-blocked-${seedCommit.value.reason}`,
@@ -5531,10 +6614,6 @@ export class ReconciliationController {
 		coalescedOpIds: string[];
 		active?: ActiveMarkdownIngest;
 	}): Promise<void> {
-		function assertNever(value: never): never {
-			throw new Error(`Unhandled EnsureFileResult: ${JSON.stringify(value)}`);
-		}
-
 		const {
 			file,
 			path,
@@ -5542,7 +6621,6 @@ export class ReconciliationController {
 			stat,
 			diskRevision,
 			entry,
-			sourceReason,
 			opId,
 			coalescedOpIds,
 			active,
@@ -5561,8 +6639,8 @@ export class ReconciliationController {
 
 		const existingText = vaultSync.getTextForPath(path);
 		const existingCrdtContent = yTextToString(existingText);
-		if (!existingText && !isRemoteDeletePreservedUnresolvedEntry(entry)) {
-			// A generic structural/path episode cannot authorize a new CRDT identity.
+		if (!existingText) {
+			// A disk event cannot authorize a new identity for a removed or quarantined path.
 			this.deps.trace("reconcile", "preserved-unresolved-local-resolution-deferred", {
 				path,
 				reason: entry.reason,
@@ -5627,55 +6705,10 @@ export class ReconciliationController {
 			expectedPreservedUnresolvedEpisodeId: expectedEpisodeId,
 			stage: "preserved-unresolved-fresh-local-event",
 			commit: () => {
-				let finalText = existingText;
-				let finalMatchesExpected = existingCrdtContent === content;
-				if (existingText) {
-					const result = vaultSync.serverAckTracker.withActiveOpId(opId, () =>
-						applyDiffToYTextWithPostcondition(
-							existingText,
-							existingCrdtContent ?? "",
-							content,
-							ORIGIN_DISK_SYNC,
-						),
-					);
-					finalMatchesExpected = result.finalMatchesExpected;
-				} else {
-					const ensureResult = vaultSync.serverAckTracker.withActiveOpId(opId, () =>
-						vaultSync.ensureFile(
-							path,
-							content,
-							this.deps.getSettings().deviceName,
-							{
-								reviveTombstone: true,
-								reviveReason: sourceReason === "create"
-									? "local-create-event"
-									: "local-modify-after-attention",
-								opId,
-							},
-						),
-					);
-					switch (ensureResult.kind) {
-						case "created":
-						case "existing":
-							finalText = ensureResult.ytext;
-							finalMatchesExpected = yTextToString(finalText) === content;
-							break;
-						case "replan":
-							finalText = null;
-							finalMatchesExpected = false;
-							break;
-						case "blocked":
-							this.deps.log(
-								`preservedUnresolved: "${path}" admission blocked (${ensureResult.reason})`,
-							);
-							finalText = null;
-							finalMatchesExpected = false;
-							break;
-						default:
-							assertNever(ensureResult);
-					}
-				}
-				return { finalText, finalMatchesExpected };
+				const result = vaultSync.serverAckTracker.withActiveOpId(opId, () =>
+					applyDiffToYTextWithPostcondition(existingText, existingCrdtContent ?? "", content, ORIGIN_DISK_SYNC),
+				);
+				return { finalText: existingText, finalMatchesExpected: result.finalMatchesExpected };
 			},
 		});
 		if (mutationAttempt.kind === "stale") return;
@@ -5851,7 +6884,6 @@ export class ReconciliationController {
 			});
 			if (!this.isDiskWriteSettled(writeResult)) {
 				this.traceDiskWriteNotSettled(path, writeResult, "fenced-conflict-winner-heal");
-				this.requestFollowupForUnsettledDiskWrite(path, writeResult, "fenced-conflict-winner-heal");
 				return false;
 			}
 			// The settled write result is the ground truth even when live
@@ -6233,9 +7265,14 @@ export class ReconciliationController {
 		expectedCandidateIdentityEpoch?: number;
 		shouldAbort?: () => boolean;
 		additionalAuthorityStaleReason?: () => string | null;
+		automaticTextMutation?: boolean;
+		automaticRecoveryFence?: () => string | null;
 		stage: string;
 		commit: () => T;
 	}): Promise<OpenEditorDiskMutationCommit<T>> {
+		const recoveryFence = input.automaticTextMutation === false ? () => null :
+			input.automaticRecoveryFence ?? this.captureAutomaticRecoveryFence(input.path, input.expectedYText, input.expectedDiskContent);
+		if (recoveryFence() !== null) return { kind: "stale" };
 		const expectedFile = input.file;
 		const expectedStat = input.expectedDiskStat !== undefined
 			? input.expectedDiskStat
@@ -6286,7 +7323,7 @@ export class ReconciliationController {
 
 		const callerAborted = input.shouldAbort?.() ?? false;
 		const additionalAuthorityStaleReason =
-			input.additionalAuthorityStaleReason?.() ?? null;
+			input.additionalAuthorityStaleReason?.() ?? recoveryFence();
 		const currentDiskRevision = this.getMarkdownDiskRevision(input.path);
 		const currentBaselineHash = this.deps.getDiskIndex()[input.path]?.contentHash ?? null;
 		const currentBaselineRevision = this.diskBaselineRevisions.get(input.path) ?? 0;
@@ -6360,7 +7397,7 @@ export class ReconciliationController {
 		// is resolved between this check and the CRDT transaction.
 		const finalCallerAborted = input.shouldAbort?.() ?? false;
 		const finalAdditionalAuthorityStaleReason =
-			input.additionalAuthorityStaleReason?.() ?? null;
+			input.additionalAuthorityStaleReason?.() ?? recoveryFence();
 		const finalPreservedUnresolved = this.isMarkdownPreservedUnresolved(input.path);
 		const finalYText = this.deps.getVaultSync()?.getTextForPath(input.path) ?? null;
 		const finalCrdtContent = yTextToString(finalYText);
@@ -7105,6 +8142,7 @@ export class ReconciliationController {
 		file: TFile | null,
 	): Promise<boolean> {
 		if (!ytext) return false;
+		const automaticRecoveryFence = this.captureAutomaticRecoveryFence(path, ytext, diskContent);
 		// This startup shortcut can await hashing and conflict-artifact writes.
 		// Capture every non-editor authority before the first await so a later
 		// baseline settlement, lifecycle change, or same-TFile disk epoch cannot
@@ -7318,6 +8356,8 @@ export class ReconciliationController {
 			return false;
 		}
 
+		if (automaticRecoveryFence() !== null || !this.admitAutomaticRecovery(path, ytext, diskContent)) return true;
+
 		if (
 			preflightAction.kind === "import-disk-to-crdt"
 			&& editorMatchesBaseline
@@ -7373,6 +8413,7 @@ export class ReconciliationController {
 				expectedInterceptedCandidate: interceptedCandidate,
 				expectedCandidateIdentityEpoch: candidateIdentityEpoch,
 				additionalAuthorityStaleReason: getStartupSupplementalStaleReason,
+				automaticRecoveryFence,
 				stage: "startup-open-stale-editor-disk-convergence",
 				commit: () => {
 					const result = applyDiffToYTextWithPostcondition(
@@ -7449,6 +8490,7 @@ export class ReconciliationController {
 			expectedInterceptedCandidate: interceptedCandidate,
 			expectedCandidateIdentityEpoch: candidateIdentityEpoch,
 			additionalAuthorityStaleReason: getStartupSupplementalStaleReason,
+				automaticRecoveryFence,
 			stage: "startup-open-editor-convergence",
 			commit: () => {
 				const result = applyDiffToYTextWithPostcondition(
@@ -7507,6 +8549,8 @@ export class ReconciliationController {
 				distinctEditorContentCount,
 				chosenSource,
 			} = input;
+			if (chosenSource !== "crdt" && !this.admitAutomaticRecovery(file.path, expectedYText, diskContent)) return false;
+
 			let convergenceApplied = false;
 
 			// With preservation abolished, the losing sides are recorded
@@ -7649,6 +8693,7 @@ export class ReconciliationController {
 				: undefined;
 		let visibleAuthorityMarker = this.visibleAuthorityDeferredPaths.get(file.path) ?? null;
 		let mutationTicketStale = false;
+		const automaticRecoveryFence = this.captureAutomaticRecoveryFence(file.path, existingText, physicalDiskContent);
 		const commitMutation = async <T>(
 			stage: string,
 			expectedCrdtContent: string | null,
@@ -7658,6 +8703,7 @@ export class ReconciliationController {
 				revision: number;
 			},
 			ticket: OpenEditorMutationTicket | null = mutationTicket,
+			automaticTextMutation = true,
 		): Promise<OpenEditorDiskMutationCommit<T>> => {
 			const attempt = await this.commitOpenEditorDiskMutation({
 				path: file.path,
@@ -7676,6 +8722,8 @@ export class ReconciliationController {
 				expectedCandidateIdentityEpoch: candidateIdentityEpoch,
 				shouldAbort,
 				stage,
+				automaticTextMutation,
+				automaticRecoveryFence,
 				commit,
 			});
 			mutationTicketStale ||= attempt.kind === "stale";
@@ -7749,6 +8797,7 @@ export class ReconciliationController {
 				},
 				baselineAuthority,
 				ticket,
+				false,
 			);
 			if (attempt.kind === "stale" || attempt.value === null) {
 				return this.deferStaleOpenEditorMutation(input.stage);
@@ -8350,34 +9399,192 @@ export class ReconciliationController {
 				})),
 			});
 
-			if (existingText && openBoundAction?.kind === "apply-crdt-to-disk") {
-				if (openBoundAction.preserveDisk) {
-					const preserved = await this.preserveOpenBoundPlannerConflict({
-						file,
-						diskContent: content,
-						crdtContent: crdtContent ?? "",
-						expectedYText: existingText,
-						targetContent: undefined,
-						reason: `bound-file-${openBoundAction.reason}`,
-						preserveDisk: true,
-						preserveCrdt: false,
-						editorViewCount: viewStates.length,
-						distinctEditorContentCount: distinctEditorContentsForPlanner.length,
-						chosenSource: "crdt",
+			// Manual resolution lane: the user chose the room version for this
+			// held episode. Flush CRDT→disk with the remote-projection CAS, then
+			// refresh the frozen panes so the editor==disk==CRDT invariant that
+			// binding attachment requires is restored directly. The discarded
+			// local text is audited server-side like every other explicit choice.
+			const manualChoice = this.peekManualRecoveryChoice(file.path);
+			if (existingText && crdtContent != null && manualChoice === "keep-remote") {
+				await this.recordDiscardedRevision(
+					file.path,
+					content,
+					"manual-recovery-keep-remote",
+				);
+				const diskMirror = this.deps.getDiskMirror();
+				const remoteProjectionAdmission = diskMirror
+					? this.captureRemoteProjectionAdmission(diskMirror, [file.path])
+					: null;
+				const writeResult = diskMirror && remoteProjectionAdmission
+					? await diskMirror.flushWrite(file.path, true, {
+						requireRemoteProjectionAdmission: true,
+						remoteProjectionAdmission,
+						recordBaseline: true,
+						expectedDiskContent: content,
+					})
+					: {
+						kind: "deferred" as const,
+						path: file.path,
+						reason: "remote-projection-not-ready" as const,
+					};
+				if (this.isDiskWriteSettled(writeResult)) {
+					await this.updateDiskIndexForPath(file.path, writeResult.content);
+					this.refreshStaleEditorPanes(openViews, crdtContent, file.path);
+					this.finishManualRecoveryResolution(file.path, "keep-remote", {
+						local: content.length,
+						remote: crdtContent.length,
 					});
-					if (!preserved) {
+					return { kind: "handled" };
+				}
+				this.traceDiskWriteNotSettled(file.path, writeResult, "manual-recovery-keep-remote");
+				this.requestFollowupForUnsettledDiskWrite(
+					file.path,
+					writeResult,
+					"manual-recovery-keep-remote",
+				);
+				return { kind: "handled" };
+			}
+
+			// P3: Hoist 3-way baseline hash computation for localOnlyViews
+			const baselineHash = this.deps.getDiskIndex()[file.path]?.contentHash ?? null;
+			const diskHash = await contentBaselineHash(content);
+			const crdtHash = await contentBaselineHash(crdtContent ?? "");
+			const diskChanged = baselineHash === null ? true : diskHash !== baselineHash;
+			const crdtChanged = baselineHash === null ? false : crdtHash !== baselineHash;
+
+			// Localized idle guard: defer recovery if the user just typed.
+			// The localOnly branch is the typing-cadence amplifier shape:
+			// editor matches disk but CRDT trails, repeatedly, because
+			// Obsidian autosave lands keystrokes faster than the
+			// y-codemirror.next plumbing propagates them into Y.Text.
+			// Quenching that loop requires a window longer than a typical
+			// human typing burst.
+			const lastEditorActivityLocalOnly =
+				editorBindings?.getLastEditorActivityForPath(file.path) ?? null;
+			if (
+				lastEditorActivityLocalOnly !== null
+				&& (Date.now() - lastEditorActivityLocalOnly) < OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS
+			) {
+				const idleMs = Date.now() - lastEditorActivityLocalOnly;
+				this.deps.log(
+					`syncFileFromDisk: deferring "${file.path}" ` +
+					`(editor-bound local-only, recent typing ${idleMs}ms ago)`,
+				);
+				this.deps.recordFlightPathEvent?.({
+					priority: "verbose",
+					kind: PRODUCT_EVENT_KIND.recoverySkipped,
+					severity: "info",
+					scope: "file",
+					source: "reconciliationController",
+					layer: "recovery",
+					path: file.path,
+					data: {
+						reason: "recent-editor-activity-local-only",
+						idleMs,
+					},
+				});
+				this.traceOpenExternalEvent("open-external-recent-typing-deferred", {
+					path: file.path,
+					reason: "recent-editor-activity-local-only",
+					diskLength: content.length,
+					currentLength: crdtContent?.length ?? null,
+					deferMs: Math.max(
+						0,
+						lastEditorActivityLocalOnly + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS - Date.now(),
+					),
+				});
+				// Pauses reset the amplification detector. See spec R3.8.
+				this.amplificationHistory.delete(file.path);
+				return {
+					kind: "deferred",
+					deferUntil: lastEditorActivityLocalOnly + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS,
+					reason: "recent-editor-activity-local-only",
+				};
+			}
+
+			if (existingText && crdtContent != null && baselineHash !== null && !diskChanged && crdtChanged) {
+				const diskMirror = this.deps.getDiskMirror();
+				const remoteProjectionAdmission = diskMirror
+					? this.captureRemoteProjectionAdmission(diskMirror, [file.path])
+					: null;
+				const writeResult = diskMirror && remoteProjectionAdmission
+					? await diskMirror.flushWrite(file.path, true, {
+						requireRemoteProjectionAdmission: true,
+						remoteProjectionAdmission,
+						recordBaseline: true,
+						expectedDiskContent: content,
+					})
+					: {
+						kind: "deferred" as const,
+						path: file.path,
+						reason: "remote-projection-not-ready" as const,
+					};
+				if (this.isDiskWriteSettled(writeResult)) {
+					await this.updateDiskIndexForPath(file.path, writeResult.content);
+
+					// P2 Safety: Re-verify open editor panes are still pristine (matching captured disk content)
+					// before overwriting them. If the user typed during the flush awaits, do NOT overwrite;
+					// defer followup so reconciliation replans with the user's fresh editor content.
+					const editorPanesUnchanged = openViews.every((view) => {
+						try {
+							return normalizeEditorText(view.editor.getValue()) === normalizeEditorText(content);
+						} catch {
+							return false;
+						}
+					});
+					if (!editorPanesUnchanged) {
+						this.deps.trace("editor", "stale-tab-editor-concurrent-typing-deferred", {
+							path: file.path,
+							diskLength: content.length,
+							settledLength: writeResult.content.length,
+						});
+						this.requestReconciliationFollowup(file.path, "stale-tab-editor-concurrent-typing");
 						return { kind: "handled" };
 					}
-					plannerConflictPreserved = true;
+
+					this.refreshStaleEditorPanes(openViews, writeResult.content, file.path);
+					const editorBindings = this.deps.getEditorBindings();
+					for (const state of localOnlyViews) {
+						const repaired = editorBindings?.repair(
+							state.view,
+							this.deps.getSettings().deviceName,
+							"bound-file-local-only-divergence",
+						) ?? false;
+						if (!repaired) {
+							editorBindings?.rebind(
+								state.view,
+								this.deps.getSettings().deviceName,
+								"bound-file-local-only-divergence",
+							);
+						}
+					}
+					this.deps.recordFlightPathEvent?.({
+						priority: "important",
+						kind: PRODUCT_EVENT_KIND.recoveryDecision,
+						severity: "info",
+						scope: "file",
+						source: "reconciliationController",
+						layer: "recovery",
+						path: file.path,
+						data: {
+							reason: "bound-file-local-only-divergence",
+							action: "crdt-wins-stale-tab",
+							diskLength: content.length,
+							crdtLength: crdtContent.length,
+						},
+					});
+					return { kind: "handled" };
 				}
-				this.deps.scheduleTraceStateSnapshot("bound-file-open-planner-crdt-wins");
-				return admitOpenFlush({
-					stage: "bound-file-local-only-planner-crdt-flush",
-					provisionalBaseline: plannerConflictPreserved,
-					reason: `bound-file-${openBoundAction.reason}`,
-					expectedCrdtContent: crdtContent,
-				});
+				this.traceDiskWriteNotSettled(file.path, writeResult, "crdt-wins-stale-tab");
+				this.requestFollowupForUnsettledDiskWrite(
+					file.path,
+					writeResult,
+					"crdt-wins-stale-tab",
+				);
+				return { kind: "handled" };
 			}
+
+			if (existingText && automaticRecoveryFence() !== null) return { kind: "handled" };
 
 			if (existingText && openBoundAction?.kind === "editor-wins-preserve") {
 				const editorAuthority =
@@ -8436,55 +9643,21 @@ export class ReconciliationController {
 			}
 
 			if (existingText) {
-				// Localized idle guard: defer recovery if the user just typed.
-				// The localOnly branch is the typing-cadence amplifier shape:
-				// editor matches disk but CRDT trails, repeatedly, because
-				// Obsidian autosave lands keystrokes faster than the
-				// y-codemirror.next plumbing propagates them into Y.Text.
-				// Quenching that loop requires a window longer than a typical
-				// human typing burst.
-				const lastEditorActivityLocalOnly =
-					editorBindings?.getLastEditorActivityForPath(file.path) ?? null;
-				if (
-					lastEditorActivityLocalOnly !== null
-					&& (Date.now() - lastEditorActivityLocalOnly) < OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS
-				) {
-					const idleMs = Date.now() - lastEditorActivityLocalOnly;
-					this.deps.log(
-						`syncFileFromDisk: deferring "${file.path}" ` +
-						`(editor-bound local-only, recent typing ${idleMs}ms ago)`,
-					);
-					this.deps.recordFlightPathEvent?.({
-						priority: "verbose",
-						kind: PRODUCT_EVENT_KIND.recoverySkipped,
-						severity: "info",
-						scope: "file",
-						source: "reconciliationController",
-						layer: "recovery",
-						path: file.path,
-						data: {
-							reason: "recent-editor-activity-local-only",
-							idleMs,
-						},
-						});
-						this.traceOpenExternalEvent("open-external-recent-typing-deferred", {
-							path: file.path,
-							reason: "recent-editor-activity-local-only",
-							diskLength: content.length,
-							currentLength: crdtContent?.length ?? null,
-							deferMs: Math.max(
-								0,
-								lastEditorActivityLocalOnly + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS - Date.now(),
-							),
-						});
-						// Pauses reset the amplification detector. See spec R3.8.
-						this.amplificationHistory.delete(file.path);
-						return {
-							kind: "deferred",
-							deferUntil: lastEditorActivityLocalOnly + OPEN_FILE_LOCAL_ONLY_RECOVERY_IDLE_MS,
-							reason: "recent-editor-activity-local-only",
-						};
+				const localOnlyEvidence = this.getRecoveryPaneEvidence(openViews);
+				const hasUnboundFallback = localOnlyEvidence.some(
+					(pane) => pane?.origin === "unbound-fallback",
+				);
+				if ((baselineHash === null || (diskChanged && crdtChanged)) && hasUnboundFallback) {
+					if (existingText) {
+						this.holdAutomaticRecovery(
+							file.path,
+							existingText,
+							"unverified-local-successor",
+							localOnlyViews.length,
+						);
 					}
+					return { kind: "handled" };
+				}
 
 				if (this.deps.shouldBlockFrontmatterIngest(
 					file.path,
@@ -8511,6 +9684,7 @@ export class ReconciliationController {
 				});
 			// recovery.decision: emit before quarantine check so even quarantined cases are visible
 			const _rsh1 = await this.deps.computeRecoveryStateHash?.(file.path, content) ?? undefined;
+			if (automaticRecoveryFence() !== null) return { kind: "handled" };
 			// Snapshot binding health across all localOnly views. Surfaces in
 			// the trace why we may or may not also call repair() on the views
 			// after the diff applies. See spec R7.
@@ -8567,6 +9741,13 @@ export class ReconciliationController {
 					return { kind: "handled" };
 				}
 				if (shouldAbort()) return { kind: "handled" };
+				// A pending keep-local decision is the user's explicit authority:
+				// the diff that lands must be auditable as a manual choice, not
+				// as the automatic disk-wins recovery that the hold blocked.
+				const manualKeepLocal = this.peekManualRecoveryChoice(file.path) === "keep-local";
+				const localOnlyRecoveryOrigin = manualKeepLocal
+					? ORIGIN_MANUAL_RECOVERY_CHOICE
+					: ORIGIN_DISK_SYNC_RECOVER_BOUND;
 				// recovery.apply.start: before the actual diff application
 				this.deps.recordFlightPathEvent?.({
 					priority: "important",
@@ -8578,7 +9759,7 @@ export class ReconciliationController {
 					path: file.path,
 					data: {
 						reason: "bound-file-local-only-divergence",
-						origin: ORIGIN_DISK_SYNC_RECOVER_BOUND,
+						origin: localOnlyRecoveryOrigin,
 						diskLength: content.length,
 						crdtLength: crdtContent?.length ?? null,
 					},
@@ -8590,7 +9771,7 @@ export class ReconciliationController {
 						existingText,
 						crdtContent ?? "",
 						content,
-						ORIGIN_DISK_SYNC_RECOVER_BOUND,
+						localOnlyRecoveryOrigin,
 					),
 				);
 				if (recoveryAttempt.kind === "stale") {
@@ -8602,7 +9783,7 @@ export class ReconciliationController {
 				(event) => this.deps.recordFlightPathEvent?.(event),
 				file.path,
 				"bound-file-local-only-divergence",
-				ORIGIN_DISK_SYNC_RECOVER_BOUND,
+				localOnlyRecoveryOrigin,
 				content.length,
 				recoveryResult,
 			);
@@ -8616,13 +9797,23 @@ export class ReconciliationController {
 					path: file.path,
 					data: {
 						reason: "bound-file-local-only-divergence",
-						origin: ORIGIN_DISK_SYNC_RECOVER_BOUND,
+						origin: localOnlyRecoveryOrigin,
 						expectedLength: content.length,
 						actualLength: recoveryResult.finalLength,
 						matchesExpected: recoveryResult.finalMatchesExpected,
 						forceReplaceApplied: recoveryResult.forceReplaceApplied,
 					},
 				});
+				if (
+					manualKeepLocal &&
+					recoveryResult.finalMatchesExpected &&
+					this.peekManualRecoveryChoice(file.path) === "keep-local"
+				) {
+					this.finishManualRecoveryResolution(file.path, "keep-local", {
+						local: content.length,
+						remote: crdtContent?.length ?? null,
+					});
+				}
 			} else {
 				if (this.deps.shouldBlockFrontmatterIngest(
 					file.path,
@@ -8674,6 +9865,11 @@ export class ReconciliationController {
 					path: file.path,
 					data: { reason: "bound-file-local-only-seed", action: "seed-crdt-from-disk", diskLength: content.length },
 				});
+				const tombstoneDeletedAt = typeof vaultSync?.getMarkdownTombstoneDeletedAt === "function"
+					? vaultSync.getMarkdownTombstoneDeletedAt(file.path)
+					: null;
+				await vaultSync?.prepareMarkdownCreationHistory?.([file.path]);
+				if (shouldAbort()) return { kind: "handled" };
 				const seedAttempt = await commitMutation(
 					"bound-file-local-only-seed",
 					null,
@@ -8682,8 +9878,7 @@ export class ReconciliationController {
 						content,
 						this.deps.getSettings().deviceName,
 						{
-							reviveTombstone: sourceReason === "create",
-							reviveReason: sourceReason === "create" ? "local-create-event" : undefined,
+							reviveTombstone: false,
 						},
 					),
 				);
@@ -8698,11 +9893,19 @@ export class ReconciliationController {
 				switch (ensureResult.kind) {
 					case "created":
 					case "existing":
+						this.clearTombstonedDiskConflict(file.path);
 						seededText = ensureResult.ytext;
 						break;
 					case "replan":
 						return this.deferStaleOpenEditorMutation("bound-file-local-only-seed-replan");
 					case "blocked":
+						if (ensureResult.reason === "tombstone") {
+							this.deps.log(
+								`syncFileFromDisk: tombstone blocked for open file "${file.path}", recording Attention and stopping defer loop`,
+							);
+							this.recordTombstonedDiskConflict(file.path, tombstoneDeletedAt, file.stat?.ctime, true);
+							return { kind: "handled" };
+						}
 						this.deps.log(
 							`syncFileFromDisk: controller admission blocked for "${file.path}" (${ensureResult.reason})`,
 						);

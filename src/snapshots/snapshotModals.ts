@@ -1,3 +1,4 @@
+import { FullVaultRestoreConfirmModal } from "./fullRestoreModal";
 import { App, Modal, Notice } from "obsidian";
 import type { SnapshotDiff, SnapshotIndex } from "../sync/snapshotClient";
 
@@ -94,6 +95,7 @@ export class SnapshotDiffModal extends Modal {
 		private diff: SnapshotDiff,
 		private onRestore: (markdownPaths: string[], blobPaths: string[]) => void | Promise<void>,
 		private cleanup: () => void,
+		private onFullRestore?: () => void | Promise<void>,
 	) {
 		super(app);
 	}
@@ -119,7 +121,7 @@ export class SnapshotDiffModal extends Modal {
 			diff.blobsDeletedSinceSnapshot.length +
 			diff.blobsChanged.length;
 
-		if (totalChanges === 0 && diff.createdSinceSnapshot.length === 0) {
+		if (totalChanges === 0 && diff.createdSinceSnapshot.length === 0 && diff.blobsCreatedSinceSnapshot.length === 0) {
 			contentEl.createEl("p", { text: "No differences found between the vault snapshot and current state." });
 			return;
 		}
@@ -179,6 +181,13 @@ export class SnapshotDiffModal extends Modal {
 			);
 		}
 
+		if (diff.blobsCreatedSinceSnapshot.length > 0) {
+			const section = contentEl.createDiv();
+			section.createEl("h4", { text: `Attachments created since vault snapshot (${diff.blobsCreatedSinceSnapshot.length})` });
+			const list = section.createEl("ul");
+			for (const path of diff.blobsCreatedSinceSnapshot) list.createEl("li", { text: path });
+		}
+
 		// --- Unchanged summary ---
 		if (diff.unchanged.length > 0) {
 			contentEl.createEl("p", {
@@ -189,6 +198,19 @@ export class SnapshotDiffModal extends Modal {
 
 		// --- Restore button ---
 		const buttonRow = contentEl.createDiv({ cls: "modal-button-container snapshot-diff-actions" });
+
+		const fullRestore = buttonRow.createEl("button", { text: "Restore entire vault to this snapshot", cls: "mod-cta" });
+		fullRestore.disabled = !this.onFullRestore;
+		if (!this.onFullRestore) fullRestore.title = "Full restore authority is unavailable. Let sync settle and reopen this snapshot.";
+		fullRestore.addEventListener("click", () => {
+			if (!this.onFullRestore || this.didRestore) return;
+			new FullVaultRestoreConfirmModal(this.app, diff, async () => {
+				if (this.didRestore) return;
+				this.didRestore = true;
+				this.close();
+				await this.onFullRestore!();
+			}).open();
+		});
 
 		buttonRow
 			.createEl("button", { text: "Cancel" })

@@ -122,6 +122,8 @@ function makeVaultSync(
 	onFlightPathEvent: (event: FlightPathEventInput) => void,
 ): VaultSync {
 	const vs = Object.create(VaultSync.prototype) as VaultSync & Record<string, unknown>;
+	vs.getRemoteTextRevisionForPath = () => null;
+	vs.getActivePathForTrackedText = () => null;
 	vs.ydoc = new Y.Doc();
 	vs.pathToId = vs.ydoc.getMap("pathToId");
 	vs.idToText = vs.ydoc.getMap("idToText");

@@ -23,6 +23,16 @@ export function getSyncStatusLabel(state: SyncStatus): string {
 	return labels[state];
 }
 
+export interface UnsyncedEditsSummary {
+	hasUnsynced: boolean;
+	unsyncedFileCount: number;
+	activeUnsyncedChars: number;
+	activeHasUnsynced: boolean;
+	/** Open views whose push is frozen by a conflict hold awaiting resolution. */
+	conflictHoldCount: number;
+	activeConflictHold: boolean;
+}
+
 /**
  * Derives a status bar label directly from the rich `ConnectionState`. This
  * replaces the coarse 7-value SyncStatus → label mapping for the visible
@@ -35,6 +45,7 @@ export function getLabelFromConnectionState(
 	transferStatus?: string | null,
 	serverReceipt?: ServerReceiptStatus | null,
 	attentionCount = 0,
+	unsyncedSummary?: UnsyncedEditsSummary | null,
 ): string {
 	let base: string;
 	switch (state.kind) {
@@ -78,7 +89,43 @@ export function getLabelFromConnectionState(
 	if (attentionCount > 0) {
 		base = `${base} · ${attentionCount} file${attentionCount === 1 ? "" : "s"} need attention`;
 	}
+	const unsyncedSegment = formatUnsyncedSegment(unsyncedSummary, state.kind === "online");
+	if (unsyncedSegment) base = `${base} · ${unsyncedSegment}`;
 	return receipt ? `${base} · ${receipt}` : base;
+}
+
+/**
+ * Status-bar segment for editor-to-CRDT residue and conflict holds.
+ *
+ * Plain residue is transient while connected (realtime push), so it is only
+ * shown when not connected. A conflict hold freezes the push (and remote
+ * projection) until resolved, so it is shown regardless of connection state
+ * and regardless of whether the editor currently differs from the base.
+ */
+export function formatUnsyncedSegment(
+	summary: UnsyncedEditsSummary | null | undefined,
+	connected: boolean,
+): string | null {
+	if (!summary) return null;
+	const parts: string[] = [];
+	const showResidue = summary.hasUnsynced &&
+		(!connected || (summary.activeHasUnsynced && summary.activeConflictHold));
+	if (showResidue) {
+		if (summary.activeHasUnsynced) {
+			const count = Math.abs(summary.activeUnsyncedChars);
+			const conflict = summary.activeConflictHold ? " (conflict)" : "";
+			parts.push(`${count > 0 ? `${count} unsynced chars` : "unsynced edits"}${conflict}`);
+		} else {
+			parts.push(`${summary.unsyncedFileCount} unsynced file${summary.unsyncedFileCount === 1 ? "" : "s"}`);
+		}
+	}
+	// Conflict holds not already described by the active-note segment above.
+	const describedActive = showResidue && summary.activeHasUnsynced && summary.activeConflictHold;
+	const otherHolds = summary.conflictHoldCount - (describedActive ? 1 : 0);
+	if (otherHolds > 0) {
+		parts.push(`${otherHolds} sync conflict${otherHolds === 1 ? "" : "s"}`);
+	}
+	return parts.length > 0 ? parts.join(" · ") : null;
 }
 
 function shouldShowReceiptStatus(state: ConnectionState): boolean {
@@ -120,6 +167,7 @@ export function renderSyncStatus(
 	state: SyncStatus,
 	transferStatus?: string | null,
 	attentionCount = 0,
+	unsyncedSummary?: UnsyncedEditsSummary | null,
 ): void {
 	let text = getSyncStatusLabel(state);
 	if (transferStatus) {
@@ -128,6 +176,8 @@ export function renderSyncStatus(
 	if (attentionCount > 0) {
 		text += ` · ${attentionCount} file${attentionCount === 1 ? "" : "s"} need attention`;
 	}
+	const unsyncedSegment = formatUnsyncedSegment(unsyncedSummary, state === "connected");
+	if (unsyncedSegment) text += ` · ${unsyncedSegment}`;
 	statusBarEl.setText(text);
 }
 
@@ -141,10 +191,25 @@ export function renderConnectionState(
 	transferStatus?: string | null,
 	serverReceipt?: ServerReceiptStatus | null,
 	attentionCount = 0,
+	unsyncedSummary?: UnsyncedEditsSummary | null,
 ): void {
-	statusBarEl.setText(getLabelFromConnectionState(state, transferStatus, serverReceipt, attentionCount));
-	const title = serverReceipt && shouldShowReceiptStatus(state)
+	statusBarEl.setText(getLabelFromConnectionState(state, transferStatus, serverReceipt, attentionCount, unsyncedSummary));
+	let title = serverReceipt && shouldShowReceiptStatus(state)
 		? "Server receipt means the server Y.Doc received this device's latest local CRDT state. It is not durable and does not mean other devices have applied it."
 		: "";
+	const connected = state.kind === "online";
+	const notes: string[] = [];
+	if (unsyncedSummary?.hasUnsynced && !connected) {
+		notes.push("Local edits have not yet synced to the server.");
+	}
+	if ((unsyncedSummary?.conflictHoldCount ?? 0) > 0) {
+		notes.push(
+			"A sync conflict froze syncing for an open note: local and remote edits overlap. " +
+			"Both versions are kept until it is resolved.",
+		);
+	}
+	if (notes.length > 0) {
+		title = (title ? `${title}\n` : "") + notes.join("\n");
+	}
 	statusBarEl.setAttr("title", title);
 }

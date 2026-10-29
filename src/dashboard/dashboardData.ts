@@ -241,7 +241,9 @@ export function collectDashboardAttention(
 				? downloadConflictArtifactAvailable
 					? "Choose Keep local or Use remote copy in the Conflicts section."
 					: "The preserved remote copy is missing or was moved. Restore the exact copy from trash, or review the local attachment manually."
-				: entry.reason,
+				: entry.artifactPath && entry.kind === "markdown"
+					? `${entry.reason}. Local backup: ${entry.artifactPath}`
+					: entry.reason,
 			structuralChange: null,
 			firstSeenAt: new Date(entry.firstSeenAt).toISOString(),
 			lastSeenAt: new Date(entry.lastSeenAt).toISOString(),
@@ -328,6 +330,40 @@ export function collectDashboardAttention(
 		});
 	}
 
+	for (const conflict of input.reconciliationState.tombstonedDiskConflicts ?? []) {
+		const localFile = getDashboardLocalFileIdentity(input, conflict.path);
+		const ctime = conflict.ctime ?? null;
+		const deletedAt = conflict.deletedAt ?? null;
+		const hasOpenTabs = conflict.hasOpenViews === true;
+		const ctimeDesc = ctime ? `ctime: ${new Date(ctime).toLocaleString()}` : "ctime: unknown";
+		const deletedAtDesc = deletedAt ? `deletedAt: ${new Date(deletedAt).toLocaleString()}` : "deletedAt: recorded";
+		const tabDesc = hasOpenTabs ? "open tabs: yes" : "open tabs: no";
+
+		items.push({
+			kind: "tombstone-disk-conflict",
+			title: conflict.movedTo
+				? "Note remains at its old location and is not syncing"
+				: "Note exists at a deleted path and is not syncing",
+			path: conflict.path,
+			detail: conflict.movedTo ? `Moved to ${conflict.movedTo}. ${tabDesc}` : `${deletedAtDesc}, ${ctimeDesc}, ${tabDesc}`,
+			structuralChange: null,
+			firstSeenAt: deletedAt ? new Date(deletedAt).toISOString() : null,
+			lastSeenAt: ctime ? new Date(ctime).toISOString() : null,
+			tone: "warn",
+			resolution: {
+				kind: "tombstone-disk-conflict",
+				remoteDeleteFingerprint: conflict.removalFingerprint ?? null,
+				localFileToken: conflict.localFileToken,
+				path: conflict.path,
+				localFile,
+				canKeepLocal: localFile.kind === "file",
+				canAcceptDelete: true,
+				keepLocalUnavailableReason: localFile.kind !== "file" ? "The local file no longer exists." : null,
+				acceptDeleteUnavailableReason: null,
+			},
+		});
+	}
+
 	return items.sort((left, right) =>
 		(Date.parse(right.lastSeenAt ?? right.firstSeenAt ?? "0") || 0)
 		- (Date.parse(left.lastSeenAt ?? left.firstSeenAt ?? "0") || 0),
@@ -374,6 +410,8 @@ export function getDashboardAttentionTotalCount(
 		+ input.frontmatterQuarantineEntries.length
 		+ input.reconciliationState.unresolvedStructuralChangeGroupCount
 		+ input.reconciliationState.blockedDivergenceCount
+		+ (input.reconciliationState.automaticRecoveryHeldCount ?? 0)
+		+ (input.reconciliationState.tombstonedDiskConflictCount ?? 0)
 		+ (input.remoteProjectionPolicyError ? 1 : 0)
 		+ (input.roomDivergence && input.roomDivergence.kind !== "ok" ? 1 : 0);
 }

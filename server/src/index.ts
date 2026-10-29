@@ -14,6 +14,7 @@ import type { ValidatedClaimRequest } from "./routes/auth";
 import { handleBlobRoute } from "./routes/blobs";
 import { corsPreflight, createCspNonce, html, json, withCors } from "./routes/http";
 import { handleSnapshotRoute } from "./routes/snapshots";
+import { handleFileRepairRoute } from "./routes/fileRepair";
 import { handleRecoveryContentRoute, handleRecoverySnapshotRoute } from "./routes/recoverySnapshots";
 import { handleSyncSocketRoute, parseSyncPath } from "./routes/syncSocket";
 import { fetchVaultDebug, fetchVaultDocument, handleVaultTraceRoute, recordVaultTrace } from "./routes/trace";
@@ -59,7 +60,7 @@ type WorkerRoute =
  * The complete set of vault sub-resources the server actually handles.
  * Anything outside this set returns not-found before auth — zero DO access.
  */
-const VALID_VAULT_RESOURCES = new Set(["auth", "debug", "trace", "blobs", "snapshots", "recovery-snapshots", "recovery-content"]);
+const VALID_VAULT_RESOURCES = new Set(["auth", "debug", "trace", "blobs", "snapshots", "recovery-snapshots", "recovery-content", "file-repair"]);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SECURITY / BILLING INVARIANT — route classifier duplication is intentional
@@ -172,6 +173,8 @@ function isKnownVaultRouteShape(method: string, resource: string, rest: string[]
 
 		case "recovery-content":
 			return method === "GET" && rest.length === 1 && rest[0].length > 0;
+		case "file-repair":
+			return (method === "GET" || method === "POST") && rest.length === 0;
 
 		default:
 			return false;
@@ -468,6 +471,8 @@ const worker = {
 				response = withCors(await handleVaultTraceRoute(env, vaultId, req, json));
 			} else if (resource === "blobs") {
 				response = withCors(await handleBlobRoute(env, vaultId, req, rest, json));
+			} else if (resource === "file-repair") {
+				response = withCors(await handleFileRepairRoute(env, vaultId, req));
 			} else if (resource === "snapshots") {
 				response = withCors(await handleSnapshotRoute(env, vaultId, req, rest, json, {
 					fetchVaultDocument,

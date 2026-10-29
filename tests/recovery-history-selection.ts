@@ -131,3 +131,35 @@ console.log("\n--- Test 4: recovery history selection falls back to first visibl
 	);
 	assert.equal(selected, "m1:f2:1");
 }
+
+console.log("\n--- Test 5: recovery history feed with initialPath selects all history and targets newest change ---");
+{
+	const resolved = resolveRecoveryHistoryFeedState(manifests, {
+		initialPath: "notes/a.md",
+		autoExpandDiff: true,
+	});
+	assert.deepEqual(resolved.scope, { kind: "all" });
+	assert.equal(resolved.selectedChangeKey, "m2:f1:1");
+
+	const changes = buildRecoveryHistoryChanges(manifests);
+	const visible = filterRecoveryHistoryChanges(changes, {
+		scope: resolved.scope,
+		query: "notes/a.md",
+		kindFilter: "all",
+	});
+	// Only changes matching notes/a.md across manifests should appear
+	assert.deepEqual(
+		visible.map((item) => item.key),
+		["m2:f1:1", "m1:f1:0"],
+	);
+}
+
+console.log("\n--- Test 6: recovery history feed with unmatched initialPath selects all scope and null key ---");
+{
+	const resolved = resolveRecoveryHistoryFeedState(manifests, {
+		initialPath: "nonexistent/file.md",
+		autoExpandDiff: true,
+	});
+	assert.deepEqual(resolved.scope, { kind: "all" });
+	assert.equal(resolved.selectedChangeKey, null);
+}

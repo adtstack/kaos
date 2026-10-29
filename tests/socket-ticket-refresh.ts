@@ -47,6 +47,7 @@ interface FakeProvider {
 }
 
 interface TicketHarness {
+	_isConnectionAllowed?: () => boolean;
 	provider: FakeProvider;
 	_getSocketTicket: ((force?: boolean) => Promise<TicketValue | null>) | null;
 	_socketTicketRefreshTimer: unknown | null;
@@ -996,6 +997,33 @@ console.log("\n--- socket ticket HTTP auth errors: initial, proactive, and recov
 	} finally {
 		recoveryClock.restore();
 	}
+}
+
+console.log("\n--- explicit repair hold: constructor/manual/ticket reconnects stay closed ---");
+{
+	const clock = installFakeTimers();
+	let allowed = false;
+	let connectCalls = 0;
+	let ticketCalls = 0;
+	const sync = makeHarness(async () => { ticketCalls++; return null; }, {
+		async connect() { connectCalls++; this.shouldConnect = true; },
+	});
+	try {
+		sync._isConnectionAllowed = () => allowed;
+		sync._socketTicketConnectionWanted = false;
+		sync.provider.shouldConnect = false;
+		sync.installSocketTicketProviderLifecycle();
+		await sync.provider.connect();
+		await sync.refreshProviderTicketUrl(true);
+		sync.recoverSocketTicketAfterDisconnect();
+		await drainAsync();
+		assertEqual(connectCalls, 0, "unresolved repair blocks every new provider connect");
+		assertEqual(ticketCalls, 0, "unresolved repair blocks ticket recovery HTTP");
+		assertEqual(activeTimers(clock.timers).length, 0, "repair hold does not spin a retry loop");
+		allowed = true;
+		await sync.provider.connect();
+		assertEqual(connectCalls, 1, "completed repair can resume ordinary connection intent");
+	} finally { clock.restore(); }
 }
 
 console.log("\n--- socket ticket lifecycle: source ordering guards ---");

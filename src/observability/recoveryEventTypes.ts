@@ -34,3 +34,22 @@ export type RecoverySkippedFrontmatterData = {
 	wasBound: boolean;
 	branch: FrontmatterIngestBlockBranch;
 };
+
+/** Runtime admission reasons; unknown future values must remain diagnostic-only. */
+export type LocalOnlyRecoveryBlockDetail =
+ | "initial-authority-unverified"
+ | "remote-not-acknowledged"
+ | "pane-identity-mismatch"
+ | "source-unverified"
+ | "admission-stale"
+ | "automatic-recovery-paused"
+ | "unverified-local-successor";
+
+export type RecoverySkippedLocalOnlyData = {
+ reason: "local-only-remote-contamination";
+ detail: LocalOnlyRecoveryBlockDetail;
+ textRevision: number | null;
+ remoteRevision: number | null;
+ paneCount: number;
+ episode: number;
+};

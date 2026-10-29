@@ -80,6 +80,7 @@ export interface HeadlessDaemonStatus {
 
 export interface StatePublisherPluginTarget {
 	manifest?: { version?: string };
+	reconnect?: (reason?: string) => void;
 	getHeadlessRuntimeSnapshot?: () => {
 		connection: {
 			status: string;
@@ -149,6 +150,9 @@ export class DaemonStatePublisher {
 	private interval: ReturnType<typeof setInterval> | null = null;
 	private startedAt: string;
 	private stopped = false;
+	private consecutiveOfflineCount = 0;
+	private nextWatchdogReconnectAt = 0;
+	private watchdogBackoffMs = 5000;
 
 	private readonly options: DaemonStatePublisherOptions;
 
@@ -281,5 +285,27 @@ export class DaemonStatePublisher {
 		await writeFile(tmp, payload, "utf8");
 		await chmod(tmp, 0o600).catch(() => undefined);
 		await rename(tmp, this.statusFile);
+
+		if (alive && !shutdownReason && typeof this.options.plugin.reconnect === "function") {
+			const connStatus = status.connection.status;
+			const fatalAuth = status.connection.fatalAuthCode;
+			if (!fatalAuth && (connStatus === "offline" || connStatus === "disconnected")) {
+				this.consecutiveOfflineCount++;
+				const now = Date.now();
+				if (this.consecutiveOfflineCount >= 5 && now >= this.nextWatchdogReconnectAt) {
+					try {
+						this.options.plugin.reconnect("headless-watchdog");
+					} catch {
+						// Best-effort watchdog retry
+					}
+					this.nextWatchdogReconnectAt = now + this.watchdogBackoffMs;
+					this.watchdogBackoffMs = Math.min(60000, this.watchdogBackoffMs * 2);
+				}
+			} else if (connStatus === "online" || connStatus === "connected") {
+				this.consecutiveOfflineCount = 0;
+				this.watchdogBackoffMs = 5000;
+				this.nextWatchdogReconnectAt = 0;
+			}
+		}
 	}
 }

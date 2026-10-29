@@ -78,7 +78,9 @@ External changes to open notes merge automatically when edits do not overlap.
 Overlapping or ambiguous edits never clobber the open editor: the editor
 stays authoritative, the losing revision is recorded to the server audit log
 (hashed path + content hash + reason), and the CRDT journal/snapshots, the
-durable disk-index baseline, and git remain the recovery layer.
+durable disk-index baseline, and git remain the recovery layer. Fenced Markdown
+conflicts in Dashboard → Attention also offer side-by-side diff review and
+three-way or manual merge, with explicit application of the reviewed result.
 
 ## Attachments and Snapshots
 
@@ -87,8 +89,10 @@ configure an R2 bucket for the server.
 
 R2 also enables daily automatic snapshots and manual point-in-time backups.
 Snapshots can be browsed, compared with the current vault, and selectively
-restored. Without R2, text sync still works, but attachment sync and snapshots
-are disabled.
+restored. Full-vault point-in-time restore also removes synchronized files created
+since the snapshot, after a required safety snapshot and local backups. Created
+notes move to Obsidian trash; created attachments become visible local backup files.
+Without R2, text sync still works, but attachment sync and snapshots are disabled.
 
 ## Shared Exclude File
 
@@ -173,6 +177,7 @@ points:
 - [Zero-config auth](./engineering/zero-config-auth.md)
 - [Zero-ops update pipeline](./engineering/zero-ops-update-pipeline.md)
 - [Local multi-device QA (no Cloudflare deploy)](./docs/testing/local-multidevice-qa.md)
+- [Editor rollback observation and trace analysis](./docs/testing/2026-09-30-editor-rollback-observation.md)
 - [Warts and limits](./engineering/warts-and-limits.md)
 
 ## Local Development

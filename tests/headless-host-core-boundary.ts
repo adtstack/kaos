@@ -3,6 +3,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { EditorState } from "../src/headless-host/codeMirrorStateShim";
 import { EditorView } from "../src/headless-host/codeMirrorViewShim";
+import { HeadlessWorkspace } from "../src/headless-host/core/workspace";
 
 const CORE_DIR = "src/headless-host/core";
 const forbiddenImportPatterns = [
@@ -45,3 +46,16 @@ assert.equal(typeof EditorState.transactionFilter.of, "function");
 assert.equal(typeof EditorState.transactionExtender.of, "function");
 assert.equal(typeof EditorView.domEventHandlers, "function");
 console.log("  PASS  transaction filters, extenders, and DOM handlers can be installed during plugin boot");
+
+console.log("\n--- headless host workspace: UI-only menu events register without failing sync init ---");
+const workspace = new HeadlessWorkspace();
+for (const name of ["layout-change", "active-leaf-change", "file-open", "file-menu", "editor-menu"]) {
+	const ref = workspace.on(name, () => {});
+	assert.ok(ref, `${name} must return an event ref`);
+}
+assert.throws(
+	() => workspace.on("quit", () => {}),
+	/does not implement/,
+	"unknown workspace events must keep failing closed",
+);
+console.log("  PASS  menu events subscribe as no-ops and unknown events still fail closed");

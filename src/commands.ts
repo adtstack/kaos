@@ -26,6 +26,10 @@ export interface CommandsRuntimeHost {
 	nuclearReset(): void;
 	prunePhantomRemotePaths(): Promise<void>;
 	resolveSettledCollisionMarkers(): Promise<void>;
+	openRecoveryHoldResolution(): void;
+	openDivergenceResolutionForPath?(path: string): void;
+	restoreFileFromServer(file: TFile): Promise<void>;
+	restoreAllFilesFromServer?(): Promise<void>;
 }
 
 export function registerCommands(
@@ -142,6 +146,46 @@ export function registerCommands(
 	});
 
 	registrar.addCommand({
+		id: "resolve-paused-recovery",
+		name: "Resolve paused sync recovery",
+		callback: () => {
+			host.openRecoveryHoldResolution();
+		},
+	});
+
+	registrar.addCommand({
+		id: "resolve-active-note-divergence",
+		name: "Resolve divergence for active note (compare and choose)",
+		checkCallback: (checking: boolean) => {
+			const activeFile = host.getActiveFile?.();
+			if (!activeFile || activeFile.extension !== "md") return false;
+			if (checking) return true;
+			host.openDivergenceResolutionForPath?.(activeFile.path);
+			return true;
+		},
+	});
+
+	registrar.addCommand({
+		id: "restore-file-from-server-active-file",
+		name: "Restore file from server (active file)",
+		checkCallback: (checking: boolean) => {
+			const activeFile = host.getActiveFile?.();
+			if (!activeFile) return false;
+			if (checking) return true;
+			void host.restoreFileFromServer(activeFile);
+			return true;
+		},
+	});
+
+	registrar.addCommand({
+		id: "restore-all-files-from-server",
+		name: "Restore all files from server (overwrite differing local files)",
+		callback: () => {
+			void host.restoreAllFilesFromServer?.();
+		},
+	});
+
+	registrar.addCommand({
 		id: "export-diagnostics",
 		name: "Export sync diagnostics (safe)",
 		callback: () => {
@@ -243,7 +287,12 @@ export function registerCommands(
 		id: "review-file-history",
 		name: "Review file history",
 		callback: async () => {
-			await host.getSnapshotService()?.showRecoveryHistory();
+			const activeFile = host.getActiveFile?.();
+			if (activeFile) {
+				await host.getSnapshotService()?.showFileHistoryForPath(activeFile.path);
+			} else {
+				await host.getSnapshotService()?.showRecoveryHistory();
+			}
 		},
 	});
 

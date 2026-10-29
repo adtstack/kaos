@@ -32,10 +32,14 @@ export class HeadlessWorkspace extends HeadlessEventEmitter {
 	updateOptions(): void {}
 
 	on(name: string, callback: (...args: any[]) => void) {
+		// Menu events are pure UI registrations whose callbacks never fire on the
+		// headless host; registering them keeps plugin sync initialization alive.
 		if (
 			name === "layout-change" ||
 			name === "active-leaf-change" ||
-			name === "file-open"
+			name === "file-open" ||
+			name === "file-menu" ||
+			name === "editor-menu"
 		) {
 			return super.on(name, callback);
 		}
