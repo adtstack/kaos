@@ -56,6 +56,7 @@ import {
 } from "./sync/policy/vaultEventCommitPolicy";
 import { classifySyncPath } from "./paths/pathCategory";
 import { isCrdtDocumentPath } from "./paths/crdtDocumentPath";
+import { normalizeEditorText } from "./utils/editorTextNormalization";
 import type { TraceSink, ProductFlightPathEventInput } from "./observability/traceSink";
 import { NoopTraceSink } from "./observability/noopTraceSink";
 import {
@@ -156,8 +157,10 @@ import {
 } from "./snapshots/snapshotService";
 import {
 	getFileHistoryStorageStatus,
+	listFileHistoryManifests,
 	type RecoveryStorageAuditReport,
 } from "./sync/recoverySnapshotClient";
+import { createMarkdownCreationHistoryLoader } from "./sync/markdownCreationHistory";
 import type {
 	TraceEventDetails,
 	TraceHttpContext,
@@ -273,6 +276,11 @@ import {
 import { formatUnknown, yTextToString } from "./utils/format";
 import { randomBase64Url } from "./utils/base64url";
 import { ConfirmModal } from "./ui/ConfirmModal";
+import { RecoveryHoldResolutionModal } from "./ui/recoveryHoldResolutionModal";
+import { DivergenceResolutionModal } from "./ui/divergenceResolutionModal";
+import { getOpenFileViewsForPath } from "./utils/openFileViews";
+import { ServerFileClient } from "./sync/serverFileClient";
+import { ServerFileRepairService, readPendingServerRepairPaths } from "./runtime/serverFileRepairService";
 import { runSchemaMigrationToV2 } from "./migrations/schemaV2";
 import type { TelemetryRuntimeHandle } from "./telemetry/installTelemetryRuntime";
 import type { EngineControlPort, DiskIngestPort } from "./runtime/engineControlPort";
@@ -492,6 +500,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		BlobAuthorityScopeToken
 	>();
 	private blobAuthorityResetInProgress = false;
+	private pendingExplicitMarkdownSeed?: (path: string) => boolean;
 	/** Device-local v4 upgrade fence; paths remain blocked until explicit resolution. */
 	private legacyMissingBlobPaths = new Set<string>();
 	/** Corrupt authority is never auto-healed; only explicit nuclear reset unlatches it. */
@@ -539,6 +548,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 	private capabilityUpdateService: CapabilityUpdateService | null = null;
 	private commandsRegistered = false;
+	private vaultEventsRegistered = false;
 	private idbDegradedHandled = false;
 	private frontmatterGuardCoordinator!: FrontmatterGuardCoordinator;
 	private frontmatterQuarantineEntries: FrontmatterQuarantineEntry[] = [];
@@ -556,6 +566,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	 * provider sync event, even if connection generation did not change.
 	 */
 	private awaitingFirstProviderSyncAfterStartup = false;
+	private pendingServerRepairPaths = new Set<string>();
+	private serverRepairEventPaths = new Set<string>();
+	private serverRepairProjectionPaths = new Set<string>();
+	private serverFileRepairInFlight = false;
 	/** Uploads require both local Yjs persistence and a provider-synced room. */
 	private blobLocalPersistenceReady = false;
 	private blobProviderReady = false;
@@ -585,6 +599,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getRuntimeConfig: () => this.getRuntimeConfig(),
 			getVaultSync: () => this.vaultSync,
 			getDiskMirror: () => this.diskMirror,
+			trashRemovedMarkdownFile: async (file) => {
+				const path = normalizePath(file.path);
+				this.attentionMarkdownDeleteInFlight.set(path, file);
+				let succeeded = false;
+				try {
+					await this.app.fileManager.trashFile(file);
+					succeeded = true;
+				} finally {
+					const clear = () => {
+						if (this.attentionMarkdownDeleteInFlight.get(path) === file) this.attentionMarkdownDeleteInFlight.delete(path);
+					};
+					if (succeeded) setTimeout(clear, 1_000);
+					else clear();
+				}
+			},
 			getBlobSync: () => this.getBlobSync(),
 			getEditorBindings: () => this.editorBindings,
 			getDiskIndex: () => this.diskIndex,
@@ -661,6 +690,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private isMarkdownPathSyncable(path: string): boolean {
+		if ((this.pendingServerRepairPaths.has(path) || this.serverRepairEventPaths.has(path)) && !this.serverRepairProjectionPaths.has(path)) return false;
 		return isMarkdownSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
 	}
 
@@ -684,6 +714,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private isBlobPathSyncable(path: string): boolean {
+		if (this.pendingServerRepairPaths.has(path) || this.serverRepairEventPaths.has(path)) return false;
 		return isBlobSyncable(path, this.excludePatterns, this.getRuntimeConfig().vaultConfigDir);
 	}
 
@@ -3340,6 +3371,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		this.registerView(KAOS_DASHBOARD_VIEW_TYPE, (leaf) => new KaosDashboardView(leaf, {
 			collectData: () => this.collectDashboardData(),
 			getBaselineText: (contentHash) => this.getBaselineText(contentHash),
+			getMarkdownConflictReviewSides: async (rawPath) => {
+				const path = normalizePath(rawPath);
+				const vaultSync = this.vaultSync;
+				if (!vaultSync) return null;
+				const file = this.app.vault.getAbstractFileByPath(path);
+				const localText = file instanceof TFile ? await this.app.vault.read(file) : null;
+				const ytext = vaultSync.getTextForPath(path);
+				const remoteText = ytext ? yTextToString(ytext) : null;
+				if (this.vaultSync !== vaultSync || (localText === null && remoteText === null)) return null;
+				return { path, localText, remoteText, baseHash: this.diskIndex[path]?.contentHash ?? null };
+			},
 			getConflictMergeBaseHash: (artifactPath) => this.conflictMergeBases[artifactPath] ?? null,
 			clearConflictMergeBase: (artifactPath) => {
 				const previousHash = this.conflictMergeBases[artifactPath];
@@ -3356,13 +3398,31 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.connectionController?.reconnect("dashboard");
 					new Notice("Reconnecting...");
 				},
-				forceReconcile: () => {
+				forceReconcile: async () => {
 					const vaultSync = this.vaultSync;
 					if (!vaultSync) {
 						new Notice("Sync not initialized");
 						return;
 					}
-					void this.runReconciliation(vaultSync.getSafeReconcileMode());
+					const collisionPaths = vaultSync.getActivePathCollisionPaths();
+					let resolvedCollisions = 0;
+					for (const path of collisionPaths) {
+						let diskContent: string | null = null;
+						const file = this.app.vault.getAbstractFileByPath(path);
+						if (file instanceof TFile) {
+							diskContent = await this.app.vault.read(file).catch(() => null);
+						}
+						if (vaultSync.resolveActivePathCollision(path, diskContent)) {
+							resolvedCollisions++;
+							this.diskMirror?.clearPreservedUnresolved(path);
+							this.getBlobSync()?.clearPreservedUnresolved(path);
+						}
+					}
+					if (resolvedCollisions > 0) {
+						new Notice(`KAOS: Resolved ${resolvedCollisions} active path collision(s).`);
+						this.refreshStatusBar();
+					}
+					await this.runReconciliation(vaultSync.getSafeReconcileMode());
 				},
 				importUntracked: async () => {
 					if (!this.vaultSync) {
@@ -3400,6 +3460,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				},
 				auditAttention: () => this.auditAttention(),
 				retireVerifiedAttention: (targets) => this.retireVerifiedAttention(targets),
+				dismissAttentionEntry: (path) => this.dismissAttentionEntry(path),
+				adoptStructuralRename: (oldPath, newPath) =>
+					this.adoptStructuralRename(oldPath, newPath),
 				clearResolvedAttentionHistory: () => this.clearResolvedAttentionHistory(),
 				resolveRemoteDeleteAttention: (target, choice) =>
 					this.resolveRemoteDeleteAttention(target, choice),
@@ -3411,6 +3474,79 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.dismissStuckLocalMutationAttention(target),
 				resolveBlobConflict: (target, choice) =>
 					this.resolveBlobConflict(target, choice),
+				resolveTombstoneConflict: async (path, choice, target) => {
+					if (choice === "keep-local") {
+						await this.reconciliationController.resolveTombstoneConflictKeepLocal(path, target);
+					} else {
+						await this.reconciliationController.resolveTombstoneConflictAcceptDelete(path, target);
+					}
+					await this.persistPluginState();
+				},
+				resetLocalCache: () => this.resetLocalCache(),
+				nuclearReset: () => this.nuclearReset(),
+				forceReconcileUnhydrated: async () => {
+					const vaultSync = this.vaultSync;
+					if (!vaultSync) {
+						new Notice("Sync not initialized");
+						return;
+					}
+					if (vaultSync.localReady) {
+						new Notice("Local cache is already loaded — running a normal authoritative reconcile.");
+						await this.runReconciliation("authoritative");
+						return;
+					}
+					new Notice(
+						"KAOS: forcing an authoritative reconcile while the local cache is not loaded. " +
+						"If the server is behind this device, notes may visibly revert to older server state.",
+						10000,
+					);
+					await this.runReconciliation("authoritative", { forceUnhydrated: true });
+				},
+				prunePhantomRemotePaths: async () => {
+					await this.prunePhantomRemotePaths();
+				},
+				resolveSettledCollisionMarkers: async () => {
+					await this.resolveSettledCollisionMarkers();
+				},
+				clearLocalServerReceiptState: async () => {
+					if (!this.vaultSync) {
+						new Notice("Sync not initialized");
+						return;
+					}
+					const result = await this.clearLocalServerReceiptState();
+					new Notice(
+						result === "cleared_persistent"
+							? "Local server-receipt state cleared."
+							: result === "cleared_memory_only"
+								? "Local server-receipt state cleared for this session. Persistent receipt store is unavailable."
+								: "Failed to clear local server-receipt state. Check console.",
+						result === "cleared_persistent" ? 4000 : 7000,
+					);
+				},
+				runSyncCheck: async () => {
+					await this.runSyncCheck();
+				},
+				openRecoveryHoldResolution: () => {
+					this.openRecoveryHoldResolution();
+				},
+				repairFileHistoryStorage: async () => {
+					await this.snapshotService?.repairFileHistoryStorage();
+				},
+				cleanupFileHistory: async () => {
+					await this.snapshotService?.cleanupFileHistory();
+				},
+				pruneSnapshots: async () => {
+					await this.snapshotService?.pruneSnapshots();
+				},
+				copyDebugInfo: () => {
+					const info = (this.lab?.diagnosticsService as import("./telemetry/diagnostics/diagnosticsService").DiagnosticsService | undefined)?.buildDebugInfo() ?? "Sync not initialized";
+					navigator.clipboard.writeText(info).then(
+						() => new Notice("Debug info copied to clipboard."),
+						() => new Notice("Failed to copy to clipboard. Check console.", 5000),
+					);
+				},
+				restoreAllFilesFromServer: () => this.restoreAllFilesFromServer(),
+				openDivergenceResolutionForPath: (path) => this.openDivergenceResolutionModal(path),
 			},
 		}));
 		this.addRibbonIcon("layout-dashboard", "Open dashboard", () => {
@@ -3446,6 +3582,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.log(`Local attachment authority ID unavailable: ${formatUnknown(err)}`);
 		}
 		await this.loadSettings();
+		try {
+			this.pendingServerRepairPaths = new Set(await readPendingServerRepairPaths(this.app, this.settings, this.blobIntentLocalDeviceId));
+		} catch (error) {
+			new Notice(`KAOS: sync startup paused because a server repair backup could not be verified. ${formatUnknown(error)}`, 12000);
+			throw error;
+		}
+		if (this.pendingServerRepairPaths.size > 0) {
+			new Notice("KAOS: sync is paused for interrupted server file repairs. Run Restore from server again for those files; safety backups are in the plugin's restore-backups folder.", 10000);
+		}
 		this.applyRuntimeSettings("load-settings");
 		await this.refreshExcludeFile("startup", false);
 			const isFrontmatterGuardEnabled = () => this.settings.frontmatterGuardEnabled;
@@ -3475,6 +3620,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			getVaultSync: () => this.vaultSync,
 			getDiskMirror: () => this.diskMirror,
 			getBlobSync: () => this.getBlobSync(),
+			getEditorBindings: () => this.editorBindings,
+			removeDiskIndexEntry: async (path) => {
+				const next = { ...this.diskIndex };
+				delete next[path];
+				this.diskIndex = next;
+				await this.saveDiskIndex();
+			},
+			trace: (source, msg, details) => this.trace(source, msg, details),
+			recordFlightEvent: (event) => this.recordFlightEvent(event as import("./telemetry/debug/flightEvents").FlightEventInput),
 			getServerSupportsSnapshots: () => this.serverSupportsSnapshots,
 			log: (message) => this.log(message),
 			onEditorsNeedReconcile: (reason) => this.editorWorkspace?.onReconciled(reason),
@@ -3578,6 +3732,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
 					lastReconciledGeneration: this.reconciliationController.getState().lastReconciledGeneration,
 					untrackedFileCount: this.reconciliationController.untrackedFileCount,
+					automaticRecoveryHeldCount: this.reconciliationController.getState().automaticRecoveryHeldCount,
+					automaticRecoveryMode: this.settings.automaticRecoveryMode,
 					unresolvedStructuralChangeCount: this.reconciliationController.getState().unresolvedStructuralChangeCount,
 					unresolvedStructuralChangeSample: this.reconciliationController.getState().unresolvedStructuralChangeSample,
 					openFileCount: this.editorWorkspace?.openFileCount ?? 0,
@@ -3655,6 +3811,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				this.persistPreservedUnresolvedStateDurably(),
 			hasPendingBlobIntentForPath: (path) =>
 				this.pendingBlobIntents.hasPath(path, this.getBlobIntentScope()),
+			isFileRepairPaused: (path) => this.pendingServerRepairPaths.has(path) || this.serverRepairEventPaths.has(path),
 			replayPendingBlobIntents: (reason) => this.replayPendingBlobIntents(reason),
 			trace: (source, msg, details) => this.trace(source, msg, details),
 			scheduleTraceStateSnapshot: (reason) => this.scheduleTraceStateSnapshot(reason),
@@ -3779,7 +3936,17 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 
 			// 1. Create VaultSync (Y.Doc + IndexedDB + provider in parallel)
+			this.pendingServerRepairPaths = new Set(await readPendingServerRepairPaths(this.app, this.settings, this.blobIntentLocalDeviceId));
+			if (!this.isCurrentBlobAuthority(initPersistenceAuthority)) return;
+			const canSeedExplicitly = this.pendingExplicitMarkdownSeed;
+			this.pendingExplicitMarkdownSeed = undefined;
 			this.vaultSync = new VaultSync(this.settings, {
+				canSeedExplicitly,
+				loadMarkdownCreationHistory: ((settings) =>
+					createMarkdownCreationHistoryLoader(cursor =>
+						listFileHistoryManifests(settings, this.getTraceHttpContext(), 200, cursor),
+					))({ ...this.settings }),
+				isConnectionAllowed: () => this.pendingServerRepairPaths.size === 0 && !this.serverFileRepairInFlight,
 				traceContext: this.getTraceHttpContext(),
 				trace: (source, msg, details) => this.trace(source, msg, details),
 				onFlightEvent: (event) => this.recordFlightEvent(event as import("./telemetry/debug/flightEvents").FlightEventInput),
@@ -3902,7 +4069,15 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					this.reconciliationController.noteInterceptedExternalDiskMutation(candidate);
 				},
 				() => true,
+				{
+					isEnabled: () => this.lab?.contentTraceObserver.isEnabled() ?? false,
+					record: (event, samples) => this.lab?.contentTraceObserver.record(event, samples),
+				},
+				() => this.refreshStatusBar(),
 			);
+			this.editorBindings.onResolveDivergenceRequested = (path) => {
+				this.openDivergenceResolutionModal(path);
+			};
 
 			// 3. Global CM6 extension
 			this.registerEditorExtension(
@@ -3969,6 +4144,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			});
 			this.diskMirror.startMapObservers();
 			this.diskMirror.setFlightEventHandler((event) => this.recordFlightPathEvent(event as import("./telemetry/debug/flightEvents").FlightPathEventInput));
+			this.diskMirror.setContentTraceObserver({
+				isEnabled: () => this.lab?.contentTraceObserver.isEnabled() ?? false,
+				record: (event, samples) => this.lab?.contentTraceObserver.record(event, samples),
+			});
 			// Track SHA-256 baseline hash after every successful flushWrite.
 			// Used by decideClosedFileConflict on startup/re-enable to determine
 			// which side actually changed from the last known stable state.
@@ -4157,6 +4336,10 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					nuclearReset: () => this.nuclearReset(),
 					prunePhantomRemotePaths: () => this.prunePhantomRemotePaths(),
 					resolveSettledCollisionMarkers: () => this.resolveSettledCollisionMarkers(),
+					openRecoveryHoldResolution: () => this.openRecoveryHoldResolution(),
+					openDivergenceResolutionForPath: (path) => this.openDivergenceResolutionModal(path),
+					restoreFileFromServer: (file) => this.restoreFileFromServerInteractive(file),
+					restoreAllFilesFromServer: () => this.restoreAllFilesFromServer(),
 				});
 				// Lab/QA commands are registered separately by the lab runtime.
 				this.lab?.registerCommands(this);
@@ -4456,6 +4639,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private registerVaultEvents(): void {
+		if (this.vaultEventsRegistered) return;
+		this.vaultEventsRegistered = true;
 		// Layout change: clean up observers for closed files
 		this.registerEvent(
 			this.app.workspace.on("layout-change", () => {
@@ -4495,6 +4680,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 								void this.snapshotService?.showFileHistoryForPath(file.path);
 							});
 					});
+					menu.addItem((item) => {
+						item
+							.setTitle("KAOS: Restore from server")
+							.setIcon("refresh-cw")
+							.onClick(() => {
+								void this.restoreFileFromServerInteractive(file);
+							});
+					});
 				}
 			}),
 		);
@@ -4511,12 +4704,21 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 								void this.snapshotService?.showFileHistoryForPath(file.path);
 							});
 					});
+					menu.addItem((item) => {
+						item
+							.setTitle("KAOS: Restore from server")
+							.setIcon("refresh-cw")
+							.onClick(() => {
+								void this.restoreFileFromServerInteractive(file);
+							});
+					});
 				}
 			}),
 		);
 
 		this.registerEvent(
 			this.app.vault.on("modify", (file) => {
+				if (this.serverRepairEventPaths.has(file.path) || this.pendingServerRepairPaths.has(file.path)) return;
 				if (file instanceof TFile && isKaosExcludeFilePath(file.path)) {
 					void this.refreshExcludeFile("vault-modify");
 				}
@@ -4598,6 +4800,20 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 									file,
 									diskMutationRevision,
 								);
+								this.lab?.contentTraceObserver.record({
+									kind: "disk.modify.classified", priority: "important", severity: "info",
+									scope: "file", source: "vaultEvents", layer: "disk", path: diskMutationRevision.path,
+									opId, data: {
+										classification: probe.kind, sequence, eventObservedAt: observedAt,
+										runtimeId: editorBindingsAtEvent.observationRuntimeId,
+										mtime: diskMutationRevision.mtime, size: diskMutationRevision.size,
+										runtimeCurrent: this.diskMirror === dm && this.editorBindings === editorBindingsAtEvent,
+									},
+								}, {
+									disk: probe.kind === "stale-or-unreadable" ? null : probe.content,
+									diskEditorNormalized: probe.kind === "stale-or-unreadable" ? null
+										: normalizeEditorText(probe.content),
+								});
 								if (probe.kind === "self-write") return;
 								if (probe.kind !== "stale-or-unreadable") {
 									content = probe.content;
@@ -4652,6 +4868,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		// Blob renames still go through the batch (blob exclusion is separate).
 		this.registerEvent(
 			this.app.vault.on("rename", (file, oldPath) => {
+				if (this.serverRepairEventPaths.has(oldPath) || this.pendingServerRepairPaths.has(oldPath)
+					|| this.serverRepairEventPaths.has(file.path) || this.pendingServerRepairPaths.has(file.path)) return;
 				if (!(file instanceof TFile)) return;
 				if (
 					isKaosExcludeFilePath(oldPath)
@@ -4850,6 +5068,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("delete", (file) => {
+				if (this.serverRepairEventPaths.has(file.path) || this.pendingServerRepairPaths.has(file.path)) return;
 				if (file instanceof TFile && isKaosExcludeFilePath(file.path)) {
 					void this.refreshExcludeFile("vault-delete");
 				}
@@ -5023,6 +5242,7 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.vault.on("create", (file) => {
+				if (this.serverRepairEventPaths.has(file.path) || this.pendingServerRepairPaths.has(file.path)) return;
 				if (file instanceof TFile && isKaosExcludeFilePath(file.path)) {
 					void this.refreshExcludeFile("vault-create");
 				}
@@ -5102,6 +5322,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			this.statusInterval = null;
 		}
 		this.stopSnapshotMaintenanceTimers();
+		this.serverRepairEventPaths.clear();
+		this.pendingServerRepairPaths.clear();
+		this.serverRepairProjectionPaths.clear();
 		this.reconciliationController.reset();
 		this.connectionController?.stop();
 
@@ -5272,12 +5495,179 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				}
 
 				this.log("Nuclear reset: reinitializing (will re-seed from disk)");
+				// The confirmed reset explicitly imports this exact disk snapshot once.
+				// Later replacements/edits must pass ordinary history admission.
+				const seedFiles = new Map(this.app.vault.getFiles()
+					.filter(file => this.isMarkdownPathSyncable(file.path))
+					.map(file => [file.path, { file, ctime: file.stat.ctime, mtime: file.stat.mtime, size: file.stat.size }]));
+				this.pendingExplicitMarkdownSeed = path => {
+					const expected = seedFiles.get(path);
+					seedFiles.delete(path);
+					return !!expected && this.app.vault.getAbstractFileByPath(path) === expected.file
+						&& expected.file.stat.ctime === expected.ctime && expected.file.stat.mtime === expected.mtime
+						&& expected.file.stat.size === expected.size;
+				};
 				await this.initSync();
 				new Notice(
 					`KAOS: nuclear reset complete. ` +
 					`Re-seeded ${this.vaultSync?.getActiveMarkdownPaths().length ?? 0} files from disk.`,
 				);
 			},
+		).open();
+	}
+
+	private async ensureDirectoryExists(directory: string): Promise<void> {
+		const adapter = this.app.vault.adapter;
+		const parts = normalizePath(directory).split("/").filter(Boolean);
+		let current = "";
+		for (const part of parts) {
+			current = current ? `${current}/${part}` : part;
+			if (!await adapter.exists(current)) {
+				try {
+					await adapter.mkdir(current);
+				} catch {
+					// ignore if directory was created concurrently
+				}
+			}
+		}
+	}
+
+	private async restoreAllFilesFromServer(): Promise<void> {
+		const vaultSync = this.vaultSync;
+		if (!vaultSync) {
+			new Notice("KAOS: Sync is not initialized.");
+			return;
+		}
+
+		if (!vaultSync.connected) {
+			new Notice("KAOS: Not connected to sync server. Reconnect first.", 6000);
+			return;
+		}
+
+		new Notice("KAOS: Scanning server and local files for differences...", 4000);
+
+		const activeMarkdownPaths = vaultSync.getActiveMarkdownPaths();
+		const config = this.getRuntimeConfig();
+		const syncablePaths = activeMarkdownPaths.filter((path) =>
+			isMarkdownSyncable(path, this.excludePatterns, config.vaultConfigDir),
+		);
+
+		const toRestore: { path: string; file: TFile; diskContent: string; crdtContent: string }[] = [];
+		const toCreate: { path: string; crdtContent: string }[] = [];
+
+		for (const path of syncablePaths) {
+			const ytext = vaultSync.getTextForPath(path);
+			if (!ytext) continue;
+			const crdtContent = yTextToString(ytext);
+			if (crdtContent === null) continue;
+
+			const abstractFile = this.app.vault.getAbstractFileByPath(path);
+			if (!abstractFile) {
+				toCreate.push({ path, crdtContent });
+			} else if (abstractFile instanceof TFile) {
+				const diskContent = await this.app.vault.read(abstractFile).catch(() => null);
+				if (diskContent !== null && diskContent !== crdtContent) {
+					toRestore.push({ path, file: abstractFile, diskContent, crdtContent });
+				}
+			}
+		}
+
+		const totalCount = toRestore.length + toCreate.length;
+		if (totalCount === 0) {
+			new Notice("KAOS: All local files already match the server state. Nothing to restore.", 6000);
+			return;
+		}
+
+		const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+		const backupDir = normalizePath(`${this.app.vault.configDir}/plugins/kaos/restore-backups/${timestamp}`);
+
+		const sampleDiff = toRestore.slice(0, 5).map((f) => `- ${f.path}`).join("\n");
+		const moreDiff = toRestore.length > 5 ? `\n...and ${toRestore.length - 5} more` : "";
+		const sampleMissing = toCreate.slice(0, 5).map((f) => `- ${f.path}`).join("\n");
+		const moreMissing = toCreate.length > 5 ? `\n...and ${toCreate.length - 5} more` : "";
+
+		let details = "";
+		if (toRestore.length > 0) {
+			details += `Differing file(s) to overwrite (${toRestore.length}):\n${sampleDiff}${moreDiff}\n\n`;
+		}
+		if (toCreate.length > 0) {
+			details += `Missing file(s) to recreate (${toCreate.length}):\n${sampleMissing}${moreMissing}\n\n`;
+		}
+
+		new ConfirmModal(
+			this.app,
+			"Restore all files from server",
+			`Found ${totalCount} file(s) out of sync with the server.\n\n` +
+			details +
+			`Safety backup: Existing local files will be backed up to:\n${backupDir}\n\n` +
+			`Local-only files not on the server will NOT be deleted. Overwrite local files with server version?`,
+			async () => {
+				new Notice(`KAOS: Restoring ${totalCount} file(s) from server...`);
+				this.log(`Restore all files from server: starting for ${totalCount} files`);
+
+				// 1. Back up existing differing files
+				for (const item of toRestore) {
+					try {
+						const backupPath = `${backupDir}/${item.path}`;
+						const parent = backupPath.substring(0, backupPath.lastIndexOf("/"));
+						if (parent) {
+							await this.ensureDirectoryExists(parent);
+						}
+						await this.app.vault.adapter.write(backupPath, item.diskContent);
+					} catch (err) {
+						console.error(`[kaos] Failed to backup "${item.path}":`, err);
+					}
+				}
+
+				// 2. Restore differing files through reconciliationController
+				let restored = 0;
+				for (const item of toRestore) {
+					try {
+						const result = await this.reconciliationController.restoreFileFromServerState(item.path);
+						if (result.ok) {
+							restored++;
+						} else {
+							console.warn(`[kaos] restoreFileFromServerState returned not ok for "${item.path}":`, result.reason);
+						}
+					} catch (err) {
+						console.error(`[kaos] Failed to restore file "${item.path}":`, err);
+					}
+				}
+
+				// 3. Create missing files
+				for (const item of toCreate) {
+					try {
+						const parent = item.path.substring(0, item.path.lastIndexOf("/"));
+						if (parent) {
+							await this.ensureDirectoryExists(parent);
+						}
+						await this.app.vault.create(item.path, item.crdtContent);
+						const hash = await this.sha256Hex(item.crdtContent);
+						this.diskIndex[item.path] = {
+							contentHash: hash,
+							mtime: Date.now(),
+							size: item.crdtContent.length,
+						};
+						restored++;
+					} catch (err) {
+						console.error(`[kaos] Failed to create missing file "${item.path}":`, err);
+					}
+				}
+				await this.saveDiskIndex();
+
+				// 4. Run authoritative reconciliation to align all states
+				const mode = vaultSync.getSafeReconcileMode();
+				if (mode) {
+					await this.runReconciliation(mode);
+				}
+
+				this.log(`Restore all files from server: completed, ${restored}/${totalCount} files restored`);
+				new Notice(`KAOS: Successfully restored ${restored} file(s) from server state. (Backups in ${backupDir})`, 10000);
+			},
+			`Restore ${totalCount} file(s)`,
+			"Cancel",
+			() => {},
+			"mod-warning",
 		).open();
 	}
 
@@ -5387,6 +5777,13 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			}
 		}
 
+		const crdtCollisionPaths = this.vaultSync?.getActivePathCollisionPaths() ?? [];
+		for (const path of crdtCollisionPaths) {
+			if (!resolvedPaths.includes(path)) {
+				resolvedPaths.push(path);
+			}
+		}
+
 		if (resolvedPaths.length === 0) {
 			new Notice("KAOS: No settled move or collision markers found.");
 			return;
@@ -5406,6 +5803,12 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					(e) => !resolvedSet.has(normalizePath(e.path)),
 				);
 				for (const path of resolvedPaths) {
+					let diskContent: string | null = null;
+					const file = this.app.vault.getAbstractFileByPath(path);
+					if (file instanceof TFile) {
+						diskContent = await this.app.vault.read(file).catch(() => null);
+					}
+					this.vaultSync?.resolveActivePathCollision(path, diskContent);
 					this.diskMirror?.clearPreservedUnresolved(path);
 					this.getBlobSync()?.clearPreservedUnresolved(path);
 				}
@@ -6184,16 +6587,23 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 					// could batch-retire live fences and unblock winner-pick merges
 					// that discard the losing side.
 					if (target.kind === "markdown") {
-						const settlement = await this.verifyMarkdownRetirementSettlement(normalizedPath);
-						if (!settlement.ok) {
-							failedCount++;
-							failedPaths.push(normalizedPath);
-							this.trace("attention", "attention-retire-rejected", {
-								path: normalizedPath,
-								reason: "settlement-not-proven",
-								proof: settlement.proof,
-							});
-							return;
+						const pairPath = target.pairPath || current.pairPath;
+						const isVerifiedMovePair = target.reason === "path-collision"
+							&& typeof pairPath === "string"
+							&& (localFile.kind === "file"
+								|| this.getDashboardLocalFileIdentity(normalizePath(pairPath)).kind === "file");
+						if (!isVerifiedMovePair) {
+							const settlement = await this.verifyMarkdownRetirementSettlement(normalizedPath);
+							if (!settlement.ok) {
+								failedCount++;
+								failedPaths.push(normalizedPath);
+								this.trace("attention", "attention-retire-rejected", {
+									path: normalizedPath,
+									reason: "settlement-not-proven",
+									proof: settlement.proof,
+								});
+								return;
+							}
 						}
 					}
 
@@ -6249,6 +6659,176 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			retiredPaths,
 			failedPaths,
 		};
+	}
+
+	private async dismissAttentionEntry(path: string): Promise<void> {
+		const normalized = normalizePath(path);
+		const lockKey = `attention-dismiss:${normalized}`;
+
+		await withAttentionResolutionLock(
+			this.attentionResolutionInFlight,
+			lockKey,
+			normalized,
+			async () => {
+				const found = this.preservedUnresolvedEntries.find(
+					(entry) => normalizePath(entry.path) === normalized,
+				);
+				const before = this.preservedUnresolvedEntries.length;
+				this.preservedUnresolvedEntries = this.preservedUnresolvedEntries.filter(
+					(entry) => normalizePath(entry.path) !== normalized,
+				);
+				this.diskMirror?.clearPreservedUnresolved(normalized);
+				this.getBlobSync()?.clearPreservedUnresolved(normalized);
+
+				const quarantineFound = this.frontmatterQuarantineEntries.some(
+					(entry) => normalizePath(entry.path) === normalized,
+				);
+				if (quarantineFound) {
+					await this.frontmatterGuardCoordinator.clearFrontmatterQuarantine(
+						normalized,
+						"operator-dismissed",
+					);
+				}
+
+				this.trace("attention", "attention-marker-operator-dismissed", {
+					path: normalized,
+					removedEntriesCount: before - this.preservedUnresolvedEntries.length,
+					removedQuarantine: quarantineFound,
+				});
+
+				this.recordResolvedAttention({
+					id: `operator-dismiss:${normalized}:${Date.now()}`,
+					path: normalized,
+					kind: found?.kind ?? (quarantineFound ? "markdown" : "blob"),
+					reason: found?.reason ?? "unknown",
+					resolution: "operator-dismissed",
+					resolvedAt: Date.now(),
+					summary: quarantineFound
+						? "Operator acknowledged and dismissed frontmatter quarantine marker manually."
+						: "Operator acknowledged and dismissed attention marker manually.",
+				});
+
+				this.refreshStatusBar();
+				await this.persistPreservedUnresolvedStateDurably();
+			},
+		);
+	}
+
+	public async adoptStructuralRename(oldPath: string, newPath: string): Promise<void> {
+		const normOld = normalizePath(oldPath);
+		const normNew = normalizePath(newPath);
+		const lockKeyOld = `markdown:${normOld}`;
+		const lockKeyNew = `markdown:${normNew}`;
+
+		await withAttentionResolutionLock(
+			this.attentionResolutionInFlight,
+			lockKeyOld,
+			normOld,
+			async () => {
+				await withAttentionResolutionLock(
+					this.attentionResolutionInFlight,
+					lockKeyNew,
+					normNew,
+					async () => {
+						if (!this.vaultSync) {
+							throw new Error("Vault sync engine is not available.");
+						}
+
+						// 1. CAS Verification
+						// 1a. Old path must still be tracked in CRDT
+						const oldFileId = this.vaultSync.getFileId(normOld);
+						const oldYText = this.vaultSync.getTextForPath(normOld);
+						if (!oldFileId || !oldYText) {
+							throw new Error(`Cannot adopt rename: "${normOld}" is no longer tracked in CRDT.`);
+						}
+
+						// 1b. Old path must be absent from local disk
+						const oldDiskFile = this.app.vault.getAbstractFileByPath(normOld);
+						if (oldDiskFile) {
+							throw new Error(`Cannot adopt rename: "${normOld}" still exists on local disk.`);
+						}
+
+						// 1c. New path must exist on local disk as a file
+						const newDiskFile = this.app.vault.getAbstractFileByPath(normNew);
+						if (!(newDiskFile instanceof TFile)) {
+							throw new Error(`Cannot adopt rename: "${normNew}" does not exist on local disk.`);
+						}
+
+						// 1d. New path must NOT be tracked in CRDT with a different file identity
+						const newFileId = this.vaultSync.getFileId(normNew);
+						if (newFileId && newFileId !== oldFileId) {
+							throw new Error(`Cannot adopt rename: "${normNew}" is already tracked in CRDT with a different file identity.`);
+						}
+
+						// 1e. Content hash must match between old CRDT text and new disk file
+						const oldCrdtContent = yTextToString(oldYText) ?? "";
+						const newDiskContent = await this.app.vault.read(newDiskFile);
+						const crdtHash = await contentBaselineHash(oldCrdtContent);
+						const diskHash = await contentBaselineHash(newDiskContent);
+						if (crdtHash !== diskHash) {
+							throw new Error("Cannot adopt rename: content diverged between CRDT baseline and disk copy.");
+						}
+
+						// 1f. Verify matching unresolved structural change in reconciliation controller
+						const matchingChange = this.reconciliationController.findUnresolvedStructuralChange(
+							(change) =>
+								change.oldPaths.some((p) => normalizePath(p) === normOld) &&
+								change.newPaths.some((p) => normalizePath(p) === normNew),
+						);
+						if (!matchingChange) {
+							throw new Error("Cannot adopt rename: structural change is no longer pending in reconciliation controller.");
+						}
+
+						// 2. Commit Rename in CRDT
+						const renameBatch = new Map([[normOld, normNew]]);
+						this.vaultSync.applyReconcileRenameBatch(renameBatch);
+
+						// 3. Clear preserved-unresolved markers and write fences for BOTH paths
+						this.diskMirror?.clearPreservedUnresolved(normOld);
+						this.diskMirror?.clearPreservedUnresolved(normNew);
+						this.getBlobSync()?.clearPreservedUnresolved(normOld);
+						this.getBlobSync()?.clearPreservedUnresolved(normNew);
+						this.vaultSync.resolveActivePathCollision(normOld);
+						this.vaultSync.resolveActivePathCollision(normNew, newDiskContent);
+
+						// 4. Remove from reconciliationController's unresolved structural changes and recovery holds
+						this.reconciliationController.removeUnresolvedStructuralChange(normOld, normNew);
+						this.reconciliationController.clearAutomaticRecoveryHoldsForPath(normOld);
+						this.reconciliationController.clearAutomaticRecoveryHoldsForPath(normNew);
+
+						// 5. Remove from preservedUnresolvedEntries
+						this.preservedUnresolvedEntries = this.preservedUnresolvedEntries.filter(
+							(e) => {
+								const norm = normalizePath(e.path);
+								return norm !== normOld && norm !== normNew;
+							},
+						);
+
+						// 6. Record history
+						this.recordResolvedAttention({
+							id: `adopt-structural-rename:${normOld}:${normNew}:${Date.now()}`,
+							path: normNew,
+							pairPath: normOld,
+							kind: "markdown",
+							reason: "path-collision",
+							resolution: "operator-dismissed",
+							resolvedAt: Date.now(),
+							summary: `Operator adopted structural rename: "${normOld}" -> "${normNew}".`,
+						});
+
+						// 7. Persist durably and update status
+						this.refreshStatusBar();
+						await this.persistPreservedUnresolvedStateDurably();
+
+						this.trace("attention", "structural-rename-adopted", {
+							oldPath: normOld,
+							newPath: normNew,
+							fileId: oldFileId,
+						});
+					},
+				);
+			},
+		);
 	}
 
 	public recordResolvedAttention(item: ResolvedAttentionItem): void {
@@ -6768,10 +7348,14 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		}
 	}
 
+	public reconnect(reason = "headless"): void {
+		this.connectionController?.reconnect(reason);
+	}
+
 	public async resolvePreservedUnresolvedEntry(
 		path: string,
 		action: "keep-local" | "accept-delete",
-	): Promise<void> {
+	): Promise<DashboardRemoteDeleteResolutionResult> {
 		const normalized = normalizePath(path);
 		const current = this.collectPreservedUnresolvedEntries().find(
 			(e) => normalizePath(e.path) === normalized,
@@ -6779,33 +7363,75 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		if (!current) {
 			throw new Error(`Preserved unresolved entry not found: ${path}`);
 		}
-		if (action === "accept-delete") {
-			const file = this.app.vault.getAbstractFileByPath(normalized);
-			if (file instanceof TFile) {
-				await this.app.fileManager.trashFile(file).catch(() => undefined);
-			}
+		if (!isRemoteDeletePreservedUnresolvedEntry(current)) {
+			throw new Error(`This Attention entry requires a different resolution: ${path} (${current.reason}). Review it in the dashboard.`);
 		}
-		if (current.kind === "markdown") {
-			this.diskMirror?.resolvePreservedUnresolvedEpisode(normalized, getPreservedUnresolvedEpisodeId(current));
-		} else {
-			this.getBlobSync()?.resolvePreservedUnresolvedEpisode(normalized, getPreservedUnresolvedEpisodeId(current));
-		}
-		this.preservedUnresolvedEntries = this.preservedUnresolvedEntries.filter(
-			(e) => !(e.kind === current.kind && normalizePath(e.path) === normalized),
+		if (!this.vaultSync) throw new Error("Sync is not initialized.");
+		const episodeId = getPreservedUnresolvedEpisodeId(current);
+		const target: DashboardRemoteDeleteResolutionTarget = {
+			kind: "remote-delete",
+			path: normalized,
+			fileKind: current.kind,
+			reason: current.reason,
+			episodeId,
+			remoteDeleteFingerprint: current.kind === "markdown"
+				? this.vaultSync.getAuthoritativeMarkdownDeleteSnapshot(normalized)?.fingerprint ?? null
+				: this.vaultSync.getAuthoritativeBlobDeleteSnapshot(normalized)?.fingerprint ?? null,
+			localFile: this.getDashboardLocalFileIdentity(normalized),
+		};
+		// CLI and dashboard share the same leases, identity fences, trash-event
+		// suppression, and engine-specific publication/queue settlement.
+		const result = await this.resolveRemoteDeleteAttention(
+			target,
+			action === "accept-delete" ? "accept-remote-delete" : "keep-local",
 		);
+		if (result.status === "pending") return result;
+		// Never record completion while an attachment is still being published.
 		this.recordResolvedAttention({
-			id: getPreservedUnresolvedEpisodeId(current),
+			id: episodeId,
 			path: normalized,
 			kind: current.kind,
 			reason: current.reason,
-			resolution: action === "accept-delete" ? "accept-delete" : "keep-local",
+			resolution: action,
 			pairPath: null,
 			resolvedAt: Date.now(),
 			summary: action === "accept-delete"
 				? "Accepted remote delete and moved local copy to trash."
-				: "Kept local file copy.",
+				: "Published the local file copy.",
 		});
-		await this.saveSettings();
+		await this.persistPluginState();
+		return result;
+	}
+
+	/** IPC surface for `kaos fix`: local disk/editor text vs synced CRDT text of one path. */
+	public async loadDivergenceVersionsForPath(
+		path: string,
+	): Promise<{ local: string | null; remote: string | null; base?: string | null }> {
+		return this.loadRecoveryHoldVersions(normalizePath(path));
+	}
+
+	/** IPC surface for `kaos fix`: apply an explicit divergence decision on this device. */
+	public async resolveAttentionDivergence(
+		path: string,
+		choice: "server" | "local" | "copy",
+	): Promise<{ ok: boolean; reason?: string; conflictPath?: string }> {
+		const normalized = normalizePath(path);
+		if (!this.vaultSync) return { ok: false, reason: "sync-not-ready" };
+		if (choice === "server") {
+			return this.reconciliationController.restoreFileFromServerState(normalized);
+		}
+		const file = this.app.vault.getAbstractFileByPath(normalized);
+		if (!(file instanceof TFile)) return { ok: false, reason: "file-missing" };
+		let localContent: string;
+		try {
+			localContent = await this.app.vault.read(file);
+		} catch (err) {
+			return { ok: false, reason: `disk-read-failed: ${formatUnknown(err)}` };
+		}
+		if (choice === "local") {
+			return this.reconciliationController.resolveDivergenceKeepLocal(normalized, localContent);
+		}
+		return this.reconciliationController.resolveDivergenceKeepBoth(normalized, localContent);
 	}
 
 	private updateStatusBar(_coarseState: SyncStatus): void {
@@ -6826,17 +7452,22 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			candidatePersistenceHealthy: vaultSync.candidatePersistenceHealthy,
 			serverReceiptStartupValidation: vaultSync.serverReceiptStartupValidation,
 		} : null;
+		const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+		const activePath = activeView?.file?.path ?? null;
+		const unsyncedSummary = this.editorBindings?.getUnsyncedEditsSummary(activePath) ?? null;
+
 		if (this.providerExcludeFileLastError) {
 			renderSyncStatus(
 				this.statusBarEl,
 				"error",
 				transferStatus,
 				attentionCount,
+				unsyncedSummary,
 			);
 		} else if (connectionState) {
-			renderConnectionState(this.statusBarEl, connectionState, transferStatus, serverReceipt, attentionCount);
+			renderConnectionState(this.statusBarEl, connectionState, transferStatus, serverReceipt, attentionCount, unsyncedSummary);
 		} else {
-			renderSyncStatus(this.statusBarEl, _coarseState, transferStatus, attentionCount);
+			renderSyncStatus(this.statusBarEl, _coarseState, transferStatus, attentionCount, unsyncedSummary);
 		}
 	}
 
@@ -6844,7 +7475,9 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 		const entries = this.collectPreservedUnresolvedEntries()
 			.sort((a, b) => b.lastSeenAt - a.lastSeenAt);
 		const structural = this.reconciliationController.getState().unresolvedStructuralChangeSample;
-		if (entries.length === 0 && structural.length === 0) return "No files currently need attention.";
+		const recoveryHolds = this.reconciliationController.getAutomaticRecoveryHolds();
+		const tombstoneConflicts = this.reconciliationController.getState().tombstonedDiskConflicts ?? [];
+		if (entries.length === 0 && structural.length === 0 && recoveryHolds.length === 0 && tombstoneConflicts.length === 0) return "No files currently need attention.";
 		const preservedText = entries.map((entry) => [
 			entry.path,
 			`  kind: ${entry.kind}`,
@@ -6864,7 +7497,166 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 			`  content hash: ${entry.contentHashPrefix}`,
 			"  suggested action: inspect the old/new paths, then manually rename or edit/save the intended file.",
 		].join("\n"));
-		return [...preservedText, ...structuralText].join("\n\n");
+		const recoveryText = recoveryHolds.map(entry => [entry.path,
+			"  automatic recovery: paused", `  reason: ${entry.detail}`,
+			"  suggested action: run \"Resolve paused sync recovery\" from the command palette to compare versions and choose one.",
+		].join("\n"));
+		const tombstoneText = tombstoneConflicts.map(entry => [
+			entry.path,
+			"  kind: tombstone-disk-conflict",
+			"  reason: local file exists on disk but CRDT records a deletion",
+			entry.deletedAt ? `  deleted at: ${new Date(entry.deletedAt).toLocaleString()}` : "",
+			entry.ctime ? `  ctime: ${new Date(entry.ctime).toLocaleString()}` : "",
+			entry.hasOpenViews ? "  open views: yes" : "",
+			"  suggested action: open the dashboard, inspect the file, then choose Keep local file or Accept delete.",
+		].filter(Boolean).join("\n"));
+		return [...preservedText, ...structuralText, ...recoveryText, ...tombstoneText].join("\n\n");
+	}
+
+	private readRecoveryHoldRemoteText(path: string): string | null {
+		const text = this.vaultSync?.getTextForPath(path);
+		if (!text) return null;
+		try {
+			return text.toJSON();
+		} catch {
+			return null;
+		}
+	}
+
+	private async loadRecoveryHoldVersions(path: string): Promise<{ local: string | null; remote: string | null; base?: string | null }> {
+		const remote = this.readRecoveryHoldRemoteText(path);
+		let base: string | null = null;
+		for (const view of getOpenFileViewsForPath(this.app.workspace, path)) {
+			try {
+				const evidence = this.editorBindings?.getLocalOnlyRecoveryEvidenceForView(view as MarkdownView);
+				if (evidence?.baseContent) {
+					base = evidence.baseContent;
+				}
+				const content = (view as MarkdownView).editor?.getValue();
+				if (typeof content === "string") return { local: content, remote, base };
+			} catch {
+				// Fall through to the disk read below.
+			}
+		}
+		const abstractFile = this.app.vault.getAbstractFileByPath(path);
+		if (abstractFile instanceof TFile) {
+			try {
+				return { local: await this.app.vault.read(abstractFile), remote, base };
+			} catch {
+				// Unreadable local file: report the remote side only.
+			}
+		}
+		return { local: null, remote, base };
+	}
+
+	private openRecoveryHoldResolution(): void {
+		new RecoveryHoldResolutionModal(this.app, {
+			getRecoveryHolds: () => this.reconciliationController.getAutomaticRecoveryHolds(),
+			loadRecoveryHoldVersions: async (path) => this.loadRecoveryHoldVersions(path),
+			resolveRecoveryHold: async (path, choice) =>
+				this.reconciliationController.resolveAutomaticRecoveryHold(path, choice),
+		}).open();
+	}
+
+	private openDivergenceResolutionModal(path: string): void {
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (file instanceof TFile && file.extension !== "md") {
+			new Notice(`KAOS: "${path}" is a binary file without editor divergence. Use "Restore file from server" to recover it.`, 7000);
+			return;
+		}
+		new DivergenceResolutionModal(this.app, path, {
+			loadDivergenceVersions: async (p) => this.loadRecoveryHoldVersions(p),
+			resolveAlreadyConverged: async (p) =>
+				this.reconciliationController.markDivergenceConverged(p),
+			resolveKeepRemote: async (p) => this.reconciliationController.restoreFileFromServerState(p),
+			resolveKeepLocal: async (p, localContent) =>
+				this.reconciliationController.resolveDivergenceKeepLocal(p, localContent),
+			resolveKeepBoth: async (p, localContent) =>
+				this.reconciliationController.resolveDivergenceKeepBoth(p, localContent),
+		}).open();
+	}
+
+	/** Restore an explicit HTTP server version, including unsent local CRDT divergence. */
+	private async restoreFileFromServerInteractive(file: TFile): Promise<void> {
+		if (!this.vaultSync) {
+			new Notice("KAOS: sync is not initialized yet — cannot restore from the server.", 6000);
+			return;
+		}
+		const path = file.path;
+		const config = this.getRuntimeConfig();
+		if (!isMarkdownSyncable(path, this.excludePatterns, config.vaultConfigDir)
+			&& !isBlobSyncable(path, this.excludePatterns, config.vaultConfigDir)) {
+			new Notice(`KAOS: "${path}" is excluded from sync and cannot be restored.`, 7000);
+			return;
+		}
+		try {
+			const inspectedSync = this.vaultSync;
+			const inspectedSettings = { ...this.settings };
+			const version = await new ServerFileClient(inspectedSettings).inspect(path);
+			if (version.kind === "missing" || version.kind === "deleted") {
+				new Notice(`KAOS: "${path}" ${version.kind === "deleted" ? "was deleted on the server" : "has no server copy"}. The local file has been kept.`, 7000);
+				return;
+			}
+			const size = version.kind === "text" ? `${version.content.length} chars` : `${version.ref.size.toLocaleString()} bytes`;
+			new ConfirmModal(this.app, "Restore this file from the server?",
+				`The server copy of "${path}" (${size}) will replace this device's copy. ` +
+				"Local file and unsaved text versions are backed up before replacement. " +
+				"Sync resumes after repair; other pending edits are preserved.",
+				async () => {
+					if (this.serverFileRepairInFlight) { new Notice("KAOS: another server file repair is running."); return; }
+					if ([...this.pendingServerRepairPaths].some((pending) => pending !== path)) {
+						new Notice("KAOS: retry the interrupted file repair before restoring another file.", 8000);
+						return;
+					}
+					const assertInspectedScope = () => {
+						if (this.vaultSync !== inspectedSync || this.settings.host !== inspectedSettings.host || this.settings.vaultId !== inspectedSettings.vaultId) {
+							throw new Error("The selected server or sync runtime changed. Review the server version again.");
+						}
+					};
+					let resumeAfterRepair = false;
+					this.serverFileRepairInFlight = true;
+					this.serverRepairEventPaths.add(path);
+					this.reconciliationController.dropDirtyPath(path);
+					this.editorBindings?.unbindByPath(path);
+					try {
+						assertInspectedScope();
+						await this.diskMirror?.waitForFileRepairWriteBarrier(path);
+						assertInspectedScope();
+						const service = new ServerFileRepairService({
+							app: this.app, getSettings: () => this.settings,
+							getLocalDeviceId: () => this.blobIntentLocalDeviceId,
+							isPathSyncable: (target) => {
+								const currentConfig = this.getRuntimeConfig();
+								return isMarkdownSyncable(target, this.excludePatterns, currentConfig.vaultConfigDir)
+									|| isBlobSyncable(target, this.excludePatterns, currentConfig.vaultConfigDir);
+							},
+							resumeSync: () => { resumeAfterRepair = true; },
+							getVaultSync: () => this.vaultSync, getBlobSync: () => this.getBlobSync(),
+							setPending: (target, pending) => {
+								if (this.vaultSync !== inspectedSync || this.settings.host !== inspectedSettings.host || this.settings.vaultId !== inspectedSettings.vaultId) return;
+								if (pending) this.pendingServerRepairPaths.add(target); else this.pendingServerRepairPaths.delete(target);
+							},
+							setProjecting: (target, projecting) => { if (projecting) this.serverRepairProjectionPaths.add(target); else this.serverRepairProjectionPaths.delete(target); },
+							projectText: (target, expectedFile, expectedDiskContent, expectedServerContent, isCurrent) =>
+								this.reconciliationController.restoreFileFromServerState(target, { expectedFile, expectedDiskContent, expectedServerContent, isCurrent }),
+						});
+						const backup = await service.execute(version, file);
+						new Notice(`KAOS: restored "${path}" from its server version. Safety backup: ${backup}`, 10000);
+					} catch (error) {
+						new Notice(`KAOS: could not restore "${path}". ${formatUnknown(error)}`, 12000);
+					} finally {
+						this.serverRepairEventPaths.delete(path);
+						this.serverRepairProjectionPaths.delete(path);
+						this.serverFileRepairInFlight = false;
+						if (resumeAfterRepair && this.vaultSync === inspectedSync && this.pendingServerRepairPaths.size === 0) {
+							void inspectedSync.provider.connect().catch(() => undefined);
+						}
+						this.editorWorkspace?.validateOpenBindings("server-file-repair-settled");
+					}
+				}, "Restore from server").open();
+		} catch (error) {
+			new Notice(`KAOS: could not read the server version of "${path}". ${formatUnknown(error)}`, 10000);
+		}
 	}
 
 	private setupTraceRuntime(): void {
@@ -6938,6 +7730,8 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 				reconcilePending: this.reconciliationController.getState().reconcilePending,
 				awaitingFirstProviderSyncAfterStartup: this.awaitingFirstProviderSyncAfterStartup,
 				lastReconciledGeneration: this.reconciliationController.getState().lastReconciledGeneration,
+				automaticRecoveryHeldCount: this.reconciliationController.getState().automaticRecoveryHeldCount,
+				automaticRecoveryMode: this.settings.automaticRecoveryMode,
 				unresolvedStructuralChangeCount: this.reconciliationController.getState().unresolvedStructuralChangeCount,
 				unresolvedStructuralChangeSample: this.reconciliationController.getState().unresolvedStructuralChangeSample,
 				openFileCount: this.editorWorkspace?.openFileCount ?? 0,
@@ -7714,7 +8508,11 @@ export default class VaultCrdtSyncPlugin extends Plugin {
 	}
 
 	private applyRuntimeSettings(reason: string): void {
+		const previousRecoveryMode = this.runtimeConfig?.automaticRecoveryMode;
 		this.runtimeConfig = this.buildEffectiveRuntimeConfig();
+		if (previousRecoveryMode !== this.runtimeConfig.automaticRecoveryMode) {
+			this.reconciliationController.notifyAutomaticRecoveryPolicyChanged();
+		}
 		this.updateMarkdownSyncScopeGeneration(this.runtimeConfig);
 		this.activateBlobAuthorityScope(`runtime-settings:${reason}`);
 		this.excludePatterns = this.runtimeConfig.excludePatterns;

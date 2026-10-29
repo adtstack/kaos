@@ -1,3 +1,4 @@
+import { createCertifiedLocalRecoveryFixture } from "./helpers/certified-local-recovery";
 /**
  * Controller-level recovery orchestration test.
  *
@@ -354,7 +355,10 @@ function buildFixture(initial: {
 	// localOnly recovery branch's binding-health-conditional repair fires.
 	// Healthy-binding behavior (no repair on every recovery) is exercised
 	// by tests/controller-recovery-orchestration-amplifier.ts.
+
+	const recoveryProof = createCertifiedLocalRecoveryFixture(() => ytext);
 	const editorBindings = {
+		getLocalOnlyRecoveryEvidenceForView: recoveryProof.pane,
 		isBound: () => isBound,
 		getBindingDebugInfoForView: () => ({
 			leafId: "stub-leaf-1",
@@ -544,6 +548,7 @@ function buildFixture(initial: {
 	};
 
 	const vaultSync = {
+		getRemoteTextRevisionForPath: recoveryProof.revision,
 		connected: true,
 		providerSynced: true,
 		getTextForPath: (p: string) => (p === path ? ytext : null),
@@ -1499,7 +1504,7 @@ async function invokeStartupOpenFileReconcileDivergence(
 
 console.log("\n--- Test 0: flight taxonomy bumped and new kinds present ---");
 {
-	assertEq(FLIGHT_TAXONOMY_VERSION, 11, "FLIGHT_TAXONOMY_VERSION === 11");
+	assertEq(FLIGHT_TAXONOMY_VERSION, 13, "FLIGHT_TAXONOMY_VERSION === 13");
 	assertEq(FLIGHT_KIND.recoverySkipped, "recovery.skipped", "FLIGHT_KIND.recoverySkipped");
 	assertEq(FLIGHT_KIND.editorRepairApplied, "editor.repair.applied", "FLIGHT_KIND.editorRepairApplied");
 	assertEq(FLIGHT_KIND.editorHealApplied, "editor.heal.applied", "FLIGHT_KIND.editorHealApplied");
@@ -4817,7 +4822,7 @@ console.log("\n--- Test 8: source-grep regressions on EditorBindingManager emit 
 		"constructor accepts optional recordFlightPathEvent callback",
 	);
 	assert(
-		src.includes('import type { ProductFlightPathEventInput } from "../observability/traceSink"'),
+		/import type \{[^}]*ProductFlightPathEventInput[^}]*\} from "\.\.\/observability\/traceSink"/.test(src),
 		"ProductFlightPathEventInput imported from observability",
 	);
 
@@ -4826,7 +4831,7 @@ console.log("\n--- Test 8: source-grep regressions on EditorBindingManager emit 
 		"private applyBinding(",
 	);
 	assert(applyBindingIdx > 0, "applyBinding method present");
-	const applyBindingTail = src.slice(applyBindingIdx, applyBindingIdx + 4500);
+	const applyBindingTail = src.slice(applyBindingIdx, src.indexOf("private canApplyBindingToEditor", applyBindingIdx));
 	assert(
 		applyBindingTail.includes("PRODUCT_EVENT_KIND.editorRepairApplied"),
 		"applyBinding emits PRODUCT_EVENT_KIND.editorRepairApplied",

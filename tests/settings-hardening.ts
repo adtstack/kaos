@@ -9,6 +9,15 @@ import {
 	SettingsMutationQueue,
 } from "../src/settings/settingsStore";
 
+for (const invalid of [null, false, "off", "legacy", 1, {}]) {
+ const { settings } = readVaultSyncSettings({ automaticRecoveryMode: invalid } as never);
+ if (settings.automaticRecoveryMode !== "guarded") throw new Error("Invalid recovery policy must remain guarded");
+}
+for (const mode of ["guarded", "pause-automatic-recovery"] as const) {
+ const { settings } = readVaultSyncSettings({ automaticRecoveryMode: mode });
+ if (settings.automaticRecoveryMode !== mode) throw new Error("Local recovery mode not retained");
+}
+
 let passed = 0;
 let failed = 0;
 

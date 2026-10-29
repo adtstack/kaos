@@ -133,6 +133,7 @@ export default tseslint.config(
 		"server/.wrangler",
 		"server/.partykit",
 		"tests",
+		"deploy/oracle-acceptance-logs",
 		// QA harness, analyzers, and run artifacts.
 		// `qa/` contains both .ts sources and emitted .js artifacts (e.g.
 		// qa/analyzers/analyzer.js sits next to qa/analyzers/analyzer.ts).

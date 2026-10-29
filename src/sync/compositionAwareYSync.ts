@@ -72,19 +72,27 @@ export interface CompositionHoldTelemetry {
 		ytextLength: number;
 		mergedLength: number | null;
 	}) => void;
+	onConflict?: (info: {
+		base: string;
+		editor: string;
+		ytext: string;
+	}) => void;
 }
 
 export type CompositionFlushReason =
 	| "compositionend"
+	| "compositionend-lag"
 	| "blur"
 	| "destroy"
-	| "cap-timeout";
+	| "cap-timeout"
+	| "binding-boundary"
+	| "binding-target-divergence-probe";
 
 export type CompositionFlushPlan =
 	| { kind: "no-op" }
 	| { kind: "push-only"; mergedText: string }
 	| { kind: "projection-only"; mergedText: string }
-	| { kind: "merge"; mergedText: string };
+	| { kind: "merge"; mergedText: string; hasConflict?: boolean };
 
 /**
  * Decide how to converge editor and ytext after a hold. Pure — no Yjs, no
@@ -100,11 +108,47 @@ export function planCompositionFlush(
 	if (editor === ytext) return { kind: "no-op" };
 	if (ytext === base) return { kind: "push-only", mergedText: editor };
 	if (editor === base) return { kind: "projection-only", mergedText: ytext };
-	return { kind: "merge", mergedText: mergeConcurrentEdits(base, editor, ytext).mergedText };
+	const merge = mergeConcurrentEdits(base, editor, ytext);
+	return {
+		kind: "merge",
+		mergedText: merge.mergedText,
+		hasConflict: merge.hadConflictingOverlap,
+	};
+}
+
+/**
+ * Compute the CodeMirror changes required to transform `from` into `to` via fast-diff.
+ * Pure function: op === 0 advances pos; op === -1 adds deletion and advances pos;
+ * op === 1 adds insertion without advancing pos (since inserted text does not consume
+ * characters from the original document).
+ */
+export function computeContentDiffChanges(
+	from: string,
+	to: string,
+): Array<{ from: number; to: number; insert: string }> {
+	const changes: Array<{ from: number; to: number; insert: string }> = [];
+	let pos = 0;
+	for (const [op, text] of diff(from, to)) {
+		if (op === 0) {
+			pos += text.length;
+		} else if (op === -1) {
+			changes.push({ from: pos, to: pos + text.length, insert: "" });
+			pos += text.length;
+		} else {
+			changes.push({ from: pos, to: pos, insert: text });
+		}
+	}
+	return changes;
 }
 
 interface CompositionHoldState {
 	holding: boolean;
+	/**
+	 * True while the hold was armed by the stale-projection-guard conflict
+	 * branch (no cap timer; push stays frozen until recovery resolution).
+	 * Cleared when the hold is released by a successful flush.
+	 */
+	conflictHold: boolean;
 	heldEvents: number;
 	baseText: string | null;
 }
@@ -116,6 +160,65 @@ const pluginByView = new WeakMap<EditorView, CompositionAwareYSyncPluginValue>()
 export function isCompositionHoldActive(view: EditorView | null | undefined): boolean {
 	if (!view) return false;
 	return holdStates.get(view)?.holding === true;
+}
+
+/**
+ * Flush any unpushed local composition residue from the editor into Y.Text.
+ * Safe to call at binding boundaries; no-op if holding a remote projection
+ * or if editor and Y.Text are already identical.
+ * Returns true if a diff was pushed to Y.Text.
+ */
+export function flushCompositionResidue(
+	view: EditorView | null | undefined,
+	reason: CompositionFlushReason = "binding-boundary",
+): boolean {
+	if (!view) return false;
+	const plugin = pluginByView.get(view);
+	if (!plugin) return false;
+	return plugin.flushResidualComposition(reason);
+}
+
+/**
+ * Returns true if the given EditorView has unpushed local edits that differ
+ * from lastAgreedContent.
+ */
+export function hasViewUnsyncedEdits(view: EditorView | null | undefined): boolean {
+	if (!view) return false;
+	const plugin = pluginByView.get(view);
+	if (!plugin) return false;
+	return plugin.hasUnsyncedEdits();
+}
+
+/**
+ * Returns unsynced edit details for the given EditorView, including whether
+ * the view is frozen by a conflict hold (stale-projection guard).
+ */
+export function getViewUnsyncedInfo(
+	view: EditorView | null | undefined,
+): { hasUnsynced: boolean; charDelta: number; conflictHold: boolean } {
+	if (!view) return { hasUnsynced: false, charDelta: 0, conflictHold: false };
+	const plugin = pluginByView.get(view);
+	if (!plugin) return { hasUnsynced: false, charDelta: 0, conflictHold: false };
+	return plugin.getUnsyncedDelta();
+}
+
+/**
+ * Returns true while the view's push is frozen by a conflict hold awaiting
+ * recovery resolution.
+ */
+export function isViewConflictHoldActive(view: EditorView | null | undefined): boolean {
+	if (!view) return false;
+	return holdStates.get(view)?.conflictHold === true;
+}
+
+/**
+ * Returns the last agreed content snapshot for the given EditorView.
+ */
+export function getViewLastAgreedContent(view: EditorView | null | undefined): string | null {
+	if (!view) return null;
+	const plugin = pluginByView.get(view);
+	if (!plugin) return null;
+	return plugin.getLastAgreedContent();
 }
 
 interface YTextDeltaOp {
@@ -130,6 +233,7 @@ export class CompositionAwareYSyncPluginValue {
 	private readonly telemetry: CompositionHoldTelemetry;
 	private readonly state: CompositionHoldState = {
 		holding: false,
+		conflictHold: false,
 		heldEvents: 0,
 		baseText: null,
 	};
@@ -145,6 +249,17 @@ export class CompositionAwareYSyncPluginValue {
 
 	private readonly _observer = (event: Y.YTextEvent, tr: Y.Transaction): void => {
 		if (tr.origin === this.conf) return;
+
+		let attached = false;
+		try {
+			attached = this.view.dom.isConnected;
+		} catch {
+			attached = false;
+		}
+		if (!attached) {
+			return;
+		}
+
 		if (this.shouldHold()) {
 			if (!this.state.holding) {
 				// The merge base is the content both sides last agreed on. With
@@ -163,8 +278,57 @@ export class CompositionAwareYSyncPluginValue {
 			this.state.heldEvents += 1;
 			return;
 		}
+
+		if (this.hasUnsyncedEdits()) {
+			// Stale projection guard: local editor has diverged from lastAgreedContent
+			// (unpushed edits or offline typing). Applying remote delta directly
+			// with stale offsets could corrupt local text or CRDT.
+			const base = this.lastAgreedContent ?? this.view.state.doc.toString();
+			// eslint-disable-next-line @typescript-eslint/no-base-to-string
+			const ytextText = this._ytext.toString();
+			const editorText = this.view.state.doc.toString();
+			const plan = planCompositionFlush(base, editorText, ytextText);
+
+			if (plan.kind === "merge" && plan.hasConflict) {
+				// Conflicting overlap: Fail-closed.
+				// 1. Arm hold without cap timer so subsequent keystrokes in update()
+				// are frozen and cannot push stale offsets to ytext.
+				this.state.baseText = base;
+				this.state.holding = true;
+				this.state.conflictHold = true;
+				this.clearCapTimer();
+				// 2. Fire onConflict callback so binding layer can register divergence.
+				this.telemetry.onConflict?.({
+					base,
+					editor: editorText,
+					ytext: ytextText,
+				});
+				return;
+			}
+
+			// Non-conflicting / disjoint merge: arm hold so subsequent flush (or reconnect boundary) converges both sides.
+			if (!this.state.holding) {
+				this.state.baseText = base;
+				this.state.holding = true;
+				this.armCapTimer();
+				this.telemetry.onHold?.({
+					heldEvents: this.state.heldEvents,
+					baseLength: base.length,
+				});
+			}
+			this.state.heldEvents += 1;
+			return;
+		}
+
 		this.dispatchProjection(event.delta as YTextDeltaOp[]);
 	};
+
+	/**
+	 * Returns the content snapshot both sides last agreed on.
+	 */
+	getLastAgreedContent(): string | null {
+		return this.lastAgreedContent;
+	}
 
 	constructor(view: EditorView, telemetry: CompositionHoldTelemetry = {}) {
 		this.view = view;
@@ -174,6 +338,7 @@ export class CompositionAwareYSyncPluginValue {
 		this._ytext.observe(this._observer);
 		this.lastAgreedContent = view.state.doc.toString();
 		holdStates.set(view, this.state);
+		pluginByView.set(view, this);
 	}
 
 	private shouldHold(): boolean {
@@ -190,6 +355,80 @@ export class CompositionAwareYSyncPluginValue {
 	}
 
 	/**
+	 * Returns true if the editor document has unpushed local edits (editor-to-CRDT residue)
+	 * that differ from lastAgreedContent.
+	 */
+	hasUnsyncedEdits(): boolean {
+		if (this.lastAgreedContent === null) return false;
+		return this.view.state.doc.toString() !== this.lastAgreedContent;
+	}
+
+	/**
+	 * Returns unsynced status details (editor-to-CRDT residue): hasUnsynced boolean
+	 * and character delta (editor.length - lastAgreedContent.length).
+	 */
+	getUnsyncedDelta(): { hasUnsynced: boolean; charDelta: number; conflictHold: boolean } {
+		const base = this.lastAgreedContent;
+		if (base === null) return { hasUnsynced: false, charDelta: 0, conflictHold: this.state.conflictHold };
+		const doc = this.view.state.doc.toString();
+		if (doc === base) {
+			return { hasUnsynced: false, charDelta: 0, conflictHold: this.state.conflictHold };
+		}
+		return { hasUnsynced: true, charDelta: doc.length - base.length, conflictHold: this.state.conflictHold };
+	}
+
+	/**
+	 * Synchronously flush local editor content to Y.Text when no remote projection
+	 * hold is active. Used at composition end, view teardown, and binding boundaries.
+	 *
+	 * Uses planCompositionFlush (3-way plan):
+	 * - if CRDT advanced remotely while editor was stale (projection-only): returns false,
+	 *   refusing to overwrite CRDT with stale editor content.
+	 * - if concurrent edits occurred (merge): returns false, because this method cannot
+	 *   dispatch content diffs to the editor view synchronously; divergence/reconciliation
+	 *   must resolve concurrent conflicts.
+	 * - if base is missing (null): fails closed (returns false) to prevent stale overwrite.
+	 * - only if editor has unpushed local composition edits while remote is unchanged (push-only):
+	 *   pushes editorText to ytext and returns true.
+	 */
+	flushResidualComposition(reason: CompositionFlushReason): boolean {
+		if (this.state.holding) return false;
+		const editorText = this.view.state.doc.toString();
+		// eslint-disable-next-line @typescript-eslint/no-base-to-string -- yjs typings omit Y.Text#toString; the runtime implementation is real
+		const ytextText = this._ytext.toString();
+		if (editorText === ytextText) return false;
+
+		// Fail-closed: without a known base, we cannot distinguish local composition
+		// residue from a stale editor overwriting an advanced CRDT.
+		if (!this.lastAgreedContent) {
+			return false;
+		}
+
+		const base = this.lastAgreedContent;
+		const plan = planCompositionFlush(base, editorText, ytextText);
+		// Only push when remote has not changed (push-only).
+		// If remote also changed (merge) or advanced alone (projection-only),
+		// flushResidualComposition cannot update the editor view synchronously,
+		// so we fail-closed and leave divergence/reconciliation to handle it.
+		if (plan.kind !== "push-only") {
+			return false;
+		}
+
+		applyDiffToYText(this._ytext, ytextText, plan.mergedText, this.conf);
+		this.lastAgreedContent = plan.mergedText;
+		this.telemetry.onFlush?.({
+			reason,
+			kind: plan.kind,
+			heldEvents: 0,
+			baseLength: base.length,
+			editorLength: editorText.length,
+			ytextLength: ytextText.length,
+			mergedLength: plan.mergedText.length,
+		});
+		return true;
+	}
+
+	/**
 	 * compositionend/blur entry: flush an active hold, or — when the
 	 * composition push-pause left unpushed local text with no remote event —
 	 * push the final composition so the mirror is restored immediately.
@@ -200,14 +439,27 @@ export class CompositionAwareYSyncPluginValue {
 			return;
 		}
 		if (!this.isComposing()) {
-			const editorText = this.view.state.doc.toString();
-			// eslint-disable-next-line @typescript-eslint/no-base-to-string -- yjs typings omit Y.Text#toString; the runtime implementation is real
-			const ytextText = this._ytext.toString();
-			if (editorText !== ytextText) {
-				applyDiffToYText(this._ytext, ytextText, editorText, this.conf);
-				this.lastAgreedContent = editorText;
-			}
+			this.flushResidualComposition(reason);
+			return;
 		}
+		// When CM6's observer has not processed compositionend yet (isComposing() still true),
+		// queue a microtask so it runs immediately after CM6 clears inputState.composing
+		// and flushes DOM mutations.
+		queueMicrotask(() => {
+			let attached = false;
+			try {
+				attached = this.view.dom.isConnected;
+			} catch {
+				attached = false;
+			}
+			if (!attached) return;
+			if (this.isComposing()) return;
+			if (this.state.holding) {
+				this.flush(reason);
+			} else {
+				this.flushResidualComposition(reason === "compositionend" ? "compositionend-lag" : reason);
+			}
+		});
 	}
 
 	private armCapTimer(): void {
@@ -234,16 +486,37 @@ export class CompositionAwareYSyncPluginValue {
 	flush(reason: CompositionFlushReason): void {
 		if (!this.state.holding) return;
 		const base = this.state.baseText ?? this.view.state.doc.toString();
-		this.state.holding = false;
-		this.state.baseText = null;
-		this.clearCapTimer();
-		const heldEvents = this.state.heldEvents;
-		this.state.heldEvents = 0;
-
 		const editorText = this.view.state.doc.toString();
 		// eslint-disable-next-line @typescript-eslint/no-base-to-string -- yjs typings omit Y.Text#toString; the runtime implementation is real
 		const ytextText = this._ytext.toString();
 		const plan = planCompositionFlush(base, editorText, ytextText);
+
+		if (plan.kind === "merge" && plan.hasConflict) {
+			// Fail-closed: Never auto-merge or overwrite when conflicting overlap exists.
+			// Keep holding active so editor push remains frozen until recovery resolution.
+			this.clearCapTimer();
+			// A hold armed earlier (IME composition, or a disjoint remote edit
+			// with a cap timer) never passed through the observer's conflict
+			// branch: later remote events only bump heldEvents. Promote it to a
+			// conflict hold here so the freeze is visible and reported exactly
+			// once, instead of leaving push frozen with no divergence evidence.
+			if (!this.state.conflictHold) {
+				this.state.conflictHold = true;
+				this.telemetry.onConflict?.({
+					base,
+					editor: editorText,
+					ytext: ytextText,
+				});
+			}
+			return;
+		}
+
+		this.state.holding = false;
+		this.state.conflictHold = false;
+		this.state.baseText = null;
+		this.clearCapTimer();
+		const heldEvents = this.state.heldEvents;
+		this.state.heldEvents = 0;
 
 		if (plan.kind !== "no-op" && plan.mergedText !== ytextText) {
 			applyDiffToYText(this._ytext, ytextText, plan.mergedText, this.conf);
@@ -284,19 +557,7 @@ export class CompositionAwareYSyncPluginValue {
 
 	/** One transaction taking the editor from `from` to `to` by minimal diff. */
 	private dispatchContentDiff(from: string, to: string): void {
-		const changes: Array<{ from: number; to: number; insert: string }> = [];
-		let pos = 0;
-		for (const [op, text] of diff(from, to)) {
-			if (op === 0) {
-				pos += text.length;
-			} else if (op === -1) {
-				changes.push({ from: pos, to: pos + text.length, insert: "" });
-				pos += text.length;
-			} else {
-				changes.push({ from: pos, to: pos, insert: text });
-				pos += text.length;
-			}
-		}
+		const changes = computeContentDiffChanges(from, to);
 		if (changes.length > 0) {
 			this.dispatchChanges(changes);
 		}
@@ -327,6 +588,17 @@ export class CompositionAwareYSyncPluginValue {
 	 * quirk, which KAOS's resyncDroppedBatchEdits compensates) plus the hold
 	 * pause: during a hold the editor's positions describe a document ytext
 	 * has not agreed to, so pushing would write stale offsets.
+	 *
+	 * Composition alone must NOT pause the push. The stock plugin pushes
+	 * every composition update, keeping editor==ytext through the IME
+	 * session; deferring the push to compositionend relies on that event
+	 * arriving with the composing flag already down, which CM6 guarantees
+	 * only on the classic DOM path — under EditContext (modern
+	 * Electron/Obsidian) the flag can stay up across chained sessions and
+	 * every deferred flush bails on isComposing(), stranding the whole
+	 * composed run outside Y.Text until some other lane repairs the mirror.
+	 * Remote events during composition still arm the hold, which is the
+	 * only state where the push must pause.
 	 */
 	update(update: ViewUpdate): void {
 		const first = update.transactions[0];
@@ -336,7 +608,7 @@ export class CompositionAwareYSyncPluginValue {
 		) {
 			return;
 		}
-		if (this.state.holding || this.isComposing()) return;
+		if (this.state.holding) return;
 		const ytext = this._ytext;
 		ytext.doc?.transact(() => {
 			let adj = 0;
@@ -355,9 +627,14 @@ export class CompositionAwareYSyncPluginValue {
 	}
 
 	destroy(): void {
-		this.flush("destroy");
+		if (this.state.holding) {
+			this.flush("destroy");
+		} else {
+			this.flushResidualComposition("destroy");
+		}
 		this._ytext.unobserve(this._observer);
 		holdStates.delete(this.view);
+		pluginByView.delete(this.view);
 		this.clearCapTimer();
 	}
 }

@@ -58,7 +58,8 @@ export function isRemoteDeletePreservedUnresolvedEntry(
 			|| entry.reason === "remote-delete-read-failed"
 			|| entry.reason === "remote-delete-open-editor-read-failed"
 			|| entry.reason === "remote-delete-multiple-open-editor-authorities"
-			|| entry.reason === "remote-delete-trash-failed";
+			|| entry.reason === "remote-delete-trash-failed"
+			|| entry.reason === "remote-delete-local-conflict";
 	}
 	return entry.reason === "remote-delete-missing-baseline"
 		|| entry.reason === "remote-delete-hash-read-failed"

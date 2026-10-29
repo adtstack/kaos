@@ -3,6 +3,7 @@ import * as Y from "yjs";
 import type { VaultSync } from "./vaultSync";
 import type { EditorBindingManager } from "./editorBinding";
 import type { TraceRecord } from "../observability/traceContext";
+import type { ContentTraceObserver } from "../observability/traceSink";
 import { getMetaPath, isFileMetaDeletedValue } from "./fileMeta";
 import { formatUnknown, yTextToString } from "../utils/format";
 import {
@@ -30,7 +31,7 @@ export { isLocalOrigin };
  */
 export type RemoteDeleteDecision =
 	| { kind: "apply-delete" }
-	| { kind: "preserve-revive"; diskContent: string; contentSource?: "disk" | "editor" }
+	| { kind: "preserve-local"; diskContent: string; contentSource?: "disk" | "editor" }
 	| { kind: "preserve-unresolved" };
 
 export type DiskWriteDeferReason =
@@ -380,6 +381,7 @@ export class DiskMirror {
 	private mapObserverCleanups: (() => void)[] = [];
 
 	private _flightEventHandler: ((event: Record<string, unknown>) => void) | null = null;
+	private contentTraceObserver?: ContentTraceObserver;
 
 	/**
 	 * Called after every successful `flushWrite` with the normalized path and
@@ -475,6 +477,32 @@ export class DiskMirror {
 
 	setFlightEventHandler(handler: (event: Record<string, unknown>) => void): void {
 		this._flightEventHandler = handler;
+	}
+
+	setContentTraceObserver(observer: ContentTraceObserver): void {
+		this.contentTraceObserver = observer;
+	}
+
+	private recordSuccessfulWrite(path: string, content: string, isCreate: boolean, baselineRecorded: boolean): void {
+		const event = {
+			priority: "important" as const, kind: "disk.write.ok", severity: "info" as const,
+			scope: "file" as const, source: "diskMirror" as const, layer: "disk" as const,
+			path, data: { contentLength: content.length, isCreate, baselineRecorded },
+		};
+		if (this.contentTraceObserver?.isEnabled()) {
+			this.contentTraceObserver.record(event, { disk: content });
+		} else {
+			this._flightEventHandler?.(event);
+		}
+	}
+
+	private recordCommittedWrite(path: string, content: string, file: TFile, isCreate: boolean): void {
+		if (!this.contentTraceObserver?.isEnabled()) return;
+		this.contentTraceObserver.record({
+			kind: "disk.write.committed", priority: "important", severity: "info",
+			scope: "file", source: "diskMirror", layer: "disk", path,
+			data: { isCreate, mtime: file.stat.mtime, size: file.stat.size, settlementVerified: false },
+		}, { disk: content });
 	}
 
 	/**
@@ -725,6 +753,13 @@ export class DiskMirror {
 		this.log(`observeText: watching "${path}" (remote-only)`);
 	}
 
+	/** Explicit full-restore removal: detach text observation and suppress its delete echo. */
+	prepareRemovalProjection(path: string): void {
+		const normalized = normalizePath(path);
+		this.suppressDelete(normalized);
+		this.unobserveText(normalized);
+	}
+
 	private unobserveText(path: string): void {
 		const obs = this.textObservers.get(path);
 		if (obs) {
@@ -745,12 +780,16 @@ export class DiskMirror {
 
 	private scheduleRemoteWrite(path: string): void {
 		path = normalizePath(path);
-		this.lastRemoteTextChangeAt.set(path, Date.now());
 		const admission = this.captureRemoteProjectionAdmission([path]);
 		if (!admission) {
 			this.log(`scheduleRemoteWrite: policy not ready for "${path}"`);
 			return;
 		}
+		// Only admitted work can make the disk a pending mirror projection.
+		// Startup provider updates arrive before the policy is ready; recording
+		// them here earlier left a pending marker without a queued write, so
+		// reconciliation waited forever instead of establishing the baseline.
+		this.lastRemoteTextChangeAt.set(path, Date.now());
 		if (!this.isMarkdownPathSyncable(path)) {
 			this.scheduleWrite(path);
 			return;
@@ -1197,6 +1236,7 @@ export class DiskMirror {
 							}
 							continue;
 						}
+						this.recordCommittedWrite(normalized, content, existing, false);
 						if (!this.isExactDiskFileCurrent(normalized, existing)) {
 							this.suppressedPaths.delete(normalized);
 							return this.deferDiskChangedWrite(path, "post-atomic-process-file-identity");
@@ -1246,16 +1286,7 @@ export class DiskMirror {
 						if (baselineRecorded) {
 							this._onDiskWriteCallback?.(normalized, contentHash, content);
 						}
-						this._flightEventHandler?.({
-							priority: "important",
-							kind: "disk.write.ok",
-							severity: "info",
-							scope: "file",
-							source: "diskMirror",
-							layer: "disk",
-							path: normalized,
-							data: { contentLength: content.length, isCreate: false, baselineRecorded },
-						});
+						this.recordSuccessfulWrite(normalized, content, false, baselineRecorded);
 						return {
 							kind: "written",
 							path: normalized,
@@ -1450,6 +1481,7 @@ export class DiskMirror {
 						}
 						throw createError;
 					}
+					this.recordCommittedWrite(normalized, content, createdFile, true);
 					if (!this.isCallerAuthorityCurrent(path, options, "after-commit", "post-create")) {
 						this.suppressedPaths.delete(normalized);
 						return this.deferCallerAuthorityStale(path, "post-create", options);
@@ -1489,16 +1521,7 @@ export class DiskMirror {
 					if (baselineRecorded) {
 						this._onDiskWriteCallback?.(normalized, contentHash, content);
 					}
-					this._flightEventHandler?.({
-						priority: "important",
-						kind: "disk.write.ok",
-						severity: "info",
-						scope: "file",
-						source: "diskMirror",
-						layer: "disk",
-						path: normalized,
-						data: { contentLength: content.length, isCreate: true, baselineRecorded },
-					});
+					this.recordSuccessfulWrite(normalized, content, true, baselineRecorded);
 					return {
 						kind: "written",
 						path: normalized,
@@ -1939,6 +1962,36 @@ export class DiskMirror {
 		}
 	}
 
+	async reconcileMarkdownRemoval(path: string): Promise<void> {
+		await this.handleRemoteDelete(path);
+	}
+
+	/** Preserve unsent local bytes outside the synchronized namespace. */
+	private async backupRemoteDeletedLocalContent(path: string, content: string): Promise<void> {
+		const episodeId = this.getPreservedUnresolvedEpisode(path);
+		try {
+			const adapter = this.app.vault.adapter;
+			const hash = await contentBaselineHash(content);
+			const directory = ".kaos-safety-backup";
+			if (!(await adapter.exists(directory))) {
+				try { await adapter.mkdir(directory); }
+				catch (error) { if (!(await adapter.exists(directory))) throw error; }
+			}
+			const filename = path.replace(/[/\\:]/g, "__").slice(-120);
+			const backupPath = `${directory}/${filename}.${hash}.remote-delete.bak.md`;
+			await adapter.write(backupPath, content);
+			const entry = this.preservedUnresolved.get(path);
+			if (entry && isRemoteDeletePreservedUnresolvedEntry(entry) && getPreservedUnresolvedEpisodeId(entry) === episodeId) {
+				entry.artifactPath = backupPath;
+				this.onPreservedUnresolvedChanged?.();
+			}
+			this.trace?.("disk", "remote-delete-local-backup-created", { path, backupPath });
+		} catch (error) {
+			this.trace?.("disk", "remote-delete-local-backup-failed", { path, error: formatUnknown(error) });
+			this.log(`Remote delete kept local work for "${path}"; recovery backup failed: ${formatUnknown(error)}`);
+		}
+	}
+
 	private async handleRemoteDelete(
 		path: string,
 		options: { baselineText?: string | null } = {},
@@ -1981,10 +2034,6 @@ export class DiskMirror {
 		expectedDeleteFingerprint: string,
 		admission: RemoteProjectionAdmissionLease,
 	): Promise<void> {
-		function assertNever(value: never): never {
-			throw new Error(`Unhandled EnsureFileResult: ${JSON.stringify(value)}`);
-		}
-
 		const normalized = normalizePath(path);
 		if (!this.isRemoteDeleteOperationCurrent(
 			normalized,
@@ -2058,7 +2107,7 @@ export class DiskMirror {
 							// Known baseline exists, open editor differs → known dirty,
 							// even if Obsidian has not autosaved it to disk yet.
 							decision = {
-								kind: "preserve-revive",
+								kind: "preserve-local",
 								diskContent: openEditorAuthority.content,
 								contentSource: "editor",
 							};
@@ -2102,8 +2151,8 @@ export class DiskMirror {
 								const diskContent = await this.readFreshMarkdownFile(file);
 								if (diskContent !== lastKnownContent) {
 									// Known baseline exists, local file differs → known dirty.
-									// Preserve and revive: local dirty work wins over remote delete.
-									decision = { kind: "preserve-revive", diskContent, contentSource: "disk" };
+									// Preserve the local work without undoing the remote delete.
+									decision = { kind: "preserve-local", diskContent, contentSource: "disk" };
 									this.trace?.("disk", "remote-delete-conflict-preserved", {
 										path,
 										normalizedPath: normalized,
@@ -2195,7 +2244,7 @@ export class DiskMirror {
 									&& latestEditorAuthority.content !== lastKnownContent
 									) {
 										decision = {
-											kind: "preserve-revive",
+											kind: "preserve-local",
 											diskContent: latestEditorAuthority.content,
 											contentSource: "editor",
 										};
@@ -2207,7 +2256,7 @@ export class DiskMirror {
 										unresolvedReason = "remote-delete-open-editor-read-failed";
 									} else if (latestDiskContent !== lastKnownContent) {
 										decision = {
-											kind: "preserve-revive",
+											kind: "preserve-local",
 											diskContent: latestDiskContent,
 											contentSource: "disk",
 										};
@@ -2386,109 +2435,25 @@ export class DiskMirror {
 							path: normalized,
 							data: { deleteMode, reason: "tombstone-applied" },
 						});
-					} else if (decision.kind === "preserve-revive") {
+					} else if (decision.kind === "preserve-local") {
+						// Keep local work without cancelling the remote removal. File events,
+						// reconcile and import must all leave this episode quarantined.
+						if (!this.isRemoteDeleteOperationCurrent(normalized, deleteGeneration, expectedDeleteFingerprint, admission)) return;
+						this.ensurePreservedUnresolved(normalized, "remote-delete-local-conflict");
+						await this.backupRemoteDeletedLocalContent(normalized, decision.diskContent);
+						if (!this.isRemoteDeleteOperationCurrent(normalized, deleteGeneration, expectedDeleteFingerprint, admission)) return;
+						this.unobserveText(normalized);
+						this.openPaths.delete(normalized);
+						this.editorBindings.unbindByPath(normalized);
 						this._flightEventHandler?.({
-							priority: "critical",
-							kind: "delete.preserved",
-							severity: "warn",
-							scope: "file",
-							source: "diskMirror",
-							layer: "disk",
-							path: normalized,
-							data: { reason: "local-dirty-wins-over-remote-delete", preserveKind: "preserve-revive" },
+							priority: "critical", kind: "delete.preserved", severity: "warn",
+							scope: "file", source: "diskMirror", layer: "disk", path: normalized,
+							data: { reason: "remote-delete-local-conflict", preserveKind: "preserve-local" },
 						});
-						// Known dirty: local file intentionally differs from baseline.
-						// Revive tombstone so the file re-enters sync. This is the
-						// explicit policy: local dirty work wins over remote delete.
-						const markerEpisodeBeforeRevive = this.getPreservedUnresolvedEpisode(normalized);
-						try {
-							if (!this.isExactDiskFileCurrent(normalized, file)) {
-								throw new Error("disk file identity changed before dirty revival");
-							}
-							if (decision.contentSource === "editor") {
-								const latestEditorAuthority = this.getOpenEditorAuthority(normalized);
-								if (
-									latestEditorAuthority.kind !== "single"
-									|| latestEditorAuthority.content !== decision.diskContent
-								) {
-									throw new Error("editor authority changed before dirty revival");
-								}
-							} else {
-								const latestDiskContent = await this.readFreshMarkdownFile(file);
-								if (
-									!this.isExactDiskFileCurrent(normalized, file)
-									|| latestDiskContent !== decision.diskContent
-								) {
-									throw new Error("disk authority changed before dirty revival");
-								}
-							}
-							if (!this.isRemoteDeleteOperationCurrent(
-								normalized,
-								deleteGeneration,
-								expectedDeleteFingerprint,
-								admission,
-							)) {
-								throw new Error("remote delete episode changed before dirty revival");
-							}
-							const ensureResult = this.vaultSync.ensureFile(
-								normalized,
-								decision.diskContent,
-								this.getDeviceName(),
-								{
-									reviveTombstone: true,
-									reviveReason: "remote-delete-local-dirty-preserved",
-								},
-							);
-							let revivedText: Y.Text;
-							switch (ensureResult.kind) {
-								case "created":
-								case "existing":
-									revivedText = ensureResult.ytext;
-									break;
-								case "replan":
-									throw new Error("dirty revival active set changed before commit");
-								case "blocked":
-									throw new Error(`dirty revival blocked (${ensureResult.reason})`);
-								default:
-									assertNever(ensureResult);
-							}
-							const activeText = this.vaultSync.getTextForPath(normalized);
-							const reviveSettled = activeText === revivedText
-								&& yTextToString(revivedText) === decision.diskContent
-								&& this.getAuthoritativeMarkdownDeleteFingerprint(normalized) === null
-								&& this.remoteDeleteGenerations.get(normalized) === deleteGeneration;
-							if (!reviveSettled) {
-								throw new Error("revived Y.Text did not settle to the preserved disk authority");
-							}
-							// The exact active Y.Text now exposes the preserved bytes and the
-							// tombstone is gone. Only now may the prior marker be resolved.
-							this.resolvePreservedUnresolvedEpisode(
-								normalized,
-								markerEpisodeBeforeRevive,
-							);
-							this.trace?.("disk", "remote-delete-preserved-revived", {
-								path,
-								normalizedPath: normalized,
-								reason: "remote-delete-local-dirty-preserved",
-								contentLength: decision.diskContent.length,
-							});
-							this.log(
-								`handleRemoteDelete: revived tombstone for "${path}" after dirty preservation`,
-							);
-						} catch (reviveErr) {
-							// The local file remains authoritative. Keep an existing marker exactly
-							// as-is, or create a generic conflict marker when this was the first
-							// failed preservation attempt (including partial/mismatched revival).
-							this.ensurePreservedUnresolved(
-								normalized,
-								"three-way-preserve-failed",
-							);
-							this.trace?.("disk", "remote-delete-preserved-revive-failed", {
-								path,
-								normalizedPath: normalized,
-								error: reviveErr instanceof Error ? reviveErr.message : String(reviveErr),
-							});
-						}
+						this.trace?.("disk", "remote-delete-local-conflict-preserved", {
+							path: normalized, contentSource: decision.contentSource ?? "disk",
+							contentLength: decision.diskContent.length,
+						});
 					}
 				// kind === "preserve-unresolved": file stays on disk, tombstone
 				// remains in CRDT. The file is NOT auto-revived by later
@@ -2533,6 +2498,10 @@ export class DiskMirror {
 							normalized,
 							unresolvedReason ?? "unknown",
 						);
+						const editor = this.getOpenEditorAuthority(normalized);
+						if (editor.kind === "single") {
+							await this.backupRemoteDeletedLocalContent(normalized, editor.content);
+						}
 					}
 			} catch (err) {
 				console.error(
@@ -3987,6 +3956,11 @@ export class DiskMirror {
 		});
 		this.pathWriteLocks.set(path, tracked);
 		return tracked;
+	}
+
+	/** Await previously admitted writes after a caller has fenced this path's sync scope. */
+	async waitForFileRepairWriteBarrier(path: string): Promise<void> {
+		await this.runPathWriteLocked(normalizePath(path), async () => undefined);
 	}
 
 	private runPathWritesLocked<T>(paths: string[], work: () => Promise<T>): Promise<T> {

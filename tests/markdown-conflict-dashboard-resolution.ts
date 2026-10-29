@@ -14,7 +14,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { TFile } from "obsidian";
+import { MarkdownView, TFile } from "obsidian";
 import * as Y from "yjs";
 import { VaultSync } from "../src/sync/vaultSync";
 import { contentBaselineHash, type DiskIndex } from "../src/sync/diskIndex";
@@ -137,6 +137,13 @@ function makeResolutionFixture(init: {
 	crdt: string;
 	disk: string;
 	baseline: string | null;
+	maxFileSizeBytes?: number;
+	shouldBlockFrontmatterIngest?: (path: string, previous: string | null, next: string, reason: string) => boolean;
+	resetController?: boolean;
+	editorContent?: string;
+	lastActivity?: () => number;
+	onRead?: () => void;
+	onDiscard?: () => void;
 }): ResolutionFixture {
 	const path = "JOURNALS/manual-resolve.md";
 	let diskContent = init.disk;
@@ -176,7 +183,7 @@ function makeResolutionFixture(init: {
 		vault: {
 			getMarkdownFiles: () => fileExists ? [file] : [],
 			read: async (candidate: TFile & { path: string }) => {
-				if (candidate.path === path && fileExists) return diskContent;
+				if (candidate.path === path && fileExists) { init.onRead?.(); return diskContent; }
 				throw new Error(`unexpected read: ${candidate.path}`);
 			},
 			adapter: {
@@ -187,7 +194,9 @@ function makeResolutionFixture(init: {
 			},
 			getAbstractFileByPath: (candidate: string) => candidate === path && fileExists ? file : null,
 		},
-		workspace: { iterateAllLeaves: () => {} },
+		workspace: { iterateAllLeaves: (cb: (leaf: unknown) => void) => {
+			if (init.editorContent !== undefined) cb({ view: Object.assign(new MarkdownView(), { file, editor: { getValue: () => init.editorContent } }) });
+		} },
 	};
 
 	const diskMirror = {
@@ -231,21 +240,26 @@ function makeResolutionFixture(init: {
 		app: app as never,
 		getSettings: () => ({ deviceName: "ResolutionFixture" }) as never,
 		getRuntimeConfig: () => ({
-			maxFileSizeBytes: 0,
+			maxFileSizeBytes: init.maxFileSizeBytes ?? 0,
+			automaticRecoveryMode: "pause-automatic-recovery",
 			maxFileSizeKB: 1,
 			excludePatterns: [],
 		}) as never,
 		getVaultSync: () => vaultSync,
 		getDiskMirror: () => diskMirror as never,
 		getBlobSync: () => null,
-		getEditorBindings: () => null,
+		getEditorBindings: () => init.editorContent === undefined ? null : ({
+			getLastEditorActivityForPath: () => init.lastActivity?.() ?? 0,
+			separateUndoCaptureForPath: () => {},
+		} as never),
 		getDiskIndex: () => diskIndex,
 		setDiskIndex: (next: DiskIndex) => { diskIndex = next; },
 		recordBaselineText: () => {},
 		recordDiscardedRevision: (p: string, contentHash: string, reason: string) => {
 			discarded.push({ path: p, contentHash, reason });
+			init.onDiscard?.();
 		},
-		shouldBlockFrontmatterIngest: () => false,
+		shouldBlockFrontmatterIngest: init.shouldBlockFrontmatterIngest ?? (() => false),
 		onReconciled: () => {},
 		onReconcileSkipped: () => {},
 		refreshStatusBar: () => {},
@@ -287,6 +301,7 @@ function makeResolutionFixture(init: {
 		getEpisode: () => entry ? { ...entry } : null,
 		getDiskIndex: () => diskIndex,
 		reset: () => {
+			if (init.resetController) controller.reset();
 			doc.destroy();
 		},
 	};
@@ -295,6 +310,72 @@ function makeResolutionFixture(init: {
 const BASELINE = "settled baseline bytes\n";
 const REMOTE_EDITS = "baseline + unseen remote edits\n";
 const LOCAL_EDITS = "baseline + local disk edits\n";
+
+console.log("\n--- Manual merged resolution: idle editor, guards, audits and settlement ---");
+for (const mode of ["happy", "idle", "active", "size", "frontmatter", "stale", "replaced", "review-stale", "old-lane"] as const) {
+	let activity = mode === "active" ? Date.now() : 0;
+	let replaceEpisode = false;
+	const fx = makeResolutionFixture({
+		crdt: REMOTE_EDITS, disk: LOCAL_EDITS, baseline: BASELINE, resetController: true,
+		maxFileSizeBytes: mode === "size" ? 1 : 0,
+		shouldBlockFrontmatterIngest: () => mode === "frontmatter",
+		editorContent: ["idle", "active", "old-lane"].includes(mode) ? "unsaved diverged editor" : undefined,
+		lastActivity: () => activity,
+		onRead: () => { if (replaceEpisode) { replaceEpisode = false; fx.setEpisode("conflict-winner-flush-deferred"); } },
+	});
+	fx.setEpisode("conflict-winner-flush-deferred");
+	const ep = fx.getEpisode()!;
+	replaceEpisode = mode === "replaced";
+	let error = "";
+	const mergedText = "## 업무\nlocal work\n\n## 일상\nremote life\n";
+	try {
+		await fx.controller.resolveMarkdownConflictAttention(fx.path,
+			mode === "old-lane" ? "keep-local" : { kind: "use-merged", mergedText,
+				...(mode === "review-stale" ? { expectedRemoteText: "old reviewed text" } : {}) },
+			{ reason: ep.reason, episodeId: mode === "stale" ? "stale" : ep.episodeId });
+	} catch (err) { error = String(err); }
+	if (mode === "happy" || mode === "idle") {
+		assertEq(error, "", `${mode}: merge succeeds`);
+		assertEq(fx.ytext.toString(), mergedText, `${mode}: merged CRDT`);
+		assertEq(fx.getDiskContent(), mergedText, `${mode}: merged disk`);
+		assertEq(fx.getEpisode(), null, `${mode}: episode cleared`);
+		assertEq(fx.getDiskIndex()[fx.path]?.contentHash, baselineHashSync(mergedText), `${mode}: baseline settled`);
+		for (const side of ["crdt", "disk"]) assert(fx.discarded.some(d => d.reason === `manual-conflict-use-merged-${side}-discarded`), `${mode}: ${side} audit`);
+		assert(fx.traces.some(t => t.msg === "reconcile-followup-requested"), `${mode}: reconciliation followup`);
+	} else {
+		assert(error.length > 0, `${mode}: rejects`);
+		assertEq(fx.ytext.toString(), REMOTE_EDITS, `${mode}: no CRDT mutation`);
+		assertEq(fx.getDiskContent(), LOCAL_EDITS, `${mode}: no disk mutation`);
+		assertEq(fx.flushWriteCalls.length, 0, `${mode}: no flush`);
+		assertEq(fx.discarded.length, 0, `${mode}: no discarded revisions`);
+		assert(fx.getEpisode() !== null, `${mode}: remains fenced`);
+		if (mode === "active") {
+			assert(error.includes("actively edited"), "typing gives settle-and-retry message");
+			activity = 0;
+			await fx.controller.resolveMarkdownConflictAttention(fx.path, { kind: "use-merged", mergedText }, { reason: ep.reason, episodeId: ep.episodeId });
+			assertEq(fx.ytext.toString(), mergedText, "typing settled: retry succeeds");
+		}
+	}
+	fx.reset();
+}
+
+{
+	let replace = true;
+	const fx = makeResolutionFixture({ crdt: REMOTE_EDITS, disk: LOCAL_EDITS, baseline: BASELINE, resetController: true,
+		onDiscard: () => { if (replace) { replace = false; fx.setEpisode("conflict-winner-flush-deferred"); } },
+	});
+	fx.setEpisode("conflict-winner-flush-deferred");
+	const reviewedEpisode = fx.getEpisode()!;
+	let rejected = false;
+	try {
+		await fx.controller.resolveMarkdownConflictAttention(fx.path, { kind: "use-merged", mergedText: "merged" }, reviewedEpisode);
+	} catch { rejected = true; }
+	assert(rejected, "episode replaced during audit rejects before flush");
+	assertEq(fx.flushWriteCalls.length, 0, "replacement incident prevents disk flush");
+	assertEq(fx.getDiskContent(), LOCAL_EDITS, "replacement incident preserves disk bytes");
+	assert(fx.getEpisode()?.episodeId !== reviewedEpisode.episodeId, "replacement episode remains intact");
+	fx.reset();
+}
 
 console.log("\n--- Manual Resolution: Keep Local version promotes disk to CRDT and clears fence ---");
 {

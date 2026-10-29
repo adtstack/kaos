@@ -1,7 +1,8 @@
 import { webcrypto } from "node:crypto";
-import { indexedDB as fakeIndexedDB, IDBKeyRange as FakeIDBKeyRange } from "fake-indexeddb";
+import { IDBKeyRange as FakeIDBKeyRange } from "fake-indexeddb";
 import NodeWebSocket from "ws";
 import { createHeadlessElement } from "./core/dom";
+import { createHeadlessIndexedDbFactory } from "./core/indexedDb";
 
 type Listener = (...args: any[]) => void;
 
@@ -62,7 +63,7 @@ export function installHeadlessHostPolyfills(): void {
 	win.requestAnimationFrame ??= (callback: FrameRequestCallback) => setTimeout(() => callback(Date.now()), 16) as any;
 	win.cancelAnimationFrame ??= (id: ReturnType<typeof setTimeout>) => clearTimeout(id);
 	win.crypto ??= webcrypto;
-	win.indexedDB ??= fakeIndexedDB;
+	win.indexedDB ??= createHeadlessIndexedDbFactory();
 	win.IDBKeyRange ??= FakeIDBKeyRange;
 	win.WebSocket ??= NodeWebSocket;
 }

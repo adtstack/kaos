@@ -1,3 +1,7 @@
+import type * as Y from "yjs";
+import type { EditorBindingManager } from "../sync/editorBinding";
+import type { ProductFlightEventInput } from "../observability/traceSink";
+import { binaryRestoreAuthorityReader, captureFullRestoreBlobDiskAuthority, decodeRestoreBytes, fullRestoreDiffIdentity, fullRestorePaths, fullRestoreCounts } from "./fullRestore";
 import { App, MarkdownView, Notice, TFile, normalizePath } from "obsidian";
 import { BlobSyncManager } from "../sync/blobSync";
 import { DiskMirror } from "../sync/diskMirror";
@@ -15,7 +19,9 @@ import {
 	captureMarkdownRestoreAuthority,
 	isBlobRestoreAuthorityCurrent,
 	isMarkdownRestoreAuthorityCurrent,
+	isFullVaultMarkdownRestoreAuthorityCurrent,
 	type SnapshotIndex,
+	type SnapshotDiff,
 } from "../sync/snapshotClient";
 import {
 	cleanupFileHistoryStorage,
@@ -68,6 +74,10 @@ interface SnapshotServiceDeps {
 	getVaultSync(): VaultSync | null;
 	getDiskMirror(): DiskMirror | null;
 	getBlobSync(): BlobSyncManager | null;
+	getEditorBindings?(): EditorBindingManager | null;
+	removeDiskIndexEntry?(path: string): Promise<void>;
+	trace?(source: string, msg: string, details?: Record<string, unknown>): void;
+	recordFlightEvent?(event: ProductFlightEventInput): void;
 	getServerSupportsSnapshots(): boolean;
 	log(message: string): void;
 	onEditorsNeedReconcile(reason: string): void;
@@ -77,6 +87,16 @@ interface RestoreEditorAuthorityEntry {
 	view: MarkdownView;
 	file: TFile;
 	content: string;
+}
+
+interface FullVaultRestoreReview {
+	vaultSync: VaultSync;
+	diff: SnapshotDiff;
+	markdown: ReturnType<typeof captureMarkdownRestoreAuthority>;
+	blobs: ReturnType<typeof captureBlobRestoreAuthority>;
+	disk: Map<string, RestoreDiskPrecondition>;
+	blobDisk: Map<string, RestoreDiskPrecondition>;
+	editors: Map<string, RestoreEditorAuthorityEntry[]>;
 }
 
 export class SnapshotService {
@@ -863,13 +883,17 @@ export class SnapshotService {
 		content: string,
 		backupDir: string,
 	): Promise<void> {
+		const adapter = this.deps.app.vault.adapter;
 		const backupPath = normalizePath(`${backupDir}/${path}`);
-		const parentDir = backupPath.substring(0, backupPath.lastIndexOf("/"));
+		const parts = backupPath.split("/").slice(0, -1);
 		try {
-			if (parentDir && !this.deps.app.vault.getAbstractFileByPath(parentDir)) {
-				await this.deps.app.vault.createFolder(parentDir);
+			for (let i = 1; i <= parts.length; i++) {
+				const parent = parts.slice(0, i).join("/");
+				if (await adapter.exists(parent)) continue;
+				try { await adapter.mkdir(parent); }
+				catch (err) { if (!await adapter.exists(parent)) throw err; }
 			}
-			await this.deps.app.vault.create(backupPath, content);
+			await adapter.write(backupPath, content);
 		} catch (err) {
 			throw new Error(
 				`Restore not started: could not back up "${path}" (${formatUnknown(err)}).`,
@@ -1100,6 +1124,159 @@ export class SnapshotService {
 			.join(", ");
 	}
 
+	private async captureFullRestoreReview(snapshotDoc: Y.Doc, vaultSync: VaultSync): Promise<FullVaultRestoreReview> {
+		const noticeTimer = setTimeout(() => new Notice("Preparing the full-vault restore review..."), 3000);
+		try {
+			const diff = diffSnapshot(snapshotDoc, vaultSync.ydoc);
+			const paths = fullRestorePaths(diff);
+			const markdownPaths = [...paths.markdownPaths, ...paths.removeMarkdownPaths];
+			const blobPaths = [...paths.blobPaths, ...paths.removeBlobPaths];
+			const markdown = captureMarkdownRestoreAuthority(vaultSync.ydoc, markdownPaths);
+			const blobs = captureBlobRestoreAuthority(vaultSync.ydoc, blobPaths);
+			const editors = this.captureOpenEditorRestoreAuthority(markdownPaths);
+			const disk = await this.captureMarkdownRestoreDiskAuthority(markdownPaths);
+			const blobDisk = await captureFullRestoreBlobDiskAuthority(this.deps.app.vault, blobPaths);
+			const review = { vaultSync, diff, markdown, blobs, disk, blobDisk, editors };
+			if (!this.isFullRestoreReviewCurrent(snapshotDoc, review)
+				|| findIncoherentMarkdownRestoreReviewPaths(markdownPaths, markdown, disk, editors).length > 0) {
+				throw new Error("Full restore authority changed or has visible divergence. Let sync settle and reopen the snapshot diff.");
+			}
+			return review;
+		} finally { clearTimeout(noticeTimer); }
+	}
+
+	private isFullRestoreReviewCurrent(snapshotDoc: Y.Doc, review: FullVaultRestoreReview): boolean {
+		return this.deps.getVaultSync() === review.vaultSync
+			&& fullRestoreDiffIdentity(diffSnapshot(snapshotDoc, review.vaultSync.ydoc)) === fullRestoreDiffIdentity(review.diff)
+			&& isFullVaultMarkdownRestoreAuthorityCurrent(review.vaultSync.ydoc, review.markdown)
+			&& isBlobRestoreAuthorityCurrent(review.vaultSync.ydoc, review.blobs)
+			&& this.isOpenEditorRestoreAuthorityCurrent(review.editors);
+	}
+
+	/** This safety snapshot is mandatory; unlike the manual command, errors propagate. */
+	private async takeSnapshotNowForRestore(): Promise<SnapshotIndex> {
+		try {
+			if (!this.deps.getServerSupportsSnapshots() || !this.deps.getVaultSync()?.connected) {
+				throw new Error("Snapshot storage is unavailable or the device is offline.");
+			}
+			const settings = this.deps.getSettings();
+			const result = await requestSnapshotNow(settings, settings.deviceName, this.deps.getTraceHttpContext());
+			if (result.status !== "created" || !result.index?.snapshotId) throw new Error(result.reason ?? "Server did not confirm a safety snapshot.");
+			this.invalidateDashboardSnapshotCache();
+			return result.index;
+		} catch (err) {
+			throw new Error(`Pre-restore snapshot failed: ${formatUnknown(err)}`);
+		}
+	}
+
+	private recordFullRestoreEvent(stage: "started" | "completed" | "failed", counts: ReturnType<typeof fullRestoreCounts>, startedAt: number): void {
+		const kind = `recovery.restore.full.${stage}`;
+		const data = { ...counts, durationMs: Date.now() - startedAt };
+		this.deps.trace?.("recovery", kind, data);
+		this.deps.recordFlightEvent?.({ kind, scope: "vault", layer: "recovery", source: "snapshotService",
+			severity: stage === "failed" ? "error" : "info", priority: stage === "failed" ? "critical" : "important", data });
+	}
+
+	/** Hidden plugin backups use the adapter: vault file metadata omits configDir. */
+	private async writeFullRestoreBackup(backupDir: string, path: string, content: string, binary: boolean): Promise<void> {
+		const adapter = this.deps.app.vault.adapter;
+		const backupPath = normalizePath(`${backupDir}/${path}`);
+		const parts = backupPath.split("/").slice(0, -1);
+		for (let i = 1; i <= parts.length; i++) {
+			const parent = parts.slice(0, i).join("/");
+			if (await adapter.exists(parent)) continue;
+			try { await adapter.mkdir(parent); }
+			catch (err) { if (!await adapter.exists(parent)) throw err; }
+		}
+		if (await adapter.exists(backupPath)) throw new Error("Safety backup already exists; reopen the snapshot and retry.");
+		if (binary) await adapter.writeBinary(backupPath, decodeRestoreBytes(content));
+		else await adapter.write(backupPath, content);
+	}
+
+	async restoreEntireVaultFromSnapshot(snapshotDoc: Y.Doc, review: FullVaultRestoreReview): Promise<void> {
+		const startedAt = Date.now();
+		const counts = fullRestoreCounts(review.diff);
+		this.recordFullRestoreEvent("started", counts, startedAt);
+		try {
+			const paths = fullRestorePaths(review.diff);
+			const markdownPaths = [...paths.markdownPaths, ...paths.removeMarkdownPaths];
+			const allBlobPaths = [...paths.blobPaths, ...paths.removeBlobPaths];
+			const mirror = this.deps.getDiskMirror();
+			if (markdownPaths.length > 0 && !mirror) throw new Error("Full restore not started: the disk writer is unavailable.");
+			const assertReview = () => {
+				if (!this.isFullRestoreReviewCurrent(snapshotDoc, review) || mirror !== this.deps.getDiskMirror()) {
+					throw new Error("Live file/editor/attachment authority changed. Reopen the snapshot diff and review again.");
+				}
+			};
+			assertReview();
+			const diskCheck = await commitWithCurrentRestoreDiskAuthority(this.deps.app.vault, review.disk, () => undefined);
+			const blobReader = binaryRestoreAuthorityReader(this.deps.app.vault);
+			const blobCheck = await commitWithCurrentRestoreDiskAuthority(blobReader, review.blobDisk, () => undefined);
+			if (diskCheck.kind === "stale" || blobCheck.kind === "stale") throw new Error("Disk changed after review. Reopen the snapshot diff.");
+			assertReview();
+			new Notice("Creating a safety snapshot and local backups before full restore...");
+			await this.takeSnapshotNowForRestore();
+			assertReview();
+			const backupDir = normalizePath(`${this.deps.app.vault.configDir}/plugins/kaos/restore-backups/${new Date().toISOString().replace(/[:.]/g, "-")}`);
+			const preparation = { preconditions: review.disk };
+			for (const [path, expected] of review.disk) {
+				if (expected.kind === "present") await this.writeFullRestoreBackup(backupDir, path, expected.content, false);
+			}
+			for (const path of allBlobPaths) {
+				const expected = review.blobDisk.get(path);
+				if (!expected) throw new Error("Attachment disk authority was not reviewed.");
+				if (expected.kind === "missing") continue;
+				await this.writeFullRestoreBackup(backupDir, path, expected.content, true);
+			}
+			const blobAttempt = await commitWithCurrentRestoreDiskAuthority(blobReader, review.blobDisk, isCurrent => isCurrent);
+			if (blobAttempt.kind === "stale") throw new Error("Attachment disk changed during backup. Reopen the snapshot diff.");
+			const attempt = await commitWithCurrentRestoreDiskAuthority(this.deps.app.vault, preparation.preconditions, isDiskCurrent => {
+				assertReview();
+				if (!blobAttempt.value()) throw new Error("Attachment disk identity changed during backup.");
+				return restoreFromSnapshot(snapshotDoc, review.vaultSync.ydoc, {
+					...paths, device: this.deps.getSettings().deviceName,
+					expectedMarkdownAuthority: review.markdown, expectedBlobAuthority: review.blobs,
+					canCommitMarkdownRestore: () => this.isFullRestoreReviewCurrent(snapshotDoc, review) && mirror === this.deps.getDiskMirror() && blobAttempt.value(),
+					isMarkdownRestoreDiskAuthorityCurrent: isDiskCurrent,
+				});
+			});
+			if (attempt.kind === "stale") throw new Error("Disk changed during backup. Reopen the snapshot diff.");
+			if (attempt.value.markdownRejected.length || attempt.value.blobRejected.length) {
+				throw new Error("Full restore rejected by file authority or rename collision. Reopen the snapshot diff.");
+			}
+			const contents = this.captureRestoredMarkdownContents(review.vaultSync, paths.markdownPaths);
+			const settlementFailures = await this.settleMarkdownRestores(paths.markdownPaths, preparation.preconditions, contents, mirror);
+			for (const path of paths.removeMarkdownPaths) {
+				try {
+					const expected = review.disk.get(path)!;
+					const removal = await commitWithCurrentRestoreDiskAuthority(this.deps.app.vault, new Map([[path, expected]]), () => {
+						if (captureMarkdownRestoreAuthority(review.vaultSync.ydoc, [path]).get(path)?.fileId !== null) throw new Error("Removed note was revived before trash.");
+						if (expected.kind === "missing") return Promise.resolve();
+						mirror!.prepareRemovalProjection(path);
+						this.deps.getEditorBindings?.()?.unbindByPath(path);
+						return this.deps.app.fileManager.trashFile(expected.fileIdentity);
+					});
+					if (removal.kind === "stale") throw new Error("Removed note changed before trash.");
+					await removal.value;
+					if (this.deps.app.vault.getAbstractFileByPath(path) !== null) throw new Error("Trash did not remove the exact disk file.");
+					await this.deps.removeDiskIndexEntry?.(path);
+				} catch (err) {
+					quarantineUnsettledMarkdownRestore(mirror, path);
+					settlementFailures.push({ path, detail: formatUnknown(err) });
+				}
+			}
+			if (paths.blobPaths.length > 0) this.deps.getBlobSync()?.prioritizeDownloads(paths.blobPaths);
+			this.deps.onEditorsNeedReconcile("snapshot-full-restore");
+			if (settlementFailures.length > 0) throw new Error(`Synced state changed, but ${settlementFailures.length} disk file(s) could not settle. Review Attention; full restore is incomplete.`);
+			this.recordFullRestoreEvent("completed", counts, startedAt);
+			new Notice(`Full restore applied: ${counts.changed + counts.deleted} files restored, ${counts.removed} paths removed. Attachments settle through sync; local backups: ${backupDir}`, 12000);
+		} catch (err) {
+			this.recordFullRestoreEvent("failed", counts, startedAt);
+			new Notice(`Full restore failed: ${formatUnknown(err)}`, 12000);
+			throw err;
+		}
+	}
+
 	/**
 	 * Download a snapshot, compute diff against current CRDT, and show the restore UI.
 	 */
@@ -1200,6 +1377,14 @@ export class SnapshotService {
 					+ `the current disk/open-editor authority: ${incoherentMarkdownPaths.join(", ")}. `
 					+ "Let sync settle or resolve the visible divergence, then reload the snapshot.",
 				);
+			}
+
+			let fullReview: FullVaultRestoreReview | null = null;
+			try {
+				fullReview = await this.captureFullRestoreReview(snapshotDoc, vaultSync);
+				if (fullRestoreDiffIdentity(fullReview.diff) !== fullRestoreDiffIdentity(diff)) fullReview = null;
+			} catch (err) {
+				this.deps.log(`Full restore unavailable for this review: ${formatUnknown(err)}`);
 			}
 
 			new SnapshotDiffModal(
@@ -1408,6 +1593,13 @@ export class SnapshotService {
 					}
 				},
 				cleanup,
+				fullReview ? async () => {
+					try {
+						if (destroyed) throw new Error("Snapshot review closed. Reopen it before restoring.");
+						await this.restoreEntireVaultFromSnapshot(snapshotDoc, fullReview);
+					}
+					finally { cleanup(); }
+				} : undefined,
 			).open();
 		} catch (err) {
 			this.showSnapshotFailure("Failed to load snapshot", "Snapshots", err);

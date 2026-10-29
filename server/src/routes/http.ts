@@ -1,6 +1,6 @@
-const CORS_ALLOW_HEADERS = "Authorization, Content-Type";
+const CORS_ALLOW_HEADERS = "Authorization, Content-Type, X-KAOS-Repair-Token";
 const CORS_ALLOW_METHODS = "GET, POST, PUT, OPTIONS";
-const CORS_EXPOSE_HEADERS = "X-KAOS-Snapshot-Day";
+const CORS_EXPOSE_HEADERS = "X-KAOS-Snapshot-Day, X-KAOS-File-Repair";
 
 export interface HtmlResponseOptions {
 	scriptNonce?: string;

@@ -23,6 +23,7 @@ export interface RecoveryHistoryChangeItem extends RecoveryHistoryFileHistoryIte
 
 export type RecoveryHistoryScope =
 	| { kind: "none" }
+	| { kind: "all" }
 	| { kind: "manifest"; manifestId: string };
 
 export type RecoveryHistoryKindFilter = FileHistoryEntryKind | "all";
@@ -111,7 +112,7 @@ export function filterRecoveryHistoryChanges(
 	const query = filters.query.trim().toLowerCase();
 	return changes.filter((item) => {
 		if (filters.scope.kind === "none") return false;
-		if (item.manifest.manifestId !== filters.scope.manifestId) {
+		if (filters.scope.kind === "manifest" && item.manifest.manifestId !== filters.scope.manifestId) {
 			return false;
 		}
 		if (filters.kindFilter !== "all" && item.entry.kind !== filters.kindFilter) {
@@ -148,19 +149,20 @@ export function resolveRecoveryHistoryFeedState(
 		: { kind: "none" };
 
 	if (options?.initialPath) {
-		const targetPath = options.initialPath.replace(/\\/g, "/");
+		const targetPath = options.initialPath.replace(/\\/g, "/").toLowerCase();
 		const matchingChange = changes.find((item) =>
-			item.entry.path === targetPath ||
-			item.entry.newPath === targetPath ||
-			item.entry.oldPath === targetPath ||
-			item.displayPath === targetPath,
+			item.entry.path.toLowerCase() === targetPath ||
+			(item.entry.newPath && item.entry.newPath.toLowerCase() === targetPath) ||
+			(item.entry.oldPath && item.entry.oldPath.toLowerCase() === targetPath) ||
+			item.displayPath.toLowerCase() === targetPath,
+		) ?? changes.find((item) =>
+			item.entry.path.toLowerCase().endsWith(`/${targetPath}`) ||
+			item.displayPath.toLowerCase().endsWith(`/${targetPath}`),
 		);
-		if (matchingChange) {
-			return {
-				scope: { kind: "manifest", manifestId: matchingChange.manifest.manifestId },
-				selectedChangeKey: matchingChange.key,
-			};
-		}
+		return {
+			scope: { kind: "all" },
+			selectedChangeKey: matchingChange ? matchingChange.key : null,
+		};
 	}
 
 	if (!options?.initialManifestId || !options.initialFileId) {
@@ -266,7 +268,7 @@ export function resolveRecoveryHistoryInitialSelection(
 	};
 }
 
-function searchableRecoveryHistoryText(item: RecoveryHistoryChangeItem): string {
+export function searchableRecoveryHistoryText(item: RecoveryHistoryChangeItem): string {
 	return [
 		item.displayPath,
 		item.entry.path,

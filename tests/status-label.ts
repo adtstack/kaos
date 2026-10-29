@@ -167,6 +167,74 @@ for (const state of allStates) {
 	seen.add(l);
 }
 
+console.log("\n--- Test 6: unsynced summary visibility vs conflict holds ---");
+const onlineState: ConnectionState = { kind: "online", generation: 1 };
+const plainUnsynced = {
+	hasUnsynced: true,
+	unsyncedFileCount: 1,
+	activeUnsyncedChars: 35,
+	activeHasUnsynced: true,
+	conflictHoldCount: 0,
+	activeConflictHold: false,
+};
+const conflictUnsynced = {
+	...plainUnsynced,
+	conflictHoldCount: 1,
+	activeConflictHold: true,
+};
+assert(
+	!getLabelFromConnectionState(onlineState, null, null, 0, plainUnsynced).includes("unsynced"),
+	"online without conflict hold hides plain unsynced residue (transient while online)",
+);
+const onlineConflict = getLabelFromConnectionState(onlineState, null, null, 0, conflictUnsynced);
+assert(onlineConflict.includes("unsynced"), "online with conflict hold shows unsynced signal");
+assert(onlineConflict.includes("(conflict)"), "online conflict hold is marked as conflict");
+assert(
+	getLabelFromConnectionState(onlineState, null, null, 0, null) === "KAOS: Connected",
+	"online without unsynced summary is unaffected",
+);
+const offlinePlain = getLabelFromConnectionState(
+	{ kind: "offline", reason: "provider_disconnected", generation: 1 },
+	null,
+	null,
+	0,
+	plainUnsynced,
+);
+assert(offlinePlain.includes("unsynced"), "offline still shows plain unsynced residue");
+assert(!offlinePlain.includes("(conflict)"), "offline plain residue is not marked as conflict");
+
+console.log("\n--- Test 7: conflict on a non-active file is summarized, not hidden ---");
+const otherFileConflictOnline = {
+	hasUnsynced: true,
+	unsyncedFileCount: 2,
+	activeUnsyncedChars: 5,
+	activeHasUnsynced: true,
+	conflictHoldCount: 1,
+	activeConflictHold: false,
+};
+const otherOnline = getLabelFromConnectionState(onlineState, null, null, 0, otherFileConflictOnline);
+assert(otherOnline.includes("1 sync conflict"), "online label summarizes a non-active conflict hold");
+assert(!otherOnline.includes("(conflict)"), "active plain residue is not mislabeled as the conflict");
+const otherFileConflictOffline = getLabelFromConnectionState(
+	{ kind: "offline", reason: "provider_disconnected", generation: 1 },
+	null,
+	null,
+	0,
+	{ ...otherFileConflictOnline, activeHasUnsynced: false, activeUnsyncedChars: 0 },
+);
+assert(otherFileConflictOffline.includes("1 sync conflict"), "offline label keeps the conflict segment");
+assert(
+	getLabelFromConnectionState(onlineState, null, null, 0, {
+		hasUnsynced: true,
+		unsyncedFileCount: 1,
+		activeUnsyncedChars: 7,
+		activeHasUnsynced: true,
+		conflictHoldCount: 2,
+		activeConflictHold: true,
+	}).includes("1 sync conflict"),
+	"other-file conflicts are counted after the active one is described inline",
+);
+
 console.log(`\n${"─".repeat(50)}`);
 console.log(`Results: ${passed} passed, ${failed} failed`);
 console.log(`${"─".repeat(50)}\n`);

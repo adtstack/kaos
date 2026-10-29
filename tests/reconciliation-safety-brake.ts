@@ -1,3 +1,4 @@
+import { createCertifiedLocalRecoveryFixture } from "./helpers/certified-local-recovery";
 import { MarkdownView, TFile } from "obsidian";
 import * as Y from "yjs";
 import { contentBaselineHash, updateIndex, type DiskIndex } from "../src/sync/diskIndex";
@@ -876,7 +877,9 @@ console.log("\n--- Test 2d: startup open editor content wins before binding can 
 		},
 	};
 
+	const recoveryProof = createCertifiedLocalRecoveryFixture(() => ytext);
 	const vaultSync = {
+		getRemoteTextRevisionForPath: recoveryProof.revision,
 		connected: true,
 		providerSynced: true,
 		getTextForPath: (candidate: string) => candidate === path ? ytext : null,
@@ -910,6 +913,7 @@ console.log("\n--- Test 2d: startup open editor content wins before binding can 
 		}) as any,
 		getBlobSync: () => null,
 		getEditorBindings: () => ({
+			getLocalOnlyRecoveryEvidenceForView: recoveryProof.pane,
 			isBound: () => false,
 		}) as any,
 		getDiskIndex: () => diskIndex,
@@ -1012,7 +1016,9 @@ console.log("\n--- Test 2d1: remote C2 cannot be reverted by the stale open edit
 		},
 	};
 
+	const recoveryProof = createCertifiedLocalRecoveryFixture(() => ytext);
 	const vaultSync = {
+		getRemoteTextRevisionForPath: recoveryProof.revision,
 		connected: true,
 		providerSynced: true,
 		get lastRemoteUpdateAt() { return lastRemoteUpdateAt; },
@@ -1054,6 +1060,7 @@ console.log("\n--- Test 2d1: remote C2 cannot be reverted by the stale open edit
 		}) as any,
 		getBlobSync: () => null,
 		getEditorBindings: () => ({
+			getLocalOnlyRecoveryEvidenceForView: recoveryProof.pane,
 			isBound: () => false,
 			getLastEditorActivityForPath: () => null,
 			getBindingDebugInfoForView: () => null,
@@ -1194,7 +1201,9 @@ console.log("\n--- Test 2e: recent startup typing defers open editor conflict cr
 		},
 	};
 
+	const recoveryProof = createCertifiedLocalRecoveryFixture(() => ytext);
 	const vaultSync = {
+		getRemoteTextRevisionForPath: recoveryProof.revision,
 		connected: true,
 		providerSynced: true,
 		getTextForPath: (candidate: string) => candidate === path ? ytext : null,
@@ -1229,6 +1238,7 @@ console.log("\n--- Test 2e: recent startup typing defers open editor conflict cr
 		}) as any,
 		getBlobSync: () => null,
 		getEditorBindings: () => ({
+			getLocalOnlyRecoveryEvidenceForView: recoveryProof.pane,
 			isBound: () => isOpen,
 			getLastEditorActivityForPath: (candidate: string) =>
 				candidate === path ? Date.now() - 100 : null,
@@ -1359,7 +1369,9 @@ console.log("\n--- Test 2f: startup editor ahead of disk and CRDT defers without
 		},
 	};
 
+	const recoveryProof = createCertifiedLocalRecoveryFixture(() => ytext);
 	const vaultSync = {
+		getRemoteTextRevisionForPath: recoveryProof.revision,
 		connected: true,
 		providerSynced: true,
 		getTextForPath: (candidate: string) => candidate === path ? ytext : null,
@@ -1394,6 +1406,7 @@ console.log("\n--- Test 2f: startup editor ahead of disk and CRDT defers without
 		}) as any,
 		getBlobSync: () => null,
 		getEditorBindings: () => ({
+			getLocalOnlyRecoveryEvidenceForView: recoveryProof.pane,
 			isBound: () => isOpen,
 			getLastEditorActivityForPath: () => null,
 		}) as any,
@@ -1513,7 +1526,7 @@ console.log("\n--- Test 3: reconciliation safety brake leaves blocked overwrites
 
 	const controller = new ReconciliationController({
 		app: app as any,
-		getSettings: () => ({ deviceName: "device" }) as any,
+		getSettings: () => ({ deviceName: "device", enableSafetyBrake: true }) as any,
 		getRuntimeConfig: () => ({
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
@@ -1616,7 +1629,7 @@ console.log("\n--- Test 3b: safety brake still flushes additive creates ---");
 
 	const controller = new ReconciliationController({
 		app: app as any,
-		getSettings: () => ({ deviceName: "device" }) as any,
+		getSettings: () => ({ deviceName: "device", enableSafetyBrake: true }) as any,
 		getRuntimeConfig: () => ({
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
@@ -1746,7 +1759,7 @@ console.log("\n--- Test 4: second reconcile reads blocked paths again ---");
 
 	const controller = new ReconciliationController({
 		app: app as any,
-		getSettings: () => ({ deviceName: "device" }) as any,
+		getSettings: () => ({ deviceName: "device", enableSafetyBrake: true }) as any,
 		getRuntimeConfig: () => ({
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
@@ -1835,12 +1848,15 @@ console.log("\n--- Test 5: bound recovery aborts when CRDT changes after authori
 		},
 	};
 
+	const recoveryProof = createCertifiedLocalRecoveryFixture(() => ytext);
 	const vaultSync = {
+		getRemoteTextRevisionForPath: recoveryProof.revision,
 		getTextForPath: () => ytext,
 	};
 
 	let editorTicketCurrent = true;
 	const editorBindings = {
+		getLocalOnlyRecoveryEvidenceForView: recoveryProof.pane,
 		isBound: () => true,
 		captureOpenEditorMutationTicket: () => ({ path, views: [] }),
 		validateOpenEditorMutationTicket: () => editorTicketCurrent
@@ -1974,11 +1990,14 @@ console.log("\n--- Test 6: bound ambiguous divergence creates a conflict artifac
 		},
 	};
 
+	const recoveryProof = createCertifiedLocalRecoveryFixture(() => ytext);
 	const vaultSync = {
+		getRemoteTextRevisionForPath: recoveryProof.revision,
 		getTextForPath: () => ytext,
 	};
 
 	const editorBindings = {
+		getLocalOnlyRecoveryEvidenceForView: recoveryProof.pane,
 		isBound: () => true,
 		getBindingDebugInfoForView: () => null,
 		getCollabDebugInfoForView: () => null,
@@ -2076,11 +2095,14 @@ console.log("\n--- Test 7: repeated identical recovery fingerprint is quarantine
 		},
 	};
 
+	const recoveryProof = createCertifiedLocalRecoveryFixture(() => ytext);
 	const vaultSync = {
+		getRemoteTextRevisionForPath: recoveryProof.revision,
 		getTextForPath: () => ytext,
 	};
 
 	const editorBindings = {
+		getLocalOnlyRecoveryEvidenceForView: recoveryProof.pane,
 		isBound: () => true,
 		getBindingDebugInfoForView: () => null,
 		getCollabDebugInfoForView: () => null,
@@ -2192,11 +2214,14 @@ console.log("\n--- Test 8: successful recovery clears quarantine fingerprint ---
 		},
 	};
 
+	const recoveryProof = createCertifiedLocalRecoveryFixture(() => ytext);
 	const vaultSync = {
+		getRemoteTextRevisionForPath: recoveryProof.revision,
 		getTextForPath: () => ytext,
 	};
 
 	const editorBindings = {
+		getLocalOnlyRecoveryEvidenceForView: recoveryProof.pane,
 		isBound: () => true,
 		getBindingDebugInfoForView: () => null,
 		getCollabDebugInfoForView: () => null,
@@ -2319,7 +2344,9 @@ console.log("\n--- Test 9: convergence failure does not create infinite conflict
 		},
 	};
 
+	const recoveryProof = createCertifiedLocalRecoveryFixture(() => ytext);
 	const vaultSync = {
+		getRemoteTextRevisionForPath: recoveryProof.revision,
 		getTextForPath: () => {
 			getTextForPathCallCount++;
 			// Return ytext for the first call (syncFileFromDisk's initial check)
@@ -2331,6 +2358,7 @@ console.log("\n--- Test 9: convergence failure does not create infinite conflict
 	};
 
 	const editorBindings = {
+		getLocalOnlyRecoveryEvidenceForView: recoveryProof.pane,
 		isBound: () => true,
 		getBindingDebugInfoForView: () => null,
 		getCollabDebugInfoForView: () => null,
@@ -2430,11 +2458,14 @@ console.log("\n--- Test 10: second reconcile after successful convergence does n
 		},
 	};
 
+	const recoveryProof = createCertifiedLocalRecoveryFixture(() => ytext);
 	const vaultSync = {
+		getRemoteTextRevisionForPath: recoveryProof.revision,
 		getTextForPath: () => ytext,
 	};
 
 	const editorBindings = {
+		getLocalOnlyRecoveryEvidenceForView: recoveryProof.pane,
 		isBound: () => true,
 		getBindingDebugInfoForView: () => null,
 		getCollabDebugInfoForView: () => null,
@@ -2528,11 +2559,14 @@ console.log("\n--- Test 11: artifact creation failure does NOT trigger convergen
 		},
 	};
 
+	const recoveryProof = createCertifiedLocalRecoveryFixture(() => ytext);
 	const vaultSync = {
+		getRemoteTextRevisionForPath: recoveryProof.revision,
 		getTextForPath: () => ytext,
 	};
 
 	const editorBindings = {
+		getLocalOnlyRecoveryEvidenceForView: recoveryProof.pane,
 		isBound: () => true,
 		getBindingDebugInfoForView: () => null,
 		getCollabDebugInfoForView: () => null,

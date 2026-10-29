@@ -787,6 +787,62 @@ console.log("\n--- Test 11: same-TFile microtask write after read cannot enter h
 	liveDoc.destroy();
 }
 
+console.log("\n--- Full restore removal authority and all-or-nothing commit ---");
+for (const schema of [1, 2]) {
+	for (const mode of ["happy", "markdown-race", "blob-race", "snapshot-path", "blob-snapshot-path", "rename", "editor", "disk"] as const) {
+		const snapshot = new Y.Doc();
+		const live = new Y.Doc();
+		const seed = (doc: Y.Doc, path: string, id: string, content: string) => {
+			const text = new Y.Text(); text.insert(0, content);
+			doc.getMap("pathToId").set(path, id); doc.getMap("idToText").set(id, text);
+			doc.getMap("meta").set(id, { path }); doc.getMap("sys").set("schemaVersion", schema);
+		};
+		seed(snapshot, "old.md", "old", "snapshot");
+		seed(live, "old.md", "old", "changed");
+		seed(live, "new.md", "new", "created");
+		snapshot.getMap("pathToBlob").set("old.png", { hash: "snapshot", size: 1 });
+		live.getMap("pathToBlob").set("old.png", { hash: "changed", size: 2 });
+		live.getMap("pathToBlob").set("new.png", { hash: "new", size: 3 });
+		if (mode === "rename") {
+			live.getMap("pathToId").delete("old.md");
+			live.getMap("pathToId").set("new.md", "old");
+			live.getMap("meta").set("old", { path: "new.md" });
+			live.getMap("meta").delete("new");
+		}
+		const markdownAuthority = captureMarkdownRestoreAuthority(live, ["old.md", "new.md"]);
+		const blobAuthority = captureBlobRestoreAuthority(live, ["old.png", "new.png"]);
+		if (mode === "markdown-race") (live.getMap<Y.Text>("idToText").get("new")!).insert(0, "race");
+		if (mode === "blob-race") live.getMap("pathToBlob").set("new.png", { hash: "race", size: 4 });
+		const before = Y.encodeStateAsUpdate(live);
+		const result = restoreFromSnapshot(snapshot, live, {
+			markdownPaths: ["old.md"], blobPaths: ["old.png"],
+			removeMarkdownPaths: [mode === "snapshot-path" ? "old.md" : "new.md"],
+			removeBlobPaths: [mode === "blob-snapshot-path" ? "old.png" : "new.png"],
+			expectedMarkdownAuthority: markdownAuthority, expectedBlobAuthority: blobAuthority,
+			canCommitMarkdownRestore: () => mode !== "editor",
+			isMarkdownRestoreDiskAuthorityCurrent: () => mode !== "disk",
+		});
+		if (mode === "happy") {
+			assert(result.markdownRemoved === 1 && result.blobsRemoved === 1, `schema ${schema}: counts removals`);
+			assert(live.getMap<{ deleted?: boolean }>("meta").get("new")?.deleted === true, `schema ${schema}: markdown tombstone`);
+			assert(!live.getMap("pathToBlob").has("new.png"), `schema ${schema}: blob removed`);
+			assert(live.getMap<{ deletedRef?: BlobRef }>("blobTombstones").get("new.png")?.deletedRef?.hash === "new", `schema ${schema}: remote delete baseline retained`);
+			assert(!diffSnapshot(snapshot, live).createdSinceSnapshot.includes("new.md"), `schema ${schema}: removed path inactive`);
+		} else {
+			assert(result.markdownRejected.length + result.blobRejected.length > 0, `${mode}: rejection`);
+			assert(Buffer.from(Y.encodeStateAsUpdate(live)).equals(Buffer.from(before)), `${mode}: whole union unchanged`);
+		}
+		snapshot.destroy(); live.destroy();
+	}
+	const snapshot = new Y.Doc(); const live = new Y.Doc();
+	const text = new Y.Text(); text.insert(0, "new");
+	live.getMap("pathToId").set("only.md", "only"); live.getMap("idToText").set("only", text);
+	live.getMap("meta").set("only", { path: "only.md" }); live.getMap("sys").set("schemaVersion", schema);
+	const result = restoreFromSnapshot(snapshot, live, { removeMarkdownPaths: ["only.md"], canCommitMarkdownRestore: () => false });
+	assert(result.markdownRejected[0]?.reason === "editor-authority-changed", "removal-only checks external authority");
+	snapshot.destroy(); live.destroy();
+}
+
 if (failed > 0) {
 	console.error(`\n${failed} snapshot restore authority test(s) failed.`);
 	process.exit(1);

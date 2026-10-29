@@ -1,9 +1,9 @@
 {
 	"name": "kaos",
-	"version": "1.13.3",
+	"version": "1.14.1",
 	"releaseVersions": {
-		"server": "0.8.3",
-		"headlessHost": "0.3.3"
+		"server": "0.8.5",
+		"headlessHost": "0.3.5"
 	},
 	"description": "A zero-terminal, real-time sync engine powered by your own Cloudflare Worker.",
 	"main": "main.js",
@@ -49,6 +49,7 @@
 		"qa:compare": "bun run qa/scripts/compare.ts",
 		"qa:analyze": "bun run qa/analyzers/analyzer.ts",
 		"qa:analyze-bundles": "bun run qa/scripts/analyze-bundles.ts",
+		"qa:analyze-editor-causality": "node --import jiti/register qa/scripts/analyze-editor-causality.ts",
 		"qa:prepare": "bun run qa/scripts/prepare-vault.ts",
 		"qa:obsidian": "bun run qa/controllers/single-device.ts",
 		"qa:open-external-merge": "bun run qa/controllers/open-external-merge.ts",

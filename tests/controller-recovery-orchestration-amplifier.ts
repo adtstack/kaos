@@ -21,8 +21,10 @@
  */
 
 import { createHash } from "node:crypto";
-import { MarkdownView, TFile } from "obsidian";
+import { MarkdownView, Notice, TFile } from "obsidian";
 import * as Y from "yjs";
+import { RemoteTextRevisionTracker } from "../src/sync/remoteTextRevisionTracker";
+import { LocalOnlyRecoveryEvidence } from "../src/sync/localOnlyRecoveryEvidence";
 import { ReconciliationController } from "../src/runtime/reconciliationController";
 import type { DiskIngestPort } from "../src/runtime/engineControlPort";
 import {
@@ -110,10 +112,21 @@ interface Fixture {
 	view: MarkdownView;
 	doc: Y.Doc;
 	ytext: Y.Text;
+	provider: object;
 	captured: CapturedEvent[];
 	repairCalls: Array<{ deviceName: string; reason: string }>;
 	transactionOrigins: unknown[];
 	controller: ReconciliationController;
+	setOpen(value: boolean): void;
+	setEvidenceAvailable(value: boolean): void;
+	setMode(value: "guarded" | "pause-automatic-recovery"): void;
+	setHashHook(hook: (() => Promise<void> | void) | null): void;
+	setReadHook(hook: (() => Promise<void> | void) | null): void;
+	invalidateEvidence(): void;
+	clearBaseline(): void;
+	getDiskContent(): string;
+	getBaselineHash(): string | undefined;
+	discarded: string[];
 	setDiskContent(content: string): void;
 	setEditorContent(content: string): void;
 	setLastEditorActivity(value: number | null): void;
@@ -132,6 +145,11 @@ function buildFixture(initial: {
 	bindingHealthy?: boolean;
 }): Fixture {
 	const path = initial.path;
+	let isOpen = true;
+	let evidenceAvailable = true;
+	let mode: "guarded" | "pause-automatic-recovery" = "guarded";
+	let hashHook: (() => Promise<void> | void) | null = null;
+	let readHook: (() => Promise<void> | void) | null = null;
 	let diskContent = initial.disk;
 	let editorContent = initial.editor;
 	let editorRevision = 0;
@@ -147,8 +165,28 @@ function buildFixture(initial: {
 	};
 
 	const doc = new Y.Doc();
-	const ytext = doc.getText("content");
-	ytext.insert(0, initial.crdt);
+	const provider = {};
+	const texts = doc.getMap<Y.Text>("idToText");
+	const tracker = new RemoteTextRevisionTracker(doc, texts, () => provider, () => null);
+	const ytext = new Y.Text(initial.crdt);
+	texts.set("stub-file-id", ytext);
+	const evidence = new LocalOnlyRecoveryEvidence();
+	const paneIdentity = {};
+	// These pre-existing orchestration cases model certified local lag. The
+	// fixture explicitly supplies the missing finalized checkpoint+local edit.
+	const certifyLocalLag = () => {
+		const revision = tracker.get(ytext, "stub-file-id");
+		evidence.update({ identity: paneIdentity, revision, before: null,
+			editor: ytext.toString(), crdt: ytext.toString(), source: "projection", complete: true });
+		evidence.update({ identity: paneIdentity, revision, before: ytext.toString(),
+			editor: editorContent, crdt: ytext.toString(), source: "local", complete: true });
+	};
+	certifyLocalLag();
+	doc.on("afterTransaction", txn => {
+		// Null-origin writes in old scenarios reset the synthetic lag fixture.
+		// Provider and arbitrary origins never fabricate an acknowledgement.
+		if (txn.origin === null) certifyLocalLag();
+	});
 
 	const file = makeTFile(path);
 	const view = new MarkdownView() as MarkdownView & {
@@ -160,6 +198,7 @@ function buildFixture(initial: {
 
 	const captured: CapturedEvent[] = [];
 	const repairCalls: Array<{ deviceName: string; reason: string }> = [];
+	const discarded: string[] = [];
 	const transactionOrigins: unknown[] = [];
 
 	doc.on("afterTransaction", (txn) => {
@@ -175,6 +214,7 @@ function buildFixture(initial: {
 
 	const editorBindings = {
 		isBound: () => true,
+		getLocalOnlyRecoveryEvidenceForView: () => evidenceAvailable ? evidence.get() : null,
 		getBindingDebugInfoForView: () => ({
 			leafId: "stub-leaf-1",
 			storedCmId: "stub-cm-1",
@@ -254,6 +294,7 @@ function buildFixture(initial: {
 		vault: {
 			read: async (f: TFile & { path: string }) => {
 				if (f.path !== path) throw new Error(`unexpected read: ${f.path}`);
+				await readHook?.();
 				return diskContent;
 			},
 			adapter: {
@@ -264,12 +305,14 @@ function buildFixture(initial: {
 		},
 		workspace: {
 			iterateAllLeaves: (cb: (leaf: { view: MarkdownView }) => void) => {
-				cb({ view });
+				if (isOpen) cb({ view });
 			},
 		},
 	};
 
 	const vaultSync = {
+		remoteTextRevisions: tracker,
+		getRemoteTextRevisionForPath: (p: string) => p === path ? tracker.get(ytext, "stub-file-id") : null,
 		getTextForPath: (p: string) => (p === path ? ytext : null),
 		serverAckTracker: {
 			withActiveOpId: (_opId: string | undefined, fn: () => void) => fn(),
@@ -284,6 +327,7 @@ function buildFixture(initial: {
 			maxFileSizeBytes: 0,
 			maxFileSizeKB: 0,
 			excludePatterns: [],
+			automaticRecoveryMode: mode,
 		}) as never,
 		getVaultSync: () => vaultSync as never,
 		getDiskMirror: () => ({
@@ -310,11 +354,13 @@ function buildFixture(initial: {
 		setAwaitingFirstProviderSyncAfterStartup: () => {},
 		saveDiskIndex: async () => {},
 		refreshStatusBar: () => {},
+		computeRecoveryStateHash: async () => { await hashHook?.(); return "fixture-hash"; },
 		trace: () => {},
 		scheduleTraceStateSnapshot: () => {},
 		log: () => {},
 		recordFlightEvent,
 		recordFlightPathEvent,
+		recordDiscardedRevision: (_path, _hash, reason) => { discarded.push(reason); },
 		registerDiskIngestPort: (p: DiskIngestPort) => { diskIngestPort = p; },
 	});
 
@@ -324,14 +370,26 @@ function buildFixture(initial: {
 		view,
 		doc,
 		ytext,
+		provider,
 		captured,
 		repairCalls,
 		transactionOrigins,
 		controller,
+		setOpen: (value) => { isOpen = value; },
+		setEvidenceAvailable: (value) => { evidenceAvailable = value; },
+		setMode: (value) => { mode = value; controller.notifyAutomaticRecoveryPolicyChanged(); },
+		setHashHook: (hook) => { hashHook = hook; },
+		setReadHook: (hook) => { readHook = hook; },
+		invalidateEvidence: () => evidence.invalidate(),
+		clearBaseline: () => { diskIndex = {}; },
+		getDiskContent: () => diskContent,
+		getBaselineHash: () => diskIndex[path]?.contentHash,
+		discarded,
 		setDiskContent: (c) => { diskContent = c; },
 		setEditorContent: (c) => {
 			editorContent = c;
 			editorRevision++;
+			certifyLocalLag();
 		},
 		setLastEditorActivity: (v) => { lastEditorActivity = v; },
 		setBindingHealthy: (h) => { bindingHealthy = h; },
@@ -359,9 +417,9 @@ function buildFixture(initial: {
 // Test 0 — taxonomy bumped, new flight kinds present
 // -------------------------------------------------------------------
 
-console.log("\n--- Test 0: taxonomy bumped to 11, recovery/editor guard kinds defined ---");
+console.log("\n--- Test 0: taxonomy 13, recovery/editor guard kinds defined ---");
 {
-	assertEq(FLIGHT_TAXONOMY_VERSION, 11, "FLIGHT_TAXONOMY_VERSION === 11");
+	assertEq(FLIGHT_TAXONOMY_VERSION, 13, "FLIGHT_TAXONOMY_VERSION === 13");
 	assertEq(
 		FLIGHT_KIND.recoveryAmplificationQuarantined,
 		"recovery.amplification.quarantined",
@@ -658,6 +716,123 @@ console.log("\n--- Scenario 5: unhealthy binding triggers editor.repair.applied 
 	assert(newDecision !== undefined, "healthy pass: recovery.decision emitted");
 	assert(newApplyDone !== undefined, "healthy pass: recovery.apply.done emitted");
 	assert(newRepair === undefined, "healthy pass: NO editor.repair.applied");
+}
+
+// A-T01: a provider update must not be replaced by stale editor/disk bytes.
+{
+ const fix = buildFixture({ path: "Notes/remote-contamination.md", disk: "BASE", editor: "BASE", crdt: "BASE" });
+ fix.setBaselineContent("ANCESTRAL");
+ fix.doc.transact(() => fix.ytext.insert(fix.ytext.length, "-REMOTE"), fix.provider);
+ await fix.ingestDiskFileNow("modify");
+ assertEq(fix.ytext.toString(), "BASE-REMOTE", "A-T01: retain received remote text");
+ assert(fix.captured.some(e => e.kind === FLIGHT_KIND.recoverySkipped && e.data.reason === "local-only-remote-contamination"), "A-T01: typed contamination skip");
+}
+
+// A-T01/A-T03/A-T09: holding is independent of logs, binding presence,
+// elapsed idle time and closing the editor. One episode gets one Notice.
+for (const missingBinding of [false, true]) {
+ const fix = buildFixture({path: `Notes/hold-${missingBinding}.md`, disk: "BASE", editor: "BASE", crdt: "BASE"});
+ fix.setBaselineContent("ANCESTRAL");
+ if (missingBinding) fix.setEvidenceAvailable(false);
+ fix.doc.transact(() => fix.ytext.insert(4, "-REMOTE"), fix.provider);
+ const notices = Notice.calls.length;
+ await fix.ingestDiskFileNow(); await fix.ingestDiskFileNow();
+ assertEq(Notice.calls.length - notices, 1, "A-T09: one Notice per episode");
+ assertEq(fix.captured.filter(e => e.data.reason === "local-only-remote-contamination").length, 1, "A-T09: repeated tick deduplicated");
+ assertEq(fix.controller.getState().automaticRecoveryHeldCount, 1, "A-T09: hold visible without telemetry");
+ fix.setOpen(false);
+ // Exercise the CENTRAL closed-file mutation boundary directly; force/read
+ // flags cannot turn a held identity into an ordinary closed-file import.
+ const attempt = await (fix.controller as any).commitClosedFileReconcileMutation({path:fix.path,file:fix.file,
+  expectedYText:fix.ytext,expectedDiskContent:"BASE",expectedCrdtContent:"BASE-REMOTE",expectedDiskRevision:0,
+  stage:"closed-held-fallback",commit:()=>fix.ytext.delete(4,7)});
+ assertEq(attempt.kind,"stale","A-T03: closed fallback cannot publish held bytes");
+ assertEq(fix.ytext.toString(),"BASE-REMOTE","A-T03: close retains remote input");
+ // Convergence through an existing manual/projection lane releases the hold.
+ fix.setDiskContent("BASE-REMOTE");fix.setEditorContent("BASE-REMOTE");
+ (fix.controller as any).admitAutomaticRecovery(fix.path,fix.ytext,"BASE-REMOTE");
+ assertEq(fix.controller.getState().automaticRecoveryHeldCount,0,"A-T09: convergence releases hold");
+ fix.controller.reset();fix.doc.destroy();
+}
+
+// A-T01: both-changed and absent baselines must block before audit/baseline
+// side effects, preserving both raw sides rather than merely avoiding a diff.
+for (const baseline of ["ANCESTRAL", null]) {
+ const fix=buildFixture({path:`Notes/no-discard-${baseline}.md`,disk:"BASE",editor:"BASE",crdt:"BASE"});
+ if(baseline===null)fix.clearBaseline();else fix.setBaselineContent(baseline);
+ const hash=fix.getBaselineHash();
+ fix.doc.transact(()=>fix.ytext.insert(4,"-REMOTE"),fix.provider);
+ await fix.ingestDiskFileNow();
+ assertEq(fix.getBaselineHash(),hash,"A-T01: blocked episode does not advance baseline");
+ assertEq(fix.getDiskContent(),"BASE","A-T01: blocked episode retains disk bytes");
+ assertEq(fix.discarded.length,0,"A-T01: block occurs before losing-revision audit");
+ assertEq(fix.ytext.toString(),"BASE-REMOTE","A-T01: block retains remote bytes");
+ assertEq(fix.captured.filter(e=>e.kind===FLIGHT_KIND.recoveryApplyDone).length,0,"A-T01: no false recovery apply completion");
+ fix.controller.reset();fix.doc.destroy();
+}
+
+// A-T02: a reflected remote update followed by genuine local lag must pass
+// without a rebind, including an offline/certified fixture.
+{
+ const fix=buildFixture({path:"Notes/remote-then-local.md",disk:"BASE",editor:"BASE",crdt:"BASE"});
+ fix.doc.transact(()=>fix.ytext.insert(4,"-REMOTE"),fix.provider);
+ fix.setEditorContent("BASE-REMOTE");
+ fix.setEditorContent("BASE-REMOTE-LOCAL");fix.setDiskContent("BASE-REMOTE-LOCAL");
+ await fix.ingestDiskFileNow();
+ assertEq(fix.ytext.toString(),"BASE-REMOTE-LOCAL","A-T02: same epoch remote then local lag admitted");
+ fix.controller.reset();fix.doc.destroy();
+}
+
+// A-T04: remote arrival during hashing and during the final disk read,
+// including a provider transaction with unchanged final bytes, goes stale.
+for (const atRead of [false,true]) for (const sameBytes of [false,true]) {
+ const fix=buildFixture({path:`Notes/cas-${atRead}-${sameBytes}.md`,disk:"BASE-LOCAL",editor:"BASE-LOCAL",crdt:"BASE"});
+ let fired=false;
+ const remote=()=>{if(fired)return;fired=true;fix.doc.transact(()=>{
+  if(sameBytes){fix.ytext.delete(0,4);fix.ytext.insert(0,"BASE");}else fix.ytext.insert(4,"-REMOTE");
+ },fix.provider);};
+ fix.setHashHook(()=>{if(atRead)fix.setReadHook(remote);else remote();});
+ await fix.ingestDiskFileNow();
+ assertEq(fired,true,"A-T04: inject actual provider transaction at await boundary");
+ assertEq(fix.ytext.toString(),sameBytes?"BASE":"BASE-REMOTE","A-T04: stale admission cannot apply local snapshot");
+ assertEq(fix.transactionOrigins.filter(o=>o==="disk-sync-recover-bound").length,0,"A-T04: no recovery mutation transaction");
+ fix.controller.reset();fix.doc.destroy();
+}
+
+// A-T01 control/A-T09: CRDT-wins projections are exempt and emergency mode
+// has no unsafe off switch. A new runtime with no checkpoint cannot auto-win.
+{
+ const fix=buildFixture({path:"Notes/paused.md",disk:"LOCAL",editor:"LOCAL",crdt:"BASE"});
+ fix.setMode("pause-automatic-recovery"); await fix.ingestDiskFileNow();
+ assertEq(fix.ytext.toString(),"BASE","A-T09: emergency pauses automatic takeover");
+ assert(fix.captured.some(e=>e.data.detail==="automatic-recovery-paused"),"A-T09: typed emergency detail");
+ fix.setMode("guarded"); await fix.ingestDiskFileNow();
+ assertEq(fix.ytext.toString(),"LOCAL","A-T09: guarded mode resumes certified recovery");
+ fix.controller.reset();fix.doc.destroy();
+ const unverified=buildFixture({path:"Notes/restarted.md",disk:"BASE",editor:"BASE",crdt:"BASE-REMOTE"});
+ unverified.setBaselineContent("ANCESTRAL");unverified.invalidateEvidence();await unverified.ingestDiskFileNow();
+ assertEq(unverified.ytext.toString(),"BASE-REMOTE","A-T06: remoteRevision zero gives no startup authority");
+ unverified.controller.reset();unverified.doc.destroy();
+ const projection=buildFixture({path:"Notes/crdt-wins.md",disk:"BASE",editor:"BASE",crdt:"BASE"});
+ projection.doc.transact(()=>projection.ytext.insert(4,"-REMOTE"),projection.provider);
+ projection.setMode("pause-automatic-recovery");await projection.ingestDiskFileNow();
+ assertEq(projection.controller.getState().automaticRecoveryHeldCount,0,"A-T01: CRDT-wins bypasses automatic posting admission");
+ assertEq(projection.ytext.toString(),"BASE-REMOTE","A-T01: CRDT authority unchanged");
+ projection.controller.reset();projection.doc.destroy();
+}
+
+// A-T10: real inter-document update delivery retains the other replica's input.
+{
+ const fix=buildFixture({path:"Notes/two-replicas.md",disk:"BASE",editor:"BASE",crdt:"BASE"});
+ fix.setBaselineContent("ANCESTRAL");
+ const remote=new Y.Doc();Y.applyUpdate(remote,Y.encodeStateAsUpdate(fix.doc));
+ const text=remote.getMap<Y.Text>("idToText").get("stub-file-id")!;
+ text.insert(text.length,"-DEVICE-A");
+ Y.applyUpdate(fix.doc,Y.encodeStateAsUpdate(remote),fix.provider);
+ await fix.ingestDiskFileNow();Y.applyUpdate(remote,Y.encodeStateAsUpdate(fix.doc));
+ assertEq(fix.ytext.toString(),"BASE-DEVICE-A","A-T10: receiving replica retains device A input");
+ assertEq(text.toString(),"BASE-DEVICE-A","A-T10: no stale replacement propagates back to device A");
+ fix.controller.reset();fix.doc.destroy();remote.destroy();
 }
 
 // -------------------------------------------------------------------

@@ -1,5 +1,5 @@
 export const FLIGHT_EVENT_SCHEMA_VERSION = 1;
-export const FLIGHT_TAXONOMY_VERSION = 11; // bumped: editor authority shield event
+export const FLIGHT_TAXONOMY_VERSION = 13; // automatic local-only recovery admission
 
 export type FlightSeverity = "debug" | "info" | "warn" | "error";
 export type FlightScope =
@@ -32,6 +32,7 @@ export type FlightSource =
 	| "reconciliationController"
 	| "connectionController"
 	| "blobSync"
+	| "snapshotService"
 	| "serverAckTracker"
 	| "traceRuntime"
 	| "diagnostics"
@@ -81,6 +82,7 @@ export const FLIGHT_KIND = {
 
 	// Disk — KAOS writes
 	diskWriteOk: "disk.write.ok",
+	diskWriteCommitted: "disk.write.committed",
 	diskWriteFailed: "disk.write.failed",                  // priority: critical
 
 	// Disk — rename
@@ -131,6 +133,9 @@ export const FLIGHT_KIND = {
 	 * `ReconciliationController.recordFrontmatterIngestBlocked`.
 	 */
 	recoverySkipped: "recovery.skipped",
+	recoveryRestoreFullStarted: "recovery.restore.full.started",
+	recoveryRestoreFullCompleted: "recovery.restore.full.completed",
+	recoveryRestoreFullFailed: "recovery.restore.full.failed",
 
 	// Tombstone / remote delete lifecycle
 	/** Emitted by diskMirror: CRDT remote delete observed, deciding action. */
@@ -150,9 +155,29 @@ export const FLIGHT_KIND = {
 	editorHealApplied: "editor.heal.applied",
 	editorAuthorityShieldApplied: "editor.authority_shield.applied",
 	providerRegressiveDeleteSuspected: "editor.provider_regressive_delete.suspected",
+	editorCausalityObserved: "editor.causality.observed",
+	diskModifyClassified: "disk.modify.classified",
+	bindingDivergenceObserved: "binding.divergence.observed",
 } as const;
 
 export type FlightKind = typeof FLIGHT_KIND[keyof typeof FLIGHT_KIND];
+
+export type BindingDivergenceOrigin =
+	| "composition-active"
+	| "pending-remote-projection"
+	| "recent-reconnect"
+	| "recent-disk-modify"
+	| "tombstone-blocked"
+	| "unknown";
+
+export interface BindingDivergenceObservedData {
+	origin: BindingDivergenceOrigin;
+	leafId: string;
+	editorLength: number;
+	crdtLength: number;
+	remoteRevision: number | null;
+	authorityRevision: number | null;
+}
 
 // -----------------------------------------------------------------------
 // recovery.skipped — typed reason discriminator and frontmatter payload
@@ -175,7 +200,8 @@ export type RecoverySkippedReason =
 	| "recovery-lock-active"
 	| "recent-editor-activity"
 	| "recent-editor-activity-local-only"
-	| "frontmatter-ingest-blocked";
+	| "frontmatter-ingest-blocked"
+	| "local-only-remote-contamination";
 
 /**
  * Closed string-literal union covering every site at which
@@ -351,3 +377,5 @@ export type FlightExportResult =
 			| "write-failed"
 			| "flush-failed";
 	};
+
+export type { LocalOnlyRecoveryBlockDetail, RecoverySkippedLocalOnlyData } from "../../observability/recoveryEventTypes";

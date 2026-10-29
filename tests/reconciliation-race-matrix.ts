@@ -449,7 +449,7 @@ console.log("\n--- Race 4: full reconcile equality cannot publish after provider
 		[path]: { mtime: 1, size: previousBaseline.length, contentHash: previousBaselineHash },
 	};
 	let baselineRecordCount = 0;
-	let editorReadCount = 0;
+	let primaryReadCount = 0;
 	let providerAdvanceQueued = false;
 	const providerOrigin = { provider: "full-settlement-race" };
 	const view = new MarkdownView() as MarkdownView & {
@@ -457,27 +457,23 @@ console.log("\n--- Race 4: full reconcile equality cannot publish after provider
 		editor: { getValue(): string };
 	};
 	view.file = file;
-	view.editor = {
-		getValue: () => {
-			editorReadCount++;
-			if (editorReadCount === 3 && !providerAdvanceQueued) {
-				providerAdvanceQueued = true;
-				queueMicrotask(() => {
-					doc.transact(() => {
-						ytext.delete(0, ytext.length);
-						ytext.insert(0, providerC2);
-					}, providerOrigin);
-				});
-			}
-			return settledC1;
-		},
-	};
+	view.editor = { getValue: () => settledC1 };
 
 	const app = {
 		vault: {
 			getMarkdownFiles: () => [file],
 			read: async (candidate: TFile) => {
 				if (candidate !== file) throw new Error("unexpected full settlement read");
+				primaryReadCount++;
+				// Inject after the final settlement read, independent of how many
+				// additional read-only editor evidence queries the controller makes.
+				if (primaryReadCount === 3 && !providerAdvanceQueued) {
+					providerAdvanceQueued = true;
+					queueMicrotask(() => doc.transact(() => {
+						ytext.delete(0, ytext.length);
+						ytext.insert(0, providerC2);
+					}, providerOrigin));
+				}
 				return settledC1;
 			},
 			adapter: { stat: async () => ({ mtime: 2, size: settledC1.length }) },

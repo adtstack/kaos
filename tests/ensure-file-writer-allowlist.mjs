@@ -13,48 +13,44 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const APPROVED_ENSURE_FILE_WRITERS = Object.freeze([
 	["src/sync/vaultSync.ts", "reconcileVault", "authoritative-disk-snapshot-seed", 1],
-	["src/sync/diskMirror.ts", "handleRemoteDeleteUnlocked", "dirty-local-wins-remote-delete-revival", 1],
 	["src/runtime/reconciliationController.ts", "importUntrackedFiles", "explicit-untracked-disk-import", 1],
 	["src/runtime/reconciliationController.ts", "keepLocalRemoteDeletedMarkdown", "confirmed-attention-keep-local", 1],
 	["src/runtime/reconciliationController.ts", "resolveMarkdownConflictAttention", "confirmed-attention-conflict-keep-local", 1],
+	["src/runtime/reconciliationController.ts", "resolveTombstoneConflictKeepLocal", "confirmed-attention-tombstone-keep-local", 1],
 	["src/runtime/reconciliationController.ts", "syncFileFromDisk", "closed-file-missing-crdt-admission", 1],
-	["src/runtime/reconciliationController.ts", "resolvePreservedUnresolvedFromFreshDiskEvent", "fresh-disk-recovery-admission", 1],
 	["src/runtime/reconciliationController.ts", "handleBoundFileSyncGap", "controller-certified-open-path-admission", 1],
 	["qa/harness/qaDebugApi.ts", "__qaOnlyForceCrdtContentUnsafe", "explicit-qa-force-route", 1],
 ]);
 
 const REQUIRED_SOURCE_MARKERS = Object.freeze(new Map([
 	["authoritative-disk-snapshot-seed", "canSeedSnapshot"],
-	["dirty-local-wins-remote-delete-revival", "isRemoteDeleteOperationCurrent"],
 	["explicit-untracked-disk-import", "shouldBlockFrontmatterIngest"],
 	["confirmed-attention-keep-local", "acquireMarkdownRemoteDeleteResolution"],
 	["confirmed-attention-conflict-keep-local", "shouldBlockFrontmatterIngest"],
+	["confirmed-attention-tombstone-keep-local", "clearTombstonedDiskConflict"],
 	["closed-file-missing-crdt-admission", "commitClosedFileReconcileMutation"],
-	["fresh-disk-recovery-admission", "episodeIsCurrent"],
 	["controller-certified-open-path-admission", "captureOpenEditorMutationTicket"],
 	["explicit-qa-force-route", "__KAOS_QA_HARNESS_ENABLED__"],
 ]));
 
 const APPROVED_WRITER_OWNER_PATHS = Object.freeze(new Map([
 	["authoritative-disk-snapshot-seed", "VaultSync.reconcileVault"],
-	["dirty-local-wins-remote-delete-revival", "DiskMirror.handleRemoteDeleteUnlocked"],
 	["explicit-untracked-disk-import", "ReconciliationController.importUntrackedFiles"],
 	["confirmed-attention-keep-local", "ReconciliationController.keepLocalRemoteDeletedMarkdown.withActiveOpId#arg1"],
 	["confirmed-attention-conflict-keep-local", "ReconciliationController.resolveMarkdownConflictAttention.withActiveOpId#arg1[branch=then]"],
+	["confirmed-attention-tombstone-keep-local", "ReconciliationController.resolveTombstoneConflictKeepLocal.withActiveOpId#arg1"],
 	["closed-file-missing-crdt-admission", "ReconciliationController.syncFileFromDisk.commit[stage=\"open-unbound-disk-seed\"].withActiveOpId#arg1"],
-	["fresh-disk-recovery-admission", "ReconciliationController.resolvePreservedUnresolvedFromFreshDiskEvent.commit[stage=\"preserved-unresolved-fresh-local-event\"].withActiveOpId#arg1[branch=else]"],
 	["controller-certified-open-path-admission", "ReconciliationController.handleBoundFileSyncGap.commitMutation#arg2[arg0=\"bound-file-local-only-seed\"][branch=else][branch=then]"],
 	["explicit-qa-force-route", "buildQaDebugApi.api.__qaOnlyForceCrdtContentUnsafe"],
 ]));
 
 const REQUIRED_MARKER_OWNER_PATHS = Object.freeze(new Map([
 	["authoritative-disk-snapshot-seed", "VaultSync.reconcileVault"],
-	["dirty-local-wins-remote-delete-revival", "DiskMirror.handleRemoteDeleteUnlocked"],
 	["explicit-untracked-disk-import", "ReconciliationController.importUntrackedFiles"],
 	["confirmed-attention-keep-local", "ReconciliationController.keepLocalRemoteDeletedMarkdown"],
 	["confirmed-attention-conflict-keep-local", "ReconciliationController.resolveMarkdownConflictAttention"],
+	["confirmed-attention-tombstone-keep-local", "ReconciliationController.resolveTombstoneConflictKeepLocal"],
 	["closed-file-missing-crdt-admission", "ReconciliationController.syncFileFromDisk"],
-	["fresh-disk-recovery-admission", "ReconciliationController.resolvePreservedUnresolvedFromFreshDiskEvent"],
 	["controller-certified-open-path-admission", "ReconciliationController.handleBoundFileSyncGap"],
 	["explicit-qa-force-route", "buildQaDebugApi.api.__qaOnlyForceCrdtContentUnsafe"],
 ]));

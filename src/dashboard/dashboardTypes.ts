@@ -104,7 +104,8 @@ export interface DashboardAttentionItem {
 		| "blocked-divergence"
 		| "frontmatter-quarantine"
 		| "remote-projection-policy"
-		| "room-divergence";
+		| "room-divergence"
+		| "tombstone-disk-conflict";
 	title: string;
 	path: string | null;
 	detail: string;
@@ -164,14 +165,28 @@ export interface DashboardMarkdownConflictResolution {
 	unavailableReason: string | null;
 }
 
+export interface DashboardTombstoneDiskConflictResolution {
+	kind: "tombstone-disk-conflict";
+	remoteDeleteFingerprint?: string | null;
+	localFileToken?: string;
+	path: string;
+	localFile: DashboardLocalFileIdentity;
+	canKeepLocal: boolean;
+	canAcceptDelete: boolean;
+	keepLocalUnavailableReason: string | null;
+	acceptDeleteUnavailableReason: string | null;
+}
+
 export type DashboardAttentionResolution =
 	| DashboardRemoteDeleteResolution
 	| DashboardLegacyMissingBlobResolution
 	| DashboardStuckLocalMutationResolution
-	| DashboardMarkdownConflictResolution;
+	| DashboardMarkdownConflictResolution
+	| DashboardTombstoneDiskConflictResolution;
 
 export interface DashboardRemoteDeleteResolutionTarget
-	extends DashboardRemoteDeleteResolution {
+	extends Pick<DashboardRemoteDeleteResolution,
+		"kind" | "fileKind" | "reason" | "episodeId" | "remoteDeleteFingerprint" | "localFile"> {
 	path: string;
 }
 
@@ -190,7 +205,15 @@ export interface DashboardMarkdownConflictResolutionTarget
 
 export type DashboardMarkdownConflictResolutionChoice =
 	| "keep-local"
-	| "use-remote";
+	| "use-remote"
+	| { kind: "use-merged"; mergedText: string; expectedLocalText?: string; expectedRemoteText?: string };
+
+export interface DashboardMarkdownConflictReviewSides {
+	path: string;
+	localText: string | null;
+	remoteText: string | null;
+	baseHash: string | null;
+}
 
 export type DashboardMarkdownConflictResolutionResult =
 	| { status: "completed" }
