@@ -84,9 +84,9 @@ export type ClosedFileReconcileAction =
  * Plan the reconcile action for a single closed file.
  *
  * Decision tree:
- *   1. If not authoritative mode → defer to CRDT flush (CRDT wins)
- *   2. If file is open or bound → defer to CRDT flush (live editing takes priority)
- *   3. If disk == CRDT → no-op
+ *   1. If disk == CRDT → no-op
+ *   2. If not authoritative mode → conservative fail-closed: defer destructive projection (no-op)
+ *   3. If file is open or bound → defer to CRDT flush (live editing takes priority)
  *   4. If authoritative + closed + hashes differ → delegate to decideClosedFileConflict
  *      which uses three-way baseline comparison
  */
@@ -106,19 +106,20 @@ export function planClosedFileReconcile(input: ClosedFileReconcileInput): Closed
 		pathBindingReason,
 	} = input;
 
-	// Rule 1: non-authoritative mode → CRDT wins, flush to disk.
-	if (mode !== "authoritative") {
-		return { kind: "defer-to-crdt-flush", path, reason: "non-authoritative-mode" };
-	}
-
-	// Rule 2: file is open or editor-bound → don't touch it during reconcile.
-	if (isOpenOrBound) {
-		return { kind: "defer-to-crdt-flush", path, reason: "open-or-bound" };
-	}
-
-	// Rule 3: disk and CRDT agree → nothing to do.
+	// Rule 1: disk and CRDT agree → nothing to do.
 	if (diskHash === crdtHash) {
 		return { kind: "no-op", path, reason: "disk-equals-crdt" };
+	}
+
+	// Rule 2: non-authoritative mode → conservative fail-closed.
+	// Additive creates and blob downloads continue, destructive projection waits.
+	if (mode !== "authoritative") {
+		return { kind: "no-op", path, reason: "conservative-mode-defer-destructive-projection" };
+	}
+
+	// Rule 3: file is open or editor-bound → don't touch it during reconcile.
+	if (isOpenOrBound) {
+		return { kind: "defer-to-crdt-flush", path, reason: "open-or-bound" };
 	}
 
 	if (pathBindingStatus && pathBindingStatus !== "ok" && pathBindingStatus !== "unknown") {

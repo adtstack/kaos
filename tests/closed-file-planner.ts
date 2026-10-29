@@ -42,11 +42,18 @@ function makeInput(overrides: Partial<ClosedFileReconcileInput> = {}): ClosedFil
 // Non-authoritative mode
 // -----------------------------------------------------------------------
 
-console.log("\n--- Test 1: non-authoritative mode => defer-to-crdt-flush ---");
+console.log("\n--- Test 1: non-authoritative mode differing => defer destructive projection (no-op) ---");
 {
 	const action = planClosedFileReconcile(makeInput({ mode: "conservative" }));
-	assert(action.kind === "defer-to-crdt-flush", "kind is defer-to-crdt-flush");
-	assert(action.reason === "non-authoritative-mode", "reason is non-authoritative-mode");
+	assert(action.kind === "no-op", "kind is no-op");
+	assert(action.reason === "conservative-mode-defer-destructive-projection", "reason is conservative-mode-defer-destructive-projection");
+}
+
+console.log("\n--- Test 1b: non-authoritative mode agreeing => no-op ---");
+{
+	const action = planClosedFileReconcile(makeInput({ mode: "conservative", diskHash: HASH_A, crdtHash: HASH_A }));
+	assert(action.kind === "no-op", "kind is no-op");
+	assert(action.reason === "disk-equals-crdt", "reason is disk-equals-crdt");
 }
 
 // -----------------------------------------------------------------------

@@ -3,9 +3,27 @@ import { chmod, rm } from "node:fs/promises";
 import type { DaemonStatePublisher, HeadlessDaemonStatus } from "./daemonStatePublisher";
 import type { HeadlessVaultPoller } from "../core/vaultPoller";
 
+export interface IpcDivergenceVersions {
+	local: string | null;
+	remote: string | null;
+	base?: string | null;
+}
+
+export interface IpcDivergenceResolution {
+	ok: boolean;
+	reason?: string;
+	conflictPath?: string;
+}
+
+export type IpcPreservedResolution =
+	| { status: "completed" }
+	| { status: "pending"; message: string };
+
 export interface IpcPluginTarget {
 	triggerManualSync?: () => Promise<{ ok: boolean; message?: string }>;
-	resolvePreservedUnresolvedEntry?: (path: string, action: "keep-local" | "accept-delete") => Promise<void>;
+	resolvePreservedUnresolvedEntry?: (path: string, action: "keep-local" | "accept-delete") => Promise<IpcPreservedResolution>;
+	loadDivergenceVersionsForPath?: (path: string) => Promise<IpcDivergenceVersions>;
+	resolveAttentionDivergence?: (path: string, choice: "server" | "local" | "copy") => Promise<IpcDivergenceResolution>;
 }
 
 export interface DaemonIpcServerOptions {
@@ -15,9 +33,16 @@ export interface DaemonIpcServerOptions {
 	poller?: Pick<HeadlessVaultPoller, "pollOnce">;
 }
 
+export type IpcAttentionChoice =
+	| "server"
+	| "local"
+	| "copy"
+	| "keep-local"
+	| "accept-delete";
+
 export interface IpcRequest {
 	id?: string | number;
-	command: "status" | "sync" | "conflicts.list" | "conflicts.resolve" | "ping";
+	command: "status" | "sync" | "conflicts.list" | "conflicts.resolve" | "attention.diff" | "attention.resolve" | "ping";
 	params?: Record<string, unknown>;
 }
 
@@ -174,13 +199,83 @@ export class DaemonIpcServer {
 						error: "plugin does not support online conflict resolution",
 					};
 				}
-				await this.options.plugin.resolvePreservedUnresolvedEntry(path, action);
+				return this.resolvePreservedEntry(req, path, action);
+			}
+			case "attention.diff": {
+				const path = typeof req.params?.path === "string" ? req.params.path : null;
+				if (!path) {
+					return { id: req.id, ok: false, error: "path is required" };
+				}
+				if (!this.options.plugin.loadDivergenceVersionsForPath) {
+					return { id: req.id, ok: false, error: "plugin does not support divergence review" };
+				}
+				const versions = await this.options.plugin.loadDivergenceVersionsForPath(path);
+				return { id: req.id, ok: true, result: versions };
+			}
+			case "attention.resolve": {
+				const path = typeof req.params?.path === "string" ? req.params.path : null;
+				const choice = req.params?.choice;
+				if (!path || typeof choice !== "string") {
+					return {
+						id: req.id,
+						ok: false,
+						error: "path and choice (server | local | copy | keep-local | accept-delete) are required",
+					};
+				}
+				if (choice === "keep-local" || choice === "accept-delete") {
+					if (!this.options.plugin.resolvePreservedUnresolvedEntry) {
+						return { id: req.id, ok: false, error: "plugin does not support online conflict resolution" };
+					}
+					return this.resolvePreservedEntry(req, path, choice);
+				}
+				if (choice !== "server" && choice !== "local" && choice !== "copy") {
+					return {
+						id: req.id,
+						ok: false,
+						error: "choice must be one of: server | local | copy | keep-local | accept-delete",
+					};
+				}
+				if (!this.options.plugin.resolveAttentionDivergence) {
+					return { id: req.id, ok: false, error: "plugin does not support divergence resolution" };
+				}
+				const resolved = await this.options.plugin.resolveAttentionDivergence(path, choice);
 				await this.options.publisher.publishOnce(true).catch(() => undefined);
-				return { id: req.id, ok: true, result: { resolved: path, action } };
+				if (!resolved.ok) {
+					return { id: req.id, ok: false, error: resolved.reason ?? "resolution failed" };
+				}
+				return { id: req.id, ok: true, result: resolved };
 			}
 			default: {
 				return { id: req.id, ok: false, error: `unknown command: ${(req as { command: string }).command}` };
 			}
+		}
+	}
+
+	private async resolvePreservedEntry(
+		req: IpcRequest,
+		path: string,
+		action: "keep-local" | "accept-delete",
+	): Promise<IpcResponse> {
+		try {
+			const outcome = await this.options.plugin.resolvePreservedUnresolvedEntry?.(path, action);
+			if (!outcome || (outcome.status !== "completed" && outcome.status !== "pending")
+				|| (outcome.status === "pending" && typeof outcome.message !== "string")) {
+				throw new Error("Plugin did not confirm the resolution outcome. Update the plugin and headless host together.");
+			}
+			return {
+				id: req.id,
+				ok: true,
+				result: {
+					path,
+					...(req.command === "conflicts.resolve" ? { action } : { choice: action }),
+					...outcome,
+					...(outcome.status === "completed" ? { resolved: path } : {}),
+				},
+			};
+		} catch (error) {
+			return { id: req.id, ok: false, error: error instanceof Error ? error.message : String(error) };
+		} finally {
+			await this.options.publisher.publishOnce(true).catch(() => undefined);
 		}
 	}
 }

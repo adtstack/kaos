@@ -148,6 +148,8 @@ console.log("\n--- Test 3: source-grep static guard for recovery.skipped frontma
 		"crdt-current-no-op",
 		"recovery-lock-active",
 		"recent-editor-activity",
+		"recent-editor-activity-local-only",
+		"local-only-remote-contamination",
 		"frontmatter-ingest-blocked",
 	]) {
 		assert(
@@ -200,10 +202,10 @@ console.log("\n--- Test 3: source-grep static guard for recovery.skipped frontma
 		`recordFrontmatterIngestBlocked covers every typed branch (got ${helperInvocations.length} call sites)`,
 	);
 
-		// FLIGHT_TAXONOMY_VERSION is at 11 (bumped by editor authority shield).
+		// FLIGHT_TAXONOMY_VERSION is at 13 (automatic recovery admission).
 		assert(
-			flight.includes("export const FLIGHT_TAXONOMY_VERSION = 11"),
-			"FLIGHT_TAXONOMY_VERSION at 11",
+			flight.includes("export const FLIGHT_TAXONOMY_VERSION = 13"),
+			"FLIGHT_TAXONOMY_VERSION at 13",
 		);
 	}
 
@@ -249,6 +251,17 @@ console.log("\n--- Test 4: targeted-diff failure is an ordinary persisted markdo
 		!isRemoteDeletePreservedUnresolvedReason(reason),
 		"targeted-diff failure is not misclassified as a remote-delete reason",
 	);
+}
+
+// The product owns the closed admission reason/payload and telemetry re-exports it.
+{
+ const product = file("src/observability/recoveryEventTypes.ts");
+ const flight = file("src/telemetry/debug/flightEvents.ts");
+ const reconciliation = file("src/runtime/reconciliationController.ts");
+ for (const detail of ["initial-authority-unverified", "remote-not-acknowledged", "pane-identity-mismatch", "source-unverified", "admission-stale", "automatic-recovery-paused", "unverified-local-successor"]) {
+  assert(product.includes(`"${detail}"`), `Product admission detail ${detail}`);
+ }
+ assert(flight.includes("RecoverySkippedLocalOnlyData") && reconciliation.includes("RecoverySkippedLocalOnlyData"), "Admission payload shared between product and telemetry");
 }
 
 console.log("\n──────────────────────────────────────────────────");

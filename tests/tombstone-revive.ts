@@ -2,9 +2,9 @@
  * Tombstone revive consistency tests.
  *
  * Validates:
- *   - local create event revives a tombstoned path (ensureFile with reviveTombstone: true)
+ *   - explicit restore revives a tombstoned path (ensureFile with reviveTombstone: true)
  *   - local modify event does NOT revive a tombstoned path (ensureFile with reviveTombstone: false)
- *   - importUntrackedFiles revives tombstoned paths (user explicitly placed file after deletion)
+ *   - importUntrackedFiles never cancels a recorded deletion
  *   - v2 deletedAt tombstone format is recognized
  *   - a healthy live identity is returned without mutating stale tombstones
  *
@@ -108,9 +108,9 @@ function ensuredText(result: EnsureFileResult): Y.Text | null {
 	return result.kind === "created" || result.kind === "existing" ? result.ytext : null;
 }
 
-// ── Test 1: create event revives tombstoned path ──────────────────────────────
+// ── Test 1: explicit restore revives tombstoned path ──────────────────────────────
 
-console.log("\n--- Test 1: create event revives tombstoned path ---");
+console.log("\n--- Test 1: explicit restore revives tombstoned path ---");
 {
 	const doc = new Y.Doc();
 	const idToText = doc.getMap("idToText") as Y.Map<Y.Text>;
@@ -139,7 +139,7 @@ console.log("\n--- Test 1: create event revives tombstoned path ---");
 		reviveTombstone: true,
 		reviveReason: "local-create-event",
 	});
-	assert(revived.kind === "created", "create event revives tombstoned path");
+	assert(revived.kind === "created", "explicit restore revives tombstoned path");
 	assert(ensuredText(revived)?.toString() === "revived content", "revived file has correct content");
 	assert(getMarkdownTombstoneIds(meta, "notes/revived.md").length === 0, "tombstone entries cleared after revive");
 
@@ -211,11 +211,10 @@ console.log("\n--- Test 3: v2 deletedAt tombstone format is recognized ---");
 
 // ── Test 4: importUntrackedFiles revives tombstoned paths ─────────────────────
 
-console.log("\n--- Test 4: importUntrackedFiles should revive tombstoned paths ---");
+console.log("\n--- Test 4: explicit undelete can revive a tombstoned path ---");
 {
-	// This test validates the *policy*: untracked files on disk that have tombstones
-	// should be revived because the user explicitly placed them after deletion.
-	// The actual call from reconciliationController now passes reviveTombstone: true.
+	// Explicit restore authority remains available at the integrity boundary.
+	// Disk import itself must not use this authority (real controller test below).
 
 	const doc = new Y.Doc();
 	const idToText = doc.getMap("idToText") as Y.Map<Y.Text>;
@@ -237,7 +236,7 @@ console.log("\n--- Test 4: importUntrackedFiles should revive tombstoned paths -
 		reviveTombstone: true,
 		reviveReason: "import-untracked-local-file",
 	});
-	assert(result.kind === "created", "importUntrackedFiles revives tombstoned path");
+	assert(result.kind === "created", "explicit undelete revives tombstoned path");
 	assert(ensuredText(result)?.toString() === "reimported content", "reimported file has new content");
 	assert(getMarkdownTombstoneIds(meta, "notes/reimported.md").length === 0, "tombstone cleared after import revive");
 
@@ -470,17 +469,17 @@ console.log("\n--- Test 8: importUntrackedFiles through real ReconciliationContr
 	// Verify ensureFile was called with reviveTombstone: true
 	assert(ensureFileCalls.length === 1, "ensureFile called once during import");
 	assert(
-		ensureFileCalls[0].opts?.reviveTombstone === true,
-		"ensureFile called with reviveTombstone: true",
+		ensureFileCalls[0].opts?.reviveTombstone === false,
+		"import carries no undelete authority",
 	);
 	assert(
-		ensureFileCalls[0].opts?.reviveReason === "import-untracked-local-file",
-		"ensureFile called with correct reviveReason",
+		ensureFileCalls[0].opts?.reviveReason === undefined,
+		"import does not claim explicit recreation",
 	);
 
 	// Verify tombstone was cleared by the mock's real Y.Doc behavior
 	const tombsAfter = getMarkdownTombstoneIds(metaMap, "notes/revived-via-controller.md");
-	assert(tombsAfter.length === 0, "tombstone cleared after controller import");
+	assert(tombsAfter.length === 1, "tombstone remains after controller import");
 
 	// Verify a new entry exists
 	let foundActiveEntry = false;
@@ -489,7 +488,7 @@ console.log("\n--- Test 8: importUntrackedFiles through real ReconciliationContr
 			foundActiveEntry = true;
 		}
 	});
-	assert(foundActiveEntry, "active meta entry exists after revive");
+	assert(!foundActiveEntry, "import creates no active identity for the removed path");
 
 	doc.destroy();
 }

@@ -449,11 +449,11 @@ function buildFixture(opts: {
 
 console.log("\n--- Taxonomy: FLIGHT_TAXONOMY_VERSION ---");
 {
-		// Bumped to 11 by later editor safety specs. This spec does not bump.
+		// Bumped to 13 by automatic recovery admission. This spec does not bump.
 		assertEq(
 			FLIGHT_TAXONOMY_VERSION,
-			11,
-			"FLIGHT_TAXONOMY_VERSION === 11 (no bump for this spec)",
+			13,
+			"FLIGHT_TAXONOMY_VERSION === 13 (no bump for this spec)",
 		);
 	}
 

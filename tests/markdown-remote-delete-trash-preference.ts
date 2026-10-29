@@ -18,7 +18,7 @@
  *   Scenario B: trashFile missing, recoverable vault.trash fallback
  *   Scenario C: both trash mechanisms fail, disk is preserved and quarantined;
  *               irreversible Vault.delete is never called
- *   Scenario D: preserve-revive — no trash, no delete; ensureFile(..., reviveTombstone:true)
+ *   Scenario D: preserve-local — no trash, no delete, no automatic revival
  *   Scenario E: preserve-unresolved — no trash, no delete, no ensureFile;
  *               path enters preservedUnresolved registry
  *
@@ -454,10 +454,10 @@ console.log("\n--- Scenario C2: partial trash failure cannot delete a same-path 
 }
 
 // -------------------------------------------------------------------
-// Scenario D — preserve-revive (local dirty wins over remote delete)
+// Scenario D — preserve-local (local dirty wins over remote delete)
 // -------------------------------------------------------------------
 
-console.log("\n--- Scenario D: preserve-revive does not invoke trash or delete; revives via ensureFile ---");
+console.log("\n--- Scenario D: preserve-local does not invoke trash or delete; keeps the removal authoritative ---");
 {
 	const path = "Notes/scenario-d.md";
 	const baselineText = "scenario-d known baseline";
@@ -471,29 +471,22 @@ console.log("\n--- Scenario D: preserve-revive does not invoke trash or delete; 
 		handleRemoteDelete: (p: string, opts?: { baselineText?: string | null }) => Promise<void>;
 	}).handleRemoteDelete(path, { baselineText });
 
-	assertEq(fix.trashCalls.length, 0, "preserve-revive does not call trashFile");
-	assertEq(fix.deleteCalls.length, 0, "preserve-revive does not call vault.delete");
+	assertEq(fix.trashCalls.length, 0, "preserve-local does not call trashFile");
+	assertEq(fix.deleteCalls.length, 0, "preserve-local does not call vault.delete");
 
 	const appliedEvents = fix.flightEvents.filter((e) => e.kind === "delete.disk.applied");
 	const preservedEvents = fix.flightEvents.filter((e) => e.kind === "delete.preserved");
-	assertEq(appliedEvents.length, 0, "no delete.disk.applied event in preserve-revive branch");
-	assertEq(preservedEvents.length, 1, "exactly one delete.preserved event in preserve-revive branch");
+	assertEq(appliedEvents.length, 0, "no delete.disk.applied event in preserve-local branch");
+	assertEq(preservedEvents.length, 1, "exactly one delete.preserved event in preserve-local branch");
 
-	assertEq(preservedEvents[0]?.data?.preserveKind, "preserve-revive", "preserveKind is preserve-revive");
-	assertEq(preservedEvents[0]?.data?.reason, "local-dirty-wins-over-remote-delete", "preserve-revive reason matches production literal");
+	assertEq(preservedEvents[0]?.data?.preserveKind, "preserve-local", "preserveKind is preserve-local");
+	assertEq(preservedEvents[0]?.data?.reason, "remote-delete-local-conflict", "preserve-local reason matches production literal");
 
-	// Positive proof that the tombstone revive happened.
-	assertEq(fix.ensureFileCalls.length, 1, "preserve-revive revives tombstone through ensureFile");
-	assertEq(fix.ensureFileCalls[0]?.path, path, "ensureFile called with correct path");
-	assertEq(fix.ensureFileCalls[0]?.content, diskContent, "ensureFile content equals disk content");
-	assertEq(fix.ensureFileCalls[0]?.options?.reviveTombstone, true, "preserve-revive uses reviveTombstone: true");
-	assertEq(
-		fix.ensureFileCalls[0]?.options?.reviveReason,
-		"remote-delete-local-dirty-preserved",
-		"preserve-revive uses expected reviveReason",
-	);
+	assertEq(fix.ensureFileCalls.length, 0, "dirty preservation never republishes the removed path");
+	assert(fix.mirror.isPreservedUnresolved(path), "dirty local file is quarantined for explicit recovery");
+	assertEq(fix.mirror.getPreservedUnresolvedEntries()[0]?.reason, "remote-delete-local-conflict", "conflict is actionable as a remote deletion");
 
-	assert(fix.fileExists(path), "file remains in vault after preserve-revive");
+	assert(fix.fileExists(path), "file remains in vault after preserve-local");
 }
 
 // -------------------------------------------------------------------

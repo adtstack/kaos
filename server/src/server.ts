@@ -43,6 +43,8 @@ import {
 	type PersistenceHealth,
 } from "./persistenceCoordinator";
 import { attachConnectionClientKind } from "./connectionMetadata";
+import { commitServerFileRepair, inspectServerFile, FileRepairError } from "./fileRepair";
+import { readRepairBody } from "./routes/fileRepair";
 
 const MAX_DEBUG_TRACE_EVENTS = 200;
 const JOURNAL_COMPACT_MAX_ENTRIES = 50;
@@ -343,6 +345,29 @@ export class VaultSyncServer extends YServer {
 					"Cache-Control": "no-store",
 				},
 			});
+		}
+		if (url.pathname === "/__kaos/file-repair" && (request.method === "GET" || request.method === "POST")) {
+			try {
+				await this.ensureDocumentLoaded();
+				const path = url.searchParams.get("path");
+				if (request.method === "GET") {
+					const response = json(await inspectServerFile(this.document, path));
+					response.headers.set("Cache-Control", "no-store");
+					return response;
+				}
+				const bytes = await readRepairBody(request);
+				const update = await commitServerFileRepair(this.document, path,
+					request.headers.get("X-KAOS-Repair-Token"), bytes);
+				const saved = await this.getPersistenceCoordinator().enqueueSave();
+				if (!saved.success) throw new FileRepairError(503, "repair-persistence-pending");
+				return new Response(update, { headers: {
+					"Content-Type": "application/octet-stream", "Cache-Control": "no-store",
+					"X-KAOS-File-Repair": "1",
+				} });
+			} catch (error) {
+				return json({ error: error instanceof FileRepairError ? error.message : "server-file-unavailable" },
+					error instanceof FileRepairError ? error.status : 503);
+			}
 		}
 
 		if (request.method === "GET" && url.pathname === "/__kaos/debug") {

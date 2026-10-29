@@ -8,6 +8,7 @@ export interface RuntimeConfig {
 	deviceName: string;
 	debug: boolean;
 	frontmatterGuardEnabled: boolean;
+	automaticRecoveryMode?: VaultSyncSettings["automaticRecoveryMode"];
 	excludePatterns: string[];
 	maxFileSizeBytes: number;
 	maxFileSizeKB: number;
@@ -33,6 +34,7 @@ export function buildRuntimeConfig(
 		deviceName: settings.deviceName.trim(),
 		debug: settings.debug,
 		frontmatterGuardEnabled: settings.frontmatterGuardEnabled,
+		automaticRecoveryMode: settings.automaticRecoveryMode,
 		excludePatterns: parseExcludePatterns(settings.excludePatterns),
 		maxFileSizeBytes: settings.maxFileSizeKB * 1024,
 		maxFileSizeKB: settings.maxFileSizeKB,

@@ -163,13 +163,43 @@ console.log("\n--- Test 7: frontmatter growth burst is blocked ---");
 	const next = [
 		"---",
 		"title: Short",
-		`notes: ${"x".repeat(300)}`,
+		`notes: ${"x".repeat(600)}`,
 		"---",
 		"body",
 	].join("\n");
 	const result = validateFrontmatterTransition(previous, next);
 	assert(isFrontmatterBlocked(result), "large frontmatter-only growth burst is blocked");
 	assert(result.reasons.includes("frontmatter-growth-burst"), "growth burst reason is reported");
+}
+
+console.log("\n--- Test 7b: legitimate frontmatter expansion (multi-item array append) is not blocked ---");
+{
+	const previous = [
+		"---",
+		"date: 2026-10-13",
+		"domain:",
+		"  - LIFE",
+		"---",
+		"body",
+	].join("\n");
+	const next = [
+		"---",
+		"date: 2026-10-13",
+		"domain:",
+		"  - LIFE",
+		"  - WORK",
+		"stack:",
+		"  - \"[[📋 Project Alpha - VIEW]]\"",
+		"  - \"[[📋 Project Beta - VIEW]]\"",
+		"  - \"[[📋 Project Gamma - VIEW]]\"",
+		"  - \"[[📋 Project Delta - VIEW]]\"",
+		"  - \"[[📋 Project Epsilon - VIEW]]\"",
+		"---",
+		"body",
+	].join("\n");
+	const result = validateFrontmatterTransition(previous, next);
+	assert(result.risk === "ok", "legitimate frontmatter expansion is ok");
+	assert(!result.reasons.includes("frontmatter-growth-burst"), "growth burst is not reported for normal array append");
 }
 
 console.log("\n--- Test 8: extractor separates frontmatter and body ---");

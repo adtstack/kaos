@@ -20,6 +20,13 @@ export const ORIGIN_EDITOR_AUTHORITY_SHIELD = "editor-authority-shield" as const
 export const ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT = "editor-external-reload-reject" as const;
 export const ORIGIN_OPEN_EXTERNAL_EDIT_MERGE = "open-external-edit-merge" as const;
 export const ORIGIN_LOCAL_TEXT_MUTATION = "local-text-mutation" as const;
+/**
+ * The user explicitly chose to keep the local version for a path whose
+ * automatic recovery is held (`resolveAutomaticRecoveryHold`). The resulting
+ * disk→CRDT diff is a manual decision, not an automatic admission, and must
+ * stay auditable as such.
+ */
+export const ORIGIN_MANUAL_RECOVERY_CHOICE = "manual-recovery-choice" as const;
 
 /**
  * Internal set — not exported directly to prevent mutable cast-away access.
@@ -39,6 +46,7 @@ const LOCAL_STRING_ORIGIN_SET = new Set<string>([
 	ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT,
 	ORIGIN_OPEN_EXTERNAL_EDIT_MERGE,
 	ORIGIN_LOCAL_TEXT_MUTATION,
+	ORIGIN_MANUAL_RECOVERY_CHOICE,
 	ORIGIN_RESTORE,
 ]);
 

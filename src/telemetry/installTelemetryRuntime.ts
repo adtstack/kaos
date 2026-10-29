@@ -64,6 +64,7 @@ export interface TelemetryRuntimeHandle {
 	// Called by main.ts on every path event (from reconciliation, sync)
 	recordFlightPathEvent(event: ProductFlightPathEventInput | FlightPathEventInput): void;
 	recordFlightEvent(event: FlightEventInput): void;
+	readonly contentTraceObserver: import("../observability/traceSink").ContentTraceObserver;
 
 	// Witness notifications from main.ts hot path (passive — marks for re-evaluation)
 	markWitnessDirty(path: string, origin: string): void;
@@ -389,6 +390,7 @@ export async function installTelemetryRuntime(host: TelemetryRuntimeHost): Promi
 			_qaTraceSecretHash = `len:${secret.length}`;
 		}
 		_startDeviceWitnessTracker(resolved);
+		host.getEditorBindings()?.captureCausalitySnapshot("trace-start");
 		new Notice(`Telemetry trace started (mode: ${resolved}).`, 4000);
 	}
 
@@ -505,6 +507,18 @@ export async function installTelemetryRuntime(host: TelemetryRuntimeHost): Promi
 	// -----------------------------------------------------------------------
 
 	function registerTelemetryCommands(plugin: Pick<Plugin, "addCommand">): void {
+		plugin.addCommand({
+			id: "telemetry-mark-editor-rollback",
+			name: "Mark editor rollback",
+			callback: () => {
+				if (!flightTrace?.isEnabled) {
+					new Notice("Start telemetry trace before marking an editor rollback.", 4000);
+					return;
+				}
+				const count = host.getEditorBindings()?.captureCausalitySnapshot("symptom-marked") ?? 0;
+				new Notice(`Editor rollback marked (${count} bound panes sampled).`, 4000);
+			},
+		});
 		// Passive flight trace commands
 		plugin.addCommand({
 			id: "telemetry-trace-start",
@@ -570,6 +584,10 @@ export async function installTelemetryRuntime(host: TelemetryRuntimeHost): Promi
 	const handle: TelemetryRuntimeHandle = {
 		traceSink,
 		recordFlightPathEvent,
+		contentTraceObserver: {
+			isEnabled: () => flightTrace?.canRecordContent ?? false,
+			record: (event, samples) => flightTrace?.recordContentPath(event, samples),
+		},
 		recordFlightEvent(event) {
 			flightTrace?.record(event);
 		},

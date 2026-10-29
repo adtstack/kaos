@@ -52,6 +52,12 @@ export interface VaultSyncSettings {
 	debug: boolean;
 	/** Pause propagation of suspicious YAML frontmatter transitions. */
 	frontmatterGuardEnabled: boolean;
+	/**
+	 * Reconcile safety brake: block CRDT-to-disk overwrites when >20 files and >25% of vault would change.
+	 * Disabled by default so git-backed vaults are never blocked by bulk changes or formatting normalization.
+	 */
+	enableSafetyBrake: boolean;
+	automaticRecoveryMode: "guarded" | "pause-automatic-recovery";
 	/** Legacy device-local prefixes retained for backward compatibility. */
 	excludePatterns: string;
 	/** Maximum file size in KB to sync via CRDT. Files larger are skipped. */
@@ -90,6 +96,8 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 	identityFile: "",
 	debug: false,
 	frontmatterGuardEnabled: true,
+	enableSafetyBrake: false,
+	automaticRecoveryMode: "guarded",
 	excludePatterns: "",
 	maxFileSizeKB: 2048,
 	enableAttachmentSync: true,
@@ -261,12 +269,17 @@ export function readVaultSyncSettings(
 	for (const key of [
 		"debug",
 		"frontmatterGuardEnabled",
+		"enableSafetyBrake",
 		"enableAttachmentSync",
 		"showRemoteCursors",
 		"remoteTypingGuardEnabled",
 		"qaTraceEnabled",
 		"qaDebugMode",
 	] as const) repairBoolean(key);
+	if (settings.automaticRecoveryMode !== "guarded" && settings.automaticRecoveryMode !== "pause-automatic-recovery") {
+		settings.automaticRecoveryMode = "guarded";
+		migrated = true;
+	}
 	if (
 		settings.qaTraceMode !== "safe"
 		&& settings.qaTraceMode !== "qa-safe"

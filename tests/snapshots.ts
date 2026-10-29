@@ -22,6 +22,7 @@
  */
 
 import * as Y from "yjs";
+import { diffSnapshot } from "../src/sync/snapshotClient";
 import { gzipSync, gunzipSync } from "fflate";
 import { readFileSync } from "fs";
 import { resolve } from "path";
@@ -663,8 +664,14 @@ async function main(): Promise<void> {
 	console.log("║     Snapshot Infrastructure Test Suite        ║");
 	console.log("╚═══════════════════════════════════════════════╝");
 
+	{
+		const snapshot = new Y.Doc(); const live = new Y.Doc();
+		live.getMap("pathToBlob").set("created.png", { hash: "new", size: 3 });
+		assertEqual(diffSnapshot(snapshot, live).blobsCreatedSinceSnapshot[0], "created.png", "actual diffSnapshot includes created blobs");
+		snapshot.destroy(); live.destroy();
+	}
 	await testCategory1();
-	await testCategory2();
+	if (process.env.KAOS_SNAPSHOT_PURE_ONLY !== "1") await testCategory2();
 
 	console.log("\n═══════════════════════════════════════════════");
 	console.log(`RESULTS: ${passed} passed, ${failed} failed`);

@@ -1,3 +1,4 @@
+import { LocalOnlyRecoveryEvidence, type LocalOnlyPaneEvidence, type RecoveryEditorSource } from "./localOnlyRecoveryEvidence";
 import {
 	Annotation,
 	Compartment,
@@ -15,10 +16,17 @@ import type { VaultSync } from "./vaultSync";
 import { applyDiffToYText } from "./diff";
 import {
 	buildCompositionAwareCollab,
+	kaosYSyncAnnotation,
 	isCompositionHoldActive,
+	flushCompositionResidue,
+	getViewLastAgreedContent,
+	getViewUnsyncedInfo,
+	isViewConflictHoldActive,
 } from "./compositionAwareYSync";
+import type { UnsyncedEditsSummary } from "../status/statusBarController";
 import type { TraceRecord } from "../observability/traceContext";
-import type { ProductFlightPathEventInput } from "../observability/traceSink";
+import type { ProductFlightPathEventInput, ContentTraceObserver, ContentTraceSamples } from "../observability/traceSink";
+import type { BindingDivergenceOrigin } from "../telemetry/debug/flightEvents";
 import { PRODUCT_EVENT_KIND } from "../observability/productEventKinds";
 import {
 	ORIGIN_DISK_SYNC,
@@ -27,6 +35,7 @@ import {
 	ORIGIN_EDITOR_AUTHORITY_SHIELD,
 	ORIGIN_EDITOR_EXTERNAL_RELOAD_REJECT,
 	ORIGIN_EDITOR_HEALTH_HEAL,
+	isLocalStringOrigin,
 } from "./origins";
 import {
 	buildActiveFileAwareness,
@@ -88,6 +97,17 @@ const CONCURRENT_TYPING_NOTICE_COOLDOWN_MS = 8_000;
  * local mirror), and bind retries recur — notify at most once per minute.
  */
 const EDITOR_DIVERGENCE_NOTICE_COOLDOWN_MS = 60_000;
+/**
+ * Vault-wide cap for the stale-tab divergence notice. Many paused tabs each
+ * passing the per-path cooldown would otherwise stack one Notice per tab;
+ * suppressed paths are summarized on the next globally-cooled emission.
+ */
+const EDITOR_DIVERGENCE_NOTICE_GLOBAL_COOLDOWN_MS = 300_000;
+const TOMBSTONED_BINDING_NOTICE_COOLDOWN_MS = 60_000;
+const TOMBSTONED_BINDING_NOTICE_GLOBAL_COOLDOWN_MS = 300_000;
+const MAX_UNBOUND_DIVERGENCE_RECOVERY_AGE_MS = 300_000;
+/** Timestamp floor, not a flag: successful binds on other panes must not re-open a degraded pane's notice window. */
+const CM_DEGRADED_NOTICE_MIN_INTERVAL_MS = 300_000;
 const EDITOR_AUTHORITY_SHIELD_ORIGINS = new Set<string>([
 	ORIGIN_DISK_SYNC,
 	ORIGIN_DISK_SYNC_RECOVER_BOUND,
@@ -97,6 +117,20 @@ const CM_RESOLVE_RETRY_DELAYS_MS = [80, 160, 320, 640, 1000, 1500, 2000] as cons
 const CM_RESOLVE_DELAYED_ATTEMPT = 5;
 const CM_RESOLVE_IDLE_RETRY_DELAY_MS = 5000;
 const STALE_FILE_TRANSITION_FENCE_MS = 5000;
+
+interface UnboundDivergedViewEvidence {
+	readonly leafId: string;
+	readonly view: MarkdownView;
+	readonly path: string;
+	readonly crdtText: Y.Text;
+	readonly scope: object;
+	readonly authorityRevision: number;
+	readonly remoteRevision: number;
+	divergedAtMs: number;
+	lastObservedEditorContent: string;
+	cachedEvidence: LocalOnlyPaneEvidence | null;
+	baseContent?: string | null;
+}
 
 /** Map from MarkdownView instance id to its binding state. */
 interface EditorBinding {
@@ -383,6 +417,8 @@ export interface BindingPropagationGate {
 }
 
 export class EditorBindingManager {
+	private static observationRuntimeCounter = 0;
+	readonly observationRuntimeId = ++EditorBindingManager.observationRuntimeCounter;
 	/** The CM6 compartment that holds yCollab for each editor. */
 	readonly compartment = new Compartment();
 	/** Makes only the short same-view A -> B adoption window read-only. */
@@ -390,6 +426,12 @@ export class EditorBindingManager {
 
 	/** Track which views are currently bound. Keyed by MarkdownView leaf id. */
 	private bindings = new Map<string, EditorBinding>();
+	private readonly recoveryEditorSnapshots = new WeakMap<Text, string>();
+	private readonly recoveryEvidence = new WeakMap<EditorBinding, LocalOnlyRecoveryEvidence>();
+	private readonly pendingRecoveryEvidence = new WeakMap<EditorBinding, {
+		before: string | null; source: RecoveryEditorSource; state: EditorState;
+	}>();
+	private readonly recoveryEvidenceListeners = new Set<(path: string) => void>();
 	private knownCmViews = new Set<EditorView>();
 	private cmIds = new WeakMap<EditorView, string>();
 	private cmToLeafId = new WeakMap<EditorView, string>();
@@ -399,7 +441,7 @@ export class EditorBindingManager {
 	private pendingHealthChecks = new Map<string, ReturnType<typeof setTimeout>>();
 	private healthWorkInFlight = new Set<string>();
 	private lastDeviceName = "unknown";
-	private cmDegradedWarned = false;
+	private cmDegradedLastNoticeAt = 0;
 	private cmResolveAttempts = new Map<string, number>();
 	private cmResolveDelayedLogged = new Set<string>();
 	private pendingCmResolveRetries = new Map<string, ReturnType<typeof setTimeout>>();
@@ -418,16 +460,27 @@ export class EditorBindingManager {
 	private concurrentTypingNoticeAtByPath = new Map<string, number>();
 	private providerRegressiveNoticeAtByPath = new Map<string, number>();
 	private bindingDivergenceNoticeAtByPath = new Map<string, number>();
+	private bindingDivergenceLastGlobalNoticeAt = 0;
+	private bindingDivergenceSuppressedPaths = new Set<string>();
+	private bindingDivergenceObservedEpisodes = new Set<string>();
+	private readonly bindingDivergenceNoticesByPath = new Map<string, Notice>();
+	private tombstonedBindingNoticeAtByPath = new Map<string, number>();
+	private tombstonedBindingLastGlobalNoticeAt = 0;
+	private readonly unboundDivergedViews = new Map<string, UnboundDivergedViewEvidence>();
 	private pendingExternalDiskMutations = new Map<string, PendingExternalDiskMutation>();
 	private pendingExternalDiskMutationStarts = new Map<string, PendingExternalDiskMutationStart>();
 	private pendingExternalDiskHostProjectionFences =
 		new WeakMap<EditorState, PendingExternalDiskHostProjectionFence>();
 	private recentEditorOriginChanges = new Map<string, RecentEditorOriginChange[]>();
 	private lastExternalDiskMutationSequenceByPath = new Map<string, number>();
+	private lastExternalDiskMutationAtByPath = new Map<string, number>();
 	private observedExternalDiskMutationSequenceByPath = new Map<string, number>();
 	private readonly fileTransitionFences = new Map<MarkdownView, EditorFileTransitionFence>();
 	private readonly activeCompositions = new WeakSet<EditorView>();
 	private readonly debug: boolean;
+	private readonly causalTextIds = new WeakMap<Y.Text, number>();
+	private causalTextCounter = 0;
+	public onResolveDivergenceRequested?: (path: string) => void;
 
 	constructor(
 		private vaultSync: VaultSync,
@@ -441,6 +494,8 @@ export class EditorBindingManager {
 			candidate: InterceptedExternalDiskMutation,
 		) => void,
 		private readonly isExternalDiskReloadGuardEnabled: () => boolean = () => true,
+		private readonly contentTraceObserver?: ContentTraceObserver,
+		private readonly onEditorDocChanged?: () => void,
 	) {
 		this.debug = debug;
 		// Register the reconfigure hook so the harness can trigger CM extension
@@ -460,6 +515,239 @@ export class EditorBindingManager {
 				}
 				void leafId;
 			}
+		});
+	}
+
+	subscribeRecoveryEvidence(listener: (path: string) => void): () => void {
+		this.recoveryEvidenceListeners.add(listener);
+		return () => { this.recoveryEvidenceListeners.delete(listener); };
+	}
+
+	clearUnboundDivergence(path: string): void {
+		for (const [leafId, entry] of this.unboundDivergedViews) {
+			if (entry.path === path) {
+				this.unboundDivergedViews.delete(leafId);
+			}
+		}
+		for (const key of this.bindingDivergenceObservedEpisodes) {
+			if (key.endsWith(`:${path}`)) {
+				this.bindingDivergenceObservedEpisodes.delete(key);
+			}
+		}
+		this.bindingDivergenceNoticeAtByPath.delete(path);
+		this.bindingDivergenceSuppressedPaths.delete(path);
+		this.dismissBindingDivergenceNotice(path);
+	}
+
+	/**
+	 * Binding-layer reaction to a composition conflict hold (editor push is
+	 * frozen because local residue and a remote edit overlap):
+	 *  - invalidate the linear recovery-evidence chain (it can no longer prove
+	 *    a local-only successor),
+	 *  - register divergence evidence (incl. the 3-way base) for the leaf,
+	 *  - notify recovery-evidence listeners so an existing automatic-recovery
+	 *    hold re-evaluates,
+	 *  - refresh the status bar so the freeze is visible immediately, even
+	 *    online and before any keystroke.
+	 * Kept as a method (not an inline closure) so tests drive the production
+	 * wiring rather than a copy of it.
+	 */
+	private handleCompositionConflict(
+		leafId: string,
+		view: MarkdownView,
+		ytext: Y.Text,
+		filePath: string,
+		info: { base: string; editor: string; ytext: string },
+	): void {
+		this.trace?.("editor", "composition-conflict-detected", {
+			path: filePath,
+			leafId,
+			baseLength: info.base.length,
+			editorLength: info.editor.length,
+			ytextLength: info.ytext.length,
+		});
+		const binding = this.bindings.get(leafId);
+		if (binding) {
+			this.recoveryEvidence.get(binding)?.invalidate();
+		}
+		const file = view.file;
+		if (file) {
+			// The read side (getLocalOnlyRecoveryEvidenceForView) rejects entries
+			// whose revision is missing or stale, so without a revision there is
+			// nothing useful to register; the push freeze itself is unaffected.
+			const fileId = this.vaultSync.getFileId(file.path) ?? this.vaultSync.getFileIdForText(ytext);
+			const rev = (fileId && this.vaultSync.remoteTextRevisions)
+				? this.vaultSync.remoteTextRevisions.get(ytext, fileId)
+				: null;
+			if (rev) {
+				this.unboundDivergedViews.set(leafId, {
+					leafId,
+					view,
+					path: file.path,
+					crdtText: ytext,
+					scope: rev.scope,
+					authorityRevision: rev.authorityRevision,
+					remoteRevision: rev.remoteRevision,
+					divergedAtMs: Date.now(),
+					lastObservedEditorContent: info.editor,
+					cachedEvidence: null,
+					baseContent: info.base,
+				});
+			}
+			for (const listener of this.recoveryEvidenceListeners) {
+				listener(file.path);
+			}
+		}
+		this.onEditorDocChanged?.();
+	}
+
+	/**
+	 * Inspects whether any active or open bound editor has local unpushed edits
+	 * compared to lastAgreedContent.
+	 */
+	getUnsyncedEditsSummary(activePath?: string | null): UnsyncedEditsSummary {
+		let unsyncedFileCount = 0;
+		let activeUnsyncedChars = 0;
+		let activeHasUnsynced = false;
+		let conflictHoldCount = 0;
+		let activeConflictHold = false;
+
+		for (const binding of this.bindings.values()) {
+			const info = getViewUnsyncedInfo(binding.cm);
+			const isActive = !!activePath && binding.path === activePath;
+			// A conflict hold freezes both directions (no push, no projection),
+			// so it stays relevant even if the editor text happens to equal the
+			// last agreed base again; count it independently of residue.
+			if (info.conflictHold) {
+				conflictHoldCount++;
+				if (isActive) activeConflictHold = true;
+			}
+			if (info.hasUnsynced) {
+				unsyncedFileCount++;
+				if (isActive) {
+					activeHasUnsynced = true;
+					activeUnsyncedChars = info.charDelta;
+				}
+			}
+		}
+
+		return {
+			hasUnsynced: unsyncedFileCount > 0,
+			unsyncedFileCount,
+			activeUnsyncedChars,
+			activeHasUnsynced,
+			conflictHoldCount,
+			activeConflictHold,
+		};
+	}
+
+	getLocalOnlyRecoveryEvidenceForView(view: MarkdownView): LocalOnlyPaneEvidence | null {
+		const cm = this.getCmView(view);
+		const match = cm ? this.findBindingForCm(cm) : null;
+		if (
+			match &&
+			match.binding.view === view &&
+			match.binding.path === view.file?.path &&
+			this.bindings.get(match.leafId) === match.binding
+		) {
+			const evidence = this.recoveryEvidence.get(match.binding)?.get();
+			if (evidence) return evidence;
+		}
+
+		// Controlled fallback for an open editor whose binding was skipped due to divergence:
+		const path = view.file?.path;
+		if (!path) return null;
+		const leafId = (view.leaf as unknown as { id: string }).id ?? path;
+		const diverged = this.unboundDivergedViews.get(leafId);
+		if (!diverged || diverged.view !== view || diverged.path !== path) return null;
+
+		// 1. Age check: Divergence must be fresh (within 5 minutes).
+		// Ancient tabs (e.g. W39 / days old) must fail-closed to manual review.
+		const ageMs = Date.now() - diverged.divergedAtMs;
+		if (ageMs > MAX_UNBOUND_DIVERGENCE_RECOVERY_AGE_MS) {
+			return null;
+		}
+
+		// 2. Remote check: Verify remote has not advanced since divergence was observed.
+		const rev = this.vaultSync.getRemoteTextRevisionForPath(path);
+		if (!rev) return null;
+		if (rev.scope !== diverged.scope) return null;
+		if (rev.remoteRevision !== diverged.remoteRevision) return null;
+		if (rev.authorityRevision !== diverged.authorityRevision) return null;
+
+		const lastRemoteAdvanced =
+			this.vaultSync.remoteTextRevisions?.getLastRemoteAdvancedAt(diverged.crdtText) ?? 0;
+		if (lastRemoteAdvanced > diverged.divergedAtMs) return null;
+
+		// 3. Editor content: read current editor value
+		let currentContent: string;
+		try {
+			currentContent = view.editor.getValue();
+		} catch {
+			return null;
+		}
+
+		const normalizedCurrent = normalizeEditorText(currentContent);
+		if (diverged.cachedEvidence && diverged.cachedEvidence.content === normalizedCurrent) {
+			return diverged.cachedEvidence;
+		}
+
+		const evidence: LocalOnlyPaneEvidence = Object.freeze({
+			identity: view,
+			scope: rev.scope,
+			authorityRevision: rev.authorityRevision,
+			remoteRevision: rev.remoteRevision,
+			editorRevision: (diverged.cachedEvidence?.editorRevision ?? 0) + 1,
+			content: normalizedCurrent,
+			localSuccessor: true,
+			origin: "unbound-fallback",
+			baseContent: diverged.baseContent ?? null,
+		});
+		diverged.cachedEvidence = evidence;
+		return evidence;
+	}
+
+	private getRecoveryEditorContent(document: Text): string {
+		let content = this.recoveryEditorSnapshots.get(document);
+		if (content === undefined) {
+			content = normalizeEditorText(document.toString());
+			this.recoveryEditorSnapshots.set(document, content);
+		}
+		return content;
+	}
+
+	private queueRecoveryEvidence(binding: EditorBinding, before: string | null, source: RecoveryEditorSource): void {
+		if (!this.vaultSync.remoteTextRevisions) return;
+		const pending = this.pendingRecoveryEvidence.get(binding);
+		if (pending) {
+			pending.state = binding.cm.state;
+			if (source !== "local") pending.source = source;
+			return;
+		}
+		const next = { before, source, state: binding.cm.state };
+		this.pendingRecoveryEvidence.set(binding, next);
+		// Base ViewPlugin may run before ySyncPlugin. A checkpoint is valid only
+		// after both the finalized ViewUpdate and enclosing Yjs cycle finish.
+		queueMicrotask(() => {
+			this.pendingRecoveryEvidence.delete(binding);
+			const cm = binding.cm;
+			if (!cm.dom.isConnected || !binding.view.containerEl.contains(cm.dom) || cm.state !== next.state ||
+				binding.view.file?.path !== binding.path ||
+				this.findBindingForCm(cm)?.binding !== binding) return;
+			let evidence = this.recoveryEvidence.get(binding);
+			if (!evidence) { evidence = new LocalOnlyRecoveryEvidence(); this.recoveryEvidence.set(binding, evidence); }
+			try {
+				const revision = this.vaultSync.getRemoteTextRevisionForPath(binding.path);
+				const crdt = revision ? this.vaultSync.remoteTextRevisions.getNormalizedContent(revision) : null;
+
+				evidence.update({ identity: binding, revision, before: next.before,
+					editor: this.getRecoveryEditorContent(cm.state.doc),
+					crdt: crdt ?? "",
+					source: next.source, normalized: true,
+					complete: crdt !== null && !cm.composing && !this.activeCompositions.has(cm) && !isCompositionHoldActive(cm),
+				});
+			} catch { evidence.invalidate(); }
+			for (const listener of this.recoveryEvidenceListeners) listener(binding.path);
 		});
 	}
 
@@ -630,6 +918,7 @@ export class EditorBindingManager {
 			return;
 		}
 		this.lastExternalDiskMutationSequenceByPath.set(notice.path, notice.sequence);
+		this.lastExternalDiskMutationAtByPath.set(notice.path, Date.now());
 		const now = Date.now();
 		const normalizedDiskContent = notice.content === null
 			? null
@@ -972,7 +1261,6 @@ export class EditorBindingManager {
 		}
 		if (!transition) {
 			this.clearCmResolveRetry(leafId);
-			this.cmDegradedWarned = false;
 		}
 		const cmId = this.getCmId(cm);
 		this.carryCmActivityToPath(cm, file.path);
@@ -1095,7 +1383,6 @@ export class EditorBindingManager {
 			return true;
 		}
 		this.clearCmResolveRetry(leafId);
-		this.cmDegradedWarned = false;
 
 		const existing = this.bindings.get(leafId);
 		if (!existing) {
@@ -1237,6 +1524,7 @@ export class EditorBindingManager {
 		const file = view.file;
 		const leafId =
 			(view.leaf as unknown as { id: string }).id ?? file?.path ?? "unknown";
+		this.unboundDivergedViews.delete(leafId);
 		if (!preserveFileTransitionFence) {
 			this.cancelFileTransition(view, undefined, "unbind");
 		}
@@ -1246,6 +1534,9 @@ export class EditorBindingManager {
 
 		this.clearScheduledHealthCheck(leafId);
 		this.clearCmResolveRetry(leafId);
+		if (file?.path) {
+			this.bindingDivergenceObservedEpisodes.delete(`${leafId}:${file.path}`);
+		}
 		this.healthWorkInFlight.delete(leafId);
 		binding.undoManager.destroy();
 		this.bindings.delete(leafId);
@@ -1290,6 +1581,7 @@ export class EditorBindingManager {
 		this.pendingExternalDiskMutationStarts.clear();
 		this.recentEditorOriginChanges.clear();
 		this.lastExternalDiskMutationSequenceByPath.clear();
+		this.lastExternalDiskMutationAtByPath.clear();
 		this.observedExternalDiskMutationSequenceByPath.clear();
 		this.clearLocalPresence("unbind-all");
 	}
@@ -1829,18 +2121,101 @@ export class EditorBindingManager {
 		const now = Date.now();
 		const lastNoticedAt = this.bindingDivergenceNoticeAtByPath.get(path) ?? 0;
 		if (now - lastNoticedAt < EDITOR_DIVERGENCE_NOTICE_COOLDOWN_MS) return;
+		if (now - this.bindingDivergenceLastGlobalNoticeAt < EDITOR_DIVERGENCE_NOTICE_GLOBAL_COOLDOWN_MS) {
+			this.bindingDivergenceNoticeAtByPath.set(path, now);
+			this.bindingDivergenceSuppressedPaths.add(path);
+			this.trace?.("editor", "binding-divergence-notice-suppressed", {
+				path,
+				suppressedPathCount: this.bindingDivergenceSuppressedPaths.size,
+			});
+			return;
+		}
 		this.bindingDivergenceNoticeAtByPath.set(path, now);
+		this.bindingDivergenceLastGlobalNoticeAt = now;
+		const suppressedCount = this.bindingDivergenceSuppressedPaths.size;
+		let suppressedSummary = "";
+		if (suppressedCount > 0) {
+			const names = [...this.bindingDivergenceSuppressedPaths]
+				.map((p) => `"${p.split("/").pop() ?? p}"`);
+			if (names.length <= 2) {
+				suppressedSummary = `(${suppressedCount} other note${suppressedCount === 1 ? "" : "s"} paused recently: ${names.join(", ")}.) `;
+			} else {
+				const visible = names.slice(0, 2).join(", ");
+				const remaining = names.length - 2;
+				suppressedSummary = `(${suppressedCount} other notes paused recently: ${visible} and ${remaining} more.) `;
+			}
+		}
+		this.bindingDivergenceSuppressedPaths.clear();
 		const noteName = path.split("/").pop() ?? path;
-		new Notice(
+		const notice = new Notice(
 			`KAOS: this tab of "${noteName}" shows an older copy than the synced version, ` +
 				"so sync is paused for it and edits here will not sync. " +
-				"Close and reopen the note to resume syncing.",
-			10000,
+				suppressedSummary,
+			15000,
 		);
+		this.bindingDivergenceNoticesByPath.set(path, notice);
+		const noticeEl = (notice as unknown as { noticeEl?: HTMLElement }).noticeEl;
+		if (noticeEl && this.onResolveDivergenceRequested) {
+			const actionRow = noticeEl.createDiv({ cls: "kaos-notice-action-row" });
+			const resolveBtn = actionRow.createEl("button", {
+				text: "Review & resolve",
+				cls: "mod-cta",
+			});
+			resolveBtn.addEventListener("click", (e) => {
+				e.stopPropagation();
+				this.dismissBindingDivergenceNotice(path);
+				this.onResolveDivergenceRequested?.(path);
+			});
+		}
 		this.trace?.("editor", "binding-divergence-notice-shown", {
 			path,
 			cooldownMs: EDITOR_DIVERGENCE_NOTICE_COOLDOWN_MS,
+			suppressedPathCount: suppressedCount,
 		});
+	}
+
+	/**
+	 * Hide the live "older copy" notice for a path once the tab actually
+	 * binds (or the divergence is resolved), so the 15s message never
+	 * outlives the paused-sync state it describes.
+	 */
+	private dismissBindingDivergenceNotice(path: string): void {
+		const notice = this.bindingDivergenceNoticesByPath.get(path);
+		if (!notice) return;
+		this.bindingDivergenceNoticesByPath.delete(path);
+		try {
+			notice.hide();
+		} catch {
+			// Notice may already be hidden by Obsidian
+		}
+		this.trace?.("editor", "binding-divergence-notice-dismissed", { path });
+	}
+
+	private classifyDivergenceOrigin(
+		_view: MarkdownView,
+		cm: EditorView | null,
+		path: string,
+		ytext: Y.Text | null,
+	): BindingDivergenceOrigin {
+		if (cm && (this.activeCompositions.has(cm) || isCompositionHoldActive(cm) || cm.composing === true)) {
+			return "composition-active";
+		}
+		if (ytext && this.vaultSync.remoteTextRevisions) {
+			const lastAdv = this.vaultSync.remoteTextRevisions.getLastRemoteAdvancedAt(ytext);
+			if (lastAdv > 0 && Date.now() - lastAdv <= 1500) {
+				return "pending-remote-projection";
+			}
+		}
+		const lastConn = this.vaultSync.lastConnectedAt ?? 0;
+		if (lastConn > 0 && Date.now() - lastConn <= 5000) {
+			return "recent-reconnect";
+		}
+		const lastDiskSeq = this.lastExternalDiskMutationSequenceByPath.get(path) ?? 0;
+		const lastDiskAt = this.lastExternalDiskMutationAtByPath.get(path) ?? 0;
+		if (lastDiskSeq > 0 && lastDiskAt > 0 && Date.now() - lastDiskAt <= 5000) {
+			return "recent-disk-modify";
+		}
+		return "unknown";
 	}
 
 	/**
@@ -1931,8 +2306,9 @@ export class EditorBindingManager {
 		source: string,
 		attempts: number,
 	): void {
-		if (this.cmDegradedWarned) return;
-		this.cmDegradedWarned = true;
+		const now = Date.now();
+		if (now - this.cmDegradedLastNoticeAt < CM_DEGRADED_NOTICE_MIN_INTERVAL_MS) return;
+		this.cmDegradedLastNoticeAt = now;
 		new Notice(
 			"KAOS: Live editing is still reconnecting for this note. " +
 			"Background sync is still running; try focusing the editor or reopening the note if cursors do not appear.",
@@ -2723,25 +3099,6 @@ export class EditorBindingManager {
 		};
 	}
 
-	private buildGuardedCollabExtension(
-		leafId: string,
-		binding: EditorBinding,
-	): Extension {
-		if (this.bindingPropagationGate?.isPaused(binding.path)) return [];
-		return [
-			this.createYTextOriginCaptureExtension(
-				binding.ytext,
-				binding.path,
-				leafId,
-			),
-			buildCompositionAwareCollab(
-				binding.ytext,
-				this.vaultSync.provider.awareness,
-				{ undoManager: binding.undoManager },
-			),
-		];
-	}
-
 	private rememberExternalDiskHostProjectionFence(
 		startState: EditorState,
 		fence: PendingExternalDiskHostProjectionFence,
@@ -3053,6 +3410,7 @@ export class EditorBindingManager {
 			// A proof started for an earlier binding/runtime lifetime must not arm a
 			// later editor if its asynchronous read finishes after the transition.
 			this.lastExternalDiskMutationSequenceByPath.set(path, throughSequence);
+			this.lastExternalDiskMutationAtByPath.set(path, Date.now());
 		}
 	}
 
@@ -3359,6 +3717,7 @@ export class EditorBindingManager {
 		path: string,
 		leafId: string,
 		transaction: Y.Transaction,
+		event?: Y.YTextEvent,
 	): void {
 		let revision = this.yTextMutationRevisionByText.get(ytext) ?? 0;
 		if (this.lastYTextMutationTransactionByText.get(ytext) !== transaction) {
@@ -3373,6 +3732,80 @@ export class EditorBindingManager {
 			at: Date.now(),
 			revision,
 		});
+		const binding = this.bindings.get(leafId);
+		if (this.contentTraceObserver?.isEnabled() && binding?.ytext === ytext) {
+			const origin: unknown = transaction.origin;
+			const originKind = origin === this.vaultSync.provider ? "provider"
+				: origin === this.vaultSync.persistence ? "persistence"
+					: typeof origin === "string" && isLocalStringOrigin(origin) ? "local-repair"
+						: origin != null && origin === binding.cm.state.facet(ySyncFacet) ? "editor-binding"
+							: origin instanceof Y.UndoManager ? "undo-manager"
+								: origin == null ? "unspecified" : "other";
+			this.recordCausalState(binding, leafId, "crdt-change", {
+				originKind,
+				originName: typeof origin === "string" && isLocalStringOrigin(origin) ? origin : null,
+				transactionLocal: transaction.local ?? null,
+				insertedChars: event ? event.delta.reduce((sum, item) => sum +
+					(typeof item.insert === "string" ? item.insert.length : item.insert ? 1 : 0), 0) : null,
+				deletedChars: event ? event.delta.reduce((sum, item) => sum + (item.delete ?? 0), 0) : null,
+				// These are CRDT client clocks, not the identity of the sending device.
+				advancedClients: transaction.afterState ? Array.from(transaction.afterState)
+					.filter(([client, clock]) => clock > (transaction.beforeState.get(client) ?? 0))
+					.slice(0, 16).map(([client, clock]) => ({ client, clock })) : [],
+			});
+		}
+	}
+
+	private recordCausalState(
+		binding: EditorBinding, leafId: string, phase: string,
+		data: Record<string, unknown> = {}, samples: ContentTraceSamples = {},
+	): void {
+		if (!this.contentTraceObserver?.isEnabled()) return;
+		try {
+			let yTextId = this.causalTextIds.get(binding.ytext);
+			if (yTextId === undefined) {
+				yTextId = ++this.causalTextCounter;
+				this.causalTextIds.set(binding.ytext, yTextId);
+			}
+			const editor = binding.cm.state.doc.toString();
+			const crdt = binding.ytext.toJSON();
+			this.contentTraceObserver.record({
+				kind: PRODUCT_EVENT_KIND.editorCausalityObserved, priority: "important",
+				severity: "info", scope: "file", source: "editorBinding", layer: "editor",
+				path: binding.path,
+				data: {
+					phase, runtimeId: this.observationRuntimeId,
+					paneId: this.getViewId(binding.view), cmId: binding.cmId, yTextId,
+					bindingEpoch: this.bindingEpochByLeafId.get(leafId) ?? 0,
+					editorRevision: this.editorRevisionByCm.get(binding.cm) ?? 0,
+					editorAuthorityRevision: this.editorAuthorityRevisionByCm.get(binding.cm) ?? 0,
+					yTextRevision: this.yTextMutationRevisionByText.get(binding.ytext) ?? 0,
+					editorEqualsCrdt: editor === crdt,
+					connectionGeneration: this.vaultSync.connectionGeneration ?? null,
+					providerConnected: this.vaultSync.connected ?? null,
+					providerSynced: this.vaultSync.providerSynced ?? null,
+					localPersistenceReady: this.vaultSync.localReady ?? null,
+					lastUserInputAt: this.lastUserDocChangeAtByCm.get(binding.cm) ?? null,
+					composing: this.activeCompositions.has(binding.cm), ...data,
+				},
+			}, { editorAfter: editor, crdt, ...samples });
+		} catch {
+			// Passive observation must never interrupt an editor transaction.
+			this.recordFlightPathEvent?.({
+				kind: PRODUCT_EVENT_KIND.editorCausalityObserved, priority: "critical",
+				severity: "warn", scope: "file", source: "editorBinding", layer: "editor",
+				path: binding.path, data: { phase, captureStatus: "snapshot-unavailable" },
+			});
+		}
+	}
+
+	/** Passive baseline/user marker: reads every currently bound pane. */
+	captureCausalitySnapshot(phase: "trace-start" | "symptom-marked"): number {
+		if (!this.contentTraceObserver?.isEnabled()) return 0;
+		for (const [leafId, binding] of this.bindings) {
+			this.recordCausalState(binding, leafId, phase);
+		}
+		return this.bindings.size;
 	}
 
 	private createYTextOriginCaptureExtension(
@@ -3383,8 +3816,8 @@ export class EditorBindingManager {
 		const recordPatch = this.recordYTextPatch.bind(this);
 		return ViewPlugin.fromClass(
 			class {
-				private readonly handler = (_event: Y.YTextEvent, transaction: Y.Transaction) => {
-					recordPatch(ytext, path, leafId, transaction);
+				private readonly handler = (event: Y.YTextEvent, transaction: Y.Transaction) => {
+					recordPatch(ytext, path, leafId, transaction, event);
 				};
 
 				constructor() {
@@ -3652,12 +4085,50 @@ export class EditorBindingManager {
 			this.deferExternalReloadFilterBypassRollback(update.view, bypass);
 		}
 		this.resyncDroppedBatchEdits(update, match.leafId, match.binding);
+		if (update.docChanged && this.vaultSync.remoteTextRevisions) {
+			const changed = update.transactions.filter(transaction => transaction.docChanged);
+			let source: RecoveryEditorSource = "local";
+			for (const transaction of changed) {
+				const authority = transaction.annotation(EDITOR_AUTHORITY_TRANSACTION);
+				if (this.getExternalReloadFilterBypass(transaction)) { source = "reload"; break; }
+				if (transaction.annotation(kaosYSyncAnnotation)) { source = "projection"; continue; }
+				if (authority?.source === "external-reload-correction") { source = "reload"; break; }
+				if (this.isUserTransaction(transaction) || authority?.source === "editor-api") continue;
+				// Incremental editor-API successors can carry no userEvent. A whole
+				// document reload or host `set` without provenance cannot grant authority.
+				let wholeReplacement = false;
+				transaction.changes.iterChangedRanges((from, to) => {
+					if (from === 0 && to === transaction.startState.doc.length) wholeReplacement = true;
+				});
+				if (wholeReplacement || transaction.annotation(Transaction.userEvent) === "set") { source = "unknown"; break; }
+			}
+			this.queueRecoveryEvidence(match.binding, changed[0] ? this.getRecoveryEditorContent(changed[0].startState.doc) : null, source);
+		}
+		if (update.docChanged && this.contentTraceObserver?.isEnabled()) {
+			const changed = update.transactions.filter(transaction => transaction.docChanged);
+			this.recordCausalState(match.binding, match.leafId, "editor-update", {
+				transactionCount: update.transactions.length,
+				userDocChanged: userDocumentEdit,
+				nonUserDocChanged: changed.some(transaction => !this.isUserTransaction(transaction)),
+				undoOrRedo: changed.some(transaction => transaction.isUserEvent("undo") || transaction.isUserEvent("redo")),
+				externalReloadBypass: externalReloadBypasses.length > 0,
+			}, { editorBefore: changed[0]?.startState.doc.toString() ?? null });
+		}
 		if (update.docChanged) {
 			this.scheduleHealthCheck(
 				match.leafId,
 				LIVE_UPDATE_HEALTH_RETRY_DELAY_MS,
 				"live-update",
 			);
+			// Online residue is normally transient (realtime push), but a
+			// conflict hold freezes the push, so its counter must stay live.
+			if (
+				!this.vaultSync.connected ||
+				!this.vaultSync.providerSynced ||
+				isViewConflictHoldActive(update.view)
+			) {
+				this.onEditorDocChanged?.();
+			}
 		}
 	}
 
@@ -4102,6 +4573,8 @@ export class EditorBindingManager {
 			return false;
 		}
 
+		this.unboundDivergedViews.delete(leafId);
+
 		const undoManager = new Y.UndoManager(ytext);
 
 		this.vaultSync.provider.awareness.setLocalStateField("user", {
@@ -4137,6 +4610,12 @@ export class EditorBindingManager {
 							ytextLength: info.ytextLength,
 							mergedLength: info.mergedLength,
 						});
+						// A flush may have released a conflict hold; keep the
+						// status bar's conflict marker in step.
+						this.onEditorDocChanged?.();
+					},
+					onConflict: (info) => {
+						this.handleCompositionConflict(leafId, view, ytext, filePath, info);
 					},
 				},
 			},
@@ -4145,6 +4624,7 @@ export class EditorBindingManager {
 			this.createYTextOriginCaptureExtension(ytext, filePath, leafId),
 			collabExtension,
 		];
+		const causalBefore = this.contentTraceObserver?.isEnabled() ? cm.state.doc.toString() : null;
 
 		try {
 			cm.dispatch({
@@ -4211,13 +4691,23 @@ export class EditorBindingManager {
 			lastEditorDocChangeAtMs,
 			settleWindowMs,
 		});
+		this.dismissBindingDivergenceNotice(filePath);
 		const binding = this.bindings.get(leafId);
 		if (binding) {
 			this.publishLocalActiveFile(binding);
+			this.recordCausalState(binding, leafId, "binding-applied", {
+				action, reason: reason ?? null,
+			}, { editorBefore: causalBefore });
 		}
 		this.cmToLeafId.set(cm, leafId);
+		if (this.vaultSync.remoteTextRevisions) {
+			const syncConfig = cm.state.facet(ySyncFacet);
+			if (syncConfig) this.vaultSync.remoteTextRevisions.registerEditorOrigin(syncConfig);
+		}
+		if (binding) this.queueRecoveryEvidence(binding, null, "projection");
 		this.finishFileTransition(view, filePath, "target-bound");
 		this.schedulePostBindHealthCheck(leafId, settleWindowMs);
+		this.bindingDivergenceObservedEpisodes.delete(`${leafId}:${filePath}`);
 		this.trace?.("editor", "binding-applied", {
 			action,
 			leafId,
@@ -4481,16 +4971,139 @@ export class EditorBindingManager {
 				});
 				return null;
 			}
-			const crdtContent = existingText.toJSON();
-			const contentDiverged =
+			let crdtContent = existingText.toJSON();
+			let contentDiverged =
 				currentContent !== crdtContent &&
 				normalizeEditorText(currentContent) !== normalizeEditorText(crdtContent);
 			if (contentDiverged && !reason.startsWith("heal")) {
+				const liveCm = this.getCmView(view);
+				if (liveCm && flushCompositionResidue(liveCm, "binding-target-divergence-probe")) {
+					crdtContent = existingText.toJSON();
+					contentDiverged =
+						currentContent !== crdtContent &&
+						normalizeEditorText(currentContent) !== normalizeEditorText(crdtContent);
+					if (!contentDiverged) {
+						this.trace?.("editor", "binding-target-divergence-healed-by-residue-flush", {
+							path: file.path,
+							leafId: (view.leaf as unknown as { id: string }).id ?? file.path,
+							reason,
+						});
+					}
+				}
+			}
+			if (contentDiverged && !reason.startsWith("heal")) {
+				const fence = this.fileTransitionFences.get(view);
+				const freshTransitionActive = !!fence
+					&& fence.targetPath === file.path
+					&& Date.now() - fence.startedAtMs < STALE_FILE_TRANSITION_FENCE_MS;
+				const editorEmptyWhileFileHasContent =
+					currentContent.length === 0
+					&& crdtContent.length > 0
+					&& (file.stat?.size ?? 0) > 0;
+				if (freshTransitionActive || editorEmptyWhileFileHasContent) {
+					// The editor facade may still be settling into the document it
+					// just opened (empty, or mid-switch residue). Refusing here
+					// would fire a false "older copy" notice; retry until the
+					// facade agrees with the file, then judge the divergence.
+					const leafId =
+						(view.leaf as unknown as { id: string }).id ?? file.path;
+					this.trace?.("editor", "binding-divergence-deferred-loading", {
+						path: file.path,
+						leafId,
+						reason,
+						freshTransitionActive,
+						editorEmpty: currentContent.length === 0,
+						crdtLength: crdtContent.length,
+					});
+					this.log(
+						`resolveBindingTarget: deferring divergence verdict for "${file.path}" ` +
+						`(editor still loading, reason=${reason})`,
+					);
+					this.scheduleCmResolveRetry(
+						view,
+						_deviceName,
+						leafId,
+						"divergence-verdict-deferred-loading",
+					);
+					return null;
+				}
+				const leafId =
+					(view.leaf as unknown as { id: string }).id ?? file.path;
+				const fileId = this.vaultSync.getFileId(file.path) ?? this.vaultSync.getFileIdForText(existingText);
+				const rev = (fileId && this.vaultSync.remoteTextRevisions)
+					? this.vaultSync.remoteTextRevisions.get(existingText, fileId)
+					: null;
+				if (rev) {
+					const existingEvidence = this.unboundDivergedViews.get(leafId);
+					const liveCm = this.getCmView(view);
+					const baseContent = getViewLastAgreedContent(liveCm);
+					if (
+						!existingEvidence ||
+						existingEvidence.path !== file.path ||
+						existingEvidence.scope !== rev.scope ||
+						existingEvidence.authorityRevision !== rev.authorityRevision ||
+						existingEvidence.remoteRevision !== rev.remoteRevision
+					) {
+						this.unboundDivergedViews.set(leafId, {
+							leafId,
+							view,
+							path: file.path,
+							crdtText: existingText,
+							scope: rev.scope,
+							authorityRevision: rev.authorityRevision,
+							remoteRevision: rev.remoteRevision,
+							divergedAtMs: Date.now(),
+							lastObservedEditorContent: currentContent,
+							cachedEvidence: null,
+							baseContent: baseContent ?? null,
+						});
+					} else {
+						existingEvidence.lastObservedEditorContent = currentContent;
+						if (baseContent && !existingEvidence.baseContent) {
+							existingEvidence.baseContent = baseContent;
+						}
+					}
+					for (const listener of this.recoveryEvidenceListeners) {
+						listener(file.path);
+					}
+				}
+
+				const episodeKey = `${leafId}:${file.path}`;
+				if (!this.bindingDivergenceObservedEpisodes.has(episodeKey)) {
+					this.bindingDivergenceObservedEpisodes.add(episodeKey);
+					const liveCm = this.getCmView(view);
+					const origin = this.classifyDivergenceOrigin(view, liveCm, file.path, existingText);
+					this.trace?.("editor", "binding-divergence-first-observed", {
+						path: file.path,
+						leafId,
+						origin,
+						editorLength: currentContent.length,
+						crdtLength: crdtContent.length,
+						remoteRevision: rev?.remoteRevision ?? null,
+						authorityRevision: rev?.authorityRevision ?? null,
+					});
+					this.recordFlightPathEvent?.({
+						priority: "important",
+						kind: PRODUCT_EVENT_KIND.bindingDivergenceObserved,
+						severity: "warn",
+						scope: "file",
+						source: "editorBinding",
+						layer: "editor",
+						path: file.path,
+						data: {
+							origin,
+							leafId,
+							editorLength: currentContent.length,
+							crdtLength: crdtContent.length,
+							remoteRevision: rev?.remoteRevision ?? null,
+							authorityRevision: rev?.authorityRevision ?? null,
+						},
+					});
+				}
 				this.trace?.("editor", "binding-target-editor-diverged", {
 					path: file.path,
 					reason,
-					leafId:
-						(view.leaf as unknown as { id: string }).id ?? file.path,
+					leafId,
 					editorLength: currentContent.length,
 					crdtLength: crdtContent.length,
 				});
@@ -4574,6 +5187,41 @@ export class EditorBindingManager {
 			`binding blocked by tombstone for "${file.path}" ` +
 			`(leaf=${leafId}, reason=${reason})`,
 		);
+
+		const now = Date.now();
+		const lastPathNotice = this.tombstonedBindingNoticeAtByPath.get(file.path) ?? 0;
+		if (
+			now - lastPathNotice >= TOMBSTONED_BINDING_NOTICE_COOLDOWN_MS &&
+			now - this.tombstonedBindingLastGlobalNoticeAt >= TOMBSTONED_BINDING_NOTICE_GLOBAL_COOLDOWN_MS
+		) {
+			this.tombstonedBindingNoticeAtByPath.set(file.path, now);
+			this.tombstonedBindingLastGlobalNoticeAt = now;
+			const noteName = file.path.split("/").pop() ?? file.path;
+			new Notice(
+				`KAOS: "${noteName}" is recorded as deleted in sync. Edits in this tab will not sync. Check Attention in Dashboard to resolve.`,
+				10000,
+			);
+		}
+
+		const editorLength = view.editor?.getValue()?.length ?? 0;
+		this.recordFlightPathEvent?.({
+			priority: "important",
+			kind: PRODUCT_EVENT_KIND.bindingDivergenceObserved,
+			severity: "warn",
+			scope: "file",
+			source: "editorBinding",
+			layer: "editor",
+			path: file.path,
+			data: {
+				origin: "tombstone-blocked",
+				leafId,
+				editorLength,
+				crdtLength: 0,
+				remoteRevision: null,
+				authorityRevision: null,
+			},
+		});
+
 		if (existing) {
 			this.unbind(view);
 		}

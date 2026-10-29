@@ -215,4 +215,81 @@ console.log("\n--- Dashboard conflict resolution CAS + artifact trash ---");
 	}
 }
 
+// Test per-file Delete backup button action on safety copies
+{
+	let pendingConfirm: Promise<void> | void;
+	const originalOpen = ConfirmModal.prototype.open;
+	try {
+		ConfirmModal.prototype.open = function openAndConfirm(): void {
+			pendingConfirm = (this as unknown as { onConfirm(): void | Promise<void> }).onConfirm();
+		};
+		const vault = new FakeVault();
+		const backupPath = "scripts/watcher (KAOS local backup 2026-10-07T04-00-00Z 1234567812345678).js";
+		vault.add(backupPath, "backup content");
+		let refreshed = false;
+		const app = {
+			vault,
+			fileManager: {
+				trashFile: async (file: FakeTFile) => vault.trash(file, true),
+			},
+		};
+		const view = new KaosDashboardView(
+			{ app } as any,
+			{
+				collectData: async () => ({}) as any,
+				actions: {} as any,
+			},
+		);
+		(view as any).refresh = async () => { refreshed = true; };
+		const copy = {
+			kind: "blob",
+			artifactPath: backupPath,
+			inferredOriginalPath: "scripts/watcher.js",
+			originalExists: true,
+		} as DashboardConflictArtifact;
+		await (view as any).confirmDeleteSafetyCopy(copy);
+		await pendingConfirm;
+		assert.equal(vault.trashCalls, 1, "safety copy was trashed");
+		assert.equal(vault.files.has(backupPath), false, "backup removed from vault");
+		assert.equal(refreshed, true, "dashboard view refreshed after deletion");
+	} finally {
+		ConfirmModal.prototype.open = originalOpen;
+	}
+}
+
+// Test per-file Acknowledge & clear button action on attention items
+{
+	let pendingConfirm: Promise<void> | void;
+	const originalOpen = ConfirmModal.prototype.open;
+	try {
+		ConfirmModal.prototype.open = function openAndConfirm(): void {
+			pendingConfirm = (this as unknown as { onConfirm(): void | Promise<void> }).onConfirm();
+		};
+		let dismissedPath: string | null = null;
+		let refreshed = false;
+		const app = { vault: new FakeVault() };
+		const view = new KaosDashboardView(
+			{ app } as any,
+			{
+				collectData: async () => ({}) as any,
+				actions: {
+					dismissAttentionEntry: async (p: string) => { dismissedPath = p; },
+				} as any,
+			},
+		);
+		(view as any).refresh = async () => { refreshed = true; };
+		const attentionItem = {
+			path: "ARCHIVES/test.md",
+			title: "Path collision",
+			detail: "path-collision",
+		} as any;
+		await (view as any).confirmAcknowledgeAttention(attentionItem);
+		await pendingConfirm;
+		assert.equal(dismissedPath, "ARCHIVES/test.md", "attention item was dismissed via action");
+		assert.equal(refreshed, true, "dashboard view refreshed after acknowledgment");
+	} finally {
+		ConfirmModal.prototype.open = originalOpen;
+	}
+}
+
 console.log("PASS dashboard conflict resolution CAS + artifact trash");

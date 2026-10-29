@@ -89,6 +89,7 @@ interface AttachmentOrchestratorDeps {
 	onPreservedUnresolvedChanged(): void;
 	persistPreservedUnresolvedChanged(): Promise<void>;
 	hasPendingBlobIntentForPath(path: string): boolean;
+	isFileRepairPaused?(path: string): boolean;
 	replayPendingBlobIntents(reason: string): Promise<void>;
 	trace: TraceRecord;
 	scheduleTraceStateSnapshot(reason: string): void;
@@ -242,7 +243,7 @@ export class AttachmentOrchestrator {
 				path,
 				this.deps.getExcludePatterns(),
 				this.deps.app.vault.configDir,
-			) && !this.deps.hasPendingBlobIntentForPath(path),
+			) && !this.deps.hasPendingBlobIntentForPath(path) && !this.deps.isFileRepairPaused?.(path),
 			this.deps.getBlobSettledRefs(),
 			(path, ref) => {
 				if (!this.isManagerAuthorityCurrent(blobSync)) return;

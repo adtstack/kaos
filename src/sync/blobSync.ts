@@ -2162,6 +2162,103 @@ export class BlobSyncManager {
 		}
 	}
 
+	/** Explicit server-file repair; shares exact backup, swap and settlement machinery. */
+	async repairFileFromServer(
+		path: string,
+		ref: BlobRef,
+		commitRemote: () => Promise<void>,
+		canCommit: () => boolean,
+	): Promise<{ safetyCopyPath: string | null }> {
+		const normalized = normalizePath(path);
+		if (this.attentionAcceptInFlight.has(normalized)) throw new Error("Attachment repair already running.");
+		this.assertDownloadConflictOperationAuthority(normalized);
+		this.attentionAcceptInFlight.add(normalized);
+		const generation = this.fenceTransfersForPath(normalized, "manual-server-file-repair");
+		const attentionAtStart = this.preservedUnresolved.get(normalized);
+		const operation = (async () => {
+			let stage: BlobSettlementStage | undefined;
+			let backup: string | null = null;
+			let created: TFile | null = null;
+			const assertCurrent = () => {
+				this.assertDownloadConflictOperationAuthority(normalized);
+				if (this.currentTransferGeneration(normalized) !== generation || !canCommit()) {
+					throw new Error("File changed during server repair. Keep the safety backup and retry.");
+				}
+			};
+			try {
+				await this.waitForTransfersToSettle(normalized);
+				assertCurrent();
+				const previousStage = this.settlementStages[normalized];
+				if (previousStage) {
+					// An explicit retry may retire its earlier download stage. Other
+					// manual decisions keep their own identity and must resolve there.
+					if (previousStage.kind !== "download" || !sameBlobRef(previousStage.ref, ref)) {
+						throw new Error("Attachment settlement is unresolved. Resolve it before repair.");
+					}
+					await this.abortSettlementStage(normalized, previousStage);
+					assertCurrent();
+				}
+				const original = this.app.vault.getAbstractFileByPath(normalized);
+				if (!(original instanceof TFile)) throw new Error("Local attachment is missing.");
+				const stat = { mtime: original.stat.mtime, size: original.stat.size };
+				const local = await this.readAndHashExactExistingFile(original, normalized, stat);
+				if (!local.current || !local.hash) throw new Error("Local attachment changed or could not be read.");
+				const data = await this.blobClient.download(ref.hash, transferTimeoutMs(ref.size));
+				if (await hashArrayBuffer(data) !== ref.hash || data.byteLength !== ref.size) throw new Error("Server attachment verification failed.");
+				assertCurrent();
+				const finalLocal = await this.readAndHashExactExistingFile(original, normalized, stat);
+				if (!finalLocal.current || finalLocal.hash !== local.hash) throw new Error("Local attachment changed during download.");
+				await commitRemote();
+				assertCurrent();
+				const source = this.vaultSync.getBlobSourceVersion(normalized);
+				if (!source || !sameBlobRef(this.vaultSync.getBlobRef(normalized), ref)) throw new Error("Server reference did not settle locally.");
+				stage = await this.prepareSettlementStage(normalized, "download", ref, source);
+				assertCurrent();
+				if (local.hash !== ref.hash) {
+					backup = await this.moveExactFileToVisibleLocalBackup(original, normalized, stat,
+						({ hash }) => hash === local.hash && canCommit()
+							&& this.isOperationAuthorityCurrent()
+							&& sameBlobRef(this.vaultSync.getBlobRef(normalized), ref)
+							&& this.vaultSync.getBlobSourceVersion(normalized) === source,
+						generation, "manual-server-file-repair", false, true);
+					if (!backup) throw new Error("Local attachment could not be backed up safely.");
+					assertCurrent();
+					if (this.app.vault.getAbstractFileByPath(normalized) !== null) throw new Error("Attachment path is occupied.");
+					this.suppress(normalized);
+					created = await this.app.vault.createBinary(normalized, data);
+				}
+				assertCurrent();
+				const installed = created ?? original;
+				const verified = await this.hashExactExistingFile(installed, normalized);
+				if (!verified.current || verified.hash !== ref.hash) throw new Error("Restored attachment did not match the server.");
+				if (!await this.finalizeSettlementStage(normalized, stage, ref, source)) throw new Error("Restored attachment state could not be saved.");
+				stage = undefined;
+				setCachedHash(this.hashCache, normalized, installed.stat, ref.hash);
+				const attentionNow = this.preservedUnresolved.get(normalized);
+				if (attentionNow && (!attentionAtStart || getPreservedUnresolvedEpisodeId(attentionNow) !== getPreservedUnresolvedEpisodeId(attentionAtStart))) {
+					throw new Error("Attachment Attention changed during repair. Review the new decision.");
+				}
+				this.clearPreservedUnresolved(normalized);
+				await this.persistPreservedUnresolvedChanged?.();
+				return { safetyCopyPath: backup };
+			} catch (error) {
+				if (backup) {
+					if (created) await this.trashExactDownloadedReplica(created, normalized, ref.hash);
+					const saved = this.app.vault.getAbstractFileByPath(backup);
+					if (saved instanceof TFile && this.app.vault.getAbstractFileByPath(normalized) === null) {
+						await this.restoreRemoteOverwriteBackup(saved, backup, normalized);
+					}
+				}
+				// A durable stage is retained after ambiguous persistence failure.
+				if (stage && !backup && !created) await this.abortSettlementStage(normalized, stage);
+				throw error;
+			} finally { this.attentionAcceptInFlight.delete(normalized); }
+		})();
+		const tracked = operation.then(() => undefined, () => undefined);
+		this.activeTransferPromises.add(tracked);
+		try { return await operation; } finally { this.activeTransferPromises.delete(tracked); }
+	}
+
 	private async runAcceptRemoteDownloadConflict(
 		path: string,
 		identity: BlobDownloadConflictResolutionIdentity,

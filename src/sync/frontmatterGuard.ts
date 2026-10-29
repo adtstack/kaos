@@ -71,11 +71,15 @@ export function validateFrontmatterTransition(
 	const warnReasons = new Set<string>();
 
 	const nextLength = next.frontmatterText.length;
+	// Guard against runaway growth bursts in frontmatter (e.g. repeated properties loops).
+	// Small transitions (<= 512 bytes total, or delta <= 256 bytes) are normal Obsidian edits
+	// (such as adding multiple stack wiki-links or domain tags) and must not be quarantined.
 	if (
 		previousLength != null
 		&& previousLength > 0
+		&& nextLength > 512
 		&& nextLength > previousLength * 2
-		&& nextLength - previousLength > 128
+		&& nextLength - previousLength > 256
 	) {
 		blockReasons.add("frontmatter-growth-burst");
 	}
